@@ -97,12 +97,15 @@ const SCENES = [
   { name: 'node-unreachable', js: [click('[data-view="node:family-pc"]'), click('[data-tab="findings"]')] },
   { name: 'parts', js: [`(${partsPage.toString()})()`], slices: 3 },
   { name: 'probing', js: [click('[data-view="overview"]'), click('#btnProbe')], wait: 450 },
+  // ライブ表示（プレビューの preload が架空の値を 1 秒ごとに流す）。最後に置く（入れたままだと後の場面にもパネルが出る）
+  { name: 'resources-live', js: [click('[data-view="resources"]'), click('[data-live-toggle]')], wait: 4200 },
+  { name: 'node-live', js: [click('[data-view="node:gpu-tower"]'), click('[data-tab="findings"]'), click('[data-live-toggle]')], wait: 2500, slices: 2 },
 ];
 // Windows の配置（キャプションボタンの逃げ）と、最小のウィンドウ幅
 const VARIANTS = [
   { key: 'mac', platform: 'darwin', width: 1440, height: 920, scenes: SCENES },
   { key: 'win', platform: 'win32', width: 1440, height: 920, scenes: SCENES.filter((s) => ['overview', 'node-findings', 'logs'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
-  { key: 'narrow', platform: 'darwin', width: 1040, height: 700, scenes: SCENES.filter((s) => ['overview', 'status', 'resources', 'jobs', 'logs', 'node-findings', 'node-history'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
+  { key: 'narrow', platform: 'darwin', width: 1040, height: 700, scenes: SCENES.filter((s) => ['overview', 'status', 'resources', 'jobs', 'logs', 'node-findings', 'node-history', 'probing', 'resources-live', 'node-live'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
 ];
 
 const report = { started: new Date().toISOString(), shots: [], console: [], problems: [] };

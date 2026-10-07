@@ -19,6 +19,8 @@ const COMMANDS: &[&str] = &[
     "set_schedule",
     "set_login",
     "dev_report",
+    "live_start",
+    "live_stop",
 ];
 
 fn main() {

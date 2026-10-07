@@ -124,6 +124,7 @@ function go(view) {
 
 function render() {
   renderSidebar();
+  Live.route(state.view); // ライブ表示: 新しい画面で使わないものは止める
   if (state.view === 'overview') return renderOverview();
   if (state.view === 'status') return renderStatus();
   if (state.view === 'resources') return renderResources();
@@ -279,12 +280,14 @@ async function renderNode(id) {
   else if (state.tab === 'machine') body = machineHtml(d, r);
   if (stale(t)) return;
 
-  const actions = r ? `<button class="btn" id="btnOne" ${busy ? 'disabled' : ''}>${icon('play')}${busy ? '分析中…' : 'この機体を分析し直す'}</button>` : '';
+  const actions = Live.toggle('node') + (r ? `<button class="btn" id="btnOne" ${busy ? 'disabled' : ''}>${icon('play')}${busy ? '分析中…' : 'この機体を分析し直す'}</button>` : '');
   page(`
     ${UI.head({ icon: osIcon(n), title: n.id, desc: n.role || '', props: nodeProps(n, r), actions })}
     ${n.note ? UI.callout({ tone: 'gray', icon: 'info', body: esc(n.note) }) : ''}
+    ${Live.panel('node')}
     ${UI.tabs(tabs, state.tab)}
     ${body}`);
+  Live.mount('node', [n.id], state.nodes);
   $$('[data-tab]').forEach((b) => { b.onclick = () => { state.tab = b.dataset.tab; renderNode(id); }; });
   const one = $('#btnOne');
   if (one) one.onclick = () => probe([n.id]);
@@ -506,7 +509,8 @@ function renderResources() {
   const missing = state.nodes.filter((n) => !state.results[n.id]?.ok);
   const m = (v, th) => `<td class="mid">${Charts.meter(v, { ...th })}</td>`;
   page(`
-    ${UI.head({ icon: 'resources', title: 'リソース', desc: '全機体の CPU・メモリ・swap／コミット・ディスク・GPU・稼働日数・計測を、最新の分析結果で並べます。行をクリックすると機体の詳細へ移ります。' })}
+    ${UI.head({ icon: 'resources', title: 'リソース', desc: '全機体の CPU・メモリ・swap／コミット・ディスク・GPU・稼働日数・計測を、最新の分析結果で並べます。行をクリックすると機体の詳細へ移ります。', actions: Live.toggle('resources') })}
+    ${Live.panel('resources')}
     ${rows.length ? UI.table({
       cols: [{ label: '機体' }, { label: 'CPU', width: '13%' }, { label: 'メモリ使用', width: '13%' }, { label: 'swap / コミット', cls: 'n' }, { label: 'ディスク使用', width: '13%' }, { label: '空き', cls: 'n' },
         { label: 'GPU', cls: 'n' }, { label: '稼働', cls: 'n' }, { label: '計測', cls: 'n' }, { label: 'スコア', cls: 'n' }],
@@ -529,6 +533,8 @@ function renderResources() {
     }) : UI.empty('まだ分析していません。ツールバーの「全機を分析」で始めます。')}
     ${missing.length && rows.length ? `<p class="note-line">分析結果が無いため表示していない機体: ${missing.map((n) => `${esc(n.id)}${state.results[n.id] ? '（分析できない）' : '（未分析）'}`).join('、')}</p>` : ''}`);
   bindGoto();
+  // ライブ表示は共用機（提案のみ）を除く。共用機は機体の画面から流せる
+  Live.mount('resources', state.nodes.filter((n) => !n.shared).map((n) => n.id), state.nodes);
 }
 
 // ---- プロセス（全機体） ----

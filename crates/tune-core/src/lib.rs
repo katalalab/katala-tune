@@ -10,6 +10,7 @@
 //! | [`logs`] | ログの取り込み・伏せ字・指紋・ログ由来の所見 | lib/logs.js |
 //! | [`actions`] | 変更操作の計画と検証（許可リスト）と実行 | lib/actions.js |
 //! | [`engine`] | 上をつなぐ流れ（分析・取り込み・状態・自動スキャンの判断・確認つきの実行） | main.js の画面以外 |
+//! | [`live`] | ライブ表示（画面が見ているあいだだけ 1〜2 秒ごとに取る。経路・解析・保持・管理） | なし（Tauri 版だけ） |
 //!
 //! 道具の台帳（inventory・Do-gu）と AI エージェントのセッション（ai_sessions）は、同じ形で
 //! `inventory.rs` / `ai_sessions.rs` と `db/inventory.rs` / `db/ai_sessions.rs` を足し、`engine` から呼ぶ。
@@ -21,6 +22,7 @@ pub mod db;
 pub mod engine;
 pub mod health;
 pub mod js;
+pub mod live;
 pub mod logs;
 pub mod nodes;
 pub mod rules;

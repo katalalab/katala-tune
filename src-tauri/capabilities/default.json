@@ -27,6 +27,8 @@
     "allow-status",
     "allow-set-schedule",
     "allow-set-login",
-    "allow-dev-report"
+    "allow-dev-report",
+    "allow-live-start",
+    "allow-live-stop"
   ]
 }
