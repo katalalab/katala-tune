@@ -14,7 +14,7 @@ const MAX_LINE_BYTES = 1024 * 1024;
 
 function run(home, state = {}) {
   const src = PROBE.replace('KT_STATE = {}', `KT_STATE = ${JSON.stringify(state)}`);
-  const r = spawnSync(PY, ['-'], { input: src, env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: 'utf8' });
+  const r = spawnSync(PY, ['-X', 'utf8', '-'], { input: src, env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
   return { raw: r.stdout, out: JSON.parse(r.stdout) };
 }
