@@ -231,3 +231,15 @@ test('ログインの失敗: 24時間の件数と送り元で判定し、洪水�
   const c = netsec.checks({ os: 'windows', listen: [], defense: { security_log: 'ok' } }, f, { cursors: [{ node_id: 'pc', source: 'win_security' }] }, { id: 'pc' });
   assert.equal(c.find((x) => x.id === 'sec-login').status, 'fail');
 });
+
+test('共用機は外向きの接続先を既定で残さない（network_peers で明示すれば残す）', () => {
+  assert.equal(netsec.peersEnabled({ id: 'a' }), true);
+  assert.equal(netsec.peersEnabled({ id: 's', shared: true }), false);
+  assert.equal(netsec.peersEnabled({ id: 's', shared: true, network_peers: true }), true);
+  assert.equal(netsec.peersEnabled({ id: 'a', network_peers: false }), false);
+  const data = { netsec: { outbound: [{ proc: 'x', addr: '203.0.113.5', port: 8443, n: 1 }], listen: [] } };
+  netsec.dropPeers(data);
+  assert.deepEqual([data.netsec.outbound, data.netsec.outbound_skipped], [[], 'shared']);
+  assert.equal(netsec.normalize(data.netsec, 'mac').outbound_skipped, 'shared');
+  assert.equal(netsec.normalize({ outbound: [] }, 'mac').outbound_skipped, undefined);
+});

@@ -175,6 +175,23 @@ pub fn enabled(node: &Value) -> bool {
     !matches!(node.get("network"), Some(Value::Bool(false)))
 }
 
+/// 外向きの接続先（宛先）を残すか（lib/netsec.js の peersEnabled）。台帳の "network_peers" が true / false ならそれに従い、
+/// 書いていなければ共用機（shared）は残さない（他の人の通信の宛先を集めないため）
+pub fn peers_enabled(node: &Value) -> bool {
+    match node.get("network_peers") {
+        Some(Value::Bool(b)) => *b,
+        _ => !matches!(node.get("shared"), Some(Value::Bool(true))),
+    }
+}
+
+/// 調査の結果から宛先の一覧を落とす（lib/netsec.js の dropPeers）
+pub fn drop_peers(data: &mut Value) {
+    if let Some(Value::Object(ns)) = data.get_mut("netsec") {
+        ns.insert("outbound".into(), Value::Array(vec![]));
+        ns.insert("outbound_skipped".into(), Value::String("shared".into()));
+    }
+}
+
 /// アドレスと範囲（any・loopback・link・private・public）
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddrInfo {
@@ -448,10 +465,15 @@ pub fn normalize(raw: &Value, probe: &str) -> Value {
             parts_ms.insert(p.into(), js::jnum(js::round(x)));
         }
     }
-    json!({
+    let mut out = json!({
         "v": 1, "os": os, "listen": listen, "outbound": outbound, "defense": defense, "persist": persist,
         "errors": errors, "parts_ms": parts_ms, "elapsed_ms": rnd(r.get("elapsed_ms")), "cpu_ms": rnd(r.get("cpu_ms")),
-    })
+    });
+    // 共用機で宛先を落としたしるし（drop_peers）。あれば初めての接続先を覚えない・点検に出さない
+    if r.get("outbound_skipped").and_then(Value::as_str) == Some("shared") {
+        out["outbound_skipped"] = json!("shared");
+    }
+    out
 }
 
 /// 前回の分析と比べる。at = この分析の時刻（ms）。prev = 前回の snapshot の netsec
@@ -1130,8 +1152,8 @@ pub fn ingest(db: &Store, node: Option<&Node>, r: &Value, prev_data: Option<&Val
         Err(e) => store_err.push(format!("常駐の記録: {e}")),
     }
 
-    // 初めての接続先（取れなかったときは覚えない）
-    if !matches!(ob(ns.get("errors")).get("listen"), Some(Value::String(_))) {
+    // 初めての接続先（取れなかったとき・共用機で宛先を落としたときは覚えない）
+    if !matches!(ob(ns.get("errors")).get("listen"), Some(Value::String(_))) && ns.get("outbound_skipped").is_none() {
         let sample = ar(ns.get("outbound")).to_vec();
         match db.net_peers_step(&node_id, &sample, at) {
             Ok(p) => ns["peers"] = p,
@@ -1218,6 +1240,19 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_nodes_drop_peers_by_default() {
+        assert!(peers_enabled(&json!({ "id": "a" })));
+        assert!(!peers_enabled(&json!({ "id": "s", "shared": true })));
+        assert!(peers_enabled(&json!({ "id": "s", "shared": true, "network_peers": true })));
+        assert!(!peers_enabled(&json!({ "id": "a", "network_peers": false })));
+        let mut data = json!({ "netsec": { "outbound": [{ "proc": "x", "addr": "203.0.113.5", "port": 8443, "n": 1 }], "listen": [] } });
+        drop_peers(&mut data);
+        assert_eq!(data["netsec"]["outbound"], json!([]));
+        assert_eq!(normalize(&data["netsec"], "mac")["outbound_skipped"], json!("shared"));
+        assert!(normalize(&json!({ "outbound": [] }), "mac").get("outbound_skipped").is_none());
+    }
 
     #[test]
     fn addresses_are_classified() {

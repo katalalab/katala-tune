@@ -262,6 +262,9 @@ pub async fn probe_node(node: &Node) -> Value {
     {
         m.insert("bench".into(), bj);
     }
+    if !crate::netsec::peers_enabled(&node.raw) {
+        crate::netsec::drop_peers(&mut data);
+    }
     json!({ "node_id": node.id, "ok": true, "data": data, "wall_s": wall_s, "at": now_ms() })
 }
 

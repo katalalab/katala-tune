@@ -64,6 +64,7 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 - `local_hostname` がこの機体の hostname と一致すると、SSH を使わずローカルで実行する
 - `shared: true` は提案のみ。`protect` は終了を提案しても実行しないアプリ名
 - `network`（任意）: `false` でネットワークとセキュリティ（待ち受け・防御・常駐の増減・外向きの接続）を集めない。ログインの記録はログの取り込みの一部なので、止めるときは別に考える（既定は集める。共用機の「初めての接続先」は提案だけ）
+- `network_peers`（任意）: 外向きの接続先（宛先）を残すか。書いていなければ、共用機（`shared: true`）は残さない（他の人の通信の宛先を集めないため）。`true` で明示すれば共用機でも残す。`false` でどの機体でも残さない
 - `expect`（任意）: その機体で動いているはずのもの。`{ "services": ["Tailscale"], "jobs": ["\\MyTask", "com.example.job"], "processes": ["ollama"] }`。「状態」で見張る
 - `schedule`（任意）: `{ "enabled": true, "probe_minutes": 60, "logs_minutes": 15 }`
 - `fleet`（任意）: 作者のフリートで使っている常時監視（katala-fleet、非公開）の概況を `op-agent` 経由で表示する連携。設定しなければ使わない
