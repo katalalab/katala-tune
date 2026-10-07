@@ -31,6 +31,8 @@
 4. 公開鍵（`.pub` の中身、1行）を `src-tauri/tauri.conf.json` の `plugins.updater.pubkey` に入れてコミットする。仮の値（`REPLACE_WITH_TAURI_SIGNING_PUBLIC_KEY`）のままだとリリースの CI が止まる
 5. 手元の秘密鍵ファイルは 1Password に入れたら消してよい
 
+2026-10-07 に作成済み: 1Password の Katala-Agents「Katala Tune updater signing key (minisign)」（private_key・password・public_key）、GitHub の環境 `release`（タグ `v*` だけ）の secret 2 つ、`tauri.conf.json` の公開鍵。
+
 鍵を替えると、古い公開鍵を持つアプリは新しい署名の更新を受け付けない。替えるときは、新しい公開鍵を入れた版を古い鍵で署名して一度出してから替える。
 
 ## 出し方
