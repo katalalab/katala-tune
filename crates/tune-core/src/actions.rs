@@ -26,7 +26,8 @@ static WIN_START: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9]{17}$").
 static TASK_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\\([A-Za-z0-9_ .-]+\\)*$").expect("TASK_PATH"));
 static TASK_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_ .()+-]{1,120}$").expect("TASK_NAME"));
 static LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.-]{1,150}$").expect("LABEL"));
-static LAUNCH_AGENTS: LazyLock<Regex> =
+/// ユーザーの LaunchAgents の plist（rules の「登録し直す」コマンドでも使う）
+pub(crate) static LAUNCH_AGENTS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^/Users/[A-Za-z0-9_.-]+/Library/LaunchAgents/[A-Za-z0-9_.-]+\.plist$").expect("LAUNCH_AGENTS"));
 
 /// 終了スクリプトの結果コード

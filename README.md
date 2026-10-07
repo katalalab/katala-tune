@@ -58,6 +58,7 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 - `local_hostname` がこの機体の hostname と一致すると、SSH を使わずローカルで実行する
 - `shared: true` は提案のみ。`protect` は終了を提案しても実行しないアプリ名
 - `expect`（任意）: その機体で動いているはずのもの。`{ "services": ["Tailscale"], "jobs": ["\\MyTask", "com.example.job"], "processes": ["ollama"] }`。「状態」で見張る
+  - `expect.ignore_jobs`（任意）: 意図どおり 0 以外で終わる定期処理のラベル・タスク名。「状態」の「定期処理」の失敗に数えない（根拠に「既知 N 件を除く」と出る）。例 `{ "ignore_jobs": ["com.example.check-and-exit-1", "MyProbeTask"] }`
 - `schedule`（任意）: `{ "enabled": true, "probe_minutes": 60, "logs_minutes": 15 }`
 - `fleet`（任意）: 作者のフリートで使っている常時監視（katala-fleet、非公開）の概況を `op-agent` 経由で表示する連携。設定しなければ使わない
 
