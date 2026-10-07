@@ -390,7 +390,9 @@ impl Store {
                 if file.is_empty() || file == "undefined" {
                     continue;
                 }
-                if !rec.get("hours").is_some_and(Value::is_object) { rec["hours"] = json!({}); }
+                for key in ["hours", "tokens", "tool_counts", "tool_error_counts"] {
+                    if !rec.get(key).is_some_and(Value::is_object) { rec[key] = json!({}); }
+                }
                 let replace = !js::is_str(rec.get("mode"), "add");
                 let old = if replace { None } else { c.prepare_cached("SELECT * FROM ai_sessions WHERE node_id = ? AND file = ?")?.query_row(params![node_id, file], Session::from_row).optional()? };
                 claude_events(c, node_id, &mut rec, out, replace)?;
@@ -842,6 +844,17 @@ mod tests {
         assert!(db.ai_session("n", "claude:x").unwrap().is_some(), "gone preserves historical session");
         let ids: i64 = db.conn.query_row("SELECT count(*) FROM ai_claude_messages WHERE node_id='n' AND file='claude:x'", [], |r| r.get(0)).unwrap();
         assert_eq!(ids, 0);
+    }
+
+    #[test]
+    fn claude_metadata_normalizes_malformed_aggregate_objects() {
+        let db = Store::open_in_memory().unwrap();
+        let data = json!({"sessions":[{"tool":"claude","file":"claude:malformed","mode":"replace","tokens":1,"hours":[],"tool_counts":true,"tool_error_counts":"bad"}],"cursors":{"claude:malformed":10},"claude_usage":[{"file":"claude:malformed","id":"m","usage":[4,0,0,0,0],"hour":H}],"claude_tools":[{"file":"claude:malformed","id":"t","name":"Bash","hour":H}],"claude_errors":[{"file":"claude:malformed","id":"t","hour":H}]});
+        db.ai_ingest("n", &data, 1).unwrap();
+        let record = db.ai_session("n", "claude:malformed").unwrap().unwrap();
+        assert_eq!(record.tokens[0], 4);
+        assert_eq!(record.tool_counts["Bash"], 1);
+        assert_eq!(record.tool_error_counts["Bash"], 1);
     }
 
     #[test]
