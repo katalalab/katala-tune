@@ -20,7 +20,9 @@
     "logs": "node scripts/logs-sync.js",
     "oss-check": "node scripts/oss-check.js",
     "inventory": "node scripts/inventory.js",
-    "ui-preview": "electron scripts/ui-preview.js"
+    "ui-preview": "electron scripts/ui-preview.js",
+    "tauri:dev": "cargo tauri dev",
+    "tauri:build": "cargo tauri build"
   },
   "devDependencies": {
     "@electron/fuses": "^2.1.3",
