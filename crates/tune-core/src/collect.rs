@@ -5,13 +5,14 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 
 use crate::db::now_ms;
 use crate::js;
@@ -95,22 +96,8 @@ pub async fn run(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Dura
         }
         drop(stdin);
     });
-    let mut so = child.stdout.take();
-    let mut se = child.stderr.take();
-    let read_out = tokio::spawn(async move {
-        let mut b = Vec::new();
-        if let Some(s) = so.as_mut() {
-            let _ = s.read_to_end(&mut b).await;
-        }
-        b
-    });
-    let read_err = tokio::spawn(async move {
-        let mut b = Vec::new();
-        if let Some(s) = se.as_mut() {
-            let _ = s.read_to_end(&mut b).await;
-        }
-        b
-    });
+    let (out, read_out) = read_into_buffer(child.stdout.take());
+    let (err, read_err) = read_into_buffer(child.stderr.take());
     let mut extra = String::new();
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(st) => st.ok(),
@@ -120,12 +107,45 @@ pub async fn run(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Dura
             child.wait().await.ok()
         }
     };
-    let _ = writer.await;
-    // 孫プロセスがパイプを持ち続けても止まらないよう、読み終わりを待つのは少しだけ
-    let grace = Duration::from_secs(3);
-    let out = tokio::time::timeout(grace, read_out).await.ok().and_then(Result::ok).unwrap_or_default();
-    let err = tokio::time::timeout(grace, read_err).await.ok().and_then(Result::ok).unwrap_or_default();
+    // 孫プロセスがパイプを握り続けても止まらないよう、子が終わってから待つのは PIPE_GRACE まで。
+    // 過ぎたら読み取り（と書き込み）を止め、それまでに読んだ分を返す
+    let deadline = tokio::time::Instant::now() + PIPE_GRACE;
+    for mut task in [writer, read_out, read_err] {
+        if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    let out = std::mem::take(&mut *lock_buf(&out));
+    let err = std::mem::take(&mut *lock_buf(&err));
     RunResult { code: status.and_then(|s| s.code()), out: decode(&out), err: decode(&err) + &extra }
+}
+
+/// 子が終わった後、孫プロセスが標準出力・標準エラーを握っていても待つ時間。
+/// lib/collect.js が 'exit' から 'close' を待つ 500ms と揃える（同じコマンドなら Electron 版と Tauri 版で同じ出力を返す）。
+/// 子が書いた分はパイプに残っていて終了の直後に読み切れるので、ここで切れるのは孫が後から書く分だけ
+const PIPE_GRACE: Duration = Duration::from_millis(500);
+
+type SharedBuf = Arc<Mutex<Vec<u8>>>;
+
+fn lock_buf(b: &SharedBuf) -> std::sync::MutexGuard<'_, Vec<u8>> {
+    b.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// パイプを読み終わるまで共有のバッファへ貯めるタスク。止めても、それまでに読んだ分はバッファに残る
+fn read_into_buffer<R: AsyncRead + Unpin + Send + 'static>(pipe: Option<R>) -> (SharedBuf, JoinHandle<()>) {
+    let buf = SharedBuf::default();
+    let b = buf.clone();
+    let task = tokio::spawn(async move {
+        let Some(mut p) = pipe else { return };
+        let mut chunk = vec![0u8; 16 * 1024];
+        while let Ok(n) = p.read(&mut chunk).await
+            && n > 0
+        {
+            lock_buf(&b).extend_from_slice(&chunk[..n]);
+        }
+    });
+    (buf, task)
 }
 
 /// 出力の最後の JSON 行（`{` で始まる行を後ろから読めるまで）
@@ -374,5 +394,17 @@ mod tests {
         let missing = run("/nonexistent/cmd", &[], None, Duration::from_secs(1)).await;
         assert_eq!(missing.code, None);
         assert!(!missing.err.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_keeps_output_when_a_grandchild_holds_the_pipes() {
+        if cfg!(windows) {
+            return;
+        }
+        // 子（sh）はすぐ終わるが、孫（sleep）が標準出力・標準エラーを 5 秒握り続ける
+        let started = Instant::now();
+        let r = run("/bin/sh", &["-c".into(), "echo first; echo oops >&2; (sleep 5 &)".into()], None, Duration::from_secs(10)).await;
+        assert_eq!((r.code, r.out.as_str(), r.err.as_str()), (Some(0), "first\n", "oops\n"), "それまでに読んだ分は捨てない");
+        assert!(started.elapsed() < Duration::from_secs(2), "孫の終わりを待たない: {:?}", started.elapsed());
     }
 }
