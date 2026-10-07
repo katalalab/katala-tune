@@ -75,6 +75,47 @@ AI のセッション中に落ちた常駐、負荷の高い時間帯との重�
 - **やらないこと**: パケットの取得、通信の遮断・ファイアウォールの書き換え（気づくまでにとどめ、手当ては許可リストの操作として別に設計する）
 - **後で足せるもの**: Windows の Sysmon（プロセス起動とネットワーク接続の詳しい記録。入れるかは操作者の判断）、`tune-agent` での常時の接続の記録
 
+## OpenTelemetry の受け口（tune-agent。実装 2026-10-07）
+
+`tune-agent run` が `http://127.0.0.1:4318`（`--otlp-port`。`--no-otlp` で開かない）で OTLP/HTTP を受け、本文・引数・出力の断片を落としてから `~/.katala-tune/agent/otel/otel.jsonl` に 1 レコード 1 行で書く（16 MiB で回し、3 世代まで。ファイルは 0600）。後で調査がこのファイルを読む（`otlp.read`。次の段階）。中身は `crates/tune-agent/src/otlp.rs`。
+
+- 受けるのは `POST /v1/logs`・`POST /v1/metrics` の `application/json` だけ。protobuf・圧縮・トレース（`/v1/traces`）は受けない（依存を増やさないため。断ると 415・404 を返す）
+- 待つのは 127.0.0.1 だけ。Host が 127.0.0.1・localhost・[::1] 以外の要求は断る（ブラウザからの書き込み・DNS rebinding を防ぐ）
+- **落とし方は許可リスト**: 文字列の属性は、決めた名前（`event.name`・`session.id`・`model`・`tool_name`・`decision`・`success`・`error_type` など。一覧は `KEEP_STRING`）で、128 文字までのものだけ残す。数・真偽は残す。配列・入れ子・バイト列は残さない。ログの本文はイベント名の形のときだけ。トレース ID・exemplar は残さない。各行に落とした数（`dropped`）を書く
+- だから `prompt`・`prompt_text`・`tool_parameters`・`tool_input`・`error`（Claude Code）、`arguments`・`output`（Codex の `codex.tool_result`）、`user.email`・`vcs.repository.url.full`・`workspace.host_paths` などは、設定を間違えて本文の出力をオンにしても残らない（`otlp::tests` で確かめている）
+
+### 各機体での設定（手順だけ。配布は操作者の確認のあと）
+
+tune-agent は Claude Code・Codex の設定を書き換えない。入れるときは機体ごとに次を足す。
+
+Claude Code（`~/.claude/settings.json` の `env`。リポジトリの `.claude/settings.json` の `OTEL_*` は Claude Code が無視する）:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "OTEL_METRICS_EXPORTER": "otlp",
+    "OTEL_LOGS_EXPORTER": "otlp",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318"
+  }
+}
+```
+
+本文を出す設定（`OTEL_LOG_USER_PROMPTS`・`OTEL_LOG_ASSISTANT_RESPONSES`・`OTEL_LOG_TOOL_DETAILS`・`OTEL_LOG_TOOL_CONTENT`・`OTEL_LOG_RAW_API_BODIES`）は入れない（どれも既定でオフ）。`OTEL_EXPORTER_OTLP_COMPRESSION` とトレースの出力も入れない。
+
+Codex（`~/.codex/config.toml`）:
+
+```toml
+[otel]
+log_user_prompt = false
+exporter = { otlp-http = { endpoint = "http://127.0.0.1:4318/v1/logs", protocol = "json" } }
+```
+
+Codex の `codex.tool_result` には引数と出力の断片が入るが、受け口で落とす。資料の例は endpoint に `/v1/logs` まで書いているが、版によって付け方が違いうるので、入れた後に `tune-agent status` の `otlp.bytes` が増えること（増えなければ endpoint を `http://127.0.0.1:4318` にする）を確かめる。
+
+確かめ方: Claude Code か Codex を 1 回使ったあと、`tune-agent status` の `otlp.bytes` が増え、`otel.jsonl` に `"event":"claude_code.api_request"` などの行が出ること。本文が残っていないことは、使った指示の一部の語で `otel.jsonl` を検索して 0 件であることで見る。
+
 ## 順番
 
 1. 出どころの台帳と「この数字はどこから」画面
