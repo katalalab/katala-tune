@@ -1,0 +1,54 @@
+{
+  "_comment": "~/.config/katala-tune/nodes.json にコピーして編集する。alias は ~/.ssh/config の Host 名。local_hostname がこの機体の hostname と一致するとローカルで実行する",
+  "fleet": null,
+  "protect": [
+    "python.exe",
+    "Code",
+    "Xcode"
+  ],
+  "nodes": [
+    {
+      "id": "my-mac",
+      "alias": "my-mac",
+      "os": "macos",
+      "local_hostname": "My-MacBook-Pro",
+      "role": "この Mac",
+      "expect": {
+        "jobs": [
+          "com.example.backup"
+        ]
+      }
+    },
+    {
+      "id": "gpu-pc",
+      "alias": "gpu-pc",
+      "os": "windows",
+      "role": "Windows GPU 機",
+      "note": "任意のメモ。カードと詳細に表示される",
+      "expect": {
+        "services": [
+          "Tailscale"
+        ],
+        "jobs": [
+          "\\MyBackupTask"
+        ],
+        "processes": [
+          "ollama"
+        ]
+      }
+    },
+    {
+      "id": "family-pc",
+      "alias": "family-pc",
+      "os": "windows",
+      "role": "共用 PC",
+      "shared": true,
+      "note": "shared: true の機体は提案だけで、変更を実行しない"
+    }
+  ],
+  "schedule": {
+    "enabled": true,
+    "probe_minutes": 60,
+    "logs_minutes": 15
+  }
+}

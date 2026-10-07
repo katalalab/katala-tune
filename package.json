@@ -1,0 +1,28 @@
+{
+  "name": "katala-tune",
+  "productName": "Katala Tune",
+  "version": "0.3.0",
+  "description": "Katala フリート（Mac / Windows）を並列に分析し、承認した最適化だけを実行するデスクトップアプリ",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/katalalab/katala-tune.git"
+  },
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.js",
+    "probe": "node scripts/probe-all.js",
+    "package": "electron-packager . 'Katala Tune' --platform=darwin --arch=arm64 --out=dist --overwrite --icon=build/icon.icns --ignore='^/(dist|test|docs|build/icon\\.iconset)' --app-bundle-id=org.katala.tune && node scripts/harden.js 'dist/Katala Tune-darwin-arm64/Katala Tune.app'",
+    "install-app": "npm run package && rm -rf ~/Applications/'Katala Tune.app' && mkdir -p ~/Applications && cp -R 'dist/Katala Tune-darwin-arm64/Katala Tune.app' ~/Applications/",
+    "package:win": "electron-packager . 'Katala Tune' --platform=win32 --arch=x64 --out=dist --overwrite --icon=build/icon.ico --ignore='^/(dist|test|docs|build/icon\\.iconset)' && node scripts/harden.js 'dist/Katala Tune-win32-x64/Katala Tune.exe' && cd dist && rm -f Katala-Tune-win-x64.zip && zip -qry Katala-Tune-win-x64.zip 'Katala Tune-win32-x64'",
+    "logs": "node scripts/logs-sync.js",
+    "oss-check": "node scripts/oss-check.js"
+  },
+  "devDependencies": {
+    "@electron/fuses": "^2.1.3",
+    "@electron/packager": "^20.3.0",
+    "electron": "^44.6.0"
+  }
+}

@@ -1,0 +1,27 @@
+'use strict';
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('tune', {
+  config: () => ipcRenderer.invoke('config'),
+  last: () => ipcRenderer.invoke('last'),
+  probe: (ids) => ipcRenderer.invoke('probe', ids),
+  history: (id) => ipcRenderer.invoke('history', id),
+  fleet: () => ipcRenderer.invoke('fleet'),
+  action: (nodeId, action, label) => ipcRenderer.invoke('action', nodeId, action, label),
+  undo: (entryId) => ipcRenderer.invoke('undo', entryId),
+  actionsLog: () => ipcRenderer.invoke('actions-log'),
+  logsSync: (ids) => ipcRenderer.invoke('logs-sync', ids),
+  logsQuery: (filter) => ipcRenderer.invoke('logs-query', filter),
+  logsSignatures: (filter) => ipcRenderer.invoke('logs-signatures', filter),
+  logsCursors: () => ipcRenderer.invoke('logs-cursors'),
+  copy: (text) => ipcRenderer.invoke('copy', text),
+  openDataDir: () => ipcRenderer.invoke('open-data-dir'),
+  openConfig: () => ipcRenderer.invoke('open-config'),
+  status: () => ipcRenderer.invoke('status'),
+  setSchedule: (patch) => ipcRenderer.invoke('set-schedule', patch),
+  setLogin: (on) => ipcRenderer.invoke('set-login', on),
+  onChecksUpdated: (fn) => ipcRenderer.on('checks-updated', () => fn()),
+  onNavigate: (fn) => ipcRenderer.on('navigate', (_e, v) => fn(v)),
+  onProbeResult: (fn) => ipcRenderer.on('probe-result', (_e, r) => fn(r)),
+  onLogsSynced: (fn) => ipcRenderer.on('logs-synced', (_e, r) => fn(r)),
+});

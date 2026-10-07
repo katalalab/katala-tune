@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
+  <meta name="color-scheme" content="light dark">
+  <title>Katala Tune</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="side-drag"></div>
+      <nav class="side-nav" id="sideNav"></nav>
+      <div class="side-section">機体</div>
+      <nav class="side-nodes" id="sideNodes"></nav>
+      <div class="side-foot">
+        <button class="side-link" id="btnConfig" title="機体台帳を開く">台帳</button>
+        <button class="side-link" id="btnData" title="データの保存先を開く">データ</button>
+      </div>
+    </aside>
+    <main class="content">
+      <header class="toolbar">
+        <div class="tb-title">
+          <div class="tb-h" id="tbTitle">概要</div>
+          <div class="tb-sub" id="tbSub"></div>
+        </div>
+        <div class="tb-center" id="tbCenter"></div>
+        <div class="tb-actions">
+          <div class="capsule">
+            <button id="btnSync" class="cap-btn" title="全機のログを取り込む">
+              <svg viewBox="0 0 20 20"><path d="M4 10a6 6 0 0 1 10.2-4.3M16 10a6 6 0 0 1-10.2 4.3M14.5 2.5v3.5H11M5.5 17.5V14H9" /></svg><span>ログ</span>
+            </button>
+            <button id="btnFleet" class="cap-btn" title="katala-fleet の概況を更新">
+              <svg viewBox="0 0 20 20"><path d="M3 15l4-5 3 3 4-6 3 4" /></svg><span>概況</span>
+            </button>
+          </div>
+          <button id="btnProbe" class="cta"><svg viewBox="0 0 20 20"><path d="M6 4l10 6-10 6z" /></svg><span>全機を分析</span></button>
+        </div>
+      </header>
+      <div class="page" id="page"></div>
+      <div class="toast" id="toast" role="status"></div>
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
