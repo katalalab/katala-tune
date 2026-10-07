@@ -151,3 +151,15 @@ test('版のずれは先頭の数字の並びで比べる（OS ごとの接尾�
   assert.equal(matrix([row('a', '2.51.0'), row('b', '2.50.1.windows.1')])[0].drift, true);
   assert.equal(matrix([row('a', 'v1.2'), row('b', 'v1.2')])[0].drift, false);
 });
+
+test('Do-gu の登録の実行記録の ID は、同じミリ秒に重なっても一意（Rust 版と同じ <ms>-dogu-<pid>-<連番> の形）', () => {
+  const a = dogu.publishActionId(1700000000000);
+  const b = dogu.publishActionId(1700000000000);
+  assert.notEqual(a, b);
+  assert.match(a, new RegExp(`^1700000000000-dogu-${process.pid}-\\d+$`));
+  // Electron 版の登録（main.js）もこの ID を使う（${Date.now()}-dogu のままだと同じミリ秒の2回目の記録が重なる）
+  const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
+  const handler = main.slice(main.indexOf("ipcMain.handle('dogu-publish'"));
+  assert.match(handler.slice(0, handler.indexOf('\n});')), /id: dogu\.publishActionId\(at\)/);
+  assert.doesNotMatch(main, /`\$\{Date\.now\(\)\}-dogu`/);
+});
