@@ -181,6 +181,15 @@ snow は `std` の feature を入れない（入れると ring まで入る。al
 - 安い共有経路として n0 の有料 relay を案内するか
 - リモート画面やファイル転送（月数十 GB）を最初の範囲に入れるか
 
+## 操作者の決定（2026-10-08）
+
+- ペアリングと暗号化は `spake2`・`snow` で進める。どちらも正式な第三者監査は受けていないので、作者と操作者の機体だけの試験運用とし、段階 C（NAT 越え）で iroh（QUIC・TLS 1.3）を試すときに、監査済みの選択肢と合わせて見直す
+- 待ち受けの既定: 操作卓との接続 47231、ペアリング 47232、OpenTelemetry 4318（Claude Code・Codex の標準の送り先なので変えない）。どれも設定で変えられる
+- OpenTelemetry は JSON（`http/json`）だけを受ける。各機体で有効にするとき、実物の Claude Code・Codex が JSON で送れることを確かめてから配る
+- 続けて間違えて受付が止まったら、`tune-agent pair` をやり直す前に 1 分待つ（`pair.lockout` に止まった時刻を残す）
+- 機体鍵は当面ファイル（本人だけが読める権限。Windows は ACL）。OS の鍵置き場（Keychain・DPAPI）への対応は後で
+- 名刺の名前の既定はホスト名。暗号化して相手に送り、相手の台帳に残る
+
 ## 出典（2026-10-07 確認）
 
 - Cloudflare Realtime TURN: https://developers.cloudflare.com/realtime/turn/faq/ ・ https://developers.cloudflare.com/realtime/sfu/pricing/

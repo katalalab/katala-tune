@@ -31,7 +31,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tune_link::frame::Framed;
 use tune_link::keys::{self, DeviceKeys};
-use tune_link::pair::{self, Code, PairEvent, PairWindow};
+use tune_link::pair::{self, Code, PairEvent, PairWindow, Refusal};
 use tune_link::peers::{Peer, PeerStore, Role};
 use tune_link::{PAIR_PORT, RUN_PORT};
 
@@ -135,7 +135,26 @@ fn terminal() -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().write(true).open(p)
 }
 
+/// 続けて間違えて受付が止まった時刻を残すファイル。止まった直後に `pair` をやり直して、また試せるのを遅らせる
+const LOCKOUT_FILE: &str = "pair.lockout";
+/// 止まってから次の受付を始められるまで
+const LOCKOUT_COOLDOWN_MS: i64 = 60_000;
+
+/// 止まってからまだ待つ必要があれば、残りのミリ秒
+fn cooldown_remaining(dir: &std::path::Path, now: i64) -> Option<i64> {
+    let at: i64 = std::fs::read_to_string(dir.join(LOCKOUT_FILE)).ok()?.trim().parse().ok()?;
+    let until = at.saturating_add(LOCKOUT_COOLDOWN_MS);
+    (now < until).then(|| until - now)
+}
+
+fn record_lockout(dir: &std::path::Path, now: i64) {
+    let _ = std::fs::write(dir.join(LOCKOUT_FILE), now.to_string());
+}
+
 async fn pair_cmd(o: &Opts) -> Result<(), String> {
+    if let Some(ms) = cooldown_remaining(&o.dir, tune_link::now_ms()) {
+        return Err(format!("続けて間違えて受付が止まった直後なので、あと {} 秒待ってからやり直してください", (ms + 999) / 1000));
+    }
     let mut tty = terminal().map_err(|_| "端末が無いのでコードを表示できない（端末から実行してください）".to_string())?;
     let (keys, created) = DeviceKeys::load_or_create(&o.dir).map_err(|e| e.to_string())?;
     if created {
@@ -186,7 +205,12 @@ async fn pair_cmd(o: &Opts) -> Result<(), String> {
         |ev| match ev {
             PairEvent::Attempt { from } => log(&format!("ペアリングの試行 from={from}")),
             PairEvent::WrongCode { remaining } => log(&format!("コードが違った（あと {remaining} 回）")),
-            PairEvent::Refused(r) => log(&format!("断った: {r}")),
+            PairEvent::Refused(r) => {
+                if matches!(r, Refusal::Locked) {
+                    record_lockout(&o.dir, tune_link::now_ms());
+                }
+                log(&format!("断った: {r}"))
+            }
             PairEvent::Failed(e) => log(&format!("試行が失敗: {e}")),
             PairEvent::Paired { name, fingerprint } => log(&format!("ペアリングした: {name}（指紋 {fingerprint}）")),
         },
@@ -357,6 +381,20 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairing_waits_a_minute_after_lockout() {
+        let dir = std::env::temp_dir().join(format!("tune-agent-lockout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(cooldown_remaining(&dir, 1_000_000), None, "止まっていなければ待たない");
+        record_lockout(&dir, 1_000_000);
+        assert_eq!(cooldown_remaining(&dir, 1_000_000), Some(60_000));
+        assert_eq!(cooldown_remaining(&dir, 1_059_999), Some(1));
+        assert_eq!(cooldown_remaining(&dir, 1_060_000), None, "1 分たてばやり直せる");
+        std::fs::write(dir.join(LOCKOUT_FILE), "壊れた中身").unwrap();
+        assert_eq!(cooldown_remaining(&dir, 1_000_000), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn options() {
