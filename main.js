@@ -388,7 +388,13 @@ function createTray() {
   updateTray();
 }
 
+// 二重に起動すると同じ DB に自動スキャンが2重に走るので、2つ目は1つ目のウィンドウを出して終わる
+const singleInstance = app.requestSingleInstanceLock();
+if (!singleInstance) app.quit();
+else app.on('second-instance', () => showWindow());
+
 app.whenReady().then(() => {
+  if (!singleInstance) return;
   ensureConfig();
   reloadConfig();
   const dataDir = path.join(app.getPath('userData'), 'data');
