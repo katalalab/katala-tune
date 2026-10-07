@@ -74,5 +74,21 @@ try {
   }
 } catch { [void]$errors.Add("dev: $_") }
 
+try {
+  # Package managers / runtimes themselves, and Store-delivered tools that have no Uninstall entry
+  $wa = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
+  $checks = [ordered]@{
+    'winget' = @((Join-Path $wa 'winget.exe'))
+    'windows-terminal' = @((Join-Path $wa 'wt.exe'))
+    'wsl' = @((Join-Path $env:SystemRoot 'System32\wsl.exe'))
+    'scoop' = @((Join-Path $env:USERPROFILE 'scoop\shims\scoop.ps1'))
+    'chocolatey' = @((Join-Path $env:ProgramData 'chocolatey\bin\choco.exe'))
+    'rustup' = @((Join-Path $env:USERPROFILE '.cargo\bin\rustup.exe'))
+    'cargo' = @((Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'))
+    'nvm' = @((Join-Path $env:APPDATA 'nvm\nvm.exe'), (Join-Path $env:LOCALAPPDATA 'nvm\nvm.exe'))
+  }
+  foreach ($k in $checks.Keys) { if (@($checks[$k] | Where-Object { Test-Path -LiteralPath $_ }).Count) { Add-Item 'platform' $k $null } }
+} catch { [void]$errors.Add("platform: $_") }
+
 $result = [ordered]@{ os = 'windows'; items = @($items); errors = @($errors); elapsed_s = [math]::Round(((Get-Date) - $t0).TotalSeconds, 2) }
 $result | ConvertTo-Json -Depth 4 -Compress

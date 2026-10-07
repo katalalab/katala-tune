@@ -9,6 +9,7 @@
 #   npm:   グローバルの node_modules（mise の node も含む）
 #   bin:   パッケージマネージャを通さずに置いた CLI（~/.local/bin・~/.bun/bin・~/go/bin・~/.deno/bin・/usr/local/bin）。
 #          Homebrew へのリンク・退避ファイル（.bak など拡張子つき）は数えない。~/bin は個人のスクリプト置き場なので見ない
+#   platform: パッケージマネージャ・ランタイム管理そのもの（Homebrew・rustup/cargo・nvm・rbenv・pyenv・Nix・colima・Docker）
 import json, os, plistlib, glob, time
 
 HOME = os.path.expanduser("~")
@@ -124,7 +125,22 @@ def loose_bins():
             add("bin", name)
 
 
-for fn in (brew, apps, mise, uv_cargo, npm_global, loose_bins):
+def platform():
+    checks = {
+        "homebrew": ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"],
+        "rustup": [os.path.join(HOME, ".cargo", "bin", "rustup")],
+        "cargo": [os.path.join(HOME, ".cargo", "bin", "cargo")],
+        "nvm": [os.path.join(HOME, ".nvm", "nvm.sh")],
+        "rbenv": [os.path.join(HOME, ".rbenv")],
+        "pyenv": [os.path.join(HOME, ".pyenv")],
+        "nix": ["/nix/store"],
+    }
+    for name, paths in checks.items():
+        if any(os.path.exists(p) for p in paths):
+            add("platform", name)
+
+
+for fn in (brew, apps, mise, uv_cargo, npm_global, loose_bins, platform):
     try:
         fn()
     except Exception as e:  # 1つの取り方が壊れても他は返す
