@@ -17,6 +17,7 @@ mod commands_tools;
 mod confirm;
 mod live;
 mod tray;
+mod update;
 mod window;
 
 use std::sync::Arc;
@@ -99,6 +100,7 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--hidden"])))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::config,
             commands::last,
@@ -145,6 +147,8 @@ pub fn run() {
             tray::create(&handle)?;
             engine.compute_checks(false, true);
             start_scheduler(engine);
+            // 新しい版があれば通知だけする（入れるのはメニューから、確認のあとだけ）
+            update::start(handle.clone());
             Ok(())
         })
         .build(tauri::generate_context!())

@@ -45,6 +45,25 @@ test('速度の表記', () => {
   assert.equal(Live.rate(null), '–');
 });
 
+test('順序の乱れ・重複・全体の再送も、従来の時刻マージと一致する', () => {
+  const store = {};
+  let expected = [];
+  let seed = 42;
+  const rand = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0);
+  for (let i = 0; i < 1000; i++) {
+    const at = now + i * 1000;
+    const full = i % 17 === 0;
+    const points = Array.from({ length: 1 + rand() % 5 }, () => ({ t: at - (rand() % 450) * 1000, cpu: rand() % 100 }));
+    const last = expected.at(-1)?.t ?? -Infinity;
+    const byT = new Map((full ? [...expected, ...points] : expected.concat(points.filter((p) => p.t > last))).map((p) => [p.t, p]));
+    expected = [...byT.values()].sort((a, b) => a.t - b.t).filter((p) => p.t >= at - 300_000);
+    Live.merge(store, { nodes: { a: { full, points } } }, at);
+    assert.deepEqual(store.a.points, expected, `event ${i}`);
+  }
+  Live.merge(store, { nodes: { a: { state: 'stopped' } } }, now + 2_000_000);
+  assert.deepEqual(store.a.points, [], '点の無い状態イベントでも保持期限を守る');
+});
+
 test('スパークライン: 時刻で横に並べ、間が空いたら線を切る', () => {
   const points = [0, 1, 2, 10, 11].map((s) => ({ t: now - 60_000 + s * 1000, v: s * 10 }));
   const svg = Charts.spark([{ points, tone: 'info' }], { window: 60_000, now, min: 0, max: 200, width: 600, height: 40 });

@@ -1,6 +1,7 @@
 //! 各機体のログを前回の続きから取り込む。読み取り専用。仕様は lib/logs.js。
 //! 取り込みは (node, source, uid) で一意なので、同じ範囲を読み直しても重複しない（失敗したら次回やり直せばよい）。
 
+use std::borrow::Cow;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -37,11 +38,14 @@ static REDACT: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
 
 /// 秘密らしい値を伏せ、1,000 文字（UTF-16 単位）で切る
 pub fn redact(s: &str) -> String {
-    let mut out = s.to_string();
+    let mut out = Cow::Borrowed(s);
     for (re, rep) in REDACT.iter() {
-        out = re.replace_all(&out, *rep).into_owned();
+        // マッチしない規則では入力を借りたままにし、文字列全体のコピーを避ける。
+        if let Cow::Owned(next) = re.replace_all(&out, *rep) {
+            out = Cow::Owned(next);
+        }
     }
-    if js::len16(&out) > MAX_MESSAGE { js::slice16(&out, MAX_MESSAGE) + "…" } else { out }
+    if js::len16(&out) > MAX_MESSAGE { js::slice16(&out, MAX_MESSAGE) + "…" } else { out.into_owned() }
 }
 
 static FP: LazyLock<[Regex; 6]> = LazyLock::new(|| {
@@ -61,7 +65,9 @@ pub fn fingerprint(source: &str, provider: Option<&Value>, event_id: Option<&Val
     let reps = ["<guid>", "<hex>", "<path>", "<q>", "<n>", " "];
     let mut norm = lower;
     for (re, rep) in FP.iter().zip(reps) {
-        norm = re.replace_all(&norm, rep).into_owned();
+        if let Cow::Owned(next) = re.replace_all(&norm, rep) {
+            norm = next;
+        }
     }
     let norm = js::slice16(js::trim(&norm), 400);
     let part = |v: Option<&Value>| if present(v) { string(v) } else { String::new() };
@@ -101,7 +107,7 @@ pub fn sources(os: &str) -> &'static [&'static str] {
     }
 }
 
-/// `String(Number.parseInt(cursor ?? '0', 10) || 0)`
+/// `String(Number.parseInt(cursor ?? '0', 10) || 0)` のうち、安全な整数だけを渡す
 fn cursor_arg(c: Option<&Value>) -> String {
     let s = match c {
         None | Some(Value::Null) => "0".to_string(),
@@ -117,8 +123,42 @@ fn cursor_arg(c: Option<&Value>) -> String {
     if digits.is_empty() {
         return "0".into();
     }
-    let x = digits.parse::<f64>().unwrap_or(0.0) * if neg { -1.0 } else { 1.0 };
-    if x == 0.0 { "0".into() } else { js::num_str(x) }
+    let Ok(mut x) = digits.parse::<i128>() else {
+        return "0".into();
+    };
+    if neg {
+        x = -x;
+    }
+    if x.unsigned_abs() > 9_007_199_254_740_991 { "0".into() } else { x.to_string() }
+}
+
+pub(crate) fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn windows_remote_transport(cursors: &Map<String, Value>, script: &[u8]) -> Result<(String, String), String> {
+    let c = |s: &str| cursor_arg(cursors.get(s));
+    let params = format!("-SysCursor {} -AppCursor {} -NeonCursor {}", c("win_system"), c("win_application"), c("neonmonitor"));
+    let script = script.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(script);
+    let payload = base64(script);
+    let bootstrap = format!(
+        "[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false);$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd()));& ([ScriptBlock]::Create($s)) {params}"
+    );
+    let utf16: Vec<u8> = bootstrap.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let command = format!("printf %s {payload} | powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {}", base64(&utf16));
+    if command.len() >= 8191 {
+        return Err("Windows remote log command exceeds 8191 bytes".into());
+    }
+    Ok((command, bootstrap))
 }
 
 async fn fetch_logs(node: &Node, cursors: &Map<String, Value>) -> RunResult {
@@ -141,10 +181,11 @@ async fn fetch_logs(node: &Node, cursors: &Map<String, Value>) -> RunResult {
     if node.local {
         return collect::local::powershell_file(WIN_LOGS, &params, t).await;
     }
-    let remote = format!(
-        "mkdir -p ~/.katala-tune && cat > ~/.katala-tune/logs.ps1 && powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$(cygpath -w ~/.katala-tune/logs.ps1)\" {params}"
-    );
-    collect::run("ssh", &ssh_args(&node.alias, &remote), Some(WIN_LOGS), t).await
+    let (remote, _) = match windows_remote_transport(cursors, WIN_LOGS) {
+        Ok(transport) => transport,
+        Err(err) => return RunResult { code: None, out: String::new(), err },
+    };
+    collect::run("ssh", &ssh_args(&node.alias, &remote), None, t).await
 }
 
 /// 1台分を取り込む。戻り値は `{ node_id, sources: { <source>: { inserted, fetched, dropped, note? } | { error } }, meta, error? }`
@@ -298,7 +339,9 @@ pub fn log_findings(db: &Store, node_id: &str, now: i64) -> rusqlite::Result<Vec
             json!({ "node_id": node_id, "q": "Resource" }),
         );
     }
-    let disk = sum(&|r| ["disk", "Ntfs", "stornvme", "storahci", "volmgr"].iter().any(|p| prov(r, p)) && r.level != "info");
+    // volmgr の 161・162 は BSOD の後のクラッシュダンプ作成の記録（ディスクの故障ではない。停止そのものは安定性で数える）
+    let dump_record = |r: &crate::db::LogCount| prov(r, "volmgr") && (ev(r, "161") || ev(r, "162"));
+    let disk = sum(&|r| ["disk", "Ntfs", "stornvme", "storahci", "volmgr"].iter().any(|p| prov(r, p)) && r.level != "info" && !dump_record(r));
     if disk > 0 {
         push(
             "log-disk",
@@ -446,5 +489,27 @@ mod tests {
         assert_eq!(cursor_arg(Some(&Value::from(" 12abc"))), "12");
         assert_eq!(cursor_arg(Some(&Value::from("abc"))), "0");
         assert_eq!(cursor_arg(Some(&Value::from("-5"))), "-5");
+    }
+
+    #[test]
+    fn windows_remote_logs_use_base64_stdin_without_fixed_file() {
+        let mut cursors = Map::new();
+        cursors.insert("win_system".into(), Value::from("42; Write-Error bad"));
+        cursors.insert("win_application".into(), Value::from(" 7tail"));
+        cursors.insert("neonmonitor".into(), Value::from("not-a-number"));
+        let (command, bootstrap) = windows_remote_transport(&cursors, b"\xef\xbb\xbfparam([long]$SysCursor)\n").unwrap();
+        assert!(!command.contains("katala-tune") && !command.contains("logs.ps1") && !command.contains("-File") && !command.contains("cygpath"));
+        assert!(command.starts_with("printf %s "));
+        assert!(command.contains(" | powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand "));
+        assert!(command.len() < 8191);
+        assert!(bootstrap.contains("FromBase64String([Console]::In.ReadToEnd())"));
+        assert!(bootstrap.contains("[ScriptBlock]::Create($s)"));
+        assert!(bootstrap.ends_with("-SysCursor 42 -AppCursor 7 -NeonCursor 0"));
+        let mut max_cursors = Map::new();
+        for source in ["win_system", "win_application", "neonmonitor"] {
+            max_cursors.insert(source.into(), Value::from("9007199254740991"));
+        }
+        assert!(windows_remote_transport(&max_cursors, WIN_LOGS).unwrap().0.len() < 8191);
+        assert!(windows_remote_transport(&Map::new(), &[0; 6000]).is_err());
     }
 }

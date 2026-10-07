@@ -1,0 +1,16 @@
+name: 不具合
+description: 動作・負荷・更新の問題を報告する
+title: "[bug] "
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 期待した動作と実際の動作
+      description: 操作の順番、アプリの版、OS の版、再現頻度。台帳・ホスト名・ユーザー名・秘密・会話本文・生ログは投稿しないでください。
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 確認した範囲
+      description: 匿名化したエラー名・件数と検証結果。巨大なログや DB は添付しないでください。

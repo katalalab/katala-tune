@@ -16,6 +16,8 @@ import json, os, re, time
 
 KT_STATE = {}       # 呼び出し側が置き換える: {"files": {key: offset}}
 KT_BUDGET_S = 25
+MAX_LINE_BYTES = 1024 * 1024
+DRAIN_BYTES = 64 * 1024
 
 HOME = os.path.expanduser("~")
 WIN = os.name == "nt"
@@ -196,6 +198,19 @@ def codex_line(r, line):
                     b[i] = max(b[i], r["tokens"][k])
 
 
+def discard_large_line(f, first):
+    """Complete an over-limit line without retaining its body. None means retry from its start."""
+    size, tail = len(first), first
+    while not tail.endswith(b"\n"):
+        if time.time() - t0 > KT_BUDGET_S:
+            return None
+        tail = f.readline(DRAIN_BYTES)
+        if not tail:
+            return None
+        size += len(tail)
+    return size if time.time() - t0 <= KT_BUDGET_S else None
+
+
 def scan_file(tool, path, key, off, out):
     size = os.path.getsize(path)
     reset = size < off
@@ -209,10 +224,26 @@ def scan_file(tool, path, key, off, out):
             r["parent_id"] = rel[rel.index("subagents") - 1]
     usage, tool_names = {}, {}
     pos = off
+    skipped_large = 0
     with open(path, "rb") as f:
         f.seek(off)
-        for line in f:
+        while True:
+            if time.time() - t0 > KT_BUDGET_S:
+                out["truncated"] = True
+                break
+            line = f.readline(MAX_LINE_BYTES + 1)
+            if not line:
+                break
+            if len(line) > MAX_LINE_BYTES:
+                consumed = discard_large_line(f, line)
+                if consumed is None:
+                    out["truncated"] = True
+                    break
+                pos += consumed
+                skipped_large += 1
+                continue
             if not line.endswith(b"\n"):
+                out["truncated"] = True
                 break  # 書きかけの行は次回
             pos += len(line)
             try:
@@ -222,6 +253,8 @@ def scan_file(tool, path, key, off, out):
             if time.time() - t0 > KT_BUDGET_S:
                 out["truncated"] = True
                 break
+    if skipped_large:
+        out["errors"].append(f"{key}: {skipped_large} line(s) exceeds {MAX_LINE_BYTES} bytes; metadata unavailable")
     for u, h in usage.values():
         add = (u.get("input_tokens") or 0, u.get("output_tokens") or 0, u.get("cache_read_input_tokens") or 0,
                u.get("cache_creation_input_tokens") or 0, ((u.get("output_tokens_details") or {}).get("thinking_tokens") or 0))

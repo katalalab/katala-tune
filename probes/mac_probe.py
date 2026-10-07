@@ -5,7 +5,7 @@ python3 標準ライブラリだけで動く。設定・プロセス・ファイ
 秘密・環境変数・コマンドライン引数・ファイルの中身は集めない（プロセスは実行ファイル名だけ）。
 """
 import json, os, plistlib, re, shutil, socket, statistics, subprocess, sys, time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 
 HOME = os.path.expanduser("~")
 CACHE_DIRS = [
@@ -250,13 +250,39 @@ def launchd_jobs():
     return jobs
 
 
+def exit_reason(target):
+    """launchctl print の last exit reason（起動制約で止められた OS_REASON_CODESIGNING など）。読めなければ None"""
+    for line in run(["launchctl", "print", target], timeout=4).splitlines():
+        m = re.match(r"\s*last exit reason\s*=\s*(.+)$", line, re.I)
+        if m:
+            return m.group(1).strip()[:300]
+    return None
+
+
 def launchd_failing():
     out = run(["launchctl", "list"])
     bad = []
     for line in out.splitlines()[1:]:
         parts = line.split("\t")
         if len(parts) == 3 and not parts[2].startswith("com.apple.") and parts[1] not in ("0", "-") and parts[0] == "-":
-            bad.append({"label": parts[2], "exit": parts[1]})
+            bad.append({"label": parts[2], "exit": parts[1], "reason": None})
+    # 失敗しているものだけ終了の理由を読む（多すぎるときは先頭 20 件）。1 件 4 秒の上限があるので、
+    # 4 並列で読み、全体も 10 秒で打ち切る（遅い機体で調査全体の上限 90 秒に当たって結果をまるごと失わないため）
+    uid = os.getuid()
+    targets = bad[:20]
+    if targets:
+        ex = ThreadPoolExecutor(max_workers=4)
+        futs = {ex.submit(exit_reason, f"gui/{uid}/{b['label']}"): b for b in targets}
+        done, _ = wait(futs, timeout=10)
+        for f in done:
+            try:
+                futs[f]["reason"] = f.result()
+            except Exception:
+                pass
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:  # Python 3.8 以前
+            ex.shutdown(wait=False)
     return bad
 
 
@@ -306,7 +332,10 @@ def main():
         result["time_machine_running"] = f_tm.result()
         result["spotlight"] = f_sp.result()[0].strip()
         result["caches"] = [r for r in (f.result() for f in f_dirs) if r]
-    result["bench"] = bench()
+    skip_benchmark = "--skip-benchmark" in sys.argv[1:]
+    result["bench"] = None if skip_benchmark else bench()
+    if skip_benchmark:
+        result["benchmark_skipped"] = True
     result["elapsed_s"] = round(time.time() - t0, 1)
     json.dump(result, sys.stdout, ensure_ascii=False)
     print()

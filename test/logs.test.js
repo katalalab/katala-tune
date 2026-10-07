@@ -4,10 +4,26 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { redact, fingerprint, normalize, logFindings } = require('../lib/logs');
+const { redact, fingerprint, normalize, logFindings, windowsRemoteTransport } = require('../lib/logs');
 const { openDb } = require('../lib/db');
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'kt-test-'));
+
+test('Windows リモートログは固定ファイルを使わず Base64 stdin から実行する', () => {
+  const script = Buffer.from('\uFEFFparam([long]$SysCursor)\n[Console]::OutputEncoding = [Text.Encoding]::UTF8\n', 'utf8');
+  const transport = windowsRemoteTransport({ win_system: '42; Write-Error bad', win_application: ' 7tail', neonmonitor: 'not-a-number' }, script);
+  assert.doesNotMatch(transport.command, /katala-tune|logs\.ps1|-File|cygpath/);
+  assert.match(transport.command, /^printf %s [A-Za-z0-9+/=]+ \| powershell\.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand [A-Za-z0-9+/=]+$/);
+  assert.ok(Buffer.byteLength(transport.command) < 8191);
+  assert.match(transport.bootstrap, /FromBase64String\(\[Console\]::In\.ReadToEnd\(\)\)/);
+  assert.match(transport.bootstrap, /\[ScriptBlock\]::Create\(\$s\)/);
+  assert.match(transport.bootstrap, /-SysCursor 42 -AppCursor 7 -NeonCursor 0$/);
+  assert.equal(transport.input, undefined);
+  const fullScript = fs.readFileSync(path.join(__dirname, '..', 'probes', 'win_logs.ps1'));
+  const maxCursors = { win_system: '9007199254740991', win_application: '9007199254740991', neonmonitor: '9007199254740991' };
+  assert.ok(Buffer.byteLength(windowsRemoteTransport(maxCursors, fullScript).command) < 8191);
+  assert.throws(() => windowsRemoteTransport({}, Buffer.alloc(6000)), /8191/);
+});
 
 test('秘密らしい値を伏せる', () => {
   // 偽の値は実行時に組み立てる（ソースに秘密らしい文字列を置かない。gitleaks が正しく反応するため）
@@ -95,4 +111,15 @@ test('同じエラーの洪水（24時間で200件以上）と .NET の未処理
   assert.ok(f.find((x) => x.id.startsWith('log-flood-') && /250 件/.test(x.title)), JSON.stringify(f.map((x) => x.title)));
   assert.ok(f.find((x) => x.id === 'log-crashes'));
   assert.ok(f.find((x) => x.id === 'log-dropped'));
+});
+
+test('volmgr の 161・162（BSOD 後のクラッシュダンプ作成）はディスクのエラーに数えない', () => {
+  const db = openDb(tmp());
+  const now = Date.now();
+  const mk = (event_id, i) => ({ uid: `v-${event_id}-${i}`, ts: now - i * 1000, level: 'error', provider: 'volmgr', event_id, message: `volmgr ${event_id} ${i}` });
+  db.insertLogs('pc', 'win_system', normalize('win_system', [mk('161', 1), mk('162', 2), mk('161', 3), mk('162', 4)]));
+  assert.equal(logFindings(db, 'pc', now).find((x) => x.id === 'log-disk'), undefined);
+  // 同じ volmgr でも別の事象（例: 46）は数える
+  db.insertLogs('pc', 'win_system', normalize('win_system', [mk('46', 5)]));
+  assert.match(logFindings(db, 'pc', now).find((x) => x.id === 'log-disk').title, / 1 件$/);
 });

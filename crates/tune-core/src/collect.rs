@@ -23,7 +23,8 @@ pub const MAC_LOGS: &str = include_str!("../../../probes/mac_logs.py");
 pub const WIN_PROBE: &[u8] = include_bytes!("../../../probes/win_probe.ps1");
 pub const WIN_LOGS: &[u8] = include_bytes!("../../../probes/win_logs.ps1");
 
-pub const SSH_OPTS: [&str; 6] = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=10"];
+pub const SSH_OPTS: [&str; 11] =
+    ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=10", "-o", "ControlMaster=no", "-o", "ControlPath=none"];
 pub const BENCH_PY: &str = "import time,json,statistics as s\nr=[]\nfor _ in range(5):\n t=time.perf_counter();sum(i*i for i in range(3000000));r.append(round((time.perf_counter()-t)*1000,1))\nprint(json.dumps({'runs_ms':r,'median_ms':s.median(r)}))";
 pub const BENCH_MARK: &str = "@@KATALA_TUNE_BENCH@@";
 
@@ -198,38 +199,51 @@ pub fn ssh_args(alias: &str, remote: &str) -> Vec<String> {
     a
 }
 
-fn windows_ssh_command() -> String {
+fn mac_probe_args(benchmark: bool) -> Vec<String> {
+    let mut args = vec!["python3".into(), "-".into()];
+    if !benchmark {
+        args.push("--skip-benchmark".into());
+    }
+    args
+}
+
+fn mac_ssh_command(benchmark: bool) -> String {
+    let suffix = if benchmark { "" } else { " --skip-benchmark" };
+    format!("command -v python3 >/dev/null && exec python3 -{suffix} || exec /usr/bin/python3 -{suffix}")
+}
+
+fn windows_ssh_command(benchmark: bool) -> String {
     let bench = BENCH_PY.replace('\'', "\"");
-    [
+    let mut parts = vec![
         "mkdir -p ~/.katala-tune && cat > ~/.katala-tune/probe.ps1 &&".to_string(),
         "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$(cygpath -w ~/.katala-tune/probe.ps1)\";".to_string(),
-        format!("echo {BENCH_MARK};"),
-        format!("PY=$(command -v python3 || command -v python); [ -n \"$PY\" ] && \"$PY\" -c '{bench}'"),
-    ]
-    .join(" ")
+    ];
+    if benchmark {
+        parts.extend([format!("echo {BENCH_MARK};"), format!("PY=$(command -v python3 || command -v python); [ -n \"$PY\" ] && \"$PY\" -c '{bench}'")]);
+    }
+    parts.join(" ")
 }
 
 /// 1台を調べる。戻り値は `{ node_id, ok, data | error, wall_s, at }`（collect.js と同じ形）
 pub async fn probe_node(node: &Node) -> Value {
     let started = Instant::now();
+    let benchmark = node.get("benchmark") != Some(&Value::Bool(false));
     let res = if node.is_mac() {
         if node.local {
-            run("/usr/bin/env", &["python3".into(), "-".into()], Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
+            run("/usr/bin/env", &mac_probe_args(benchmark), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
         } else {
-            run(
-                "ssh",
-                &ssh_args(&node.alias, "command -v python3 >/dev/null && exec python3 - || exec /usr/bin/python3 -"),
-                Some(MAC_PROBE.as_bytes()),
-                Duration::from_secs(90),
-            )
-            .await
+            run("ssh", &ssh_args(&node.alias, &mac_ssh_command(benchmark)), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
         }
     } else if node.local {
         let p = local::powershell_file(WIN_PROBE, "", Duration::from_secs(120)).await;
-        let b = local::python(BENCH_PY, Duration::from_secs(60)).await;
-        RunResult { out: format!("{}\n{BENCH_MARK}\n{}", p.out, b.out), ..p }
+        if benchmark {
+            let b = local::python(BENCH_PY, Duration::from_secs(60)).await;
+            RunResult { out: format!("{}\n{BENCH_MARK}\n{}", p.out, b.out), ..p }
+        } else {
+            p
+        }
     } else {
-        run("ssh", &ssh_args(&node.alias, &windows_ssh_command()), Some(WIN_PROBE), Duration::from_secs(120)).await
+        run("ssh", &ssh_args(&node.alias, &windows_ssh_command(benchmark)), Some(WIN_PROBE), Duration::from_secs(120)).await
     };
     let wall_s = started.elapsed().as_secs_f64();
     let (main, bench) = match res.out.split_once(BENCH_MARK) {
@@ -251,6 +265,10 @@ pub async fn probe_node(node: &Node) -> Value {
         && let Some(bj) = last_json_line(b)
     {
         m.insert("bench".into(), bj);
+    }
+    if !benchmark {
+        data["bench"] = Value::Null;
+        data["benchmark_skipped"] = Value::Bool(true);
     }
     json!({ "node_id": node.id, "ok": true, "data": data, "wall_s": wall_s, "at": now_ms() })
 }
@@ -316,9 +334,31 @@ mod tests {
     }
 
     #[test]
+    fn disabled_benchmark_never_sends_fixed_computation() {
+        let enabled = windows_ssh_command(true);
+        assert!(enabled.contains(BENCH_MARK));
+        assert!(enabled.contains("3000000"));
+        let disabled = windows_ssh_command(false);
+        assert!(disabled.contains("probe.ps1"));
+        assert!(!disabled.contains(BENCH_MARK));
+        assert!(!disabled.contains("3000000"));
+        assert!(!disabled.contains("command -v python"));
+        assert_eq!(mac_probe_args(false), vec!["python3", "-", "--skip-benchmark"]);
+        assert_eq!(mac_ssh_command(false).matches("--skip-benchmark").count(), 2);
+        assert!(!mac_ssh_command(true).contains("--skip-benchmark"));
+    }
+
+    #[test]
     fn probes_are_embedded() {
         assert!(MAC_PROBE.contains("def "));
         assert_eq!(&WIN_PROBE[..3], &[0xEF, 0xBB, 0xBF], "PS 5.1 のため BOM 付き");
+    }
+
+    #[test]
+    fn ssh_does_not_reuse_controlpersist_master() {
+        assert!(SSH_OPTS.contains(&"-T"));
+        assert!(SSH_OPTS.contains(&"ControlMaster=no"));
+        assert!(SSH_OPTS.contains(&"ControlPath=none"));
     }
 
     #[tokio::test]
