@@ -8,6 +8,8 @@ function execute(command, args) {
 function inspect(platform = process.platform, run = execute) {
   const value = { platform, default_route_present: null, ip_address_present: null, dns_configured: null };
   if (platform === 'darwin') {
+    value.interface_up = null;
+    value.link_active = null;
     let route = run('route', ['-n', 'get', 'default']);
     if (route.status !== 0) {
       const ipv6 = run('route', ['-n', 'get', '-inet6', 'default']);
@@ -24,7 +26,7 @@ function inspect(platform = process.platform, run = execute) {
           if (/^\w+: flags=/m.test(text)) {
             value.interface_up = /<[^>]*\bUP\b[^>]*>/.test(text);
             value.link_active = /status:\s*active\b/.test(text) ? true : /status:\s*inactive\b/.test(text) ? false : null;
-            value.ip_address_present = /\binet\s/.test(text) || /\binet6\s+(?!fe80:)/i.test(text);
+            value.ip_address_present = /\binet\s+(?!169\.254\.|127\.)/.test(text) || /\binet6\s+(?!fe80:|::1\b)/i.test(text);
           }
         } else value.link_active = null;
       }
@@ -36,25 +38,33 @@ function inspect(platform = process.platform, run = execute) {
       else if (/^No DNS configuration available\s*$/.test(text.trim())) value.dns_configured = false;
     }
   } else if (platform === 'win32') {
+    value.gateway_configured = null;
+    value.interfaces_up = null;
     // .NETのNIC状態を読む。CIM棚卸しを避け、仮想NICを含む接続中インターフェースだけを数える。
-    const source = '[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false);$ErrorActionPreference="Stop";$a=@([Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()|Where-Object {$_.OperationalStatus -eq "Up" -and $_.NetworkInterfaceType -ne "Loopback"});$p=@($a|ForEach-Object {$_.GetIPProperties()});$ip=@($p|ForEach-Object {$_.UnicastAddresses}|Where-Object {$_.Address.ToString() -notmatch "^(fe80:|169[.]254[.]|127[.]|::1$)"});$g=@($p|ForEach-Object {$_.GatewayAddresses}|Where-Object {$_.Address.ToString() -notin @("0.0.0.0","::")});$d=@($p|ForEach-Object {$_.DnsAddresses});@{interfaces_up=$a.Count;ip_address_present=($ip.Count -gt 0);default_route_present=($g.Count -gt 0);dns_configured=($d.Count -gt 0)}|ConvertTo-Json -Compress';
+    const source = '[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false);$ErrorActionPreference="Stop";$a=@([Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()|Where-Object {$_.OperationalStatus -eq "Up" -and $_.NetworkInterfaceType -ne "Loopback"});$p=@($a|ForEach-Object {$_.GetIPProperties()});$ip=@($p|ForEach-Object {$_.UnicastAddresses}|Where-Object {$_.Address.ToString() -notmatch "^(fe80:|169[.]254[.]|127[.]|::1$)"});$g=@($p|ForEach-Object {$_.GatewayAddresses}|Where-Object {$_.Address.ToString() -notin @("0.0.0.0","::")});$d=@($p|ForEach-Object {$_.DnsAddresses});@{interfaces_up=$a.Count;ip_address_present=($ip.Count -gt 0);gateway_configured=($g.Count -gt 0);dns_configured=($d.Count -gt 0)}|ConvertTo-Json -Compress';
     const res = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(source, 'utf16le').toString('base64')]);
     if (res.status === 0) {
       try {
         const data = JSON.parse((res.stdout || '').trim().replace(/^\uFEFF/, ''));
-        for (const key of ['ip_address_present', 'default_route_present', 'dns_configured']) {
+        for (const key of ['ip_address_present', 'gateway_configured', 'dns_configured']) {
           if (typeof data[key] === 'boolean') value[key] = data[key];
         }
         if (Number.isSafeInteger(data.interfaces_up) && data.interfaces_up >= 0) value.interfaces_up = data.interfaces_up;
       } catch { /* 未観測として null を保つ */ }
     }
+    // Gateway設定は経路の存在と異なる。VPN等の既定経路も実際の経路表で確認する。
+    const v4 = run('route.exe', ['print', '-4']);
+    const v6 = run('route.exe', ['print', '-6']);
+    if ((v4.status === 0 && /^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+/m.test(v4.stdout || ''))
+      || (v6.status === 0 && /^\s*\d+\s+\d+\s+::\/0\s+/m.test(v6.stdout || ''))) value.default_route_present = true;
+    // 形式・言語・取得範囲の違いを経路なしと断定しない。見つからない時は null。
   } else value.unsupported_platform = true;
   return value;
 }
 function probeHttps(run = execute) {
   const errors = { 6: 'dns_failed', 7: 'connect_failed', 28: 'timed_out', 35: 'tls_failed', 60: 'tls_certificate_failed' };
   const one = (url) => {
-    const res = run(process.platform === 'win32' ? 'curl.exe' : 'curl', ['--proto', '=https', '--tlsv1.2', '--connect-timeout', '2', '--max-time', '4', '--silent', '--output', process.platform === 'win32' ? 'NUL' : '/dev/null', '--write-out', '%{http_code}', url]);
+    const res = run(process.platform === 'win32' ? 'curl.exe' : 'curl', ['-q', '--proto', '=https', '--tlsv1.2', '--connect-timeout', '2', '--max-time', '4', '--silent', '--output', process.platform === 'win32' ? 'NUL' : '/dev/null', '--write-out', '%{http_code}', url]);
     const http = Number((res.stdout || '').trim());
     return res.status === 0 && Number.isInteger(http) && http >= 100 && http <= 599
       ? { state: 'reachable', http_status: http }
