@@ -19,6 +19,16 @@ const COMMANDS: &[&str] = &[
     "set_schedule",
     "set_login",
     "dev_report",
+    "inventory",
+    "inventory_run",
+    "dogu_refresh",
+    "dogu_exclude",
+    "dogu_publish",
+    "ai_summary",
+    "ai_sessions",
+    "ai_sync",
+    "live_start",
+    "live_stop",
 ];
 
 fn main() {

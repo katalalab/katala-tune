@@ -1,28 +1,31 @@
 # Katala Tune
 
-手元の Mac / Windows 機を SSH で並列に調べ、所見と最適化の提案を出し、ログを集めるデスクトップアプリ（Electron、macOS / Windows）。
+手元の Mac / Windows 機を SSH で並列に調べ、所見と最適化の提案を出し、ログを集めるデスクトップアプリ（Rust ＋ Tauri 2、macOS / Windows）。
 変更を加える操作は許可リストにあるものだけで、毎回確認ダイアログで承認し、実行の直前に状態を確かめ直してから実行する。
 
-- macOS: `npm run install-app` → `~/Applications/Katala Tune.app`
-- Windows: `npm run package:win` → `dist/Katala-Tune-win-x64.zip`（展開して `Katala Tune.exe`）
-- 端末から: `npm run probe -- [機体 ...]`（調査結果を JSON で）、`npm run logs -- [機体 ...]`（ログの取り込み）
+- 配布版: [GitHub Releases](https://github.com/katalalab/katala-tune/releases)（macOS universal / Windows x64）
+- 開発: `npm run doctor` → `npm start`（Tauri）。[開発手順](docs/development.md)
+- 配布物の作成: `npm run package`。版・署名・更新の手順は [リリース手順](docs/release.md)
+- 端末から: `cargo run -p tune-cli -- --help`。従来の JS 検証用 CLI は `npm run probe` / `npm run logs`
 
 ## 画面
 
 - **概要**: 機体ごとのスコア・CPU・メモリ・ディスク、優先して見るもの
 - **状態**: アプリ自身の機能（台帳・DB・自動スキャン・連携）と、機体ごとの機能（分析・ログ取り込み・定期処理・期待するサービス／ジョブ／プロセス・ディスク・メモリ・安定性・Defender・エラーの繰り返し）を 正常／注意／異常／不明 で表示する。各項目は根拠と「いつからその状態か」を持ち、変わったときだけ履歴に残る。異常になったとき・異常から戻ったときに通知する
-- **リソース**: 全機体の CPU・メモリ・swap/コミット・ディスク・GPU・稼働日数・計測を1表で
+- **リソース**: 全機体の CPU・メモリ・swap/コミット・ディスク・GPU・稼働日数・計測を1表で。Tauri 版は「ライブ」で 1 秒ごとの値を流せる（見ているあいだだけ。docs/architecture.md の「ライブ表示」）
 - **プロセス**: 全機体の CPU・メモリ上位を横断して検索・並べ替え・終了（確認と直前の同一性チェックつき）
 - **スケジュール**: launchd（ユーザーの LaunchAgents）とタスクスケジューラ（Windows 標準以外）を横断して、予定・状態・前回の結果・次回を表示。無効化／有効化／今すぐ実行（元に戻せるものは戻せる）
 - **機体**: 所見と提案、プロセス、定期処理、ログ、履歴（計測とスコアの推移）、機体情報
 - **ログ**: 全文検索、同種ログ（数字・ID・パスを伏せて同じ形のものを集計し、何台で出ているかを表示）、取り込みの状態（最終成功・捨てた件数・エラー）
+- **道具**: 全機体の CLI・パッケージ・アプリと版を機体×道具の表で（版の違いを強調）、追加・削除の履歴、Do-gu との照合とデッキの下書き・登録（確認ダイアログつき）
+- **AI**（Tauri 版）: Claude Code・Codex のセッションの要約。機体×日の使用量（トークン・セッション数）、モデル別、失敗の多いツール、長いセッション、PR、機体ごとの版、セッションの一覧。会話の本文は取り出さない
 - **実行記録**: このアプリから実行した操作と、元に戻す操作
 
 ## 自動スキャン
 
-アプリを開くとメニューバー（Windows は通知領域）に常駐し、ウィンドウを閉じても動き続ける。既定は分析 60 分・ログ 15 分ごと（「状態」画面かメニューで変更・停止）。「ログイン時に起動」をオンにすると、ログイン後にウィンドウを開かずに常駐する（この設定は画面で操作したときだけ変わる）。
+アプリを開くとメニューバー（Windows は通知領域）に常駐し、ウィンドウを閉じても動き続ける。既定は分析 60 分・ログ 15 分ごと（「状態」画面かメニューで変更・停止）、道具の棚卸しは 24 時間ごと（「道具」画面で変更）、AI エージェントのセッションの取り込みは 30 分ごと（Tauri 版。「AI」画面で変更。初回など 25 秒で区切って続きがあるときは 2 分後に続きを読む）。「ログイン時に起動」をオンにすると、ログイン後にウィンドウを開かずに常駐する（この設定は画面で操作したときだけ変わる）。
 
-外部のサービスや中身を確かめられない道具は使わない。各機体で動くのはこのリポジトリの `probes/` にある読めるスクリプトだけで、依存は Electron 本体のみ。
+外部のサービスや中身を確かめられない道具は使わない。各機体で動くのはこのリポジトリの `probes/` にある読めるスクリプトだけで、調査先には Python 標準ライブラリと OS 標準の PowerShell を使う。Tauri 版は OS の WebView を使い、Chromium を同梱しない。
 
 macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica。ライト／ダークとアクセントカラーは OS の設定に従う。
 
@@ -33,9 +36,12 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 | 分析 | 各機体で読み取り専用の調査を並列に実行（6台でおよそ10〜17秒）。macOS は `probes/mac_probe.py` を python3 の標準入力へ、Windows は `probes/win_probe.ps1` を `~/.katala-tune/` に置いて PowerShell 5.1 で実行。アプリを動かしている機体はローカルで実行 |
 | 判定 | `lib/rules.js`（CPU の飽和と暴走、メモリ圧迫・swap・コミット、メモリの大口、実効の空きによるディスク判定、熱、電源プラン、BSOD、WSL の上限、Defender、colima/Docker の割り当て、キャッシュ）と、ログ由来の所見（`lib/logs.js`: WHEA、GPU ドライバのリセット、メモリ枯渇、ディスクエラー、クラッシュ、カーネルパニック、jetsam、NeonMonitor の自動保護） |
 | ログ | Windows のイベントログ（System / Application）と NeonMonitor の `guard.log`、macOS の DiagnosticReports とカーネルのエラーを、前回の続きから取り込む。冪等・秘密の伏せ字・件数上限つき。開いている間は15分ごとに自動で取り込む |
-| 計測 | 1スレッドの固定計算を5回（python）。前回との差で「最適化が効いたか」を見る（±15% 未満は誤差扱い） |
+| 接続診断 | 開発用の `npm run network` で経路・IP・DNS設定、`-- --probe` でHTTPS疎通を読み取り専用で確認。画面への診断統合・接続先分析は未実装 |
+| 計測 | 台帳に `"benchmark": false` を指定した機体では負荷計測を実行せず、状態だけを読み取る。省略時は従来どおり1スレッドの固定計算を5回（python）。前回との差で「最適化が効いたか」を見る（±15% 未満は誤差扱い） |
 | 実行 | プロセス終了（同一性・負荷を直前に再確認、終了を確認できなければ「終了未確認」）、Windows の電源プラン切り替え、タスクの無効化／有効化／今すぐ実行、launchd ジョブの停止／読み込み／今すぐ実行（元に戻せるものは戻せる） |
-| 保存 | Node 内蔵の `node:sqlite`（依存なし・ネイティブビルドなし）。`<userData>/data/katala-tune.db` |
+| 道具 | 各機体のインストール先を読むだけ（`probes/mac_inventory.py`・`probes/win_inventory.ps1`）。パッケージマネージャもネットワークも使わない。読めなかった取り方は削除と見なさない |
+| AI エージェント | `probes/ai_sessions.py` を各機体の python で流し（Windows は python3 → python → py。無ければ「python が無い」）、続きの位置は DB が覚えて渡す。数・時刻・モデル・トークン・PR の URL だけを取り出す。台帳の機体に `"ai_sessions": false` で取り込まない |
+| 保存 | Tauri 版は Rust の SQLite、互換確認用の JS 版は Node 内蔵の `node:sqlite`。`<userData>/data/katala-tune.db` |
 
 安全のための決めごとは [docs/safety.md](docs/safety.md)。NeonMonitor のレビューで見つかった自動終了ツールの失敗の型を、どう避けているかもここにある。
 
@@ -65,17 +71,19 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 ## 開発
 
 ```sh
-npm install
-npm test            # node:test（rules / actions / logs・db / oss-check）
-npm start           # 開発起動
-npm run oss-check   # 公開前の点検（-- --history で全コミットとメッセージも）
+npm ci --ignore-scripts   # Electron 本体を取得せず、検証用の開発依存だけを入れる
+npm run doctor           # 必要なツールの読取確認
+npm run check            # 版・JS・公開情報・Rust の検証
+npm start                # Rust + Tauri で起動
 ```
 
-パッケージ（`npm run package` / `package:win`）は最後に `scripts/harden.js` で Electron の fuse を切り替え、`ELECTRON_RUN_AS_NODE`・`NODE_OPTIONS`・`--inspect` から JS を注入できないようにする。
+互換比較が必要なときだけ `npm rebuild electron` 後に `npm run electron:start` で旧 Electron 版を起動する。旧版の配布コマンドには `electron:` を付ける。同じデータを使う両版を同時に動かさない。
 
-`npm run oss-check` は台帳（`~/.config/katala-tune/nodes.json`）の id・alias・hostname と、この機体のユーザー名・ホスト名、Tailscale のアドレス、`op://` 参照、実在のホームパス、メールアドレスがリポジトリに無いかを調べる。探す語は台帳から実行時に読むので、リポジトリには書かない。CI（`.github/workflows/ci.yml`）は公開リポジトリのときだけ動く。
+`npm run oss-check` は台帳（`~/.config/katala-tune/nodes.json`）の id・alias・hostname と、この機体のユーザー名・ホスト名、Tailscale のアドレス、`op://` 参照、実在のホームパス、メールアドレスがリポジトリに無いかを調べる。探す語は台帳から実行時に読むので、リポジトリには書かない。CI（`.github/workflows/ci.yml`）は PR と main への反映で動く。
 
 ログは、中央の DB へ後でそのまま送れる表の形で保存している。
+
+Tauri 版のリリース（タグ `v*` で macOS / Windows をビルドして GitHub Releases の下書きに置く）と自動更新（確認して承認したときだけ、署名を確かめてから入れる）は [docs/release.md](docs/release.md)。版は `npm run version:set -- <版>` でそろえて上げる。
 
 ## ライセンス
 

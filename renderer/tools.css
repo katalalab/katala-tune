@@ -1,0 +1,33 @@
+/* renderer/tools.css — 「道具」（tools.js）と「AI」（agents.js）の画面だけの細部。色・部品は style.css の変数とクラスを使う */
+
+/* ---- 道具: 機体×道具のマトリクス ---- */
+.inv-matrix { max-height: none; }
+.inv-matrix .dbt th.mx-row { min-width: 220px; max-width: 320px; white-space: normal; }
+.inv-matrix .dbt th.mx-row small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px; }
+.inv-name { font-weight: 500; overflow-wrap: anywhere; }
+.inv-cat { margin-left: 6px; vertical-align: 1px; }
+.inv-col { display: inline-flex; align-items: center; gap: 5px; font-weight: 600; font-size: 12.5px; color: var(--text); }
+.inv-col .i { width: 14px; height: 14px; color: var(--text3); }
+.inv-ver { display: inline-block; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; font-size: 12.5px; color: var(--text2); }
+.db.matrix td.mx.diff .inv-ver { color: var(--text); font-weight: 600; }
+.inv-has { color: var(--text3); font-size: 9px; }
+.inv-settings { margin-top: 26px; }
+
+/* ---- 道具: Do-gu ---- */
+.inv-publish { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 16px 0 6px; }
+.inv-publish .faint { font-size: 12.5px; }
+.inv-excluded { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.inv-ex { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; }
+
+/* ---- AI ---- */
+.ai-stats { margin: 4px 0 6px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.ai-grid { align-items: start; }
+.ai-sessions .dbt td { vertical-align: top; }
+.ai-cwd { font-family: var(--mono); font-size: 12px; }
+.ai-model { display: block; overflow-wrap: anywhere; }
+.ai-model + .chip { margin-top: 3px; }
+.ai-pr { display: block; font-size: 12.5px; white-space: nowrap; color: var(--text); text-decoration: underline; text-decoration-color: var(--line2); text-underline-offset: 3px; }
+.ai-pr:hover { text-decoration-color: currentColor; }
+.ai-pager { display: flex; justify-content: flex-end; gap: 6px; margin: 10px 0 0; }
+.ai-settings { margin-top: 26px; }
+.li-title a { color: var(--text); text-decoration: underline; text-decoration-color: var(--line2); text-underline-offset: 3px; }

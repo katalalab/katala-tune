@@ -2,15 +2,20 @@
 //! 画面は renderer/ をそのまま使い、preload.js と同じ window.tune を初期化スクリプト（bridge/tune.js）で差し込む。
 //!
 //! - commands: window.tune の各関数（preload.js と同じ名前・引数・戻り値の形）
+//! - commands_tools: 道具の棚卸し・Do-gu・AI エージェントのセッション
 //! - window: ウィンドウ（vibrancy・Mica・透過・遷移の禁止・外部 URL は https だけ既定のブラウザで）
 //! - tray: メニューバー（Windows は通知領域）
 //! - confirm: 変更操作の確認ダイアログ
+//! - live: ライブ表示（liveStart / liveStop と live イベント。中身は tune-core の live）
 //! - 自動スキャン（1分ごとに期限を見る）・通知（異常化と回復だけ）・ログイン時の起動
 
 mod accent;
 mod commands;
+mod commands_tools;
 mod confirm;
+mod live;
 mod tray;
+mod update;
 mod window;
 
 use std::sync::Arc;
@@ -55,6 +60,12 @@ impl Host for TauriHost {
     fn open_at_login(&self) -> bool {
         self.app.autolaunch().is_enabled().unwrap_or(false)
     }
+    fn inventory_result(&self, r: &Value) {
+        let _ = self.app.emit("inventory-result", r);
+    }
+    fn ai_synced(&self, r: &Value) {
+        let _ = self.app.emit("ai-synced", r);
+    }
 }
 
 /// process.platform と同じ名前（画面が見た目を変えるのに使う）
@@ -87,6 +98,7 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--hidden"])))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::config,
             commands::last,
@@ -107,12 +119,23 @@ pub fn run() {
             commands::set_schedule,
             commands::set_login,
             commands::dev_report,
+            commands_tools::inventory,
+            commands_tools::inventory_run,
+            commands_tools::dogu_refresh,
+            commands_tools::dogu_exclude,
+            commands_tools::dogu_publish,
+            commands_tools::ai_summary,
+            commands_tools::ai_sessions,
+            commands_tools::ai_sync,
+            live::live_start,
+            live::live_stop,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
             let engine = Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(TauriHost { app: handle.clone() }))?;
             app.manage(engine.clone());
             app.manage(window::Pending::default());
+            app.manage(live::create(&handle));
             if let Some(v) = std::env::var("KATALA_TUNE_DEV_VIEW").ok().filter(|_| cfg!(debug_assertions)) {
                 window::navigate_after_load(&handle, &v);
             }
@@ -120,17 +143,19 @@ pub fn run() {
             tray::create(&handle)?;
             engine.compute_checks(false, true);
             start_scheduler(engine);
+            // 新しい版があれば通知だけする（入れるのはメニューから、確認のあとだけ）
+            update::start(handle.clone());
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("Katala Tune を起動できない");
     app.run(|handle, ev| {
-        // handle を使うのは macOS の Reopen だけ（他の OS で未使用の警告にしない）
-        #[cfg(not(target_os = "macos"))]
-        let _ = handle;
         match ev {
             // ウィンドウを閉じても、自動スキャンのためにメニューバー（Windows は通知領域）に残る。終了はメニューから
             RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+            // ライブ表示: ウィンドウを閉じたら止め、終了するときはサンプラーが終わるのを待つ
+            RunEvent::WindowEvent { event: tauri::WindowEvent::Destroyed, .. } => live::stop_all(handle),
+            RunEvent::Exit => live::shutdown(handle),
             #[cfg(target_os = "macos")]
             RunEvent::Reopen { .. } => window::show(handle),
             _ => {}

@@ -5,7 +5,7 @@ resolver = "3"
 members = ["crates/tune-core", "crates/tune-cli", "src-tauri"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 license = "MIT"
 repository = "https://github.com/katalalab/katala-tune"
 edition = "2024"

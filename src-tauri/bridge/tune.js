@@ -21,9 +21,6 @@
     }
   } catch (_) { /* 見た目だけの違いなので続ける */ }
 
-  // 道具の棚卸し・Do-gu は Rust への移植待ち（呼ぶと理由つきで失敗する）
-  const notPorted = (name) => () => Promise.reject(new Error(`Tauri 版では未移植: ${name}`));
-
   const tune = {
     config: () => invoke('config'),
     last: () => invoke('last'),
@@ -43,16 +40,27 @@
     status: () => invoke('status'),
     setSchedule: (patch) => invoke('set_schedule', { patch: patch ?? null }),
     setLogin: (on) => invoke('set_login', { on: !!on }),
-    inventory: notPorted('inventory'),
-    inventoryRun: notPorted('inventoryRun'),
-    doguRefresh: notPorted('doguRefresh'),
-    doguExclude: notPorted('doguExclude'),
-    doguPublish: notPorted('doguPublish'),
+    // 道具の棚卸し・Do-gu（preload.js と同じ。inventory の opts = { all: true } で依存も含める）
+    inventory: (opts) => invoke('inventory', { opts: opts ?? null }),
+    inventoryRun: (ids) => invoke('inventory_run', { ids: ids ?? null }),
+    doguRefresh: () => invoke('dogu_refresh'),
+    doguExclude: (slugs) => invoke('dogu_exclude', { slugs: slugs ?? null }),
+    doguPublish: (slugs) => invoke('dogu_publish', { slugs: slugs ?? null }),
     onInventoryResult: (fn) => { listen('inventory-result', (r) => fn(r)); },
+    // AI エージェントのセッション（Tauri 版だけ。集計は Rust 側で行い、一覧はページングして返す）
+    aiSummary: (filter) => invoke('ai_summary', { filter: filter ?? null }),
+    aiSessions: (filter) => invoke('ai_sessions', { filter: filter ?? null }),
+    aiSync: (ids) => invoke('ai_sync', { ids: ids ?? null }),
+    onAiSynced: (fn) => { listen('ai-synced', (r) => fn(r)); },
     onChecksUpdated: (fn) => { listen('checks-updated', () => fn()); },
     onNavigate: (fn) => { listen('navigate', (v) => fn(v)); },
     onProbeResult: (fn) => { listen('probe-result', (r) => fn(r)); },
     onLogsSynced: (fn) => { listen('logs-synced', (r) => fn(r)); },
+    // ライブ表示（Tauri 版だけ。Electron 版の preload.js には無いので、画面は有無で判定する）。
+    // 見ているあいだ liveStart(ids) を呼び直すと合図（heartbeat）になり、2 分途切れると Rust 側で止まる
+    liveStart: (ids) => invoke('live_start', { ids: (Array.isArray(ids) ? ids : []).map(String) }),
+    liveStop: (ids) => invoke('live_stop', { ids: Array.isArray(ids) ? ids.map(String) : null }),
+    onLive: (fn) => { listen('live', (p) => fn(p)); },
   };
   Object.defineProperty(window, 'tune', { value: Object.freeze(tune), enumerable: true });
 

@@ -28,6 +28,9 @@ const SOURCE_LABEL = { win_system: 'System', win_application: 'Application', neo
 const TH = { cpu: { warn: 60, crit: 85 }, mem: { warn: 80, crit: 90 }, disk: { warn: 90, crit: 95 } };
 const NAV = [['overview', '概要', 'overview'], ['status', '状態', 'status'], ['resources', 'リソース', 'resources'], ['procs', 'プロセス', 'procs'],
   ['jobs', 'スケジュール', 'jobs'], ['logs', 'ログ', 'logs'], ['actions', '実行記録', 'actions']];
+// 別のファイル（tools.js・agents.js）が足した画面。実行記録の前に並べる
+const EXTRA_VIEWS = window.KT_VIEWS || [];
+for (const v of EXTRA_VIEWS) NAV.splice(NAV.findIndex(([k]) => k === 'actions'), 0, [v.key, v.label, v.icon]);
 
 const state = {
   cfg: null, nodes: [], results: {}, fleet: null, view: 'overview', tab: 'findings', busy: new Set(), syncing: false,
@@ -124,6 +127,7 @@ function go(view) {
 
 function render() {
   renderSidebar();
+  Live.route(state.view); // ライブ表示: 新しい画面で使わないものは止める
   if (state.view === 'overview') return renderOverview();
   if (state.view === 'status') return renderStatus();
   if (state.view === 'resources') return renderResources();
@@ -131,6 +135,8 @@ function render() {
   if (state.view === 'jobs') return renderJobs();
   if (state.view === 'logs') return renderLogs();
   if (state.view === 'actions') return renderActions();
+  const extra = EXTRA_VIEWS.find((v) => v.key === state.view);
+  if (extra) return extra.render();
   if (state.view.startsWith('node:')) return renderNode(state.view.slice(5));
 }
 
@@ -279,12 +285,14 @@ async function renderNode(id) {
   else if (state.tab === 'machine') body = machineHtml(d, r);
   if (stale(t)) return;
 
-  const actions = r ? `<button class="btn" id="btnOne" ${busy ? 'disabled' : ''}>${icon('play')}${busy ? '分析中…' : 'この機体を分析し直す'}</button>` : '';
+  const actions = Live.toggle('node') + (r ? `<button class="btn" id="btnOne" ${busy ? 'disabled' : ''}>${icon('play')}${busy ? '分析中…' : 'この機体を分析し直す'}</button>` : '');
   page(`
     ${UI.head({ icon: osIcon(n), title: n.id, desc: n.role || '', props: nodeProps(n, r), actions })}
     ${n.note ? UI.callout({ tone: 'gray', icon: 'info', body: esc(n.note) }) : ''}
+    ${Live.panel('node')}
     ${UI.tabs(tabs, state.tab)}
     ${body}`);
+  Live.mount('node', [n.id], state.nodes);
   $$('[data-tab]').forEach((b) => { b.onclick = () => { state.tab = b.dataset.tab; renderNode(id); }; });
   const one = $('#btnOne');
   if (one) one.onclick = () => probe([n.id]);
@@ -354,7 +362,7 @@ function machineHtml(d, r) {
     ['OS', d.host.os], ['CPU', `${d.host.cpu}（${d.host.cores} スレッド${d.host.p_cores ? ` · P ${d.host.p_cores} / E ${d.host.e_cores}` : ''}）`],
     ['稼働時間', d.host.uptime_h != null ? `${(d.host.uptime_h / 24).toFixed(1)} 日` : '-'],
     ['メモリ', `${d.memory.total_gb} GB · 空き ${d.memory.available_pct}%${d.memory.swap_used_gb != null ? ` · swap ${d.memory.swap_used_gb} GB` : ''}${d.memory.commit_pct != null ? ` · コミット ${d.memory.commit_pct}%` : ''}`],
-    ['計測（5回）', d.bench ? `${d.bench.runs_ms.join(' / ')} ms（中央値 ${d.bench.median_ms}）` : 'python が無いため省略'],
+    ['計測（5回）', d.bench ? `${d.bench.runs_ms.join(' / ')} ms（中央値 ${d.bench.median_ms}）` : d.benchmark_skipped ? '台帳の設定で省略' : '計測結果なし'],
   ];
   if (d.load) rows.push(['load', d.load.join(' / ')]);
   if (d.power?.plan_name) rows.push(['電源プラン', d.power.plan_name]);
@@ -506,7 +514,8 @@ function renderResources() {
   const missing = state.nodes.filter((n) => !state.results[n.id]?.ok);
   const m = (v, th) => `<td class="mid">${Charts.meter(v, { ...th })}</td>`;
   page(`
-    ${UI.head({ icon: 'resources', title: 'リソース', desc: '全機体の CPU・メモリ・swap／コミット・ディスク・GPU・稼働日数・計測を、最新の分析結果で並べます。行をクリックすると機体の詳細へ移ります。' })}
+    ${UI.head({ icon: 'resources', title: 'リソース', desc: '全機体の CPU・メモリ・swap／コミット・ディスク・GPU・稼働日数・計測を、最新の分析結果で並べます。行をクリックすると機体の詳細へ移ります。', actions: Live.toggle('resources') })}
+    ${Live.panel('resources')}
     ${rows.length ? UI.table({
       cols: [{ label: '機体' }, { label: 'CPU', width: '13%' }, { label: 'メモリ使用', width: '13%' }, { label: 'swap / コミット', cls: 'n' }, { label: 'ディスク使用', width: '13%' }, { label: '空き', cls: 'n' },
         { label: 'GPU', cls: 'n' }, { label: '稼働', cls: 'n' }, { label: '計測', cls: 'n' }, { label: 'スコア', cls: 'n' }],
@@ -524,11 +533,13 @@ function renderResources() {
           ${m(d.cpu_busy, TH.cpu)}${m(d.memory.available_pct != null ? 100 - d.memory.available_pct : null, TH.mem)}
           <td class="n mid">${sw}</td>${m(disk ? 100 - disk.free_pct : null, TH.disk)}<td class="n mid">${disk ? esc(disk.free_gb) + ' GB' : '-'}</td>
           <td class="n mid">${g ? `${esc(g.util)}% · ${esc(g.temp_c)}°C` : '<span class="faint">-</span>'}</td><td class="n mid">${d.host.uptime_h != null ? (d.host.uptime_h / 24).toFixed(1) + ' 日' : '-'}</td>
-          <td class="n mid">${esc(d.bench?.median_ms ?? '-')} ms</td><td class="n mid"><span class="score-cell">${Charts.ring(r.score, { size: 26, stroke: 3 })}</span></td>`;
+          <td class="n mid">${d.bench ? `${esc(d.bench.median_ms)} ms` : d.benchmark_skipped ? '省略' : '-'}</td><td class="n mid"><span class="score-cell">${Charts.ring(r.score, { size: 26, stroke: 3 })}</span></td>`;
       },
     }) : UI.empty('まだ分析していません。ツールバーの「全機を分析」で始めます。')}
     ${missing.length && rows.length ? `<p class="note-line">分析結果が無いため表示していない機体: ${missing.map((n) => `${esc(n.id)}${state.results[n.id] ? '（分析できない）' : '（未分析）'}`).join('、')}</p>` : ''}`);
   bindGoto();
+  // ライブ表示は共用機（提案のみ）を除く。共用機は機体の画面から流せる
+  Live.mount('resources', state.nodes.filter((n) => !n.shared).map((n) => n.id), state.nodes);
 }
 
 // ---- プロセス（全機体） ----
