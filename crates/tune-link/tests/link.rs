@@ -19,11 +19,27 @@ use tune_link::peers::{Peer, PeerStore, Role};
 use tune_link::proto::{Response, op};
 use tune_link::{Error, client, hex};
 
-fn tmpdir(tag: &str) -> PathBuf {
+/// テスト用の一時ディレクトリ（使い終えたら消す）
+struct Tmp(PathBuf);
+
+impl std::ops::Deref for Tmp {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn tmpdir(tag: &str) -> Tmp {
     static N: AtomicUsize = AtomicUsize::new(0);
     let d = std::env::temp_dir().join(format!("tune-link-it-{tag}-{}-{}-{}", std::process::id(), tune_link::now_ms(), N.fetch_add(1, Ordering::Relaxed)));
     let _ = std::fs::remove_dir_all(&d);
-    d
+    Tmp(d)
 }
 
 /// (送ったか, フレーム) の記録
@@ -300,7 +316,7 @@ async fn replayed_first_message_executes_nothing() {
     let agent_dir = tmpdir("replay-agent");
     PeerStore::new(&agent_dir).add(Peer { role: Role::Console, card: console.card("console"), paired_at: 0, addr: None }).unwrap();
     let (handled, unpaired) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-    let run_addr = run_server(agent.clone(), agent_dir, handled.clone(), unpaired).await;
+    let run_addr = run_server(agent.clone(), agent_dir.to_path_buf(), handled.clone(), unpaired).await;
     let agent_v = agent.card("agent-under-test").verify().unwrap();
     // 正規の接続を盗み見る
     let log: Log = Arc::default();
