@@ -2,7 +2,14 @@
 # src-tauri は core を呼ぶ薄い殻（コマンド・常駐・通知・ダイアログ・ウィンドウ）、tune-cli は Tauri なしで core を確かめる道具。
 [workspace]
 resolver = "3"
-members = ["crates/tune-core", "crates/tune-cli", "src-tauri"]
+members = [
+    "crates/tune-core",
+    "crates/tune-cli",
+    "src-tauri",
+    # 各機体の常駐（tune-agent）と、機体どうしの接続（tune-link。ペアリング・機体鍵・端末間暗号化）
+    "crates/tune-link",
+    "crates/tune-agent",
+]
 
 [workspace.package]
 version = "0.3.0"
@@ -14,6 +21,7 @@ publish = false
 
 [workspace.dependencies]
 tune-core = { path = "crates/tune-core" }
+tune-link = { path = "crates/tune-link" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["process", "time", "sync", "io-util", "macros", "rt-multi-thread"] }

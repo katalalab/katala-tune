@@ -7,9 +7,11 @@
 //! - tray: メニューバー（Windows は通知領域）
 //! - confirm: 変更操作の確認ダイアログ
 //! - live: ライブ表示（liveStart / liveStop と live イベント。中身は tune-core の live）
+//! - agent: 「接続」の画面（tune-agent とのペアリングの骨組み。中身は tune-link）
 //! - 自動スキャン（1分ごとに期限を見る）・通知（異常化と回復だけ）・ログイン時の起動
 
 mod accent;
+mod agent;
 mod commands;
 mod commands_tools;
 mod confirm;
@@ -127,6 +129,8 @@ pub fn run() {
             commands_tools::ai_sync,
             live::live_start,
             live::live_stop,
+            agent::agent_peers,
+            agent::agent_pair,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

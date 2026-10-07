@@ -29,6 +29,8 @@ const COMMANDS: &[&str] = &[
     "ai_sync",
     "live_start",
     "live_stop",
+    "agent_peers",
+    "agent_pair",
 ];
 
 fn main() {

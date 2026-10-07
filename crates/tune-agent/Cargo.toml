@@ -1,0 +1,26 @@
+[package]
+name = "tune-agent"
+description = "Katala Tune の各機体の常駐。ペア済みの操作卓だけを受け付け、読み取り専用の調査を返す。OpenTelemetry（OTLP/HTTP）の受け口も持つ"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "tune-agent"
+path = "src/main.rs"
+
+[dependencies]
+tune-link.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["net", "signal"] }
+# OTLP/HTTP の受け口の要求の解析（hyper も使っている小さな解析器。依存なし）
+httparse = "1"
+gethostname = "1"
+zeroize = "1"
+
+[lints]
+workspace = true

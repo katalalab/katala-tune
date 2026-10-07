@@ -12,8 +12,15 @@
 //!   tune live [--seconds N] 機体 ...  ライブ表示のサンプラーを N 秒（既定 30、最大 300）流し、件数・間隔・遅延・
 //!                                    サンプラー自身の負荷を JSON で（読み取り専用。機体は必ず指定する）
 //!
+//!   tune agent-pair <host[:port]>    tune-agent とペアリング（コードは標準入力から。引数には書かない）
+//!   tune agent-peers                 ペア済みの tune-agent（公開鍵の指紋だけ）
+//!   tune agent-probe <名前|指紋|addr> ペア済みの tune-agent で調査を 1 回（SSH を使わない。src/agent.rs）
+//!   tune agent-unpair <名前|指紋>    ペア済みの tune-agent を台帳から消す
+//!
 //! 台帳と DB は Electron 版と同じ場所（KATALA_TUNE_CONFIG・KATALA_TUNE_DATA_DIR で差し替えられる）。
 //! 変更操作（actions）はここからは実行しない（確認ダイアログを通すため、アプリからだけ）。
+
+mod agent;
 
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -239,6 +246,7 @@ async fn main() -> ExitCode {
             None => return usage(),
         },
         "live" => live(rest).await,
+        c if c.starts_with("agent-") => agent::run(c, rest).await,
         _ => return usage(),
     };
     match res {
