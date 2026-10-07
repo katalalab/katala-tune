@@ -23,6 +23,7 @@ WIN = os.name == "nt"
 HOME_ENC = re.sub(r"[^A-Za-z0-9]", "-", HOME)
 ROOTS = {"claude": os.path.join(HOME, ".claude", "projects"), "codex": os.path.join(HOME, ".codex", "sessions")}
 TOK = ("in", "out", "cache_read", "cache_write", "reasoning")
+BAD_LINE = (ValueError, AttributeError, TypeError, KeyError, IndexError)
 t0 = time.time()
 
 
@@ -154,7 +155,7 @@ def codex_line(r, line):
             d = json.loads(line)
             name = (d.get("payload") or {}).get("name") or "?"
             h = hour_of(d.get("timestamp"))
-        except ValueError:
+        except BAD_LINE:
             name, h = "?", None
         r["tool_counts"][name] = r["tool_counts"].get(name, 0) + 1
         bump(r, h, 5)
@@ -216,8 +217,8 @@ def scan_file(tool, path, key, off, out):
             pos += len(line)
             try:
                 (claude_line(r, line, usage, tool_names) if tool == "claude" else codex_line(r, line))
-            except ValueError:
-                pass
+            except BAD_LINE:
+                pass  # 形の違う行（古い版の書式など）は飛ばす。1行のせいでファイル全体を読めなくしない
             if time.time() - t0 > KT_BUDGET_S:
                 out["truncated"] = True
                 break

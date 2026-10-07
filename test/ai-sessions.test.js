@@ -46,6 +46,9 @@ function fixture() {
     { timestamp: '2026-10-01T01:00:01Z', type: 'event_msg', payload: { type: 'task_started' } },
     { timestamp: '2026-10-01T01:00:01Z', type: 'response_item', payload: { type: 'function_call', name: 'shell', arguments: SECRET } },
     tok(100, 10), tok(200, 20),
+    // 古い版の書式など、形の違う行は飛ばす（ファイル全体を読めなくしない）
+    { timestamp: '2026-10-01T01:00:02Z', type: 'response_item', payload: 'oops', note: '"type":"function_call",' },
+    { timestamp: '2026-10-01T01:00:02Z', type: 'event_msg', payload: { type: 'token_count', info: 'not-an-object' } },
     { timestamp: '2026-10-01T01:00:03Z', type: 'event_msg', payload: { type: 'task_complete', error: 'boom' } },
   ]));
   return { home, proj, cdx };
@@ -56,6 +59,7 @@ test('AI セッション: 本文を出さずに数・トークン・モデル・
   const { raw, out } = run(home);
   assert.ok(!raw.includes(SECRET), '本文が出力に含まれている');
   assert.equal(out.truncated, false);
+  assert.deepEqual(out.errors, [], '形の違う行でファイル全体を読めなくしない');
   const c = out.sessions.find((s) => s.file === 'claude:-work-demo/s1.jsonl');
   assert.equal(c.cwd, path.join('~', 'work', 'demo'));
   assert.deepEqual([c.prompts, c.assistant_msgs, c.tool_calls, c.tool_errors, c.model, c.version], [1, 1, 1, 1, 'model-a', '9.9.9']);

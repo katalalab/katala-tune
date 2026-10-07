@@ -28,6 +28,9 @@ const SOURCE_LABEL = { win_system: 'System', win_application: 'Application', neo
 const TH = { cpu: { warn: 60, crit: 85 }, mem: { warn: 80, crit: 90 }, disk: { warn: 90, crit: 95 } };
 const NAV = [['overview', '概要', 'overview'], ['status', '状態', 'status'], ['resources', 'リソース', 'resources'], ['procs', 'プロセス', 'procs'],
   ['jobs', 'スケジュール', 'jobs'], ['logs', 'ログ', 'logs'], ['actions', '実行記録', 'actions']];
+// 別のファイル（tools.js・agents.js）が足した画面。実行記録の前に並べる
+const EXTRA_VIEWS = window.KT_VIEWS || [];
+for (const v of EXTRA_VIEWS) NAV.splice(NAV.findIndex(([k]) => k === 'actions'), 0, [v.key, v.label, v.icon]);
 
 const state = {
   cfg: null, nodes: [], results: {}, fleet: null, view: 'overview', tab: 'findings', busy: new Set(), syncing: false,
@@ -131,6 +134,8 @@ function render() {
   if (state.view === 'jobs') return renderJobs();
   if (state.view === 'logs') return renderLogs();
   if (state.view === 'actions') return renderActions();
+  const extra = EXTRA_VIEWS.find((v) => v.key === state.view);
+  if (extra) return extra.render();
   if (state.view.startsWith('node:')) return renderNode(state.view.slice(5));
 }
 

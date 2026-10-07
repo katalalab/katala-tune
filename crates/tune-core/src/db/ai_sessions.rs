@@ -435,7 +435,9 @@ impl Store {
         )?;
         let totals = q(
             &format!(
-                "SELECT COUNT(DISTINCT h.node_id || char(0) || h.file) AS sessions, SUM(h.prompts) AS prompts, SUM(h.tool_calls) AS tool_calls, {toks}
+                "SELECT COUNT(DISTINCT h.node_id || char(0) || h.file) AS sessions, coalesce(SUM(h.prompts), 0) AS prompts, coalesce(SUM(h.tool_calls), 0) AS tool_calls,
+                        coalesce(SUM(h.tok_in), 0) AS tok_in, coalesce(SUM(h.tok_out), 0) AS tok_out, coalesce(SUM(h.tok_cache_read), 0) AS tok_cache_read,
+                        coalesce(SUM(h.tok_cache_write), 0) AS tok_cache_write, coalesce(SUM(h.tok_reasoning), 0) AS tok_reasoning
                  FROM ai_usage_hourly h WHERE {cond_h}"
             ),
             since_hour,
