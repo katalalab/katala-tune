@@ -160,7 +160,7 @@ async function runInventory(ids) {
     const targets = cfg.nodes.filter((n) => !ids?.length || ids.includes(n.id));
     const results = await Promise.all(targets.map(async (n) => {
       const r = await inventory.inventoryNode(n).catch((e) => ({ node_id: n.id, ok: false, error: String(e) }));
-      const out = r.ok ? { node_id: n.id, ok: true, wall_s: r.wall_s, errors: r.errors, ...db.saveInventory(n.id, r.items, r.at) } : { node_id: n.id, ok: false, error: r.error };
+      const out = r.ok ? { node_id: n.id, ok: true, wall_s: r.wall_s, errors: r.errors, ...db.saveInventory(n.id, r.items, r.at, { skipSources: r.failedSources }) } : { node_id: n.id, ok: false, error: r.error };
       if (r.ok) delete lastInventoryError[n.id]; else lastInventoryError[n.id] = r.error;
       win?.webContents.send('inventory-result', out);
       return out;
@@ -307,27 +307,29 @@ ipcMain.handle('dogu-exclude', (_e, slugs) => {
   db.setMeta('dogu_exclude', [...new Set((Array.isArray(slugs) ? slugs : []).map(String))]);
   return inventoryView();
 });
-// デッキへの登録。下書きに出ている slug だけを、全件を見せた確認ダイアログのあとで送る。リトライしない
+// デッキへの登録（外への送信）。機体を変える操作ではないが、同じ型で扱う:
+// 検証（下書きにある slug だけ）→ 全件を見せた確認 → 確認後に下書きを作り直して再検証（変わっていたら送らない）→ 送信 → 実行記録。リトライしない
 ipcMain.handle('dogu-publish', async (_e, slugs) => {
-  const view = inventoryView();
-  if (!view.dogu) return { ok: false, refused: '先に Do-gu の一覧を取得してください' };
-  const allowed = new Map(view.dogu.draft.map((d) => [d.slug, d]));
-  const pick = [...new Set((Array.isArray(slugs) ? slugs : []).map(String))].filter((x) => allowed.has(x));
-  if (!pick.length) return { ok: false, refused: '送る道具がない' };
+  const draftNow = () => inventoryView().dogu?.draft;
+  if (!draftNow()) return { ok: false, refused: '先に Do-gu の一覧を取得してください' };
+  const plan = dogu.planPublish(draftNow(), slugs);
+  if (plan.refused) return { ok: false, refused: plan.refused };
   const key = dogu.apiKey();
   if (!key) return { ok: false, refused: `API キーが見つからない。${dogu.BASE}/howto で発行し、環境変数 DO_GU_API_KEY か ~/.config/do-gu/api_key に保存してください` };
   let login;
   try { login = (await dogu.me(key)).login; } catch (e) { return { ok: false, refused: String(e.message || e) }; }
-  const list = pick.map((x) => `・${allowed.get(x).name}（${allowed.get(x).category}）`).join('\n');
+  const list = plan.items.map((d) => `・${d.name}（${d.category}）`).join('\n');
   const { response } = await dialog.showMessageBox(win, {
     type: 'warning', buttons: ['登録する', 'やめる'], defaultId: 1, cancelId: 1, title: 'Katala Tune',
-    message: `Do-gu のデッキに ${pick.length} 件を登録します`,
+    message: `Do-gu のデッキに ${plan.pick.length} 件を登録します`,
     detail: `登録すると ${dogu.BASE}/@${login} で誰でも見られる公開ページに載ります。\n送るのは既にある道具への紐づけだけで、新しい道具は作りません。\n\n${list}`,
   });
   if (response !== 0) return { ok: false, cancelled: true };
+  const fresh = dogu.planPublish(draftNow(), slugs);
+  if (!dogu.samePlan(plan, fresh)) return { ok: false, refused: '確認のあいだに下書きが変わったので送らなかった。もう一度確認してください' };
   let res, ok = true;
-  try { res = await dogu.publish(key, pick); } catch (e) { ok = false; res = { error: String(e.message || e) }; }
-  db.addAction({ id: `${Date.now()}-dogu`, at: Date.now(), node_id: '_app', type: 'dogu_publish', params: { slugs: pick }, label: `Do-gu に ${pick.length} 件を登録`, ok, output: JSON.stringify(res).slice(0, 4000), undo: null, undo_of: null });
+  try { res = await dogu.publish(key, fresh.pick); } catch (e) { ok = false; res = { error: String(e.message || e) }; }
+  db.addAction({ id: `${Date.now()}-dogu`, at: Date.now(), node_id: '_app', type: 'dogu_publish', params: { slugs: fresh.pick }, label: `Do-gu に ${fresh.pick.length} 件を登録`, ok, output: JSON.stringify(res).slice(0, 4000), undo: null, undo_of: null });
   return { ok, login, url: `${dogu.BASE}/@${login}`, result: res };
 });
 ipcMain.handle('copy', (_e, text) => { clipboard.writeText(String(text)); return true; });

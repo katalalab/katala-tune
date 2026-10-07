@@ -14,7 +14,7 @@ import json, os, plistlib, glob, time
 
 HOME = os.path.expanduser("~")
 t0 = time.time()
-items, errors = [], []
+items, errors, failed = [], [], []
 
 
 def add(source, name, version=None, explicit=True, **extra):
@@ -24,9 +24,10 @@ def add(source, name, version=None, explicit=True, **extra):
 
 
 def listdir(p):
+    # 無いのは「入っていない」。読めない（権限など）は失敗として上に投げる（空と見なすと、全部が削除に見える）
     try:
         return sorted(e for e in os.listdir(p) if not e.startswith("."))
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return []
 
 
@@ -56,7 +57,8 @@ def apps():
     for root in ("/Applications", os.path.join(HOME, "Applications"), "/Applications/Utilities"):
         for app in glob.glob(os.path.join(root, "*.app")):
             name = os.path.basename(app)[:-4]
-            if name in seen:
+            # macOS 付属のアプリ（Safari など）は /System 配下への参照なので数えない。Xcode・Final Cut など Apple 製でも自分で入れたものは数える
+            if name in seen or os.path.realpath(app).startswith("/System/"):
                 continue
             seen.add(name)
             info = {}
@@ -66,9 +68,6 @@ def apps():
             except Exception:
                 pass
             bid = info.get("CFBundleIdentifier")
-            # macOS 付属のアプリは数えない（/System/Applications にあり、ここに来るのは一部の例外だけ）
-            if isinstance(bid, str) and bid.startswith("com.apple.") and root != os.path.join(HOME, "Applications"):
-                continue
             mas = os.path.exists(os.path.join(app, "Contents", "_MASReceipt"))
             add("app", name, info.get("CFBundleShortVersionString") or info.get("CFBundleVersion"), True,
                 id=bid if isinstance(bid, str) else None, store="mas" if mas else None)
@@ -140,10 +139,16 @@ def platform():
             add("platform", name)
 
 
-for fn in (brew, apps, mise, uv_cargo, npm_global, loose_bins, platform):
+# 取り方ごとに、どの種類を返すか。失敗した取り方の種類は failed_sources に入れ、呼び出し側はその種類を「削除」と見なさない
+COLLECTORS = ((brew, ("brew", "cask")), (apps, ("app",)), (mise, ("mise",)), (uv_cargo, ("uv", "cargo")), (npm_global, ("npm",)),
+              (loose_bins, ("bin",)), (platform, ("platform",)))
+for fn, sources in COLLECTORS:
+    before = len(items)
     try:
         fn()
     except Exception as e:  # 1つの取り方が壊れても他は返す
+        del items[before:]
         errors.append(f"{fn.__name__}: {e}")
+        failed.extend(sources)
 
-print(json.dumps({"os": "macos", "items": items, "errors": errors, "elapsed_s": round(time.time() - t0, 2)}, ensure_ascii=False))
+print(json.dumps({"os": "macos", "items": items, "errors": errors, "failed_sources": failed, "elapsed_s": round(time.time() - t0, 2)}, ensure_ascii=False))

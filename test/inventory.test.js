@@ -47,10 +47,10 @@ test('機体×道具の表で版の違い（drift）を出す', () => {
 test('棚卸しの保存: 初回は記録しない、以降は追加・削除・版の変化・再追加を記録する', () => {
   const db = openDb(tmp());
   const it = (name, version) => ({ source: 'brew', name, version, explicit: true, extra: null });
-  assert.deepEqual(db.saveInventory('n1', [it('a', '1'), it('b', '1')], 1000), { added: 0, removed: 0, updated: 0, total: 2, baseline: true });
+  assert.deepEqual(db.saveInventory('n1', [it('a', '1'), it('b', '1')], 1000), { added: 0, removed: 0, updated: 0, total: 2, baseline: true, skipped: [] });
   assert.equal(db.inventoryEvents().length, 0);
   const c = db.saveInventory('n1', [it('a', '2'), it('c', '1')], 2000);
-  assert.deepEqual({ ...c }, { added: 1, removed: 1, updated: 1, total: 2, baseline: false });
+  assert.deepEqual({ ...c }, { added: 1, removed: 1, updated: 1, total: 2, baseline: false, skipped: [] });
   assert.deepEqual(db.inventory({ node_id: 'n1' }).map((r) => `${r.name}@${r.version}`), ['a@2', 'c@1']);
   assert.equal(db.inventory({ node_id: 'n1', includeRemoved: true }).find((r) => r.name === 'b').removed_at, 2000);
   db.saveInventory('n1', [it('a', '2'), it('b', '1'), it('c', '1')], 3000);
@@ -112,4 +112,35 @@ test('Do-gu: 同じ名前の道具が重なったら公式サイトとアイコ�
   assert.equal(match({ source: 'app', name: 'Visual Studio Code' }), 'vscode');
   assert.equal(match({ source: 'app', name: 'Claude' }), 'claude');
   assert.equal(match({ source: 'bin', name: 'claude' }), 'claude-code');
+});
+
+test('棚卸しの保存: 取り方が失敗した種類は削除と見なさず、0 件の機体も初回は1回だけ', () => {
+  const db = openDb(tmp());
+  const it = (source, name) => ({ source, name, version: '1', explicit: true, extra: null });
+  db.saveInventory('n1', [it('brew', 'a'), it('app', 'X')], 1000);
+  const c = db.saveInventory('n1', [it('app', 'X')], 2000, { skipSources: ['brew'] });
+  assert.deepEqual([c.removed, c.skipped], [0, ['brew']]);
+  assert.equal(db.inventory({ node_id: 'n1' }).find((r) => r.name === 'a').removed_at, null);
+  assert.equal(db.saveInventory('n1', [it('app', 'X')], 3000).removed, 1);
+  // 初回が 0 件でも、次の回の追加は記録する
+  assert.equal(db.saveInventory('empty', [], 1000).baseline, true);
+  const d = db.saveInventory('empty', [it('brew', 'new')], 2000);
+  assert.deepEqual([d.baseline, d.added], [false, 1]);
+});
+
+test('版のずれは機体どうしで比べ、同じ機体の中の書き方の違いは数えない', () => {
+  const row = (node_id, source, version) => ({ node_id, source, name: 'Tool', version, explicit: true });
+  assert.equal(matrix([row('a', 'cask', '1.2,34'), row('a', 'app', '1.2')])[0].drift, false);
+  assert.equal(matrix([row('a', 'cask', '1.2,34'), row('a', 'app', '1.2'), row('b', 'app', '1.2')])[0].drift, false);
+  assert.equal(matrix([row('a', 'app', '1.2'), row('b', 'app', '1.3')])[0].drift, true);
+});
+
+test('Do-gu の登録: 下書きにある slug だけを通し、確認の前後で変わったら送らない', () => {
+  const draft = [{ slug: 'jq', name: 'jq', category: 'cli' }, { slug: 'gh', name: 'gh', category: 'cli' }];
+  const a = dogu.planPublish(draft, ['jq', 'gh', 'not-in-draft', 'jq']);
+  assert.deepEqual(a.pick, ['gh', 'jq']);
+  assert.equal(dogu.planPublish(draft, ['nope']).refused, '送る道具がない');
+  assert.equal(dogu.samePlan(a, dogu.planPublish(draft, ['gh', 'jq'])), true);
+  // 確認のあいだに jq が除外された
+  assert.equal(dogu.samePlan(a, dogu.planPublish(draft.filter((d) => d.slug !== 'jq'), ['jq', 'gh'])), false);
 });
