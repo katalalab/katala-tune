@@ -2,15 +2,21 @@
 //! - ai_sessions: ファイル（= セッション）ごとの要約。会話の本文・ツールの入出力は持たない（調査が取り出さない）。cwd はホームを ~ にしたもの
 //! - ai_usage_hourly: セッション×時間（epoch の時）ごとの使用量。日ごとの集計に使う（長いセッションも日をまたいで正しく割り振る）
 //! - ai_cursors: 機体ごとの続きの位置（ファイルごとのバイト位置）と、前回の取り込みの様子（続きあり・python が無い・エラー）
+//! - ai_responses: Claude Code の応答ごとの量（応答 ID の SHA-256 の先頭 16 桁・時刻・モデル・トークン）。どの区間（source_span）から来たかを持つ。
+//!   同じ応答が複数のファイル（サブエージェントのファイルなど）に出るので、集計は機体ごとに応答で重複を除いてから行う（db/ai_usage.rs）
 //!
 //! 調査（probes/ai_sessions.py）の出力をそのまま受け取り、mode が replace なら置き換え、add なら足す。
 //! tokens_mode が max のトークン（Codex の累計）は最大値を使い、時間ごとの量は前回までの累計との差にする。
+//! 読んだ区間は出どころの台帳（db/provenance.rs）に残す。続き（add）は「前回の終了 = 今回の開始」でなければ拒否し、
+//! そのファイルは次の回に最初から読み直す（続きの位置を 0 に戻す）。調査には続きの位置と一緒に、位置の手前の指紋を渡す（[`Store::ai_state`]）。
+//! ai_sessions.tracked は、出どころの台帳つきで最初から読んだセッション（1）か、台帳より前に取り込んだもの（0）か。
 
 use std::collections::{BTreeMap, HashMap};
 
 use rusqlite::{OptionalExtension, Row, params};
 use serde_json::{Map, Value, json};
 
+use super::provenance::{self, RunMeta};
 use super::{Result, Store, row_json};
 use crate::js;
 
@@ -22,7 +28,7 @@ CREATE TABLE IF NOT EXISTS ai_sessions (
   turn_errors INTEGER NOT NULL DEFAULT 0, hook_errors INTEGER NOT NULL DEFAULT 0, api_errors INTEGER NOT NULL DEFAULT 0,
   tok_in INTEGER NOT NULL DEFAULT 0, tok_out INTEGER NOT NULL DEFAULT 0, tok_cache_read INTEGER NOT NULL DEFAULT 0, tok_cache_write INTEGER NOT NULL DEFAULT 0,
   tok_reasoning INTEGER NOT NULL DEFAULT 0, tokens_mode TEXT NOT NULL DEFAULT 'add',
-  tool_counts TEXT, tool_error_counts TEXT, prs TEXT, updated_at INTEGER NOT NULL,
+  tool_counts TEXT, tool_error_counts TEXT, prs TEXT, updated_at INTEGER NOT NULL, tracked INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (node_id, file)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS ai_sessions_last ON ai_sessions (last_ts DESC);
@@ -38,7 +44,32 @@ CREATE TABLE IF NOT EXISTS ai_cursors (
   truncated INTEGER NOT NULL DEFAULT 0, no_python INTEGER NOT NULL DEFAULT 0,
   files_total INTEGER, files_changed INTEGER, bytes_pending INTEGER, bytes_read INTEGER, elapsed_s REAL
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS ai_responses (
+  node_id TEXT NOT NULL, resp TEXT NOT NULL, span_id INTEGER NOT NULL, ts INTEGER NOT NULL, model TEXT,
+  tok_in INTEGER NOT NULL DEFAULT 0, tok_out INTEGER NOT NULL DEFAULT 0, tok_cache_read INTEGER NOT NULL DEFAULT 0,
+  tok_cache_write INTEGER NOT NULL DEFAULT 0, tok_cache_write_1h INTEGER NOT NULL DEFAULT 0, tok_reasoning INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (node_id, resp, span_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ai_responses_span ON ai_responses (span_id);
+CREATE INDEX IF NOT EXISTS ai_responses_ts ON ai_responses (ts);
 ";
+
+/// 出どころの台帳を足す前の DB の移行（済んでいれば何もしない）: ai_sessions に tracked を足し、続きの位置を忘れる。
+/// 次の取り込みで各ファイルを最初から読み直し、区間の指紋と応答ごとの量を揃える（台帳の前のセッションは tracked = 0 のまま残る。
+/// 元のファイルが消えたものは読み直せないので、そのまま数える）
+pub(super) fn migrate(c: &rusqlite::Connection) -> Result<()> {
+    let done: Option<i64> = c.query_row("SELECT 1 FROM meta WHERE k = 'migr_ai_provenance_v1'", [], |r| r.get(0)).optional()?;
+    if done.is_some() {
+        return Ok(());
+    }
+    let has: bool = c.prepare("SELECT 1 FROM pragma_table_info('ai_sessions') WHERE name = 'tracked'")?.exists([])?;
+    if !has {
+        c.execute_batch("ALTER TABLE ai_sessions ADD COLUMN tracked INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    c.execute_batch("UPDATE ai_cursors SET files = '{}', truncated = 1;")?;
+    c.execute("INSERT OR REPLACE INTO meta (k, v, updated_at) VALUES ('migr_ai_provenance_v1', 'true', ?)", [super::now_ms()])?;
+    Ok(())
+}
 
 /// トークンの5つ（入力・出力・キャッシュ読み・キャッシュ書き・推論）。調査の tokens のキーと表の列
 pub const TOK_KEYS: [&str; 5] = ["in", "out", "cache_read", "cache_write", "reasoning"];
@@ -64,6 +95,8 @@ pub struct Session {
     pub tool_counts: BTreeMap<String, i64>,
     pub tool_error_counts: BTreeMap<String, i64>,
     pub prs: Vec<String>,
+    /// 出どころの台帳つきで最初から読んだか
+    pub tracked: bool,
 }
 
 const COUNT_KEYS: [&str; 7] = ["prompts", "assistant_msgs", "tool_calls", "tool_errors", "turn_errors", "hook_errors", "api_errors"];
@@ -105,6 +138,7 @@ impl Session {
             tool_counts: counts_map(r.get("tool_counts")),
             tool_error_counts: counts_map(r.get("tool_error_counts")),
             prs: js::arr(r.get("prs")).iter().filter_map(Value::as_str).map(str::to_string).collect(),
+            tracked: false,
         }
     }
 
@@ -154,6 +188,7 @@ impl Session {
             tool_counts: tc,
             tool_error_counts: te,
             prs,
+            tracked: self.tracked,
         }
     }
 
@@ -183,6 +218,7 @@ impl Session {
             tool_counts: counts_map(parse(r.get("tool_counts")?).as_ref()),
             tool_error_counts: counts_map(parse(r.get("tool_error_counts")?).as_ref()),
             prs: parse(r.get("prs")?).map(|v| js::arr(Some(&v)).iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default(),
+            tracked: r.get::<_, i64>("tracked")? != 0,
         })
     }
 }
@@ -225,10 +261,30 @@ pub struct AiIngested {
     pub sessions: usize,
     pub hours: usize,
     pub files: usize,
+    /// 出どころの台帳: この回の ID・書いた区間・拒否した区間（次の回に最初から読み直す）・最初から読み直したファイル・応答の数
+    pub run_id: String,
+    pub spans: usize,
+    pub rejected: usize,
+    pub rewound: usize,
+    pub responses: usize,
 }
 
 fn counts_json(m: &BTreeMap<String, i64>) -> String {
     serde_json::to_string(m).unwrap_or_else(|_| "{}".into())
+}
+
+/// 調査の responses の 1 件（[応答, 時刻, モデルの番号, 入力, 出力, キャッシュ読み, キャッシュ書き, うち 1 時間, 推論]）。
+/// 応答は SHA-256 の先頭 16 桁（小文字の 16 進）だけを受け付ける。時刻が無ければ fallback（セッションの最後）
+pub fn response_of(v: &Value, models: &[Value], fallback_ts: Option<i64>) -> Option<(String, i64, Option<String>, [i64; 6])> {
+    let a = v.as_array()?;
+    let h = a.first()?.as_str().filter(|s| s.len() == 16 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))?.to_string();
+    let ts = a.get(1).and_then(Value::as_i64).or(fallback_ts)?;
+    let model = a.get(2).and_then(Value::as_u64).and_then(|i| models.get(i as usize)).and_then(Value::as_str).map(str::to_string);
+    let mut t = [0i64; 6];
+    for (i, x) in t.iter_mut().enumerate() {
+        *x = int(a.get(3 + i)).max(0);
+    }
+    Some((h, ts, model, t))
 }
 
 impl Store {
@@ -238,17 +294,42 @@ impl Store {
         Ok(s.and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v.as_object().cloned()).unwrap_or_default())
     }
 
+    /// 調査に渡す続きの位置（KT_STATE）。{ files: { 鍵: 位置 }, anchors: { 鍵: [長さ, sha256] } }。
+    /// 位置は、出どころの台帳に「終了がちょうどその位置」の生きている区間があるときだけ渡す（前回の終了 = 今回の開始）。
+    /// 無ければ 0（そのファイルは最初から読み直す）。調査は位置の手前の指紋が合わなければ、やはり最初から読み直す
+    pub fn ai_state(&self, node_id: &str) -> Result<Value> {
+        let mut files = Map::new();
+        let mut anchors = Map::new();
+        for (k, v) in self.ai_files(node_id)? {
+            let off = v.as_i64().unwrap_or(0);
+            if off > 0
+                && let Some((n, sha)) = self.span_anchor(node_id, &k, off)?
+            {
+                files.insert(k.clone(), json!(off));
+                anchors.insert(k, json!([n, sha]));
+            } else {
+                files.insert(k, json!(0));
+            }
+        }
+        Ok(json!({ "files": files, "anchors": anchors }))
+    }
+
     /// 1セッション（無ければ None）
     pub fn ai_session(&self, node_id: &str, file: &str) -> Result<Option<Session>> {
         self.conn.prepare_cached("SELECT * FROM ai_sessions WHERE node_id = ? AND file = ?")?.query_row([node_id, file], Session::from_row).optional()
     }
 
-    /// 調査の出力（out）を取り込む。セッション・時間ごとの量・続きの位置を1つのトランザクションで書く
-    /// （途中で失敗したら何も書かない。次の回に同じ位置から読み直す）
-    pub fn ai_ingest(&self, node_id: &str, out: &Value, now: i64) -> Result<AiIngested> {
+    /// 調査の出力（out）を取り込む。セッション・時間ごとの量・応答ごとの量・続きの位置・出どころの台帳（区間と、この回の行）を
+    /// 1つのトランザクションで書く（途中で失敗したら何も書かない。次の回に同じ位置から読み直す）。
+    /// 続き（add）の区間が前回の終了から始まっていない・同じ区間がすでにあるときは、そのファイルの分を取り込まず、
+    /// 続きの位置を 0 に戻す（次の回に最初から読み直す）
+    pub fn ai_ingest(&self, node_id: &str, out: &Value, run: &RunMeta, now: i64) -> Result<AiIngested> {
         let mut files = self.ai_files(node_id)?;
-        let mut res = AiIngested::default();
+        let mut res = AiIngested { run_id: run.run_id.clone(), ..Default::default() };
         self.tx(|c| {
+            let mut rejected: Vec<Value> = Vec::new();
+            let mut rewound: Vec<Value> = Vec::new();
+            let mut reset: Vec<String> = Vec::new();
             for rec in js::arr(out.get("sessions")) {
                 let file = js::string(rec.get("file"));
                 if file.is_empty() || file == "undefined" {
@@ -256,20 +337,54 @@ impl Store {
                 }
                 let add = Session::from_probe(rec);
                 let replace = !js::is_str(rec.get("mode"), "add");
-                let old = if replace { None } else { c.prepare_cached("SELECT * FROM ai_sessions WHERE node_id = ? AND file = ?")?.query_row(params![node_id, file], Session::from_row).optional()? };
+                if let Some(why) = rec.get("rewound").and_then(Value::as_str) {
+                    res.rewound += 1;
+                    if rewound.len() < 20 {
+                        rewound.push(json!({ "file": file, "reason": why }));
+                    }
+                }
+                // 出どころの台帳（区間の無い出力は、台帳より前の調査スクリプトのもの。台帳なしで取り込む）
+                let span = provenance::SpanIn::from_probe(&file, rec.get("span"));
+                let mut span_id = None;
+                if let Some(sp) = &span {
+                    if replace {
+                        for id in provenance::supersede(c, node_id, &file, &run.run_id)? {
+                            c.prepare_cached("DELETE FROM ai_responses WHERE span_id = ?")?.execute([id])?;
+                        }
+                    }
+                    if sp.end > sp.start {
+                        match provenance::insert_span(c, &run.run_id, node_id, sp, !replace)? {
+                            provenance::SpanOutcome::Inserted(id) => span_id = Some(id),
+                            provenance::SpanOutcome::Rejected(why) => {
+                                res.rejected += 1;
+                                if rejected.len() < 20 {
+                                    rejected.push(json!({ "file": file, "reason": why }));
+                                }
+                                reset.push(file);
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let old = if replace {
+                    None
+                } else {
+                    c.prepare_cached("SELECT * FROM ai_sessions WHERE node_id = ? AND file = ?")?.query_row(params![node_id, file], Session::from_row).optional()?
+                };
                 let prev_tokens = old.as_ref().map_or([0; 5], |o| o.tokens);
-                let s = match &old {
+                let mut s = match &old {
                     Some(o) => o.merge_add(&add),
                     None => add.clone(),
                 };
+                s.tracked = span.is_some() && (replace || old.as_ref().is_some_and(|o| o.tracked));
                 if replace {
                     c.prepare_cached("DELETE FROM ai_usage_hourly WHERE node_id = ? AND file = ?")?.execute(params![node_id, file])?;
                 }
                 c.prepare_cached(
                     "INSERT OR REPLACE INTO ai_sessions (node_id, file, tool, session_id, parent_id, cwd, version, origin, model, first_ts, last_ts,
                        prompts, assistant_msgs, tool_calls, tool_errors, turn_errors, hook_errors, api_errors,
-                       tok_in, tok_out, tok_cache_read, tok_cache_write, tok_reasoning, tokens_mode, tool_counts, tool_error_counts, prs, updated_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       tok_in, tok_out, tok_cache_read, tok_cache_write, tok_reasoning, tokens_mode, tool_counts, tool_error_counts, prs, updated_at, tracked)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )?
                 .execute(params![
                     node_id,
@@ -299,7 +414,8 @@ impl Store {
                     counts_json(&s.tool_counts),
                     counts_json(&s.tool_error_counts),
                     serde_json::to_string(&s.prs).unwrap_or_else(|_| "[]".into()),
-                    now
+                    now,
+                    i64::from(s.tracked)
                 ])?;
                 // 時間ごとの量（累計のトークンは前回までの累計との差）
                 for (h, x) in hour_deltas(rec.get("hours"), add.tokens_max, if replace { [0; 5] } else { prev_tokens }) {
@@ -313,12 +429,33 @@ impl Store {
                     .execute(params![node_id, file, s.tool, h, x[0], x[1], x[2], x[3], x[4], x[5], x[6]])?;
                     res.hours += 1;
                 }
+                // 応答ごとの量（Claude Code）と、この区間から足した量（検算に使う）
+                if let Some(id) = span_id {
+                    let models = js::arr(rec.get("resp_models"));
+                    let mut n = 0i64;
+                    for r in js::arr(rec.get("responses")) {
+                        let Some((h, ts, model, t)) = response_of(r, models, s.last_ts) else { continue };
+                        c.prepare_cached(
+                            "INSERT OR REPLACE INTO ai_responses (node_id, resp, span_id, ts, model, tok_in, tok_out, tok_cache_read, tok_cache_write, tok_cache_write_1h, tok_reasoning)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        )?
+                        .execute(params![node_id, h, id, ts, model, t[0], t[1], t[2], t[3], t[4], t[5]])?;
+                        n += 1;
+                    }
+                    let out_delta = if add.tokens_max { (s.tokens[1] - if replace { 0 } else { prev_tokens[1] }).max(0) } else { add.tokens[1] };
+                    provenance::set_span_counts(c, id, n, out_delta)?;
+                    res.responses += n as usize;
+                    res.spans += 1;
+                }
                 res.sessions += 1;
             }
             if let Some(m) = out.get("cursors").and_then(Value::as_object) {
                 for (k, v) in m {
                     files.insert(k.clone(), v.clone());
                 }
+            }
+            for k in &reset {
+                files.insert(k.clone(), json!(0));
             }
             for g in js::arr(out.get("gone")) {
                 if let Some(k) = g.as_str() {
@@ -327,6 +464,21 @@ impl Store {
             }
             res.files = files.len();
             let errs: Vec<&Value> = js::arr(out.get("errors")).iter().take(5).collect();
+            let mut notes = Map::new();
+            if !rejected.is_empty() {
+                notes.insert("rejected".into(), Value::Array(rejected));
+            }
+            if !rewound.is_empty() {
+                notes.insert("rewound".into(), Value::Array(rewound));
+            }
+            for k in ["truncated", "files_total", "files_changed", "bytes_read", "elapsed_s"] {
+                if let Some(v) = out.get(k).filter(|v| !v.is_null()) {
+                    notes.insert(k.into(), v.clone());
+                }
+            }
+            notes.insert("gone".into(), json!(js::arr(out.get("gone")).len()));
+            notes.insert("errors".into(), json!(js::arr(out.get("errors")).len()));
+            provenance::finish_run(c, run, res.rejected as i64, Some(&Value::Object(notes)))?;
             c.prepare_cached(
                 "INSERT INTO ai_cursors (node_id, files, updated_at, last_ok_at, last_error, file_errors, truncated, no_python, files_total, files_changed, bytes_pending, bytes_read, elapsed_s)
                  VALUES (?, ?, ?, ?, NULL, ?, ?, 0, ?, ?, ?, ?, ?)
@@ -340,7 +492,8 @@ impl Store {
                 now,
                 now,
                 if errs.is_empty() { None } else { Some(serde_json::to_string(&errs).unwrap_or_default()) },
-                i64::from(js::truthy(out.get("truncated"))),
+                // 拒否した区間があれば、最初からの読み直しを急ぐ（続きありと同じ扱い）
+                i64::from(js::truthy(out.get("truncated")) || !reset.is_empty()),
                 opt_int(out.get("files_total")),
                 opt_int(out.get("files_changed")),
                 opt_int(out.get("bytes_pending")),
@@ -389,6 +542,13 @@ impl Store {
     /// 続きの残っている機体があるか（取り込み中・続きあり）
     pub fn ai_pending(&self) -> Result<bool> {
         Ok(self.conn.query_row("SELECT count(*) FROM ai_cursors WHERE truncated = 1", [], |r| r.get::<_, i64>(0))? > 0)
+    }
+
+    /// 指定した機体（取り込む機体）のどれかに続きが残っているか。台帳で取り込まなくなった機体の古い印では急がない
+    pub fn ai_pending_among(&self, ids: &[String]) -> Result<bool> {
+        let mut st = self.conn.prepare_cached("SELECT node_id FROM ai_cursors WHERE truncated = 1")?;
+        let rows: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<Result<_>>()?;
+        Ok(rows.iter().any(|n| ids.contains(n)))
     }
 
     /// 集計（画面の AI）。f = { days（既定 30、1〜400）, tz（UTC からの分、東が正）, node_id, tool }
@@ -451,10 +611,67 @@ impl Store {
                 "SELECT s.tool, s.model, COUNT(DISTINCT h.node_id || char(0) || h.file) AS sessions, {toks},
                         SUM(h.tok_in + h.tok_out) AS io
                  FROM ai_usage_hourly h JOIN ai_sessions s ON s.node_id = h.node_id AND s.file = h.file
-                 WHERE {cond_h} GROUP BY s.tool, s.model ORDER BY io DESC LIMIT 30"
+                 WHERE {cond_h} GROUP BY s.tool, s.model ORDER BY io DESC"
             ),
             since_hour,
         )?;
+        // 重複を除いた量と費用（db/ai_usage.rs）。トークンはこちらに置き換え、除く前の量は raw に残す
+        let w = super::UsageWindow { since_hour, until_hour: i64::MAX / 3_600_000, tz_ms, node: node.clone(), tool: tool.clone() };
+        let (u_tot, u_daily, u_models) = super::summarize_usage(&self.usage_rows(&w, true)?);
+        let (raw_tot, _, _) = super::summarize_usage(&self.usage_rows(&w, false)?);
+        let mut dup = self.dup_stats(&w)?;
+        if let Value::Object(m) = &mut dup {
+            m.insert("removed".into(), super::dup_delta(&raw_tot, &u_tot));
+        }
+        let mut totals = totals;
+        if let (Value::Object(t), Value::Object(u)) = (&mut totals, &u_tot) {
+            for (k, v) in u {
+                t.insert(k.clone(), v.clone());
+            }
+        }
+        let mut seen: std::collections::HashSet<(String, i64)> = std::collections::HashSet::new();
+        let mut daily: Vec<Value> = daily
+            .into_iter()
+            .map(|mut r| {
+                let key = (js::string(r.get("node_id")), r.get("day").and_then(Value::as_i64).unwrap_or(0));
+                if let (Value::Object(m), Some(Value::Object(u))) = (&mut r, u_daily.get(&key)) {
+                    for (k, v) in u {
+                        m.insert(k.clone(), v.clone());
+                    }
+                }
+                seen.insert(key);
+                r
+            })
+            .collect();
+        for ((n, d), u) in &u_daily {
+            if !seen.contains(&(n.clone(), *d)) {
+                let mut r = json!({ "node_id": n, "day": d, "sessions": 0, "prompts": 0, "tool_calls": 0 });
+                if let (Value::Object(m), Value::Object(u)) = (&mut r, u) {
+                    for (k, v) in u {
+                        m.insert(k.clone(), v.clone());
+                    }
+                }
+                daily.push(r);
+            }
+        }
+        daily.sort_by(|a, b| {
+            let k = |r: &Value| (r.get("day").and_then(Value::as_i64).unwrap_or(0), js::string(r.get("node_id")));
+            k(a).cmp(&k(b))
+        });
+        // モデル別: 量と費用は応答（Claude Code）・時間ごとの量（Codex）のモデルで、セッションの数はセッションの最後のモデルで数える
+        let models: Vec<Value> = u_models
+            .into_iter()
+            .take(30)
+            .map(|mut m| {
+                let sessions = models
+                    .iter()
+                    .find(|x| x.get("tool") == m.get("tool") && x.get("model") == m.get("model"))
+                    .and_then(|x| x.get("sessions").cloned())
+                    .unwrap_or(json!(0));
+                m["sessions"] = sessions;
+                m
+            })
+            .collect();
         // 失敗の多いツール（期間内に動いたセッションの、ツール名ごとの呼び出しと失敗）
         let calls = q(
             &format!(
@@ -515,7 +732,8 @@ impl Store {
             .collect::<Result<Vec<_>>>()?;
         Ok(json!({
             "days": days, "since": since, "tz": tz_ms / 60_000,
-            "totals": totals, "daily": daily, "models": models, "tools": tools, "long": long, "prs": prs, "versions": versions,
+            "totals": totals, "raw": raw_tot, "dup": dup, "daily": daily, "models": models, "tools": tools, "long": long, "prs": prs, "versions": versions,
+            "prices": crate::prices::table().meta(),
         }))
     }
 
@@ -594,6 +812,10 @@ mod tests {
 
     const H: i64 = 1_800_000_000_000 / 3_600_000;
 
+    fn rm(node: &str) -> RunMeta {
+        crate::engine_tools::ai_run_meta(node, 1, 2)
+    }
+
     fn out(sessions: Vec<Value>, cursors: Value) -> Value {
         json!({ "sessions": sessions, "cursors": cursors, "gone": [], "files_total": 2, "files_changed": 1, "bytes_pending": 100, "bytes_read": 100, "truncated": false, "errors": [] })
     }
@@ -617,10 +839,15 @@ mod tests {
     #[test]
     fn replace_then_add_and_max() {
         let db = Store::open_in_memory().unwrap();
-        db.ai_ingest("n1", &out(vec![claude("replace", 1, 10, H), codex("replace", 100, H)], json!({ "claude:p/s1.jsonl": 50, "codex:2026/r.jsonl": 70 })), 1)
-            .unwrap();
+        db.ai_ingest(
+            "n1",
+            &out(vec![claude("replace", 1, 10, H), codex("replace", 100, H)], json!({ "claude:p/s1.jsonl": 50, "codex:2026/r.jsonl": 70 })),
+            &rm("n1"),
+            1,
+        )
+        .unwrap();
         // 続き: Claude は足し、Codex は累計なので最大値。時間ごとの量は差分
-        db.ai_ingest("n1", &out(vec![claude("add", 2, 7, H + 30), codex("add", 250, H + 30)], json!({ "claude:p/s1.jsonl": 90 })), 2).unwrap();
+        db.ai_ingest("n1", &out(vec![claude("add", 2, 7, H + 30), codex("add", 250, H + 30)], json!({ "claude:p/s1.jsonl": 90 })), &rm("n1"), 2).unwrap();
         let c = db.ai_session("n1", "claude:p/s1.jsonl").unwrap().unwrap();
         assert_eq!((c.counts[0], c.tokens[0], c.tool_counts["Bash"], c.prs.len()), (3, 17, 4, 1));
         assert_eq!((c.first_ts, c.last_ts), (Some(H * 3_600_000), Some((H + 30) * 3_600_000 + 60_000)));
@@ -638,13 +865,13 @@ mod tests {
         let files = db.ai_files("n1").unwrap();
         assert_eq!((files["claude:p/s1.jsonl"].clone(), files["codex:2026/r.jsonl"].clone()), (json!(90), json!(70)));
         // 置き換え（ファイルが短くなった）: 時間ごとの量も作り直す
-        db.ai_ingest("n1", &out(vec![claude("replace", 1, 4, H + 40)], json!({ "claude:p/s1.jsonl": 10 })), 3).unwrap();
+        db.ai_ingest("n1", &out(vec![claude("replace", 1, 4, H + 40)], json!({ "claude:p/s1.jsonl": 10 })), &rm("n1"), 3).unwrap();
         let c = db.ai_session("n1", "claude:p/s1.jsonl").unwrap().unwrap();
         assert_eq!((c.counts[0], c.tokens[0]), (1, 4));
         let n: i64 = db.conn().query_row("SELECT count(*) FROM ai_usage_hourly WHERE file = 'claude:p/s1.jsonl'", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
         // 消えたファイルの位置は忘れる（セッションの記録は残す）
-        db.ai_ingest("n1", &json!({ "sessions": [], "cursors": {}, "gone": ["codex:2026/r.jsonl"], "truncated": true }), 4).unwrap();
+        db.ai_ingest("n1", &json!({ "sessions": [], "cursors": {}, "gone": ["codex:2026/r.jsonl"], "truncated": true }), &rm("n1"), 4).unwrap();
         assert!(!db.ai_files("n1").unwrap().contains_key("codex:2026/r.jsonl"));
         assert!(db.ai_session("n1", "codex:2026/r.jsonl").unwrap().is_some());
         assert!(db.ai_pending().unwrap());
@@ -653,7 +880,7 @@ mod tests {
     #[test]
     fn errors_keep_the_cursor() {
         let db = Store::open_in_memory().unwrap();
-        db.ai_ingest("n1", &out(vec![], json!({ "a": 5 })), 1).unwrap();
+        db.ai_ingest("n1", &out(vec![], json!({ "a": 5 })), &rm("n1"), 1).unwrap();
         db.ai_error("n1", "python が無い", true, 2).unwrap();
         assert_eq!(db.ai_files("n1").unwrap()["a"], json!(5));
         let c = &db.ai_cursors().unwrap()[0];
@@ -663,8 +890,8 @@ mod tests {
     #[test]
     fn summary_and_list() {
         let db = Store::open_in_memory().unwrap();
-        db.ai_ingest("n1", &out(vec![claude("replace", 1, 10, H), codex("replace", 100, H + 1)], json!({})), 1).unwrap();
-        db.ai_ingest("n2", &out(vec![claude("replace", 2, 20, H + 2)], json!({})), 1).unwrap();
+        db.ai_ingest("n1", &out(vec![claude("replace", 1, 10, H), codex("replace", 100, H + 1)], json!({})), &rm("n1"), 1).unwrap();
+        db.ai_ingest("n2", &out(vec![claude("replace", 2, 20, H + 2)], json!({})), &rm("n2"), 1).unwrap();
         let now = (H + 3) * 3_600_000;
         let s = db.ai_summary(&json!({ "days": 7, "tz": 0 }), now).unwrap();
         assert_eq!(s["totals"]["sessions"], json!(3));

@@ -107,3 +107,146 @@ test('AI セッション: 時間ごとの使用量・残りの量・消えたフ
   // Codex は累計（その時間の終わりまで）。ツール呼び出しと指示は数
   assert.deepEqual(x.hours[h('2026-10-01T01:00:00Z')], [150, 20, 50, 0, 3, 1, 1]);
 });
+
+// ---- 出どころの台帳（区間の指紋・続きの検算・検算モード）と、ファイルをまたぐ重複を除くための応答ごとの量 ----
+
+const crypto = require('node:crypto');
+const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
+
+test('AI セッション: 区間の指紋・行数と、応答 ID のハッシュ（ID そのものは出さない）', { skip: !PY && 'python が無い' }, () => {
+  const { home, proj } = fixture();
+  const RESP = 'msg_RESPONSE_ID_SHOULD_NOT_LEAK';
+  const base = { sessionId: 's1', cwd: path.join(home, 'work', 'demo'), version: '9.9.9' };
+  const usage = { input_tokens: 3, output_tokens: 4, cache_read_input_tokens: 5, cache_creation_input_tokens: 9, cache_creation: { ephemeral_1h_input_tokens: 6, ephemeral_5m_input_tokens: 3 } };
+  // 同じ応答がサブエージェントのファイルにも出る（DB が応答ごとに重複を除く）
+  const rows = [{ ...base, type: 'assistant', timestamp: '2026-10-01T00:00:06Z', message: { id: RESP, model: 'model-a', usage, content: [{ type: 'text', text: SECRET }] } }];
+  fs.writeFileSync(path.join(proj, 's1', 'subagents', 'agent-y.jsonl'), jl(rows) + 'not json\n');
+  fs.appendFileSync(path.join(proj, 's1.jsonl'), jl(rows));
+  const { raw, out } = run(home);
+  assert.ok(!raw.includes(RESP), '応答 ID がそのまま出ている');
+  assert.ok(!raw.includes(SECRET));
+  const want = sha(`claude:${RESP}`).slice(0, 16);
+  const main = out.sessions.find((s) => s.file === 'claude:-work-demo/s1.jsonl');
+  const sub = out.sessions.find((s) => s.file.endsWith('agent-y.jsonl'));
+  for (const s of [main, sub]) {
+    const r = s.responses.find((x) => x[0] === want);
+    // [応答, 時刻, モデルの番号, 入力, 出力, キャッシュ読み, キャッシュ書き, うち 1 時間, 推論]
+    assert.deepEqual(r.slice(1), [Date.parse('2026-10-01T00:00:06Z'), s.resp_models.indexOf('model-a'), 3, 4, 5, 9, 6, 0]);
+  }
+  // 区間: 開始〜終了のバイト列の SHA-256・行数・数えた行・形の違う行（本文は出さない）
+  const file = fs.readFileSync(path.join(proj, 's1', 'subagents', 'agent-y.jsonl'));
+  assert.deepEqual({ ...sub.span, anchor: undefined }, { start: 0, end: file.length, sha256: sha(file), lines: 2, used: 1, skipped: 0, anchor: undefined });
+  assert.deepEqual(sub.span.anchor, [file.length, sha(file)]);
+  const m = fs.readFileSync(path.join(proj, 's1.jsonl'));
+  assert.equal(main.span.sha256, sha(m));
+  assert.equal(main.span.lines, 6);
+  assert.equal(out.version, PROBE.match(/^KT_VERSION = "([^"]+)"/m)[1]);
+});
+
+test('AI セッション: 続きは位置の手前の指紋で検算し、合わなければ最初から読み直す', { skip: !PY && 'python が無い' }, () => {
+  const { home, proj } = fixture();
+  const p = path.join(proj, 's1.jsonl');
+  const key = 'claude:-work-demo/s1.jsonl';
+  const first = run(home).out;
+  const s1 = first.sessions.find((s) => s.file === key);
+  const anchors = { [key]: s1.span.anchor };
+  const more = jl([{ type: 'user', sessionId: 's1', timestamp: '2026-10-02T00:00:00Z', message: { role: 'user', content: SECRET } }]);
+  fs.appendFileSync(p, more);
+  // 手前が同じ → 続き（add）。区間は前回の終了から
+  const next = run(home, { files: first.cursors, anchors }).out.sessions.find((s) => s.file === key);
+  assert.deepEqual([next.mode, next.rewound, next.span.start, next.span.lines, next.span.sha256], ['add', null, s1.span.end, 1, sha(Buffer.from(more))]);
+  // 手前を書き換えた（同じ長さ）→ 最初から読み直す
+  const buf = fs.readFileSync(p);
+  buf[s1.span.end - 5] = buf[s1.span.end - 5] === 0x41 ? 0x42 : 0x41;
+  fs.writeFileSync(p, buf);
+  fs.appendFileSync(p, more);
+  const again = run(home, { files: first.cursors, anchors }).out.sessions.find((s) => s.file === key);
+  assert.deepEqual([again.mode, again.rewound, again.span.start], ['replace', 'anchor', 0]);
+  // 短くなった → 最初から
+  fs.writeFileSync(p, more);
+  const shrunk = run(home, { files: first.cursors, anchors }).out.sessions.find((s) => s.file === key);
+  assert.deepEqual([shrunk.mode, shrunk.rewound], ['replace', 'shrunk']);
+});
+
+test('AI セッション: 検算モードは区間を読み直して指紋だけを返す（取り込まない）', { skip: !PY && 'python が無い' }, () => {
+  const { home, proj } = fixture();
+  const p = path.join(proj, 's1.jsonl');
+  const size = fs.statSync(p).size;
+  const src = PROBE.replace('KT_VERIFY = []', `KT_VERIFY = ${JSON.stringify([['claude:-work-demo/s1.jsonl', 0, size], ['claude:-work-demo/s1.jsonl', 10, size + 99], ['claude:gone/x.jsonl', 0, 5], ['claude:../escape', 0, 1]])}`);
+  const r = spawnSync(PY, ['-'], { input: src, env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!r.stdout.includes(SECRET));
+  const v = JSON.parse(r.stdout);
+  assert.equal(v.sessions, undefined, '取り込みはしない');
+  assert.deepEqual(v.verify.map((x) => x.state), ['ok', 'short', 'gone', 'gone']);
+  assert.equal(v.verify[0].sha256, sha(fs.readFileSync(p)));
+  assert.equal(v.verify[0].lines, 5);
+});
+
+// ---- Codex の残り枠（probes/codex_limits.py）。偽の codex で app-server の受け答えを確かめる ----
+
+const LIMITS = fs.readFileSync(path.join(__dirname, '..', 'probes', 'codex_limits.py'), 'utf8');
+
+function fakeCodex(mode) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-codex-'));
+  const bin = path.join(dir, 'codex');
+  fs.writeFileSync(bin, `#!/usr/bin/env python3
+import json, sys
+MODE = ${JSON.stringify(mode)}
+n = 0
+assert sys.argv[1:] == ["app-server"], sys.argv
+for line in sys.stdin:
+    m = json.loads(line)
+    if m.get("method") == "initialize":
+        print(json.dumps({"id": m["id"], "result": {"userAgent": "fake", "codexHome": "/SECRET-HOME"}}), flush=True)
+    elif m.get("method") == "account/rateLimits/read":
+        n += 1
+        print(json.dumps({"method": "account/rateLimits/updated", "params": {"rateLimits": {}}}), flush=True)
+        if MODE == "error":
+            print(json.dumps({"id": m["id"], "error": {"code": -32600, "message": "chatgpt authentication required to read rate limits"}}), flush=True)
+            continue
+        if MODE == "empty" or (MODE == "empty-then-full" and n == 1):
+            res = {"rateLimits": {"primary": None, "secondary": None}}
+        else:
+            res = {"rateLimits": {"limitId": "codex", "planType": "SECRET-PLAN", "credits": {"balance": "SECRET-BALANCE"},
+                                  "primary": {"usedPercent": 25, "windowDurationMins": 300, "resetsAt": 1900000000},
+                                  "secondary": {"usedPercent": 61, "windowDurationMins": 10080, "resetsAt": 1900500000}},
+                   "rateLimitResetCredits": {"availableCount": 2}}
+        print(json.dumps({"id": m["id"], "result": res}), flush=True)
+`);
+  fs.chmodSync(bin, 0o755);
+  return dir;
+}
+
+function limits(dir, src = LIMITS) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-home-'));
+  const r = spawnSync(PY, ['-'], { input: src, env: { ...process.env, HOME: home, PATH: `${dir}${path.delimiter}${process.env.PATH}` }, encoding: 'utf8', timeout: 40000 });
+  assert.equal(r.status, 0, r.stderr);
+  return { raw: r.stdout, out: JSON.parse(r.stdout) };
+}
+
+const NO_FAKE = (!PY || process.platform === 'win32') && '偽の codex は macOS / Linux だけ';
+
+test('Codex の残り枠: 窓の長さ・使用率・リセット時刻だけを出す（起動直後の空は 1 回だけ読み直す）', { skip: NO_FAKE }, () => {
+  const { raw, out } = limits(fakeCodex('empty-then-full'));
+  for (const s of ['SECRET-HOME', 'SECRET-PLAN', 'SECRET-BALANCE', 'availableCount', 'fake']) assert.ok(!raw.includes(s), `${s} が出ている`);
+  assert.deepEqual([out.codex, out.empty, out.error], [true, false, null]);
+  assert.deepEqual(out.windows, [{ mins: 300, used_pct: 25, resets_at: 1900000000 }, { mins: 10080, used_pct: 61, resets_at: 1900500000 }]);
+});
+
+test('Codex の残り枠: 空のまま・失敗・codex が無い', { skip: NO_FAKE }, () => {
+  const empty = limits(fakeCodex('empty')).out;
+  assert.deepEqual([empty.empty, empty.windows, empty.error], [true, [], null]);
+  const err = limits(fakeCodex('error')).out;
+  assert.match(err.error, /authentication required/);
+  // よくある置き場所も見ないようにして、PATH に codex が無い状態を作る
+  const none = LIMITS.replace(/cands = \[[\s\S]*?\]\n/, 'cands = []\n');
+  assert.notEqual(none, LIMITS);
+  // PATH には python だけを置いた空のディレクトリ（本物の codex を見つけて呼ばない）
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-nocodex-'));
+  const exe = spawnSync(PY, ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).stdout.trim();
+  fs.symlinkSync(exe, path.join(dir, PY));
+  const r = spawnSync(path.join(dir, PY), ['-'], { input: none, env: { ...process.env, PATH: dir, HOME: dir }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout).codex, false);
+});

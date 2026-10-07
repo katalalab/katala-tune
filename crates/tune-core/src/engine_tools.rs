@@ -2,13 +2,14 @@
 //! [`Engine`] のメソッドとして足す（engine.rs は分析・ログ・状態・変更操作の流れ）。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{Value, json};
 
 use crate::ai_sessions::{self, CATCH_UP_MINUTES, Fetched};
-use crate::db::now_ms;
+use crate::codex_limits::{self, Limits};
+use crate::db::{LimitsReport, RunMeta, now_ms};
 use crate::dogu::{self, Http, Matcher};
 use crate::engine::{Confirm, Engine};
 use crate::inventory::{self, items_of, matrix};
@@ -261,15 +262,27 @@ impl Engine {
     }
 
     async fn ai_sync_one(&self, n: &Node) -> Value {
-        let files = self.with_db(|d| d.ai_files(&n.id)).unwrap_or_default();
-        let (fetched, wall_s) = ai_sessions::fetch(n, &files).await;
+        // 続きの位置は、出どころの台帳の区間（終わりの手前の指紋つき）と合うものだけ渡す（ai_state）
+        let state = self.with_db(|d| d.ai_state(&n.id)).unwrap_or_else(|_| json!({}));
+        let started_at = now_ms();
+        // Codex の残り枠は、取り込みのたびに（続きの取り込みでは呼ばない）。セッションの取り込みと同時に問い合わせる
+        let limits_due = codex_limits::enabled(n)
+            && self
+                .with_db(|d| d.limits_checked_at(&n.id, "codex"))
+                .ok()
+                .flatten()
+                .is_none_or(|t| started_at - t >= codex_limits::MIN_INTERVAL_MINUTES * 60_000);
+        let ((fetched, wall_s), limits) =
+            tokio::join!(ai_sessions::fetch(n, &state), async { if limits_due { Some(codex_limits::fetch(n).await) } else { None } });
         let now = now_ms();
+        let limits_state = limits.map(|l| self.save_limits(&n.id, &l, now));
         let out = match fetched {
-            Fetched::Ok(v) => match self.with_db(|d| d.ai_ingest(&n.id, &v, now)) {
+            Fetched::Ok(v) => match self.with_db(|d| d.ai_ingest(&n.id, &v, &ai_run_meta(&n.id, started_at, now), now)) {
                 Ok(r) => json!({
                     "node_id": n.id, "ok": true, "sessions": r.sessions, "hours": r.hours, "files": r.files, "truncated": js::truthy(v.get("truncated")),
                     "files_total": v.get("files_total"), "files_changed": v.get("files_changed"), "bytes_pending": v.get("bytes_pending"),
                     "bytes_read": v.get("bytes_read"), "elapsed_s": v.get("elapsed_s"), "errors": js::arr(v.get("errors")).len(), "wall_s": wall_s,
+                    "run_id": r.run_id, "spans": r.spans, "rejected": r.rejected, "rewound": r.rewound, "responses": r.responses, "limits": limits_state,
                 }),
                 Err(e) => {
                     let msg = format!("読んだが保存できなかった: {e}");
@@ -286,21 +299,113 @@ impl Engine {
                 json!({ "node_id": n.id, "ok": false, "error": e, "wall_s": wall_s })
             }
         };
+        let mut out = out;
+        if out.get("limits").is_none() {
+            out["limits"] = json!(limits_state);
+        }
         self.host().ai_synced(&out);
         out
+    }
+
+    /// 残り枠の結果を保存し、状態の名前を返す
+    fn save_limits(&self, node_id: &str, l: &Limits, now: i64) -> &'static str {
+        let (windows, error) = match l {
+            Limits::Ok { windows, .. } => (windows.clone(), None),
+            Limits::NoPython(e) | Limits::Error(e) => (Vec::new(), Some(e.clone())),
+            Limits::NoCodex => (Vec::new(), None),
+        };
+        let r = LimitsReport { state: l.state().into(), windows, error, probe_version: codex_limits::probe_version() };
+        let _ = self.with_db(|d| d.save_limits(node_id, "codex", &r, now));
+        l.state()
+    }
+
+    /// 残り枠だけを問い合わせる（検証用の CLI から。間隔の下限を見ない）。ids が空なら、問い合わせる機体すべて
+    pub async fn ai_limits_sync(self: &Arc<Self>, ids: Option<Vec<String>>) -> Value {
+        let cfg = self.reload_config();
+        let all = ids.as_ref().is_none_or(Vec::is_empty);
+        let targets: Vec<Node> =
+            cfg.nodes.iter().filter(|n| codex_limits::enabled(n) && (all || ids.as_ref().is_some_and(|i| i.contains(&n.id)))).cloned().collect();
+        let mut out = Vec::new();
+        for n in targets {
+            let l = codex_limits::fetch(&n).await;
+            let st = self.save_limits(&n.id, &l, now_ms());
+            out.push(json!({ "node_id": n.id, "state": st }));
+        }
+        json!({ "results": out, "limits": self.with_db(|d| d.ai_limits()).unwrap_or_default() })
+    }
+
+    /// 数字の出どころ。f = { node_id, day }（その日の内訳）か { node_id, file }（1 ファイルの区間と検算）
+    pub fn ai_trace(&self, f: &Value) -> Result<Value, String> {
+        let node = js::string(f.get("node_id"));
+        if node.is_empty() || node == "undefined" {
+            return Err("node_id が無い".into());
+        }
+        if let Some(file) = f.get("file").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            return self.with_db(|d| d.ai_trace_file(&node, file));
+        }
+        let day = f.get("day").and_then(Value::as_f64).filter(|x| x.is_finite()).ok_or("day が無い")? as i64;
+        self.with_db(|d| d.ai_trace_day(&node, day))
+    }
+
+    /// 1 ファイルの区間を元ファイルと照合する（機体で区間を読み直して指紋だけを受け取る。読み取り専用）。
+    /// 生きている区間の新しいものから最大 20。結果は区間ごとに残す（検証済み・不一致・元ファイルなし）
+    pub async fn ai_verify(&self, f: &Value) -> Result<Value, String> {
+        let node_id = js::string(f.get("node_id"));
+        let file = js::string(f.get("file"));
+        let cfg = self.config();
+        let Some(node) = cfg.node(&node_id).cloned() else { return Err("台帳に無い機体".into()) };
+        let spans = self.with_db(|d| d.spans_of(&node_id, &file, 200))?;
+        let live: Vec<&Value> = spans.iter().filter(|s| s.get("superseded_by").is_none_or(Value::is_null)).take(20).collect();
+        if live.is_empty() {
+            return self.with_db(|d| d.ai_trace_file(&node_id, &file));
+        }
+        let items: Vec<(String, i64, i64)> = live
+            .iter()
+            .map(|s| (file.clone(), s.get("byte_start").and_then(Value::as_i64).unwrap_or(0), s.get("byte_end").and_then(Value::as_i64).unwrap_or(0)))
+            .collect();
+        let res = ai_sessions::verify(&node, &items).await?;
+        let now = now_ms();
+        for s in &live {
+            let (a, b) = (s.get("byte_start").and_then(Value::as_i64), s.get("byte_end").and_then(Value::as_i64));
+            let Some(r) = res.iter().find(|r| r.get("start").and_then(Value::as_i64) == a && r.get("end").and_then(Value::as_i64) == b) else { continue };
+            let (state, note) = match r.get("state").and_then(Value::as_str) {
+                Some("ok") if r.get("sha256") == s.get("sha256") => ("ok", None),
+                Some("ok") => ("mismatch", Some("区間の指紋が違う（元ファイルが書き換えられた）")),
+                Some("short") => ("mismatch", Some("元ファイルが区間より短い（書き換えられた）")),
+                _ => ("gone", Some("元ファイルが無い（指紋だけが残っている）")),
+            };
+            let id = s.get("id").and_then(Value::as_i64).unwrap_or(0);
+            self.with_db(|d| d.record_span_verify(id, state, note, now))?;
+        }
+        self.with_db(|d| d.ai_trace_file(&node_id, &file))
+    }
+
+    /// 出どころの台帳の様子（画面の「出どころ」）: 連鎖の検算・区間の状態の内訳・機体ごとの最後の取り込みの回・
+    /// 今の調査スクリプトの版と SHA-256・単価表の版と出典
+    pub fn ai_provenance(&self) -> Result<Value, String> {
+        let (counts, chain) = self.with_db(|d| Ok((d.provenance_counts()?, d.verify_chain()?)))?;
+        let (sha, ver) = ai_sessions::probe_meta();
+        Ok(json!({
+            "counts": counts, "chain": chain, "prices": crate::prices::table().meta(),
+            "probe": { "name": ai_sessions::AI_PROBE_NAME, "version": ver, "sha256": sha },
+            "limits_probe": { "name": "probes/codex_limits.py", "version": codex_limits::probe_version(), "sha256": crate::db::sha256_hex(codex_limits::LIMITS_PROBE.as_bytes()) },
+            "tune_version": env!("CARGO_PKG_VERSION"),
+        }))
     }
 
     /// 画面の AI（集計結果）。f は [`crate::db::Store::ai_summary`] と同じ。機体ごとの取り込みの様子も付ける
     pub fn ai_summary(&self, f: &Value) -> Result<Value, String> {
         let cfg = self.config();
         let now = now_ms();
-        let (mut s, cursors, last_at, pending) = self.with_db(|d| Ok((d.ai_summary(f, now)?, d.ai_cursors()?, d.get_meta("lastAiAt")?, d.ai_pending()?)))?;
+        let (mut s, cursors, last_at, pending, limits) =
+            self.with_db(|d| Ok((d.ai_summary(f, now)?, d.ai_cursors()?, d.get_meta("lastAiAt")?, d.ai_pending_among(&ai_ids(&cfg.nodes))?, d.ai_limits()?)))?;
         let nodes: Vec<Value> = cfg
             .nodes
             .iter()
             .map(|n| {
                 let c = cursors.iter().find(|c| js::is_str(c.get("node_id"), &n.id)).cloned().unwrap_or_else(|| json!({}));
-                let mut o = json!({ "id": n.id, "os": n.os, "shared": n.shared, "enabled": ai_sessions::enabled(n) });
+                let lim = limits.iter().find(|l| js::is_str(l.get("node_id"), &n.id) && js::is_str(l.get("tool"), "codex")).cloned().unwrap_or(Value::Null);
+                let mut o = json!({ "id": n.id, "os": n.os, "shared": n.shared, "enabled": ai_sessions::enabled(n), "limits_enabled": codex_limits::enabled(n), "limits": lim });
                 if let (Value::Object(m), Value::Object(cm)) = (&mut o, c) {
                     for (k, v) in cm {
                         if k != "node_id" {
@@ -318,6 +423,7 @@ impl Engine {
             m.insert("pending".into(), Value::Bool(pending));
             m.insert("lastAiAt".into(), last_at.unwrap_or(Value::Null));
             m.insert("schedule".into(), json!({ "enabled": sch.get("enabled"), "ai_minutes": sch.get("ai_minutes"), "catch_up_minutes": CATCH_UP_MINUTES }));
+            m.insert("limit_windows".into(), json!(codex_limits::KNOWN_WINDOWS.iter().map(|(m, l)| json!({ "mins": m, "label": l })).collect::<Vec<_>>()));
         }
         Ok(s)
     }
@@ -339,12 +445,35 @@ impl Engine {
             self.run_inventory(None).await;
         }
         if !self.is_ai_syncing() {
-            let pending = self.with_db(|d| d.ai_pending()).unwrap_or(false);
+            let ids = ai_ids(&self.config().nodes);
+            let pending = self.with_db(|d| d.ai_pending_among(&ids)).unwrap_or(false);
             let mins = if pending { CATCH_UP_MINUTES as f64 } else { js::num(s.get("ai_minutes")) };
             if mins.is_finite() && since("lastAiAt") >= mins * 60_000.0 {
                 self.ai_sync(None).await;
             }
         }
+    }
+}
+
+/// AI のセッションを取り込む機体の id
+fn ai_ids(nodes: &[Node]) -> Vec<String> {
+    nodes.iter().filter(|n| ai_sessions::enabled(n)).map(|n| n.id.clone()).collect()
+}
+
+/// 出どころの台帳に書く、AI の取り込み 1 回の見出し（実行 ID・調査スクリプトの版と SHA-256・Tune の版・開始と終了）
+pub fn ai_run_meta(node_id: &str, started_at: i64, finished_at: i64) -> RunMeta {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let (sha, ver) = ai_sessions::probe_meta();
+    RunMeta {
+        run_id: format!("ai-{started_at}-{}-{node_id}", SEQ.fetch_add(1, Ordering::SeqCst)),
+        kind: "ai_sessions".into(),
+        node_id: node_id.into(),
+        probe: ai_sessions::AI_PROBE_NAME.into(),
+        probe_version: ver.clone(),
+        probe_sha256: sha.clone(),
+        tune_version: env!("CARGO_PKG_VERSION").into(),
+        started_at,
+        finished_at,
     }
 }
 

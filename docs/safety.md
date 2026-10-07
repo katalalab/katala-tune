@@ -51,7 +51,16 @@ NeonMonitor（Windows のメモリ監視・自動強制終了ツール）の静�
 - 取り出すのはセッション単位と時間ごとの数・名前・時刻・モデル・版・トークン・PR の URL だけ。会話の本文・ツールの入出力・コマンドライン引数は取り出さない・保存しない（`test/ai-sessions.test.js` で出力に含まれないことを確かめている）。
 - cwd・ファイルの鍵・エラーの文のホームは `~` に置き換える（Claude Code のプロジェクト名に入っているホームも）。
 - 1回は 25 秒で区切る。形の違う行は飛ばし、1行のせいでファイル全体を読めなくしない。読めなかったファイルは位置を進めず、次回に読み直す。
-- 保存は tune-core だけの表（`ai_sessions`・`ai_usage_hourly`・`ai_cursors`）。台帳の機体に `"ai_sessions": false` と書くと、その機体からは取り込まない。**共用機（`shared: true`）は既定で取り込まない**（他の人のセッションの cwd や PR を集めないため）。取り込むときは `"ai_sessions": true` と明示する
+- 保存は tune-core だけの表（`ai_sessions`・`ai_usage_hourly`・`ai_cursors`・`ai_responses`）。台帳の機体に `"ai_sessions": false` と書くと、その機体からは取り込まない。**共用機（`shared: true`）は既定で取り込まない**（他の人のセッションの cwd や PR を集めないため）。取り込むときは `"ai_sessions": true` と明示する
+- ファイルをまたぐ重複を除くため、Claude Code の応答ごとの量を持つ。応答 ID そのものは出さず、SHA-256 の先頭 16 桁だけを出す・保存する（`test/ai-sessions.test.js` で ID が出力に含まれないことを確かめている）
+- 出どころの台帳（`ingest_run`・`source_span`）に残すのは、区間のバイト位置・区間の SHA-256・行数・調査スクリプトの版と SHA-256 だけ。本文は残さない。元ファイルとの照合も、機体で区間を読み直して指紋と行数だけを受け取る（読み取り専用）
+- 連鎖のハッシュは行の書き換え・削除に気づくためのもので、DB を丸ごと作り直せる相手には効かない（docs/observability.md）
+
+## Codex の残り枠
+
+- `probes/codex_limits.py` は各機体で `codex app-server` を起動して `account/rateLimits/read` を問い合わせ、窓の長さ・使用率・リセット時刻だけを出す。認証は Codex が持ち、Tune は Cookie・トークン・auth.json を読まない（`crates/tune-core/src/codex_limits.rs` のテストで、調査スクリプトが認証のファイルに触れないことを確かめている）。このスクリプト自身は機体に何も書かない（Codex が自分の認証を更新するなど、Codex 自身の動きはある）
+- 呼ぶのは AI の取り込みのとき（既定 30 分ごと）だけ。**共用機では呼ばない**（`ai_sessions: true` と書いた共用機でも。呼ぶなら `"codex_limits": true`）
+- テストは偽の codex（標準入出力で同じ受け答えをするスクリプト）で行い、本物の codex は呼ばない
 
 ## 外への送信（Do-gu）
 

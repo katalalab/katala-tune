@@ -8,10 +8,13 @@
 //! Electron 版と同じ DB を共有するので、表の定義は lib/db.js と揃える（CREATE TABLE IF NOT EXISTS のまま）。
 
 mod actions;
+mod ai_limits;
 mod ai_sessions;
+mod ai_usage;
 mod checks;
 mod inventory;
 mod logs;
+pub mod provenance;
 mod snapshots;
 
 use std::path::Path;
@@ -20,10 +23,13 @@ use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value};
 
-pub use ai_sessions::{AiIngested, SESSION_PAGE_MAX, Session as AiSession, TOK_KEYS, hour_deltas};
+pub use ai_limits::{LimitWindow, LimitsReport};
+pub use ai_sessions::{AiIngested, SESSION_PAGE_MAX, Session as AiSession, TOK_KEYS, hour_deltas, response_of};
+pub use ai_usage::{UsageRow, UsageWindow, dup_delta, span_state, summarize_usage};
 pub use checks::{Change, Check};
 pub use inventory::InventorySaved;
 pub use logs::{LogCount, LogRow, TopSignature};
+pub use provenance::{RunMeta, SpanIn, sha256_hex};
 pub use snapshots::Snapshot;
 
 pub const DB_FILE: &str = "katala-tune.db";
@@ -35,7 +41,17 @@ pub const QUERY_LIMIT_MAX: i64 = 2000;
 pub const SIGNATURE_LIMIT_MAX: i64 = 500;
 
 const PRAGMAS: &str = "PRAGMA journal_mode = WAL;\nPRAGMA synchronous = NORMAL;\n";
-const SCHEMA_PARTS: &[&str] = &[snapshots::SCHEMA, actions::SCHEMA, logs::SCHEMA, checks::SCHEMA, META_SCHEMA, inventory::SCHEMA, ai_sessions::SCHEMA];
+const SCHEMA_PARTS: &[&str] = &[
+    snapshots::SCHEMA,
+    actions::SCHEMA,
+    logs::SCHEMA,
+    checks::SCHEMA,
+    META_SCHEMA,
+    inventory::SCHEMA,
+    ai_sessions::SCHEMA,
+    provenance::SCHEMA,
+    ai_limits::SCHEMA,
+];
 const META_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT, updated_at INTEGER);\n";
 
 pub type Result<T> = rusqlite::Result<T>;
@@ -62,9 +78,16 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Store> {
         conn.execute_batch(PRAGMAS)?;
+        // 出どころの台帳を足す前の DB の ai_sessions には tracked が無い（CREATE TABLE IF NOT EXISTS では足されない）。後で足す（ai_sessions::migrate）
+        let old_ai = conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ai_sessions'")?.exists([])?;
         conn.execute_batch(&SCHEMA_PARTS.concat())?;
         let s = Store { conn };
         s.migrate()?;
+        if old_ai {
+            s.tx(ai_sessions::migrate)?;
+        } else {
+            s.conn.execute("INSERT OR IGNORE INTO meta (k, v, updated_at) VALUES ('migr_ai_provenance_v1', 'true', ?)", [now_ms()])?;
+        }
         Ok(s)
     }
 
@@ -232,5 +255,43 @@ mod tests {
         assert!(bytes > 0);
         // 移行は一度だけ
         assert_eq!(s.get_meta("migr_win_ts_v1").unwrap(), Some(Value::Bool(true)));
+        assert_eq!(s.get_meta("migr_ai_provenance_v1").unwrap(), Some(Value::Bool(true)));
+    }
+
+    #[test]
+    fn old_ai_tables_get_tracked_and_forget_cursors() {
+        // 出どころの台帳を足す前の DB（ai_sessions に tracked が無い・続きの位置がある）
+        let dir = std::env::temp_dir().join(format!("kt-db-migr-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let c = Connection::open(dir.join(DB_FILE)).unwrap();
+            c.execute_batch(
+                "CREATE TABLE ai_sessions (node_id TEXT NOT NULL, file TEXT NOT NULL, tool TEXT NOT NULL, session_id TEXT, parent_id TEXT, cwd TEXT, version TEXT,
+                   origin TEXT, model TEXT, first_ts INTEGER, last_ts INTEGER, prompts INTEGER NOT NULL DEFAULT 0, assistant_msgs INTEGER NOT NULL DEFAULT 0,
+                   tool_calls INTEGER NOT NULL DEFAULT 0, tool_errors INTEGER NOT NULL DEFAULT 0, turn_errors INTEGER NOT NULL DEFAULT 0, hook_errors INTEGER NOT NULL DEFAULT 0,
+                   api_errors INTEGER NOT NULL DEFAULT 0, tok_in INTEGER NOT NULL DEFAULT 0, tok_out INTEGER NOT NULL DEFAULT 0, tok_cache_read INTEGER NOT NULL DEFAULT 0,
+                   tok_cache_write INTEGER NOT NULL DEFAULT 0, tok_reasoning INTEGER NOT NULL DEFAULT 0, tokens_mode TEXT NOT NULL DEFAULT 'add',
+                   tool_counts TEXT, tool_error_counts TEXT, prs TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY (node_id, file)) WITHOUT ROWID;
+                 INSERT INTO ai_sessions (node_id, file, tool, tok_out, updated_at) VALUES ('n1', 'claude:a.jsonl', 'claude', 5, 1);
+                 CREATE TABLE ai_cursors (node_id TEXT PRIMARY KEY, files TEXT NOT NULL DEFAULT '{}', updated_at INTEGER, last_ok_at INTEGER, last_error TEXT, file_errors TEXT,
+                   truncated INTEGER NOT NULL DEFAULT 0, no_python INTEGER NOT NULL DEFAULT 0, files_total INTEGER, files_changed INTEGER, bytes_pending INTEGER,
+                   bytes_read INTEGER, elapsed_s REAL) WITHOUT ROWID;
+                 INSERT INTO ai_cursors (node_id, files) VALUES ('n1', '{\"claude:a.jsonl\":5}');",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&dir).unwrap();
+        let old = s.ai_session("n1", "claude:a.jsonl").unwrap().unwrap();
+        assert_eq!((old.tokens[1], old.tracked), (5, false), "前のセッションは残り、台帳なしの印");
+        assert!(s.ai_files("n1").unwrap().is_empty(), "続きの位置を忘れて最初から読み直す");
+        assert!(s.ai_pending().unwrap());
+        assert!(s.ai_pending_among(&["n1".into()]).unwrap());
+        assert!(!s.ai_pending_among(&["other".into()]).unwrap(), "取り込まない機体の古い印では急がない");
+        drop(s);
+        // 2 回目は何もしない
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.get_meta("migr_ai_provenance_v1").unwrap(), Some(Value::Bool(true)));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
