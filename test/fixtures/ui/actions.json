@@ -1,0 +1,108 @@
+[
+ {
+  "id": "a6",
+  "at": "@-40m",
+  "node_id": "studio-mac",
+  "type": "kill-process",
+  "params": {
+   "pid": 1874,
+   "name": "Google Drive",
+   "start": null,
+   "min_cpu": 50
+  },
+  "label": "studio-mac: このプロセスを終了（Google Drive / Google Drive が CPU 101%（1コア換算））",
+  "ok": true,
+  "output": "終了を確認\nPID 1874 は終了した",
+  "undo": null,
+  "undo_of": null
+ },
+ {
+  "id": "a5",
+  "at": "@-180m",
+  "node_id": "gpu-tower",
+  "type": "set-power-plan",
+  "params": {
+   "guid": "381b4222-f694-41f0-9685-ff5bb260df2e",
+   "prev_guid": "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+  },
+  "label": "gpu-tower: 元に戻す（gpu-tower: 高パフォーマンスにする（電源プランが「バランス」））",
+  "ok": true,
+  "output": "完了\n電源プランを「バランス」に戻した",
+  "undo": null,
+  "undo_of": "a4"
+ },
+ {
+  "id": "a4",
+  "at": "@-1560m",
+  "node_id": "gpu-tower",
+  "type": "set-power-plan",
+  "params": {
+   "guid": "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
+   "prev_guid": "381b4222-f694-41f0-9685-ff5bb260df2e"
+  },
+  "label": "gpu-tower: 高パフォーマンスにする（電源プランが「バランス」）",
+  "ok": true,
+  "output": "完了\n電源プランを「高パフォーマンス」にした",
+  "undo": {
+   "type": "set-power-plan",
+   "params": {
+    "guid": "381b4222-f694-41f0-9685-ff5bb260df2e",
+    "prev_guid": "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+   }
+  },
+  "undo_of": null
+ },
+ {
+  "id": "a3",
+  "at": "@-4320m",
+  "node_id": "media-pc",
+  "type": "task-disable",
+  "params": {
+   "path": "\\Example\\",
+   "name": "AutoUpdate"
+  },
+  "label": "media-pc: 無効化: AutoUpdate",
+  "ok": true,
+  "output": "完了\nSUCCESS: The parameters of scheduled task \"\\Example\\AutoUpdate\" have been changed.",
+  "undo": {
+   "type": "task-enable",
+   "params": {
+    "path": "\\Example\\",
+    "name": "AutoUpdate"
+   }
+  },
+  "undo_of": null
+ },
+ {
+  "id": "a2",
+  "at": "@-4440m",
+  "node_id": "build-mini",
+  "type": "launchd-kickstart",
+  "params": {
+   "label": "com.example.cleanup",
+   "plist": "~/Library/LaunchAgents/com.example.cleanup.plist"
+  },
+  "label": "build-mini: 今すぐ実行: com.example.cleanup",
+  "ok": false,
+  "output": "失敗\nkickstart: exit 78（設定の誤り）",
+  "undo": null,
+  "undo_of": null
+ },
+ {
+  "id": "a1",
+  "at": "@-7200m",
+  "node_id": "air-m3",
+  "type": "kill-process",
+  "params": {
+   "pid": 6610,
+   "name": "Google Chrome Helper (Renderer)",
+   "start": null,
+   "min_cpu": 50
+  },
+  "label": "air-m3: このプロセスを終了（Google Chrome / Google Chrome Helper (Renderer) が CPU 96%（1コア換算））",
+  "ok": true,
+  "output": "終了未確認\n終了の合図は送ったが、3 秒後もまだ動いている",
+  "undo": null,
+  "undo_of": null
+ }
+]

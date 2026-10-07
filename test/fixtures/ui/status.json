@@ -1,0 +1,1291 @@
+{
+ "checks": [
+  {
+   "scope": "studio-mac",
+   "id": "probe",
+   "name": "分析",
+   "status": "ok",
+   "detail": "12 分前に成功（8.2 秒）",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "studio-mac",
+   "id": "logs",
+   "name": "ログ取り込み",
+   "status": "ok",
+   "detail": "2 か所、最新 4 分前",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "studio-mac",
+   "id": "jobs",
+   "name": "定期処理",
+   "status": "ok",
+   "detail": "6 件、前回失敗なし",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "studio-mac",
+   "id": "job:com.example.backup",
+   "name": "定期処理 com.example.backup",
+   "status": "ok",
+   "detail": "loaded、前回の結果 0",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "studio-mac",
+   "id": "proc:ollama",
+   "name": "プロセス ollama",
+   "status": "ok",
+   "detail": "動いている",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "studio-mac",
+   "id": "disk",
+   "name": "ディスク",
+   "status": "ok",
+   "detail": "/ 実効の空き 655 GB（35.3%）",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "studio-mac",
+   "id": "memory",
+   "name": "メモリ",
+   "status": "ok",
+   "detail": "圧迫 normal・swap 1.2 GB",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "studio-mac",
+   "id": "cpu",
+   "name": "CPU",
+   "status": "ok",
+   "detail": "34.2%、1コアを使い切るプロセスあり",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "studio-mac",
+   "id": "stability",
+   "name": "安定性",
+   "status": "ok",
+   "detail": "パニックの記録なし",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "studio-mac",
+   "id": "flood",
+   "name": "エラーの繰り返し",
+   "status": "ok",
+   "detail": "24時間で200件を超える同じエラーなし",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "air-m3",
+   "id": "probe",
+   "name": "分析",
+   "status": "ok",
+   "detail": "13 分前に成功（9.5 秒）",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "air-m3",
+   "id": "logs",
+   "name": "ログ取り込み",
+   "status": "ok",
+   "detail": "2 か所、最新 4 分前",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "air-m3",
+   "id": "jobs",
+   "name": "定期処理",
+   "status": "ok",
+   "detail": "2 件、前回失敗なし",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "air-m3",
+   "id": "disk",
+   "name": "ディスク",
+   "status": "warn",
+   "detail": "/ 実効の空き 37 GB（8.1%）",
+   "since": "@-5760m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "air-m3",
+   "id": "memory",
+   "name": "メモリ",
+   "status": "warn",
+   "detail": "圧迫 warn・swap 3.6 GB",
+   "since": "@-3060m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "air-m3",
+   "id": "cpu",
+   "name": "CPU",
+   "status": "ok",
+   "detail": "64.3%",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "air-m3",
+   "id": "stability",
+   "name": "安定性",
+   "status": "ok",
+   "detail": "パニックの記録なし",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "air-m3",
+   "id": "flood",
+   "name": "エラーの繰り返し",
+   "status": "ok",
+   "detail": "24時間で200件を超える同じエラーなし",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "build-mini",
+   "id": "probe",
+   "name": "分析",
+   "status": "ok",
+   "detail": "12 分前に成功（6.9 秒）",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "build-mini",
+   "id": "logs",
+   "name": "ログ取り込み",
+   "status": "ok",
+   "detail": "2 か所、最新 4 分前",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "build-mini",
+   "id": "jobs",
+   "name": "定期処理",
+   "status": "warn",
+   "detail": "1 件が前回失敗: com.example.cleanup",
+   "since": "@-4320m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "build-mini",
+   "id": "job:com.example.nightly-build",
+   "name": "定期処理 com.example.nightly-build",
+   "status": "ok",
+   "detail": "loaded、前回の結果 0",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "build-mini",
+   "id": "disk",
+   "name": "ディスク",
+   "status": "ok",
+   "detail": "/ 実効の空き 612 GB（61.6%）",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "build-mini",
+   "id": "memory",
+   "name": "メモリ",
+   "status": "ok",
+   "detail": "圧迫 normal・swap 0 GB",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "build-mini",
+   "id": "cpu",
+   "name": "CPU",
+   "status": "ok",
+   "detail": "11.8%",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "build-mini",
+   "id": "stability",
+   "name": "安定性",
+   "status": "ok",
+   "detail": "パニックの記録なし",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "build-mini",
+   "id": "flood",
+   "name": "エラーの繰り返し",
+   "status": "ok",
+   "detail": "24時間で200件を超える同じエラーなし",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "gpu-tower",
+   "id": "probe",
+   "name": "分析",
+   "status": "ok",
+   "detail": "12 分前に成功（12.1 秒）",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "gpu-tower",
+   "id": "logs",
+   "name": "ログ取り込み",
+   "status": "ok",
+   "detail": "3 か所、最新 4 分前",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "gpu-tower",
+   "id": "jobs",
+   "name": "定期処理",
+   "status": "warn",
+   "detail": "1 件が前回失敗: NightlyBackup",
+   "since": "@-1800m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "gpu-tower",
+   "id": "svc:Tailscale",
+   "name": "サービス Tailscale",
+   "status": "ok",
+   "detail": "running（起動 auto）",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "gpu-tower",
+   "id": "svc:beszel-agent",
+   "name": "サービス beszel-agent",
+   "status": "fail",
+   "detail": "stopped（起動 auto）",
+   "since": "@-300m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "gpu-tower",
+   "id": "job:\\NightlyBackup",
+   "name": "定期処理 \\NightlyBackup",
+   "status": "warn",
+   "detail": "ready、前回の結果 1",
+   "since": "@-1800m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "gpu-tower",
+   "id": "proc:ollama",
+   "name": "プロセス ollama",
+   "status": "ok",
+   "detail": "動いている",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "gpu-tower",
+   "id": "disk",
+   "name": "ディスク",
+   "status": "ok",
+   "detail": "C: 実効の空き 402 GB（21.6%）",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "gpu-tower",
+   "id": "memory",
+   "name": "メモリ",
+   "status": "warn",
+   "detail": "空き 24%・コミット 84%",
+   "since": "@-1200m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "gpu-tower",
+   "id": "cpu",
+   "name": "CPU",
+   "status": "ok",
+   "detail": "38.4%、1コアを使い切るプロセスあり",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "gpu-tower",
+   "id": "stability",
+   "name": "安定性",
+   "status": "fail",
+   "detail": "7日で予期しない停止 4 回",
+   "since": "@-2880m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "gpu-tower",
+   "id": "defender",
+   "name": "Defender",
+   "status": "ok",
+   "detail": "リアルタイム保護 有効",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "gpu-tower",
+   "id": "flood",
+   "name": "エラーの繰り返し",
+   "status": "ok",
+   "detail": "24時間で200件を超える同じエラーなし",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "gpu-tower",
+   "id": "hardware",
+   "name": "ハードウェア",
+   "status": "warn",
+   "detail": "ハードウェアエラー（WHEA）が7日で 4 件",
+   "since": "@-4560m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "media-pc",
+   "id": "probe",
+   "name": "分析",
+   "status": "ok",
+   "detail": "13 分前に成功（9.6 秒）",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "media-pc",
+   "id": "logs",
+   "name": "ログ取り込み",
+   "status": "ok",
+   "detail": "3 か所、最新 4 分前",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "media-pc",
+   "id": "jobs",
+   "name": "定期処理",
+   "status": "ok",
+   "detail": "4 件、前回失敗なし",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "media-pc",
+   "id": "svc:Tailscale",
+   "name": "サービス Tailscale",
+   "status": "ok",
+   "detail": "running（起動 auto）",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "media-pc",
+   "id": "disk",
+   "name": "ディスク",
+   "status": "ok",
+   "detail": "C: 実効の空き 118 GB（12.7%）",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "media-pc",
+   "id": "memory",
+   "name": "メモリ",
+   "status": "warn",
+   "detail": "空き 40%・コミット 81%",
+   "since": "@-540m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "media-pc",
+   "id": "cpu",
+   "name": "CPU",
+   "status": "ok",
+   "detail": "22.6%",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "media-pc",
+   "id": "stability",
+   "name": "安定性",
+   "status": "ok",
+   "detail": "7日で予期しない停止 0 回",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "media-pc",
+   "id": "defender",
+   "name": "Defender",
+   "status": "warn",
+   "detail": "リアルタイム保護 無効",
+   "since": "@-8640m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "media-pc",
+   "id": "flood",
+   "name": "エラーの繰り返し",
+   "status": "ok",
+   "detail": "24時間で200件を超える同じエラーなし",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "family-pc",
+   "id": "probe",
+   "name": "分析",
+   "status": "fail",
+   "detail": "前回の分析が失敗: ssh: connect to host family-pc port 22: Operation timed out",
+   "since": "@-70m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "family-pc",
+   "id": "logs",
+   "name": "ログ取り込み",
+   "status": "fail",
+   "detail": "win_system: ssh: connect to host family-pc port 22: Operation timed out / win_application: ssh: connect to host family-pc port 22: Operation timed out / neonmonitor: ssh: connect to host family-pc port 22: Operation timed out",
+   "since": "@-70m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "family-pc",
+   "id": "jobs",
+   "name": "定期処理",
+   "status": "ok",
+   "detail": "1 件、前回失敗なし",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "family-pc",
+   "id": "disk",
+   "name": "ディスク",
+   "status": "ok",
+   "detail": "C: 実効の空き 61 GB（12.8%）",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "family-pc",
+   "id": "memory",
+   "name": "メモリ",
+   "status": "ok",
+   "detail": "空き 41%・コミット 62%",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "family-pc",
+   "id": "cpu",
+   "name": "CPU",
+   "status": "ok",
+   "detail": "8.2%",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "family-pc",
+   "id": "stability",
+   "name": "安定性",
+   "status": "ok",
+   "detail": "7日で予期しない停止 0 回",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "family-pc",
+   "id": "defender",
+   "name": "Defender",
+   "status": "ok",
+   "detail": "リアルタイム保護 有効",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "family-pc",
+   "id": "flood",
+   "name": "エラーの繰り返し",
+   "status": "ok",
+   "detail": "24時間で200件を超える同じエラーなし",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "_app",
+   "id": "config",
+   "name": "機体台帳",
+   "status": "ok",
+   "detail": "6 台、保護 3 件",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "_app",
+   "id": "db",
+   "name": "ローカル DB",
+   "status": "ok",
+   "detail": "整合性 ok、48.2 MB",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "_app",
+   "id": "scheduler",
+   "name": "自動スキャン",
+   "status": "ok",
+   "detail": "分析 60 分ごと（前回 12 分前）、ログ 15 分ごと（前回 4 分前）",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "_app",
+   "id": "fleet",
+   "name": "katala-fleet 連携",
+   "status": "ok",
+   "detail": "取得 30 分前",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  },
+  {
+   "scope": "_app",
+   "id": "login",
+   "name": "ログイン時に起動",
+   "status": "ok",
+   "detail": "有効",
+   "since": "@-12960m",
+   "checked_at": "@-1m"
+  }
+ ],
+ "events": [
+  {
+   "ts": "@-70m",
+   "scope": "family-pc",
+   "check_id": "probe",
+   "name": "分析",
+   "from_status": "ok",
+   "to_status": "fail",
+   "detail": "前回の分析が失敗: ssh: connect to host family-pc port 22: Operation timed out",
+   "id": 69
+  },
+  {
+   "ts": "@-70m",
+   "scope": "family-pc",
+   "check_id": "logs",
+   "name": "ログ取り込み",
+   "from_status": "ok",
+   "to_status": "fail",
+   "detail": "win_system: ssh: connect to host family-pc port 22: Operation timed out / win_application: ssh: connect to host family-pc port 22: Operation timed out / neonmonitor: ssh: connect to host family-pc port 22: Operation timed out",
+   "id": 68
+  },
+  {
+   "ts": "@-180m",
+   "scope": "gpu-tower",
+   "check_id": "cpu",
+   "name": "CPU",
+   "from_status": "warn",
+   "to_status": "ok",
+   "detail": "38.4%",
+   "id": 67
+  },
+  {
+   "ts": "@-240m",
+   "scope": "gpu-tower",
+   "check_id": "cpu",
+   "name": "CPU",
+   "from_status": "ok",
+   "to_status": "warn",
+   "detail": "91.2%、1コアを使い切るプロセスあり",
+   "id": 66
+  },
+  {
+   "ts": "@-300m",
+   "scope": "gpu-tower",
+   "check_id": "svc:beszel-agent",
+   "name": "サービス beszel-agent",
+   "from_status": "ok",
+   "to_status": "fail",
+   "detail": "stopped（起動 auto）",
+   "id": 65
+  },
+  {
+   "ts": "@-480m",
+   "scope": "media-pc",
+   "check_id": "probe",
+   "name": "分析",
+   "from_status": "fail",
+   "to_status": "ok",
+   "detail": "13 分前に成功（9.6 秒）",
+   "id": 64
+  },
+  {
+   "ts": "@-540m",
+   "scope": "media-pc",
+   "check_id": "memory",
+   "name": "メモリ",
+   "from_status": "ok",
+   "to_status": "warn",
+   "detail": "空き 40%・コミット 81%",
+   "id": 63
+  },
+  {
+   "ts": "@-540m",
+   "scope": "media-pc",
+   "check_id": "probe",
+   "name": "分析",
+   "from_status": "ok",
+   "to_status": "fail",
+   "detail": "前回の分析が失敗: ssh: connect to host media-pc port 22: Connection refused",
+   "id": 62
+  },
+  {
+   "ts": "@-1200m",
+   "scope": "gpu-tower",
+   "check_id": "memory",
+   "name": "メモリ",
+   "from_status": "ok",
+   "to_status": "warn",
+   "detail": "空き 24%・コミット 84%",
+   "id": 61
+  },
+  {
+   "ts": "@-1800m",
+   "scope": "gpu-tower",
+   "check_id": "jobs",
+   "name": "定期処理",
+   "from_status": "ok",
+   "to_status": "warn",
+   "detail": "1 件が前回失敗: NightlyBackup",
+   "id": 60
+  },
+  {
+   "ts": "@-1800m",
+   "scope": "gpu-tower",
+   "check_id": "job:\\NightlyBackup",
+   "name": "定期処理 \\NightlyBackup",
+   "from_status": "ok",
+   "to_status": "warn",
+   "detail": "ready、前回の結果 1",
+   "id": 59
+  },
+  {
+   "ts": "@-2880m",
+   "scope": "gpu-tower",
+   "check_id": "stability",
+   "name": "安定性",
+   "from_status": "ok",
+   "to_status": "fail",
+   "detail": "7日で予期しない停止 4 回",
+   "id": 58
+  },
+  {
+   "ts": "@-3060m",
+   "scope": "air-m3",
+   "check_id": "memory",
+   "name": "メモリ",
+   "from_status": "ok",
+   "to_status": "warn",
+   "detail": "圧迫 warn・swap 3.6 GB",
+   "id": 57
+  },
+  {
+   "ts": "@-4320m",
+   "scope": "build-mini",
+   "check_id": "jobs",
+   "name": "定期処理",
+   "from_status": "ok",
+   "to_status": "warn",
+   "detail": "1 件が前回失敗: com.example.cleanup",
+   "id": 56
+  },
+  {
+   "ts": "@-4560m",
+   "scope": "gpu-tower",
+   "check_id": "hardware",
+   "name": "ハードウェア",
+   "from_status": "ok",
+   "to_status": "warn",
+   "detail": "ハードウェアエラー（WHEA）が7日で 4 件",
+   "id": 55
+  },
+  {
+   "ts": "@-5760m",
+   "scope": "air-m3",
+   "check_id": "disk",
+   "name": "ディスク",
+   "from_status": "ok",
+   "to_status": "warn",
+   "detail": "/ 実効の空き 37 GB（8.1%）",
+   "id": 54
+  },
+  {
+   "ts": "@-8640m",
+   "scope": "media-pc",
+   "check_id": "defender",
+   "name": "Defender",
+   "from_status": "ok",
+   "to_status": "warn",
+   "detail": "リアルタイム保護 無効",
+   "id": 53
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "studio-mac",
+   "check_id": "probe",
+   "name": "分析",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "12 分前に成功（8.2 秒）",
+   "id": 52
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "studio-mac",
+   "check_id": "logs",
+   "name": "ログ取り込み",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "2 か所、最新 4 分前",
+   "id": 51
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "studio-mac",
+   "check_id": "jobs",
+   "name": "定期処理",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "6 件、前回失敗なし",
+   "id": 50
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "studio-mac",
+   "check_id": "job:com.example.backup",
+   "name": "定期処理 com.example.backup",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "loaded、前回の結果 0",
+   "id": 49
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "studio-mac",
+   "check_id": "proc:ollama",
+   "name": "プロセス ollama",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "動いている",
+   "id": 48
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "studio-mac",
+   "check_id": "disk",
+   "name": "ディスク",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "/ 実効の空き 655 GB（35.3%）",
+   "id": 47
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "studio-mac",
+   "check_id": "memory",
+   "name": "メモリ",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "圧迫 normal・swap 1.2 GB",
+   "id": 46
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "studio-mac",
+   "check_id": "cpu",
+   "name": "CPU",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "34.2%、1コアを使い切るプロセスあり",
+   "id": 45
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "studio-mac",
+   "check_id": "stability",
+   "name": "安定性",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "パニックの記録なし",
+   "id": 44
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "studio-mac",
+   "check_id": "flood",
+   "name": "エラーの繰り返し",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "24時間で200件を超える同じエラーなし",
+   "id": 43
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "air-m3",
+   "check_id": "probe",
+   "name": "分析",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "13 分前に成功（9.5 秒）",
+   "id": 42
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "air-m3",
+   "check_id": "logs",
+   "name": "ログ取り込み",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "2 か所、最新 4 分前",
+   "id": 41
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "air-m3",
+   "check_id": "jobs",
+   "name": "定期処理",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "2 件、前回失敗なし",
+   "id": 40
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "air-m3",
+   "check_id": "cpu",
+   "name": "CPU",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "64.3%",
+   "id": 39
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "air-m3",
+   "check_id": "stability",
+   "name": "安定性",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "パニックの記録なし",
+   "id": 38
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "air-m3",
+   "check_id": "flood",
+   "name": "エラーの繰り返し",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "24時間で200件を超える同じエラーなし",
+   "id": 37
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "build-mini",
+   "check_id": "probe",
+   "name": "分析",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "12 分前に成功（6.9 秒）",
+   "id": 36
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "build-mini",
+   "check_id": "logs",
+   "name": "ログ取り込み",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "2 か所、最新 4 分前",
+   "id": 35
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "build-mini",
+   "check_id": "job:com.example.nightly-build",
+   "name": "定期処理 com.example.nightly-build",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "loaded、前回の結果 0",
+   "id": 34
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "build-mini",
+   "check_id": "disk",
+   "name": "ディスク",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "/ 実効の空き 612 GB（61.6%）",
+   "id": 33
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "build-mini",
+   "check_id": "memory",
+   "name": "メモリ",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "圧迫 normal・swap 0 GB",
+   "id": 32
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "build-mini",
+   "check_id": "cpu",
+   "name": "CPU",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "11.8%",
+   "id": 31
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "build-mini",
+   "check_id": "stability",
+   "name": "安定性",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "パニックの記録なし",
+   "id": 30
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "build-mini",
+   "check_id": "flood",
+   "name": "エラーの繰り返し",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "24時間で200件を超える同じエラーなし",
+   "id": 29
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "gpu-tower",
+   "check_id": "probe",
+   "name": "分析",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "12 分前に成功（12.1 秒）",
+   "id": 28
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "gpu-tower",
+   "check_id": "logs",
+   "name": "ログ取り込み",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "3 か所、最新 4 分前",
+   "id": 27
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "gpu-tower",
+   "check_id": "svc:Tailscale",
+   "name": "サービス Tailscale",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "running（起動 auto）",
+   "id": 26
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "gpu-tower",
+   "check_id": "proc:ollama",
+   "name": "プロセス ollama",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "動いている",
+   "id": 25
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "gpu-tower",
+   "check_id": "disk",
+   "name": "ディスク",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "C: 実効の空き 402 GB（21.6%）",
+   "id": 24
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "gpu-tower",
+   "check_id": "cpu",
+   "name": "CPU",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "38.4%、1コアを使い切るプロセスあり",
+   "id": 23
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "gpu-tower",
+   "check_id": "defender",
+   "name": "Defender",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "リアルタイム保護 有効",
+   "id": 22
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "gpu-tower",
+   "check_id": "flood",
+   "name": "エラーの繰り返し",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "24時間で200件を超える同じエラーなし",
+   "id": 21
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "media-pc",
+   "check_id": "probe",
+   "name": "分析",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "13 分前に成功（9.6 秒）",
+   "id": 20
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "media-pc",
+   "check_id": "logs",
+   "name": "ログ取り込み",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "3 か所、最新 4 分前",
+   "id": 19
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "media-pc",
+   "check_id": "jobs",
+   "name": "定期処理",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "4 件、前回失敗なし",
+   "id": 18
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "media-pc",
+   "check_id": "svc:Tailscale",
+   "name": "サービス Tailscale",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "running（起動 auto）",
+   "id": 17
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "media-pc",
+   "check_id": "disk",
+   "name": "ディスク",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "C: 実効の空き 118 GB（12.7%）",
+   "id": 16
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "media-pc",
+   "check_id": "cpu",
+   "name": "CPU",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "22.6%",
+   "id": 15
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "media-pc",
+   "check_id": "stability",
+   "name": "安定性",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "7日で予期しない停止 0 回",
+   "id": 14
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "media-pc",
+   "check_id": "flood",
+   "name": "エラーの繰り返し",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "24時間で200件を超える同じエラーなし",
+   "id": 13
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "family-pc",
+   "check_id": "jobs",
+   "name": "定期処理",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "1 件、前回失敗なし",
+   "id": 12
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "family-pc",
+   "check_id": "disk",
+   "name": "ディスク",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "C: 実効の空き 61 GB（12.8%）",
+   "id": 11
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "family-pc",
+   "check_id": "memory",
+   "name": "メモリ",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "空き 41%・コミット 62%",
+   "id": 10
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "family-pc",
+   "check_id": "cpu",
+   "name": "CPU",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "8.2%",
+   "id": 9
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "family-pc",
+   "check_id": "stability",
+   "name": "安定性",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "7日で予期しない停止 0 回",
+   "id": 8
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "family-pc",
+   "check_id": "defender",
+   "name": "Defender",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "リアルタイム保護 有効",
+   "id": 7
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "family-pc",
+   "check_id": "flood",
+   "name": "エラーの繰り返し",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "24時間で200件を超える同じエラーなし",
+   "id": 6
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "_app",
+   "check_id": "config",
+   "name": "機体台帳",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "6 台、保護 3 件",
+   "id": 5
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "_app",
+   "check_id": "db",
+   "name": "ローカル DB",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "整合性 ok、48.2 MB",
+   "id": 4
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "_app",
+   "check_id": "scheduler",
+   "name": "自動スキャン",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "分析 60 分ごと（前回 12 分前）、ログ 15 分ごと（前回 4 分前）",
+   "id": 3
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "_app",
+   "check_id": "fleet",
+   "name": "katala-fleet 連携",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "取得 30 分前",
+   "id": 2
+  },
+  {
+   "ts": "@-12960m",
+   "scope": "_app",
+   "check_id": "login",
+   "name": "ログイン時に起動",
+   "from_status": null,
+   "to_status": "ok",
+   "detail": "有効",
+   "id": 1
+  }
+ ],
+ "schedule": {
+  "enabled": true,
+  "probe_minutes": 60,
+  "logs_minutes": 15
+ },
+ "lastProbeAt": "@-12m",
+ "lastLogsAt": "@-4m",
+ "openAtLogin": true,
+ "probing": false,
+ "syncing": false
+}
