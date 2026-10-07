@@ -172,17 +172,19 @@ async function runInventory(ids) {
   }
 }
 
-// 道具の一覧（機体×道具）。Do-gu のマスターは取得済みのときだけ照合に使う（ここでは取りにいかない）
-function inventoryView() {
+// 道具の一覧（機体×道具）。Do-gu のマスターは取得済みのときだけ照合に使う（ここでは取りにいかない）。
+// all: 依存として入ったものも含める（既定は自分で入れたものだけ）。下書きはいつも自分で入れたものだけから作る
+function inventoryView({ all = false } = {}) {
   const cached = db.getMeta('dogu_tools');
   const matchSlug = cached ? dogu.makeMatcher(cached.tools) : null;
   const rows = db.inventory();
   const exclude = db.getMeta('dogu_exclude') || [];
   const m = inventory.matrix(rows, { matchSlug });
+  const shown = all ? inventory.matrix(rows, { matchSlug, explicitOnly: false }) : m;
   const cats = cached ? new Map(cached.tools.map((t) => [t.slug, t.category])) : new Map();
   return {
     nodes: cfg.nodes.map(({ id, os: o }) => ({ id, os: o, count: rows.filter((r) => r.node_id === id && r.explicit).length, error: lastInventoryError[id] || null })),
-    groups: m.map((g) => ({ ...g, category: g.slug ? cats.get(g.slug) || null : null })),
+    groups: shown.map((g) => ({ ...g, category: g.slug ? cats.get(g.slug) || null : null })), all,
     events: db.inventoryEvents(100), sources: inventory.SOURCES, lastInventoryAt: db.getMeta('lastInventoryAt'), inventorying,
     dogu: cached ? { at: cached.at, tools: cached.tools.length, matched: m.filter((g) => g.slug).length, draft: dogu.deckDraft(m, cached.tools, exclude), exclude } : null,
   };
@@ -297,7 +299,7 @@ ipcMain.handle('undo', async (_e, entryId) => {
   return confirmAndRun(entry.node_id, entry.undo, `${entry.node_id}: 元に戻す（${entry.label}）`, entryId);
 });
 ipcMain.handle('actions-log', () => db.actions(100));
-ipcMain.handle('inventory', () => inventoryView());
+ipcMain.handle('inventory', (_e, opts) => inventoryView({ all: !!opts?.all }));
 ipcMain.handle('inventory-run', (_e, ids) => runInventory(ids).then(() => inventoryView()));
 // Do-gu の共通マスターを取りにいく（画面のボタンを押したときだけ。送るものは無い）
 ipcMain.handle('dogu-refresh', async () => {

@@ -81,3 +81,25 @@ test('AI セッション: 続きの位置から差分だけ読み、変わって
   // 書きかけの行の手前までしか進めない
   assert.equal(next.cursors['claude:-work-demo/s1.jsonl'], fs.statSync(path.join(proj, 's1.jsonl')).size - '{"type":"user","partial'.length);
 });
+
+test('AI セッション: 時間ごとの使用量・残りの量・消えたファイル・ホームを ~ にした鍵', { skip: !PY && 'python が無い' }, () => {
+  const { home } = fixture();
+  // Claude Code のプロジェクト名に入ったホーム（英数字以外を - にしたもの）は ~ にする
+  const enc = home.replace(/[^A-Za-z0-9]/g, '-');
+  const own = path.join(home, '.claude', 'projects', `${enc}-work-app`);
+  fs.mkdirSync(own, { recursive: true });
+  fs.writeFileSync(path.join(own, 's2.jsonl'), jl([{ type: 'user', sessionId: 's2', cwd: path.join(home, 'work', 'app'), timestamp: '2026-10-03T00:00:00Z', message: { role: 'user', content: SECRET } }]));
+  const { raw, out } = run(home, { files: { 'claude:gone/old.jsonl': 10 } });
+  assert.ok(!raw.includes(SECRET));
+  assert.ok(!raw.includes(enc), 'ホームのパスが鍵に残っている');
+  assert.ok(out.sessions.some((s) => s.file === 'claude:~-work-app/s2.jsonl'));
+  assert.deepEqual(out.gone, ['claude:gone/old.jsonl']);
+  assert.equal(out.bytes_pending, out.bytes_read);
+  const h = (iso) => String(Math.floor(Date.parse(iso) / 3600000));
+  const c = out.sessions.find((s) => s.file === 'claude:-work-demo/s1.jsonl');
+  // [入力, 出力, キャッシュ読み, キャッシュ書き, 推論, ツール呼び出し, 指示]
+  assert.deepEqual(c.hours[h('2026-10-01T00:00:00Z')], [10, 5, 100, 7, 2, 1, 1]);
+  const x = out.sessions.find((s) => s.tool === 'codex');
+  // Codex は累計（その時間の終わりまで）。ツール呼び出しと指示は数
+  assert.deepEqual(x.hours[h('2026-10-01T01:00:00Z')], [150, 20, 50, 0, 3, 1, 1]);
+});
