@@ -124,11 +124,16 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("Katala Tune を起動できない");
-    app.run(|app, ev| match ev {
-        // ウィンドウを閉じても、自動スキャンのためにメニューバー（Windows は通知領域）に残る。終了はメニューから
-        RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
-        #[cfg(target_os = "macos")]
-        RunEvent::Reopen { .. } => window::show(app),
-        _ => {}
+    app.run(|handle, ev| {
+        // handle を使うのは macOS の Reopen だけ（他の OS で未使用の警告にしない）
+        #[cfg(not(target_os = "macos"))]
+        let _ = handle;
+        match ev {
+            // ウィンドウを閉じても、自動スキャンのためにメニューバー（Windows は通知領域）に残る。終了はメニューから
+            RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen { .. } => window::show(handle),
+            _ => {}
+        }
     });
 }
