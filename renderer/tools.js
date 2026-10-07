@@ -13,9 +13,10 @@
 
   const srcLabel = (d, s) => d.sources?.[s] || s;
   // 機体どうしで最も多い版（版の違いを強調する基準）
+  const coreVersion = v => (String(v).match(/^\d+(?:\.\d+)*/) || [String(v)])[0];
   function majority(g) {
     const c = new Map();
-    for (const cell of Object.values(g.nodes)) for (const v of cell.versions) c.set(v, (c.get(v) || 0) + 1);
+    for (const cell of Object.values(g.nodes)) for (const v of new Set(cell.versions.map(coreVersion))) c.set(v, (c.get(v) || 0) + 1);
     return [...c.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
   }
 
@@ -25,7 +26,7 @@
     const srcs = x.sources.map((s) => srcLabel(d, s)).join('・');
     if (!x.versions.length) return { html: '<span class="inv-has" aria-label="あり">●</span>', title: `${srcs}（版なし）` };
     const maj = majority(g);
-    const diff = g.drift && maj != null && !x.versions.includes(maj);
+    const diff = g.drift && maj != null && !x.versions.map(coreVersion).includes(maj);
     return {
       html: `<span class="inv-ver num">${UI.esc(x.versions.join(' / '))}</span>`,
       diff,
