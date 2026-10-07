@@ -1,0 +1,798 @@
+{
+ "_comment": "画面のプレビュー用の架空データ（道具の棚卸し）。rows は DB の inventory の行、tools は Do-gu の共通マスターの見本。照合と表は lib/inventory.js・lib/dogu.js で作る",
+ "lastInventoryAt": "@-95m",
+ "nodes": {
+  "media-pc": null,
+  "family-pc": "ssh: connect to host family-pc port 22: Operation timed out"
+ },
+ "rows": [
+  {
+   "node_id": "studio-mac",
+   "source": "brew",
+   "name": "git",
+   "version": "2.51.0",
+   "explicit": true
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "brew",
+   "name": "gh",
+   "version": "2.80.0",
+   "explicit": true
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "brew",
+   "name": "jq",
+   "version": "1.8.1",
+   "explicit": true
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "brew",
+   "name": "ripgrep",
+   "version": "14.1.1",
+   "explicit": true
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "brew",
+   "name": "pcre2",
+   "version": "10.45",
+   "explicit": false
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "brew",
+   "name": "oniguruma",
+   "version": "6.9.10",
+   "explicit": false
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "mise",
+   "name": "node",
+   "version": "24.21.0",
+   "explicit": true
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "mise",
+   "name": "python",
+   "version": "3.13.7",
+   "explicit": true
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "uv",
+   "name": "ruff",
+   "version": "0.13.3",
+   "explicit": true
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "cask",
+   "name": "visual-studio-code",
+   "version": "1.105.0",
+   "explicit": true
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "app",
+   "name": "Visual Studio Code",
+   "version": "1.105.0",
+   "explicit": true,
+   "extra": {
+    "id": "com.example.vscode"
+   }
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "app",
+   "name": "Slack",
+   "version": "4.46.1",
+   "explicit": true,
+   "extra": {
+    "id": "com.example.slack"
+   }
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "bin",
+   "name": "claude",
+   "version": "2.1.40",
+   "explicit": true
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "npm",
+   "name": "@openai/codex",
+   "version": "0.160.1",
+   "explicit": true
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "platform",
+   "name": "homebrew",
+   "version": null,
+   "explicit": true
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "cask",
+   "name": "docker-desktop",
+   "version": "4.47.0",
+   "explicit": true
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "cask",
+   "name": "zoom",
+   "version": "6.6.0",
+   "explicit": true
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "app",
+   "name": "Figma",
+   "version": "125.8.4",
+   "explicit": true
+  },
+  {
+   "node_id": "studio-mac",
+   "source": "cargo",
+   "name": "tokei",
+   "version": "12.1.2",
+   "explicit": true
+  },
+  {
+   "node_id": "air-m3",
+   "source": "brew",
+   "name": "git",
+   "version": "2.51.0",
+   "explicit": true
+  },
+  {
+   "node_id": "air-m3",
+   "source": "brew",
+   "name": "gh",
+   "version": "2.80.0",
+   "explicit": true
+  },
+  {
+   "node_id": "air-m3",
+   "source": "brew",
+   "name": "jq",
+   "version": "1.8.1",
+   "explicit": true
+  },
+  {
+   "node_id": "air-m3",
+   "source": "brew",
+   "name": "ripgrep",
+   "version": "14.1.1",
+   "explicit": true
+  },
+  {
+   "node_id": "air-m3",
+   "source": "brew",
+   "name": "pcre2",
+   "version": "10.45",
+   "explicit": false
+  },
+  {
+   "node_id": "air-m3",
+   "source": "brew",
+   "name": "oniguruma",
+   "version": "6.9.10",
+   "explicit": false
+  },
+  {
+   "node_id": "air-m3",
+   "source": "mise",
+   "name": "node",
+   "version": "22.20.0",
+   "explicit": true
+  },
+  {
+   "node_id": "air-m3",
+   "source": "mise",
+   "name": "python",
+   "version": "3.13.7",
+   "explicit": true
+  },
+  {
+   "node_id": "air-m3",
+   "source": "uv",
+   "name": "ruff",
+   "version": "0.13.3",
+   "explicit": true
+  },
+  {
+   "node_id": "air-m3",
+   "source": "cask",
+   "name": "visual-studio-code",
+   "version": "1.105.0",
+   "explicit": true
+  },
+  {
+   "node_id": "air-m3",
+   "source": "app",
+   "name": "Visual Studio Code",
+   "version": "1.105.0",
+   "explicit": true,
+   "extra": {
+    "id": "com.example.vscode"
+   }
+  },
+  {
+   "node_id": "air-m3",
+   "source": "app",
+   "name": "Slack",
+   "version": "4.46.0",
+   "explicit": true,
+   "extra": {
+    "id": "com.example.slack"
+   }
+  },
+  {
+   "node_id": "air-m3",
+   "source": "bin",
+   "name": "claude",
+   "version": "2.1.40",
+   "explicit": true
+  },
+  {
+   "node_id": "air-m3",
+   "source": "npm",
+   "name": "@openai/codex",
+   "version": "0.160.1",
+   "explicit": true
+  },
+  {
+   "node_id": "air-m3",
+   "source": "platform",
+   "name": "homebrew",
+   "version": null,
+   "explicit": true
+  },
+  {
+   "node_id": "air-m3",
+   "source": "cask",
+   "name": "docker-desktop",
+   "version": "4.47.0",
+   "explicit": true
+  },
+  {
+   "node_id": "air-m3",
+   "source": "app",
+   "name": "Obsidian",
+   "version": "1.9.14",
+   "explicit": true
+  },
+  {
+   "node_id": "air-m3",
+   "source": "brew",
+   "name": "ffmpeg",
+   "version": "8.0",
+   "explicit": true
+  },
+  {
+   "node_id": "build-mini",
+   "source": "brew",
+   "name": "git",
+   "version": "2.51.0",
+   "explicit": true
+  },
+  {
+   "node_id": "build-mini",
+   "source": "brew",
+   "name": "gh",
+   "version": "2.79.0",
+   "explicit": true
+  },
+  {
+   "node_id": "build-mini",
+   "source": "brew",
+   "name": "jq",
+   "version": "1.8.1",
+   "explicit": true
+  },
+  {
+   "node_id": "build-mini",
+   "source": "brew",
+   "name": "ripgrep",
+   "version": "14.1.1",
+   "explicit": true
+  },
+  {
+   "node_id": "build-mini",
+   "source": "brew",
+   "name": "pcre2",
+   "version": "10.45",
+   "explicit": false
+  },
+  {
+   "node_id": "build-mini",
+   "source": "brew",
+   "name": "oniguruma",
+   "version": "6.9.10",
+   "explicit": false
+  },
+  {
+   "node_id": "build-mini",
+   "source": "mise",
+   "name": "node",
+   "version": "24.21.0",
+   "explicit": true
+  },
+  {
+   "node_id": "build-mini",
+   "source": "mise",
+   "name": "python",
+   "version": "3.13.7",
+   "explicit": true
+  },
+  {
+   "node_id": "build-mini",
+   "source": "uv",
+   "name": "ruff",
+   "version": "0.13.3",
+   "explicit": true
+  },
+  {
+   "node_id": "build-mini",
+   "source": "cask",
+   "name": "visual-studio-code",
+   "version": "1.105.0",
+   "explicit": true
+  },
+  {
+   "node_id": "build-mini",
+   "source": "app",
+   "name": "Visual Studio Code",
+   "version": "1.105.0",
+   "explicit": true,
+   "extra": {
+    "id": "com.example.vscode"
+   }
+  },
+  {
+   "node_id": "build-mini",
+   "source": "app",
+   "name": "Slack",
+   "version": "4.46.0",
+   "explicit": true,
+   "extra": {
+    "id": "com.example.slack"
+   }
+  },
+  {
+   "node_id": "build-mini",
+   "source": "bin",
+   "name": "claude",
+   "version": "2.1.40",
+   "explicit": true
+  },
+  {
+   "node_id": "build-mini",
+   "source": "npm",
+   "name": "@openai/codex",
+   "version": "0.150.0",
+   "explicit": true
+  },
+  {
+   "node_id": "build-mini",
+   "source": "platform",
+   "name": "homebrew",
+   "version": null,
+   "explicit": true
+  },
+  {
+   "node_id": "gpu-tower",
+   "source": "winreg",
+   "name": "Git",
+   "version": "2.51.0.windows.1",
+   "explicit": true
+  },
+  {
+   "node_id": "gpu-tower",
+   "source": "winreg",
+   "name": "Microsoft Visual Studio Code (User)",
+   "version": "1.105.0",
+   "explicit": true
+  },
+  {
+   "node_id": "gpu-tower",
+   "source": "winreg",
+   "name": "Python 3.13.7 (64-bit)",
+   "version": "3.13.7",
+   "explicit": true
+  },
+  {
+   "node_id": "gpu-tower",
+   "source": "winreg",
+   "name": "Node.js",
+   "version": "22.20.0",
+   "explicit": true
+  },
+  {
+   "node_id": "gpu-tower",
+   "source": "scoop",
+   "name": "jq",
+   "version": "1.8.1",
+   "explicit": true
+  },
+  {
+   "node_id": "gpu-tower",
+   "source": "platform",
+   "name": "winget",
+   "version": null,
+   "explicit": true
+  },
+  {
+   "node_id": "gpu-tower",
+   "source": "platform",
+   "name": "wsl",
+   "version": null,
+   "explicit": true
+  },
+  {
+   "node_id": "gpu-tower",
+   "source": "winreg",
+   "name": "Docker Desktop",
+   "version": "4.47.0",
+   "explicit": true
+  },
+  {
+   "node_id": "gpu-tower",
+   "source": "bin",
+   "name": "claude",
+   "version": "2.1.40",
+   "explicit": true
+  },
+  {
+   "node_id": "gpu-tower",
+   "source": "scoop",
+   "name": "ripgrep",
+   "version": "14.1.1",
+   "explicit": true
+  },
+  {
+   "node_id": "gpu-tower",
+   "source": "winreg",
+   "name": "NVIDIA App",
+   "version": "11.0.5.266",
+   "explicit": true
+  },
+  {
+   "node_id": "gpu-tower",
+   "source": "winreg",
+   "name": "Steam",
+   "version": "2.10.91.91",
+   "explicit": true
+  },
+  {
+   "node_id": "gpu-tower",
+   "source": "choco",
+   "name": "ollama",
+   "version": "0.12.3",
+   "explicit": true
+  },
+  {
+   "node_id": "media-pc",
+   "source": "winreg",
+   "name": "Git",
+   "version": "2.51.0.windows.1",
+   "explicit": true
+  },
+  {
+   "node_id": "media-pc",
+   "source": "winreg",
+   "name": "Microsoft Visual Studio Code (User)",
+   "version": "1.104.2",
+   "explicit": true
+  },
+  {
+   "node_id": "media-pc",
+   "source": "winreg",
+   "name": "Python 3.13.7 (64-bit)",
+   "version": "3.13.7",
+   "explicit": true
+  },
+  {
+   "node_id": "media-pc",
+   "source": "winreg",
+   "name": "Node.js",
+   "version": "24.21.0",
+   "explicit": true
+  },
+  {
+   "node_id": "media-pc",
+   "source": "scoop",
+   "name": "jq",
+   "version": "1.8.1",
+   "explicit": true
+  },
+  {
+   "node_id": "media-pc",
+   "source": "platform",
+   "name": "winget",
+   "version": null,
+   "explicit": true
+  },
+  {
+   "node_id": "media-pc",
+   "source": "platform",
+   "name": "wsl",
+   "version": null,
+   "explicit": true
+  },
+  {
+   "node_id": "media-pc",
+   "source": "winreg",
+   "name": "Docker Desktop",
+   "version": "4.47.0",
+   "explicit": true
+  },
+  {
+   "node_id": "media-pc",
+   "source": "bin",
+   "name": "claude",
+   "version": "2.1.40",
+   "explicit": true
+  },
+  {
+   "node_id": "media-pc",
+   "source": "scoop",
+   "name": "ripgrep",
+   "version": "14.1.1",
+   "explicit": true
+  },
+  {
+   "node_id": "family-pc",
+   "source": "winreg",
+   "name": "Git",
+   "version": "2.51.0.windows.1",
+   "explicit": true
+  },
+  {
+   "node_id": "family-pc",
+   "source": "winreg",
+   "name": "Microsoft Visual Studio Code (User)",
+   "version": "1.105.0",
+   "explicit": true
+  },
+  {
+   "node_id": "family-pc",
+   "source": "winreg",
+   "name": "Python 3.12.10 (64-bit)",
+   "version": "3.12.10",
+   "explicit": true
+  },
+  {
+   "node_id": "family-pc",
+   "source": "winreg",
+   "name": "Node.js",
+   "version": "24.21.0",
+   "explicit": true
+  },
+  {
+   "node_id": "family-pc",
+   "source": "scoop",
+   "name": "jq",
+   "version": "1.8.1",
+   "explicit": true
+  },
+  {
+   "node_id": "family-pc",
+   "source": "platform",
+   "name": "winget",
+   "version": null,
+   "explicit": true
+  },
+  {
+   "node_id": "family-pc",
+   "source": "platform",
+   "name": "wsl",
+   "version": null,
+   "explicit": true
+  },
+  {
+   "node_id": "family-pc",
+   "source": "winreg",
+   "name": "秀丸エディタ",
+   "version": "9.50",
+   "explicit": true
+  },
+  {
+   "node_id": "family-pc",
+   "source": "winreg",
+   "name": "Zoom Workplace (64-bit)",
+   "version": "6.6.0",
+   "explicit": true
+  }
+ ],
+ "events": [
+  {
+   "id": 100,
+   "ts": "@-95m",
+   "node_id": "gpu-tower",
+   "source": "winreg",
+   "name": "NVIDIA App",
+   "kind": "updated",
+   "from_version": "11.0.4.526",
+   "to_version": "11.0.5.266"
+  },
+  {
+   "id": 99,
+   "ts": "@-95m",
+   "node_id": "air-m3",
+   "source": "brew",
+   "name": "ffmpeg",
+   "kind": "added",
+   "from_version": null,
+   "to_version": "8.0"
+  },
+  {
+   "id": 98,
+   "ts": "@-1530m",
+   "node_id": "studio-mac",
+   "source": "app",
+   "name": "Slack",
+   "kind": "updated",
+   "from_version": "4.46.0",
+   "to_version": "4.46.1"
+  },
+  {
+   "id": 97,
+   "ts": "@-1530m",
+   "node_id": "build-mini",
+   "source": "cask",
+   "name": "docker-desktop",
+   "kind": "removed",
+   "from_version": "4.46.0",
+   "to_version": null
+  },
+  {
+   "id": 96,
+   "ts": "@-2970m",
+   "node_id": "media-pc",
+   "source": "winreg",
+   "name": "Microsoft Visual Studio Code (User)",
+   "kind": "updated",
+   "from_version": "1.103.0",
+   "to_version": "1.104.2"
+  },
+  {
+   "id": 95,
+   "ts": "@-4410m",
+   "node_id": "family-pc",
+   "source": "winreg",
+   "name": "秀丸エディタ",
+   "kind": "added",
+   "from_version": null,
+   "to_version": "9.50"
+  },
+  {
+   "id": 94,
+   "ts": "@-5850m",
+   "node_id": "studio-mac",
+   "source": "cargo",
+   "name": "tokei",
+   "kind": "added",
+   "from_version": null,
+   "to_version": "12.1.2"
+  }
+ ],
+ "tools": [
+  {
+   "slug": "visual-studio-code",
+   "name": "Visual Studio Code",
+   "category": "エディタ",
+   "website_url": "https://visual-studio-code.example",
+   "icon_url": null
+  },
+  {
+   "slug": "gh",
+   "name": "GitHub CLI",
+   "category": "CLI",
+   "website_url": "https://gh.example",
+   "icon_url": null
+  },
+  {
+   "slug": "jq",
+   "name": "jq",
+   "category": "CLI",
+   "website_url": "https://jq.example",
+   "icon_url": null
+  },
+  {
+   "slug": "ripgrep",
+   "name": "ripgrep",
+   "category": "CLI",
+   "website_url": "https://ripgrep.example",
+   "icon_url": null
+  },
+  {
+   "slug": "git",
+   "name": "Git",
+   "category": "CLI",
+   "website_url": "https://git.example",
+   "icon_url": null
+  },
+  {
+   "slug": "node-js",
+   "name": "Node.js",
+   "category": "言語",
+   "website_url": "https://node-js.example",
+   "icon_url": null
+  },
+  {
+   "slug": "python",
+   "name": "Python",
+   "category": "言語",
+   "website_url": "https://python.example",
+   "icon_url": null
+  },
+  {
+   "slug": "docker-desktop",
+   "name": "Docker Desktop",
+   "category": "インフラ",
+   "website_url": "https://docker-desktop.example",
+   "icon_url": null
+  },
+  {
+   "slug": "claude-code",
+   "name": "Claude Code",
+   "category": "AI エージェント",
+   "website_url": "https://claude-code.example",
+   "icon_url": null
+  },
+  {
+   "slug": "codex",
+   "name": "Codex",
+   "category": "AI エージェント",
+   "website_url": "https://codex.example",
+   "icon_url": null
+  },
+  {
+   "slug": "slack",
+   "name": "Slack",
+   "category": "コミュニケーション",
+   "website_url": "https://slack.example",
+   "icon_url": null
+  },
+  {
+   "slug": "zoom",
+   "name": "Zoom",
+   "category": "コミュニケーション",
+   "website_url": "https://zoom.example",
+   "icon_url": null
+  },
+  {
+   "slug": "figma",
+   "name": "Figma",
+   "category": "デザイン",
+   "website_url": "https://figma.example",
+   "icon_url": null
+  },
+  {
+   "slug": "obsidian",
+   "name": "Obsidian",
+   "category": "ノート",
+   "website_url": "https://obsidian.example",
+   "icon_url": null
+  },
+  {
+   "slug": "ruff",
+   "name": "Ruff",
+   "category": "CLI",
+   "website_url": "https://ruff.example",
+   "icon_url": null
+  }
+ ],
+ "exclude": [
+  "zoom"
+ ]
+}

@@ -8,6 +8,7 @@
 //! Electron 版と同じ DB を共有するので、表の定義は lib/db.js と揃える（CREATE TABLE IF NOT EXISTS のまま）。
 
 mod actions;
+mod ai_sessions;
 mod checks;
 mod inventory;
 mod logs;
@@ -19,7 +20,9 @@ use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value};
 
+pub use ai_sessions::{AiIngested, SESSION_PAGE_MAX, Session as AiSession, TOK_KEYS, hour_deltas};
 pub use checks::{Change, Check};
+pub use inventory::InventorySaved;
 pub use logs::{LogCount, LogRow, TopSignature};
 pub use snapshots::Snapshot;
 
@@ -32,7 +35,7 @@ pub const QUERY_LIMIT_MAX: i64 = 2000;
 pub const SIGNATURE_LIMIT_MAX: i64 = 500;
 
 const PRAGMAS: &str = "PRAGMA journal_mode = WAL;\nPRAGMA synchronous = NORMAL;\n";
-const SCHEMA_PARTS: &[&str] = &[snapshots::SCHEMA, actions::SCHEMA, logs::SCHEMA, checks::SCHEMA, META_SCHEMA, inventory::SCHEMA];
+const SCHEMA_PARTS: &[&str] = &[snapshots::SCHEMA, actions::SCHEMA, logs::SCHEMA, checks::SCHEMA, META_SCHEMA, inventory::SCHEMA, ai_sessions::SCHEMA];
 const META_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT, updated_at INTEGER);\n";
 
 pub type Result<T> = rusqlite::Result<T>;

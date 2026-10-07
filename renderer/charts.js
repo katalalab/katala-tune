@@ -31,6 +31,12 @@
  *       行×列の濃淡（最大値に対する割合で 5 段階）。列ラベルが空文字なら表示しない。
  *   Charts.dataBar(value, max, { tone })
  *       表のセルに入れる相対値の細い棒（同じ列の中で大きさを比べる）。
+ *   Charts.spark([{ points: [{ t, v }], tone: 'info' }, { points, tone: 'accent' }], { window: 180e3, now, min: 0, max: 100 })
+ *       ライブ表示のスパークライン（1〜2 本）。横軸は時刻で、右端が now、幅が window ミリ秒。
+ *       点の間が gap（既定 5 秒）より空いたら線を切る（止めていた間をつながない）。max を省くと値から切りの良い上限を決める。
+ *       幅は入れ物に合わせて伸びる（線の太さは変わらない）。1 本目の下を薄く塗る。
+ *   Charts.bars([12, 80, null, ...], { warn: 60, crit: 85 })
+ *       縦の小さな棒の並び（コアごとの CPU）。しきい値で注意・異常の色になる。
  *   Charts.scoreTone(score) / Charts.level(value, { warn, crit, invert })
  *       色の判定だけを使いたいとき。
  */
@@ -268,7 +274,47 @@ const Charts = (() => {
     return `<span class="databar tone-${tone}"><i style="width:${r2(Math.max(pct, pct ? 2 : 0))}%"></i></span>`;
   }
 
-  return { meter, ring, gauge, line, stacked, bucketize, columns, heatmap, dataBar, scoreTone, level, niceTicks, fmt };
+  // ---- スパークライン（ライブ表示） ----
+  function spark(series, o = {}) {
+    const W = o.width || 300, H = o.height || 44;
+    const win = o.window || 180e3, gap = o.gap || 5000;
+    const all = series.flatMap((s) => (s.points || []).filter((p) => p && num(p.t)));
+    const tone = series[0]?.tone || 'accent';
+    const svg = (inner, hi) => `<svg class="spark tone-${esc(tone)}" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="${esc(o.label || '')}"${hi != null ? ` data-max="${esc(hi)}"` : ''}>${inner}</svg>`;
+    if (!all.length) return svg('');
+    const now = o.now ?? Math.max(...all.map((p) => p.t));
+    const t0 = now - win;
+    const vals = all.filter((p) => p.t >= t0 && num(p.v)).map((p) => +p.v);
+    const lo = o.min ?? 0;
+    const hi = o.max ?? niceTicks(lo, Math.max(lo + (o.floor || 1), ...vals), 5).at(-1);
+    const x = (t) => r2(((t - t0) / win) * W);
+    const y = (v) => r2(H - 1.5 - ((clamp(+v, lo, hi) - lo) / (hi - lo || 1)) * (H - 3));
+    const inner = series.map((s, i) => {
+      const pts = (s.points || []).filter((p) => p && num(p.t) && num(p.v) && p.t >= t0 - gap).sort((a, b) => a.t - b.t);
+      const segs = [];
+      let cur = [], prev = null;
+      for (const p of pts) {
+        if (prev && p.t - prev.t > gap && cur.length) { segs.push(cur); cur = []; }
+        cur.push([x(p.t), y(p.v)]);
+        prev = p;
+      }
+      if (cur.length) segs.push(cur);
+      const d = segs.map((sg) => `M${sg.map((q) => q.join(' ')).join(' L')}`).join(' ');
+      const area = i === 0 && o.area !== false
+        ? segs.filter((sg) => sg.length > 1).map((sg) => `M${sg[0][0]} ${H} L${sg.map((q) => q.join(' ')).join(' L')} L${sg.at(-1)[0]} ${H} Z`).join(' ') : '';
+      return `${area ? `<path class="sp-area" d="${area}"/>` : ''}${d ? `<path class="sp-line tone-${esc(s.tone || 'accent')}" d="${d}" vector-effect="non-scaling-stroke"/>` : ''}`;
+    }).join('');
+    return svg(inner, hi);
+  }
+
+  // ---- 縦の小さな棒の並び（コアごとの CPU） ----
+  function bars(values, { max = 100, warn, crit, label = '' } = {}) {
+    const vs = (values || []).map((v) => (num(v) ? clamp(+v, 0, max) : null));
+    return `<div class="vbars" role="img" aria-label="${esc(label)}">${vs.map((v, i) =>
+      `<i class="lv-${level(v, { warn, crit })}" title="${i + 1}: ${v == null ? '-' : `${Math.round(v)}%`}"><b style="height:${v == null ? 0 : r2(Math.max(3, (v / max) * 100))}%"></b></i>`).join('')}</div>`;
+  }
+
+  return { meter, ring, gauge, line, stacked, bucketize, columns, heatmap, dataBar, spark, bars, scoreTone, level, niceTicks, fmt };
 })();
 
 if (typeof module !== 'undefined' && module.exports) module.exports = Charts;
