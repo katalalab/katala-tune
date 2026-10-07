@@ -3,6 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { inspect, probeHttps } = require('../scripts/network-check');
 const result = (stdout = '', status = 0) => ({ stdout, status });
+const routeTable = (family, active = '', persistent = '', localized = false) => `IPv${family} ${localized ? 'ルート テーブル' : 'Route Table'}\n===========\n${localized ? 'アクティブ ルート' : 'Active Routes'}:\n${active}\n===========\n${localized ? '固定ルート' : 'Persistent Routes'}:\n${persistent}\n`;
 
 test('接続断・経路欠落でもDNS状態を取り、IPやSSIDを出力しない', () => {
   const calls = [];
@@ -26,7 +27,7 @@ test('コマンド失敗を正常ゼロと混同しない', () => {
 });
 
 test('Windowsのactive interface・gateway・DNSだけを返す', () => {
-  const value = inspect('win32', cmd => result(cmd === 'route.exe' ? '  0.0.0.0  0.0.0.0  192.0.2.1  192.0.2.2  10' : '{"interfaces_up":1,"ip_address_present":true,"gateway_configured":true,"dns_configured":false}'));
+  const value = inspect('win32', cmd => result(cmd === 'route.exe' ? routeTable(4, '  0.0.0.0  0.0.0.0  192.0.2.1  192.0.2.2  10') : '{"interfaces_up":1,"ip_address_present":true,"gateway_configured":true,"dns_configured":false}'));
   assert.equal(value.interfaces_up, 1);
   assert.equal(value.default_route_present, true);
   assert.equal(value.dns_configured, false);
@@ -64,7 +65,7 @@ test('Windowsのgateway設定と未知の経路表を経路ありと混同しな
 });
 
 test('WindowsのIPv6 VPN既定経路もgateway設定なしで検出する', () => {
-  const value = inspect('win32', (cmd, args) => result(cmd === 'route.exe' && args.includes('-6') ? '  12  25  ::/0  On-link' : '{}'));
+  const value = inspect('win32', (cmd, args) => result(cmd === 'route.exe' && args.includes('-6') ? routeTable(6, '  12  25  ::/0  On-link') : '{}'));
   assert.equal(value.default_route_present, true);
 });
 
@@ -87,4 +88,23 @@ test('MacのIPはリンクローカル・ループバックだけなら利用可
   const unknown = inspect('darwin', cmd => result(cmd === 'route' ? 'interface: en0' : '', cmd === 'ifconfig' ? null : 0));
   assert.equal(unknown.interface_up, null);
   assert.equal(unknown.link_active, null);
+});
+
+
+test('WindowsのIPv6固定ルートを言語によらず現在の経路と混同しない', () => {
+  for (const localized of [false, true]) {
+    const value = inspect('win32', (cmd, args) => result(cmd === 'route.exe' && args.includes('-6') ? routeTable(6, '  1  331  ::1/128  On-link', '  12  25  ::/0  On-link', localized) : '{}'));
+    assert.equal(value.default_route_present, null);
+    const active = inspect('win32', (cmd, args) => result(cmd === 'route.exe' && args.includes('-6') ? routeTable(6, '  12  25  ::/0  On-link', '', localized) : '{}'));
+    assert.equal(active.default_route_present, true);
+  }
+});
+
+test('区切りのないWindows経路出力と未知のMac ifconfig形式は未観測', () => {
+  const windows = inspect('win32', cmd => result(cmd === 'route.exe' ? ' 12 25 ::/0 On-link' : '{}'));
+  assert.equal(windows.default_route_present, null);
+  const mac = inspect('darwin', cmd => result(cmd === 'route' ? 'interface: en0' : 'unexpected format'));
+  assert.equal(mac.interface_up, null);
+  assert.equal(mac.link_active, null);
+  assert.equal(mac.ip_address_present, null);
 });

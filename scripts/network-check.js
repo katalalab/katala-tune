@@ -55,8 +55,16 @@ function inspect(platform = process.platform, run = execute) {
     // Gateway設定は経路の存在と異なる。VPN等の既定経路も実際の経路表で確認する。
     const v4 = run('route.exe', ['print', '-4']);
     const v6 = run('route.exe', ['print', '-6']);
-    if ((v4.status === 0 && /^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+\S+\s+\d+\.\d+\.\d+\.\d+\s+\d+\s*$/m.test(v4.stdout || ''))
-      || (v6.status === 0 && /^\s*\d+\s+\d+\s+::\/0\s+/m.test(v6.stdout || ''))) value.default_route_present = true;
+    // IPv4/IPv6見出し後の最初の区切り内だけが現在の表。固定ルートは次の区切り以降。
+    // 日本語等のActive/Persistent見出し文言には依存せず、未知の形式は採用しない。
+    const activeTable = (res, family) => {
+      if (res.status !== 0) return '';
+      const sections = (res.stdout || '').split(/^={3,}[ \t]*\r?$/m);
+      const header = sections.findIndex(section => new RegExp(`^\\s*IPv${family}\\b`, 'm').test(section));
+      return header >= 0 && header + 2 < sections.length ? sections[header + 1] : '';
+    };
+    if (/^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+\S+\s+\d+\.\d+\.\d+\.\d+\s+\d+\s*$/m.test(activeTable(v4, 4))
+      || /^\s*\d+\s+\d+\s+::\/0\s+\S+[ \t]*\r?$/m.test(activeTable(v6, 6))) value.default_route_present = true;
     // 形式・言語・取得範囲の違いを経路なしと断定しない。見つからない時は null。
   } else value.unsupported_platform = true;
   return value;
