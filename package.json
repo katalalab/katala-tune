@@ -19,7 +19,9 @@
     "package:win": "electron-packager . 'Katala Tune' --platform=win32 --arch=x64 --out=dist --overwrite --icon=build/icon.ico --ignore='^/(dist|test|docs|build/icon\\.iconset)' && node scripts/harden.js 'dist/Katala Tune-win32-x64/Katala Tune.exe' && cd dist && rm -f Katala-Tune-win-x64.zip && zip -qry Katala-Tune-win-x64.zip 'Katala Tune-win32-x64'",
     "logs": "node scripts/logs-sync.js",
     "oss-check": "node scripts/oss-check.js",
-    "inventory": "node scripts/inventory.js"
+    "inventory": "node scripts/inventory.js",
+    "tauri:dev": "cargo tauri dev",
+    "tauri:build": "cargo tauri build"
   },
   "devDependencies": {
     "@electron/fuses": "^2.1.3",
