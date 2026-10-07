@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -142,16 +143,34 @@ pub mod local {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             return RunResult { code: None, out: String::new(), err: e.to_string() };
         }
-        let f = dir.join(format!("p-{}-{}.ps1", std::process::id(), now_ms()));
-        if let Err(e) = std::fs::write(&f, script) {
-            return RunResult { code: None, out: String::new(), err: e.to_string() };
-        }
+        let f = match write_unique(&dir, script) {
+            Ok(f) => f,
+            Err(e) => return RunResult { code: None, out: String::new(), err: e.to_string() },
+        };
         let mut args: Vec<String> = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"].iter().map(|s| s.to_string()).collect();
         args.push(f.to_string_lossy().into_owned());
         args.extend(params.split(' ').filter(|s| !s.is_empty()).map(str::to_string));
         let r = run("powershell.exe", &args, None, timeout).await;
         let _ = std::fs::remove_file(&f);
         r
+    }
+
+    /// 一時ファイルを、同時に走る他の実行と重ならない名前で新しく作る（分析とログ取り込みは並行して動く）
+    pub(crate) fn write_unique(dir: &std::path::Path, script: &[u8]) -> std::io::Result<PathBuf> {
+        use std::io::Write;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..16 {
+            let f = dir.join(format!("p-{}-{}-{}.ps1", std::process::id(), now_ms(), SEQ.fetch_add(1, Ordering::Relaxed)));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&f) {
+                Ok(mut h) => {
+                    h.write_all(script)?;
+                    return Ok(f);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "一時ファイルの名前を作れない"))
     }
 
     pub async fn python(code: &str, timeout: Duration) -> RunResult {
@@ -283,6 +302,17 @@ mod tests {
     fn last_json_line_skips_noise() {
         assert_eq!(last_json_line("noise\n{\"a\":1}\r\n{broken\n"), Some(json!({ "a": 1 })));
         assert_eq!(last_json_line("nothing"), None);
+    }
+
+    #[test]
+    fn temp_scripts_never_collide() {
+        let dir = std::env::temp_dir().join(format!("kt-unique-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = local::write_unique(&dir, b"a").unwrap();
+        let b = local::write_unique(&dir, b"b").unwrap();
+        assert_ne!(a, b);
+        assert_eq!((std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap()), (b"a".to_vec(), b"b".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

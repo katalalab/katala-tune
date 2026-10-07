@@ -324,14 +324,13 @@ impl Engine {
         let full = {
             let db = lock(&self.db);
             let prev = db.last_snapshots(&node_id, 1).ok().and_then(|v| v.into_iter().next());
-            let full = self.enrich(&db, &cfg, r, prev.as_ref().map(|p| &p.data));
+            let mut full = self.enrich(&db, &cfg, r, prev.as_ref().map(|p| &p.data));
             if js::truthy(full.get("ok")) {
-                lock(&self.last_probe_error).remove(&node_id);
                 let findings: Vec<Value> = js::arr(full.get("findings")).iter().map(|f| json!({ "id": f.get("id"), "severity": f.get("severity") })).collect();
                 let data = full.get("data").cloned().unwrap_or(Value::Null);
                 let summary = summarize(&data, js::arr(full.get("findings")));
                 let at = full.get("at").and_then(Value::as_i64).unwrap_or_else(now_ms);
-                let _ = db.add_snapshot(
+                let saved = db.add_snapshot(
                     &node_id,
                     at,
                     full.get("wall_s").and_then(Value::as_f64),
@@ -340,6 +339,20 @@ impl Engine {
                     &data,
                     &summary,
                 );
+                // 保存できなかった分析は成功として報告しない（状態の「分析」も異常にする）
+                match saved {
+                    Ok(_) => {
+                        lock(&self.last_probe_error).remove(&node_id);
+                    }
+                    Err(e) => {
+                        let msg = format!("分析は終わったが保存できなかった: {e}");
+                        lock(&self.last_probe_error).insert(node_id.clone(), msg.clone());
+                        if let Value::Object(m) = &mut full {
+                            m.insert("ok".into(), Value::Bool(false));
+                            m.insert("error".into(), Value::String(msg));
+                        }
+                    }
+                }
             } else {
                 lock(&self.last_probe_error).insert(node_id, js::string(full.get("error")));
             }
@@ -442,6 +455,8 @@ impl Engine {
             Ok(p) => p,
             Err(e) => return refused(e),
         };
+        // 承認した接続先（どの機体に、どのシェルで送るか）。確認の後に台帳を読み直したとき、これが変わっていたら実行しない
+        let route = (node.alias.clone(), node.os.clone(), node.local);
         if !confirm(title.to_string(), format!("{}\n\n実行するコマンド:\n{}", p.describe, p.script)).await {
             return Ok(json!({ "ok": false, "cancelled": true }));
         }
@@ -450,6 +465,9 @@ impl Engine {
             Err(e) => return refused(format!("台帳を読めないので実行しない: {e}")),
         };
         let Some(node) = fresh.node(node_id) else { return refused("台帳に無い機体".into()) };
+        if (node.alias.clone(), node.os.clone(), node.local) != route {
+            return refused("確認のあいだに台帳の接続先（alias・OS・この機体かどうか）が変わったので実行しない。もう一度確認してください".into());
+        }
         let r = match actions::execute(node, action, Some(&fresh.protect)).await {
             Ok(r) => r,
             Err(e) => return refused(e),
