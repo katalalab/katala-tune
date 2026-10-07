@@ -1,11 +1,12 @@
 # Katala Tune
 
-手元の Mac / Windows 機を SSH で並列に調べ、所見と最適化の提案を出し、ログを集めるデスクトップアプリ（Electron、macOS / Windows）。
+手元の Mac / Windows 機を SSH で並列に調べ、所見と最適化の提案を出し、ログを集めるデスクトップアプリ（Rust ＋ Tauri 2、macOS / Windows）。
 変更を加える操作は許可リストにあるものだけで、毎回確認ダイアログで承認し、実行の直前に状態を確かめ直してから実行する。
 
-- macOS: `npm run install-app` → `~/Applications/Katala Tune.app`
-- Windows: `npm run package:win` → `dist/Katala-Tune-win-x64.zip`（展開して `Katala Tune.exe`）
-- 端末から: `npm run probe -- [機体 ...]`（調査結果を JSON で）、`npm run logs -- [機体 ...]`（ログの取り込み）
+- 配布版: [GitHub Releases](https://github.com/katalalab/katala-tune/releases)（macOS universal / Windows x64）
+- 開発: `npm run doctor` → `npm start`（Tauri）。[開発手順](docs/development.md)
+- 配布物の作成: `npm run package`。版・署名・更新の手順は [リリース手順](docs/release.md)
+- 端末から: `cargo run -p tune-cli -- --help`。従来の JS 検証用 CLI は `npm run probe` / `npm run logs`
 
 ## 画面
 
@@ -24,7 +25,7 @@
 
 アプリを開くとメニューバー（Windows は通知領域）に常駐し、ウィンドウを閉じても動き続ける。既定は分析 60 分・ログ 15 分ごと（「状態」画面かメニューで変更・停止）、道具の棚卸しは 24 時間ごと（「道具」画面で変更）、AI エージェントのセッションの取り込みは 30 分ごと（Tauri 版。「AI」画面で変更。初回など 25 秒で区切って続きがあるときは 2 分後に続きを読む）。「ログイン時に起動」をオンにすると、ログイン後にウィンドウを開かずに常駐する（この設定は画面で操作したときだけ変わる）。
 
-外部のサービスや中身を確かめられない道具は使わない。各機体で動くのはこのリポジトリの `probes/` にある読めるスクリプトだけで、依存は Electron 本体のみ。
+外部のサービスや中身を確かめられない道具は使わない。各機体で動くのはこのリポジトリの `probes/` にある読めるスクリプトだけで、調査先には Python 標準ライブラリと OS 標準の PowerShell を使う。Tauri 版は OS の WebView を使い、Chromium を同梱しない。
 
 macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica。ライト／ダークとアクセントカラーは OS の設定に従う。
 
@@ -39,7 +40,7 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 | 実行 | プロセス終了（同一性・負荷を直前に再確認、終了を確認できなければ「終了未確認」）、Windows の電源プラン切り替え、タスクの無効化／有効化／今すぐ実行、launchd ジョブの停止／読み込み／今すぐ実行（元に戻せるものは戻せる） |
 | 道具 | 各機体のインストール先を読むだけ（`probes/mac_inventory.py`・`probes/win_inventory.ps1`）。パッケージマネージャもネットワークも使わない。読めなかった取り方は削除と見なさない |
 | AI エージェント | `probes/ai_sessions.py` を各機体の python で流し（Windows は python3 → python → py。無ければ「python が無い」）、続きの位置は DB が覚えて渡す。数・時刻・モデル・トークン・PR の URL だけを取り出す。台帳の機体に `"ai_sessions": false` で取り込まない |
-| 保存 | Node 内蔵の `node:sqlite`（依存なし・ネイティブビルドなし）。`<userData>/data/katala-tune.db` |
+| 保存 | Tauri 版は Rust の SQLite、互換確認用の JS 版は Node 内蔵の `node:sqlite`。`<userData>/data/katala-tune.db` |
 
 安全のための決めごとは [docs/safety.md](docs/safety.md)。NeonMonitor のレビューで見つかった自動終了ツールの失敗の型を、どう避けているかもここにある。
 
@@ -69,13 +70,13 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 ## 開発
 
 ```sh
-npm install
-npm test            # node:test（rules / actions / logs・db / oss-check）
-npm start           # 開発起動
-npm run oss-check   # 公開前の点検（-- --history で全コミットとメッセージも）
+npm ci --ignore-scripts   # Electron 本体を取得せず、検証用の開発依存だけを入れる
+npm run doctor           # 必要なツールの読取確認
+npm run check            # 版・JS・公開情報・Rust の検証
+npm start                # Rust + Tauri で起動
 ```
 
-パッケージ（`npm run package` / `package:win`）は最後に `scripts/harden.js` で Electron の fuse を切り替え、`ELECTRON_RUN_AS_NODE`・`NODE_OPTIONS`・`--inspect` から JS を注入できないようにする。
+互換比較が必要なときだけ `npm rebuild electron` 後に `npm run electron:start` で旧 Electron 版を起動する。旧版の配布コマンドには `electron:` を付ける。同じデータを使う両版を同時に動かさない。
 
 `npm run oss-check` は台帳（`~/.config/katala-tune/nodes.json`）の id・alias・hostname と、この機体のユーザー名・ホスト名、Tailscale のアドレス、`op://` 参照、実在のホームパス、メールアドレスがリポジトリに無いかを調べる。探す語は台帳から実行時に読むので、リポジトリには書かない。CI（`.github/workflows/ci.yml`）は公開リポジトリのときだけ動く。
 
