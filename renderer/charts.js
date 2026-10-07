@@ -121,9 +121,9 @@ const Charts = (() => {
     const [nx, ny] = pt(v);
     const needle = has ? `<circle class="g-knob tone-${scoreTone(value)}" cx="${nx}" cy="${ny}" r="${SW / 2 + 1.5}"/>` : '';
     return `<div class="gauge" role="img" aria-label="${esc(label)} ${has ? Math.round(value) : 'なし'}">`
-      + `<svg viewBox="0 0 120 66">${bands}${val}${needle}`
+      + `<svg viewBox="0 0 120 72">${bands}${val}${needle}`
       + `<text class="g-num${has ? '' : ' none'}" x="${CX}" y="${CY - 2}" text-anchor="middle">${has ? Math.round(value) : '–'}</text>`
-      + `<text class="g-end" x="${CX - R}" y="${CY + 8}" text-anchor="middle">0</text><text class="g-end" x="${CX + R}" y="${CY + 8}" text-anchor="middle">100</text></svg>`
+      + `<text class="g-end" x="${CX - R}" y="${CY + 15}" text-anchor="middle">0</text><text class="g-end" x="${CX + R}" y="${CY + 15}" text-anchor="middle">100</text></svg>`
       + `${label ? `<div class="g-label">${esc(label)}</div>` : ''}${sub ? `<div class="g-sub">${esc(sub)}</div>` : ''}</div>`;
   }
 

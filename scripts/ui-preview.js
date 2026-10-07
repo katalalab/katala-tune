@@ -27,6 +27,48 @@ const click = (sel) => `document.querySelector(${JSON.stringify(sel)})?.click()`
 const setInput = (sel, v) => `(() => { const i = document.querySelector(${JSON.stringify(sel)}); if (!i) return; i.value = ${JSON.stringify(v)}; i.dispatchEvent(new Event('input')); })()`;
 const setSelect = (sel, v) => `(() => { const s = document.querySelector(${JSON.stringify(sel)}); if (!s) return; s.value = ${JSON.stringify(v)}; s.dispatchEvent(new Event('change')); })()`;
 
+// 部品見本。ui.js と charts.js の部品を 1 ページに並べる（後で作る「道具」の画面で使う形も含む）。画面側で実行する
+function partsPage() {
+  const nodes = ['studio-mac', 'air-m3', 'build-mini', 'gpu-tower', 'media-pc', 'family-pc'];
+  const tools = [
+    ['git', ['2.51.0', '2.51.0', '2.50.1', '2.51.0', '2.51.0', null]],
+    ['node', ['24.21.0', '24.21.0', '24.21.0', '22.20.0', '24.21.0', '24.21.0']],
+    ['python3', ['3.13.7', '3.13.7', '3.12.11', '3.13.7', '3.13.7', '3.12.4']],
+    ['ollama', ['0.12.3', null, null, '0.12.3', null, null]],
+  ];
+  const majority = (vs) => { const c = {}; vs.filter(Boolean).forEach((v) => { c[v] = (c[v] || 0) + 1; }); return Object.entries(c).sort((a, b) => b[1] - a[1])[0]?.[0]; };
+  const now = Date.now();
+  const pts = Array.from({ length: 24 }, (_, i) => ({ t: now - (23 - i) * 3600e3, v: i === 9 ? null : 40 + Math.round(20 * Math.sin(i / 3)) }));
+  const box = (t, inner) => `<div class="chart-box"><div class="chart-title">${UI.esc(t)}</div>${inner}</div>`;
+  const tones = ['default', 'gray', 'brown', 'orange', 'yellow', 'green', 'blue', 'purple', 'pink', 'red'];
+  document.querySelector('#crumbs').innerHTML = '<span class="crumb cur">部品見本</span>';
+  document.querySelector('#page').innerHTML = `<div class="page-inner">
+    ${UI.head({ icon: 'tool', title: '部品見本', desc: 'renderer/ui.js と renderer/charts.js の部品。道具の台帳（道具×機体のマトリクス、版の違いの強調、検索、追加・削除の履歴）でも使い回す。', props: UI.props([['状態', UI.status('ok') + UI.status('warn') + UI.status('fail') + UI.status('unknown'), 'status'], ['タグ', tones.map((t) => UI.chip(t, t)).join(''), 'tag']]) })}
+    ${UI.tabs([['matrix', 'マトリクス', 4, 'tool'], ['history', '追加・削除の履歴', 3, 'history']], 'matrix')}
+    <div class="filters">${UI.search({ id: 'partsQ', placeholder: '道具の名前で絞り込む', value: '' })}${UI.select({ id: 'partsNode', label: '機体', options: [['', 'すべて'], ...nodes.map((n) => [n, n])], value: 'gpu-tower' })}${UI.seg({ attr: 'parts', options: [['all', 'すべて'], ['diff', '版が違うものだけ']], value: 'all' })}<span class="count">4 件</span></div>
+    ${UI.matrix({
+      corner: '道具', rows: tools.map(([k, vs]) => ({ key: k, label: k, sub: `多数派 ${majority(vs)}` })), cols: nodes.map((n) => ({ key: n, label: n })),
+      cell: (r, c) => { const vs = tools.find((t) => t[0] === r.key)[1]; const v = vs[nodes.indexOf(c.key)]; if (!v) return {}; const m = majority(vs); return { html: `<span class="num">${UI.esc(v)}</span>`, diff: v !== m, title: v !== m ? `多数派は ${m}` : '' }; },
+    })}
+    ${UI.section('追加・削除の履歴')}
+    ${UI.table({
+      cols: [{ label: '日時' }, { label: '機体' }, { label: '変化' }, { label: '道具' }, { label: '版', cls: 'n' }],
+      rows: [['10/7 09:12', 'gpu-tower', '更新', 'node', '22.20.0 → 24.21.0'], ['10/6 22:40', 'build-mini', '追加', 'ollama', '0.12.3'], ['10/5 18:03', 'family-pc', '削除', 'git', '2.49.0']],
+      row: (r) => `<td class="muted nowrap">${r[0]}</td><td><b>${r[1]}</b></td><td>${UI.chip(r[2], { 追加: 'green', 削除: 'red', 更新: 'blue' }[r[2]])}</td><td>${r[3]}</td><td class="n">${r[4]}</td>`,
+    })}
+    ${UI.section('コールアウトとトグル')}
+    ${['red', 'orange', 'yellow', 'green', 'blue', 'gray'].map((t) => UI.callout({ tone: t, icon: t === 'green' ? 'check' : t === 'gray' || t === 'blue' ? 'info' : 'alert', title: `${t} のコールアウト`, body: '本文はふつうの文字色で書く。' })).join('')}
+    ${UI.toggle({ summary: '<span class="f-title">開いたトグル</span>', body: '<p class="f-advice">中身。<code>inline code</code> も使える。</p><div class="code">npm run ui-preview</div>', open: true })}
+    ${UI.toggle({ summary: '<span class="f-title">閉じたトグル</span>', body: '見えない' })}
+    ${UI.section('グラフ')}
+    <div class="charts">
+      ${box('横棒（しきい値 60 / 85）', [10, 64, 92, null].map((v, i) => Charts.meter(v, { label: ['正常', '注意', '異常', '値なし'][i], warn: 60, crit: 85 })).join(''))}
+      ${box('リングとゲージ', `<div style="display:flex;gap:14px;align-items:center">${[null, 30, 70, 95].map((s) => Charts.ring(s)).join('')}${Charts.gauge(72, { label: '平均' })}</div>`)}
+      ${box('折れ線（null で線が切れる）', Charts.line(pts, { unit: '%', min: 0, max: 100, marks: [{ v: 60, tone: 'warn' }] }))}
+      ${box('積み上げと相対棒', `${Charts.stacked([{ label: '異常', value: 2, tone: 'crit' }, { label: '注意', value: 5, tone: 'warn' }, { label: '正常', value: 40, tone: 'ok' }, { label: '不明', value: 3, tone: 'unknown' }])}<div style="margin-top:14px">${Charts.dataBar(30, 100)}</div><div style="margin-top:8px">${Charts.dataBar(80, 100, { tone: 'warn' })}</div>`)}
+    </div></div>`;
+}
+
 // 場面。js を順に実行してから撮る。slices は長い画面を何枚に分けて撮るか
 const SCENES = [
   { name: 'overview', js: [click('[data-view="overview"]')], slices: 3 },
@@ -53,6 +95,7 @@ const SCENES = [
   { name: 'node-mac-history', js: [click('[data-tab="history"]')] },
   { name: 'node-healthy', js: [click('[data-view="node:build-mini"]'), click('[data-tab="findings"]')] },
   { name: 'node-unreachable', js: [click('[data-view="node:family-pc"]'), click('[data-tab="findings"]')] },
+  { name: 'parts', js: [`(${partsPage.toString()})()`], slices: 3 },
   { name: 'probing', js: [click('[data-view="overview"]'), click('#btnProbe')], wait: 450 },
 ];
 // Windows の配置（キャプションボタンの逃げ）と、最小のウィンドウ幅

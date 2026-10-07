@@ -81,7 +81,12 @@ function bindSearch(sel, view, apply, rerender, ms = 250) {
 }
 
 function page(html) { $('#page').innerHTML = `<div class="page-inner">${html}</div>`; }
-function bindGoto(root = document) { $$('[data-goto]', root).forEach((el) => { el.onclick = () => go('node:' + el.dataset.goto); }); }
+function bindGoto(root = document) {
+  $$('[data-goto]', root).forEach((el) => {
+    el.onclick = () => go('node:' + el.dataset.goto);
+    if (el.tabIndex >= 0 && el.tagName !== 'BUTTON') el.onkeydown = (e) => { if (e.key === 'Enter') go('node:' + el.dataset.goto); };
+  });
+}
 
 // ---- サイドバーとパンくず ----
 function renderSidebar() {
