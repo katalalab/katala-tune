@@ -250,13 +250,26 @@ def launchd_jobs():
     return jobs
 
 
+def exit_reason(target):
+    """launchctl print の last exit reason（起動制約で止められた OS_REASON_CODESIGNING など）。読めなければ None"""
+    for line in run(["launchctl", "print", target], timeout=4).splitlines():
+        m = re.match(r"\s*last exit reason\s*=\s*(.+)$", line, re.I)
+        if m:
+            return m.group(1).strip()[:300]
+    return None
+
+
 def launchd_failing():
     out = run(["launchctl", "list"])
     bad = []
     for line in out.splitlines()[1:]:
         parts = line.split("\t")
         if len(parts) == 3 and not parts[2].startswith("com.apple.") and parts[1] not in ("0", "-") and parts[0] == "-":
-            bad.append({"label": parts[2], "exit": parts[1]})
+            bad.append({"label": parts[2], "exit": parts[1], "reason": None})
+    # 失敗しているものだけ終了の理由を読む（数は失敗分だけなので軽い。多すぎるときは先頭 20 件）
+    uid = os.getuid()
+    for b in bad[:20]:
+        b["reason"] = exit_reason(f"gui/{uid}/{b['label']}")
     return bad
 
 

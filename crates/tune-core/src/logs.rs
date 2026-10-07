@@ -298,7 +298,9 @@ pub fn log_findings(db: &Store, node_id: &str, now: i64) -> rusqlite::Result<Vec
             json!({ "node_id": node_id, "q": "Resource" }),
         );
     }
-    let disk = sum(&|r| ["disk", "Ntfs", "stornvme", "storahci", "volmgr"].iter().any(|p| prov(r, p)) && r.level != "info");
+    // volmgr の 161・162 は BSOD の後のクラッシュダンプ作成の記録（ディスクの故障ではない。停止そのものは安定性で数える）
+    let dump_record = |r: &crate::db::LogCount| prov(r, "volmgr") && (ev(r, "161") || ev(r, "162"));
+    let disk = sum(&|r| ["disk", "Ntfs", "stornvme", "storahci", "volmgr"].iter().any(|p| prov(r, p)) && r.level != "info" && !dump_record(r));
     if disk > 0 {
         push(
             "log-disk",
