@@ -2,7 +2,7 @@
 //! [`Engine`] のメソッドとして足す（engine.rs は分析・ログ・状態・変更操作の流れ）。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{Value, json};
@@ -25,6 +25,12 @@ pub struct ToolsState {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+static NEXT_DOGU_PUBLISH_ID: AtomicU64 = AtomicU64::new(0);
+
+fn dogu_publish_action_id(at: i64) -> String {
+    format!("{at}-dogu-{}-{}", std::process::id(), NEXT_DOGU_PUBLISH_ID.fetch_add(1, Ordering::Relaxed))
 }
 
 impl Engine {
@@ -219,8 +225,9 @@ impl Engine {
             Ok(v) => (true, v),
             Err(e) => (false, json!({ "error": e })),
         };
+        let at = now_ms();
         let entry = json!({
-            "id": format!("{}-dogu", now_ms()), "at": now_ms(), "node_id": "_app", "type": "dogu_publish", "params": { "slugs": pick },
+            "id": dogu_publish_action_id(at), "at": at, "node_id": "_app", "type": "dogu_publish", "params": { "slugs": pick },
             "label": format!("Do-gu に {} 件を登録", pick.len()), "ok": ok, "output": js::slice16(&res.to_string(), 4000), "undo": null, "undo_of": null,
         });
         // 記録を書けなくても送信は済んでいる。成功扱いにせず、その旨を返す
@@ -404,6 +411,15 @@ mod tests {
         })
     }
 
+    #[test]
+    fn dogu_publish_action_ids_are_unique_with_same_timestamp() {
+        let first = dogu_publish_action_id(1_700_000_000_000);
+        let second = dogu_publish_action_id(1_700_000_000_000);
+
+        assert_ne!(first, second);
+        assert!(first.contains(&format!("-{}-", std::process::id())));
+    }
+
     #[tokio::test]
     async fn view_and_draft_follow_the_master() {
         let (e, base) = engine("view");
@@ -495,6 +511,9 @@ mod tests {
         let down = FakeHttp { sent: Mutex::new(vec![]), decks: Err("Do-gu に接続できない: timeout".into()) };
         let r = e.dogu_publish(&json!(["jq"]), &down, Some("k".into()), approve(Arc::new(Mutex::new(vec![])), true)).await.unwrap();
         assert_eq!((r["ok"].clone(), lock(&down.sent).iter().filter(|r| r.method == "POST").count()), (json!(false), 1));
+        let log = e.with_db(|d| d.actions(10)).unwrap();
+        assert_eq!(log.len(), 2, "失敗した送信もそれぞれ記録する");
+        assert!(log.iter().all(|entry| entry["ok"] == json!(false)));
         let _ = std::fs::remove_dir_all(&base);
     }
 
