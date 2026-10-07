@@ -5,7 +5,7 @@ python3 標準ライブラリだけで動く。設定・プロセス・ファイ
 秘密・環境変数・コマンドライン引数・ファイルの中身は集めない（プロセスは実行ファイル名だけ）。
 """
 import json, os, plistlib, re, shutil, socket, statistics, subprocess, sys, time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 
 HOME = os.path.expanduser("~")
 CACHE_DIRS = [
@@ -266,10 +266,23 @@ def launchd_failing():
         parts = line.split("\t")
         if len(parts) == 3 and not parts[2].startswith("com.apple.") and parts[1] not in ("0", "-") and parts[0] == "-":
             bad.append({"label": parts[2], "exit": parts[1], "reason": None})
-    # 失敗しているものだけ終了の理由を読む（数は失敗分だけなので軽い。多すぎるときは先頭 20 件）
+    # 失敗しているものだけ終了の理由を読む（多すぎるときは先頭 20 件）。1 件 4 秒の上限があるので、
+    # 4 並列で読み、全体も 10 秒で打ち切る（遅い機体で調査全体の上限 90 秒に当たって結果をまるごと失わないため）
     uid = os.getuid()
-    for b in bad[:20]:
-        b["reason"] = exit_reason(f"gui/{uid}/{b['label']}")
+    targets = bad[:20]
+    if targets:
+        ex = ThreadPoolExecutor(max_workers=4)
+        futs = {ex.submit(exit_reason, f"gui/{uid}/{b['label']}"): b for b in targets}
+        done, _ = wait(futs, timeout=10)
+        for f in done:
+            try:
+                futs[f]["reason"] = f.result()
+            except Exception:
+                pass
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:  # Python 3.8 以前
+            ex.shutdown(wait=False)
     return bad
 
 
