@@ -871,6 +871,8 @@ function setAccent(hex) {
 function setPlatform(p) {
   document.body.classList.remove('platform-darwin', 'platform-win32', 'platform-linux');
   document.body.classList.add(`platform-${p}`);
+  // Tauri 版はタイトルバーを OS のまま使う（キャプションボタンを重ねない）ので、その分の余白を取らない
+  document.body.classList.toggle('native-titlebar', !!window.__TAURI_INTERNALS__);
 }
 
 // 状態の更新通知は短時間にまとめて1回だけ反映する
