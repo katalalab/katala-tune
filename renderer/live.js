@@ -38,10 +38,19 @@ const Live = (() => {
       for (const k of ['cores', 'mem', 'gpus', 'procs', 'info']) if (n[k] != null) s[k] = n[k];
       if (Array.isArray(n.points) && n.points.length) {
         // 開始したときの全体（full）は重ねる。どちらも時刻で並べ、同じ時刻は 1 つにする
-        const byT = new Map((n.full ? [...s.points, ...n.points] : s.points.concat(n.points.filter((p) => p.t > (s.points.at(-1)?.t ?? -Infinity)))).map((p) => [p.t, p]));
-        s.points = [...byT.values()].sort((a, b) => a.t - b.t);
+        const last = s.points.at(-1)?.t ?? -Infinity;
+        const ordered = !n.full && n.points.every((p, i) => p.t > (i ? n.points[i - 1].t : last));
+        if (ordered) {
+          // 通常の差分は時刻順。過去の点をコピー・重複排除・ソートせず後ろへ足す。
+          for (const p of n.points) s.points.push(p);
+        } else {
+          const byT = new Map((n.full ? [...s.points, ...n.points] : s.points.concat(n.points.filter((p) => p.t > last))).map((p) => [p.t, p]));
+          s.points = [...byT.values()].sort((a, b) => a.t - b.t);
+        }
       }
-      s.points = s.points.filter((p) => p.t >= now - KEEP);
+      const first = s.points.findIndex((p) => p.t >= now - KEEP);
+      if (first === -1) s.points.length = 0;
+      else if (first > 0) s.points.splice(0, first);
       changed.push(id);
     }
     return changed;
