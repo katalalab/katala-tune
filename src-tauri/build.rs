@@ -15,6 +15,7 @@ const COMMANDS: &[&str] = &[
     "open_config",
     "status",
     "set_schedule",
+    "set_login",
     "dev_report",
 ];
 

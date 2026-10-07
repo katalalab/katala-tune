@@ -116,6 +116,17 @@ pub fn show(app: &AppHandle) {
     }
 }
 
+/// ウィンドウを出して、画面を移動する（通知・メニューの「状態を開く」）
+pub fn show_view(app: &AppHandle, view: &str) {
+    if app.get_webview_window(LABEL).is_some() {
+        show(app);
+        let _ = app.emit("navigate", view);
+    } else {
+        navigate_after_load(app, view);
+        show(app);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

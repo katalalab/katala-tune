@@ -24,6 +24,8 @@ tune-core.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tauri = { version = "2.12", features = ["tray-icon", "macos-private-api"] }
+tauri-plugin-notification = "2.5"
+tauri-plugin-autostart = "2.7"
 tauri-plugin-opener = "2.7"
 tauri-plugin-clipboard-manager = "2.4"
 

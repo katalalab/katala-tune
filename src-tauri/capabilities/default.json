@@ -1,13 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-window",
-  "description": "画面（renderer/）が window.tune で使うコマンドと、イベントの受け取り・ウィンドウのドラッグだけを許可する。プラグインの JS API（クリップボード・外部で開く）は Rust 側からだけ使う",
+  "description": "画面（renderer/）が window.tune で使うコマンドと、イベントの受け取り・ウィンドウのドラッグだけを許可する。プラグインの JS API（通知・自動起動・クリップボード・外部で開く）は Rust 側からだけ使う。通知の許可の確認（読むだけ）は、通知プラグインが読み込み時に自分で呼ぶため許可する",
   "windows": ["main"],
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "core:window:allow-start-dragging",
     "core:window:allow-internal-toggle-maximize",
+    "notification:allow-is-permission-granted",
     "allow-config",
     "allow-last",
     "allow-probe",
@@ -23,6 +24,7 @@
     "allow-open-config",
     "allow-status",
     "allow-set-schedule",
+    "allow-set-login",
     "allow-dev-report"
   ]
 }

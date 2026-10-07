@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use tauri::{AppHandle, State};
+use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_clipboard_manager::ClipboardExt as _;
 use tauri_plugin_opener::OpenerExt as _;
 use tune_core::engine::Engine;
@@ -126,6 +127,18 @@ pub async fn status(e: E<'_>) -> R {
 #[tauri::command]
 pub async fn set_schedule(e: E<'_>, patch: Option<Value>) -> R {
     e.set_schedule(&patch.unwrap_or_else(|| json!({})))
+}
+
+/// ログイン時の起動は、操作者が画面で切り替えたときだけ変える
+#[tauri::command]
+pub async fn set_login(app: AppHandle, e: E<'_>, on: bool) -> R {
+    let al = app.autolaunch();
+    let res = if on { al.enable() } else { al.disable() };
+    if let Err(err) = res {
+        eprintln!("ログイン時の起動を変えられなかった: {err}");
+    }
+    e.compute_checks(false, false);
+    Ok(json!(al.is_enabled().unwrap_or(false)))
 }
 
 /// 開発時だけ: 画面のエラー・警告を標準エラーに出す（検証用。リリースでは何もしない）
