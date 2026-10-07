@@ -55,7 +55,7 @@ function inspect(platform = process.platform, run = execute) {
     // Gateway設定は経路の存在と異なる。VPN等の既定経路も実際の経路表で確認する。
     const v4 = run('route.exe', ['print', '-4']);
     const v6 = run('route.exe', ['print', '-6']);
-    if ((v4.status === 0 && /^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+/m.test(v4.stdout || ''))
+    if ((v4.status === 0 && /^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+\S+\s+\d+\.\d+\.\d+\.\d+\s+\d+\s*$/m.test(v4.stdout || ''))
       || (v6.status === 0 && /^\s*\d+\s+\d+\s+::\/0\s+/m.test(v6.stdout || ''))) value.default_route_present = true;
     // 形式・言語・取得範囲の違いを経路なしと断定しない。見つからない時は null。
   } else value.unsupported_platform = true;

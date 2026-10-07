@@ -73,3 +73,18 @@ test('WindowsのNIC取得失敗も全項目をnullとして残す', () => {
   const value = inspect('win32', () => result('', null));
   for (const key of ['gateway_configured', 'interfaces_up', 'ip_address_present', 'default_route_present', 'dns_configured']) assert.equal(value[key], null);
 });
+
+test('Windowsの固定ルートだけでは現在の既定経路ありと判定しない', () => {
+  const value = inspect('win32', (cmd, args) => result(cmd === 'route.exe' && args.includes('-4') ? '固定ルート:\n  0.0.0.0  0.0.0.0  192.0.2.1  10\n' : '{}'));
+  assert.equal(value.default_route_present, null);
+});
+
+test('MacのIPはリンクローカル・ループバックだけなら利用可能と判定しない', () => {
+  for (const addresses of ['inet 169.254.1.2\n inet6 fe80::1', 'inet 127.0.0.1\n inet6 ::1']) {
+    const value = inspect('darwin', cmd => result(cmd === 'route' ? 'interface: en0' : cmd === 'ifconfig' ? `en0: flags=8863<UP,RUNNING>\n ${addresses}\n status: active` : ''));
+    assert.equal(value.ip_address_present, false);
+  }
+  const unknown = inspect('darwin', cmd => result(cmd === 'route' ? 'interface: en0' : '', cmd === 'ifconfig' ? null : 0));
+  assert.equal(unknown.interface_up, null);
+  assert.equal(unknown.link_active, null);
+});
