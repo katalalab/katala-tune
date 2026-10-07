@@ -56,6 +56,11 @@
     onNavigate: (fn) => { listen('navigate', (v) => fn(v)); },
     onProbeResult: (fn) => { listen('probe-result', (r) => fn(r)); },
     onLogsSynced: (fn) => { listen('logs-synced', (r) => fn(r)); },
+    // ライブ表示（Tauri 版だけ。Electron 版の preload.js には無いので、画面は有無で判定する）。
+    // 見ているあいだ liveStart(ids) を呼び直すと合図（heartbeat）になり、2 分途切れると Rust 側で止まる
+    liveStart: (ids) => invoke('live_start', { ids: (Array.isArray(ids) ? ids : []).map(String) }),
+    liveStop: (ids) => invoke('live_stop', { ids: Array.isArray(ids) ? ids.map(String) : null }),
+    onLive: (fn) => { listen('live', (p) => fn(p)); },
   };
   Object.defineProperty(window, 'tune', { value: Object.freeze(tune), enumerable: true });
 

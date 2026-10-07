@@ -27,6 +27,8 @@ const COMMANDS: &[&str] = &[
     "ai_summary",
     "ai_sessions",
     "ai_sync",
+    "live_start",
+    "live_stop",
 ];
 
 fn main() {

@@ -35,6 +35,8 @@
     "allow-dogu-publish",
     "allow-ai-summary",
     "allow-ai-sessions",
-    "allow-ai-sync"
+    "allow-ai-sync",
+    "allow-live-start",
+    "allow-live-stop"
   ]
 }

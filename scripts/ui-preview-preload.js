@@ -80,7 +80,62 @@ function signatures({ since = 0, node_id, limit = 50 } = {}) {
     .map(({ ids, ...s }) => ({ ...s, nodes: ids.size, node_ids: [...ids].join(','), total: total(s.fingerprint) }));
 }
 
+// ライブ表示（Tauri 版だけの API）。プレビューでは架空の値を 1 秒ごとに流す。
+// build-mini は数秒で「接続切れ」、media-pc は「つなぎ直し中」で止まって見えるようにする
+const live = { ids: new Set(), fns: [], timer: null, n: 0 };
+const wave = (i, base, amp, per) => Math.max(0, base + amp * Math.sin(i / per) + amp * 0.35 * Math.sin(i / 1.7));
+function livePoint(id, t) {
+  const i = Math.floor(t / 1000), k = id.length;
+  const p = { t, cpu: Math.min(100, wave(i + k, 18 + k * 2, 11, 6)), mem: wave(i, 44 + k * 2, 2, 40), dr: wave(i, 3e6, 2.6e6, 2.5), dw: wave(i + 3, 1.2e6, 1.1e6, 3.5), rx: wave(i, 4e5, 3.5e5, 4), tx: wave(i + 5, 9e4, 8e4, 2.2), lag: 6 + (i % 7) };
+  if (id === 'gpu-tower') Object.assign(p, { gpu: wave(i, 62, 30, 5), gmem: 58 });
+  return p;
+}
+function liveNode(id, full) {
+  const now = Date.now(), i = Math.floor(now / 1000);
+  const win = config.nodes.find((x) => x.id === id)?.os === 'windows';
+  const procs = [['Google Chrome Helper (Renderer)', 'Google Chrome', 38, 820], ['WindowServer', 'WindowServer', 21, 410], ['python3', 'python3', 12, 2300], ['ollama', 'ollama', 9, 5400], ['Code Helper (Plugin)', 'Code', 6, 960], ['mds_stores', 'mds_stores', 4, 120]]
+    .map(([name, app, cpu, mem], j) => ({ pid: 400 + j * 37, name: win ? name.split(' ')[0] : name, app, cpu: Math.round(wave(i + j, cpu, cpu / 3, 3) * 10) / 10, mem_mb: mem }));
+  return {
+    state: id === 'media-pc' ? 'retrying' : 'running', reason: null, attempt: id === 'media-pc' ? 2 : 0,
+    detail: id === 'media-pc' ? '10 秒間データが来ない' : null,
+    points: full ? Array.from({ length: 150 }, (_, j) => livePoint(id, now - (149 - j) * 1000)) : [livePoint(id, now)],
+    cores: Array.from({ length: win ? 16 : 12 }, (_, c) => Math.round(Math.min(100, wave(i + c * 3, 22, 24, 2)))),
+    mem: win ? { used_pct: 47.5, commit_pct: 61.2, commit_gb: 38.1, commit_limit_gb: 62.3 } : { used_pct: 52.1, swap_used_gb: 1.4, pressure: 'normal' },
+    gpus: id === 'gpu-tower' ? [{ name: 'GeForce RTX 4080', util: 64, mem_used_mb: 9500, mem_total_mb: 16384 }] : undefined,
+    procs: full || i % 5 === 0 ? { count: 512, at: now, top_cpu: procs, top_mem: procs.slice().sort((a, b) => b.mem_mb - a.mem_mb) } : undefined,
+    info: { os: win ? 'windows' : 'macos' }, load: win ? 1.9 : 0.6, rss_mb: win ? 108 : 23, full,
+  };
+}
+function liveEmit(nodes) { for (const fn of live.fns) fn(clone({ at: Date.now(), nodes })); }
+function liveTick() {
+  live.n++;
+  const nodes = {};
+  for (const id of live.ids) {
+    if (id === 'media-pc') continue;
+    if (id === 'build-mini' && live.n >= 3) {
+      nodes[id] = { state: 'stopped', reason: 'disconnected', detail: '3 回つなぎ直しても続かないので止めた: exit 255: ssh: connect to host build-mini port 22: Operation timed out', attempt: 0 };
+      live.ids.delete(id);
+      continue;
+    }
+    nodes[id] = liveNode(id, false);
+  }
+  if (Object.keys(nodes).length) liveEmit(nodes);
+}
+
 contextBridge.exposeInMainWorld('tune', {
+  liveStart: async (ids) => {
+    const started = (ids || []).filter((id) => !live.ids.has(id));
+    const snapshot = {};
+    for (const id of started) { live.ids.add(id); snapshot[id] = liveNode(id, true); }
+    if (!live.timer) live.timer = setInterval(liveTick, 1000);
+    return clone({ started, running: (ids || []).filter((id) => !started.includes(id)), refused: [], limit: 6, snapshot });
+  },
+  liveStop: async (ids) => {
+    const stopped = (ids || [...live.ids]).filter((id) => live.ids.delete(id));
+    liveEmit(Object.fromEntries(stopped.map((id) => [id, { state: 'stopped', reason: 'user', detail: '画面で止めた' }])));
+    return { stopped };
+  },
+  onLive: (fn) => { live.fns.push(fn); },
   config: async () => clone(config),
   last: async () => clone(results),
   probe: async (ids) => {

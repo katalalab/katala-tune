@@ -107,12 +107,15 @@ const SCENES = [
   { name: 'ai-sessions-errors', js: [setSelect('#aiTool', ''), setSelect('#aiDays', '30'), click('[data-aierr="1"]')], wait: 700, slices: 5 },
   { name: 'parts', js: [click('[data-aierr="0"]'), `(${partsPage.toString()})()`], slices: 3 },
   { name: 'probing', js: [click('[data-view="overview"]'), click('#btnProbe')], wait: 450 },
+  // ライブ表示（プレビューの preload が架空の値を 1 秒ごとに流す）。最後に置く（入れたままだと後の場面にもパネルが出る）
+  { name: 'resources-live', js: [click('[data-view="resources"]'), click('[data-live-toggle]')], wait: 4200 },
+  { name: 'node-live', js: [click('[data-view="node:gpu-tower"]'), click('[data-tab="findings"]'), click('[data-live-toggle]')], wait: 2500, slices: 2 },
 ];
 // Windows の配置（キャプションボタンの逃げ）と、最小のウィンドウ幅。electron は AI の API が「未対応」を返す Electron 版の見え方
 const VARIANTS = [
   { key: 'mac', platform: 'darwin', width: 1440, height: 920, scenes: SCENES },
   { key: 'win', platform: 'win32', width: 1440, height: 920, scenes: SCENES.filter((s) => ['overview', 'node-findings', 'logs'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
-  { key: 'narrow', platform: 'darwin', width: 1040, height: 700, scenes: SCENES.filter((s) => ['overview', 'status', 'resources', 'jobs', 'logs', 'node-findings', 'node-history', 'tools', 'tools-dogu-empty', 'tools-dogu', 'ai'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
+  { key: 'narrow', platform: 'darwin', width: 1040, height: 700, scenes: SCENES.filter((s) => ['overview', 'status', 'resources', 'jobs', 'logs', 'node-findings', 'node-history', 'tools', 'tools-dogu-empty', 'tools-dogu', 'ai', 'probing', 'resources-live', 'node-live'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
   { key: 'electron', platform: 'darwin', width: 1440, height: 920, query: { electron: '1' }, scenes: SCENES.filter((s) => s.name === 'ai').map((s) => ({ ...s, slices: 1 })) },
 ];
 
