@@ -332,7 +332,10 @@ def main():
         result["time_machine_running"] = f_tm.result()
         result["spotlight"] = f_sp.result()[0].strip()
         result["caches"] = [r for r in (f.result() for f in f_dirs) if r]
-    result["bench"] = bench()
+    skip_benchmark = "--skip-benchmark" in sys.argv[1:]
+    result["bench"] = None if skip_benchmark else bench()
+    if skip_benchmark:
+        result["benchmark_skipped"] = True
     result["elapsed_s"] = round(time.time() - t0, 1)
     json.dump(result, sys.stdout, ensure_ascii=False)
     print()
