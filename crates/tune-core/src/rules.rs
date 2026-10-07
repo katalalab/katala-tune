@@ -11,6 +11,8 @@ use crate::js::{self, Jv, Obj, arr, get, num, or, present, string, to_fixed, tru
 pub const HIGH_PERF_GUID: &str = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
 pub const BALANCED_GUID: &str = "381b4222-f694-41f0-9685-ff5bb260df2e";
 pub const POWER_SAVER_GUID: &str = "a1841308-3541-4fab-bc81-f71556f20b4a";
+/// 登録し直すコマンドに埋めてよいラベル（JS の /^[\w.-]+$/）
+static SAFE_LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.-]+$").expect("SAFE_LABEL"));
 pub const SHARED_BLOCKED: &str = "共用機のため、この画面からは実行しない（持ち主と相談）";
 
 /// JS の `.`（行末記号以外の1文字）
@@ -643,6 +645,29 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 "Time Machine のバックアップ中".into(),
                 "tmutil status".into(),
                 "終わるまで I/O が重い。急ぎの作業中なら一時停止してよい。",
+            );
+        }
+        // 起動制約（Launch Constraint）で止められた launchd ジョブ。mise・Homebrew で実行ファイルを入れ替えた後に起き、登録し直すと直る
+        for l in arr(get(s, "launchd_failing")) {
+            let reason = js::nullish(l.get("reason"), None);
+            if !(if present(reason) { string(reason) } else { String::new() }).contains("CODESIGNING") {
+                continue;
+            }
+            let label = l.get("label");
+            let job = arr(get(s, "jobs")).iter().find(|j| js::strict_eq(j.get("id"), label));
+            let plist = job
+                .map(|j| j.get("plist"))
+                .filter(|p| truthy(*p) && crate::actions::LAUNCH_AGENTS.is_match(&string(*p)) && SAFE_LABEL.is_match(&string(label)))
+                .map(|p| string(p));
+            out.add(
+                format!("launchd-constraint-{}", string(label)),
+                "warn",
+                "background",
+                format!("{} が起動制約で止められている（実行ファイルの更新後）", string(label)),
+                format!("終了コード {}、{}", string(l.get("exit")), string(l.get("reason"))),
+                "launchd に登録し直す（bootout → bootstrap）。mise や Homebrew で python・node を更新したあとに起きる。".into(),
+                plist.map(|p| vec![format!("launchctl bootout gui/$(id -u)/{}\nlaunchctl bootstrap gui/$(id -u) {p}", string(label))]),
+                None,
             );
         }
     }
