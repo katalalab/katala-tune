@@ -12,6 +12,8 @@ const actions = require('./lib/actions');
 const { openDb } = require('./lib/db');
 const logs = require('./lib/logs');
 const health = require('./lib/health');
+const inventory = require('./lib/inventory');
+const dogu = require('./lib/dogu');
 
 const IS_MAC = process.platform === 'darwin';
 const IS_WIN = process.platform === 'win32';
@@ -22,7 +24,7 @@ const extraPath = IS_WIN
   : ['/opt/homebrew/bin', '/usr/local/bin', path.join(os.homedir(), '.local/bin'), '/usr/bin', '/bin'];
 process.env.PATH = [process.env.PATH, ...extraPath].join(path.delimiter);
 
-const DEFAULT_SCHEDULE = { enabled: true, probe_minutes: 60, logs_minutes: 15 };
+const DEFAULT_SCHEDULE = { enabled: true, probe_minutes: 60, logs_minutes: 15, inventory_hours: 24 };
 let cfg = { nodes: [], protect: [] };
 let cfgError = null;
 let db;
@@ -30,9 +32,11 @@ let win;
 let tray;
 let probing = false;
 let syncing = false;
+let inventorying = false;
 let fleetCache = null;
 let fleetAt = null;
 const lastProbeError = {};
+const lastInventoryError = {};
 
 function reloadConfig() {
   try { cfg = loadConfig(); cfgError = null; } catch (e) { cfgError = String(e.message || e); }
@@ -147,6 +151,43 @@ async function syncLogs(targets = cfg.nodes) {
   }
 }
 
+// 道具の棚卸し（読み取り専用）。変化は inventory_events に残る
+async function runInventory(ids) {
+  if (inventorying) return { busy: true };
+  inventorying = true;
+  try {
+    reloadConfig();
+    const targets = cfg.nodes.filter((n) => !ids?.length || ids.includes(n.id));
+    const results = await Promise.all(targets.map(async (n) => {
+      const r = await inventory.inventoryNode(n).catch((e) => ({ node_id: n.id, ok: false, error: String(e) }));
+      const out = r.ok ? { node_id: n.id, ok: true, wall_s: r.wall_s, errors: r.errors, ...db.saveInventory(n.id, r.items, r.at, { skipSources: r.failedSources }) } : { node_id: n.id, ok: false, error: r.error };
+      if (r.ok) delete lastInventoryError[n.id]; else lastInventoryError[n.id] = r.error;
+      win?.webContents.send('inventory-result', out);
+      return out;
+    }));
+    if (!ids?.length) db.setMeta('lastInventoryAt', Date.now());
+    return { results };
+  } finally {
+    inventorying = false;
+  }
+}
+
+// 道具の一覧（機体×道具）。Do-gu のマスターは取得済みのときだけ照合に使う（ここでは取りにいかない）
+function inventoryView() {
+  const cached = db.getMeta('dogu_tools');
+  const matchSlug = cached ? dogu.makeMatcher(cached.tools) : null;
+  const rows = db.inventory();
+  const exclude = db.getMeta('dogu_exclude') || [];
+  const m = inventory.matrix(rows, { matchSlug });
+  const cats = cached ? new Map(cached.tools.map((t) => [t.slug, t.category])) : new Map();
+  return {
+    nodes: cfg.nodes.map(({ id, os: o }) => ({ id, os: o, count: rows.filter((r) => r.node_id === id && r.explicit).length, error: lastInventoryError[id] || null })),
+    groups: m.map((g) => ({ ...g, category: g.slug ? cats.get(g.slug) || null : null })),
+    events: db.inventoryEvents(100), sources: inventory.SOURCES, lastInventoryAt: db.getMeta('lastInventoryAt'), inventorying,
+    dogu: cached ? { at: cached.at, tools: cached.tools.length, matched: m.filter((g) => g.slug).length, draft: dogu.deckDraft(m, cached.tools, exclude), exclude } : null,
+  };
+}
+
 // 1分ごとに予定を見て、期限が来たものだけ動かす（スリープ明けでも溜まった分を1回で済ませる）
 function tick() {
   const s = schedule();
@@ -156,6 +197,8 @@ function tick() {
     runProbe(null, { auto: true }).then(() => syncLogs(reloadConfig().nodes)).catch(() => {});
   } else if (now - (db.getMeta('lastLogsAt') || 0) >= s.logs_minutes * 60000) {
     syncLogs(reloadConfig().nodes).catch(() => {});
+  } else if (!inventorying && now - (db.getMeta('lastInventoryAt') || 0) >= s.inventory_hours * 3600e3) {
+    runInventory().catch(() => {});
   }
 }
 
@@ -189,6 +232,7 @@ ipcMain.handle('set-schedule', (_e, patch) => {
   const s = { ...(db.getMeta('schedule') || {}) };
   if (typeof patch?.enabled === 'boolean') s.enabled = patch.enabled;
   for (const k of ['probe_minutes', 'logs_minutes']) if (Number.isInteger(patch?.[k]) && patch[k] >= 5 && patch[k] <= 1440) s[k] = patch[k];
+  if (Number.isInteger(patch?.inventory_hours) && patch.inventory_hours >= 1 && patch.inventory_hours <= 168) s.inventory_hours = patch.inventory_hours;
   db.setMeta('schedule', s);
   computeChecks({ notify: false, broadcast: false });
   return schedule();
@@ -253,6 +297,41 @@ ipcMain.handle('undo', async (_e, entryId) => {
   return confirmAndRun(entry.node_id, entry.undo, `${entry.node_id}: 元に戻す（${entry.label}）`, entryId);
 });
 ipcMain.handle('actions-log', () => db.actions(100));
+ipcMain.handle('inventory', () => inventoryView());
+ipcMain.handle('inventory-run', (_e, ids) => runInventory(ids).then(() => inventoryView()));
+// Do-gu の共通マスターを取りにいく（画面のボタンを押したときだけ。送るものは無い）
+ipcMain.handle('dogu-refresh', async () => {
+  try { await dogu.tools(db, { force: true }); return inventoryView(); } catch (e) { return { error: String(e.message || e) }; }
+});
+ipcMain.handle('dogu-exclude', (_e, slugs) => {
+  db.setMeta('dogu_exclude', [...new Set((Array.isArray(slugs) ? slugs : []).map(String))]);
+  return inventoryView();
+});
+// デッキへの登録（外への送信）。機体を変える操作ではないが、同じ型で扱う:
+// 検証（下書きにある slug だけ）→ 全件を見せた確認 → 確認後に下書きを作り直して再検証（変わっていたら送らない）→ 送信 → 実行記録。リトライしない
+ipcMain.handle('dogu-publish', async (_e, slugs) => {
+  const draftNow = () => inventoryView().dogu?.draft;
+  if (!draftNow()) return { ok: false, refused: '先に Do-gu の一覧を取得してください' };
+  const plan = dogu.planPublish(draftNow(), slugs);
+  if (plan.refused) return { ok: false, refused: plan.refused };
+  const key = dogu.apiKey();
+  if (!key) return { ok: false, refused: `API キーが見つからない。${dogu.BASE}/howto で発行し、環境変数 DO_GU_API_KEY か ~/.config/do-gu/api_key に保存してください` };
+  let login;
+  try { login = (await dogu.me(key)).login; } catch (e) { return { ok: false, refused: String(e.message || e) }; }
+  const list = plan.items.map((d) => `・${d.name}（${d.category}）`).join('\n');
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'warning', buttons: ['登録する', 'やめる'], defaultId: 1, cancelId: 1, title: 'Katala Tune',
+    message: `Do-gu のデッキに ${plan.pick.length} 件を登録します`,
+    detail: `登録すると ${dogu.BASE}/@${login} で誰でも見られる公開ページに載ります。\n送るのは既にある道具への紐づけだけで、新しい道具は作りません。\n\n${list}`,
+  });
+  if (response !== 0) return { ok: false, cancelled: true };
+  const fresh = dogu.planPublish(draftNow(), slugs);
+  if (!dogu.samePlan(plan, fresh)) return { ok: false, refused: '確認のあいだに下書きが変わったので送らなかった。もう一度確認してください' };
+  let res, ok = true;
+  try { res = await dogu.publish(key, fresh.pick); } catch (e) { ok = false; res = { error: String(e.message || e) }; }
+  db.addAction({ id: `${Date.now()}-dogu`, at: Date.now(), node_id: '_app', type: 'dogu_publish', params: { slugs: fresh.pick }, label: `Do-gu に ${fresh.pick.length} 件を登録`, ok, output: JSON.stringify(res).slice(0, 4000), undo: null, undo_of: null });
+  return { ok, login, url: `${dogu.BASE}/@${login}`, result: res };
+});
 ipcMain.handle('copy', (_e, text) => { clipboard.writeText(String(text)); return true; });
 ipcMain.handle('open-data-dir', () => shell.openPath(path.join(app.getPath('userData'), 'data')));
 ipcMain.handle('open-config', () => shell.openPath(cfg.file || ensureConfig().file));
