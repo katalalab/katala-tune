@@ -24,5 +24,15 @@
     "macOS": {
       "minimumSystemVersion": "12.0"
     }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRFODUzRDkxMUU3NTZBMjkKUldRcGFuVWVrVDJGVG5abEdPbE05eitjdENKcE9tRS9ZSUkrSG56cVhqeVZTanI3YVh6MzB3UEYK",
+      "endpoints": ["https://github.com/katalalab/katala-tune/releases/latest/download/latest.json"],
+      "requireSignedVersion": true,
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }
