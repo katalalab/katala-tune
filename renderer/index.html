@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost">
   <meta name="color-scheme" content="light dark">
   <title>Katala Tune</title>
   <link rel="stylesheet" href="style.css">
@@ -10,38 +10,41 @@
 <body>
   <div class="app">
     <aside class="sidebar">
-      <div class="side-drag"></div>
-      <nav class="side-nav" id="sideNav"></nav>
-      <div class="side-section">機体</div>
-      <nav class="side-nodes" id="sideNodes"></nav>
+      <div class="side-top" data-tauri-drag-region>
+        <div class="ws" data-tauri-drag-region>
+          <span class="ws-mark" aria-hidden="true"><svg class="i" viewBox="0 0 20 20"><path d="M3.5 14.5a6.5 6.5 0 1 1 13 0"/><path d="M10 14.5l3.2-4.6"/></svg></span>
+          <span class="ws-name">Katala Tune</span>
+        </div>
+      </div>
+      <nav class="side-nav" id="sideNav" aria-label="画面"></nav>
+      <div class="side-section"><span>機体</span><span class="side-count" id="sideCount"></span></div>
+      <nav class="side-nodes" id="sideNodes" aria-label="機体"></nav>
       <div class="side-foot">
-        <button class="side-link" id="btnConfig" title="機体台帳を開く">台帳</button>
-        <button class="side-link" id="btnData" title="データの保存先を開く">データ</button>
+        <button class="side-item" id="btnConfig" title="機体台帳を開く"><svg class="i" viewBox="0 0 20 20" aria-hidden="true"><path d="M5.5 2.75h6l3.75 3.75v10.75H5.5z"/><path d="M11.5 2.75V6.5h3.75M8 10.5h5M8 13.5h5"/></svg><span>台帳を開く</span></button>
+        <button class="side-item" id="btnData" title="データの保存先を開く"><svg class="i" viewBox="0 0 20 20" aria-hidden="true"><path d="M2.75 5.5A1.5 1.5 0 0 1 4.25 4h3.2l1.6 1.75h6.7a1.5 1.5 0 0 1 1.5 1.5v7.25a1.5 1.5 0 0 1-1.5 1.5H4.25a1.5 1.5 0 0 1-1.5-1.5z"/></svg><span>データの保存先</span></button>
       </div>
     </aside>
-    <main class="content">
-      <header class="toolbar">
-        <div class="tb-title">
-          <div class="tb-h" id="tbTitle">概要</div>
-          <div class="tb-sub" id="tbSub"></div>
-        </div>
-        <div class="tb-center" id="tbCenter"></div>
-        <div class="tb-actions">
-          <div class="capsule">
-            <button id="btnSync" class="cap-btn" title="全機のログを取り込む">
-              <svg viewBox="0 0 20 20"><path d="M4 10a6 6 0 0 1 10.2-4.3M16 10a6 6 0 0 1-10.2 4.3M14.5 2.5v3.5H11M5.5 17.5V14H9" /></svg><span>ログ</span>
-            </button>
-            <button id="btnFleet" class="cap-btn" title="katala-fleet の概況を更新">
-              <svg viewBox="0 0 20 20"><path d="M3 15l4-5 3 3 4-6 3 4" /></svg><span>概況</span>
-            </button>
-          </div>
-          <button id="btnProbe" class="cta"><svg viewBox="0 0 20 20"><path d="M6 4l10 6-10 6z" /></svg><span>全機を分析</span></button>
+    <main class="main">
+      <header class="topbar" id="topbar" data-tauri-drag-region>
+        <nav class="crumbs" id="crumbs" aria-label="現在の場所" data-tauri-drag-region></nav>
+        <div class="top-actions">
+          <button id="btnSync" class="btn ghost" title="全機のログを取り込む">
+            <svg class="i" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10a6 6 0 0 1 10.2-4.3M16 10a6 6 0 0 1-10.2 4.3M14.5 2.5v3.5H11M5.5 17.5V14H9"/></svg><span>ログを取り込む</span>
+          </button>
+          <button id="btnFleet" class="btn ghost" title="katala-fleet の概況を更新">
+            <svg class="i" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 15l4-5 3 3 4-6 3 4"/></svg><span>概況を更新</span>
+          </button>
+          <button id="btnProbe" class="btn primary" title="全機体を分析する">
+            <svg class="i" viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 4.5l9 5.5-9 5.5z" fill="currentColor"/></svg><span>全機を分析</span>
+          </button>
         </div>
       </header>
       <div class="page" id="page"></div>
-      <div class="toast" id="toast" role="status"></div>
+      <div class="toast" id="toast" role="status" aria-live="polite"></div>
     </main>
   </div>
+  <script src="charts.js"></script>
+  <script src="ui.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

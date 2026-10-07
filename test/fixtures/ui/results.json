@@ -1,0 +1,1744 @@
+[
+ {
+  "node_id": "studio-mac",
+  "ok": true,
+  "data": {
+   "probe": "mac",
+   "probe_version": 2,
+   "host": {
+    "hostname": "Studio-Mac",
+    "os": "macOS 26.1",
+    "model": "Mac16,9",
+    "cpu": "Apple M4 Max",
+    "cores": 16,
+    "p_cores": 12,
+    "e_cores": 4,
+    "uptime_h": 52.3
+   },
+   "load": [
+    3.21,
+    3.84,
+    4.02
+   ],
+   "disk": [
+    {
+     "mount": "/",
+     "total_gb": 1858,
+     "free_gb": 655,
+     "free_pct": 35.3,
+     "raw_free_gb": 579
+    }
+   ],
+   "cpu_busy": 34.2,
+   "memory": {
+    "total_gb": 64,
+    "free_gb": 1.2,
+    "wired_gb": 5.3,
+    "compressed_gb": 3.4,
+    "available_pct": 58,
+    "pressure": "normal",
+    "swap_used_gb": 1.2,
+    "swap_total_gb": 2
+   },
+   "processes": {
+    "count": 812,
+    "top_cpu": [
+     {
+      "pid": 1945,
+      "cpu": 103.6,
+      "mem_mb": 251,
+      "etime": "2-04:11:46",
+      "name": "Google Drive",
+      "app": "Google Drive",
+      "start": "Mon Oct  5 10:08:37 2026"
+     },
+     {
+      "pid": 412,
+      "cpu": 22.1,
+      "mem_mb": 310,
+      "etime": "2-04:12:02",
+      "name": "WindowServer",
+      "app": "WindowServer"
+     },
+     {
+      "pid": 8812,
+      "cpu": 18.4,
+      "mem_mb": 920,
+      "etime": "03:22:10",
+      "name": "Google Chrome Helper (Renderer)",
+      "app": "Google Chrome"
+     },
+     {
+      "pid": 2210,
+      "cpu": 12.3,
+      "mem_mb": 9800,
+      "etime": "1-02:41:00",
+      "name": "ollama",
+      "app": "ollama"
+     },
+     {
+      "pid": 9120,
+      "cpu": 9.5,
+      "mem_mb": 480,
+      "etime": "00:41:12",
+      "name": "claude",
+      "app": "claude"
+     },
+     {
+      "pid": 9311,
+      "cpu": 7.9,
+      "mem_mb": 350,
+      "etime": "00:12:40",
+      "name": "node",
+      "app": "node"
+     },
+     {
+      "pid": 3301,
+      "cpu": 4.2,
+      "mem_mb": 610,
+      "etime": "1-01:10:00",
+      "name": "Slack Helper (Renderer)",
+      "app": "Slack"
+     },
+     {
+      "pid": 1388,
+      "cpu": 3.1,
+      "mem_mb": 1054,
+      "etime": "2-04:12:00",
+      "name": "Spotlight",
+      "app": "Spotlight"
+     }
+    ],
+    "top_mem": [
+     {
+      "pid": 2210,
+      "cpu": 12.3,
+      "mem_mb": 9800,
+      "etime": "1-02:41:00",
+      "name": "ollama",
+      "app": "ollama"
+     },
+     {
+      "pid": 5521,
+      "cpu": 1.2,
+      "mem_mb": 3100,
+      "etime": "05:10:22",
+      "name": "Xcode",
+      "app": "Xcode"
+     },
+     {
+      "pid": 8800,
+      "cpu": 2.4,
+      "mem_mb": 1400,
+      "etime": "1-03:00:00",
+      "name": "Google Chrome",
+      "app": "Google Chrome"
+     },
+     {
+      "pid": 1388,
+      "cpu": 3.1,
+      "mem_mb": 1054,
+      "etime": "2-04:12:00",
+      "name": "Spotlight",
+      "app": "Spotlight"
+     },
+     {
+      "pid": 6620,
+      "cpu": 0.8,
+      "mem_mb": 880,
+      "etime": "04:01:00",
+      "name": "Code Helper (Plugin)",
+      "app": "Code"
+     }
+    ],
+    "apps": [
+     {
+      "app": "ollama",
+      "cpu": 12.3,
+      "mem_mb": 9800,
+      "count": 1
+     },
+     {
+      "app": "Google Chrome",
+      "cpu": 31.2,
+      "mem_mb": 7192,
+      "count": 39
+     },
+     {
+      "app": "Xcode",
+      "cpu": 1.6,
+      "mem_mb": 3150,
+      "count": 4
+     },
+     {
+      "app": "Code",
+      "cpu": 3.3,
+      "mem_mb": 2400,
+      "count": 12
+     },
+     {
+      "app": "Slack",
+      "cpu": 4.9,
+      "mem_mb": 1500,
+      "count": 6
+     },
+     {
+      "app": "Spotlight",
+      "cpu": 3.1,
+      "mem_mb": 1054,
+      "count": 1
+     },
+     {
+      "app": "claude",
+      "cpu": 9.5,
+      "mem_mb": 980,
+      "count": 4
+     },
+     {
+      "app": "Google Drive",
+      "cpu": 103.6,
+      "mem_mb": 414,
+      "count": 6
+     },
+     {
+      "app": "Finder",
+      "cpu": 0.4,
+      "mem_mb": 220,
+      "count": 1
+     }
+    ],
+    "apps_cpu": [
+     {
+      "app": "Google Drive",
+      "cpu": 103.6,
+      "mem_mb": 414,
+      "count": 6
+     },
+     {
+      "app": "Google Chrome",
+      "cpu": 31.2,
+      "mem_mb": 7192,
+      "count": 39
+     },
+     {
+      "app": "WindowServer",
+      "cpu": 22.1,
+      "mem_mb": 310,
+      "count": 1
+     }
+    ],
+    "agent_processes": 33
+   },
+   "containers": {
+    "colima": [
+     {
+      "name": "default",
+      "status": "Running",
+      "cpus": 8,
+      "memory_gb": 8,
+      "disk_gb": 100
+     }
+    ]
+   },
+   "power": {
+    "cpu_speed_limit": null,
+    "thermal_warning": false,
+    "low_power_mode": false,
+    "on_battery": false
+   },
+   "launchd_failing": [],
+   "jobs": [
+    {
+     "kind": "launchd",
+     "id": "com.example.backup",
+     "name": "com.example.backup",
+     "scope": "user",
+     "state": "loaded",
+     "pid": null,
+     "last_result": 0,
+     "schedule": "日時指定 Hour=3,Minute=0",
+     "program": "rsync",
+     "plist": "~/Library/LaunchAgents/com.example.backup.plist"
+    },
+    {
+     "kind": "launchd",
+     "id": "homebrew.mxcl.ollama",
+     "name": "homebrew.mxcl.ollama",
+     "scope": "user",
+     "state": "running",
+     "pid": 5776,
+     "last_result": 0,
+     "schedule": "起動時、常駐",
+     "program": "ollama",
+     "plist": "~/Library/LaunchAgents/homebrew.mxcl.ollama.plist"
+    },
+    {
+     "kind": "launchd",
+     "id": "com.example.notes-sync",
+     "name": "com.example.notes-sync",
+     "scope": "user",
+     "state": "loaded",
+     "pid": null,
+     "last_result": 0,
+     "schedule": "300 秒ごと",
+     "program": "python3",
+     "plist": "~/Library/LaunchAgents/com.example.notes-sync.plist"
+    },
+    {
+     "kind": "launchd",
+     "id": "com.example.photo-import",
+     "name": "com.example.photo-import",
+     "scope": "user",
+     "state": "not-loaded",
+     "pid": null,
+     "last_result": null,
+     "schedule": "WatchPaths",
+     "program": "sh",
+     "plist": "~/Library/LaunchAgents/com.example.photo-import.plist"
+    },
+    {
+     "kind": "launchd",
+     "id": "com.google.keystone.agent",
+     "name": "com.google.keystone.agent",
+     "scope": "user",
+     "state": "loaded",
+     "pid": null,
+     "last_result": 0,
+     "schedule": "3600 秒ごと",
+     "program": "GoogleSoftwareUpdateAgent",
+     "plist": "~/Library/LaunchAgents/com.google.keystone.agent.plist"
+    },
+    {
+     "kind": "launchd",
+     "id": "com.example.colima",
+     "name": "com.example.colima",
+     "scope": "user",
+     "state": "running",
+     "pid": 3394,
+     "last_result": 0,
+     "schedule": "起動時、常駐",
+     "program": "colima",
+     "plist": "~/Library/LaunchAgents/com.example.colima.plist"
+    }
+   ],
+   "time_machine_running": false,
+   "spotlight": "Indexing enabled.",
+   "caches": [
+    {
+     "path": "~/Library/Caches",
+     "gb": null,
+     "timeout": true
+    },
+    {
+     "path": "~/Library/Developer/Xcode/DerivedData",
+     "gb": 14.2
+    },
+    {
+     "path": "~/.npm/_cacache",
+     "gb": 4.1
+    },
+    {
+     "path": "~/Library/Caches/Homebrew",
+     "gb": 2.3
+    }
+   ],
+   "bench": {
+    "runs_ms": [
+     66.8,
+     66.2,
+     65.9,
+     67.1,
+     66.4
+    ],
+    "median_ms": 66.4
+   },
+   "elapsed_s": 6.4
+  },
+  "at": "@-12m",
+  "wall_s": 8.179053497314452,
+  "findings": [
+   {
+    "id": "runaway-Google Drive-1945",
+    "severity": "warn",
+    "category": "cpu",
+    "title": "Google Drive が CPU 104%（1コア換算）",
+    "detail": "PID 1945、起動から 2-04:11:46（直近の平均）",
+    "advice": "Google Drive for desktop の同期が CPU を使い続けている。Drive を終了して再起動し、それでも続くならミラーリング対象を減らすかストリーミングに切り替える。",
+    "action": {
+     "type": "kill-process",
+     "label": "このプロセスを終了",
+     "params": {
+      "pid": 1945,
+      "name": "Google Drive",
+      "start": "Mon Oct  5 10:08:37 2026",
+      "min_cpu": 50
+     }
+    }
+   },
+   {
+    "id": "caches",
+    "severity": "info",
+    "category": "disk",
+    "title": "再生成できるキャッシュが 21 GB",
+    "detail": "~/Library/Developer/Xcode/DerivedData 14.2 GB、~/.npm/_cacache 4.1 GB、~/Library/Caches/Homebrew 2.3 GB",
+    "advice": "消しても次に使うとき作り直される。ディスクに余裕があるなら急がない。",
+    "commands": [
+     "rm -rf ~/Library/Developer/Xcode/DerivedData/*",
+     "npm cache clean --force",
+     "brew cleanup --prune=all",
+     "docker system df   # 確認してから\ndocker image prune -a",
+     "du -sh ~/Library/Caches/* 2>/dev/null | sort -h | tail -15   # 大きいものを確認"
+    ]
+   },
+   {
+    "id": "log-crashes",
+    "severity": "info",
+    "category": "stability",
+    "title": "アプリのクラッシュ・ハングが7日で 3 件",
+    "detail": "Application Error 1000 / Hang 1002、DiagnosticReports",
+    "advice": "ログ画面の「同種ログ」で、どのアプリが繰り返しているかを見る。",
+    "log_query": {
+     "node_id": "studio-mac",
+     "level": "error"
+    }
+   }
+  ],
+  "score": 90,
+  "compare": {
+   "bench_ratio": 1.018,
+   "cpu_delta": 4.4,
+   "mem_delta": -3,
+   "verdict": "same"
+  },
+  "stale": true
+ },
+ {
+  "node_id": "air-m3",
+  "ok": true,
+  "data": {
+   "probe": "mac",
+   "probe_version": 2,
+   "host": {
+    "hostname": "Air-M3",
+    "os": "macOS 15.7",
+    "model": "Mac15,12",
+    "cpu": "Apple M3",
+    "cores": 8,
+    "p_cores": 4,
+    "e_cores": 4,
+    "uptime_h": 410.5
+   },
+   "load": [
+    6.8,
+    6.1,
+    5.9
+   ],
+   "disk": [
+    {
+     "mount": "/",
+     "total_gb": 460,
+     "free_gb": 37,
+     "free_pct": 8.1,
+     "raw_free_gb": 22
+    }
+   ],
+   "cpu_busy": 64.3,
+   "memory": {
+    "total_gb": 16,
+    "free_gb": 0.1,
+    "wired_gb": 2.8,
+    "compressed_gb": 4.1,
+    "available_pct": 9,
+    "pressure": "warn",
+    "swap_used_gb": 3.6,
+    "swap_total_gb": 5
+   },
+   "processes": {
+    "count": 488,
+    "top_cpu": [
+     {
+      "pid": 7710,
+      "cpu": 62.4,
+      "mem_mb": 1210,
+      "etime": "06:12:40",
+      "name": "Google Chrome Helper (Renderer)",
+      "app": "Google Chrome"
+     },
+     {
+      "pid": 301,
+      "cpu": 31,
+      "mem_mb": 280,
+      "etime": "17-02:10:00",
+      "name": "WindowServer",
+      "app": "WindowServer"
+     },
+     {
+      "pid": 5120,
+      "cpu": 24.2,
+      "mem_mb": 640,
+      "etime": "02:40:00",
+      "name": "Figma Helper (Renderer)",
+      "app": "Figma"
+     },
+     {
+      "pid": 2290,
+      "cpu": 12,
+      "mem_mb": 310,
+      "etime": "3-00:00:00",
+      "name": "Slack Helper (Renderer)",
+      "app": "Slack"
+     },
+     {
+      "pid": 188,
+      "cpu": 9.8,
+      "mem_mb": 90,
+      "etime": "17-02:10:00",
+      "name": "mds_stores",
+      "app": "mds_stores"
+     }
+    ],
+    "top_mem": [
+     {
+      "pid": 7710,
+      "cpu": 62.4,
+      "mem_mb": 1210,
+      "etime": "06:12:40",
+      "name": "Google Chrome Helper (Renderer)",
+      "app": "Google Chrome"
+     },
+     {
+      "pid": 5100,
+      "cpu": 3.1,
+      "mem_mb": 690,
+      "etime": "02:40:00",
+      "name": "Figma",
+      "app": "Figma"
+     }
+    ],
+    "apps": [
+     {
+      "app": "Google Chrome",
+      "cpu": 88,
+      "mem_mb": 4300,
+      "count": 28
+     },
+     {
+      "app": "Figma",
+      "cpu": 27.3,
+      "mem_mb": 1250,
+      "count": 5
+     },
+     {
+      "app": "Slack",
+      "cpu": 12.4,
+      "mem_mb": 900,
+      "count": 6
+     },
+     {
+      "app": "Notion",
+      "cpu": 2.1,
+      "mem_mb": 700,
+      "count": 4
+     },
+     {
+      "app": "WindowServer",
+      "cpu": 31,
+      "mem_mb": 280,
+      "count": 1
+     }
+    ],
+    "apps_cpu": [
+     {
+      "app": "Google Chrome",
+      "cpu": 88,
+      "mem_mb": 4300,
+      "count": 28
+     },
+     {
+      "app": "WindowServer",
+      "cpu": 31,
+      "mem_mb": 280,
+      "count": 1
+     },
+     {
+      "app": "Figma",
+      "cpu": 27.3,
+      "mem_mb": 1250,
+      "count": 5
+     }
+    ],
+    "agent_processes": 4
+   },
+   "containers": {},
+   "power": {
+    "cpu_speed_limit": null,
+    "thermal_warning": false,
+    "low_power_mode": true,
+    "on_battery": true
+   },
+   "launchd_failing": [],
+   "jobs": [
+    {
+     "kind": "launchd",
+     "id": "com.example.dotfiles-sync",
+     "name": "com.example.dotfiles-sync",
+     "scope": "user",
+     "state": "loaded",
+     "pid": null,
+     "last_result": 0,
+     "schedule": "1800 秒ごと",
+     "program": "sh",
+     "plist": "~/Library/LaunchAgents/com.example.dotfiles-sync.plist"
+    },
+    {
+     "kind": "launchd",
+     "id": "com.example.screenshot-cleanup",
+     "name": "com.example.screenshot-cleanup",
+     "scope": "user",
+     "state": "loaded",
+     "pid": null,
+     "last_result": 0,
+     "schedule": "日時指定 Hour=12,Minute=0",
+     "program": "python3",
+     "plist": "~/Library/LaunchAgents/com.example.screenshot-cleanup.plist"
+    }
+   ],
+   "time_machine_running": false,
+   "spotlight": "Indexing enabled.",
+   "caches": [
+    {
+     "path": "~/Library/Developer/Xcode/DerivedData",
+     "gb": 6.2
+    },
+    {
+     "path": "~/.npm/_cacache",
+     "gb": 2.4
+    }
+   ],
+   "bench": {
+    "runs_ms": [
+     88.1,
+     97.3,
+     91,
+     120.4,
+     90.2
+    ],
+    "median_ms": 91
+   },
+   "elapsed_s": 7.9
+  },
+  "at": "@-13m",
+  "wall_s": 9.457074737548828,
+  "findings": [
+   {
+    "id": "cpu-busy",
+    "severity": "warn",
+    "category": "cpu",
+    "title": "CPU 使用率が高い（64.3%）",
+    "detail": "上位: Google Chrome 88%、WindowServer 31%、Figma 27%",
+    "advice": "常駐アプリの見直しで下がる余地がある。"
+   },
+   {
+    "id": "mem-pressure",
+    "severity": "warn",
+    "category": "memory",
+    "title": "メモリ圧迫が警告域（warn）",
+    "detail": "圧縮 4.1 GB、swap 3.6/5 GB",
+    "advice": "swap への書き出しで体感が落ちている。メモリの大口を減らすと戻る。"
+   },
+   {
+    "id": "mem-hog-Google Chrome",
+    "severity": "warn",
+    "category": "memory",
+    "title": "Google Chrome が 4.2 GB（実メモリの 26%）",
+    "detail": "28 プロセスの合計（RSS。共有分を重ねて数えるため実際より大きめ）",
+    "advice": "タブとプロファイルの数に比例する。chrome://settings/performance の「メモリセーバー」を有効にし、使っていないプロファイルのウィンドウを閉じる。"
+   },
+   {
+    "id": "disk-/",
+    "severity": "warn",
+    "category": "disk",
+    "title": "/ の空きが 8.1%（37 GB）",
+    "detail": "容量 460 GB",
+    "advice": "10% を切ると swap の確保とアップデートに影響する。",
+    "commands": [
+     "rm -rf ~/Library/Developer/Xcode/DerivedData/*",
+     "npm cache clean --force",
+     "du -sh ~/Library/Caches/* 2>/dev/null | sort -h | tail -15   # 大きいものを確認"
+    ]
+   },
+   {
+    "id": "log-jetsam",
+    "severity": "warn",
+    "category": "memory",
+    "title": "メモリ不足でアプリが落とされた記録が7日で 3 件",
+    "detail": "jetsam",
+    "advice": "メモリの大口を減らす。",
+    "log_query": {
+     "node_id": "air-m3",
+     "q": "jetsam"
+    }
+   },
+   {
+    "id": "lowpower",
+    "severity": "info",
+    "category": "power",
+    "title": "低電力モードが有効",
+    "detail": "pmset lowpowermode 1",
+    "advice": "性能を優先するならシステム設定 > バッテリー（または省エネルギー）で低電力モードを切る。"
+   },
+   {
+    "id": "uptime",
+    "severity": "info",
+    "category": "background",
+    "title": "17 日間再起動していない",
+    "detail": "",
+    "advice": "swap・圧縮メモリ・漏れたプロセスは再起動でまとめて片付く。区切りの良いところで。"
+   },
+   {
+    "id": "bench-noise",
+    "severity": "info",
+    "category": "cpu",
+    "title": "計測のばらつきが 35%",
+    "detail": "88.1 / 97.3 / 91 / 120.4 / 90.2 ms",
+    "advice": "裏で断続的に重い処理が走っている。CPU 上位を見て原因を探す。"
+   }
+  ],
+  "score": 57,
+  "compare": {
+   "bench_ratio": 1.159,
+   "cpu_delta": 12.1,
+   "mem_delta": -6,
+   "verdict": "slower"
+  },
+  "stale": true
+ },
+ {
+  "node_id": "build-mini",
+  "ok": true,
+  "data": {
+   "probe": "mac",
+   "probe_version": 2,
+   "host": {
+    "hostname": "Build-Mini",
+    "os": "macOS 26.1",
+    "model": "Mac14,12",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "p_cores": 8,
+    "e_cores": 4,
+    "uptime_h": 120.2
+   },
+   "load": [
+    1.2,
+    1.5,
+    1.8
+   ],
+   "disk": [
+    {
+     "mount": "/",
+     "total_gb": 994,
+     "free_gb": 612,
+     "free_pct": 61.6,
+     "raw_free_gb": 590
+    }
+   ],
+   "cpu_busy": 11.8,
+   "memory": {
+    "total_gb": 32,
+    "free_gb": 4.1,
+    "wired_gb": 3.1,
+    "compressed_gb": 0.4,
+    "available_pct": 62,
+    "pressure": "normal",
+    "swap_used_gb": 0,
+    "swap_total_gb": 0
+   },
+   "processes": {
+    "count": 402,
+    "top_cpu": [
+     {
+      "pid": 4410,
+      "cpu": 24.1,
+      "mem_mb": 900,
+      "etime": "00:08:12",
+      "name": "Runner.Worker",
+      "app": "Runner.Worker"
+     },
+     {
+      "pid": 4500,
+      "cpu": 8.2,
+      "mem_mb": 2300,
+      "etime": "00:08:00",
+      "name": "XCBBuildService",
+      "app": "Xcode"
+     },
+     {
+      "pid": 233,
+      "cpu": 2.1,
+      "mem_mb": 120,
+      "etime": "5-00:12:00",
+      "name": "WindowServer",
+      "app": "WindowServer"
+     }
+    ],
+    "top_mem": [
+     {
+      "pid": 4500,
+      "cpu": 8.2,
+      "mem_mb": 2300,
+      "etime": "00:08:00",
+      "name": "XCBBuildService",
+      "app": "Xcode"
+     }
+    ],
+    "apps": [
+     {
+      "app": "Xcode",
+      "cpu": 8.2,
+      "mem_mb": 2300,
+      "count": 3
+     },
+     {
+      "app": "Runner.Worker",
+      "cpu": 24.1,
+      "mem_mb": 900,
+      "count": 1
+     },
+     {
+      "app": "Runner.Listener",
+      "cpu": 0.3,
+      "mem_mb": 160,
+      "count": 1
+     }
+    ],
+    "apps_cpu": [
+     {
+      "app": "Runner.Worker",
+      "cpu": 24.1,
+      "mem_mb": 900,
+      "count": 1
+     },
+     {
+      "app": "Xcode",
+      "cpu": 8.2,
+      "mem_mb": 2300,
+      "count": 3
+     }
+    ],
+    "agent_processes": 2
+   },
+   "containers": {},
+   "power": {
+    "cpu_speed_limit": null,
+    "thermal_warning": false,
+    "low_power_mode": false,
+    "on_battery": false
+   },
+   "launchd_failing": [],
+   "jobs": [
+    {
+     "kind": "launchd",
+     "id": "com.example.nightly-build",
+     "name": "com.example.nightly-build",
+     "scope": "user",
+     "state": "loaded",
+     "pid": null,
+     "last_result": 0,
+     "schedule": "日時指定 Hour=2,Minute=30",
+     "program": "make",
+     "plist": "~/Library/LaunchAgents/com.example.nightly-build.plist"
+    },
+    {
+     "kind": "launchd",
+     "id": "com.example.cleanup",
+     "name": "com.example.cleanup",
+     "scope": "user",
+     "state": "loaded",
+     "pid": null,
+     "last_result": 78,
+     "schedule": "日時指定 Weekday=0",
+     "program": "sh",
+     "plist": "~/Library/LaunchAgents/com.example.cleanup.plist"
+    },
+    {
+     "kind": "launchd",
+     "id": "org.example.ci-runner",
+     "name": "org.example.ci-runner",
+     "scope": "user",
+     "state": "running",
+     "pid": 5338,
+     "last_result": 0,
+     "schedule": "起動時、常駐",
+     "program": "run.sh",
+     "plist": "~/Library/LaunchAgents/org.example.ci-runner.plist"
+    },
+    {
+     "kind": "launchd",
+     "id": "com.example.cache-warm",
+     "name": "com.example.cache-warm",
+     "scope": "user",
+     "state": "loaded",
+     "pid": null,
+     "last_result": 0,
+     "schedule": "日時指定 Hour=6,Minute=0",
+     "program": "python3",
+     "plist": "~/Library/LaunchAgents/com.example.cache-warm.plist"
+    }
+   ],
+   "time_machine_running": false,
+   "spotlight": "Indexing disabled.",
+   "caches": [
+    {
+     "path": "~/Library/Developer/Xcode/DerivedData",
+     "gb": 7.9
+    }
+   ],
+   "bench": {
+    "runs_ms": [
+     71.2,
+     70.8,
+     71.5,
+     70.9,
+     71
+    ],
+    "median_ms": 71
+   },
+   "elapsed_s": 5.2
+  },
+  "at": "@-12m",
+  "wall_s": 6.889514923095703,
+  "findings": [],
+  "score": 100,
+  "compare": {
+   "bench_ratio": 0.992,
+   "cpu_delta": 2.7,
+   "mem_delta": -2,
+   "verdict": "same"
+  },
+  "stale": true
+ },
+ {
+  "node_id": "gpu-tower",
+  "ok": true,
+  "data": {
+   "probe": "windows",
+   "probe_version": 2,
+   "host": {
+    "hostname": "GPU-TOWER",
+    "os": "Microsoft Windows 11 Pro 26100",
+    "cpu": "Intel(R) Core(TM) i9-14900K",
+    "cores": 32,
+    "max_mhz": 3200,
+    "uptime_h": 3.2
+   },
+   "cpu_busy": 38.4,
+   "cpu_perf_pct": 112.5,
+   "memory": {
+    "total_gb": 63.8,
+    "free_gb": 15.3,
+    "available_pct": 24,
+    "commit_pct": 84,
+    "pagefile_alloc_mb": 4096,
+    "pagefile_used_mb": 2900,
+    "pagefile_peak_mb": 3950
+   },
+   "processes": {
+    "count": 312,
+    "top_cpu": [
+     {
+      "pid": 7720,
+      "name": "python",
+      "cpu": 3.4,
+      "avg_core": 86.2,
+      "mem_mb": 5400,
+      "start": "@-17.8m"
+     },
+     {
+      "pid": 5512,
+      "name": "ollama",
+      "cpu": 1.6,
+      "avg_core": 22.4,
+      "mem_mb": 2100,
+      "start": "@-256.7m"
+     },
+     {
+      "pid": 4410,
+      "name": "vmmemWSL",
+      "cpu": 1.1,
+      "avg_core": 40.2,
+      "mem_mb": 18400,
+      "start": "@-240m"
+     },
+     {
+      "pid": 1220,
+      "name": "chrome",
+      "cpu": 0.9,
+      "avg_core": 4.1,
+      "mem_mb": 610,
+      "start": "@-231.7m"
+     },
+     {
+      "pid": 3880,
+      "name": "MsMpEng",
+      "cpu": 0.4,
+      "avg_core": 3,
+      "mem_mb": 420,
+      "start": "@-256.7m"
+     },
+     {
+      "pid": 912,
+      "name": "dwm",
+      "cpu": 0.3,
+      "avg_core": 2,
+      "mem_mb": 180,
+      "start": "@-256.7m"
+     }
+    ],
+    "top_mem": [
+     {
+      "pid": 4410,
+      "name": "vmmemWSL",
+      "cpu": 1.1,
+      "avg_core": 40.2,
+      "mem_mb": 18400,
+      "start": "@-240m"
+     },
+     {
+      "pid": 7720,
+      "name": "python",
+      "cpu": 3.4,
+      "avg_core": 86.2,
+      "mem_mb": 5400,
+      "start": "@-17.8m"
+     },
+     {
+      "pid": 6631,
+      "name": "Code",
+      "cpu": 0.2,
+      "avg_core": 1,
+      "mem_mb": 1300,
+      "start": "@-226.7m"
+     }
+    ],
+    "apps": [
+     {
+      "app": "vmmemWSL",
+      "cpu": 1.1,
+      "mem_mb": 18400,
+      "count": 1
+     },
+     {
+      "app": "python",
+      "cpu": 3.6,
+      "mem_mb": 5400,
+      "count": 3
+     },
+     {
+      "app": "chrome",
+      "cpu": 1.3,
+      "mem_mb": 3900,
+      "count": 22
+     },
+     {
+      "app": "ollama",
+      "cpu": 1.6,
+      "mem_mb": 2100,
+      "count": 2
+     },
+     {
+      "app": "Code",
+      "cpu": 0.4,
+      "mem_mb": 1300,
+      "count": 9
+     },
+     {
+      "app": "Discord",
+      "cpu": 0.2,
+      "mem_mb": 600,
+      "count": 5
+     },
+     {
+      "app": "explorer",
+      "cpu": 0.1,
+      "mem_mb": 210,
+      "count": 1
+     }
+    ],
+    "apps_cpu": [
+     {
+      "app": "python",
+      "cpu": 3.6,
+      "mem_mb": 5400,
+      "count": 3
+     },
+     {
+      "app": "ollama",
+      "cpu": 1.6,
+      "mem_mb": 2100,
+      "count": 2
+     },
+     {
+      "app": "chrome",
+      "cpu": 1.3,
+      "mem_mb": 3900,
+      "count": 22
+     }
+    ],
+    "agent_processes": 6
+   },
+   "power": {
+    "plan_guid": "381b4222-f694-41f0-9685-ff5bb260df2e",
+    "plan_name": "バランス",
+    "plans": [
+     "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
+     "381b4222-f694-41f0-9685-ff5bb260df2e",
+     "a1841308-3541-4fab-bc81-f71556f20b4a"
+    ]
+   },
+   "defender": {
+    "realtime": true,
+    "exclusions": 3
+   },
+   "gpus": [
+    {
+     "name": "NVIDIA GeForce RTX 4080",
+     "util": 72,
+     "mem_used_mb": 11800,
+     "mem_total_mb": 16376,
+     "temp_c": 78,
+     "power_w": 248.3,
+     "power_limit_w": 320,
+     "throttle": "None",
+     "driver": "576.88"
+    }
+   ],
+   "disk": [
+    {
+     "mount": "C:",
+     "total_gb": 1863,
+     "free_gb": 402,
+     "free_pct": 21.6
+    },
+    {
+     "mount": "D:",
+     "total_gb": 3726,
+     "free_gb": 670,
+     "free_pct": 18
+    }
+   ],
+   "wsl": {
+    "config": false,
+    "memory": null,
+    "processors": null
+   },
+   "stability_7d": {
+    "kernel_power_41": 4,
+    "bugcheck_1001": 3,
+    "unexpected_6008": 4
+   },
+   "services": [
+    {
+     "name": "SysMain",
+     "status": "Running",
+     "start": "Automatic"
+    },
+    {
+     "name": "WSearch",
+     "status": "Running",
+     "start": "Automatic"
+    },
+    {
+     "name": "DiagTrack",
+     "status": "Stopped",
+     "start": "Disabled"
+    }
+   ],
+   "startup_items": [
+    "Discord",
+    "Steam",
+    "OneDrive",
+    "Tailscale",
+    "Ollama",
+    "SecurityHealth",
+    "RtkAudUService"
+   ],
+   "jobs": [
+    {
+     "kind": "schtask",
+     "id": "\\NightlyBackup",
+     "name": "NightlyBackup",
+     "path": "\\",
+     "state": "ready",
+     "last_result": 1,
+     "last_run": "@-780m",
+     "next_run": "@660m",
+     "schedule": "Daily",
+     "program": "robocopy.exe",
+     "author": null
+    },
+    {
+     "kind": "schtask",
+     "id": "\\OllamaUpdate",
+     "name": "OllamaUpdate",
+     "path": "\\",
+     "state": "ready",
+     "last_result": 0,
+     "last_run": "@-4320m",
+     "next_run": "@5760m",
+     "schedule": "Weekly",
+     "program": "ollama.exe",
+     "author": null
+    },
+    {
+     "kind": "schtask",
+     "id": "\\NVIDIA\\NvTmRep_CrashReport1",
+     "name": "NvTmRep_CrashReport1",
+     "path": "\\NVIDIA\\",
+     "state": "ready",
+     "last_result": 267011,
+     "last_run": null,
+     "next_run": "@300m",
+     "schedule": "Daily",
+     "program": "NvTmRep.exe",
+     "author": null
+    },
+    {
+     "kind": "schtask",
+     "id": "\\Example\\SyncPhotos",
+     "name": "SyncPhotos",
+     "path": "\\Example\\",
+     "state": "disabled",
+     "last_result": 1,
+     "last_run": "@-12960m",
+     "next_run": null,
+     "schedule": "Logon",
+     "program": "python.exe",
+     "author": null
+    },
+    {
+     "kind": "schtask",
+     "id": "\\GoogleUpdaterTaskSystem",
+     "name": "GoogleUpdaterTaskSystem",
+     "path": "\\",
+     "state": "ready",
+     "last_result": 0,
+     "last_run": "@-40m",
+     "next_run": "@20m",
+     "schedule": "Daily every PT1H",
+     "program": "updater.exe",
+     "author": null
+    },
+    {
+     "kind": "schtask",
+     "id": "\\WslAutoShutdown",
+     "name": "WslAutoShutdown",
+     "path": "\\",
+     "state": "running",
+     "last_result": 267009,
+     "last_run": "@-120m",
+     "next_run": null,
+     "schedule": "Idle",
+     "program": "wsl.exe",
+     "author": null
+    }
+   ],
+   "third_party_services": [
+    {
+     "name": "Tailscale",
+     "display": "Tailscale",
+     "state": "running",
+     "start": "auto",
+     "program": "tailscaled.exe"
+    },
+    {
+     "name": "beszel-agent",
+     "display": "Beszel Agent",
+     "state": "stopped",
+     "start": "auto",
+     "program": "beszel-agent.exe"
+    },
+    {
+     "name": "NVDisplay.ContainerLocalSystem",
+     "display": "NVIDIA Display Container LS",
+     "state": "running",
+     "start": "auto",
+     "program": "NVDisplay.Container.exe"
+    }
+   ],
+   "elapsed_s": 9.8,
+   "bench": {
+    "runs_ms": [
+     55.9,
+     56.4,
+     55.2,
+     56.8,
+     56.1
+    ],
+    "median_ms": 56.1
+   }
+  },
+  "at": "@-12m",
+  "wall_s": 12.091120147705078,
+  "findings": [
+   {
+    "id": "stability",
+    "severity": "critical",
+    "category": "stability",
+    "title": "直近7日で予期しない停止が 4 回",
+    "detail": "BugCheck(1001) 3、Kernel-Power(41) 4、6008 4",
+    "advice": "性能より先に安定性の問題。メモリ（XMP を切る・枚数を減らす）と CPU の劣化を疑う。この機体に常駐処理を増やさない。"
+   },
+   {
+    "id": "runaway-python-7720",
+    "severity": "warn",
+    "category": "cpu",
+    "title": "python が CPU 109%（1コア換算）",
+    "detail": "PID 7720（瞬間値。起動からの平均は 86.2%）",
+    "advice": "OS・セキュリティ、または誰かの作業（AI エージェント・python・node など）の可能性があるため、終了は提案しない。何の処理かを確かめ、原因側（同期・インデックス・ビルド・学習）を止める。"
+   },
+   {
+    "id": "commit",
+    "severity": "warn",
+    "category": "memory",
+    "title": "コミット済みメモリ 84%",
+    "detail": "ページファイル 4096 MB（ピーク 3950 MB）",
+    "advice": "予約だけで実際には使われていない分も含む。WSL や大きなモデルを動かすとここで詰まる。ページファイルが 4GB 固定なら「システム管理サイズ」に戻すと余裕ができる。"
+   },
+   {
+    "id": "mem-hog-vmmemWSL",
+    "severity": "warn",
+    "category": "memory",
+    "title": "vmmemWSL が 18.0 GB（実メモリの 28%）",
+    "detail": "1 プロセスの合計（ワーキングセット）",
+    "advice": "WSL の VM。使い終わったら `wsl --shutdown` でメモリを返す。常時大きいなら %UserProfile%\\.wslconfig の memory で上限を付ける。"
+   },
+   {
+    "id": "wsl-limit",
+    "severity": "warn",
+    "category": "memory",
+    "title": "WSL が 18.0 GB を使っていて上限が無い",
+    "detail": ".wslconfig に memory の指定が無い",
+    "advice": "Windows 側が足りなくなる前に上限を付ける。反映には `wsl --shutdown` が要る。",
+    "commands": [
+     "# %UserProfile%\\.wslconfig\n[wsl2]\nmemory=32GB\n\n[experimental]\nautoMemoryReclaim=gradual"
+    ]
+   },
+   {
+    "id": "log-whea",
+    "severity": "warn",
+    "category": "stability",
+    "title": "ハードウェアエラー（WHEA）が7日で 4 件",
+    "detail": "System ログの Microsoft-Windows-WHEA-Logger",
+    "advice": "CPU・メモリ・PCIe の訂正／訂正不能エラー。メモリの XMP を切る、枚数を減らす、MemTest86 で切り分ける。",
+    "log_query": {
+     "node_id": "gpu-tower",
+     "q": "WHEA"
+    }
+   },
+   {
+    "id": "log-gpu-reset",
+    "severity": "warn",
+    "category": "stability",
+    "title": "GPU ドライバのリセット・エラーが7日で 3 件",
+    "detail": "Display 4101 / nvlddmkm",
+    "advice": "GPU ドライバのタイムアウト。ドライバの入れ直し（DDU）、オーバークロックの解除、電源容量を確認する。",
+    "log_query": {
+     "node_id": "gpu-tower",
+     "q": "nvlddmkm OR Display"
+    }
+   },
+   {
+    "id": "power-plan",
+    "severity": "info",
+    "category": "power",
+    "title": "電源プランが「バランス」",
+    "detail": "GUID 381b4222-f694-41f0-9685-ff5bb260df2e",
+    "advice": "1スレッドの速さはほぼ変わらない（2026-10-03 に Windows 機2台で実測して -1.6%、誤差の範囲）。効くのはコアの休止からの復帰遅延くらいで、アイドル時の消費電力は増える。遅延に敏感な処理（音声・ゲーム配信・計測）をする機体だけ試し、効かなければ元に戻す。",
+    "action": {
+     "type": "set-power-plan",
+     "label": "高パフォーマンスにする",
+     "params": {
+      "guid": "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
+      "prev_guid": "381b4222-f694-41f0-9685-ff5bb260df2e"
+     }
+    }
+   },
+   {
+    "id": "log-crashes",
+    "severity": "info",
+    "category": "stability",
+    "title": "アプリのクラッシュ・ハングが7日で 5 件",
+    "detail": "Application Error 1000 / Hang 1002、DiagnosticReports",
+    "advice": "ログ画面の「同種ログ」で、どのアプリが繰り返しているかを見る。",
+    "log_query": {
+     "node_id": "gpu-tower",
+     "level": "error"
+    }
+   }
+  ],
+  "score": 25,
+  "compare": {
+   "bench_ratio": 0.982,
+   "cpu_delta": -2.6,
+   "mem_delta": -4,
+   "verdict": "same"
+  },
+  "stale": true
+ },
+ {
+  "node_id": "media-pc",
+  "ok": true,
+  "data": {
+   "probe": "windows",
+   "probe_version": 2,
+   "host": {
+    "hostname": "MEDIA-PC",
+    "os": "Microsoft Windows 11 Home 26100",
+    "cpu": "AMD Ryzen 7 7700 8-Core Processor",
+    "cores": 16,
+    "max_mhz": 3800,
+    "uptime_h": 98.4
+   },
+   "cpu_busy": 22.6,
+   "cpu_perf_pct": 98,
+   "memory": {
+    "total_gb": 31.2,
+    "free_gb": 12.5,
+    "available_pct": 40,
+    "commit_pct": 81,
+    "pagefile_alloc_mb": 4096,
+    "pagefile_used_mb": 1800,
+    "pagefile_peak_mb": 3900
+   },
+   "processes": {
+    "count": 268,
+    "top_cpu": [
+     {
+      "pid": 4410,
+      "name": "obs64",
+      "cpu": 2.1,
+      "avg_core": 31,
+      "mem_mb": 2400,
+      "start": "@-5840m"
+     },
+     {
+      "pid": 6120,
+      "name": "chrome",
+      "cpu": 1.2,
+      "avg_core": 6,
+      "mem_mb": 840,
+      "start": "@-4173.3m"
+     },
+     {
+      "pid": 2210,
+      "name": "Discord",
+      "cpu": 0.4,
+      "avg_core": 1.2,
+      "mem_mb": 420,
+      "start": "@-5831.7m"
+     },
+     {
+      "pid": 5530,
+      "name": "Spotify",
+      "cpu": 0.3,
+      "avg_core": 0.8,
+      "mem_mb": 380,
+      "start": "@-5830m"
+     }
+    ],
+    "top_mem": [
+     {
+      "pid": 4410,
+      "name": "obs64",
+      "cpu": 2.1,
+      "avg_core": 31,
+      "mem_mb": 2400,
+      "start": "@-5840m"
+     }
+    ],
+    "apps": [
+     {
+      "app": "chrome",
+      "cpu": 1.6,
+      "mem_mb": 3100,
+      "count": 18
+     },
+     {
+      "app": "obs64",
+      "cpu": 2.1,
+      "mem_mb": 2400,
+      "count": 1
+     },
+     {
+      "app": "Discord",
+      "cpu": 0.4,
+      "mem_mb": 700,
+      "count": 5
+     },
+     {
+      "app": "Spotify",
+      "cpu": 0.3,
+      "mem_mb": 400,
+      "count": 4
+     }
+    ],
+    "apps_cpu": [
+     {
+      "app": "obs64",
+      "cpu": 2.1,
+      "mem_mb": 2400,
+      "count": 1
+     },
+     {
+      "app": "chrome",
+      "cpu": 1.6,
+      "mem_mb": 3100,
+      "count": 18
+     }
+    ],
+    "agent_processes": 0
+   },
+   "power": {
+    "plan_guid": "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
+    "plan_name": "高パフォーマンス",
+    "plans": [
+     "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
+     "381b4222-f694-41f0-9685-ff5bb260df2e",
+     "a1841308-3541-4fab-bc81-f71556f20b4a"
+    ]
+   },
+   "defender": {
+    "realtime": false,
+    "exclusions": null
+   },
+   "gpus": [
+    {
+     "name": "NVIDIA GeForce RTX 4060",
+     "util": 18,
+     "mem_used_mb": 2100,
+     "mem_total_mb": 8188,
+     "temp_c": 52,
+     "power_w": 41.2,
+     "power_limit_w": 115,
+     "throttle": "None",
+     "driver": "576.88"
+    }
+   ],
+   "disk": [
+    {
+     "mount": "C:",
+     "total_gb": 931,
+     "free_gb": 118,
+     "free_pct": 12.7
+    },
+    {
+     "mount": "E:",
+     "total_gb": 7452,
+     "free_gb": 1210,
+     "free_pct": 16.2
+    }
+   ],
+   "wsl": {
+    "config": false,
+    "memory": null,
+    "processors": null
+   },
+   "stability_7d": {
+    "kernel_power_41": 0,
+    "bugcheck_1001": 0,
+    "unexpected_6008": 0
+   },
+   "services": [
+    {
+     "name": "SysMain",
+     "status": "Running",
+     "start": "Automatic"
+    },
+    {
+     "name": "WSearch",
+     "status": "Running",
+     "start": "Automatic"
+    }
+   ],
+   "startup_items": [
+    "OBS Studio",
+    "Discord",
+    "Spotify",
+    "Steam",
+    "Epic Games Launcher",
+    "OneDrive",
+    "Teams",
+    "Logi Options+",
+    "NVIDIA Broadcast",
+    "Elgato Stream Deck",
+    "Voicemeeter",
+    "Razer Synapse",
+    "iCUE",
+    "Adobe Creative Cloud",
+    "Dropbox",
+    "Google Drive",
+    "Zoom",
+    "Slack",
+    "Notion",
+    "Tailscale",
+    "SecurityHealth",
+    "RtkAudUService",
+    "AMD Software",
+    "GoXLR App"
+   ],
+   "jobs": [
+    {
+     "kind": "schtask",
+     "id": "\\Example\\AutoUpdate",
+     "name": "AutoUpdate",
+     "path": "\\Example\\",
+     "state": "disabled",
+     "last_result": 0,
+     "last_run": "@-4320m",
+     "next_run": null,
+     "schedule": "Daily",
+     "program": "updater.exe",
+     "author": null
+    },
+    {
+     "kind": "schtask",
+     "id": "\\OBS\\ReplayCleanup",
+     "name": "ReplayCleanup",
+     "path": "\\OBS\\",
+     "state": "ready",
+     "last_result": 0,
+     "last_run": "@-540m",
+     "next_run": "@900m",
+     "schedule": "Daily",
+     "program": "powershell.exe",
+     "author": null
+    },
+    {
+     "kind": "schtask",
+     "id": "\\Adobe Acrobat Update Task",
+     "name": "Adobe Acrobat Update Task",
+     "path": "\\",
+     "state": "ready",
+     "last_result": 0,
+     "last_run": "@-1200m",
+     "next_run": "@240m",
+     "schedule": "Logon, Daily",
+     "program": "AdobeARM.exe",
+     "author": null
+    },
+    {
+     "kind": "schtask",
+     "id": "\\MicrosoftEdgeUpdateTaskMachineCore",
+     "name": "MicrosoftEdgeUpdateTaskMachineCore",
+     "path": "\\",
+     "state": "ready",
+     "last_result": 0,
+     "last_run": "@-1080m",
+     "next_run": "@360m",
+     "schedule": "Logon, Daily",
+     "program": "MicrosoftEdgeUpdate.exe",
+     "author": null
+    }
+   ],
+   "third_party_services": [
+    {
+     "name": "Tailscale",
+     "display": "Tailscale",
+     "state": "running",
+     "start": "auto",
+     "program": "tailscaled.exe"
+    }
+   ],
+   "elapsed_s": 8.1,
+   "bench": {
+    "runs_ms": [
+     59.4,
+     59,
+     59.8,
+     59.1,
+     59.3
+    ],
+    "median_ms": 59.3
+   }
+  },
+  "at": "@-13m",
+  "wall_s": 9.619214630126953,
+  "findings": [
+   {
+    "id": "commit",
+    "severity": "warn",
+    "category": "memory",
+    "title": "コミット済みメモリ 81%",
+    "detail": "ページファイル 4096 MB（ピーク 3900 MB）",
+    "advice": "予約だけで実際には使われていない分も含む。WSL や大きなモデルを動かすとここで詰まる。ページファイルが 4GB 固定なら「システム管理サイズ」に戻すと余裕ができる。"
+   },
+   {
+    "id": "log-crashes",
+    "severity": "warn",
+    "category": "stability",
+    "title": "アプリのクラッシュ・ハングが7日で 16 件",
+    "detail": "Application Error 1000 / Hang 1002、DiagnosticReports",
+    "advice": "ログ画面の「同種ログ」で、どのアプリが繰り返しているかを見る。",
+    "log_query": {
+     "node_id": "media-pc",
+     "level": "error"
+    }
+   },
+   {
+    "id": "log-neon",
+    "severity": "warn",
+    "category": "memory",
+    "title": "NeonMonitor の自動保護が7日で 7 回動いた",
+    "detail": "guard.log の警告・強制終了・失敗",
+    "advice": "逼迫が繰り返している。強制終了で落ちたアプリが無いか確認し、根本の大口を減らす。",
+    "log_query": {
+     "node_id": "media-pc",
+     "source": "neonmonitor"
+    }
+   },
+   {
+    "id": "wsl-limit",
+    "severity": "info",
+    "category": "memory",
+    "title": "WSL のメモリ上限が未設定",
+    "detail": "既定では実メモリの半分まで使う",
+    "advice": "常用するなら上限と autoMemoryReclaim を設定しておくと、使い終わったメモリが Windows に戻る。",
+    "commands": [
+     "# %UserProfile%\\.wslconfig\n[wsl2]\nmemory=16GB\n\n[experimental]\nautoMemoryReclaim=gradual"
+    ]
+   },
+   {
+    "id": "defender-off",
+    "severity": "info",
+    "category": "security",
+    "title": "Defender のリアルタイム保護が無効",
+    "detail": "速さは出るが無防備",
+    "advice": "性能目的なら全体を切るより、開発ディレクトリだけ除外する方が安全。"
+   },
+   {
+    "id": "startup",
+    "severity": "info",
+    "category": "background",
+    "title": "スタートアップ項目が 24 件",
+    "detail": "OBS Studio、Discord、Spotify、Steam、Epic Games Launcher、OneDrive、Teams、Logi Options+、NVIDIA Broadcast、Elgato Stream Deck、Voicemeeter、Razer Synapse",
+    "advice": "タスクマネージャー > スタートアップ で使わないものを無効にする。"
+   }
+  ],
+  "score": 73,
+  "compare": {
+   "bench_ratio": 1.009,
+   "cpu_delta": 2.7,
+   "mem_delta": -4,
+   "verdict": "same"
+  },
+  "stale": true
+ },
+ {
+  "node_id": "family-pc",
+  "ok": false,
+  "error": "ssh: connect to host family-pc port 22: Operation timed out",
+  "at": "@-14m",
+  "wall_s": 30.1
+ }
+]
