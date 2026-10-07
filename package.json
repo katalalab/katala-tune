@@ -30,7 +30,8 @@
     "doctor": "node scripts/doctor.js",
     "check": "node scripts/check.js",
     "benchmark:live": "node scripts/benchmark-live.js",
-    "version:check": "node scripts/version.js"
+    "version:check": "node scripts/version.js",
+    "network": "node scripts/network-check.js"
   },
   "devDependencies": {
     "@electron/fuses": "^2.1.3",

@@ -36,6 +36,7 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 | 分析 | 各機体で読み取り専用の調査を並列に実行（6台でおよそ10〜17秒）。macOS は `probes/mac_probe.py` を python3 の標準入力へ、Windows は `probes/win_probe.ps1` を `~/.katala-tune/` に置いて PowerShell 5.1 で実行。アプリを動かしている機体はローカルで実行 |
 | 判定 | `lib/rules.js`（CPU の飽和と暴走、メモリ圧迫・swap・コミット、メモリの大口、実効の空きによるディスク判定、熱、電源プラン、BSOD、WSL の上限、Defender、colima/Docker の割り当て、キャッシュ）と、ログ由来の所見（`lib/logs.js`: WHEA、GPU ドライバのリセット、メモリ枯渇、ディスクエラー、クラッシュ、カーネルパニック、jetsam、NeonMonitor の自動保護） |
 | ログ | Windows のイベントログ（System / Application）と NeonMonitor の `guard.log`、macOS の DiagnosticReports とカーネルのエラーを、前回の続きから取り込む。冪等・秘密の伏せ字・件数上限つき。開いている間は15分ごとに自動で取り込む |
+| 接続診断 | 開発用の `npm run network` で経路・IP・DNS設定、`-- --probe` でHTTPS疎通を読み取り専用で確認。画面への診断統合・接続先分析は未実装 |
 | 計測 | 台帳に `"benchmark": false` を指定した機体では負荷計測を実行せず、状態だけを読み取る。省略時は従来どおり1スレッドの固定計算を5回（python）。前回との差で「最適化が効いたか」を見る（±15% 未満は誤差扱い） |
 | 実行 | プロセス終了（同一性・負荷を直前に再確認、終了を確認できなければ「終了未確認」）、Windows の電源プラン切り替え、タスクの無効化／有効化／今すぐ実行、launchd ジョブの停止／読み込み／今すぐ実行（元に戻せるものは戻せる） |
 | 道具 | 各機体のインストール先を読むだけ（`probes/mac_inventory.py`・`probes/win_inventory.ps1`）。パッケージマネージャもネットワークも使わない。読めなかった取り方は削除と見なさない |
