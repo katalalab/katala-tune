@@ -29,6 +29,11 @@ tauri-plugin-autostart = "2.7"
 tauri-plugin-opener = "2.7"
 tauri-plugin-clipboard-manager = "2.4"
 
+# 確認ダイアログ。tauri-plugin-dialog は「キャンセル系の終わり方」を2番目のボタンの押下に読み替えるため、
+# 安全側（やめる）を既定ボタンにすると取り違えが起きうる。rfd（plugin-dialog と同じもの）を直接使い、結果を自分で判定する
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+rfd = { version = "0.16", default-features = false, features = ["common-controls-v6"] }
+
 # アクセントカラー（NSColor.controlAccentColor）。tao が使う objc2-app-kit と同じもので、機能を足すだけ
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSColor", "NSColorSpace"] }

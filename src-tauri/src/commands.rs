@@ -62,6 +62,24 @@ pub async fn fleet(e: E<'_>) -> R {
     Ok(e.fleet().await)
 }
 
+/// 変更操作。台帳の読み直し → 計画と検証 → 確認ダイアログ → もう一度読み直し → 実行 → 実行記録
+#[tauri::command]
+pub async fn action(app: AppHandle, e: E<'_>, node_id: String, action: Value, label: Option<Value>) -> R {
+    if !crate::confirm::SUPPORTED {
+        return Ok(json!({ "ok": false, "refused": "この OS では確認ダイアログを出せないので実行しない" }));
+    }
+    let title = format!("{node_id}: {}", js::string(label.as_ref()));
+    e.confirm_and_run(&node_id, &action, &title, None, crate::confirm::dialog(app)).await
+}
+
+#[tauri::command]
+pub async fn undo(app: AppHandle, e: E<'_>, entry_id: String) -> R {
+    if !crate::confirm::SUPPORTED {
+        return Ok(json!({ "ok": false, "refused": "この OS では確認ダイアログを出せないので実行しない" }));
+    }
+    e.undo(&entry_id, crate::confirm::dialog(app)).await
+}
+
 #[tauri::command]
 pub async fn actions_log(e: E<'_>) -> R {
     e.with_db(|d| d.actions(100)).map(Value::Array)

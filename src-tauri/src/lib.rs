@@ -4,10 +4,12 @@
 //! - commands: window.tune の各関数（preload.js と同じ名前・引数・戻り値の形）
 //! - window: ウィンドウ（vibrancy・Mica・透過・遷移の禁止・外部 URL は https だけ既定のブラウザで）
 //! - tray: メニューバー（Windows は通知領域）
+//! - confirm: 変更操作の確認ダイアログ
 //! - 自動スキャン（1分ごとに期限を見る）・通知（異常化と回復だけ）・ログイン時の起動
 
 mod accent;
 mod commands;
+mod confirm;
 mod tray;
 mod window;
 
@@ -91,6 +93,8 @@ pub fn run() {
             commands::probe,
             commands::history,
             commands::fleet,
+            commands::action,
+            commands::undo,
             commands::actions_log,
             commands::logs_sync,
             commands::logs_query,

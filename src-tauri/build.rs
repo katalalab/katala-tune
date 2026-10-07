@@ -5,6 +5,8 @@ const COMMANDS: &[&str] = &[
     "probe",
     "history",
     "fleet",
+    "action",
+    "undo",
     "actions_log",
     "logs_sync",
     "logs_query",
