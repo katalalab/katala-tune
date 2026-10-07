@@ -46,7 +46,7 @@ NeonMonitor（Windows のメモリ監視・自動強制終了ツール）の静�
 - 取り出すのはセッション単位と時間ごとの数・名前・時刻・モデル・版・トークン・PR の URL だけ。会話の本文・ツールの入出力・コマンドライン引数は取り出さない・保存しない（`test/ai-sessions.test.js` で出力に含まれないことを確かめている）。
 - cwd・ファイルの鍵・エラーの文のホームは `~` に置き換える（Claude Code のプロジェクト名に入っているホームも）。
 - 1回は 25 秒で区切る。形の違う行は飛ばし、1行のせいでファイル全体を読めなくしない。読めなかったファイルは位置を進めず、次回に読み直す。
-- 保存は tune-core だけの表（`ai_sessions`・`ai_usage_hourly`・`ai_cursors`）。台帳の機体に `"ai_sessions": false` と書くと、その機体からは取り込まない。
+- 保存は tune-core だけの表（`ai_sessions`・`ai_usage_hourly`・`ai_cursors`）。台帳の機体に `"ai_sessions": false` と書くと、その機体からは取り込まない。**共用機（`shared: true`）は既定で取り込まない**（他の人のセッションの cwd や PR を集めないため）。取り込むときは `"ai_sessions": true` と明示する
 
 ## 外への送信（Do-gu）
 

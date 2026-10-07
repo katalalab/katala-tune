@@ -103,14 +103,27 @@ pub async fn fetch(node: &Node, files: &Map<String, Value>) -> (Fetched, f64) {
     (parse(&res), started.elapsed().as_secs_f64())
 }
 
-/// 台帳で取り込みを止めた機体（"ai_sessions": false）
+/// AI セッションを取り込む機体か。台帳の "ai_sessions" が true / false ならそれに従う。
+/// 書いていなければ、共用機（shared）は取り込まない（他の人のセッションの cwd や PR を集めないため）。それ以外は取り込む
 pub fn enabled(node: &Node) -> bool {
-    node.get("ai_sessions") != Some(&Value::Bool(false))
+    match node.get("ai_sessions") {
+        Some(Value::Bool(b)) => *b,
+        _ => !node.shared,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_nodes_are_off_unless_opted_in() {
+        let n = |v: Value| crate::nodes::Node::from_value(&v, "other-host");
+        assert!(enabled(&n(json!({ "id": "a", "alias": "a", "os": "macos" }))));
+        assert!(!enabled(&n(json!({ "id": "a", "alias": "a", "os": "macos", "ai_sessions": false }))));
+        assert!(!enabled(&n(json!({ "id": "s", "alias": "s", "os": "windows", "shared": true }))));
+        assert!(enabled(&n(json!({ "id": "s", "alias": "s", "os": "windows", "shared": true, "ai_sessions": true }))));
+    }
 
     #[test]
     fn state_is_embedded_as_python_dict() {

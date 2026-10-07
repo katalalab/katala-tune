@@ -140,7 +140,36 @@ impl Group {
     }
 }
 
-/// 機体×道具の表（matrix）。drift は「共通の版を1つも持たない機体の組がある」とき（同じ機体の中の書き方の違いは数えない）。
+/// 版の先頭の数字の並び（lib/inventory.js の core と同じ: `^\d+(?:\.\d+)*`、無ければそのまま）。
+/// 2.51.0.windows.1 → 2.51.0、Cask の 1.2,34 → 1.2
+pub fn version_core(v: &str) -> String {
+    let b = v.as_bytes();
+    let mut end = 0;
+    while end < b.len() && b[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == 0 {
+        return v.to_string();
+    }
+    loop {
+        let mut j = end;
+        if j < b.len() && b[j] == b'.' {
+            j += 1;
+            let start = j;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > start {
+                end = j;
+                continue;
+            }
+        }
+        break;
+    }
+    v[..end].to_string()
+}
+
+/// 機体×道具の表（matrix）。drift は「共通の版（先頭の数字の並び）を1つも持たない機体の組がある」とき（同じ機体の中の書き方の違い・OS ごとの接尾辞は数えない）。
 /// match_slug: Do-gu の slug に寄せられればそれで、無ければ名前を正規化してまとめる
 pub fn matrix(rows: &[Value], match_slug: Option<&SlugFn<'_>>, explicit_only: bool) -> Vec<Group> {
     let mut order: Vec<String> = Vec::new();
@@ -191,8 +220,9 @@ pub fn matrix(rows: &[Value], match_slug: Option<&SlugFn<'_>>, explicit_only: bo
         .into_iter()
         .filter_map(|k| groups.remove(&k))
         .map(|mut g| {
-            let sets: Vec<&Vec<Value>> = g.nodes.iter().map(|(_, v, _)| v).filter(|v| !v.is_empty()).collect();
-            g.drift = sets.iter().enumerate().any(|(i, a)| sets[i + 1..].iter().any(|b| !a.iter().any(|v| b.iter().any(|w| js::strict_eq(Some(v), Some(w))))));
+            let sets: Vec<Vec<String>> =
+                g.nodes.iter().map(|(_, v, _)| v.iter().map(|x| version_core(&js::string(Some(x)))).collect::<Vec<_>>()).filter(|v| !v.is_empty()).collect();
+            g.drift = sets.iter().enumerate().any(|(i, a)| sets[i + 1..].iter().any(|b| !a.iter().any(|v| b.contains(v))));
             g
         })
         .collect();
@@ -260,6 +290,16 @@ pub fn items_of(result: &Value) -> Vec<Item> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_core_takes_leading_numbers() {
+        assert_eq!(version_core("2.51.0.windows.1"), "2.51.0");
+        assert_eq!(version_core("1.2,34"), "1.2");
+        assert_eq!(version_core("24.21.0"), "24.21.0");
+        assert_eq!(version_core("3."), "3");
+        assert_eq!(version_core("v1.2"), "v1.2");
+        assert_eq!(version_core(""), "");
+    }
 
     #[test]
     fn normalize_dedupes_and_drops_blank() {
