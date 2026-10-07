@@ -87,8 +87,17 @@ pub struct Session {
 const COUNT_KEYS: [&str; 7] = ["prompts", "assistant_msgs", "tool_calls", "tool_errors", "turn_errors", "hook_errors", "api_errors"];
 
 fn int(v: Option<&Value>) -> i64 {
+    if let Some(x) = v.and_then(Value::as_i64) {
+        return x;
+    }
     let x = js::num(v);
     if x.is_finite() { x as i64 } else { 0 }
+}
+
+fn add_count(a: i64, b: i64) -> Result<i64> {
+    a.checked_add(b).ok_or_else(|| {
+        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "AI aggregate exceeds i64 range")))
+    })
 }
 
 fn opt_str(v: Option<&Value>) -> Option<String> {
@@ -127,7 +136,7 @@ impl Session {
     }
 
     /// 続き（mode = add）の分を足す。tokens_max の分は累計なので最大値
-    pub fn merge_add(&self, add: &Session) -> Session {
+    pub fn merge_add(&self, add: &Session) -> Result<Session> {
         let keep = |a: &Option<String>, b: &Option<String>| a.clone().or_else(|| b.clone());
         let newer = |a: &Option<String>, b: &Option<String>| b.clone().or_else(|| a.clone());
         let mm = |a: Option<i64>, b: Option<i64>, f: fn(i64, i64) -> i64| match (a, b) {
@@ -136,11 +145,13 @@ impl Session {
         };
         let mut tc = self.tool_counts.clone();
         for (k, v) in &add.tool_counts {
-            *tc.entry(k.clone()).or_insert(0) += v;
+            let count = tc.entry(k.clone()).or_insert(0);
+            *count = add_count(*count, *v)?;
         }
         let mut te = self.tool_error_counts.clone();
         for (k, v) in &add.tool_error_counts {
-            *te.entry(k.clone()).or_insert(0) += v;
+            let count = te.entry(k.clone()).or_insert(0);
+            *count = add_count(*count, *v)?;
         }
         let mut prs = self.prs.clone();
         for p in &add.prs {
@@ -150,13 +161,13 @@ impl Session {
         }
         let mut tokens = self.tokens;
         for (i, t) in tokens.iter_mut().enumerate() {
-            *t = if add.tokens_max { (*t).max(add.tokens[i]) } else { *t + add.tokens[i] };
+            *t = if add.tokens_max { (*t).max(add.tokens[i]) } else { add_count(*t, add.tokens[i])? };
         }
         let mut counts = self.counts;
         for (i, c) in counts.iter_mut().enumerate() {
-            *c += add.counts[i];
+            *c = add_count(*c, add.counts[i])?;
         }
-        Session {
+        Ok(Session {
             tool: if self.tool.is_empty() { add.tool.clone() } else { self.tool.clone() },
             session_id: keep(&self.session_id, &add.session_id),
             parent_id: keep(&self.parent_id, &add.parent_id),
@@ -172,7 +183,7 @@ impl Session {
             tool_counts: tc,
             tool_error_counts: te,
             prs,
-        }
+        })
     }
 
     fn from_row(r: &Row<'_>) -> rusqlite::Result<Session> {
@@ -229,7 +240,7 @@ pub fn hour_deltas(hours: Option<&Value>, tokens_max: bool, prev: [i64; 5]) -> V
         for (_, x) in &mut hs {
             for i in 0..5 {
                 let c = x[i];
-                x[i] = (c - cum[i]).max(0);
+                x[i] = c.saturating_sub(cum[i]).max(0);
                 cum[i] = cum[i].max(c);
             }
         }
@@ -248,15 +259,16 @@ pub struct AiIngested {
 fn counts_json(m: &BTreeMap<String, i64>) -> String {
     serde_json::to_string(m).unwrap_or_else(|_| "{}".into())
 }
-fn add_probe_hour(rec: &mut Value, h: Option<i64>, i: usize, n: i64) {
+fn add_probe_hour(rec: &mut Value, h: Option<i64>, i: usize, n: i64) -> Result<()> {
     if let Some(h) = h {
         let b = rec["hours"].as_object_mut().unwrap().entry(h.to_string()).or_insert_with(|| json!([0, 0, 0, 0, 0, 0, 0]));
         if let Some(a) = b.as_array_mut()
             && let Some(x) = a.get_mut(i)
         {
-            *x = json!(int(Some(x)) + n);
+            *x = json!(add_count(int(Some(x)), n)?);
         }
     }
+    Ok(())
 }
 
 fn claude_events(c: &rusqlite::Connection, node: &str, rec: &mut Value, out: &Value, replace: bool) -> Result<()> {
@@ -298,12 +310,12 @@ fn claude_events(c: &rusqlite::Connection, node: &str, rec: &mut Value, out: &Va
         for i in 0..5 {
             let d = next[i] - prior[i];
             if d > 0 {
-                rec["tokens"][TOK_KEYS[i]] = json!(int(rec["tokens"].get(TOK_KEYS[i])) + d);
-                add_probe_hour(rec, at, i, d);
+                rec["tokens"][TOK_KEYS[i]] = json!(add_count(int(rec["tokens"].get(TOK_KEYS[i])), d)?);
+                add_probe_hour(rec, at, i, d)?;
             }
         }
         if fresh {
-            rec["assistant_msgs"] = json!(int(rec.get("assistant_msgs")) + 1);
+            rec["assistant_msgs"] = json!(add_count(int(rec.get("assistant_msgs")), 1)?);
         }
     }
     for e in js::arr(out.get("claude_tools")) {
@@ -320,9 +332,9 @@ fn claude_events(c: &rusqlite::Connection, node: &str, rec: &mut Value, out: &Va
         if exists.is_none() {
             let h = hour(e.get("hour"));
             c.execute("INSERT INTO ai_claude_tools (node_id,file,tool_use_id,name,hour) VALUES (?,?,?,?,?)", params![node, file, id, name, h])?;
-            rec["tool_calls"] = json!(int(rec.get("tool_calls")) + 1);
-            rec["tool_counts"][&name] = json!(int(rec["tool_counts"].get(&name)) + 1);
-            add_probe_hour(rec, h, 5, 1);
+            rec["tool_calls"] = json!(add_count(int(rec.get("tool_calls")), 1)?);
+            rec["tool_counts"][&name] = json!(add_count(int(rec["tool_counts"].get(&name)), 1)?);
+            add_probe_hour(rec, h, 5, 1)?;
         }
     }
     for e in js::arr(out.get("claude_errors")) {
@@ -342,8 +354,8 @@ fn claude_events(c: &rusqlite::Connection, node: &str, rec: &mut Value, out: &Va
                 .optional()?;
             let name = name.unwrap_or_else(|| "?".into());
             c.execute("INSERT INTO ai_claude_tool_errors (node_id,file,tool_use_id) VALUES (?,?,?)", params![node, file, id])?;
-            rec["tool_errors"] = json!(int(rec.get("tool_errors")) + 1);
-            rec["tool_error_counts"][&name] = json!(int(rec["tool_error_counts"].get(&name)) + 1);
+            rec["tool_errors"] = json!(add_count(int(rec.get("tool_errors")), 1)?);
+            rec["tool_error_counts"][&name] = json!(add_count(int(rec["tool_error_counts"].get(&name)), 1)?);
         }
     }
     Ok(())
@@ -399,7 +411,7 @@ impl Store {
                 let add = Session::from_probe(&rec);
                 let prev_tokens = old.as_ref().map_or([0; 5], |o| o.tokens);
                 let s = match &old {
-                    Some(o) => o.merge_add(&add),
+                    Some(o) => o.merge_add(&add)?,
                     None => add.clone(),
                 };
                 if replace {
@@ -447,9 +459,9 @@ impl Store {
                     c.prepare_cached(
                         "INSERT INTO ai_usage_hourly (node_id, file, tool, hour, tok_in, tok_out, tok_cache_read, tok_cache_write, tok_reasoning, tool_calls, prompts)
                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                         ON CONFLICT (node_id, file, hour) DO UPDATE SET tok_in = tok_in + excluded.tok_in, tok_out = tok_out + excluded.tok_out,
-                           tok_cache_read = tok_cache_read + excluded.tok_cache_read, tok_cache_write = tok_cache_write + excluded.tok_cache_write,
-                           tok_reasoning = tok_reasoning + excluded.tok_reasoning, tool_calls = tool_calls + excluded.tool_calls, prompts = prompts + excluded.prompts",
+                         ON CONFLICT (node_id, file, hour) DO UPDATE SET tok_in = CASE WHEN tok_in > 9223372036854775807 - excluded.tok_in THEN NULL ELSE tok_in + excluded.tok_in END, tok_out = CASE WHEN tok_out > 9223372036854775807 - excluded.tok_out THEN NULL ELSE tok_out + excluded.tok_out END,
+                           tok_cache_read = CASE WHEN tok_cache_read > 9223372036854775807 - excluded.tok_cache_read THEN NULL ELSE tok_cache_read + excluded.tok_cache_read END, tok_cache_write = CASE WHEN tok_cache_write > 9223372036854775807 - excluded.tok_cache_write THEN NULL ELSE tok_cache_write + excluded.tok_cache_write END,
+                           tok_reasoning = CASE WHEN tok_reasoning > 9223372036854775807 - excluded.tok_reasoning THEN NULL ELSE tok_reasoning + excluded.tok_reasoning END, tool_calls = CASE WHEN tool_calls > 9223372036854775807 - excluded.tool_calls THEN NULL ELSE tool_calls + excluded.tool_calls END, prompts = CASE WHEN prompts > 9223372036854775807 - excluded.prompts THEN NULL ELSE prompts + excluded.prompts END",
                     )?
                     .execute(params![node_id, file, s.tool, h, x[0], x[1], x[2], x[3], x[4], x[5], x[6]])?;
                     res.hours += 1;
@@ -844,6 +856,75 @@ mod tests {
         assert!(db.ai_session("n", "claude:x").unwrap().is_some(), "gone preserves historical session");
         let ids: i64 = db.conn.query_row("SELECT count(*) FROM ai_claude_messages WHERE node_id='n' AND file='claude:x'", [], |r| r.get(0)).unwrap();
         assert_eq!(ids, 0);
+    }
+
+    #[test]
+    fn claude_overflow_rolls_back_metadata_and_cursor_then_retries() {
+        let db = Store::open_in_memory().unwrap();
+        let record = |mode| json!({"tool":"claude","file":"claude:overflow","mode":mode,"tokens":{},"hours":{}});
+        db.ai_ingest("n", &out(vec![], json!({"claude:overflow":7})), 0).unwrap();
+        let before = db.ai_cursors().unwrap();
+        let mut batch = json!({"sessions":[record("replace")],"cursors":{"claude:overflow":99},"claude_usage":[
+            {"file":"claude:overflow","id":"a","usage":[i64::MAX,0,0,0,0],"hour":H},
+            {"file":"claude:overflow","id":"b","usage":[i64::MAX,0,0,0,0],"hour":H}
+        ]});
+        assert!(db.ai_ingest("n", &batch, 1).unwrap_err().to_string().contains("AI aggregate exceeds i64 range"));
+        assert_eq!(db.ai_cursors().unwrap(), before);
+        for table in ["ai_sessions", "ai_usage_hourly", "ai_claude_messages", "ai_claude_replay"] {
+            let n: i64 = db.conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "{table} rolls back");
+        }
+        batch["claude_usage"][0]["usage"][0] = json!(3);
+        batch["claude_usage"][1]["usage"][0] = json!(4);
+        db.ai_ingest("n", &batch, 2).unwrap();
+        assert_eq!(db.ai_session("n", "claude:overflow").unwrap().unwrap().tokens[0], 7);
+        assert_eq!(db.ai_files("n").unwrap()["claude:overflow"], 99);
+        // A later poll must also reject a session total that cannot be represented.
+        batch["sessions"] = json!([record("add")]);
+        batch["cursors"]["claude:overflow"] = json!(100);
+        batch["claude_usage"] = json!([{"file":"claude:overflow","id":"c","usage":[i64::MAX,0,0,0,0],"hour":H+1}]);
+        assert!(db.ai_ingest("n", &batch, 3).is_err());
+        assert_eq!(db.ai_session("n", "claude:overflow").unwrap().unwrap().tokens[0], 7);
+        assert_eq!(db.ai_files("n").unwrap()["claude:overflow"], 99);
+        let n: i64 = db.conn.query_row("SELECT count(*) FROM ai_claude_messages", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn hourly_overflow_cannot_promote_sqlite_integer_to_real() {
+        let db = Store::open_in_memory().unwrap();
+        db.ai_ingest("n", &out(vec![claude("replace", 1, 3, H)], json!({"claude:p/s1.jsonl":10})), 0).unwrap();
+        db.conn.execute("UPDATE ai_usage_hourly SET tok_in=?", [i64::MAX]).unwrap();
+        let before = db.ai_session("n", "claude:p/s1.jsonl").unwrap();
+        assert!(db.ai_ingest("n", &out(vec![claude("add", 1, 1, H)], json!({"claude:p/s1.jsonl":20})), 1).is_err());
+        assert_eq!(db.ai_session("n", "claude:p/s1.jsonl").unwrap(), before);
+        assert_eq!(db.ai_files("n").unwrap()["claude:p/s1.jsonl"], 10);
+        let hour: (i64, String) = db.conn.query_row("SELECT tok_in, typeof(tok_in) FROM ai_usage_hourly", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(hour, (i64::MAX, "integer".into()));
+    }
+
+    #[test]
+    fn session_overflow_checks_all_additive_fields() {
+        let seed = Session {
+            tokens: [i64::MAX; 5],
+            counts: [i64::MAX; 7],
+            tool_counts: BTreeMap::from([("Bash".into(), i64::MAX)]),
+            tool_error_counts: BTreeMap::from([("Bash".into(), i64::MAX)]),
+            ..Default::default()
+        };
+        for i in 0..5 {
+            let mut delta = Session::default();
+            delta.tokens[i] = 1;
+            assert!(seed.merge_add(&delta).is_err());
+        }
+        for i in 0..7 {
+            let mut delta = Session::default();
+            delta.counts[i] = 1;
+            assert!(seed.merge_add(&delta).is_err());
+        }
+        assert!(seed.merge_add(&Session { tool_counts: BTreeMap::from([("Bash".into(), 1)]), ..Default::default() }).is_err());
+        assert!(seed.merge_add(&Session { tool_error_counts: BTreeMap::from([("Bash".into(), 1)]), ..Default::default() }).is_err());
+        assert_eq!(int(Some(&json!(i64::MAX - 1))), i64::MAX - 1, "integer input stays exact");
     }
 
     #[test]
