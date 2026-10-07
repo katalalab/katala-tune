@@ -386,9 +386,12 @@ impl Store {
             .collect())
     }
 
-    /// 続きの残っている機体があるか（取り込み中・続きあり）
-    pub fn ai_pending(&self) -> Result<bool> {
-        Ok(self.conn.query_row("SELECT count(*) FROM ai_cursors WHERE truncated = 1", [], |r| r.get::<_, i64>(0))? > 0)
+    /// nodes（今の台帳で取り込む機体）のうち、続きの残っている機体があるか（取り込み中・続きあり）。
+    /// 台帳から外した機体・取り込まない設定にした機体の古い続きの位置は数えない
+    pub fn ai_pending(&self, nodes: &[&str]) -> Result<bool> {
+        let mut st = self.conn.prepare_cached("SELECT node_id FROM ai_cursors WHERE truncated = 1")?;
+        let ids = st.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>>>()?;
+        Ok(ids.iter().any(|id| nodes.contains(&id.as_str())))
     }
 
     /// 集計（画面の AI）。f = { days（既定 30、1〜400）, tz（UTC からの分、東が正）, node_id, tool }
@@ -647,7 +650,8 @@ mod tests {
         db.ai_ingest("n1", &json!({ "sessions": [], "cursors": {}, "gone": ["codex:2026/r.jsonl"], "truncated": true }), 4).unwrap();
         assert!(!db.ai_files("n1").unwrap().contains_key("codex:2026/r.jsonl"));
         assert!(db.ai_session("n1", "codex:2026/r.jsonl").unwrap().is_some());
-        assert!(db.ai_pending().unwrap());
+        assert!(db.ai_pending(&["n1"]).unwrap());
+        assert!(!db.ai_pending(&["n2"]).unwrap(), "対象の機体だけを見る");
     }
 
     #[test]

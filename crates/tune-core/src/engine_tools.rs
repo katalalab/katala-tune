@@ -13,7 +13,7 @@ use crate::dogu::{self, Http, Matcher};
 use crate::engine::{Confirm, Engine};
 use crate::inventory::{self, items_of, matrix};
 use crate::js;
-use crate::nodes::Node;
+use crate::nodes::{Config, Node};
 
 /// 棚卸し・AI の取り込みの実行中の印と、機体ごとの前回のエラー
 #[derive(Default)]
@@ -31,6 +31,12 @@ static NEXT_DOGU_PUBLISH_ID: AtomicU64 = AtomicU64::new(0);
 
 fn dogu_publish_action_id(at: i64) -> String {
     format!("{at}-dogu-{}-{}", std::process::id(), NEXT_DOGU_PUBLISH_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+/// 今の台帳で AI のセッションを取り込む機体。「続きあり」はこの機体の続きの位置だけで判定する
+/// （台帳から外した機体・`ai_sessions: false` にした機体の古い位置で、空の取り込みを 2 分ごとに回し続けない）
+fn ai_node_ids(cfg: &Config) -> Vec<&str> {
+    cfg.nodes.iter().filter(|n| ai_sessions::enabled(n)).map(|n| n.id.as_str()).collect()
 }
 
 impl Engine {
@@ -301,7 +307,9 @@ impl Engine {
     pub fn ai_summary(&self, f: &Value) -> Result<Value, String> {
         let cfg = self.config();
         let now = now_ms();
-        let (mut s, cursors, last_at, pending) = self.with_db(|d| Ok((d.ai_summary(f, now)?, d.ai_cursors()?, d.get_meta("lastAiAt")?, d.ai_pending()?)))?;
+        let ids = ai_node_ids(&cfg);
+        let (mut s, cursors, last_at, pending) =
+            self.with_db(|d| Ok((d.ai_summary(f, now)?, d.ai_cursors()?, d.get_meta("lastAiAt")?, d.ai_pending(&ids)?)))?;
         let nodes: Vec<Value> = cfg
             .nodes
             .iter()
@@ -346,7 +354,8 @@ impl Engine {
             self.run_inventory(None).await;
         }
         if !self.is_ai_syncing() {
-            let pending = self.with_db(|d| d.ai_pending()).unwrap_or(false);
+            let cfg = self.reload_config();
+            let pending = self.with_db(|d| d.ai_pending(&ai_node_ids(&cfg))).unwrap_or(false);
             let mins = if pending { CATCH_UP_MINUTES as f64 } else { js::num(s.get("ai_minutes")) };
             if mins.is_finite() && since("lastAiAt") >= mins * 60_000.0 {
                 self.ai_sync(None).await;
@@ -527,6 +536,36 @@ mod tests {
         // 自動スキャンがオフなら何も動かさない（台帳の機体に ssh しない）
         e.tick_tools().await;
         assert_eq!(e.with_db(|d| d.get_meta("lastInventoryAt")).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn pending_only_counts_nodes_the_ledger_still_ingests() {
+        let base = std::env::temp_dir().join(format!("kt-tools-pending-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&base).unwrap();
+        let cfg = base.join("nodes.json");
+        // n1 は取り込まない設定、n2 は共用機（既定で取り込まない）。取り込む対象が無いので、取り込みが走っても ssh しない
+        let ledger = r#"{ "id": "n1", "alias": "n1", "os": "macos", "ai_sessions": false }, { "id": "n2", "alias": "n2", "os": "windows", "shared": true }"#;
+        std::fs::write(&cfg, format!(r#"{{ "nodes": [{ledger}] }}"#)).unwrap();
+        let e = Engine::open(cfg.clone(), base.join("data"), Arc::new(NoHost)).unwrap();
+        // 古い続きの位置: 台帳から外した機体（gone）と、取り込まない n1・n2
+        let rest = json!({ "sessions": [], "cursors": {}, "gone": [], "truncated": true });
+        e.with_db(|d| ["gone", "n1", "n2"].iter().try_for_each(|id| d.ai_ingest(id, &rest, 1).map(|_| ()))).unwrap();
+        assert_eq!(e.ai_summary(&json!({})).unwrap()["pending"], json!(false), "取り込まない機体の続きは「続きあり」にしない");
+        // 前回の取り込みは 3 分前。続きありと見なすと 2 分ごとの取り込み（対象 0 台）が走って lastAiAt が進む
+        let last = now_ms() - 3 * 60_000;
+        e.with_db(|d| {
+            d.set_meta("lastAiAt", &json!(last))?;
+            d.set_meta("lastInventoryAt", &json!(now_ms()))
+        })
+        .unwrap();
+        e.tick_tools().await;
+        assert_eq!(e.with_db(|d| d.get_meta("lastAiAt")).unwrap(), Some(json!(last)), "30 分ごとの間隔のまま");
+        // 今の台帳で取り込む機体（n3）に続きがあれば「続きあり」（ここでは画面の集計だけを見て、取り込みは走らせない）
+        std::fs::write(&cfg, format!(r#"{{ "nodes": [{ledger}, {{ "id": "n3", "alias": "n3", "os": "macos" }}] }}"#)).unwrap();
+        e.reload_config();
+        e.with_db(|d| d.ai_ingest("n3", &rest, 2).map(|_| ())).unwrap();
+        assert_eq!(e.ai_summary(&json!({})).unwrap()["pending"], json!(true));
         let _ = std::fs::remove_dir_all(&base);
     }
 }
