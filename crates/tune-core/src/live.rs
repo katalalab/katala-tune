@@ -1273,6 +1273,42 @@ mod tests {
         assert!(launch(&node("x", "linux"), &o).is_err());
     }
 
+    /// 実 PowerShell で scope・短い stdin chunk・末尾 byte・EOF 前後を検証する。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_boot_preserves_script_scope_and_stdin_lifetime() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let script = b"$value=42;function Scope {$script:value};[Console]::WriteLine((Scope));$io=[Console]::OpenStandardInput();[Console]::WriteLine($io.ReadByte());[Console]::WriteLine($io.ReadByte())";
+        let boot = windows_boot(script.len(), "");
+        let utf16: Vec<u8> = boot.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut child = collect::command("powershell.exe")
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &crate::logs::base64(&utf16)])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        for chunk in script.chunks(7) {
+            input.write_all(chunk).await.unwrap();
+            input.flush().await.unwrap();
+        }
+        input.write_all(b"Q").await.unwrap();
+        input.flush().await.unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+        let scope = tokio::time::timeout(Duration::from_secs(15), output.next_line()).await.unwrap().unwrap();
+        assert_eq!(scope.as_deref(), Some("42"), "dot-source must preserve $script scope");
+        let tail = tokio::time::timeout(Duration::from_secs(5), output.next_line()).await.unwrap().unwrap();
+        assert_eq!(tail.as_deref(), Some("81"), "bootstrap must consume exactly script.len() bytes");
+        assert!(child.try_wait().unwrap().is_none(), "must remain alive before stdin EOF");
+        drop(input);
+        let eof = tokio::time::timeout(Duration::from_secs(5), output.next_line()).await.unwrap().unwrap();
+        assert_eq!(eof.as_deref(), Some("-1"));
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait()).await.unwrap().unwrap();
+        assert!(status.success());
+    }
+
     // ---- 偽のサンプラー（一定間隔で行を出すローカルのスクリプト）で、開始・停止・自動停止・上限・つなぎ直しを確かめる ----
 
     /// sh で動かす偽のサンプラー。$1 に機体の id、$KT_DIR に記録の置き場所（起動ごとに pid を書く）
