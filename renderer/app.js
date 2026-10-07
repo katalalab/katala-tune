@@ -556,7 +556,7 @@ function renderProcs() {
   page(`
     ${UI.head({ icon: 'procs', title: 'プロセス', desc: '各機体の最新の分析から、CPU 上位とメモリ上位を横断して検索・並べ替えます。終了は確認のうえ、直前に同じプロセスかを確かめてから行います。' })}
     <div class="filters">
-      ${UI.search({ id: 'procQ', placeholder: '名前で絞り込む', value: f.q })}
+      ${UI.search({ id: 'procQ', placeholder: '名前で絞り込む', label: 'プロセスの検索', value: f.q })}
       ${UI.select({ id: 'procNode', label: '機体', options: nodeOptions(), value: f.node_id })}
       ${UI.seg({ attr: 'sort', options: [['cpu', 'CPU 順'], ['mem', 'メモリ順']], value: f.sort })}
       <span class="count">${rows.length} 件${rows.length > 300 ? '（上位 300 件を表示）' : ''}</span>
@@ -654,7 +654,7 @@ function renderJobs() {
     ${UI.head({ icon: 'jobs', title: 'スケジュール', desc: 'launchd（ユーザーの LaunchAgents）とタスクスケジューラ（Windows 標準・Apple 標準は除く）を横断して、予定・状態・前回の結果・次回を表示します。無効化・有効化・今すぐ実行は確認のうえで行い、元に戻せるものは「実行記録」から戻せます。' })}
     ${failing ? UI.callout({ tone: 'orange', icon: 'alert', title: `前回失敗した定期処理が ${failing} 件あります`, body: '「前回失敗のみ」で絞り込めます。失敗は運用の問題のことが多いので、止める前に何を実行しているかを確かめてください。' }) : ''}
     <div class="filters">
-      ${UI.search({ id: 'jobQ', placeholder: '名前・実行ファイル・予定で絞り込む', value: f.q })}
+      ${UI.search({ id: 'jobQ', placeholder: '名前・実行ファイル・予定で絞り込む', label: '定期処理の検索', value: f.q })}
       ${UI.select({ id: 'jobNode', label: '機体', options: nodeOptions(), value: f.node_id })}
       ${UI.seg({ attr: 'jf', options: [['0', `すべて ${total}`], ['1', `前回失敗のみ ${failing}`]], value: f.failing ? '1' : '0' })}
       <span class="count">${rows.length} 件</span>
@@ -762,7 +762,7 @@ async function renderLogs() {
   page(`
     ${UI.head({ icon: 'logs', title: 'ログ', desc: '各機体のイベントログ・クラッシュ・NeonMonitor を、前回の続きから取り込みます。数字・ID・パスを伏せて同じ形のものを「同種ログ」にまとめ、何台で出ているかを数えます。⌘K（Ctrl+K）で検索へ移ります。' })}
     <div class="filters">
-      ${UI.search({ id: 'logQ', placeholder: '全文検索（例: WHEA、beszel、crash）', value: f.q })}
+      ${UI.search({ id: 'logQ', placeholder: '全文検索（例: WHEA、beszel、crash）', label: 'ログの全文検索', value: f.q })}
       ${UI.select({ id: 'logNode', label: '機体', options: nodeOptions(), value: f.node_id })}
       ${UI.select({ id: 'logLevel', label: 'レベル', options: [['', 'すべて'], ...['critical', 'error', 'warn', 'info'].map((l) => [l, LEVEL_LABEL[l]])], value: f.level })}
       ${UI.select({ id: 'logSince', label: '期間', options: [1, 7, 30].map((d) => [d, `${d} 日`]), value: f.since, active: f.since !== 7 })}

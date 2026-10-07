@@ -88,8 +88,9 @@ const UI = (() => {
   const section = (title, hint = '', extra = '') =>
     `<h2 class="sec"><span>${esc(title)}</span>${hint ? `<span class="hint">${esc(hint)}</span>` : ''}${extra ? `<span class="sec-extra">${extra}</span>` : ''}</h2>`;
 
-  const tabs = (list, active) => `<div class="tabs" role="tablist">${list.map(([k, label, count, ic]) =>
-    `<button class="tab${k === active ? ' on' : ''}" role="tab" aria-selected="${k === active}" data-tab="${esc(k)}">${ic ? icon(ic) : ''}<span>${esc(label)}</span>${count != null && count !== '' ? `<span class="tab-count">${esc(count)}</span>` : ''}</button>`).join('')}</div>`;
+  // ビューの切り替え。ARIA のタブ（矢印キーでの移動が要る）ではなく、選択中を aria-current で示すボタンの並び
+  const tabs = (list, active, label = '表示の切り替え') => `<div class="tabs" role="group" aria-label="${esc(label)}">${list.map(([k, label, count, ic]) =>
+    `<button type="button" class="tab${k === active ? ' on' : ''}"${k === active ? ' aria-current="true"' : ''} data-tab="${esc(k)}">${ic ? icon(ic) : ''}<span>${esc(label)}</span>${count != null && count !== '' ? `<span class="tab-count">${esc(count)}</span>` : ''}</button>`).join('')}</div>`;
 
   const callout = ({ tone = 'gray', icon: ic = 'info', title = '', body = '', cls = '' }) =>
     `<div class="callout t-${tone}${cls ? ' ' + cls : ''}"><div class="co-icon">${icon(ic)}</div><div class="co-body">${title ? `<div class="co-title">${esc(title)}</div>` : ''}${body ? `<div class="co-text">${body}</div>` : ''}</div></div>`;
@@ -115,8 +116,9 @@ const UI = (() => {
     return `<div class="db matrix${cls ? ' ' + cls : ''}"><table class="dbt"><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table></div>`;
   }
 
-  const search = ({ id, placeholder = '', value = '' }) =>
-    `<label class="search">${icon('search')}<input id="${esc(id)}" type="search" placeholder="${esc(placeholder)}" value="${esc(value)}" autocomplete="off" spellcheck="false"></label>`;
+  // label: 読み上げ用の名前（入力すると消える placeholder の代わり）。省略時は placeholder を使う
+  const search = ({ id, placeholder = '', value = '', label = '' }) =>
+    `<label class="search">${icon('search')}<input id="${esc(id)}" type="search" aria-label="${esc(label || placeholder)}" placeholder="${esc(placeholder)}" value="${esc(value)}" autocomplete="off" spellcheck="false"></label>`;
 
   // 先頭の選択肢（「すべて」など）以外を選んでいるときは色を付けて、絞り込み中だと分かるようにする。
   // active: false を渡すと色を付けない（設定の値など）
