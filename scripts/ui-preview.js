@@ -102,10 +102,14 @@ const SCENES = [
   { name: 'tools-history', js: [setInput('#invQ', ''), click('[data-tab="history"]')], wait: 700 },
   { name: 'tools-dogu-empty', js: [click('[data-tab="dogu"]')], wait: 400 },
   { name: 'tools-dogu', js: [click('#doguRefresh')], wait: 1100, slices: 2 },
-  { name: 'ai', js: [click('[data-tab="matrix"]'), click('[data-view="ai"]')], wait: 700, slices: 5 },
+  { name: 'ai', js: [click('[data-tab="matrix"]'), click('[data-view="ai"]')], wait: 700, slices: 8 },
   { name: 'ai-codex-7d', js: [setSelect('#aiTool', 'codex'), setSelect('#aiDays', '7')], wait: 700, slices: 2 },
   { name: 'ai-sessions-errors', js: [setSelect('#aiTool', ''), setSelect('#aiDays', '30'), click('[data-aierr="1"]')], wait: 700, slices: 5 },
-  { name: 'security', js: [click('[data-aierr="0"]'), click('[data-view="security"]')], wait: 700, slices: 4 },
+  // 数字の出どころ: 日ごとの内訳の行 → その日のファイル → 1 ファイルの区間 → 元ファイルと照合
+  { name: 'ai-trace-day', js: [click('[data-aierr="0"]'), click('[data-aitrace-day]')], wait: 900, slices: 2, scrollTo: '#aiTrace' },
+  { name: 'ai-trace-file', js: [click('#aiTrace [data-aitrace-file]')], wait: 900, slices: 2, scrollTo: '#aiTrace' },
+  { name: 'ai-trace-verified', js: [click('#aiVerify')], wait: 1600, scrollTo: '#aiTrace' },
+  { name: 'security', js: [click('#aiTraceClose'), click('[data-view="security"]')], wait: 700, slices: 4 },
   { name: 'security-node', js: [setSelect('#secNode', 'gpu-tower')], wait: 500, slices: 2 },
   { name: 'parts', js: [click('[data-aierr="0"]'), `(${partsPage.toString()})()`], slices: 3 },
   { name: 'probing', js: [click('[data-view="overview"]'), click('#btnProbe')], wait: 450 },
@@ -117,7 +121,7 @@ const SCENES = [
 const VARIANTS = [
   { key: 'mac', platform: 'darwin', width: 1440, height: 920, scenes: SCENES },
   { key: 'win', platform: 'win32', width: 1440, height: 920, scenes: SCENES.filter((s) => ['overview', 'node-findings', 'logs'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
-  { key: 'narrow', platform: 'darwin', width: 1040, height: 700, scenes: SCENES.filter((s) => ['overview', 'status', 'resources', 'jobs', 'logs', 'node-findings', 'node-history', 'tools', 'tools-dogu-empty', 'tools-dogu', 'ai', 'security', 'probing', 'resources-live', 'node-live'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
+  { key: 'narrow', platform: 'darwin', width: 1040, height: 700, scenes: SCENES.filter((s) => ['overview', 'status', 'resources', 'jobs', 'logs', 'node-findings', 'node-history', 'tools', 'tools-dogu-empty', 'tools-dogu', 'ai', 'ai-trace-day', 'ai-trace-file', 'security', 'probing', 'resources-live', 'node-live'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
   { key: 'electron', platform: 'darwin', width: 1440, height: 920, query: { electron: '1' }, scenes: SCENES.filter((s) => ['ai', 'security'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
 ];
 
@@ -132,12 +136,14 @@ async function waitFor(wc, expr, ms = 5000) {
   throw new Error(`待ちきれなかった: ${expr}`);
 }
 
-async function shoot(wc, base, slices) {
-  const geo = await wc.executeJavaScript(`(() => { const p = document.querySelector('#page'); return { sh: p.scrollHeight, ch: p.clientHeight }; })()`);
+// from: その要素の少し上から撮り始める（長い画面の途中にある部分を撮るとき）
+async function shoot(wc, base, slices, from) {
+  const geo = await wc.executeJavaScript(`(() => { const p = document.querySelector('#page'); const el = ${JSON.stringify(from || '')} && document.querySelector(${JSON.stringify(from || '')});
+    return { sh: p.scrollHeight, ch: p.clientHeight, top: el ? Math.max(0, el.getBoundingClientRect().top - p.getBoundingClientRect().top + p.scrollTop - 16) : 0 }; })()`);
   const step = Math.max(200, geo.ch - 90);
-  const n = Math.max(1, Math.min(slices || 1, Math.ceil((geo.sh - geo.ch) / step) + 1));
+  const n = Math.max(1, Math.min(slices || 1, Math.ceil((geo.sh - geo.ch - geo.top) / step) + 1));
   for (let i = 0; i < n; i++) {
-    await wc.executeJavaScript(`(() => { const p = document.querySelector('#page'); p.scrollTop = ${i * step}; p.dispatchEvent(new Event('scroll')); })()`);
+    await wc.executeJavaScript(`(() => { const p = document.querySelector('#page'); p.scrollTop = ${geo.top + i * step}; p.dispatchEvent(new Event('scroll')); })()`);
     await wait(120);
     const img = await wc.capturePage();
     const file = path.join(OUT, `${base}${i ? `-${i + 1}` : ''}.png`);
@@ -180,7 +186,7 @@ async function runVariant(theme, v) {
     }
     for (const js of s.js) { await wc.executeJavaScript(js); await wait(60); }
     await wait(s.wait ?? 350);
-    await shoot(wc, `${theme}-${v.key}-${String(i).padStart(2, '0')}-${s.name}`, s.slices);
+    await shoot(wc, `${theme}-${v.key}-${String(i).padStart(2, '0')}-${s.name}`, s.slices, s.scrollTo);
   }
   await wait(1700); // 分析中の場面の後始末（プレビューの分析は 1.5 秒で終わる）
   win.destroy();

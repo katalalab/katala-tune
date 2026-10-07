@@ -8,7 +8,11 @@
 //!   tune analyze <snapshot.json>     snapshot（probe の data）から所見を作る
 //!   tune inventory [機体 ...]        道具の棚卸しを DB に保存し、結果を JSON で（DB は KATALA_TUNE_DATA_DIR で写しを指す）
 //!   tune ai [機体 ...]               AI エージェントのセッションを取り込み、結果を JSON で（同上。続きは DB が覚える）
-//!   tune ai-summary [日数]           DB の AI エージェントのセッションの集計を JSON で
+//!   tune ai-summary [日数 [機体]]    DB の AI エージェントのセッションの集計を JSON で（重複を除いた量・費用の推定つき）
+//!   tune ai-provenance               出どころの台帳の様子（連鎖の検算・区間の状態・調査スクリプトと単価表の版）
+//!   tune ai-trace 機体 <ファイルの鍵 | 日の epoch ms>   数字の出どころ（1 ファイルの区間と検算か、その日の内訳）
+//!   tune ai-verify 機体 ファイルの鍵  区間を元ファイルと照合する（機体で読み直して指紋だけを受け取る。読み取り専用）
+//!   tune ai-limits [機体 ...]        Codex の残り枠だけを問い合わせる（codex app-server。間隔の下限を見ない。共用機は呼ばない）
 //!   tune netsec [--probe] [機体 ...]  ネットワークとセキュリティ（「セキュリティ」の画面と同じ JSON）。--probe で先に分析して保存する
 //!                                    （DB は KATALA_TUNE_DATA_DIR で写しを指す）
 //!   tune live [--seconds N] 機体 ...  ライブ表示のサンプラーを N 秒（既定 30、最大 300）流し、件数・間隔・遅延・
@@ -26,7 +30,9 @@ use tune_core::engine::{Engine, NoHost};
 use tune_core::{collect, logs, nodes, rules};
 
 fn usage() -> ExitCode {
-    eprintln!("使い方: tune <paths|probe|logs|last|status|analyze|inventory|ai|ai-summary|netsec|live> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）");
+    eprintln!(
+        "使い方: tune <paths|probe|logs|last|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
+    );
     ExitCode::from(2)
 }
 
@@ -220,8 +226,31 @@ async fn main() -> ExitCode {
                     "ai" => Ok(e.ai_sync(ids).await),
                     _ => {
                         let days = rest.first().and_then(|d| d.parse::<i64>().ok()).unwrap_or(30);
-                        e.ai_summary(&json!({ "days": days }))
+                        e.ai_summary(&json!({ "days": days, "node_id": rest.get(1) }))
                     }
+                };
+                eprintln!("done {:.1}s db={}", t0.elapsed().as_secs_f64(), e.data_dir().display());
+                v.map(|v| print(&v))
+            }
+            Err(e) => Err(e),
+        },
+        "ai-provenance" | "ai-trace" | "ai-verify" | "ai-limits" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => {
+                let t0 = std::time::Instant::now();
+                let target = |r: &[String]| -> Value {
+                    let mut f = json!({ "node_id": r.first().cloned().unwrap_or_default() });
+                    match r.get(1) {
+                        Some(x) if x.parse::<i64>().is_ok() => f["day"] = json!(x.parse::<i64>().unwrap_or(0)),
+                        Some(x) => f["file"] = json!(x),
+                        None => {}
+                    }
+                    f
+                };
+                let v = match cmd.as_str() {
+                    "ai-provenance" => e.ai_provenance(),
+                    "ai-trace" => e.ai_trace(&target(rest)),
+                    "ai-verify" => e.ai_verify(&target(rest)).await,
+                    _ => Ok(e.ai_limits_sync((!rest.is_empty()).then(|| rest.to_vec())).await),
                 };
                 eprintln!("done {:.1}s db={}", t0.elapsed().as_secs_f64(), e.data_dir().display());
                 v.map(|v| print(&v))

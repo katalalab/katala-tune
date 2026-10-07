@@ -8,11 +8,14 @@
 //! Electron 版と同じ DB を共有するので、表の定義は lib/db.js と揃える（CREATE TABLE IF NOT EXISTS のまま）。
 
 mod actions;
+mod ai_limits;
 mod ai_sessions;
+mod ai_usage;
 mod checks;
 mod inventory;
 mod logs;
 mod netsec;
+pub mod provenance;
 mod snapshots;
 
 use std::path::Path;
@@ -21,11 +24,14 @@ use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value};
 
+pub use ai_limits::{LimitWindow, LimitsReport};
 pub use ai_sessions::{AiIngested, SESSION_PAGE_MAX, Session as AiSession, TOK_KEYS, hour_deltas};
+pub use ai_usage::{UsageRow, UsageWindow, dup_delta, span_state, summarize_usage};
 pub use checks::{Change, Check};
 pub use inventory::InventorySaved;
 pub use logs::{LogCount, LogRow, TopSignature};
 pub use netsec::NET_EVENT_DAYS;
+pub use provenance::{RunMeta, SpanIn, sha256_hex};
 pub use snapshots::Snapshot;
 
 pub const DB_FILE: &str = "katala-tune.db";
@@ -37,8 +43,18 @@ pub const QUERY_LIMIT_MAX: i64 = 2000;
 pub const SIGNATURE_LIMIT_MAX: i64 = 500;
 
 const PRAGMAS: &str = "PRAGMA journal_mode = WAL;\nPRAGMA synchronous = NORMAL;\n";
-const SCHEMA_PARTS: &[&str] =
-    &[snapshots::SCHEMA, actions::SCHEMA, logs::SCHEMA, checks::SCHEMA, META_SCHEMA, inventory::SCHEMA, ai_sessions::SCHEMA, netsec::SCHEMA];
+const SCHEMA_PARTS: &[&str] = &[
+    snapshots::SCHEMA,
+    actions::SCHEMA,
+    logs::SCHEMA,
+    checks::SCHEMA,
+    META_SCHEMA,
+    inventory::SCHEMA,
+    ai_sessions::SCHEMA,
+    netsec::SCHEMA,
+    provenance::SCHEMA,
+    ai_limits::SCHEMA,
+];
 const META_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT, updated_at INTEGER);\n";
 
 pub type Result<T> = rusqlite::Result<T>;
@@ -65,9 +81,12 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Store> {
         conn.execute_batch(PRAGMAS)?;
+        // 出どころの台帳・費用の列を足す前の DB の ai_claude_messages / ai_sessions に列が無い（CREATE TABLE IF NOT EXISTS では足されない）ので、後で足す
+        let old_ai = conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ai_sessions'")?.exists([])?;
         conn.execute_batch(&SCHEMA_PARTS.concat())?;
         let s = Store { conn };
         s.migrate()?;
+        s.tx(|c| ai_sessions::migrate(c, old_ai))?;
         Ok(s)
     }
 
@@ -237,5 +256,52 @@ mod tests {
         assert!(bytes > 0);
         // 移行は一度だけ
         assert_eq!(s.get_meta("migr_win_ts_v1").unwrap(), Some(Value::Bool(true)));
+        assert_eq!(s.get_meta("migr_ai_provenance_v1").unwrap(), Some(Value::Bool(true)));
+    }
+
+    #[test]
+    fn old_ai_tables_get_new_columns_and_reread_from_the_start() {
+        // 出どころの台帳・費用の列を足す前の DB（ai_claude_messages に span_id・model・cw1h が無い。続きの位置がある）
+        let dir = std::env::temp_dir().join(format!("kt-db-migr-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = 1_800_000_000_000 / 3_600_000;
+        {
+            let c = Connection::open(dir.join(DB_FILE)).unwrap();
+            c.execute_batch(
+                "CREATE TABLE ai_sessions (node_id TEXT NOT NULL, file TEXT NOT NULL, tool TEXT NOT NULL, session_id TEXT, parent_id TEXT, cwd TEXT, version TEXT,
+                   origin TEXT, model TEXT, first_ts INTEGER, last_ts INTEGER, prompts INTEGER NOT NULL DEFAULT 0, assistant_msgs INTEGER NOT NULL DEFAULT 0,
+                   tool_calls INTEGER NOT NULL DEFAULT 0, tool_errors INTEGER NOT NULL DEFAULT 0, turn_errors INTEGER NOT NULL DEFAULT 0, hook_errors INTEGER NOT NULL DEFAULT 0,
+                   api_errors INTEGER NOT NULL DEFAULT 0, tok_in INTEGER NOT NULL DEFAULT 0, tok_out INTEGER NOT NULL DEFAULT 0, tok_cache_read INTEGER NOT NULL DEFAULT 0,
+                   tok_cache_write INTEGER NOT NULL DEFAULT 0, tok_reasoning INTEGER NOT NULL DEFAULT 0, tokens_mode TEXT NOT NULL DEFAULT 'add',
+                   tool_counts TEXT, tool_error_counts TEXT, prs TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY (node_id, file)) WITHOUT ROWID;
+                 INSERT INTO ai_sessions (node_id, file, tool, model, tok_out, updated_at) VALUES ('n1', 'claude:a.jsonl', 'claude', 'claude-opus-5-5', 5, 1);
+                 CREATE TABLE ai_claude_messages (node_id TEXT NOT NULL, file TEXT NOT NULL, message_id TEXT NOT NULL, usage TEXT NOT NULL, hour INTEGER,
+                   PRIMARY KEY (node_id, file, message_id)) WITHOUT ROWID;
+                 CREATE TABLE ai_cursors (node_id TEXT PRIMARY KEY, files TEXT NOT NULL DEFAULT '{}', updated_at INTEGER, last_ok_at INTEGER, last_error TEXT, file_errors TEXT,
+                   truncated INTEGER NOT NULL DEFAULT 0, no_python INTEGER NOT NULL DEFAULT 0, files_total INTEGER, files_changed INTEGER, bytes_pending INTEGER,
+                   bytes_read INTEGER, elapsed_s REAL) WITHOUT ROWID;
+                 INSERT INTO ai_cursors (node_id, files) VALUES ('n1', '{\"claude:a.jsonl\":5}');",
+            )
+            .unwrap();
+            c.execute("INSERT INTO ai_claude_messages (node_id, file, message_id, usage, hour) VALUES ('n1', 'claude:a.jsonl', 'm', '[1,5,0,0,0]', ?)", [h])
+                .unwrap();
+        }
+        let s = Store::open(&dir).unwrap();
+        let old = s.ai_session("n1", "claude:a.jsonl").unwrap().unwrap();
+        assert_eq!(old.tokens[1], 5, "前のセッションは残る");
+        // 区間の無い続きの位置は渡さない（調査は最初から読み直す）。急いで読み直す
+        assert_eq!(s.ai_state("n1").unwrap()["files"]["claude:a.jsonl"], serde_json::json!(0));
+        assert!(s.ai_pending(&["n1".into()]).unwrap());
+        assert!(!s.ai_pending(&["other".into()]).unwrap(), "取り込まない機体の古い印では急がない");
+        // 応答ごとの量は残り、モデルが無い分はセッションのモデルで数える（1 時間のキャッシュ書きは 0）
+        let w = UsageWindow { since_hour: h - 1, until_hour: h + 1, tz_ms: 0, node: None, tool: None };
+        let rows = s.usage_rows(&w, true).unwrap();
+        assert_eq!((rows.len(), rows[0].model.clone(), rows[0].tokens.output, rows[0].tokens.cache_write_1h), (1, Some("claude-opus-5-5".into()), 5, 0));
+        drop(s);
+        // 2 回目は何もしない
+        let s = Store::open(&dir).unwrap();
+        assert_eq!(s.get_meta("migr_ai_provenance_v1").unwrap(), Some(Value::Bool(true)));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

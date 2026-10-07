@@ -1,6 +1,6 @@
 //! window.tune の道具の棚卸し・Do-gu・AI エージェントのセッション（commands.rs と同じ作り）。
 //! inventory・inventoryRun・doguRefresh・doguExclude・doguPublish は preload.js（Electron 版）と同じ名前・同じ戻り値の形。
-//! aiSummary・aiSessions・aiSync は Tauri 版だけ（Electron 版の preload は「未対応」を返す）。
+//! aiSummary・aiSessions・aiSync・aiTrace・aiVerify・aiProvenance は Tauri 版だけ（Electron 版の preload は「未対応」を返すか、関数が無い）。
 
 use std::sync::Arc;
 
@@ -71,4 +71,23 @@ pub async fn ai_sessions(e: E<'_>, filter: Option<Value>) -> R {
 pub async fn ai_sync(e: E<'_>, ids: Option<Vec<String>>) -> R {
     let e = e.inner().clone();
     Ok(e.ai_sync(ids).await)
+}
+
+/// 数字の出どころ。filter = { node_id, day }（その日の内訳）か { node_id, file }（1 ファイルの区間と検算）
+#[tauri::command]
+pub async fn ai_trace(e: E<'_>, filter: Option<Value>) -> R {
+    e.ai_trace(&filter.unwrap_or_else(|| json!({})))
+}
+
+/// 1 ファイルの区間を元ファイルと照合する（機体で区間を読み直して指紋だけを受け取る。読み取り専用）
+#[tauri::command]
+pub async fn ai_verify(e: E<'_>, filter: Option<Value>) -> R {
+    let e = e.inner().clone();
+    e.ai_verify(&filter.unwrap_or_else(|| json!({}))).await
+}
+
+/// 出どころの台帳の様子（連鎖の検算・区間の状態・調査スクリプトと単価表の版）
+#[tauri::command]
+pub async fn ai_provenance(e: E<'_>) -> R {
+    e.ai_provenance()
 }

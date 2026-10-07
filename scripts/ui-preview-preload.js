@@ -187,6 +187,12 @@ contextBridge.exposeInMainWorld('tune', {
   aiSummary: async (f) => (params.get('electron') ? { unsupported: true } : clone(aiSummary(f || {}))),
   aiSessions: async (f) => (params.get('electron') ? { unsupported: true, rows: [], total: 0, offset: 0, limit: 0 } : clone(aiSessions(f || {}))),
   aiSync: async () => { await wait(1200); return { ms: 1200, results: aiData.nodes.filter((n) => n.enabled !== false).map((n) => ({ node_id: n.id, ok: !n.no_python, sessions: 3, truncated: !!n.truncated })) }; },
+  // 数字の出どころ・元ファイルとの照合・台帳の様子（Tauri 版だけ。Electron 版の見え方では関数を出さない）
+  ...(params.get('electron') ? {} : {
+    aiTrace: async (f) => clone(aiTrace(f || {})),
+    aiVerify: async (f) => { await wait(900); verified = true; return clone(aiTrace(f || {})); },
+    aiProvenance: async () => clone({ ...aiData.provenance, prices: pricesMeta() }),
+  }),
   onAiSynced: () => {},
   // ネットワークとセキュリティ（Tauri 版だけ。?electron=1 では Electron 版と同じく関数が無い扱い）
   ...(params.get('electron') ? {} : { netsec: async () => clone(netsecView()) }),
@@ -225,6 +231,34 @@ function inventoryView({ all = false } = {}) {
 }
 
 const io = (x) => (x.tok_in || 0) + (x.tok_out || 0);
+// 費用の推定（tune-core の prices.rs と同じ数え方。架空のモデル名は price_of で単価表のモデルに当てる）
+const prices = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'prices.json'), 'utf8'));
+const pricesMeta = () => ({ version: prices.version, fetched_at: prices.fetched_at, sources: prices.sources, models: Object.keys(prices.models).length });
+function costOf(tool, model, x) {
+  const p = prices.models[aiData.price_of[model]];
+  if (!p) return null;
+  const cw = tool === 'claude' ? (x.tok_cache_write || 0) * p.cache_write_5m : (x.tok_cache_write || 0) * (p.cache_write || 0);
+  return ((x.tok_in || 0) * p.input + (x.tok_out || 0) * p.output + (x.tok_cache_read || 0) * p.cache_read + cw) / 1e6;
+}
+let verified = false;
+function aiTrace(f) {
+  const sess = aiData.sessions.filter((s) => s.node_id === f.node_id);
+  if (f.file) {
+    const s = sess.find((x) => x.file === f.file) || aiData.sessions.find((x) => x.file === f.file) || aiData.sessions[0];
+    const spans = aiData.spans.map((x) => ({ ...x, state: x.superseded_by ? 'superseded' : verified || x.verify_state === 'ok' ? 'verified' : 'unverified', verified_at: verified && !x.superseded_by ? NOW : x.verified_at }));
+    const live = spans.filter((x) => !x.superseded_by);
+    const sum = (k) => live.reduce((a, x) => a + (x[k] || 0), 0);
+    const states = {};
+    live.forEach((x) => { states[x.state] = (states[x.state] || 0) + 1; });
+    return {
+      node_id: f.node_id, file: f.file, gone: false, tracked: true, session: s, spans,
+      checks: { contiguous: true, gaps: [], covered_to: 1911430, lines: sum('lines'), used: sum('used'), skipped: sum('skipped'), responses_recorded: sum('responses'), responses_now: sum('responses_now'), responses_match: true, tok_out_spans: sum('tok_out'), tok_out_session: sum('tok_out'), tok_out_match: true, states },
+    };
+  }
+  const files = sess.slice(0, 8).map((s, i) => ({ ...s, spans: 1 + (i % 3), tracked: i !== 5, gone: i === 4, responses: s.tool === 'claude' ? s.assistant_msgs : null, shared: s.tool === 'claude' && s.parent_id ? 3 : 0, shared_out: s.tool === 'claude' && s.parent_id ? 1200 : 0 }));
+  const tot = files.reduce((a, x) => ({ tok_in: a.tok_in + x.tok_in, tok_out: a.tok_out + x.tok_out, cost_usd: a.cost_usd + (costOf(x.tool, x.model, x) || 0) }), { tok_in: 0, tok_out: 0, cost_usd: 0 });
+  return { node_id: f.node_id, day: f.day, totals: { ...tot, prices_version: prices.version }, raw: { tok_in: tot.tok_in, tok_out: Math.round(tot.tok_out * 1.012) }, dup: { responses: 980, cross_file: 9 }, files };
+}
 function aiFilter(f) {
   return (s) => (!f.node_id || s.node_id === f.node_id) && (!f.tool || s.tool === f.tool);
 }
@@ -237,13 +271,28 @@ function aiSummary(f) {
     .map(({ day, ...r }) => ({ ...r, day: (today + day) * DAY - tz }));
   const sum = (k) => daily.reduce((a, r) => a + (r[k] || 0), 0);
   const sess = aiData.sessions.filter(aiFilter(f));
+  const models = aiData.models.filter((m) => !f.tool || m.tool === f.tool).map((m) => {
+    const c = costOf(m.tool, m.model, m);
+    const p = prices.models[aiData.price_of[m.model]];
+    return { ...m, cost_usd: c, price: p ? { key: aiData.price_of[m.model], ...p } : null, prices_version: prices.version };
+  });
+  const priced = models.filter((m) => m.cost_usd != null);
+  const rate = priced.reduce((a, m) => a + m.cost_usd, 0) / Math.max(1, models.reduce((a, m) => a + io(m), 0));
+  const unpriced = models.filter((m) => m.cost_usd == null);
+  const totals = Object.fromEntries(['sessions', 'prompts', 'tool_calls', 'tok_in', 'tok_out', 'tok_cache_read', 'tok_cache_write', 'tok_reasoning'].map((k) => [k, sum(k)]));
+  const cost = io(totals) * rate;
+  const un = unpriced.reduce((a, m) => ({ tok_in: a.tok_in + m.tok_in, tok_out: a.tok_out + m.tok_out }), { tok_in: 0, tok_out: 0 });
+  Object.assign(totals, { cost_usd: cost, unpriced: io(un) ? un : null, unpriced_models: unpriced.map((m) => `${m.tool}:${m.model}`), prices_version: prices.version });
+  const removedOut = Math.round(totals.tok_out * aiData.dup.out_pct / 100);
   return {
     days, since: (today - (days - 1)) * DAY - tz, tz: f.tz || 0,
-    totals: Object.fromEntries(['sessions', 'prompts', 'tool_calls', 'tok_in', 'tok_out', 'tok_cache_read', 'tok_cache_write', 'tok_reasoning'].map((k) => [k, sum(k)])),
-    daily, models: aiData.models.filter((m) => !f.tool || m.tool === f.tool), tools: aiData.tools,
+    totals, raw: { ...totals, tok_out: totals.tok_out + removedOut, cost_usd: cost * 1.004 },
+    dup: { ...aiData.dup, tok_out_raw: totals.tok_out + removedOut, tok_out: totals.tok_out, removed: { tok_out: removedOut, tok_out_pct: aiData.dup.out_pct, cost_usd: cost * 0.004 } },
+    prices: pricesMeta(), limit_windows: [{ mins: 300, label: '5 時間' }, { mins: 10080, label: '7 日' }],
+    daily: daily.map((r) => ({ ...r, cost_usd: io(r) * rate, prices_version: prices.version })), models, tools: aiData.tools,
     long: sess.slice().sort((a, b) => b.duration_ms - a.duration_ms).slice(0, 10),
     prs: aiData.prs.filter(aiFilter(f)), versions: aiData.versions,
-    nodes: config.nodes.map((n) => ({ id: n.id, os: n.os, shared: !!n.shared, enabled: true, file_errors: [], ...aiData.nodes.find((x) => x.id === n.id) })),
+    nodes: config.nodes.map((n) => ({ id: n.id, os: n.os, shared: !!n.shared, enabled: true, limits_enabled: !n.shared, limits: null, file_errors: [], ...aiData.nodes.find((x) => x.id === n.id) })),
     ingesting: false, pending: aiData.nodes.some((n) => n.truncated), lastAiAt: aiData.lastAiAt, schedule: { enabled: status.schedule.enabled, ai_minutes: status.schedule.ai_minutes ?? 30, catch_up_minutes: 2 },
   };
 }

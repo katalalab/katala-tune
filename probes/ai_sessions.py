@@ -10,12 +10,23 @@
 #   sessions: ファイルごとの要約。mode が replace なら置き換え、add なら前回の値に足す（tokens_mode が max のトークンは累計なので最大値）
 #     hours: { "<epoch の時（ms / 3600000）>": [入力, 出力, キャッシュ読み, キャッシュ書き, 推論, ツール呼び出し, 指示] }
 #            トークンの5つは tokens_mode に従う（add はその時間の量、max はその時間の終わりまでの累計）
+#     span: 読んだ区間の指紋（出どころの台帳）。{ start, end（バイト位置）, sha256（区間のバイト列）, lines（行数）, used（数えた行。Claude Code は
+#           読めた行、Codex は対象の種類の行）, skipped（読めなかった行・上限を超えた行）, anchor: [長さ, sha256]（終わりの手前の数 KB。次回の続きの検算に使う） }。本文は出さない
+#     rewound: 続きの位置から読めなかったので最初から読み直した理由（shrunk: 短くなった、anchor: 手前のハッシュが合わない）
+#   claude_usage: Claude Code の応答ごとの量。{ file, id（応答 ID）, usage: [入力, 出力, キャッシュ読み, キャッシュ書き, 推論], cw1h（キャッシュ書きのうち 1 時間の分）,
+#           model（単価を引く名前。高速モード・US は @fast・@us を付ける）, hour }。ファイルをまたぐ重複は DB が応答 ID ごとに除く
 #   cursors: 読んだファイルの続きの位置。gone: KT_STATE にあるが、もう無いファイル
 #   bytes_pending: 読む前に残っていた量。truncated: 時間で区切った（続きあり）
-import json, os, re, time
+#
+# KT_VERIFY に [[ファイルの鍵, 開始, 終了], ...] が入っているときは、取り込まずにその区間を読み直して指紋だけを返す（検算）:
+#   { "version": 版, "verify": [{ file, start, end, state: ok | gone | short, sha256, lines }] }
+import hashlib, json, os, re, time
 
-KT_STATE = {}       # 呼び出し側が置き換える: {"files": {key: offset}}
+KT_VERSION = "2026-10-09.1"   # 調査スクリプトの版（出どころの台帳に残る。数え方を変えたら上げる）
+KT_STATE = {}       # 呼び出し側が置き換える: {"files": {key: offset}, "anchors": {key: [長さ, sha256]}, "claude_replay": [key]}
+KT_VERIFY = []      # 呼び出し側が置き換える（検算のときだけ）: [[key, start, end], ...]
 KT_BUDGET_S = 25
+ANCHOR = 4096       # 続きの検算に使う、位置の手前のバイト数
 MAX_LINE_BYTES = 1024 * 1024
 DRAIN_BYTES = 64 * 1024
 MAX_EVENTS = 4096
@@ -83,6 +94,32 @@ def file_key(tool, root, path):
     return tool + ":" + rel
 
 
+def key_path(key):
+    # file_key の逆（検算で元のファイルを開くため）。鍵の外へ出るもの（..）は扱わない
+    tool, _, rel = key.partition(":")
+    if tool not in ROOTS or not rel or ".." in rel.split("/"):
+        return None
+    if tool == "claude" and rel.startswith("~"):
+        rel = HOME_ENC + rel[1:]
+    return os.path.join(ROOTS[tool], *rel.split("/"))
+
+
+def sha_bytes(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def price_model(m, u):
+    # 単価が変わる使い方は別のモデルとして数える（単価表に無ければ「単価不明」になる）
+    name = m.get("model")
+    if not valid_metadata_text(name, 128) or name == "<synthetic>":
+        return None
+    if u.get("speed") == "fast":
+        name += "@fast"
+    if u.get("inference_geo") == "us":
+        name += "@us"
+    return name if len(name.encode("utf-8")) <= 128 else None
+
+
 def new_rec(tool, key):
     return {"tool": tool, "file": key, "session_id": None, "parent_id": None, "cwd": None, "version": None, "origin": None, "model": None,
             "first_ts": None, "last_ts": None, "prompts": 0, "assistant_msgs": 0, "tool_calls": 0, "tool_errors": 0, "turn_errors": 0,
@@ -107,9 +144,11 @@ def touch_ts(r, ts):
 
 
 def usage_values(usage):
+    # TOK の 5 つ＋キャッシュ書きのうち 1 時間の分（cw1h）
     return [usage.get("input_tokens") or 0, usage.get("output_tokens") or 0,
             usage.get("cache_read_input_tokens") or 0, usage.get("cache_creation_input_tokens") or 0,
-            ((usage.get("output_tokens_details") or {}).get("thinking_tokens") or 0)]
+            ((usage.get("output_tokens_details") or {}).get("thinking_tokens") or 0),
+            ((usage.get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0)]
 
 
 def valid_metadata_text(v, limit):
@@ -133,11 +172,13 @@ def claude_line(r, d, events):
             r["model"] = m["model"]
         mid = m.get("id")
         if valid_metadata_text(mid, 256):
-            values = usage_values(m.get("usage") or {})
+            u = m.get("usage") or {}
+            values = usage_values(u)
             invalid += int(any(not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= 9223372036854775807 for v in values))
             current = [(v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 9223372036854775807 else 0) for v in values]
             old = events["usage"].get(mid)
-            events["usage"][mid] = ([max(current[i], old[0][i]) for i in range(len(TOK))] if old else current, old[1] if old else h)
+            model = price_model(m, u) or (old[2] if old else None)
+            events["usage"][mid] = ([max(current[i], old[0][i]) for i in range(len(current))] if old else current, old[1] if old else h, model)
         else:
             invalid += 1
         for b in m.get("content") or []:
@@ -179,9 +220,9 @@ def codex_line(r, line):
             name, h = "?", None
         r["tool_counts"][name] = r["tool_counts"].get(name, 0) + 1
         bump(r, h, 5)
-        return
+        return True
     if not (b'"token_count"' in line or b'"session_meta"' in line or b'"turn_context"' in line or b'"task_started"' in line or b'"task_complete"' in line):
-        return
+        return False
     d = json.loads(line)
     p = d.get("payload") or {}
     touch_ts(r, d.get("timestamp"))
@@ -214,24 +255,36 @@ def codex_line(r, line):
                 b = bucket(r, h)
                 for i, k in enumerate(TOK):
                     b[i] = max(b[i], r["tokens"][k])
+    return True
 
 
-def discard_large_line(f, first):
-    """Complete an over-limit line without retaining its body. None means retry from its start."""
+def discard_large_line(f, first, digest):
+    """Complete an over-limit line without retaining its body. (None, digest) means retry from its start.
+    On success returns (size, a copy of digest that also covers the line); the digest passed in is left untouched."""
     size, tail = len(first), first
+    d = digest.copy()
+    d.update(first)
     while not tail.endswith(b"\n"):
         if time.time() - t0 > KT_BUDGET_S:
-            return None
+            return None, digest
         tail = f.readline(DRAIN_BYTES)
         if not tail:
-            return None
+            return None, digest
         size += len(tail)
-    return size if time.time() - t0 <= KT_BUDGET_S else None
+        d.update(tail)
+    return (size, d) if time.time() - t0 <= KT_BUDGET_S else (None, digest)
+
+
+def anchor_of(f, pos):
+    # 位置の手前 ANCHOR バイトの指紋（次回、続きから読む前に同じかを確かめる）
+    n = min(ANCHOR, pos)
+    f.seek(pos - n)
+    return [n, sha_bytes(f.read(n))]
 
 
 def event_size(file, kind, ident, value):
     if kind == "usage":
-        item = {"file": file, "id": ident, "usage": value[0], "hour": value[1]}
+        item = {"file": file, "id": ident, "usage": value[0][:len(TOK)], "cw1h": value[0][len(TOK)], "model": value[2], "hour": value[1]}
     elif kind == "tools":
         item = {"file": file, "id": ident, "name": value[0], "hour": value[1]}
     else:
@@ -243,15 +296,28 @@ def event_size(file, kind, ident, value):
 METADATA_OVERHEAD = len(json.dumps({"claude_usage": [], "claude_tools": [], "claude_errors": []}, separators=(",", ":")).encode("utf-8"))
 
 
-def scan_file(tool, path, key, off, out, migrate_files):
+def scan_file(tool, path, key, off, anchor, out, migrate_files):
     size = os.path.getsize(path)
-    reset = size < off
+    rewound = None
+    if size < off:
+        rewound = "shrunk"
+    elif off > 0 and isinstance(anchor, list) and len(anchor) == 2:
+        # 続きから読む前に、位置の手前が前回と同じかを確かめる（書き換え・ローテーション）
+        n = anchor[0]
+        if not isinstance(n, int) or isinstance(n, bool) or not 0 <= n <= off:
+            rewound = "anchor"
+        else:
+            with open(path, "rb") as f:
+                f.seek(off - n)
+                if sha_bytes(f.read(n)) != anchor[1]:
+                    rewound = "anchor"
     # 旧cursorはバイト位置だけでClaude応答IDを持たない。次の差分pollで同じ応答を足さないよう、一度だけ全量をreplaceする。
     migrate = tool == "claude" and off > 0 and key in migrate_files
-    if reset or migrate:
+    if rewound or migrate:
         off = 0
     r = new_rec(tool, key)
     r["mode"] = "replace" if off == 0 else "add"
+    r["rewound"] = rewound
     if tool == "claude":
         rel = os.path.relpath(path, ROOTS["claude"]).split(os.sep)
         if "subagents" in rel:
@@ -260,6 +326,8 @@ def scan_file(tool, path, key, off, out, migrate_files):
     pos = off
     skipped_large = 0
     invalid_metadata = 0
+    lines, used, skipped = 0, 0, 0
+    digest = hashlib.sha256()
     with open(path, "rb") as f:
         f.seek(off)
         while True:
@@ -270,11 +338,14 @@ def scan_file(tool, path, key, off, out, migrate_files):
             if not line:
                 break
             if len(line) > MAX_LINE_BYTES:
-                consumed = discard_large_line(f, line)
+                consumed, digest_next = discard_large_line(f, line, digest)
                 if consumed is None:
                     out["truncated"] = True
                     break
                 pos += consumed
+                digest = digest_next
+                lines += 1
+                skipped += 1
                 skipped_large += 1
                 continue
             if not line.endswith(b"\n"):
@@ -297,7 +368,7 @@ def scan_file(tool, path, key, off, out, migrate_files):
                             old = events[kind].get(ident)
                             if old is not None:
                                 if kind == "usage":
-                                    value = ([max(value[0][i], old[0][i]) for i in range(len(TOK))], old[1])
+                                    value = ([max(value[0][i], old[0][i]) for i in range(len(value[0]))], old[1], value[2] or old[2])
                                 else:
                                     value = old
                             if ident not in events[kind] or old != value:
@@ -324,35 +395,73 @@ def scan_file(tool, path, key, off, out, migrate_files):
                         out["_event_count"] += delta_count
                         out["_event_bytes"] += delta_bytes
                 else:
-                    codex_line(r, line)
+                    relevant = codex_line(r, line)
+                used += 1 if tool == "claude" else int(bool(relevant))
             except BAD_LINE:
-                pass
+                skipped += 1
+            lines += 1
+            digest.update(line)
             if time.time() - t0 > KT_BUDGET_S:
                 out["truncated"] = True
                 break
+        r["span"] = {"start": off, "end": pos, "sha256": digest.hexdigest(), "lines": lines, "used": used, "skipped": skipped, "anchor": anchor_of(f, pos)}
     if invalid_metadata:
         out["errors"].append(f"{key}: {invalid_metadata} invalid metadata field(s); metadata unavailable")
     if skipped_large:
         out["errors"].append(f"{key}: {skipped_large} line(s) exceeds {MAX_LINE_BYTES} bytes; metadata unavailable")
     if tool == "claude":
-        for mid, (usage, h) in events["usage"].items():
-            out["claude_usage"].append({"file": key, "id": mid, "usage": usage, "hour": h})
+        for mid, (usage, h, model) in events["usage"].items():
+            out["claude_usage"].append({"file": key, "id": mid, "usage": usage[:len(TOK)], "cw1h": usage[len(TOK)], "hour": h, "model": model})
         for tid, (name, h) in events["tools"].items():
             out["claude_tools"].append({"file": key, "id": tid, "name": name, "hour": h})
         for tid, h in events["errors"].items():
             out["claude_errors"].append({"file": key, "id": tid, "hour": h})
     out["bytes_read"] += pos - off
     out["cursors"][key] = pos
-    if pos > off or reset:
+    if pos > off or rewound:
         out["sessions"].append(r)
 
 
+def verify(items):
+    # 検算: 区間を読み直して指紋を返す（本文は出さない）
+    res = []
+    for it in items[:50]:
+        try:
+            key, start, end = str(it[0]), int(it[1]), int(it[2])
+        except BAD_LINE:
+            continue
+        o = {"file": key, "start": start, "end": end}
+        p = key_path(key)
+        if p is None or not os.path.isfile(p):
+            o["state"] = "gone"
+        elif start < 0 or end < start or os.path.getsize(p) < end:
+            o["state"] = "short"
+        else:
+            h, n, left = hashlib.sha256(), 0, end - start
+            with open(p, "rb") as f:
+                f.seek(start)
+                while left > 0:
+                    b = f.read(min(left, 1 << 20))
+                    if not b:
+                        break
+                    h.update(b)
+                    n += b.count(b"\n")
+                    left -= len(b)
+            o.update({"state": "ok" if left == 0 else "short", "sha256": h.hexdigest(), "lines": n})
+        res.append(o)
+    print(json.dumps({"version": KT_VERSION, "verify": res}, ensure_ascii=False, separators=(",", ":")))
+
+
 def main():
+    if KT_VERIFY:
+        verify(KT_VERIFY)
+        return
     state = KT_STATE if isinstance(KT_STATE, dict) else {}
     files = state.get("files") if isinstance(state.get("files"), dict) else state
     files = {k: v for k, v in files.items() if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v >= 0}
     migrate_files = set(state.get("claude_replay") or []) if isinstance(state.get("claude_replay"), list) else set()
-    out = {"sessions": [], "cursors": {}, "gone": [], "claude_usage": [], "claude_tools": [], "claude_errors": [], "files_total": 0, "files_changed": 0, "bytes_pending": 0, "bytes_read": 0, "truncated": False, "errors": [], "_event_count": 0, "_event_bytes": METADATA_OVERHEAD, "_metadata_full": False}
+    anchors = state.get("anchors") if isinstance(state.get("anchors"), dict) else {}
+    out = {"version": KT_VERSION, "sessions": [], "cursors": {}, "gone": [], "claude_usage": [], "claude_tools": [], "claude_errors": [], "files_total": 0, "files_changed": 0, "bytes_pending": 0, "bytes_read": 0, "truncated": False, "errors": [], "_event_count": 0, "_event_bytes": METADATA_OVERHEAD, "_metadata_full": False}
     todo, seen = [], set()
     for tool, root in ROOTS.items():
         for dirpath, _dirs, names in os.walk(root):
@@ -379,7 +488,7 @@ def main():
             out["truncated"] = True
             break
         try:
-            scan_file(tool, p, key, files.get(key, 0), out, migrate_files)
+            scan_file(tool, p, key, files.get(key, 0), anchors.get(key), out, migrate_files)
         except Exception as e:
             out["errors"].append(tilde_text(f"{key}: {e}")[:300])
     out["elapsed_s"] = round(time.time() - t0, 2)

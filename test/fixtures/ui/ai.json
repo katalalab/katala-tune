@@ -1,5 +1,5 @@
 {
- "_comment": "画面のプレビュー用の架空データ（AI エージェントのセッションの集計）。daily の day は今日から何日前か。時刻は @-分",
+ "_comment": "画面のプレビュー用の架空データ（AI エージェントのセッションの集計）。daily の day は今日から何日前か。時刻は @-分。price_of は架空のモデル名を単価表（data/prices.json）のどのモデルとして費用を出すか（無いものは「単価不明」）。limits は Codex の残り枠、provenance・spans は出どころの台帳",
  "lastAiAt": "@-2m",
  "nodes": [
   {
@@ -11,7 +11,28 @@
    "bytes_pending": 1830000,
    "bytes_read": 1830000,
    "elapsed_s": 0.4,
-   "sessions": 1240
+   "sessions": 1240,
+   "limits": {
+    "state": "ok",
+    "checked_at": "@-12m",
+    "error": null,
+    "windows": [
+     {
+      "window_mins": 300,
+      "used_pct": 34,
+      "resets_at": "@s140m",
+      "observed_at": "@-12m"
+     },
+     {
+      "window_mins": 10080,
+      "used_pct": 61,
+      "resets_at": "@s3900m",
+      "observed_at": "@-12m"
+     }
+    ],
+    "node_id": "studio-mac",
+    "tool": "codex"
+   }
   },
   {
    "id": "air-m3",
@@ -22,7 +43,22 @@
    "bytes_pending": 13400000000,
    "bytes_read": 4100000000,
    "elapsed_s": 25,
-   "sessions": 980
+   "sessions": 980,
+   "limits": {
+    "state": "ok",
+    "checked_at": "@-2m",
+    "error": null,
+    "windows": [
+     {
+      "window_mins": 10080,
+      "used_pct": 8,
+      "resets_at": "@s8200m",
+      "observed_at": "@-2m"
+     }
+    ],
+    "node_id": "air-m3",
+    "tool": "codex"
+   }
   },
   {
    "id": "build-mini",
@@ -33,7 +69,15 @@
    "bytes_pending": 0,
    "bytes_read": 0,
    "elapsed_s": 0.1,
-   "sessions": 310
+   "sessions": 310,
+   "limits": {
+    "state": "no_codex",
+    "checked_at": "@-12m",
+    "error": null,
+    "windows": [],
+    "node_id": "build-mini",
+    "tool": "codex"
+   }
   },
   {
    "id": "gpu-tower",
@@ -47,13 +91,42 @@
    "sessions": 640,
    "file_errors": [
     "codex:2026/10/01/rollout-x.jsonl: [Errno 13] Permission denied"
-   ]
+   ],
+   "limits": {
+    "state": "error",
+    "checked_at": "@-12m",
+    "error": "codex app-server が時間内に答えない",
+    "windows": [
+     {
+      "window_mins": 300,
+      "used_pct": 92,
+      "resets_at": "@s20m",
+      "observed_at": "@-42m"
+     },
+     {
+      "window_mins": 10080,
+      "used_pct": 71,
+      "resets_at": "@s5000m",
+      "observed_at": "@-42m"
+     }
+    ],
+    "node_id": "gpu-tower",
+    "tool": "codex"
+   }
   },
   {
    "id": "media-pc",
    "no_python": true,
    "last_error": "python が無い（python 3.8 以上を入れると取り込める）",
-   "sessions": 0
+   "sessions": 0,
+   "limits": {
+    "state": "no_python",
+    "checked_at": "@-12m",
+    "error": "python が無い（python 3.8 以上を入れると取り込める）",
+    "windows": [],
+    "node_id": "media-pc",
+    "tool": "codex"
+   }
   },
   {
    "id": "family-pc",
@@ -5635,6 +5708,125 @@
    "tool": "claude",
    "version": "2.1.40",
    "last_ts": "@-30m"
+  }
+ ],
+ "price_of": {
+  "claude-opus": "claude-opus-5-5",
+  "claude-sonnet": "claude-sonnet-5-5",
+  "claude-haiku": "claude-haiku-4-5",
+  "gpt-codex-large": "gpt-6-astra"
+ },
+ "dup": {
+  "responses": 46883,
+  "copies": 47300,
+  "cross_file": 417,
+  "out_pct": 1.2
+ },
+ "provenance": {
+  "chain": {
+   "ok": true,
+   "runs": 1284,
+   "head": "9f2c5e0d4a7b81c3e6f9a2d5b8c1e4f7a0d3b6c9e2f5a8b1c4d7e0f3a6b9c2d5",
+   "broken": null
+  },
+  "counts": {
+   "runs": 1284,
+   "spans": 5210,
+   "superseded": 41,
+   "rejected": 2,
+   "states": [
+    {
+     "state": "unverified",
+     "n": 5170
+    },
+    {
+     "state": "ok",
+     "n": 36
+    },
+    {
+     "state": "gone",
+     "n": 3
+    },
+    {
+     "state": "mismatch",
+     "n": 1
+    }
+   ],
+   "last": []
+  },
+  "probe": {
+   "name": "probes/ai_sessions.py",
+   "version": "2026-10-07.1",
+   "sha256": "3b1f0c9e8d7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c"
+  },
+  "tune_version": "0.3.0"
+ },
+ "spans": [
+  {
+   "id": 905,
+   "byte_start": 1832000,
+   "byte_end": 1911430,
+   "sha256": "aa41c7e2f0d93b6a85c1e4f7a2d5b8c1e4f7a0d3b6c9e2f5a8b1c4d7e0f3a6b9",
+   "lines": 214,
+   "used": 160,
+   "skipped": 0,
+   "responses": 41,
+   "responses_now": 41,
+   "tok_out": 9120,
+   "superseded_by": null,
+   "verify_state": null,
+   "verified_at": null,
+   "verify_note": null,
+   "run_seq": 1281,
+   "probe": "probes/ai_sessions.py",
+   "probe_version": "2026-10-07.1",
+   "probe_sha256": "3b1f0c9e8d7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c",
+   "tune_version": "0.3.0",
+   "finished_at": "@-12m"
+  },
+  {
+   "id": 611,
+   "byte_start": 0,
+   "byte_end": 1832000,
+   "sha256": "5e07b2d9c4a1f8e3b6d0c9a2f5e8b1d4c7a0f3e6b9d2c5a8f1e4b7d0c3a6f9e2",
+   "lines": 3810,
+   "used": 2702,
+   "skipped": 2,
+   "responses": 980,
+   "responses_now": 980,
+   "tok_out": 21375,
+   "superseded_by": null,
+   "verify_state": "ok",
+   "verified_at": "@-1440m",
+   "verify_note": null,
+   "run_seq": 940,
+   "probe": "probes/ai_sessions.py",
+   "probe_version": "2026-10-07.1",
+   "probe_sha256": "3b1f0c9e8d7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c",
+   "tune_version": "0.3.0",
+   "finished_at": "@-1500m"
+  },
+  {
+   "id": 402,
+   "byte_start": 0,
+   "byte_end": 1200300,
+   "sha256": "c9d2e5f8a1b4c7d0e3f6a9b2c5d8e1f4a7b0c3d6e9f2a5b8c1d4e7f0a3b6c9d2",
+   "lines": 2500,
+   "used": 1790,
+   "skipped": 0,
+   "responses": 640,
+   "responses_now": 0,
+   "tok_out": 14000,
+   "superseded_by": "ai-x",
+   "verify_state": null,
+   "verified_at": null,
+   "verify_note": null,
+   "run_seq": 512,
+   "probe": "probes/ai_sessions.py",
+   "probe_version": "2026-10-07.1",
+   "probe_sha256": "3b1f0c9e8d7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c",
+   "tune_version": "0.3.0",
+   "finished_at": "@-2900m"
   }
  ]
 }

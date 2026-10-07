@@ -17,11 +17,15 @@
 //! | [`engine_tools`] | 棚卸し・Do-gu・AI の流れ（[`engine::Engine`] のメソッド） | main.js の runInventory・inventoryView・dogu-* |
 //! | [`netsec`] | ネットワークとセキュリティ（待ち受け・防御・常駐の増減・ログイン・初めての接続先。正規化・判定・状態と、DB を使う取り込み・画面） | lib/netsec.js（DB を使う部分は tune-core だけ） |
 //! | [`live`] | ライブ表示（画面が見ているあいだだけ 1〜2 秒ごとに取る。経路・解析・保持・管理） | なし（Tauri 版だけ） |
+//! | [`prices`] | 費用の推定（API 単価換算）。同梱の単価表 data/prices.json（取得日・出典・版つき） | （tune-core だけ） |
+//! | [`codex_limits`] | Codex の残り枠（codex app-server の account/rateLimits/read。窓の長さ・使用率・リセット時刻だけ） | （tune-core だけ） |
 //!
 //! 表の定義は `db/` に機能ごとに置く（inventory は Electron 版と同じ表、ai_sessions は tune-core だけの表）。
+//! 取り込んだ数字の出どころ（取り込みの回・読んだ区間・連鎖）は `db/provenance.rs`、重複を除いた量と費用は `db/ai_usage.rs`。
 
 pub mod actions;
 pub mod ai_sessions;
+pub mod codex_limits;
 pub mod collate;
 pub mod collect;
 pub mod db;
@@ -35,4 +39,5 @@ pub mod live;
 pub mod logs;
 pub mod netsec;
 pub mod nodes;
+pub mod prices;
 pub mod rules;
