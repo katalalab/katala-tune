@@ -71,8 +71,11 @@ pub async fn check_and_install(app: &AppHandle) -> Result<String, String> {
     if BUSY.swap(true, Ordering::SeqCst) {
         return Ok("更新を確かめている途中".into());
     }
+    // メニューは作ったときの is_busy() を写しているので、状態を変えるたびに作り直す（確認中は「更新を確認…」を押せなくする）
+    crate::tray::update(app);
     let r = run(app).await;
     BUSY.store(false, Ordering::SeqCst);
+    crate::tray::update(app);
     r
 }
 

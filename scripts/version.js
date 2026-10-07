@@ -9,7 +9,8 @@ const path = require('node:path');
 
 const ROOT = path.join(__dirname, '..');
 const CRATES = ['katala-tune', 'tune-core', 'tune-cli'];
-const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+// SemVer 2.0.0 の正規表現（semver.org）。先頭が 0 の数字や空のプレリリース識別子（01.2.3・1.2.3-alpha..1）は通さない
+const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
 const file = (f) => path.join(ROOT, f);
 const read = (f) => fs.readFileSync(file(f), 'utf8');
 
@@ -49,15 +50,17 @@ function main(argv) {
     return 2;
   }
   if (want !== undefined && !check) {
+    // 先に全部を書き換えて確かめてから書く（途中で失敗して版がずれたまま残らないように）
+    const staged = [];
     for (const [f, h] of Object.entries(FILES)) {
-      const before = read(f);
-      const after = h.set(before, want);
+      const after = h.set(read(f), want);
       if (h.get(after) !== want) {
-        console.error(`${f} の版を書き換えられなかった`);
+        console.error(`${f} の版を書き換えられなかった（どのファイルも変えていない）`);
         return 1;
       }
-      fs.writeFileSync(file(f), after);
+      staged.push([f, after]);
     }
+    for (const [f, after] of staged) fs.writeFileSync(file(f), after);
   }
   const vs = versions();
   for (const [f, v] of Object.entries(vs)) console.log(`${v}\t${f}`);
@@ -74,4 +77,4 @@ function main(argv) {
 }
 
 if (require.main === module) process.exitCode = main(process.argv.slice(2));
-module.exports = { main, versions, FILES };
+module.exports = { main, versions, FILES, SEMVER };
