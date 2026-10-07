@@ -38,6 +38,24 @@ CREATE TABLE IF NOT EXISTS ai_cursors (
   truncated INTEGER NOT NULL DEFAULT 0, no_python INTEGER NOT NULL DEFAULT 0,
   files_total INTEGER, files_changed INTEGER, bytes_pending INTEGER, bytes_read INTEGER, elapsed_s REAL
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS ai_claude_replay (
+  node_id TEXT NOT NULL, file TEXT NOT NULL,
+  PRIMARY KEY (node_id, file)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS ai_claude_messages (
+  node_id TEXT NOT NULL, file TEXT NOT NULL, message_id TEXT NOT NULL,
+  usage TEXT NOT NULL, hour INTEGER,
+  PRIMARY KEY (node_id, file, message_id)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS ai_claude_tools (
+  node_id TEXT NOT NULL, file TEXT NOT NULL, tool_use_id TEXT NOT NULL,
+  name TEXT NOT NULL, hour INTEGER,
+  PRIMARY KEY (node_id, file, tool_use_id)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS ai_claude_tool_errors (
+  node_id TEXT NOT NULL, file TEXT NOT NULL, tool_use_id TEXT NOT NULL,
+  PRIMARY KEY (node_id, file, tool_use_id)
+) WITHOUT ROWID;
 ";
 
 /// トークンの5つ（入力・出力・キャッシュ読み・キャッシュ書き・推論）。調査の tokens のキーと表の列
@@ -230,12 +248,129 @@ pub struct AiIngested {
 fn counts_json(m: &BTreeMap<String, i64>) -> String {
     serde_json::to_string(m).unwrap_or_else(|_| "{}".into())
 }
+fn add_probe_hour(rec: &mut Value, h: Option<i64>, i: usize, n: i64) {
+    if let Some(h) = h {
+        let b = rec["hours"].as_object_mut().unwrap().entry(h.to_string()).or_insert_with(|| json!([0, 0, 0, 0, 0, 0, 0]));
+        if let Some(a) = b.as_array_mut()
+            && let Some(x) = a.get_mut(i)
+        {
+            *x = json!(int(Some(x)) + n);
+        }
+    }
+}
+
+fn claude_events(c: &rusqlite::Connection, node: &str, rec: &mut Value, out: &Value, replace: bool) -> Result<()> {
+    if js::string(rec.get("tool")) != "claude" {
+        return Ok(());
+    }
+    let file = js::string(rec.get("file"));
+    if replace {
+        for table in ["ai_claude_messages", "ai_claude_tools", "ai_claude_tool_errors"] {
+            c.execute(&format!("DELETE FROM {table} WHERE node_id = ? AND file = ?"), params![node, file])?;
+        }
+    }
+    let hour = |h: Option<&Value>| h.and_then(Value::as_i64);
+    for e in js::arr(out.get("claude_usage")) {
+        if js::string(e.get("file")) != file {
+            continue;
+        }
+        let id = js::string(e.get("id"));
+        let vals = js::arr(e.get("usage"));
+        if id.is_empty() || id.len() > 256 || vals.len() != 5 {
+            continue;
+        }
+        let current: [i64; 5] = std::array::from_fn(|i| int(vals.get(i)).max(0));
+        let old: Option<(String, Option<i64>)> = c
+            .query_row("SELECT usage, hour FROM ai_claude_messages WHERE node_id=? AND file=? AND message_id=?", params![node, file, id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let (prior, at, fresh) = match old {
+            Some((s, h)) => (
+                serde_json::from_str::<Value>(&s).ok().map(|v| std::array::from_fn(|i| int(v.as_array().and_then(|a| a.get(i))).max(0))).unwrap_or([0; 5]),
+                h,
+                false,
+            ),
+            None => ([0; 5], hour(e.get("hour")), true),
+        };
+        let next: [i64; 5] = std::array::from_fn(|i| prior[i].max(current[i]));
+        c.execute("INSERT INTO ai_claude_messages (node_id,file,message_id,usage,hour) VALUES (?,?,?,?,?) ON CONFLICT(node_id,file,message_id) DO UPDATE SET usage=excluded.usage", params![node,file,id,serde_json::to_string(&next).unwrap(),at])?;
+        for i in 0..5 {
+            let d = next[i] - prior[i];
+            if d > 0 {
+                rec["tokens"][TOK_KEYS[i]] = json!(int(rec["tokens"].get(TOK_KEYS[i])) + d);
+                add_probe_hour(rec, at, i, d);
+            }
+        }
+        if fresh {
+            rec["assistant_msgs"] = json!(int(rec.get("assistant_msgs")) + 1);
+        }
+    }
+    for e in js::arr(out.get("claude_tools")) {
+        if js::string(e.get("file")) != file {
+            continue;
+        }
+        let id = js::string(e.get("id"));
+        let name = js::string(e.get("name"));
+        if id.is_empty() || id.len() > 256 || name.is_empty() || name.len() > 128 {
+            continue;
+        }
+        let exists: Option<i64> =
+            c.query_row("SELECT 1 FROM ai_claude_tools WHERE node_id=? AND file=? AND tool_use_id=?", params![node, file, id], |r| r.get(0)).optional()?;
+        if exists.is_none() {
+            let h = hour(e.get("hour"));
+            c.execute("INSERT INTO ai_claude_tools (node_id,file,tool_use_id,name,hour) VALUES (?,?,?,?,?)", params![node, file, id, name, h])?;
+            rec["tool_calls"] = json!(int(rec.get("tool_calls")) + 1);
+            rec["tool_counts"][&name] = json!(int(rec["tool_counts"].get(&name)) + 1);
+            add_probe_hour(rec, h, 5, 1);
+        }
+    }
+    for e in js::arr(out.get("claude_errors")) {
+        if js::string(e.get("file")) != file {
+            continue;
+        }
+        let id = js::string(e.get("id"));
+        if id.is_empty() || id.len() > 256 {
+            continue;
+        }
+        let exists: Option<i64> = c
+            .query_row("SELECT 1 FROM ai_claude_tool_errors WHERE node_id=? AND file=? AND tool_use_id=?", params![node, file, id], |r| r.get(0))
+            .optional()?;
+        if exists.is_none() {
+            let name: Option<String> = c
+                .query_row("SELECT name FROM ai_claude_tools WHERE node_id=? AND file=? AND tool_use_id=?", params![node, file, id], |r| r.get(0))
+                .optional()?;
+            let name = name.unwrap_or_else(|| "?".into());
+            c.execute("INSERT INTO ai_claude_tool_errors (node_id,file,tool_use_id) VALUES (?,?,?)", params![node, file, id])?;
+            rec["tool_errors"] = json!(int(rec.get("tool_errors")) + 1);
+            rec["tool_error_counts"][&name] = json!(int(rec["tool_error_counts"].get(&name)) + 1);
+        }
+    }
+    Ok(())
+}
 
 impl Store {
     /// 機体ごとの続きの位置（{ ファイルの鍵: バイト位置 }）
     pub fn ai_files(&self, node_id: &str) -> Result<Map<String, Value>> {
         let s: Option<String> = self.conn.query_row("SELECT files FROM ai_cursors WHERE node_id = ?", [node_id], |r| r.get(0)).optional()?;
         Ok(s.and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v.as_object().cloned()).unwrap_or_default())
+    }
+
+    /// 旧来の数値cursorだけの Claude ファイルは、ID台帳を作るため一度だけ replace で再読する。
+    pub fn ai_claude_replay(&self, node_id: &str) -> Result<Value> {
+        let files = self.ai_files(node_id)?;
+        let mut replay = Vec::new();
+        for (file, off) in files {
+            if !file.starts_with("claude:") || int(Some(&off)) <= 0 {
+                continue;
+            }
+            let seen: Option<i64> =
+                self.conn.query_row("SELECT 1 FROM ai_claude_replay WHERE node_id = ? AND file = ?", params![node_id, file], |r| r.get(0)).optional()?;
+            if seen.is_none() {
+                replay.push(Value::String(file));
+            }
+        }
+        Ok(Value::Array(replay))
     }
 
     /// 1セッション（無ければ None）
@@ -249,14 +384,17 @@ impl Store {
         let mut files = self.ai_files(node_id)?;
         let mut res = AiIngested::default();
         self.tx(|c| {
-            for rec in js::arr(out.get("sessions")) {
+            for source in js::arr(out.get("sessions")) {
+                let mut rec = source.clone();
                 let file = js::string(rec.get("file"));
                 if file.is_empty() || file == "undefined" {
                     continue;
                 }
-                let add = Session::from_probe(rec);
+                if !rec.get("hours").is_some_and(Value::is_object) { rec["hours"] = json!({}); }
                 let replace = !js::is_str(rec.get("mode"), "add");
                 let old = if replace { None } else { c.prepare_cached("SELECT * FROM ai_sessions WHERE node_id = ? AND file = ?")?.query_row(params![node_id, file], Session::from_row).optional()? };
+                claude_events(c, node_id, &mut rec, out, replace)?;
+                let add = Session::from_probe(&rec);
                 let prev_tokens = old.as_ref().map_or([0; 5], |o| o.tokens);
                 let s = match &old {
                     Some(o) => o.merge_add(&add),
@@ -264,6 +402,7 @@ impl Store {
                 };
                 if replace {
                     c.prepare_cached("DELETE FROM ai_usage_hourly WHERE node_id = ? AND file = ?")?.execute(params![node_id, file])?;
+                    if add.tool == "claude" { c.execute("INSERT OR IGNORE INTO ai_claude_replay (node_id,file) VALUES (?,?)", params![node_id,file])?; }
                 }
                 c.prepare_cached(
                     "INSERT OR REPLACE INTO ai_sessions (node_id, file, tool, session_id, parent_id, cwd, version, origin, model, first_ts, last_ts,
@@ -323,6 +462,9 @@ impl Store {
             for g in js::arr(out.get("gone")) {
                 if let Some(k) = g.as_str() {
                     files.remove(k);
+                    for table in ["ai_claude_messages", "ai_claude_tools", "ai_claude_tool_errors", "ai_claude_replay"] {
+                        c.execute(&format!("DELETE FROM {table} WHERE node_id = ? AND file = ?"), params![node_id, k])?;
+                    }
                 }
             }
             res.files = files.len();
@@ -387,8 +529,13 @@ impl Store {
     }
 
     /// 続きの残っている機体があるか（取り込み中・続きあり）
-    pub fn ai_pending(&self) -> Result<bool> {
-        Ok(self.conn.query_row("SELECT count(*) FROM ai_cursors WHERE truncated = 1", [], |r| r.get::<_, i64>(0))? > 0)
+    pub fn ai_pending(&self, enabled: &[String]) -> Result<bool> {
+        if enabled.is_empty() {
+            return Ok(false);
+        }
+        let placeholders = std::iter::repeat_n("?", enabled.len()).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT count(*) FROM ai_cursors WHERE truncated = 1 AND node_id IN ({placeholders})");
+        Ok(self.conn.query_row(&sql, rusqlite::params_from_iter(enabled.iter()), |r| r.get::<_, i64>(0))? > 0)
     }
 
     /// 集計（画面の AI）。f = { days（既定 30、1〜400）, tz（UTC からの分、東が正）, node_id, tool }
@@ -647,7 +794,8 @@ mod tests {
         db.ai_ingest("n1", &json!({ "sessions": [], "cursors": {}, "gone": ["codex:2026/r.jsonl"], "truncated": true }), 4).unwrap();
         assert!(!db.ai_files("n1").unwrap().contains_key("codex:2026/r.jsonl"));
         assert!(db.ai_session("n1", "codex:2026/r.jsonl").unwrap().is_some());
-        assert!(db.ai_pending().unwrap());
+        assert!(db.ai_pending(&["n1".into()]).unwrap());
+        assert!(!db.ai_pending(&["disabled".into()]).unwrap(), "台帳から外れた機体のcursorは追いかけない");
     }
 
     #[test]
@@ -658,6 +806,134 @@ mod tests {
         assert_eq!(db.ai_files("n1").unwrap()["a"], json!(5));
         let c = &db.ai_cursors().unwrap()[0];
         assert_eq!((c["no_python"].clone(), c["last_error"].clone()), (json!(true), json!("python が無い")));
+    }
+
+    #[test]
+    fn claude_metadata_is_exactly_once_across_polls_and_replace() {
+        let db = Store::open_in_memory().unwrap();
+        db.ai_ingest("n", &out(vec![], json!({ "claude:legacy": 9 })), 0).unwrap();
+        assert_eq!(db.ai_claude_replay("n").unwrap(), json!(["claude:legacy"]));
+        let record =
+            |mode: &str| json!({ "mode": mode, "file": "claude:x", "tool": "claude", "tokens": {}, "hours": {}, "tool_counts": {}, "tool_error_counts": {} });
+        let first = json!({ "sessions": [record("replace")], "cursors": {"claude:x": 10}, "gone": [], "claude_usage": [{"file":"claude:x","id":"m","usage":[10,2,0,0,0],"hour":H}], "claude_tools":[{"file":"claude:x","id":"t","name":"Bash","hour":H}], "claude_errors":[], "errors":[] });
+        db.ai_ingest("n", &first, 1).unwrap();
+        let before_files = db.ai_files("n").unwrap();
+        db.conn.execute_batch("CREATE TRIGGER fail_ai BEFORE INSERT ON ai_usage_hourly BEGIN SELECT RAISE(ABORT, 'test rollback'); END;").unwrap();
+        assert!(db.ai_ingest("n", &json!({ "sessions": [record("add")], "cursors": {"claude:x": 99}, "gone": [], "claude_usage": [{"file":"claude:x","id":"new","usage":[1,0,0,0,0],"hour":H}], "claude_tools": [], "claude_errors": [], "errors": [] }), 2).is_err());
+        assert_eq!(db.ai_files("n").unwrap(), before_files, "cursor rolls back with metadata");
+        let ids: i64 = db.conn.query_row("SELECT count(*) FROM ai_claude_messages WHERE node_id='n' AND file='claude:x'", [], |r| r.get(0)).unwrap();
+        assert_eq!(ids, 1, "dedupe rows roll back");
+        db.conn.execute_batch("DROP TRIGGER fail_ai;").unwrap();
+        let second = json!({ "sessions": [record("add")], "cursors": {"claude:x": 20}, "gone": [], "claude_usage": [{"file":"claude:x","id":"m","usage":[15,1,0,0,0],"hour":H + 1}], "claude_tools":[], "claude_errors":[{"file":"claude:x","id":"t","hour":H + 1}], "errors":[] });
+        db.ai_ingest("n", &second, 2).unwrap();
+        db.ai_ingest("n", &second, 3).unwrap();
+        let s = db.ai_session("n", "claude:x").unwrap().unwrap();
+        assert_eq!(s.counts[..4], [0, 1, 1, 1]);
+        assert_eq!(s.tokens, [15, 2, 0, 0, 0]);
+        let hour: (i64, i64) = db
+            .conn
+            .query_row("SELECT tok_in, tool_calls FROM ai_usage_hourly WHERE node_id='n' AND file='claude:x' AND hour=?", [H], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(hour, (15, 1), "usage update remains attributed to its original hour");
+        let reset = json!({ "sessions": [record("replace")], "cursors": {"claude:x": 30}, "gone": [], "claude_usage": [{"file":"claude:x","id":"m","usage":[4,0,0,0,0],"hour":H}], "claude_tools":[], "claude_errors":[], "errors":[] });
+        db.ai_ingest("n", &reset, 4).unwrap();
+        assert_eq!(db.ai_session("n", "claude:x").unwrap().unwrap().tokens[0], 4);
+        db.ai_ingest("n", &json!({ "sessions": [], "cursors": {}, "gone": ["claude:x"], "errors": [] }), 5).unwrap();
+        assert!(db.ai_session("n", "claude:x").unwrap().is_some(), "gone preserves historical session");
+        let ids: i64 = db.conn.query_row("SELECT count(*) FROM ai_claude_messages WHERE node_id='n' AND file='claude:x'", [], |r| r.get(0)).unwrap();
+        assert_eq!(ids, 0);
+    }
+
+    #[test]
+    fn claude_replay_failure_rolls_back_all_tables_and_retries() {
+        let db = Store::open_in_memory().unwrap();
+        let record = |file, mode| json!({"tool":"claude","file":file,"mode":mode,"tokens":{},"hours":{}});
+        let seed = json!({"sessions":[record("claude:old","replace")],"cursors":{"claude:old":10},"claude_usage":[{"file":"claude:old","id":"old","usage":[3,0,0,0,0],"hour":H}]});
+        db.ai_ingest("n", &seed, 1).unwrap();
+        let old_session = db.ai_session("n", "claude:old").unwrap();
+        let old_cursors = db.ai_cursors().unwrap();
+        db.conn.execute_batch("CREATE TRIGGER fail_new BEFORE INSERT ON ai_usage_hourly WHEN NEW.file='claude:new' BEGIN SELECT RAISE(ABORT, 'test migration rollback'); END;").unwrap();
+        let batch = json!({"sessions":[record("claude:old","add"),record("claude:new","replace")],"cursors":{"claude:old":20,"claude:new":30},"claude_usage":[{"file":"claude:old","id":"old","usage":[5,0,0,0,0],"hour":H},{"file":"claude:new","id":"new","usage":[7,0,0,0,0],"hour":H}],"claude_tools":[{"file":"claude:new","id":"tool","name":"Bash","hour":H}],"claude_errors":[{"file":"claude:new","id":"tool","hour":H}]});
+        assert!(db.ai_ingest("n", &batch, 2).is_err());
+        assert_eq!(db.ai_session("n", "claude:old").unwrap(), old_session);
+        assert_eq!(db.ai_cursors().unwrap(), old_cursors);
+        for table in ["ai_sessions", "ai_usage_hourly", "ai_claude_messages", "ai_claude_tools", "ai_claude_tool_errors", "ai_claude_replay"] {
+            let n: i64 = db.conn.query_row(&format!("SELECT count(*) FROM {table} WHERE file='claude:new'"), [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "{table} must roll back with the migration cursor");
+        }
+        let usage: String = db.conn.query_row("SELECT usage FROM ai_claude_messages WHERE file='claude:old'", [], |r| r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&usage).unwrap(), json!([3, 0, 0, 0, 0]));
+        let tokens: i64 = db.conn.query_row("SELECT tok_in FROM ai_usage_hourly WHERE file='claude:old'", [], |r| r.get(0)).unwrap();
+        assert_eq!(tokens, 3);
+        db.conn.execute_batch("DROP TRIGGER fail_new;").unwrap();
+        db.ai_ingest("n", &batch, 3).unwrap();
+        assert_eq!(db.ai_session("n", "claude:old").unwrap().unwrap().tokens[0], 5);
+        let fresh = db.ai_session("n", "claude:new").unwrap().unwrap();
+        assert_eq!(fresh.tokens[0], 7);
+        assert_eq!(fresh.counts[1..4], [1, 1, 1]);
+        assert_eq!(db.ai_claude_replay("n").unwrap(), json!([]));
+    }
+
+    #[test]
+    fn legacy_cursor_db_script_python_replay_then_incremental() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let python = ["python3", "python"]
+            .into_iter()
+            .find(|p| Command::new(p).arg("--version").status().is_ok_and(|s| s.success()))
+            .expect("AI probe tests require Python");
+        let home = std::env::temp_dir().join(format!("kt-ai-chain-{}-{}", std::process::id(), super::super::now_ms()));
+        let project = home.join(".claude/projects/project");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join("session.jsonl");
+        let row = |input, stamp| {
+            json!({"type":"assistant","sessionId":"session","timestamp":stamp,"message":{"id":"m","usage":{"input_tokens":input},"content":[{"type":"text","text":"private-message-body"},{"type":"tool_use","id":"t","name":"Bash","input":{"command":"private-command-body"}}]}}).to_string() + "\n"
+        };
+        std::fs::write(&path, row(10, "2026-10-07T00:00:00Z")).unwrap();
+        let file = "claude:project/session.jsonl";
+        let db = Store::open_in_memory().unwrap();
+        let mut legacy = claude("replace", 0, 99, H);
+        legacy["file"] = json!(file);
+        db.ai_ingest("node", &out(vec![legacy], json!({file:std::fs::metadata(&path).unwrap().len()})), 1).unwrap();
+        db.conn.execute("DELETE FROM ai_claude_replay", []).unwrap(); // 旧schema由来の数値cursorだけの状態
+        let probe = || {
+            let replay = db.ai_claude_replay("node").unwrap();
+            let src = crate::ai_sessions::script(&db.ai_files("node").unwrap(), &replay);
+            let mut child = Command::new(python)
+                .args(["-X", "utf8", "-"])
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(src.as_bytes()).unwrap();
+            let result = child.wait_with_output().unwrap();
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+            let raw = String::from_utf8(result.stdout).unwrap();
+            assert!(!raw.contains("private-message-body") && !raw.contains("private-command-body"));
+            serde_json::from_str::<Value>(&raw).unwrap()
+        };
+        assert_eq!(db.ai_claude_replay("node").unwrap(), json!([file]));
+        let first = probe();
+        assert_eq!(first["sessions"][0]["mode"], "replace", "不変サイズも旧cursorを再読する");
+        db.ai_ingest("node", &first, 2).unwrap();
+        assert_eq!(db.ai_session("node", file).unwrap().unwrap().tokens[0], 10, "旧二重集計を訂正する");
+        assert_eq!(db.ai_claude_replay("node").unwrap(), json!([]));
+        assert_eq!(probe()["sessions"], json!([]), "移行成功後は全量を再送しない");
+        let mut writer = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writer.write_all(row(15, "2026-10-07T01:00:00Z").as_bytes()).unwrap();
+        writer.write_all((json!({"type":"user","timestamp":"2026-10-07T01:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t","is_error":true,"content":"private-message-body"}]}}).to_string()+"\n").as_bytes()).unwrap();
+        drop(writer);
+        let second = probe();
+        assert_eq!(second["sessions"][0]["mode"], "add");
+        db.ai_ingest("node", &second, 3).unwrap();
+        let session = db.ai_session("node", file).unwrap().unwrap();
+        assert_eq!(session.tokens[0], 15);
+        assert_eq!(session.counts[1..4], [1, 1, 1]);
+        assert_eq!(session.tool_error_counts["Bash"], 1);
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
