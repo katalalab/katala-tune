@@ -15,7 +15,7 @@ publish = false
 [workspace.dependencies]
 tune-core = { path = "crates/tune-core" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }  # JS の JSON.parse と同じく正確に丸めて読む
 tokio = { version = "1", features = ["process", "time", "sync", "io-util", "macros", "rt-multi-thread"] }
 
 [workspace.lints.rust]

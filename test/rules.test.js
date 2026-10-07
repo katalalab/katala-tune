@@ -95,3 +95,21 @@ test('ディスク: 実効の空き（自動で空く分を含む）で判定す
   const f = analyze(mac({ disk: [{ mount: '/', total_gb: 460, free_gb: 108, free_pct: 23.4, raw_free_gb: 19 }] }));
   assert.equal(f.find((x) => x.id.startsWith('disk-')), undefined);
 });
+
+test('launchd: 起動制約（CODESIGNING）で止められたジョブは登録し直しを提案する', () => {
+  const plist = '/Users/me/Library/LaunchAgents/com.example.job.plist';
+  const f = analyze(mac({
+    launchd_failing: [
+      { label: 'com.example.job', exit: '78', reason: 'OS_REASON_CODESIGNING | Launch Constraint Violation' },
+      { label: 'com.example.other', exit: '1', reason: 'OS_REASON_EXIT' },
+      { label: 'com.example.noplist', exit: '78', reason: 'OS_REASON_CODESIGNING' },
+    ],
+    jobs: [{ kind: 'launchd', id: 'com.example.job', name: 'com.example.job', scope: 'user', plist }],
+  }));
+  const c = f.find((x) => x.id === 'launchd-constraint-com.example.job');
+  assert.equal(c.title, 'com.example.job が起動制約で止められている（実行ファイルの更新後）');
+  assert.match(c.advice, /bootout → bootstrap/);
+  assert.deepEqual(c.commands, [`launchctl bootout gui/$(id -u)/com.example.job\nlaunchctl bootstrap gui/$(id -u) ${plist}`]);
+  assert.equal(f.find((x) => x.id === 'launchd-constraint-com.example.other'), undefined);
+  assert.equal(f.find((x) => x.id === 'launchd-constraint-com.example.noplist').commands, undefined, 'plist が分からなければコマンドは添えない');
+});

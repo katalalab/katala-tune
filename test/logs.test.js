@@ -96,3 +96,14 @@ test('同じエラーの洪水（24時間で200件以上）と .NET の未処理
   assert.ok(f.find((x) => x.id === 'log-crashes'));
   assert.ok(f.find((x) => x.id === 'log-dropped'));
 });
+
+test('volmgr の 161・162（BSOD 後のクラッシュダンプ作成）はディスクのエラーに数えない', () => {
+  const db = openDb(tmp());
+  const now = Date.now();
+  const mk = (event_id, i) => ({ uid: `v-${event_id}-${i}`, ts: now - i * 1000, level: 'error', provider: 'volmgr', event_id, message: `volmgr ${event_id} ${i}` });
+  db.insertLogs('pc', 'win_system', normalize('win_system', [mk('161', 1), mk('162', 2), mk('161', 3), mk('162', 4)]));
+  assert.equal(logFindings(db, 'pc', now).find((x) => x.id === 'log-disk'), undefined);
+  // 同じ volmgr でも別の事象（例: 46）は数える
+  db.insertLogs('pc', 'win_system', normalize('win_system', [mk('46', 5)]));
+  assert.match(logFindings(db, 'pc', now).find((x) => x.id === 'log-disk').title, / 1 件$/);
+});
