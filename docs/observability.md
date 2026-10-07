@@ -75,6 +75,22 @@ AI のセッション中に落ちた常駐、負荷の高い時間帯との重�
 - **やらないこと**: パケットの取得、通信の遮断・ファイアウォールの書き換え（気づくまでにとどめ、手当ては許可リストの操作として別に設計する）
 - **後で足せるもの**: Windows の Sysmon（プロセス起動とネットワーク接続の詳しい記録。入れるかは操作者の判断）、`tune-agent` での常時の接続の記録
 
+### 実装（2026-10-08）
+
+判定は `lib/netsec.js`（仕様）と `crates/tune-core/src/netsec.rs`（同じ入力に同じ出力。`tests/parity_netsec.rs`）。調査の出力の解析（normalize）も両方にある。常駐の増減と初めての接続先は DB を使うので tune-core だけ（判定の部分 `diffPersist`・`classifyPeers` は両方）。
+
+| 項目 | 取り方 | 判定（所見・状態） |
+|---|---|---|
+| 待ち受け | macOS: `nettop -L 1`（root のプロセスも見える。名前は `proc_pidpath` の実行ファイル名）、Windows: `MSFT_NetTCPConnection`・`MSFT_NetUDPEndpoint`（CIM、8 秒で打ち切り） | 全部の口・特定のアドレス・この機体の中に分ける。前回の分析に無かった (プロトコル, プロセス, 番号) で外から届くものを所見に（TCP は注意、UDP は提案）。10000 以上の番号はプロセスごとに1つとして比べる（起動ごとに変わるため）。macOS のファイアウォールが「すべて遮断」なら提案にとどめる |
+| 防御 | macOS: `socketfilterfw`・`spctl --status`・`xprotect version`（無ければバンドルの版）、Windows: `Get-MpComputerStatus`・SecurityCenter2 の `AntiVirusProduct`・`Get-NetFirewallProfile -PolicyStore ActiveStore`・`MSFT_MpThreatDetection` | リアルタイムのウイルス対策が無い（Defender が止まっていて、ほかの製品も動いていない）・Gatekeeper の無効・今つながっているネットワークのファイアウォールの無効は**異常**。定義が 7 日以上古い・XProtect が 45 日以上古い・他のプロファイルのファイアウォールの無効・未解決の検出は注意。隔離・削除済みの検出は提案 |
+| 常駐の増減 | macOS: `~/Library/LaunchAgents`・`/Library/LaunchAgents`・`/Library/LaunchDaemons` の plist（`com.apple.*` も数える）、Windows: `\Microsoft\` 以外のタスク・全サービス（ユーザーごとのサービスの接尾辞はまとめる）・HKCU/HKLM の Run・スタートアップのフォルダ。名前と実行ファイルの名前だけ | 道具の棚卸しと同じ型（初回は記録だけ、取れなかった種類は削除と見なさない）。増えたものは注意。記録は `net_events`（180 日） |
+| ログイン | ログの取り込みに `mac_auth`（統合ログの sshd の失敗。接続ごとに1件、最大 7 日・300 件）と `win_security`（4625、4624 のうち種別 3・8・10 で送り元のあるもの。読めなければ note に「権限が無い」）を足す。送り元のアドレスは provider に入る | 24 時間の失敗が 10 件以上で注意、100 件以上で重大、外部のアドレスからの失敗だけなら提案。外部のアドレスからの成功（7 日）は注意。洪水の所見には数えない |
+| 外向きの接続 | 分析のときに1回。確立した TCP のうち、自分の待ち受けの番号で受けたもの（外から来た接続）とこの機体の中を除く | 機体・プロセスごとに覚え（`net_peers`、30 日見なければ消す）、最初の 7 日は覚えるだけ。新しいプロセス・新しいポート・決まった宛先（10 以下）としか話さないプロセスの新しい宛先を提案に。外と初めて通信したプロセスがあれば状態は注意（共用機は提案だけ） |
+
+- snapshot に宛先は残さない（`outbound`・`persist` は件数だけにする）。宛先・送り元は手元の DB（`net_peers`・ログ）にだけ置く
+- 時間: この機体（macOS）で netsec は 0.1 秒前後（CPU 0.05〜0.15 秒）で、他の調査と並べて動くので分析の時間は変わらない（6.4 秒）。Windows 1 台で 1.3〜2.5 秒（多くは `Get-NetFirewallProfile` の 0.75〜1.7 秒）、PowerShell 自身の CPU 1.0〜1.2 秒（CIM の処理は WmiPrvSE 側で、ここには入らない）。部分ごとに上限（CIM 5〜8 秒）、全体で 20 秒（macOS 15 秒）
+- まだ無いもの: DNS のキャッシュ、Tailscale の接続先と鍵の期限、画面を見ている間の接続の記録（ライブ）
+
 ## 順番
 
 1. 出どころの台帳と「この数字はどこから」画面

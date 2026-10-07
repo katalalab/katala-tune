@@ -3,6 +3,7 @@
 //!
 //! - commands: window.tune の各関数（preload.js と同じ名前・引数・戻り値の形）
 //! - commands_tools: 道具の棚卸し・Do-gu・AI エージェントのセッション
+//! - commands_netsec: ネットワークとセキュリティ（「セキュリティ」の画面）
 //! - window: ウィンドウ（vibrancy・Mica・透過・遷移の禁止・外部 URL は https だけ既定のブラウザで）
 //! - tray: メニューバー（Windows は通知領域）
 //! - confirm: 変更操作の確認ダイアログ
@@ -11,6 +12,7 @@
 
 mod accent;
 mod commands;
+mod commands_netsec;
 mod commands_tools;
 mod confirm;
 mod live;
@@ -125,6 +127,7 @@ pub fn run() {
             commands_tools::ai_summary,
             commands_tools::ai_sessions,
             commands_tools::ai_sync,
+            commands_netsec::netsec,
             live::live_start,
             live::live_stop,
         ])

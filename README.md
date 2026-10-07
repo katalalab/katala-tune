@@ -18,6 +18,7 @@
 - **ログ**: 全文検索、同種ログ（数字・ID・パスを伏せて同じ形のものを集計し、何台で出ているかを表示）、取り込みの状態（最終成功・捨てた件数・エラー）
 - **道具**: 全機体の CLI・パッケージ・アプリと版を機体×道具の表で（版の違いを強調）、追加・削除の履歴、Do-gu との照合とデッキの下書き・登録（確認ダイアログつき）
 - **AI**（Tauri 版）: Claude Code・Codex のセッションの要約。機体×日の使用量（トークン・セッション数）、モデル別、失敗の多いツール、長いセッション、PR、機体ごとの版、セッションの一覧。会話の本文は取り出さない
+- **セキュリティ**（Tauri 版）: 機体×項目（待ち受け・防御・常駐の増減・ログイン・初めての接続先）の表と、外から届く待ち受け、防御の状態、自動起動の増減の記録、ログインの送り元、初めての接続先。接続のメタデータと OS の記録だけで、パケットの中身は取らない。Electron 版では、防御と待ち受けの判定が「状態」と各機体の所見にだけ出る
 - **実行記録**: このアプリから実行した操作と、元に戻す操作
 
 ## 自動スキャン
@@ -38,6 +39,7 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 | 計測 | 1スレッドの固定計算を5回（python）。前回との差で「最適化が効いたか」を見る（±15% 未満は誤差扱い） |
 | 実行 | プロセス終了（同一性・負荷を直前に再確認、終了を確認できなければ「終了未確認」）、Windows の電源プラン切り替え、タスクの無効化／有効化／今すぐ実行、launchd ジョブの停止／読み込み／今すぐ実行（元に戻せるものは戻せる） |
 | 道具 | 各機体のインストール先を読むだけ（`probes/mac_inventory.py`・`probes/win_inventory.ps1`）。パッケージマネージャもネットワークも使わない。読めなかった取り方は削除と見なさない |
+| ネットワークとセキュリティ | 60 分ごとの分析に足す（読み取り専用。docs/observability.md の 6）。待ち受けているポートとプロセス（全部の口・特定のアドレス・この機体の中を分け、前回の分析と比べて新しく外から届くもの）、防御の状態（macOS: アプリケーションファイアウォール・Gatekeeper・XProtect、Windows: Defender・登録されたウイルス対策・ファイアウォールのプロファイル・直近 30 日の検出）、自動起動の増減（LaunchAgents・LaunchDaemons／タスク・サービス・Run キー・スタートアップ。初回は記録だけ）、外向きの接続の標本（機体・プロセスごとに覚え、最初の 7 日は覚えるだけ。宛先は手元の DB にだけ置き 30 日で消す）。ログインは取り込みに足す（macOS の sshd の失敗、Windows のセキュリティログ 4625・4624 のネットワーク／リモート。読めなければ「権限が無い」）。保護が止まっている機体は「状態」で異常。台帳の機体に `"network": false` で集めない |
 | AI エージェント | `probes/ai_sessions.py` を各機体の python で流し（Windows は python3 → python → py。無ければ「python が無い」）、続きの位置は DB が覚えて渡す。数・時刻・モデル・トークン・PR の URL だけを取り出す。台帳の機体に `"ai_sessions": false` で取り込まない |
 | 保存 | Node 内蔵の `node:sqlite`（依存なし・ネイティブビルドなし）。`<userData>/data/katala-tune.db` |
 
@@ -53,7 +55,7 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
   "nodes": [
     { "id": "my-mac", "alias": "my-mac", "os": "macos", "local_hostname": "My-MacBook-Pro" },
     { "id": "gpu-pc", "alias": "gpu-pc", "os": "windows", "note": "メモ" },
-    { "id": "family-pc", "alias": "family-pc", "os": "windows", "shared": true }
+    { "id": "family-pc", "alias": "family-pc", "os": "windows", "shared": true, "network": false }
   ]
 }
 ```
@@ -61,6 +63,7 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 - `alias` は `~/.ssh/config` の Host 名。非対話（BatchMode）で入れる鍵が要る。Windows 側は OpenSSH サーバーと、既定シェル（Git Bash または PowerShell）で `powershell.exe` が動くこと
 - `local_hostname` がこの機体の hostname と一致すると、SSH を使わずローカルで実行する
 - `shared: true` は提案のみ。`protect` は終了を提案しても実行しないアプリ名
+- `network`（任意）: `false` でネットワークとセキュリティ（待ち受け・防御・常駐の増減・外向きの接続）を集めない。ログインの記録はログの取り込みの一部なので、止めるときは別に考える（既定は集める。共用機の「初めての接続先」は提案だけ）
 - `expect`（任意）: その機体で動いているはずのもの。`{ "services": ["Tailscale"], "jobs": ["\\MyTask", "com.example.job"], "processes": ["ollama"] }`。「状態」で見張る
 - `schedule`（任意）: `{ "enabled": true, "probe_minutes": 60, "logs_minutes": 15 }`
 - `fleet`（任意）: 作者のフリートで使っている常時監視（katala-fleet、非公開）の概況を `op-agent` 経由で表示する連携。設定しなければ使わない

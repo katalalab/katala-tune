@@ -1,4 +1,4 @@
-/* renderer/tools.css — 「道具」（tools.js）と「AI」（agents.js）の画面だけの細部。色・部品は style.css の変数とクラスを使う */
+/* renderer/tools.css — 「道具」（tools.js）・「AI」（agents.js）・「セキュリティ」（security.js）の画面だけの細部。色・部品は style.css の変数とクラスを使う */
 
 /* ---- 道具: 機体×道具のマトリクス ---- */
 .inv-matrix { max-height: none; }
@@ -31,3 +31,11 @@
 .ai-pager { display: flex; justify-content: flex-end; gap: 6px; margin: 10px 0 0; }
 .ai-settings { margin-top: 26px; }
 .li-title a { color: var(--text); text-decoration: underline; text-decoration-color: var(--line2); text-underline-offset: 3px; }
+
+/* ---- セキュリティ ---- */
+.sec-matrix .dbt th.mx-row { min-width: 190px; white-space: normal; }
+.sec-node { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; margin-right: 6px; }
+.sec-node .i { width: 14px; height: 14px; color: var(--text3); }
+.sec-addr, .sec-key { font-family: var(--mono); font-size: 12px; }
+.sec-addr { white-space: nowrap; }
+.sec-key { overflow-wrap: anywhere; }
