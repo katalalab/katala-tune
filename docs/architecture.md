@@ -37,7 +37,7 @@
 | 0 | 公開（MIT）、点検（oss-check・gitleaks）、Electron 44、CI | 済み |
 | 1 | `tune-core`・`tune-cli`・Tauri の殻。既存の画面を `window.tune` の橋渡しでそのまま動かす。DB と台帳は Electron 版と同じ場所・同じ表 | 作業中 |
 | 2 | 画面を Notion 風に作り直す（グラフ・プログレスバー・データベース風の表の部品） | 作業中 |
-| 3 | 道具の台帳と Do-gu、AI エージェントのセッションを `tune-core` と画面に足す | 道具と Do-gu: 調査・保存・照合を JS で実装（PR #1）、Rust への移植と画面は未着手。AI エージェント: 調査スクリプトのみ（PR #3、下書き）、取り込みと画面は未着手 |
+| 3 | 道具の台帳と Do-gu、AI エージェントのセッションを `tune-core` と画面に足す | 道具と Do-gu: `tune-core`（inventory・dogu。JS 版との一致は tests/parity_inventory.rs）と画面「道具」。AI エージェント: `tune-core`（ai_sessions。取り込み・時間ごとの量・集計・ページング）と画面「AI」（Tauri 版だけ） |
 | 4 | 画面を TypeScript にする（ビルドは Vite か esbuild） | 未着手 |
 | 5 | SSH の管理（到達性・認証の経路・鍵の種類と古さ・known_hosts） | 設計 |
 | 6 | `tune-agent`（各機体の調査を Rust の単一バイナリに） | 未着手 |

@@ -34,6 +34,10 @@ pub trait Host: Send + Sync + 'static {
     fn open_at_login(&self) -> bool {
         false
     }
+    /// 1台の道具の棚卸しが終わった（画面の `onInventoryResult`）
+    fn inventory_result(&self, _r: &Value) {}
+    /// 1台の AI エージェントのセッションの取り込みが終わった（画面の `onAiSynced`）
+    fn ai_synced(&self, _r: &Value) {}
 }
 
 /// 何もしない Host（CLI・テスト用）
@@ -57,6 +61,8 @@ pub struct Engine {
     syncing: AtomicBool,
     last_probe_error: Mutex<HashMap<String, String>>,
     fleet: Mutex<(Option<Value>, Option<i64>)>,
+    /// 道具の棚卸し・AI の取り込みの状態（engine_tools.rs）
+    pub(crate) tools: crate::engine_tools::ToolsState,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -94,9 +100,15 @@ impl Engine {
             syncing: AtomicBool::new(false),
             last_probe_error: Mutex::new(HashMap::new()),
             fleet: Mutex::new((None, None)),
+            tools: Default::default(),
         });
         e.reload_config();
         Ok(e)
+    }
+
+    /// 呼び出し側への知らせ（engine_tools.rs から使う）
+    pub(crate) fn host(&self) -> &Arc<dyn Host> {
+        &self.host
     }
 
     pub fn config_path(&self) -> &Path {
@@ -144,8 +156,9 @@ impl Engine {
         m.insert("enabled".into(), Value::Bool(true));
         m.insert("probe_minutes".into(), Value::from(DEFAULT_PROBE_MINUTES));
         m.insert("logs_minutes".into(), Value::from(DEFAULT_LOGS_MINUTES));
-        // 道具の棚卸しの間隔（main.js と同じ既定。棚卸しそのものの移植は別の作業）
+        // 道具の棚卸しの間隔（main.js と同じ既定）と、AI エージェントのセッションの取り込みの間隔（engine_tools.rs）
         m.insert("inventory_hours".into(), Value::from(DEFAULT_INVENTORY_HOURS));
+        m.insert("ai_minutes".into(), Value::from(crate::ai_sessions::DEFAULT_AI_MINUTES));
         if let Some(Value::Object(c)) = self.config().schedule {
             m.extend(c);
         }
@@ -289,7 +302,7 @@ impl Engine {
         if let Some(Value::Bool(b)) = patch.get("enabled") {
             s.insert("enabled".into(), Value::Bool(*b));
         }
-        for (k, lo, hi) in [("probe_minutes", 5.0, 1440.0), ("logs_minutes", 5.0, 1440.0), ("inventory_hours", 1.0, 168.0)] {
+        for (k, lo, hi) in [("probe_minutes", 5.0, 1440.0), ("logs_minutes", 5.0, 1440.0), ("inventory_hours", 1.0, 168.0), ("ai_minutes", 5.0, 1440.0)] {
             if let Some(v) = patch.get(k).and_then(Value::as_f64).filter(|v| v.fract() == 0.0 && (lo..=hi).contains(v)) {
                 s.insert(k.into(), Value::from(v as i64));
             }
@@ -397,6 +410,8 @@ impl Engine {
             let nodes = self.reload_config().nodes;
             self.sync_logs(nodes).await;
         }
+        // 道具の棚卸しと AI エージェントのセッションの取り込み（engine_tools.rs）
+        self.tick_tools().await;
     }
 
     /// katala-fleet の概況（任意）。op-agent が秘密を子プロセスにだけ渡すので、この画面には値が来ない

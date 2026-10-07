@@ -2,6 +2,7 @@
 //! 画面は renderer/ をそのまま使い、preload.js と同じ window.tune を初期化スクリプト（bridge/tune.js）で差し込む。
 //!
 //! - commands: window.tune の各関数（preload.js と同じ名前・引数・戻り値の形）
+//! - commands_tools: 道具の棚卸し・Do-gu・AI エージェントのセッション
 //! - window: ウィンドウ（vibrancy・Mica・透過・遷移の禁止・外部 URL は https だけ既定のブラウザで）
 //! - tray: メニューバー（Windows は通知領域）
 //! - confirm: 変更操作の確認ダイアログ
@@ -9,6 +10,7 @@
 
 mod accent;
 mod commands;
+mod commands_tools;
 mod confirm;
 mod tray;
 mod window;
@@ -54,6 +56,12 @@ impl Host for TauriHost {
     }
     fn open_at_login(&self) -> bool {
         self.app.autolaunch().is_enabled().unwrap_or(false)
+    }
+    fn inventory_result(&self, r: &Value) {
+        let _ = self.app.emit("inventory-result", r);
+    }
+    fn ai_synced(&self, r: &Value) {
+        let _ = self.app.emit("ai-synced", r);
     }
 }
 
@@ -107,6 +115,14 @@ pub fn run() {
             commands::set_schedule,
             commands::set_login,
             commands::dev_report,
+            commands_tools::inventory,
+            commands_tools::inventory_run,
+            commands_tools::dogu_refresh,
+            commands_tools::dogu_exclude,
+            commands_tools::dogu_publish,
+            commands_tools::ai_summary,
+            commands_tools::ai_sessions,
+            commands_tools::ai_sync,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

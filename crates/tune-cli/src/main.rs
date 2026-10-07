@@ -6,6 +6,9 @@
 //!   tune last                        DB の前回の分析結果（所見・スコアつき）を JSON で
 //!   tune status [--recompute]        DB の状態（機能チェック）を JSON で。--recompute で計算し直して保存する
 //!   tune analyze <snapshot.json>     snapshot（probe の data）から所見を作る
+//!   tune inventory [機体 ...]        道具の棚卸しを DB に保存し、結果を JSON で（DB は KATALA_TUNE_DATA_DIR で写しを指す）
+//!   tune ai [機体 ...]               AI エージェントのセッションを取り込み、結果を JSON で（同上。続きは DB が覚える）
+//!   tune ai-summary [日数]           DB の AI エージェントのセッションの集計を JSON で
 //!
 //! 台帳と DB は Electron 版と同じ場所（KATALA_TUNE_CONFIG・KATALA_TUNE_DATA_DIR で差し替えられる）。
 //! 変更操作（actions）はここからは実行しない（確認ダイアログを通すため、アプリからだけ）。
@@ -19,7 +22,7 @@ use tune_core::engine::{Engine, NoHost};
 use tune_core::{collect, logs, nodes, rules};
 
 fn usage() -> ExitCode {
-    eprintln!("使い方: tune <paths|probe|logs|last|status|analyze> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）");
+    eprintln!("使い方: tune <paths|probe|logs|last|status|analyze|inventory|ai|ai-summary> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）");
     ExitCode::from(2)
 }
 
@@ -118,6 +121,23 @@ async fn main() -> ExitCode {
                             print(&v)
                         })
                 }
+            }
+            Err(e) => Err(e),
+        },
+        "inventory" | "ai" | "ai-summary" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => {
+                let ids = (!rest.is_empty() && cmd != "ai-summary").then(|| rest.to_vec());
+                let t0 = std::time::Instant::now();
+                let v = match cmd.as_str() {
+                    "inventory" => Ok(e.run_inventory(ids).await),
+                    "ai" => Ok(e.ai_sync(ids).await),
+                    _ => {
+                        let days = rest.first().and_then(|d| d.parse::<i64>().ok()).unwrap_or(30);
+                        e.ai_summary(&json!({ "days": days }))
+                    }
+                };
+                eprintln!("done {:.1}s db={}", t0.elapsed().as_secs_f64(), e.data_dir().display());
+                v.map(|v| print(&v))
             }
             Err(e) => Err(e),
         },

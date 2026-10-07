@@ -144,3 +144,10 @@ test('Do-gu の登録: 下書きにある slug だけを通し、確認の前後
   // 確認のあいだに jq が除外された
   assert.equal(dogu.samePlan(a, dogu.planPublish(draft.filter((d) => d.slug !== 'jq'), ['jq', 'gh'])), false);
 });
+
+test('版のずれは先頭の数字の並びで比べる（OS ごとの接尾辞は数えない）', () => {
+  const row = (node_id, version) => ({ node_id, source: 'winreg', name: 'Git', version, explicit: true });
+  assert.equal(matrix([row('a', '2.51.0'), row('b', '2.51.0.windows.1')])[0].drift, false);
+  assert.equal(matrix([row('a', '2.51.0'), row('b', '2.50.1.windows.1')])[0].drift, true);
+  assert.equal(matrix([row('a', 'v1.2'), row('b', 'v1.2')])[0].drift, false);
+});

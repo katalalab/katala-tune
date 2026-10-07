@@ -31,6 +31,12 @@ const actions = load('actions.json');
 const fleet = load('fleet.json');
 
 const clone = (v) => JSON.parse(JSON.stringify(v));
+const inventoryLib = require('../lib/inventory');
+const doguLib = require('../lib/dogu');
+const inv = load('inventory.json');
+const aiData = load('ai.json');
+let doguCache = null; // 「Do-gu の一覧を取得」を押すまで取得していない（本物と同じ）
+let doguExcludeList = inv.exclude;
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const listeners = { probe: [], checks: [], logs: [] };
 
@@ -106,7 +112,7 @@ contextBridge.exposeInMainWorld('tune', {
   status: async () => clone({ ...status, counts: counts() }),
   setSchedule: async (patch) => {
     if (typeof patch?.enabled === 'boolean') status.schedule.enabled = patch.enabled;
-    for (const k of ['probe_minutes', 'logs_minutes']) if (Number.isInteger(patch?.[k])) status.schedule[k] = patch[k];
+    for (const k of ['probe_minutes', 'logs_minutes', 'inventory_hours', 'ai_minutes']) if (Number.isInteger(patch?.[k])) status.schedule[k] = patch[k];
     return clone(status.schedule);
   },
   setLogin: async (on) => { status.openAtLogin = !!on; return status.openAtLogin; },
@@ -114,4 +120,64 @@ contextBridge.exposeInMainWorld('tune', {
   onNavigate: (fn) => ipcRenderer.on('navigate', (_e, v) => fn(v)),
   onProbeResult: (fn) => { listeners.probe.push(fn); },
   onLogsSynced: (fn) => { listeners.logs.push(fn); },
+  // 道具の棚卸し・Do-gu（main.js の inventoryView と同じ形を lib/inventory.js・lib/dogu.js で作る）。送信は何もしない
+  inventory: async (opts) => clone(inventoryView(opts || {})),
+  inventoryRun: async () => { await wait(1200); return clone(inventoryView()); },
+  doguRefresh: async () => { await wait(500); doguCache = { at: Date.now(), tools: inv.tools }; return clone(inventoryView()); },
+  doguExclude: async (slugs) => { doguExcludeList = [...new Set(slugs || [])]; return clone(inventoryView()); },
+  doguPublish: async () => ({ ok: false, cancelled: true }),
+  onInventoryResult: () => {},
+  // AI エージェントのセッション（集計済みの架空データ。絞り込みとページングだけここで行う）
+  // ?electron=1 では Electron 版（preload.js）と同じく「未対応」を返す
+  aiSummary: async (f) => (params.get('electron') ? { unsupported: true } : clone(aiSummary(f || {}))),
+  aiSessions: async (f) => (params.get('electron') ? { unsupported: true, rows: [], total: 0, offset: 0, limit: 0 } : clone(aiSessions(f || {}))),
+  aiSync: async () => { await wait(1200); return { ms: 1200, results: aiData.nodes.filter((n) => n.enabled !== false).map((n) => ({ node_id: n.id, ok: !n.no_python, sessions: 3, truncated: !!n.truncated })) }; },
+  onAiSynced: () => {},
 });
+
+function inventoryView({ all = false } = {}) {
+  const matchSlug = doguCache ? doguLib.makeMatcher(doguCache.tools) : null;
+  const m = inventoryLib.matrix(inv.rows, { matchSlug });
+  const shown = all ? inventoryLib.matrix(inv.rows, { matchSlug, explicitOnly: false }) : m;
+  const cats = new Map((doguCache?.tools || []).map((t) => [t.slug, t.category]));
+  return {
+    nodes: config.nodes.map(({ id, os }) => ({ id, os, count: inv.rows.filter((r) => r.node_id === id && r.explicit).length, error: inv.nodes[id] || null, last_ok_at: inv.lastInventoryAt })),
+    groups: shown.map((g) => ({ ...g, category: g.slug ? cats.get(g.slug) || null : null })), all,
+    events: inv.events, sources: inventoryLib.SOURCES, lastInventoryAt: inv.lastInventoryAt, inventorying: false,
+    dogu: doguCache ? { at: doguCache.at, tools: doguCache.tools.length, matched: m.filter((g) => g.slug).length, draft: doguLib.deckDraft(m, doguCache.tools, doguExcludeList), exclude: doguExcludeList } : null,
+  };
+}
+
+const io = (x) => (x.tok_in || 0) + (x.tok_out || 0);
+function aiFilter(f) {
+  return (s) => (!f.node_id || s.node_id === f.node_id) && (!f.tool || s.tool === f.tool);
+}
+function aiSummary(f) {
+  const days = f.days || 30;
+  const tz = (f.tz || 0) * 60000;
+  const DAY = 86400e3;
+  const today = Math.floor((NOW + tz) / DAY);
+  const daily = aiData.daily.filter((r) => -r.day < days && (!f.node_id || r.node_id === f.node_id))
+    .map(({ day, ...r }) => ({ ...r, day: (today + day) * DAY - tz }));
+  const sum = (k) => daily.reduce((a, r) => a + (r[k] || 0), 0);
+  const sess = aiData.sessions.filter(aiFilter(f));
+  return {
+    days, since: (today - (days - 1)) * DAY - tz, tz: f.tz || 0,
+    totals: Object.fromEntries(['sessions', 'prompts', 'tool_calls', 'tok_in', 'tok_out', 'tok_cache_read', 'tok_cache_write', 'tok_reasoning'].map((k) => [k, sum(k)])),
+    daily, models: aiData.models.filter((m) => !f.tool || m.tool === f.tool), tools: aiData.tools,
+    long: sess.slice().sort((a, b) => b.duration_ms - a.duration_ms).slice(0, 10),
+    prs: aiData.prs.filter(aiFilter(f)), versions: aiData.versions,
+    nodes: config.nodes.map((n) => ({ id: n.id, os: n.os, shared: !!n.shared, enabled: true, file_errors: [], ...aiData.nodes.find((x) => x.id === n.id) })),
+    ingesting: false, pending: aiData.nodes.some((n) => n.truncated), lastAiAt: aiData.lastAiAt, schedule: { enabled: status.schedule.enabled, ai_minutes: status.schedule.ai_minutes ?? 30, catch_up_minutes: 2 },
+  };
+}
+function aiSessions(f) {
+  const q = (f.q || '').toLowerCase();
+  const errs = (s) => s.tool_errors + s.turn_errors + s.api_errors + s.hook_errors;
+  let rows = aiData.sessions.filter(aiFilter(f)).filter((s) => (!q || `${s.cwd} ${s.model} ${s.version}`.toLowerCase().includes(q))
+    && (f.kind !== 'main' || !s.parent_id) && (f.kind !== 'sub' || s.parent_id) && (!f.errors || errs(s) > 0));
+  const key = { duration: (s) => s.duration_ms, tokens: io, errors: errs }[f.sort] || ((s) => s.last_ts);
+  rows = rows.slice().sort((a, b) => key(b) - key(a));
+  const offset = f.offset || 0, limit = Math.min(200, f.limit || 50);
+  return { rows: rows.slice(offset, offset + limit), total: rows.length, offset, limit };
+}

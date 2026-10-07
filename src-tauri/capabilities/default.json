@@ -27,6 +27,14 @@
     "allow-status",
     "allow-set-schedule",
     "allow-set-login",
-    "allow-dev-report"
+    "allow-dev-report",
+    "allow-inventory",
+    "allow-inventory-run",
+    "allow-dogu-refresh",
+    "allow-dogu-exclude",
+    "allow-dogu-publish",
+    "allow-ai-summary",
+    "allow-ai-sessions",
+    "allow-ai-sync"
   ]
 }
