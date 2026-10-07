@@ -14,8 +14,6 @@ concurrency:
 
 jobs:
   test:
-    # private の間は動かさない（hosted runner の課金を止めているため）。公開すると動く
-    if: ${{ !github.event.repository.private }}
     strategy:
       fail-fast: false
       matrix:
@@ -39,7 +37,6 @@ jobs:
 
   # Rust 側（crates/tune-core・crates/tune-cli・src-tauri）。test のジョブ名と必須チェックは変えない
   rust:
-    if: ${{ !github.event.repository.private }}
     strategy:
       fail-fast: false
       matrix:

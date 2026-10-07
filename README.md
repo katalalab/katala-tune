@@ -78,7 +78,7 @@ npm start                # Rust + Tauri で起動
 
 互換比較が必要なときだけ `npm rebuild electron` 後に `npm run electron:start` で旧 Electron 版を起動する。旧版の配布コマンドには `electron:` を付ける。同じデータを使う両版を同時に動かさない。
 
-`npm run oss-check` は台帳（`~/.config/katala-tune/nodes.json`）の id・alias・hostname と、この機体のユーザー名・ホスト名、Tailscale のアドレス、`op://` 参照、実在のホームパス、メールアドレスがリポジトリに無いかを調べる。探す語は台帳から実行時に読むので、リポジトリには書かない。CI（`.github/workflows/ci.yml`）は公開リポジトリのときだけ動く。
+`npm run oss-check` は台帳（`~/.config/katala-tune/nodes.json`）の id・alias・hostname と、この機体のユーザー名・ホスト名、Tailscale のアドレス、`op://` 参照、実在のホームパス、メールアドレスがリポジトリに無いかを調べる。探す語は台帳から実行時に読むので、リポジトリには書かない。CI（`.github/workflows/ci.yml`）は PR と main への反映で動く。
 
 ログは、中央の DB へ後でそのまま送れる表の形で保存している。
 
