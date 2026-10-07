@@ -31,7 +31,7 @@
 4. 公開鍵（`.pub` の中身、1行）を `src-tauri/tauri.conf.json` の `plugins.updater.pubkey` に入れてコミットする。仮の値（`REPLACE_WITH_TAURI_SIGNING_PUBLIC_KEY`）のままだとリリースの CI が止まる
 5. 手元の秘密鍵ファイルは 1Password に入れたら消してよい
 
-2026-10-07 に作成済み: 1Password の Katala-Agents「Katala Tune updater signing key (minisign)」（private_key・password・public_key）、GitHub の環境 `release`（タグ `v*` だけ）の secret 2 つ、`tauri.conf.json` の公開鍵。
+更新署名の公開鍵は `tauri.conf.json` に保存する。秘密鍵の保存先や管理者向けの復旧記録は公開リポジトリへ含めない。
 
 鍵を替えると、古い公開鍵を持つアプリは新しい署名の更新を受け付けない。替えるときは、新しい公開鍵を入れた版を古い鍵で署名して一度出してから替える。
 
@@ -49,11 +49,11 @@
    ```
 4. CI がタグと版の一致・公開鍵が仮の値でないことを確かめてからビルドし、下書きのリリースに置く:
    `KatalaTune_<版>_universal.dmg`（初めて入れる人向け）・`KatalaTune_<版>_universal.app.tar.gz`（と `.sig`）・`KatalaTune_<版>_x64-setup.exe`（と `.sig`）・`latest.json`
-5. 下書きを確かめて公開する。公開した時点で、動いているアプリの「更新を確認…」に出る
+5. 下記の公開前チェックを完了してから下書きを公開する。公開した時点で、動いているアプリの「更新を確認…」に出る。未検証の環境が残る初期配布は prerelease とし、通常の latest 自動更新の対象にしない
 
 ## 注意
 
-- Apple の公証（notarization）と Windows のコード署名はしていない。初めて入れるときは、macOS は Finder で右クリック →「開く」、Windows は SmartScreen の「詳細情報 → 実行」が要る。自動更新で入れた版にはこの手順は要らない
+- Apple の公証（notarization）と Windows のコード署名はしていない。OS の警告や管理ポリシーで起動が止められる場合がある。更新ファイルの署名は OS の配布認証とは別で、組織の保護設定を解除して導入しない
 - 識別子は `org.katala.tune.tauri`（Electron 版の `org.katala.tune` と分けている）
 
 ## 確かめ方（手元、本物の鍵を使わない）
@@ -71,5 +71,21 @@
 ## 配布物の検証と切り戻し
 
 CI は全3 target の feed の版・URL・署名文字列と実ファイルの一致、欠落・空ファイルを検証し、`SHA256SUMS` を同梱する。暗号としての署名検証は updater の責務で、文字列の一致を暗号検証とは呼ばない。公開前は下書きの全 asset を取得し、SHA256 を照合して実機で確認する。
+
+### 公開前チェック
+
+- タグの commit がレビュー済み main に含まれ、版が一致し、必須 CI と配布ビルドが成功している
+- 下書きから実ファイルを取得し、6 asset の SHA256 が同梱の `SHA256SUMS` と一致する。feed の3 platform の URL・版・署名がそのファイルに対応する
+- Mac `.app.tar.gz` と Windows `.exe` の署名を、製品に埋め込んだ公開鍵で暗号検証する。署名の trusted comment の版も feed と一致する。使い捨て鍵での成功だけでは本番の鍵の対応を確認したことにしない
+- Mac は DMG から隔離した場所へコピーして起動し、アプリの版、台帳読込、分析、ログ、AI、確認ダイアログ、終了を確認する。universal executable の arm64 / x86_64 を確認し、実際に動かした CPU の種類を記録する
+- Windows は既存のアプリとデータを保持し、NSIS で隔離した場所へ導入する。WebView2 の画面、台帳読込、分析、ログ、確認ダイアログ、終了、アンインストールを確認する。署名つき更新は旧版から入れ替え・再起動後の版まで確認する
+- 更新のキャンセル、別の鍵、署名の版の不一致がアプリを変更しないことと、正常更新が再起動後の版に反映されることを確認する
+- リリースノートに導入方法、検証済み OS / CPU、未検証の環境、OS 配布認証の有無、切り戻し手順を記載する。公開後に実際の配布 URL・feed・SHA256 を読み返す
+
+検証記録はタグ・commit・CI run ID・OS / CPU・asset 名 / サイズ / SHA256・操作と結果を残す。台帳、端末名、ログ本文、秘密鍵は公開しない。未検証を成功に置き換えない。
+
+### 導入前のデータ保護
+
+旧 Electron 版と Tauri 版をともに終了し、台帳 `~/.config/katala-tune/nodes.json` とアプリのデータディレクトリをコピーして退避する。DB が WAL を使っている間に `.db` だけをコピーしない。検証では `KATALA_TUNE_CONFIG` と `KATALA_TUNE_DATA_DIR` で台帳・データを隔離し、自動スキャンを無効にする。旧版と新版を同じ DB に同時接続させない。
 
 公開後に配布の問題が判明した場合は、まず問題の release を prerelease または draft に戻し latest の対象から外す。DB を古い版に上書きしない。updater は版を下げないため、修正版をより高い版で旧署名鍵により配布する。旧アプリの手動復旧には事前の DB バックアップと schema の互換確認が必要。鍵を捨てたり保護ルールを外して出し直したりしない。

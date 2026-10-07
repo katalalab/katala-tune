@@ -268,8 +268,8 @@ impl Engine {
     }
 
     async fn ai_sync_one(&self, n: &Node) -> Value {
-        let files = self.with_db(|d| d.ai_files(&n.id)).unwrap_or_default();
-        let (fetched, wall_s) = ai_sessions::fetch(n, &files).await;
+        let (files, claude_replay) = self.with_db(|d| Ok((d.ai_files(&n.id)?, d.ai_claude_replay(&n.id)?))).unwrap_or_default();
+        let (fetched, wall_s) = ai_sessions::fetch(n, &files, &claude_replay).await;
         let now = now_ms();
         let out = match fetched {
             Fetched::Ok(v) => match self.with_db(|d| d.ai_ingest(&n.id, &v, now)) {
@@ -301,7 +301,9 @@ impl Engine {
     pub fn ai_summary(&self, f: &Value) -> Result<Value, String> {
         let cfg = self.config();
         let now = now_ms();
-        let (mut s, cursors, last_at, pending) = self.with_db(|d| Ok((d.ai_summary(f, now)?, d.ai_cursors()?, d.get_meta("lastAiAt")?, d.ai_pending()?)))?;
+        let enabled: Vec<String> = cfg.nodes.iter().filter(|n| ai_sessions::enabled(n)).map(|n| n.id.clone()).collect();
+        let (mut s, cursors, last_at, pending) =
+            self.with_db(|d| Ok((d.ai_summary(f, now)?, d.ai_cursors()?, d.get_meta("lastAiAt")?, d.ai_pending(&enabled)?)))?;
         let nodes: Vec<Value> = cfg
             .nodes
             .iter()
@@ -346,7 +348,8 @@ impl Engine {
             self.run_inventory(None).await;
         }
         if !self.is_ai_syncing() {
-            let pending = self.with_db(|d| d.ai_pending()).unwrap_or(false);
+            let enabled: Vec<String> = self.config().nodes.iter().filter(|n| ai_sessions::enabled(n)).map(|n| n.id.clone()).collect();
+            let pending = self.with_db(|d| d.ai_pending(&enabled)).unwrap_or(false);
             let mins = if pending { CATCH_UP_MINUTES as f64 } else { js::num(s.get("ai_minutes")) };
             if mins.is_finite() && since("lastAiAt") >= mins * 60_000.0 {
                 self.ai_sync(None).await;
