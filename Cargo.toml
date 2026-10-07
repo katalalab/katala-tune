@@ -1,0 +1,32 @@
+# Katala Tune の Rust 側。分析エンジン（tune-core）は Tauri に依存しない。
+# src-tauri は core を呼ぶ薄い殻（コマンド・常駐・通知・ダイアログ・ウィンドウ）、tune-cli は Tauri なしで core を確かめる道具。
+[workspace]
+resolver = "3"
+members = ["crates/tune-core", "crates/tune-cli", "src-tauri"]
+
+[workspace.package]
+version = "0.3.0"
+license = "MIT"
+repository = "https://github.com/katalalab/katala-tune"
+edition = "2024"
+rust-version = "1.90"
+publish = false
+
+[workspace.dependencies]
+tune-core = { path = "crates/tune-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "time", "sync", "io-util", "macros", "rt-multi-thread"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

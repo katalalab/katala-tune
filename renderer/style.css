@@ -135,7 +135,7 @@ code { font: 12.5px var(--mono); background: var(--code-inline); color: var(--co
 .main { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
 .topbar { height: 44px; flex: none; display: flex; align-items: center; gap: 12px; padding: 0 12px 0 14px; -webkit-app-region: drag; transition: box-shadow .15s; position: relative; z-index: 6; background: var(--bg); }
 .topbar.scrolled { box-shadow: 0 1px 0 var(--line); }
-.platform-win32 .topbar { padding-right: 150px; } /* Windows のキャプションボタン（titleBarOverlay）を避ける */
+.platform-win32:not(.native-titlebar) .topbar { padding-right: 150px; } /* Electron 版の Windows のキャプションボタン（titleBarOverlay）を避ける */
 .topbar button, .topbar input, .topbar select { -webkit-app-region: no-drag; }
 .crumbs { display: flex; align-items: center; gap: 2px; min-width: 0; font-size: 14px; }
 .crumb { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 6px; border: 0; background: none; border-radius: 4px; color: var(--text2); white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; }

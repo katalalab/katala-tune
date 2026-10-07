@@ -1,0 +1,42 @@
+[package]
+name = "katala-tune"
+description = "Katala Tune のアプリ（Tauri 2）。分析エンジン tune-core を呼ぶ薄い殻（コマンド・常駐・通知・ダイアログ・ウィンドウ）"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "katala_tune"
+path = "src/lib.rs"
+
+[[bin]]
+name = "katala-tune"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+tune-core.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tauri = { version = "2.12", features = ["tray-icon", "macos-private-api"] }
+tauri-plugin-notification = "2.5"
+tauri-plugin-autostart = "2.7"
+tauri-plugin-opener = "2.7"
+tauri-plugin-clipboard-manager = "2.4"
+
+# 確認ダイアログ。tauri-plugin-dialog は「キャンセル系の終わり方」を2番目のボタンの押下に読み替えるため、
+# 安全側（やめる）を既定ボタンにすると取り違えが起きうる。rfd（plugin-dialog と同じもの）を直接使い、結果を自分で判定する
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+rfd = { version = "0.16", default-features = false, features = ["common-controls-v6"] }
+
+# アクセントカラー（NSColor.controlAccentColor）。tao が使う objc2-app-kit と同じもので、機能を足すだけ
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSColor", "NSColorSpace"] }
+
+[lints]
+workspace = true
