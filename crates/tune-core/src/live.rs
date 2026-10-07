@@ -506,10 +506,15 @@ fn secs(d: Duration) -> String {
     if s.fract() == 0.0 { format!("{}", s as u64) } else { format!("{s}") }
 }
 
-/// 機体ごとの起動のしかた（collect.rs の probe と同じ作法に、止めたら残らないための 2 点を足したもの）。
-/// macOS: python3 に標準入力でスクリプトを渡す。Windows: ~/.katala-tune/live.ps1 に置いて PowerShell 5.1
-/// （ssh の既定シェルは Git Bash）。この機体ならローカルで実行する。
-/// どれもスクリプトを渡した後も標準入力を開いておき（watch=1・-WatchStdin）、SSH は多重化を使わない
+/// スクリプト長だけ読む。残りの stdin は EOF 監視に残し、実行先にファイルを作らない。
+fn windows_boot(n: usize, params: &str) -> String {
+    format!(
+        "[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false);$i=[Console]::OpenStandardInput();$b=New-Object byte[] {n};$p=0;while($p -lt {n}){{$r=$i.Read($b,$p,({n}-$p));if($r -eq 0){{exit 2}};$p+=$r}};$s=[Text.Encoding]::UTF8.GetString($b);. ([ScriptBlock]::Create($s)) {params}"
+    )
+}
+
+/// 機体ごとの起動方法。macOS / Windows とも標準入力でスクリプトを渡す。
+/// 渡した後も stdin を開き、停止時に閉じる。SSH は多重化しない。
 pub fn launch(node: &Node, o: &Opts) -> Result<Launch, String> {
     if node.is_mac() {
         let a = format!("interval={} procs={} max={} watch=1", secs(o.interval), secs(o.procs_every), secs(o.sampler_max_age));
@@ -525,21 +530,17 @@ pub fn launch(node: &Node, o: &Opts) -> Result<Launch, String> {
     }
     if node.is_windows() {
         let params = format!("-Interval {} -ProcEvery {} -MaxSeconds {} -WatchStdin", secs(o.interval), secs(o.procs_every), secs(o.sampler_max_age));
+        let script = WIN_LIVE.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(WIN_LIVE);
+        let boot = windows_boot(script.len(), &params);
+        let utf16: Vec<u8> = boot.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let encoded = crate::logs::base64(&utf16);
+        let stdin = script.to_vec();
         if node.local {
-            let dir = std::env::temp_dir().join("katala-tune");
-            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            let f = collect::local::write_unique(&dir, WIN_LIVE).map_err(|e| e.to_string())?;
-            let mut args: Vec<String> = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"].iter().map(|s| s.to_string()).collect();
-            args.push(f.to_string_lossy().into_owned());
-            args.extend(params.split(' ').map(str::to_string));
-            return Ok(Launch { program: "powershell.exe".into(), args, stdin: Vec::new(), keep_stdin: true, cleanup: Some(f) });
+            let args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded].iter().map(|s| s.to_string()).collect();
+            return Ok(Launch { program: "powershell.exe".into(), args, stdin, keep_stdin: true, cleanup: None });
         }
-        // head -c で先頭のスクリプトだけを書き、残りの標準入力（開いたまま）を PowerShell に渡す
-        let remote = format!(
-            "mkdir -p ~/.katala-tune && head -c {} > ~/.katala-tune/live.ps1 && powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$(cygpath -w ~/.katala-tune/live.ps1)\" {params}",
-            WIN_LIVE.len()
-        );
-        return Ok(Launch { program: "ssh".into(), args: live_ssh_args(&node.alias, &remote), stdin: WIN_LIVE.to_vec(), keep_stdin: true, cleanup: None });
+        let remote = format!("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}");
+        return Ok(Launch { program: "ssh".into(), args: live_ssh_args(&node.alias, &remote), stdin, keep_stdin: true, cleanup: None });
     }
     Err(format!("この OS（{}）はライブ表示に対応していない", node.os))
 }
@@ -1256,14 +1257,56 @@ mod tests {
         assert!(mac.keep_stdin && mac.stdin == MAC_LIVE.as_bytes());
         let win = launch(&node("w", "windows"), &Opts { interval: Duration::from_millis(1500), ..o.clone() }).unwrap();
         let cmd = win.args.last().unwrap();
-        assert!(cmd.contains(&format!("head -c {} > ~/.katala-tune/live.ps1", WIN_LIVE.len())), "{cmd}");
-        assert!(cmd.contains("-Interval 1.5 -ProcEvery 5 -MaxSeconds 900 -WatchStdin"), "{cmd}");
-        assert!(!cmd.contains(" /"), "Git Bash が / で始まる引数をパスに書き換えるので使わない");
-        assert!(!cmd.contains('\''), "Git Bash で包むのでシングルクォートを使わない");
+        assert!(cmd.starts_with("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand "), "{cmd}");
+        assert!(!cmd.contains("live.ps1") && !cmd.contains("mkdir") && !cmd.contains("-File"));
+        let boot = windows_boot(WIN_LIVE.len() - 3, "-Interval 1.5 -ProcEvery 5 -MaxSeconds 900 -WatchStdin");
+        assert!(boot.contains("OpenStandardInput") && boot.contains(".Read($b,$p,"));
+        assert!(boot.ends_with("-Interval 1.5 -ProcEvery 5 -MaxSeconds 900 -WatchStdin"));
         assert!(win.keep_stdin && win.args.contains(&"ControlPath=none".to_string()));
-        assert_eq!(&win.stdin[..3], &[0xEF, 0xBB, 0xBF], "PS 5.1 のため BOM 付き");
+        assert_eq!(win.stdin, WIN_LIVE[3..]);
+        assert!(win.cleanup.is_none());
+        let mut local_node = node("local", "windows");
+        local_node.local = true;
+        let local = launch(&local_node, &o).unwrap();
+        assert!(local.cleanup.is_none() && local.keep_stdin && local.stdin == WIN_LIVE[3..]);
         assert!(WIN_LIVE[3..].iter().all(|b| b.is_ascii()), "probes/live_win.ps1 は ASCII のみ");
         assert!(launch(&node("x", "linux"), &o).is_err());
+    }
+
+    /// 実 PowerShell で scope・短い stdin chunk・末尾 byte・EOF 前後を検証する。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_boot_preserves_script_scope_and_stdin_lifetime() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let script = b"$value=42;function Scope {$script:value};[Console]::WriteLine((Scope));$io=[Console]::OpenStandardInput();[Console]::WriteLine($io.ReadByte());[Console]::WriteLine($io.ReadByte())";
+        let boot = windows_boot(script.len(), "");
+        let utf16: Vec<u8> = boot.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut child = collect::command("powershell.exe")
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &crate::logs::base64(&utf16)])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        for chunk in script.chunks(7) {
+            input.write_all(chunk).await.unwrap();
+            input.flush().await.unwrap();
+        }
+        input.write_all(b"Q").await.unwrap();
+        input.flush().await.unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+        let scope = tokio::time::timeout(Duration::from_secs(15), output.next_line()).await.unwrap().unwrap();
+        assert_eq!(scope.as_deref(), Some("42"), "dot-source must preserve $script scope");
+        let tail = tokio::time::timeout(Duration::from_secs(5), output.next_line()).await.unwrap().unwrap();
+        assert_eq!(tail.as_deref(), Some("81"), "bootstrap must consume exactly script.len() bytes");
+        assert!(child.try_wait().unwrap().is_none(), "must remain alive before stdin EOF");
+        drop(input);
+        let eof = tokio::time::timeout(Duration::from_secs(5), output.next_line()).await.unwrap().unwrap();
+        assert_eq!(eof.as_deref(), Some("-1"));
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait()).await.unwrap().unwrap();
+        assert!(status.success());
     }
 
     // ---- 偽のサンプラー（一定間隔で行を出すローカルのスクリプト）で、開始・停止・自動停止・上限・つなぎ直しを確かめる ----

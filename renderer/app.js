@@ -362,7 +362,7 @@ function machineHtml(d, r) {
     ['OS', d.host.os], ['CPU', `${d.host.cpu}（${d.host.cores} スレッド${d.host.p_cores ? ` · P ${d.host.p_cores} / E ${d.host.e_cores}` : ''}）`],
     ['稼働時間', d.host.uptime_h != null ? `${(d.host.uptime_h / 24).toFixed(1)} 日` : '-'],
     ['メモリ', `${d.memory.total_gb} GB · 空き ${d.memory.available_pct}%${d.memory.swap_used_gb != null ? ` · swap ${d.memory.swap_used_gb} GB` : ''}${d.memory.commit_pct != null ? ` · コミット ${d.memory.commit_pct}%` : ''}`],
-    ['計測（5回）', d.bench ? `${d.bench.runs_ms.join(' / ')} ms（中央値 ${d.bench.median_ms}）` : 'python が無いため省略'],
+    ['計測（5回）', d.bench ? `${d.bench.runs_ms.join(' / ')} ms（中央値 ${d.bench.median_ms}）` : d.benchmark_skipped ? '台帳の設定で省略' : '計測結果なし'],
   ];
   if (d.load) rows.push(['load', d.load.join(' / ')]);
   if (d.power?.plan_name) rows.push(['電源プラン', d.power.plan_name]);
@@ -533,7 +533,7 @@ function renderResources() {
           ${m(d.cpu_busy, TH.cpu)}${m(d.memory.available_pct != null ? 100 - d.memory.available_pct : null, TH.mem)}
           <td class="n mid">${sw}</td>${m(disk ? 100 - disk.free_pct : null, TH.disk)}<td class="n mid">${disk ? esc(disk.free_gb) + ' GB' : '-'}</td>
           <td class="n mid">${g ? `${esc(g.util)}% · ${esc(g.temp_c)}°C` : '<span class="faint">-</span>'}</td><td class="n mid">${d.host.uptime_h != null ? (d.host.uptime_h / 24).toFixed(1) + ' 日' : '-'}</td>
-          <td class="n mid">${esc(d.bench?.median_ms ?? '-')} ms</td><td class="n mid"><span class="score-cell">${Charts.ring(r.score, { size: 26, stroke: 3 })}</span></td>`;
+          <td class="n mid">${d.bench ? `${esc(d.bench.median_ms)} ms` : d.benchmark_skipped ? '省略' : '-'}</td><td class="n mid"><span class="score-cell">${Charts.ring(r.score, { size: 26, stroke: 3 })}</span></td>`;
       },
     }) : UI.empty('まだ分析していません。ツールバーの「全機を分析」で始めます。')}
     ${missing.length && rows.length ? `<p class="note-line">分析結果が無いため表示していない機体: ${missing.map((n) => `${esc(n.id)}${state.results[n.id] ? '（分析できない）' : '（未分析）'}`).join('、')}</p>` : ''}`);

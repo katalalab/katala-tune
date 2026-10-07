@@ -3,10 +3,12 @@
 
 python3 標準ライブラリだけで動く。設定・プロセス・ファイルを変更しない。
 秘密・環境変数・コマンドライン引数・ファイルの中身は集めない（プロセスは実行ファイル名だけ）。
-使い方: python3 - [nonet]   nonet を渡すとネットワークとセキュリティ（netsec）を集めない（台帳の "network": false）。
+使い方: python3 - [--skip-benchmark] [nonet]
+  --skip-benchmark  ベンチマークを省く（台帳の "benchmark": false）
+  nonet             ネットワークとセキュリティ（netsec）を集めない（台帳の "network": false）
 """
 import json, os, plistlib, re, shutil, socket, statistics, subprocess, sys, time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
 
 HOME = os.path.expanduser("~")
@@ -252,13 +254,39 @@ def launchd_jobs():
     return jobs
 
 
+def exit_reason(target):
+    """launchctl print の last exit reason（起動制約で止められた OS_REASON_CODESIGNING など）。読めなければ None"""
+    for line in run(["launchctl", "print", target], timeout=4).splitlines():
+        m = re.match(r"\s*last exit reason\s*=\s*(.+)$", line, re.I)
+        if m:
+            return m.group(1).strip()[:300]
+    return None
+
+
 def launchd_failing():
     out = run(["launchctl", "list"])
     bad = []
     for line in out.splitlines()[1:]:
         parts = line.split("\t")
         if len(parts) == 3 and not parts[2].startswith("com.apple.") and parts[1] not in ("0", "-") and parts[0] == "-":
-            bad.append({"label": parts[2], "exit": parts[1]})
+            bad.append({"label": parts[2], "exit": parts[1], "reason": None})
+    # 失敗しているものだけ終了の理由を読む（多すぎるときは先頭 20 件）。1 件 4 秒の上限があるので、
+    # 4 並列で読み、全体も 10 秒で打ち切る（遅い機体で調査全体の上限 90 秒に当たって結果をまるごと失わないため）
+    uid = os.getuid()
+    targets = bad[:20]
+    if targets:
+        ex = ThreadPoolExecutor(max_workers=4)
+        futs = {ex.submit(exit_reason, f"gui/{uid}/{b['label']}"): b for b in targets}
+        done, _ = wait(futs, timeout=10)
+        for f in done:
+            try:
+                futs[f]["reason"] = f.result()
+            except Exception:
+                pass
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except TypeError:  # Python 3.8 以前
+            ex.shutdown(wait=False)
     return bad
 
 
@@ -514,7 +542,10 @@ def main():
         result["caches"] = [r for r in (f.result() for f in f_dirs) if r]
         if f_ns:
             result["netsec"] = f_ns.result()
-    result["bench"] = bench()
+    skip_benchmark = "--skip-benchmark" in sys.argv[1:]
+    result["bench"] = None if skip_benchmark else bench()
+    if skip_benchmark:
+        result["benchmark_skipped"] = True
     result["elapsed_s"] = round(time.time() - t0, 1)
     json.dump(result, sys.stdout, ensure_ascii=False)
     print()

@@ -115,8 +115,30 @@ test('台帳の "network": false で止める（ログインの記録も集め�
   assert.deepEqual(logs.sourcesOf({ os: 'windows' }), ['win_system', 'win_application', 'neonmonitor', 'win_security']);
   const src = fs.readFileSync(path.join(PROBES, 'mac_logs.py'), 'utf8');
   assert.match(src, /"nonet" not in sys\.argv/);
-  assert.match(fs.readFileSync(path.join(PROBES, 'win_logs.ps1'), 'utf8'), /if \(-not \$NoNetwork\) \{ \$result\.sources\.win_security/);
   assert.match(fs.readFileSync(path.join(PROBES, 'win_probe.ps1'), 'utf8'), /param\(\[switch\]\$NoNetwork\)/);
+  // 調査スクリプトへの印は benchmark とは別に渡す（lib/collect.js）
+  const { macProbeArgs, macSshCommand, windowsSshCommand } = require('../lib/collect');
+  assert.deepEqual(macProbeArgs(true, false), ['python3', '-', 'nonet']);
+  assert.deepEqual(macProbeArgs(false, false), ['python3', '-', '--skip-benchmark', 'nonet']);
+  assert.equal(macSshCommand(false, false).match(/ --skip-benchmark nonet/g).length, 2);
+  assert.match(windowsSshCommand(true, false), /probe\.ps1\)" -NoNetwork;/);
+  assert.doesNotMatch(windowsSshCommand(false, true), /NoNetwork/);
+});
+
+test('Windows のログオンの記録は別のスクリプトで、同じ運び方（8191 バイトまで）で送り、結果を1つにまとめる', () => {
+  const script = fs.readFileSync(path.join(PROBES, 'win_logons.ps1'));
+  const t = logs.windowsLogonsTransport({ win_security: '9007199254740991' }, script);
+  assert.ok(Buffer.byteLength(t.command) < 8191);
+  assert.match(t.bootstrap, /\[ScriptBlock\]::Create\(\$s\)\) -SecCursor 9007199254740991$/);
+  assert.match(t.command, /^printf %s [A-Za-z0-9+/=]+ \| powershell\.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand [A-Za-z0-9+/=]+$/);
+  const main = { code: 0, out: JSON.stringify({ probe: 'win_logs', sources: { win_system: { cursor: '1', rows: [] } } }), err: '' };
+  const merged = JSON.parse(logs.mergeLogons(main, { code: 0, out: `noise\n${JSON.stringify({ sources: { win_security: { cursor: '9', rows: [], note: 'no-permission' } } })}`, err: '' }).out);
+  assert.deepEqual([merged.sources.win_system.cursor, merged.sources.win_security.note], ['1', 'no-permission']);
+  // ログオンの方が失敗しても、ほかの元はそのまま取り込む
+  const failed = JSON.parse(logs.mergeLogons(main, { code: null, out: '', err: 'ssh: timeout' }).out);
+  assert.deepEqual([failed.sources.win_system.cursor, failed.sources.win_security.error], ['1', 'ssh: timeout']);
+  // 本体が失敗したら本体のまま
+  assert.equal(logs.mergeLogons({ code: 255, out: '', err: 'x' }, main).err, 'x');
 });
 
 test('新しく外から届く待ち受けだけを所見にする（前回の分析と比べる）', () => {

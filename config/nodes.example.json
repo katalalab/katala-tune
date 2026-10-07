@@ -16,6 +16,9 @@
       "expect": {
         "jobs": [
           "com.example.backup"
+        ],
+        "ignore_jobs": [
+          "com.example.check-and-exit-1"
         ]
       }
     },

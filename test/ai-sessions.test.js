@@ -10,6 +10,7 @@ const { spawnSync } = require('node:child_process');
 const PROBE = fs.readFileSync(path.join(__dirname, '..', 'probes', 'ai_sessions.py'), 'utf8');
 const PY = ['python3', 'python'].find((c) => spawnSync(c, ['--version']).status === 0);
 const SECRET = ['TOP', 'SECRET', 'PROMPT'].join('-');
+const MAX_LINE_BYTES = 1024 * 1024;
 
 function run(home, state = {}) {
   const src = PROBE.replace('KT_STATE = {}', `KT_STATE = ${JSON.stringify(state)}`);
@@ -106,4 +107,36 @@ test('AI セッション: 時間ごとの使用量・残りの量・消えたフ
   const x = out.sessions.find((s) => s.tool === 'codex');
   // Codex は累計（その時間の終わりまで）。ツール呼び出しと指示は数
   assert.deepEqual(x.hours[h('2026-10-01T01:00:00Z')], [150, 20, 50, 0, 3, 1, 1]);
+});
+
+test('AI セッション: 1MiBを超える完結行を捨てて直後の正常行を読む', { skip: !PY && 'python が無い' }, () => {
+  const { home, proj } = fixture();
+  const file = path.join(proj, 'huge.jsonl');
+  const normal = JSON.stringify({ type: 'user', sessionId: 'huge', timestamp: '2026-10-04T00:00:00Z', message: { role: 'user', content: SECRET } });
+  fs.writeFileSync(file, Buffer.concat([Buffer.alloc(MAX_LINE_BYTES + 1, 0x78), Buffer.from('\n' + normal + '\n')]));
+
+  const { out } = run(home);
+  const key = 'claude:-work-demo/huge.jsonl';
+  const session = out.sessions.find((s) => s.file === key);
+  assert.equal(session.prompts, 1, '巨大行の直後の完結した正常行を数える');
+  assert.equal(out.cursors[key], fs.statSync(file).size, '完結した巨大行は安全に読み捨てて進める');
+  assert.ok(out.errors.some((e) => e.includes('1048576 bytes; metadata unavailable')), '巨大行で欠けたメタデータを出す');
+});
+
+test('AI セッション: partial の巨大行は cursor を進めず、完結後に同じ行境界から再読する', { skip: !PY && 'python が無い' }, () => {
+  const { home, proj } = fixture();
+  const file = path.join(proj, 'partial-huge.jsonl');
+  const key = 'claude:-work-demo/partial-huge.jsonl';
+  fs.writeFileSync(file, Buffer.alloc(MAX_LINE_BYTES + 1, 0x79));
+
+  const first = run(home).out;
+  assert.equal(first.cursors[key], 0, '改行の無い巨大行の途中へ cursor を置かない');
+  assert.equal(first.truncated, true, '完結していない巨大行は次回に持ち越す');
+  fs.appendFileSync(file, '\n' + JSON.stringify({ type: 'user', sessionId: 'partial', timestamp: '2026-10-05T00:00:00Z', message: { role: 'user', content: SECRET } }) + '\n');
+
+  const next = run(home, { files: first.cursors }).out;
+  const session = next.sessions.find((s) => s.file === key);
+  assert.equal(session.prompts, 1, '完結後は巨大行を先頭から捨て、直後の正常行を数える');
+  assert.equal(next.cursors[key], fs.statSync(file).size, '再読後は完結行の境界へ進める');
+  assert.ok(next.errors.some((e) => e.includes('metadata unavailable')));
 });

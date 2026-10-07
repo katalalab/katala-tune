@@ -1,13 +1,14 @@
 //! 各機体のログを前回の続きから取り込む。読み取り専用。仕様は lib/logs.js。
 //! 取り込みは (node, source, uid) で一意なので、同じ範囲を読み直しても重複しない（失敗したら次回やり直せばよい）。
 
+use std::borrow::Cow;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use regex::Regex;
 use serde_json::{Map, Value, json};
 
-use crate::collect::{self, MAC_LOGS, RunResult, WIN_LOGS, last_json_line, ssh_args};
+use crate::collect::{self, MAC_LOGS, RunResult, WIN_LOGONS, WIN_LOGS, last_json_line, ssh_args};
 use crate::db::{LogRow, Store, now_ms};
 use crate::js::{self, Obj, get, present, string, truthy};
 use crate::nodes::Node;
@@ -37,11 +38,14 @@ static REDACT: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
 
 /// 秘密らしい値を伏せ、1,000 文字（UTF-16 単位）で切る
 pub fn redact(s: &str) -> String {
-    let mut out = s.to_string();
+    let mut out = Cow::Borrowed(s);
     for (re, rep) in REDACT.iter() {
-        out = re.replace_all(&out, *rep).into_owned();
+        // マッチしない規則では入力を借りたままにし、文字列全体のコピーを避ける。
+        if let Cow::Owned(next) = re.replace_all(&out, *rep) {
+            out = Cow::Owned(next);
+        }
     }
-    if js::len16(&out) > MAX_MESSAGE { js::slice16(&out, MAX_MESSAGE) + "…" } else { out }
+    if js::len16(&out) > MAX_MESSAGE { js::slice16(&out, MAX_MESSAGE) + "…" } else { out.into_owned() }
 }
 
 static FP: LazyLock<[Regex; 6]> = LazyLock::new(|| {
@@ -61,7 +65,9 @@ pub fn fingerprint(source: &str, provider: Option<&Value>, event_id: Option<&Val
     let reps = ["<guid>", "<hex>", "<path>", "<q>", "<n>", " "];
     let mut norm = lower;
     for (re, rep) in FP.iter().zip(reps) {
-        norm = re.replace_all(&norm, rep).into_owned();
+        if let Cow::Owned(next) = re.replace_all(&norm, rep) {
+            norm = next;
+        }
     }
     let norm = js::slice16(js::trim(&norm), 400);
     let part = |v: Option<&Value>| if present(v) { string(v) } else { String::new() };
@@ -111,7 +117,7 @@ pub fn sources_of(node: &Node) -> Vec<&'static str> {
     sources(&node.os).iter().copied().filter(|s| network || !LOGIN_SOURCES.contains(s)).collect()
 }
 
-/// `String(Number.parseInt(cursor ?? '0', 10) || 0)`
+/// `String(Number.parseInt(cursor ?? '0', 10) || 0)` のうち、安全な整数だけを渡す
 fn cursor_arg(c: Option<&Value>) -> String {
     let s = match c {
         None | Some(Value::Null) => "0".to_string(),
@@ -127,8 +133,79 @@ fn cursor_arg(c: Option<&Value>) -> String {
     if digits.is_empty() {
         return "0".into();
     }
-    let x = digits.parse::<f64>().unwrap_or(0.0) * if neg { -1.0 } else { 1.0 };
-    if x == 0.0 { "0".into() } else { js::num_str(x) }
+    let Ok(mut x) = digits.parse::<i128>() else {
+        return "0".into();
+    };
+    if neg {
+        x = -x;
+    }
+    if x.unsigned_abs() > 9_007_199_254_740_991 { "0".into() } else { x.to_string() }
+}
+
+pub(crate) fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// スクリプトを Base64 にして標準入力から ScriptBlock として実行する（固定ファイルを使わない）。
+/// コマンド行に載るので 8191 バイトを超えたら送らない（lib/logs.js の windowsScriptTransport）
+fn windows_script_transport(script: &[u8], params: &str) -> Result<(String, String), String> {
+    let script = script.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(script);
+    let payload = base64(script);
+    let bootstrap = format!(
+        "[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false);$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd()));& ([ScriptBlock]::Create($s)) {params}"
+    );
+    let utf16: Vec<u8> = bootstrap.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let command = format!("printf %s {payload} | powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {}", base64(&utf16));
+    if command.len() >= 8191 {
+        return Err("Windows remote log command exceeds 8191 bytes".into());
+    }
+    Ok((command, bootstrap))
+}
+
+fn windows_remote_transport(cursors: &Map<String, Value>, script: &[u8]) -> Result<(String, String), String> {
+    let c = |s: &str| cursor_arg(cursors.get(s));
+    windows_script_transport(script, &format!("-SysCursor {} -AppCursor {} -NeonCursor {}", c("win_system"), c("win_application"), c("neonmonitor")))
+}
+
+/// ログオンの記録（win_security）は別のスクリプト（probes/win_logons.ps1）。win_logs.ps1 と合わせると 8191 バイトに収まらないため
+fn windows_logons_transport(cursors: &Map<String, Value>, script: &[u8]) -> Result<(String, String), String> {
+    windows_script_transport(script, &format!("-SecCursor {}", cursor_arg(cursors.get("win_security"))))
+}
+
+/// 2つの取り込みの出力を1つにする（win_logs.ps1 の結果に win_security を足す）。ログオンの方が失敗したら、その元だけをエラーにする
+fn merge_logons(main: RunResult, logons: RunResult) -> RunResult {
+    let Some(mut data) = last_json_line(&main.out).filter(|d| d.get("sources").is_some_and(|v| truthy(Some(v)))) else { return main };
+    let sec = last_json_line(&logons.out).and_then(|d| d.get("sources").and_then(|s| s.get("win_security")).cloned()).filter(|v| truthy(Some(v)));
+    let sec = sec.unwrap_or_else(|| {
+        let e = if !logons.err.is_empty() {
+            logons.err.clone()
+        } else if !logons.out.is_empty() {
+            logons.out.clone()
+        } else {
+            format!("exit {}", logons.code_str())
+        };
+        json!({ "error": js::slice16_tail(js::trim(&e), 400) })
+    });
+    if let Some(Value::Object(m)) = data.get_mut("sources") {
+        m.insert("win_security".into(), sec);
+    }
+    RunResult { out: data.to_string(), ..main }
+}
+
+async fn ssh_transport(node: &Node, transport: Result<(String, String), String>, t: Duration) -> RunResult {
+    match transport {
+        Ok((remote, _)) => collect::run("ssh", &ssh_args(&node.alias, &remote), None, t).await,
+        Err(err) => RunResult { code: None, out: String::new(), err },
+    }
 }
 
 async fn fetch_logs(node: &Node, cursors: &Map<String, Value>) -> RunResult {
@@ -150,22 +227,24 @@ async fn fetch_logs(node: &Node, cursors: &Map<String, Value>) -> RunResult {
             collect::run("ssh", &ssh_args(&node.alias, &remote), Some(MAC_LOGS.as_bytes()), t).await
         };
     }
-    let params = format!(
-        "-SysCursor {} -AppCursor {} -NeonCursor {} -SecCursor {}{}",
-        c("win_system"),
-        c("win_application"),
-        c("neonmonitor"),
-        c("win_security"),
-        if network { "" } else { " -NoNetwork" }
-    );
     let t = Duration::from_secs(90);
     if node.local {
-        return collect::local::powershell_file(WIN_LOGS, &params, t).await;
+        let params = format!("-SysCursor {} -AppCursor {} -NeonCursor {}", c("win_system"), c("win_application"), c("neonmonitor"));
+        if !network {
+            return collect::local::powershell_file(WIN_LOGS, &params, t).await;
+        }
+        let sec_params = format!("-SecCursor {}", c("win_security"));
+        let (main, sec) = tokio::join!(collect::local::powershell_file(WIN_LOGS, &params, t), collect::local::powershell_file(WIN_LOGONS, &sec_params, t));
+        return merge_logons(main, sec);
     }
-    let remote = format!(
-        "mkdir -p ~/.katala-tune && cat > ~/.katala-tune/logs.ps1 && powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$(cygpath -w ~/.katala-tune/logs.ps1)\" {params}"
+    if !network {
+        return ssh_transport(node, windows_remote_transport(cursors, WIN_LOGS), t).await;
+    }
+    let (main, sec) = tokio::join!(
+        ssh_transport(node, windows_remote_transport(cursors, WIN_LOGS), t),
+        ssh_transport(node, windows_logons_transport(cursors, WIN_LOGONS), t)
     );
-    collect::run("ssh", &ssh_args(&node.alias, &remote), Some(WIN_LOGS), t).await
+    merge_logons(main, sec)
 }
 
 /// 1台分を取り込む。戻り値は `{ node_id, sources: { <source>: { inserted, fetched, dropped, note? } | { error } }, meta, error? }`
@@ -319,7 +398,9 @@ pub fn log_findings(db: &Store, node_id: &str, now: i64) -> rusqlite::Result<Vec
             json!({ "node_id": node_id, "q": "Resource" }),
         );
     }
-    let disk = sum(&|r| ["disk", "Ntfs", "stornvme", "storahci", "volmgr"].iter().any(|p| prov(r, p)) && r.level != "info");
+    // volmgr の 161・162 は BSOD の後のクラッシュダンプ作成の記録（ディスクの故障ではない。停止そのものは安定性で数える）
+    let dump_record = |r: &crate::db::LogCount| prov(r, "volmgr") && (ev(r, "161") || ev(r, "162"));
+    let disk = sum(&|r| ["disk", "Ntfs", "stornvme", "storahci", "volmgr"].iter().any(|p| prov(r, p)) && r.level != "info" && !dump_record(r));
     if disk > 0 {
         push(
             "log-disk",
@@ -542,5 +623,47 @@ mod tests {
         assert_eq!(cursor_arg(Some(&Value::from(" 12abc"))), "12");
         assert_eq!(cursor_arg(Some(&Value::from("abc"))), "0");
         assert_eq!(cursor_arg(Some(&Value::from("-5"))), "-5");
+    }
+
+    #[test]
+    fn windows_remote_logs_use_base64_stdin_without_fixed_file() {
+        let mut cursors = Map::new();
+        cursors.insert("win_system".into(), Value::from("42; Write-Error bad"));
+        cursors.insert("win_application".into(), Value::from(" 7tail"));
+        cursors.insert("neonmonitor".into(), Value::from("not-a-number"));
+        let (command, bootstrap) = windows_remote_transport(&cursors, b"\xef\xbb\xbfparam([long]$SysCursor)\n").unwrap();
+        assert!(!command.contains("katala-tune") && !command.contains("logs.ps1") && !command.contains("-File") && !command.contains("cygpath"));
+        assert!(command.starts_with("printf %s "));
+        assert!(command.contains(" | powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand "));
+        assert!(command.len() < 8191);
+        assert!(bootstrap.contains("FromBase64String([Console]::In.ReadToEnd())"));
+        assert!(bootstrap.contains("[ScriptBlock]::Create($s)"));
+        assert!(bootstrap.ends_with("-SysCursor 42 -AppCursor 7 -NeonCursor 0"));
+        let mut max_cursors = Map::new();
+        for source in ["win_system", "win_application", "neonmonitor"] {
+            max_cursors.insert(source.into(), Value::from("9007199254740991"));
+        }
+        assert!(windows_remote_transport(&max_cursors, WIN_LOGS).unwrap().0.len() < 8191);
+        assert!(windows_remote_transport(&Map::new(), &[0; 6000]).is_err());
+        // ログオンの記録は別のスクリプトで、同じ運び方・同じ上限
+        max_cursors.insert("win_security".into(), Value::from("9007199254740991"));
+        let (command, bootstrap) = windows_logons_transport(&max_cursors, WIN_LOGONS).unwrap();
+        assert!(command.len() < 8191);
+        assert!(bootstrap.ends_with("-SecCursor 9007199254740991"));
+    }
+
+    #[test]
+    fn logons_are_merged_into_the_log_output() {
+        let r = |out: &str, err: &str| RunResult { code: Some(0), out: out.into(), err: err.into() };
+        let main = r("{\"probe\":\"win_logs\",\"sources\":{\"win_system\":{\"cursor\":\"1\",\"rows\":[]}}}", "");
+        let m = merge_logons(main.clone(), r("noise\n{\"sources\":{\"win_security\":{\"cursor\":\"9\",\"rows\":[],\"note\":\"no-permission\"}}}", ""));
+        let d = last_json_line(&m.out).unwrap();
+        assert_eq!((d["sources"]["win_system"]["cursor"].clone(), d["sources"]["win_security"]["note"].clone()), (json!("1"), json!("no-permission")));
+        // ログオンの方が失敗しても、ほかの元はそのまま取り込む
+        let f = last_json_line(&merge_logons(main.clone(), r("", "ssh: timeout")).out).unwrap();
+        assert_eq!((f["sources"]["win_system"]["cursor"].clone(), f["sources"]["win_security"]["error"].clone()), (json!("1"), json!("ssh: timeout")));
+        // 本体が失敗したら本体のまま（全部の元のエラーになる）
+        let bad = r("", "exit 255");
+        assert_eq!(merge_logons(bad.clone(), r("{}", "")).err, "exit 255");
     }
 }

@@ -123,14 +123,19 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
 
     // 定期処理（launchd / タスクスケジューラ）
     let jobs = arr(get(d, "jobs"));
-    let bad = failing_jobs(jobs);
+    // 意図どおり非0で終わるジョブ（台帳の expect.ignore_jobs。ラベルかタスク名）は失敗に数えない
+    let ignore = arr(get(get(c, "expect"), "ignore_jobs"));
+    let ignored = |v: Option<&Value>| ignore.iter().any(|x| js::strict_eq(Some(x), v));
+    let failing = failing_jobs(jobs);
+    let bad: Vec<&Value> = failing.iter().copied().filter(|j| !ignored(j.get("id")) && !ignored(j.get("name"))).collect();
+    let known = if failing.len() > bad.len() { format!("（既知 {} 件を除く）", failing.len() - bad.len()) } else { String::new() };
     let (st, detail) = if jobs.is_empty() {
         ("unknown", "取得できない（古い調査スクリプト）".to_string())
     } else if bad.is_empty() {
-        ("ok", format!("{} 件、前回失敗なし", jobs.len()))
+        ("ok", format!("{} 件、前回失敗なし{known}", jobs.len()))
     } else {
         let names = js::join(&bad.iter().take(4).map(|j| j.get("name").cloned().unwrap_or(Value::Null)).collect::<Vec<_>>(), ", ");
-        ("warn", format!("{} 件が前回失敗: {names}{}", bad.len(), if bad.len() > 4 { " ほか" } else { "" }))
+        ("warn", format!("{} 件が前回失敗: {names}{}{known}", bad.len(), if bad.len() > 4 { " ほか" } else { "" }))
     };
     out.add("jobs", "定期処理", st, detail);
 

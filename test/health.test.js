@@ -51,3 +51,16 @@ test('アプリの状態: 台帳・DB・自動スキャン', () => {
   assert.equal(st.scheduler, 'warn');
   assert.equal(appChecks({ now, configError: 'JSON の誤り', dbCheck: 'ok', dbBytes: 0, scheduler: {} })[0].status, 'fail');
 });
+
+test('定期処理: 台帳の expect.ignore_jobs（意図どおり非0で終わるもの）は失敗に数えず、既知の件数を根拠に書く', () => {
+  const byId = (data, expect) => Object.fromEntries(nodeChecks({ id: 'pc' }, snap(data), [], { now, expect }).map((x) => [x.id, x]));
+  assert.equal(byId(win).jobs.status, 'warn');
+  const j = byId(win, { ignore_jobs: ['bad'] }).jobs;
+  assert.equal(j.status, 'ok');
+  assert.match(j.detail, /前回失敗なし（既知 1 件を除く）/);
+  // id（\bad）でも名前（bad）でも外せる。外していないものは残る
+  const two = { ...win, jobs: [...win.jobs, { kind: 'schtask', id: '\\bad2', name: 'bad2', state: 'ready', last_result: 2 }] };
+  const c = byId(two, { ignore_jobs: ['\\bad'] }).jobs;
+  assert.equal(c.status, 'warn');
+  assert.equal(c.detail, '1 件が前回失敗: bad2（既知 1 件を除く）');
+});

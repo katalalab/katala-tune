@@ -56,6 +56,7 @@ fn on_menu(app: &AppHandle, id: &str) {
             let _ = e.with_db(|d| d.set_meta("schedule", &serde_json::Value::Object(s)));
             e.compute_checks(false, true);
         }
+        "update" => crate::update::from_menu(app),
         "quit" => app.exit(0),
         _ => {}
     }
@@ -87,6 +88,7 @@ pub fn update(app: &AppHandle) {
                 &MenuItem::with_id(app, "status", "状態を開く", true, None::<&str>)?,
                 &MenuItem::with_id(app, "probe", "今すぐ分析", !e.is_probing(), None::<&str>)?,
                 &MenuItem::with_id(app, "logs", "ログを取り込む", !e.is_syncing(), None::<&str>)?,
+                &MenuItem::with_id(app, "update", "更新を確認…", !crate::update::is_busy(), None::<&str>)?,
                 &PredefinedMenuItem::separator(app)?,
                 &CheckMenuItem::with_id(
                     app,

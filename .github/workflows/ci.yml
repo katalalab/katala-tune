@@ -8,10 +8,12 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
-    # private の間は動かさない（hosted runner の課金を止めているため）。公開すると動く
-    if: ${{ !github.event.repository.private }}
     strategy:
       fail-fast: false
       matrix:
@@ -30,11 +32,11 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      - run: npm run version:check
       - run: npm run oss-check
 
   # Rust 側（crates/tune-core・crates/tune-cli・src-tauri）。test のジョブ名と必須チェックは変えない
   rust:
-    if: ${{ !github.event.repository.private }}
     strategy:
       fail-fast: false
       matrix:
@@ -83,3 +85,6 @@ jobs:
           else
             cargo test --workspace --locked
           fi
+      - name: Tauri アプリのリンクを検証
+        if: runner.os != 'Linux'
+        run: cargo build --package katala-tune --locked

@@ -22,8 +22,11 @@ pub const MAC_LOGS: &str = include_str!("../../../probes/mac_logs.py");
 /// PS 5.1 のため BOM 付き ASCII。バイトのまま渡す
 pub const WIN_PROBE: &[u8] = include_bytes!("../../../probes/win_probe.ps1");
 pub const WIN_LOGS: &[u8] = include_bytes!("../../../probes/win_logs.ps1");
+/// ログオンの記録（win_security）。win_logs.ps1 と合わせると取り込みのコマンド行（8191 バイト）に収まらないので別にする
+pub const WIN_LOGONS: &[u8] = include_bytes!("../../../probes/win_logons.ps1");
 
-pub const SSH_OPTS: [&str; 6] = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=10"];
+pub const SSH_OPTS: [&str; 11] =
+    ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=10", "-o", "ControlMaster=no", "-o", "ControlPath=none"];
 pub const BENCH_PY: &str = "import time,json,statistics as s\nr=[]\nfor _ in range(5):\n t=time.perf_counter();sum(i*i for i in range(3000000));r.append(round((time.perf_counter()-t)*1000,1))\nprint(json.dumps({'runs_ms':r,'median_ms':s.median(r)}))";
 pub const BENCH_MARK: &str = "@@KATALA_TUNE_BENCH@@";
 
@@ -198,48 +201,66 @@ pub fn ssh_args(alias: &str, remote: &str) -> Vec<String> {
     a
 }
 
-/// network = false（台帳の "network": false）なら、ネットワークとセキュリティ（netsec）を集めない
-fn windows_ssh_command(network: bool) -> String {
+/// 調査スクリプトへの印。benchmark = false（台帳の "benchmark": false）でベンチマークを省き、
+/// network = false（台帳の "network": false）でネットワークとセキュリティ（netsec）を集めない（lib/collect.js と同じ）
+fn mac_probe_flags(benchmark: bool, network: bool) -> Vec<String> {
+    let mut f = Vec::new();
+    if !benchmark {
+        f.push("--skip-benchmark".to_string());
+    }
+    if !network {
+        f.push("nonet".to_string());
+    }
+    f
+}
+
+fn mac_probe_args(benchmark: bool, network: bool) -> Vec<String> {
+    let mut args = vec!["python3".to_string(), "-".to_string()];
+    args.extend(mac_probe_flags(benchmark, network));
+    args
+}
+
+fn mac_ssh_command(benchmark: bool, network: bool) -> String {
+    let suffix: String = mac_probe_flags(benchmark, network).iter().map(|a| format!(" {a}")).collect();
+    format!("command -v python3 >/dev/null && exec python3 -{suffix} || exec /usr/bin/python3 -{suffix}")
+}
+
+fn windows_ssh_command(benchmark: bool, network: bool) -> String {
     let bench = BENCH_PY.replace('\'', "\"");
-    [
+    let mut parts = vec![
         "mkdir -p ~/.katala-tune && cat > ~/.katala-tune/probe.ps1 &&".to_string(),
         format!(
             "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$(cygpath -w ~/.katala-tune/probe.ps1)\"{};",
             if network { "" } else { " -NoNetwork" }
         ),
-        format!("echo {BENCH_MARK};"),
-        format!("PY=$(command -v python3 || command -v python); [ -n \"$PY\" ] && \"$PY\" -c '{bench}'"),
-    ]
-    .join(" ")
+    ];
+    if benchmark {
+        parts.extend([format!("echo {BENCH_MARK};"), format!("PY=$(command -v python3 || command -v python); [ -n \"$PY\" ] && \"$PY\" -c '{bench}'")]);
+    }
+    parts.join(" ")
 }
 
 /// 1台を調べる。戻り値は `{ node_id, ok, data | error, wall_s, at }`（collect.js と同じ形）
 pub async fn probe_node(node: &Node) -> Value {
     let started = Instant::now();
     let network = crate::netsec::enabled(&node.raw);
+    let benchmark = node.get("benchmark") != Some(&Value::Bool(false));
     let res = if node.is_mac() {
         if node.local {
-            let mut a: Vec<String> = vec!["python3".into(), "-".into()];
-            if !network {
-                a.push("nonet".into());
-            }
-            run("/usr/bin/env", &a, Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
+            run("/usr/bin/env", &mac_probe_args(benchmark, network), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
         } else {
-            let a = if network { "" } else { " nonet" };
-            run(
-                "ssh",
-                &ssh_args(&node.alias, &format!("command -v python3 >/dev/null && exec python3 -{a} || exec /usr/bin/python3 -{a}")),
-                Some(MAC_PROBE.as_bytes()),
-                Duration::from_secs(90),
-            )
-            .await
+            run("ssh", &ssh_args(&node.alias, &mac_ssh_command(benchmark, network)), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
         }
     } else if node.local {
         let p = local::powershell_file(WIN_PROBE, if network { "" } else { "-NoNetwork" }, Duration::from_secs(120)).await;
-        let b = local::python(BENCH_PY, Duration::from_secs(60)).await;
-        RunResult { out: format!("{}\n{BENCH_MARK}\n{}", p.out, b.out), ..p }
+        if benchmark {
+            let b = local::python(BENCH_PY, Duration::from_secs(60)).await;
+            RunResult { out: format!("{}\n{BENCH_MARK}\n{}", p.out, b.out), ..p }
+        } else {
+            p
+        }
     } else {
-        run("ssh", &ssh_args(&node.alias, &windows_ssh_command(network)), Some(WIN_PROBE), Duration::from_secs(120)).await
+        run("ssh", &ssh_args(&node.alias, &windows_ssh_command(benchmark, network)), Some(WIN_PROBE), Duration::from_secs(120)).await
     };
     let wall_s = started.elapsed().as_secs_f64();
     let (main, bench) = match res.out.split_once(BENCH_MARK) {
@@ -261,6 +282,10 @@ pub async fn probe_node(node: &Node) -> Value {
         && let Some(bj) = last_json_line(b)
     {
         m.insert("bench".into(), bj);
+    }
+    if !benchmark {
+        data["bench"] = Value::Null;
+        data["benchmark_skipped"] = Value::Bool(true);
     }
     if !crate::netsec::peers_enabled(&node.raw) {
         crate::netsec::drop_peers(&mut data);
@@ -329,9 +354,43 @@ mod tests {
     }
 
     #[test]
+    fn disabled_benchmark_never_sends_fixed_computation() {
+        let enabled = windows_ssh_command(true, true);
+        assert!(enabled.contains(BENCH_MARK));
+        assert!(enabled.contains("3000000"));
+        let disabled = windows_ssh_command(false, true);
+        assert!(disabled.contains("probe.ps1"));
+        assert!(!disabled.contains(BENCH_MARK));
+        assert!(!disabled.contains("3000000"));
+        assert!(!disabled.contains("command -v python"));
+        assert_eq!(mac_probe_args(false, true), vec!["python3", "-", "--skip-benchmark"]);
+        assert_eq!(mac_ssh_command(false, true).matches("--skip-benchmark").count(), 2);
+        assert!(!mac_ssh_command(true, true).contains("--skip-benchmark"));
+    }
+
+    #[test]
+    fn network_false_skips_netsec_independently_of_benchmark() {
+        assert_eq!(mac_probe_args(true, false), vec!["python3", "-", "nonet"]);
+        assert_eq!(mac_probe_args(false, false), vec!["python3", "-", "--skip-benchmark", "nonet"]);
+        assert_eq!(mac_ssh_command(false, false).matches(" --skip-benchmark nonet").count(), 2);
+        assert!(!mac_ssh_command(true, true).contains("nonet"));
+        assert!(windows_ssh_command(true, false).contains("probe.ps1)\" -NoNetwork;"));
+        assert!(windows_ssh_command(true, false).contains(BENCH_MARK));
+        assert!(!windows_ssh_command(false, true).contains("-NoNetwork"));
+    }
+
+    #[test]
     fn probes_are_embedded() {
         assert!(MAC_PROBE.contains("def "));
         assert_eq!(&WIN_PROBE[..3], &[0xEF, 0xBB, 0xBF], "PS 5.1 のため BOM 付き");
+        assert_eq!(&WIN_LOGONS[..3], &[0xEF, 0xBB, 0xBF], "PS 5.1 のため BOM 付き");
+    }
+
+    #[test]
+    fn ssh_does_not_reuse_controlpersist_master() {
+        assert!(SSH_OPTS.contains(&"-T"));
+        assert!(SSH_OPTS.contains(&"ControlMaster=no"));
+        assert!(SSH_OPTS.contains(&"ControlPath=none"));
     }
 
     #[tokio::test]
