@@ -23,6 +23,26 @@ test('版: 書き換えは版の行だけで、読み直すと新しい版にな
   }
 });
 
+test('版: Cargo.lock は純LF・CRLFそれぞれの改行を保って3 crateを更新する', () => {
+  const h = FILES['Cargo.lock'];
+  const source = read('Cargo.lock');
+  const expectedBefore = JSON.parse(read('package.json')).version;
+  const pureLf = source.replace(/\r?\n/g, '\n');
+  const crlf = pureLf.replace(/\n/g, '\r\n');
+  for (const [label, before, eol] of [['LF', pureLf, '\n'], ['CRLF', crlf, '\r\n']]) {
+    assert.equal(h.get(before), expectedBefore, `${label}: 変換前も3 crateで同じ版を読む`);
+    const after = h.set(before, '9.8.7-rc.1');
+
+    assert.equal(h.get(after), '9.8.7-rc.1', `${label}: 書換え後の版を読む`);
+    for (const crate of ['katala-tune', 'tune-core', 'tune-cli']) {
+      const escapedEol = eol === '\n' ? '\\n' : '\\r\\n';
+      assert.match(after, new RegExp(`${escapedEol}name = "${crate}"${escapedEol}version = "9\\.8\\.7-rc\\.1"`), `${label}: ${crate}`);
+    }
+    assert.equal(after.replaceAll(eol, '').match(/[\r\n]/), null, `${label}: EOL以外のCR/LFを残さない`);
+    assert.equal(after.includes('\r\r\n'), false, `${label}: CRCRLFを作らない`);
+  }
+});
+
 test('版: SemVer でない形（先頭の 0・空のプレリリース識別子）は受け付けない', () => {
   const { main, SEMVER } = require('../scripts/version');
   for (const ok of ['0.4.0', '1.2.3-alpha.1', '1.0.0+build.5']) assert.ok(SEMVER.test(ok), ok);

@@ -29,8 +29,8 @@ const FILES = {
     set: (t, v) => t.replace(/(\[workspace\.package\][^[]*?\nversion = )"[^"]*"/, `$1"${v}"`),
   },
   'Cargo.lock': {
-    get: (t) => { const vs = new Set(CRATES.map((c) => new RegExp(`\\nname = "${c}"\\nversion = "([^"]*)"`).exec(t)?.[1])); return vs.size === 1 ? [...vs][0] : [...vs].join(' / '); },
-    set: (t, v) => CRATES.reduce((acc, c) => acc.replace(new RegExp(`(\\nname = "${c}"\\nversion = )"[^"]*"`), `$1"${v}"`), t),
+    get: (t) => { const vs = new Set(CRATES.map((c) => new RegExp(`\\r?\\nname = "${c}"\\r?\\nversion = "([^"]*)"`).exec(t)?.[1])); return vs.size === 1 ? [...vs][0] : [...vs].join(' / '); },
+    set: (t, v) => CRATES.reduce((acc, c) => acc.replace(new RegExp(`(\\r?\\nname = "${c}"\\r?\\nversion = )"[^"]*"`), `$1"${v}"`), t),
   },
   'src-tauri/tauri.conf.json': {
     get: (t) => JSON.parse(t).version,
