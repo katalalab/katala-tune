@@ -4,10 +4,26 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { redact, fingerprint, normalize, logFindings } = require('../lib/logs');
+const { redact, fingerprint, normalize, logFindings, windowsRemoteTransport } = require('../lib/logs');
 const { openDb } = require('../lib/db');
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'kt-test-'));
+
+test('Windows リモートログは固定ファイルを使わず Base64 stdin から実行する', () => {
+  const script = Buffer.from('\uFEFFparam([long]$SysCursor)\n[Console]::OutputEncoding = [Text.Encoding]::UTF8\n', 'utf8');
+  const transport = windowsRemoteTransport({ win_system: '42; Write-Error bad', win_application: ' 7tail', neonmonitor: 'not-a-number' }, script);
+  assert.doesNotMatch(transport.command, /katala-tune|logs\.ps1|-File|cygpath/);
+  assert.match(transport.command, /^printf %s [A-Za-z0-9+/=]+ \| powershell\.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand [A-Za-z0-9+/=]+$/);
+  assert.ok(Buffer.byteLength(transport.command) < 8191);
+  assert.match(transport.bootstrap, /FromBase64String\(\[Console\]::In\.ReadToEnd\(\)\)/);
+  assert.match(transport.bootstrap, /\[ScriptBlock\]::Create\(\$s\)/);
+  assert.match(transport.bootstrap, /-SysCursor 42 -AppCursor 7 -NeonCursor 0$/);
+  assert.equal(transport.input, undefined);
+  const fullScript = fs.readFileSync(path.join(__dirname, '..', 'probes', 'win_logs.ps1'));
+  const maxCursors = { win_system: '9007199254740991', win_application: '9007199254740991', neonmonitor: '9007199254740991' };
+  assert.ok(Buffer.byteLength(windowsRemoteTransport(maxCursors, fullScript).command) < 8191);
+  assert.throws(() => windowsRemoteTransport({}, Buffer.alloc(6000)), /8191/);
+});
 
 test('秘密らしい値を伏せる', () => {
   // 偽の値は実行時に組み立てる（ソースに秘密らしい文字列を置かない。gitleaks が正しく反応するため）
