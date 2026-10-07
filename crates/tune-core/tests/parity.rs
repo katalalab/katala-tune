@@ -147,6 +147,15 @@ fn jobs(r: &mut Rng, win: bool) -> Value {
                     ("state", Some(json!(r.pick(&states).to_string()))),
                     ("scope", if win { None } else { Some(json!(*r.pick(&["user", "system"]))) }),
                     ("last_result", mb!(r, lr)),
+                    (
+                        "plist",
+                        match r.below(3) {
+                            _ if win => None,
+                            0 => Some(json!(format!("/Users/me/Library/LaunchAgents/com.example.job{i}.plist"))),
+                            1 => Some(json!("/Library/LaunchDaemons/x.plist")),
+                            _ => None,
+                        },
+                    ),
                 ])
             })
             .collect(),
@@ -258,7 +267,21 @@ fn snapshot(r: &mut Rng) -> Value {
         let colima: Vec<Value> = (0..r.below(3))
             .map(|i| json!({ "name": format!("vm{i}"), "status": *r.pick(&["Running", "Stopped"]), "cpus": r.below(12) + 1, "memory_gb": r.num(64.0) }))
             .collect();
+        // 失敗している launchd ジョブと終了の理由（起動制約 CODESIGNING かどうか）
+        let failing: Vec<Value> = (0..r.below(4))
+            .map(|_| {
+                let label = *r.pick(&["com.example.job0", "com.example.job1", "com.example.job2", "com.example.zzz", "bad label;x"]);
+                let reason = match r.below(4) {
+                    0 => Some(json!("OS_REASON_CODESIGNING | Launch Constraint Violation")),
+                    1 => Some(json!("OS_REASON_EXIT")),
+                    2 => Some(Value::Null),
+                    _ => None,
+                };
+                obj(vec![("label", Some(json!(label))), ("exit", Some(json!(*r.pick(&["78", "1"])))), ("reason", reason)])
+            })
+            .collect();
         s.extend([
+            ("launchd_failing", Some(Value::Array(failing))),
             ("power", Some(obj(vec![("cpu_speed_limit", mb!(r, json!(*r.pick(&[100, 80, 55])))), ("low_power_mode", mb!(r, json!(r.chance(0.3))))]))),
             (
                 "containers",
@@ -479,7 +502,8 @@ fn rules_health_logs_actions_match_js() {
                 "expect",
                 if r.chance(0.6) {
                     Some(
-                        json!({ "services": ["svc-a", "svc-b", "missing"], "jobs": ["\\job0", "com.example.job1", "nope"], "processes": ["Slack", "ollama", "node"] }),
+                        json!({ "services": ["svc-a", "svc-b", "missing"], "jobs": ["\\job0", "com.example.job1", "nope"], "processes": ["Slack", "ollama", "node"],
+                            "ignore_jobs": if r.chance(0.5) { json!(["\\job0", "job1", "com.example.job2"]) } else { json!("not-an-array") } }),
                     )
                 } else {
                     None
@@ -641,7 +665,11 @@ fn rules_health_logs_actions_match_js() {
 
     // ログ由来の所見（DB を通す）
     let mut lf_in = Vec::new();
-    let kinds: [(&str, &str, Option<&str>, &str); 14] = [
+    let kinds: [(&str, &str, Option<&str>, &str); 17] = [
+        // BSOD 後のクラッシュダンプ作成（161・162）はディスクのエラーに数えない。46 は数える
+        ("win_system", "volmgr", Some("161"), "error"),
+        ("win_system", "volmgr", Some("162"), "warn"),
+        ("win_system", "volmgr", Some("46"), "error"),
         ("win_system", "Microsoft-Windows-WHEA-Logger", Some("17"), "warn"),
         ("win_system", "Display", Some("4101"), "warn"),
         ("win_system", "nvlddmkm", Some("14"), "error"),
