@@ -1,0 +1,120 @@
+{
+ "now": "@s0m",
+ "summary": {
+  "nodes": 6,
+  "online": 5,
+  "attention": 3
+ },
+ "nodes": [
+  {
+   "node_id": "studio-mac",
+   "state": "online",
+   "last_seen": "@s-1m",
+   "metrics": {
+    "cpu": 31,
+    "mem": 44,
+    "disk": 65
+   },
+   "failing": 0,
+   "running_containers": 3,
+   "agent_processes": 33,
+   "os": "macos"
+  },
+  {
+   "node_id": "air-m3",
+   "state": "online",
+   "last_seen": "@s-2m",
+   "metrics": {
+    "cpu": 58,
+    "mem": 90,
+    "disk": 92
+   },
+   "failing": 0,
+   "running_containers": 0,
+   "agent_processes": 4,
+   "os": "macos"
+  },
+  {
+   "node_id": "build-mini",
+   "state": "online",
+   "last_seen": "@s-1m",
+   "metrics": {
+    "cpu": 12,
+    "mem": 38,
+    "disk": 38
+   },
+   "failing": 1,
+   "running_containers": 1,
+   "agent_processes": 2,
+   "os": "macos"
+  },
+  {
+   "node_id": "gpu-tower",
+   "state": "online",
+   "last_seen": "@s-1m",
+   "metrics": {
+    "cpu": 40,
+    "mem": 76,
+    "disk": 78
+   },
+   "failing": 1,
+   "running_containers": 4,
+   "agent_processes": 6,
+   "os": "windows"
+  },
+  {
+   "node_id": "media-pc",
+   "state": "online",
+   "last_seen": "@s-3m",
+   "metrics": {
+    "cpu": 21,
+    "mem": 60,
+    "disk": 87
+   },
+   "failing": 0,
+   "running_containers": 0,
+   "agent_processes": 0,
+   "os": "windows"
+  },
+  {
+   "node_id": "family-pc",
+   "state": "offline",
+   "last_seen": "@s-130m",
+   "metrics": {
+    "cpu": null,
+    "mem": null,
+    "disk": 87
+   },
+   "failing": 0,
+   "running_containers": 0,
+   "agent_processes": 0,
+   "os": "windows"
+  }
+ ],
+ "attention": [
+  {
+   "node_id": "gpu-tower",
+   "severity": "error",
+   "type": "job",
+   "subject": "NightlyBackup",
+   "state": "failed",
+   "detail": "exit 1 が 3 回続いている"
+  },
+  {
+   "node_id": "build-mini",
+   "severity": "warn",
+   "type": "job",
+   "subject": "com.example.cleanup",
+   "state": "failed",
+   "detail": "exit 78"
+  },
+  {
+   "node_id": "family-pc",
+   "severity": "warn",
+   "type": "node",
+   "subject": "heartbeat",
+   "state": "stale",
+   "detail": "最終受信が 2 時間前"
+  }
+ ]
+}

@@ -1,0 +1,102 @@
+{
+ "nodes": [
+  {
+   "id": "studio-mac",
+   "alias": "studio-mac",
+   "os": "macos",
+   "role": "メインの Mac",
+   "note": null,
+   "shared": false,
+   "local": true,
+   "expect": {
+    "jobs": [
+     "com.example.backup"
+    ],
+    "processes": [
+     "ollama"
+    ]
+   }
+  },
+  {
+   "id": "air-m3",
+   "alias": "air-m3",
+   "os": "macos",
+   "role": "持ち歩き用",
+   "note": null,
+   "shared": false,
+   "local": false,
+   "expect": null
+  },
+  {
+   "id": "build-mini",
+   "alias": "build-mini",
+   "os": "macos",
+   "role": "ビルド用 Mac mini",
+   "note": null,
+   "shared": false,
+   "local": false,
+   "expect": {
+    "jobs": [
+     "com.example.nightly-build"
+    ]
+   }
+  },
+  {
+   "id": "gpu-tower",
+   "alias": "gpu-tower",
+   "os": "windows",
+   "role": "GPU 機",
+   "note": "9月から予期しない再起動が続いている。メモリを1枚ずつ外して切り分け中",
+   "shared": false,
+   "local": false,
+   "expect": {
+    "services": [
+     "Tailscale",
+     "beszel-agent"
+    ],
+    "jobs": [
+     "\\NightlyBackup"
+    ],
+    "processes": [
+     "ollama"
+    ]
+   }
+  },
+  {
+   "id": "media-pc",
+   "alias": "media-pc",
+   "os": "windows",
+   "role": "録画・配信用",
+   "note": null,
+   "shared": false,
+   "local": false,
+   "expect": {
+    "services": [
+     "Tailscale"
+    ]
+   }
+  },
+  {
+   "id": "family-pc",
+   "alias": "family-pc",
+   "os": "windows",
+   "role": "共用 PC",
+   "note": "家族と共用。ここからは提案だけで、変更は実行しない",
+   "shared": true,
+   "local": false,
+   "expect": null
+  }
+ ],
+ "error": null,
+ "file": "~/.config/katala-tune/nodes.json",
+ "dataDir": "~/Library/Application Support/Katala Tune/data",
+ "platform": null,
+ "fleet": true,
+ "example": false,
+ "schedule": {
+  "enabled": true,
+  "probe_minutes": 60,
+  "logs_minutes": 15
+ },
+ "accent": null
+}
