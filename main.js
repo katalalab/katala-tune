@@ -14,6 +14,7 @@ const logs = require('./lib/logs');
 const health = require('./lib/health');
 const inventory = require('./lib/inventory');
 const dogu = require('./lib/dogu');
+const netsec = require('./lib/netsec');
 
 const IS_MAC = process.platform === 'darwin';
 const IS_WIN = process.platform === 'win32';
@@ -120,6 +121,8 @@ async function runProbe(ids, { auto = false } = {}) {
     const targets = cfg.nodes.filter((n) => !ids?.length || ids.includes(n.id));
     const results = await probeAll(targets, (r) => {
       const prev = db.lastSnapshots(r.node_id, 1)[0];
+      // ネットワークとセキュリティ: 正規化して前回の待ち受けと比べ、宛先の一覧は snapshot に残さない（増減と接続先の記録は Tauri 版だけ）
+      if (r.ok && r.data?.netsec) r.data.netsec = netsec.prepare(r.data.netsec, r.data.probe, prev?.data?.netsec, r.at);
       const full = enrich(r, prev?.data);
       if (full.ok) {
         delete lastProbeError[r.node_id];

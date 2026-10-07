@@ -337,6 +337,8 @@ impl Engine {
         let full = {
             let db = lock(&self.db);
             let prev = db.last_snapshots(&node_id, 1).ok().and_then(|v| v.into_iter().next());
+            // ネットワークとセキュリティ: 正規化・前回の待ち受けとの比較・常駐の増減・初めての接続先（宛先は DB にだけ置く。netsec.rs）
+            let r = &crate::netsec::ingest(&db, cfg.node(&node_id), r, prev.as_ref().map(|p| &p.data));
             let mut full = self.enrich(&db, &cfg, r, prev.as_ref().map(|p| &p.data));
             if js::truthy(full.get("ok")) {
                 let findings: Vec<Value> = js::arr(full.get("findings")).iter().map(|f| json!({ "id": f.get("id"), "severity": f.get("severity") })).collect();

@@ -198,11 +198,15 @@ pub fn ssh_args(alias: &str, remote: &str) -> Vec<String> {
     a
 }
 
-fn windows_ssh_command() -> String {
+/// network = false（台帳の "network": false）なら、ネットワークとセキュリティ（netsec）を集めない
+fn windows_ssh_command(network: bool) -> String {
     let bench = BENCH_PY.replace('\'', "\"");
     [
         "mkdir -p ~/.katala-tune && cat > ~/.katala-tune/probe.ps1 &&".to_string(),
-        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$(cygpath -w ~/.katala-tune/probe.ps1)\";".to_string(),
+        format!(
+            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$(cygpath -w ~/.katala-tune/probe.ps1)\"{};",
+            if network { "" } else { " -NoNetwork" }
+        ),
         format!("echo {BENCH_MARK};"),
         format!("PY=$(command -v python3 || command -v python); [ -n \"$PY\" ] && \"$PY\" -c '{bench}'"),
     ]
@@ -212,24 +216,30 @@ fn windows_ssh_command() -> String {
 /// 1台を調べる。戻り値は `{ node_id, ok, data | error, wall_s, at }`（collect.js と同じ形）
 pub async fn probe_node(node: &Node) -> Value {
     let started = Instant::now();
+    let network = crate::netsec::enabled(&node.raw);
     let res = if node.is_mac() {
         if node.local {
-            run("/usr/bin/env", &["python3".into(), "-".into()], Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
+            let mut a: Vec<String> = vec!["python3".into(), "-".into()];
+            if !network {
+                a.push("nonet".into());
+            }
+            run("/usr/bin/env", &a, Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
         } else {
+            let a = if network { "" } else { " nonet" };
             run(
                 "ssh",
-                &ssh_args(&node.alias, "command -v python3 >/dev/null && exec python3 - || exec /usr/bin/python3 -"),
+                &ssh_args(&node.alias, &format!("command -v python3 >/dev/null && exec python3 -{a} || exec /usr/bin/python3 -{a}")),
                 Some(MAC_PROBE.as_bytes()),
                 Duration::from_secs(90),
             )
             .await
         }
     } else if node.local {
-        let p = local::powershell_file(WIN_PROBE, "", Duration::from_secs(120)).await;
+        let p = local::powershell_file(WIN_PROBE, if network { "" } else { "-NoNetwork" }, Duration::from_secs(120)).await;
         let b = local::python(BENCH_PY, Duration::from_secs(60)).await;
         RunResult { out: format!("{}\n{BENCH_MARK}\n{}", p.out, b.out), ..p }
     } else {
-        run("ssh", &ssh_args(&node.alias, &windows_ssh_command()), Some(WIN_PROBE), Duration::from_secs(120)).await
+        run("ssh", &ssh_args(&node.alias, &windows_ssh_command(network)), Some(WIN_PROBE), Duration::from_secs(120)).await
     };
     let wall_s = started.elapsed().as_secs_f64();
     let (main, bench) = match res.out.split_once(BENCH_MARK) {

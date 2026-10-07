@@ -12,6 +12,7 @@ Repo-specific delta only. The global baseline is inherited.
 - 変更する操作は `lib/actions.js` の許可リストに足し、`plan()` で引数を検証し、テストを書く。main.js の確認ダイアログと直前の台帳読み直しを通さずに実行しない。安全の型は docs/safety.md。
 - `probes/*.ps1` は ASCII のみ・BOM 付き（PS 5.1 対策）。日本語は `\uXXXX` で書く。Windows の ssh 既定シェルは Git Bash で、`/xxx` 引数はパスに書き換えられる（`-xxx` で渡す）。PowerShell 本体にシングルクォートを入れない。
 - PS 5.1 の `[DateTime]'1970-01-01T00:00:00Z'` は現地時刻として読まれる。epoch は `[DateTimeOffset]::new($d.ToUniversalTime()).ToUnixTimeMilliseconds()` で出す。
+- ネットワークとセキュリティ（probes の netsec・`lib/netsec.js`・tune-core の netsec）は読み取り専用で、遮断・設定の変更を入れない。宛先の IP は snapshot に残さず（`strip`）、tune-core の `net_peers`（30 日）にだけ置く。判定を変えたら JS と Rust の両方を直し、`tests/parity_netsec.rs` で一致を確かめる。
 - 状態（lib/health.js）は根拠を detail に書き、画面からの問い合わせでは更新通知を送らない（往復が止まらなくなる）。
 - Windows の CPU は瞬間値なので、暴走判定は起動からの平均（avg_core）と両方で見る。macOS のディスクは実効の空き（自動で空く分を含む）で判定する。
 - 機体台帳は個人情報なのでリポジトリに置かない（`~/.config/katala-tune/nodes.json`）。見本は config/nodes.example.json。
