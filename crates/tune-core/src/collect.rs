@@ -23,7 +23,8 @@ pub const MAC_LOGS: &str = include_str!("../../../probes/mac_logs.py");
 pub const WIN_PROBE: &[u8] = include_bytes!("../../../probes/win_probe.ps1");
 pub const WIN_LOGS: &[u8] = include_bytes!("../../../probes/win_logs.ps1");
 
-pub const SSH_OPTS: [&str; 6] = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=10"];
+pub const SSH_OPTS: [&str; 11] =
+    ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=10", "-o", "ControlMaster=no", "-o", "ControlPath=none"];
 pub const BENCH_PY: &str = "import time,json,statistics as s\nr=[]\nfor _ in range(5):\n t=time.perf_counter();sum(i*i for i in range(3000000));r.append(round((time.perf_counter()-t)*1000,1))\nprint(json.dumps({'runs_ms':r,'median_ms':s.median(r)}))";
 pub const BENCH_MARK: &str = "@@KATALA_TUNE_BENCH@@";
 
@@ -319,6 +320,13 @@ mod tests {
     fn probes_are_embedded() {
         assert!(MAC_PROBE.contains("def "));
         assert_eq!(&WIN_PROBE[..3], &[0xEF, 0xBB, 0xBF], "PS 5.1 のため BOM 付き");
+    }
+
+    #[test]
+    fn ssh_does_not_reuse_controlpersist_master() {
+        assert!(SSH_OPTS.contains(&"-T"));
+        assert!(SSH_OPTS.contains(&"ControlMaster=no"));
+        assert!(SSH_OPTS.contains(&"ControlPath=none"));
     }
 
     #[tokio::test]
