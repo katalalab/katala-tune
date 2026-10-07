@@ -2,8 +2,11 @@
 const COMMANDS: &[&str] = &[
     "config",
     "last",
+    "probe",
     "history",
+    "fleet",
     "actions_log",
+    "logs_sync",
     "logs_query",
     "logs_signatures",
     "logs_cursors",

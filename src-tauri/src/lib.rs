@@ -50,8 +50,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::config,
             commands::last,
+            commands::probe,
             commands::history,
+            commands::fleet,
             commands::actions_log,
+            commands::logs_sync,
             commands::logs_query,
             commands::logs_signatures,
             commands::logs_cursors,

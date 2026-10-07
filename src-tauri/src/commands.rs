@@ -35,6 +35,21 @@ pub async fn last(e: E<'_>) -> R {
     e.last().map(Value::Array)
 }
 
+/// 全機（ids が空）を分析したら、続けてログも取り込む（main.js と同じ）
+#[tauri::command]
+pub async fn probe(e: E<'_>, ids: Option<Vec<String>>) -> R {
+    let e = e.inner().clone();
+    let all = ids.as_ref().is_none_or(Vec::is_empty);
+    let r = e.run_probe(ids, false).await;
+    if all && r.get("busy").is_none() {
+        tauri::async_runtime::spawn(async move {
+            let nodes = e.config().nodes;
+            e.sync_logs(nodes).await;
+        });
+    }
+    Ok(r)
+}
+
 #[tauri::command]
 pub async fn history(e: E<'_>, id: Option<Value>) -> R {
     let id = id.map(|v| js::string(Some(&v))).unwrap_or_default();
@@ -42,8 +57,20 @@ pub async fn history(e: E<'_>, id: Option<Value>) -> R {
 }
 
 #[tauri::command]
+pub async fn fleet(e: E<'_>) -> R {
+    Ok(e.fleet().await)
+}
+
+#[tauri::command]
 pub async fn actions_log(e: E<'_>) -> R {
     e.with_db(|d| d.actions(100)).map(Value::Array)
+}
+
+#[tauri::command]
+pub async fn logs_sync(e: E<'_>, ids: Option<Vec<String>>) -> R {
+    let e = e.inner().clone();
+    let nodes = e.reload_config().nodes.into_iter().filter(|n| ids.as_ref().is_none_or(|i| i.is_empty() || i.contains(&n.id))).collect();
+    Ok(e.sync_logs(nodes).await)
 }
 
 /// 全文検索。検索式の誤りは `{ error }` で返す（main.js と同じ）。件数の上限は Rust 側で守る
