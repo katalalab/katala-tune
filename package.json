@@ -22,7 +22,8 @@
     "inventory": "node scripts/inventory.js",
     "ui-preview": "electron scripts/ui-preview.js",
     "tauri:dev": "cargo tauri dev",
-    "tauri:build": "cargo tauri build"
+    "tauri:build": "cargo tauri build",
+    "version:set": "node scripts/version.js"
   },
   "devDependencies": {
     "@electron/fuses": "^2.1.3",

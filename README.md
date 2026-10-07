@@ -76,6 +76,8 @@ npm run oss-check   # 公開前の点検（-- --history で全コミットとメ
 
 ログは、中央の DB へ後でそのまま送れる表の形で保存している。
 
+Tauri 版のリリース（タグ `v*` で macOS / Windows をビルドして GitHub Releases の下書きに置く）と自動更新（確認して承認したときだけ、署名を確かめてから入れる）は [docs/release.md](docs/release.md)。版は `npm run version:set -- <版>` でそろえて上げる。
+
 ## ライセンス
 
 MIT（[LICENSE](LICENSE)）

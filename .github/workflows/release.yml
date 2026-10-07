@@ -1,0 +1,142 @@
+# タグ v* で Tauri 版をビルドし、GitHub Releases に下書きとして置く（docs/release.md）。
+# 公開（下書きを外す）は操作者が中身を確かめてから行う。公開すると latest.json が自動更新の対象になる。
+# 第三者の action は使わない（GitHub 公式の checkout・upload-artifact・download-artifact だけ。ツールは runner の rustup・cargo・gh・jq）
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Apple Silicon と Intel の両方で動く1つの .app（updater は darwin-aarch64 / darwin-x86_64 の両方にこれを渡す）
+          - name: macos-universal
+            os: macos-latest
+            target: universal-apple-darwin
+            rust_targets: aarch64-apple-darwin x86_64-apple-darwin
+            bundles: app,dmg
+          - name: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rust_targets: x86_64-pc-windows-msvc
+            bundles: nsis
+    runs-on: ${{ matrix.os }}
+    # 署名の秘密鍵はこの環境の secret に置く（タグ v* だけに絞り、必要なら承認を挟める。docs/release.md）
+    environment: release
+    permissions:
+      contents: read # ソースを読むだけ
+    env:
+      RUST_TOOLCHAIN: '1.99.0'
+      TAURI_CLI_VERSION: '2.12.1'
+      TARGET: ${{ matrix.target }}
+      RUST_TARGETS: ${{ matrix.rust_targets }}
+      BUNDLES: ${{ matrix.bundles }}
+      NAME: ${{ matrix.name }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: タグ・版・公開鍵を確かめる
+        shell: bash
+        run: |
+          # タグ（v0.4.0）と package.json・Cargo・tauri.conf.json の版が同じこと
+          node scripts/version.js --check "${TAG#v}"
+          # 公開鍵が仮の値のままなら止める（docs/release.md の手順で本番の公開鍵に替える）
+          if grep -q 'REPLACE_WITH_TAURI_SIGNING_PUBLIC_KEY' src-tauri/tauri.conf.json; then
+            echo "::error::src-tauri/tauri.conf.json の plugins.updater.pubkey が仮の値のまま"
+            exit 1
+          fi
+      - name: Rust と tauri-cli
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          # shellcheck disable=SC2086 # 複数のターゲットを空白で区切って渡す
+          rustup target add $RUST_TARGETS
+          cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
+      - name: ビルドと更新用の署名
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::secret TAURI_SIGNING_PRIVATE_KEY が無い（docs/release.md）"
+            exit 1
+          fi
+          cargo tauri build --ci --target "$TARGET" --bundles "$BUNDLES" --config src-tauri/tauri.release.conf.json
+      - name: 配る物を集める（名前から空白をなくす）
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${TAG#v}"
+          b="target/$TARGET/release/bundle"
+          mkdir -p dist-release
+          if [ "$RUNNER_OS" = macOS ]; then
+            cp "$b/macos/Katala Tune.app.tar.gz" "dist-release/KatalaTune_${v}_universal.app.tar.gz"
+            cp "$b/macos/Katala Tune.app.tar.gz.sig" "dist-release/KatalaTune_${v}_universal.app.tar.gz.sig"
+            cp "$b/dmg/Katala Tune_${v}_universal.dmg" "dist-release/KatalaTune_${v}_universal.dmg"
+          else
+            cp "$b/nsis/Katala Tune_${v}_x64-setup.exe" "dist-release/KatalaTune_${v}_x64-setup.exe"
+            cp "$b/nsis/Katala Tune_${v}_x64-setup.exe.sig" "dist-release/KatalaTune_${v}_x64-setup.exe.sig"
+          fi
+          ls -l dist-release
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.name }}
+          path: dist-release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: release（下書き）
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 下書きのリリースを作り、ビルドしたものと latest.json を置くため
+    env:
+      TAG: ${{ github.ref_name }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: latest.json（自動更新の知らせ）を組み立てる
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${TAG#v}"
+          base="https://github.com/$REPO/releases/download/$TAG"
+          mac="KatalaTune_${v}_universal.app.tar.gz"
+          win="KatalaTune_${v}_x64-setup.exe"
+          jq -n \
+            --arg version "$v" \
+            --arg notes "Katala Tune $TAG（変更点: https://github.com/$REPO/releases/tag/$TAG）" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg mac_url "$base/$mac" --rawfile mac_sig "dist/$mac.sig" \
+            --arg win_url "$base/$win" --rawfile win_sig "dist/$win.sig" \
+            '{version: $version, notes: $notes, pub_date: $date, platforms: {
+              "darwin-aarch64": {url: $mac_url, signature: ($mac_sig | rtrimstr("\n"))},
+              "darwin-x86_64": {url: $mac_url, signature: ($mac_sig | rtrimstr("\n"))},
+              "windows-x86_64": {url: $win_url, signature: ($win_sig | rtrimstr("\n"))}
+            }}' > dist/latest.json
+          cat dist/latest.json
+      - name: 下書きのリリースに置く
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" dist/* --repo "$REPO" --draft --verify-tag --title "Katala Tune $TAG" --generate-notes
