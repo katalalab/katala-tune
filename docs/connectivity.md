@@ -176,7 +176,7 @@ snow は `std` の feature を入れない（入れると ring まで入る。al
 
 ## 操作者が決めること
 
-- 中継を利用者の Cloudflare に置く方針でよいか（作者は共有中継を運営しない）
+- ~~中継を利用者の Cloudflare に置く方針でよいか~~ → 2026-10-07 に決定（利用者の Cloudflare。作者は共有中継を運営しない）
 - NAT 越えと中継を iroh（QUIC）で組むか、WebRTC（ICE ＋ Cloudflare の TURN）で組むか。PoC の遅延の結果で決める
 - 安い共有経路として n0 の有料 relay を案内するか
 - リモート画面やファイル転送（月数十 GB）を最初の範囲に入れるか
