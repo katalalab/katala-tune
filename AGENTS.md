@@ -17,7 +17,7 @@ Repo-specific delta only. The global baseline is inherited.
 - 機体台帳は個人情報なのでリポジトリに置かない（`~/.config/katala-tune/nodes.json`）。見本は config/nodes.example.json。
 - 依存を増やさない（保存は node:sqlite、画面は素の JS）。開発時だけの依存は Electron 公式（electron・@electron/packager・@electron/fuses）に限る。
 - 実行時の Node は Electron 内蔵のもの（Electron 44 = Node 24）。node:sqlite に触る変更は `ELECTRON_RUN_AS_NODE=1 ./node_modules/.bin/electron --test test/*.test.js` でも確かめる（パッケージ後のアプリは fuse で RunAsNode を閉じている）。
-- 公開を前提に、個人・環境の情報（機体名・ホスト名・ユーザー名・tailnet・op:// 参照）をコード・テスト・コミットメッセージに書かない。`npm run oss-check` が通ること。
+- 公開を前提に、個人・環境の情報（機体名・ホスト名・ユーザー名・tailnet・op:// 参照）をコード・テスト・コミットメッセージに書かない。`npm run oss-check` と `npm run oss-check -- --history`（HEAD から辿れるコミット。全部の枝は `--all-refs`）が通ること。
 
 ## Verification
 
