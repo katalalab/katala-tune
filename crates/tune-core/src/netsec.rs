@@ -595,11 +595,11 @@ pub fn filter_check_rows(rows: Vec<Value>, nodes: &[Value]) -> Vec<Value> {
     let by_id: HashMap<String, &Value> = nodes.iter().map(|n| (st(n.get("id")).to_string(), n)).collect();
     rows.into_iter()
         .filter(|r| {
-            let Some(node) = by_id.get(st(r.get("scope"))) else { return true };
             let id = r.get("id").and_then(Value::as_str).unwrap_or_else(|| st(r.get("check_id")));
             if !id.starts_with("sec-") {
                 return true;
             }
+            let Some(node) = by_id.get(st(r.get("scope"))) else { return false };
             enabled(node) && (id != "sec-login" || logins_enabled(node)) && (id != "sec-peers" || peers_enabled(node))
         })
         .collect()
@@ -1485,6 +1485,19 @@ mod tests {
         ];
         let got: Vec<Value> = filter_log_signatures(signatures, &nodes).into_iter().map(|v| v["sample"].clone()).collect();
         assert_eq!(got, vec![json!("login 198.51.100.1"), json!("disk")]);
+    }
+
+    #[test]
+    fn removed_nodes_do_not_expose_security_history() {
+        let rows = vec![
+            json!({ "scope": "removed", "id": "sec-login", "detail": "192.0.2.1" }),
+            json!({ "scope": "removed", "check_id": "sec-peers", "detail": "192.0.2.2" }),
+            json!({ "scope": "_app", "id": "sec-login", "detail": "192.0.2.3" }),
+            json!({ "scope": "removed", "id": "memory" }),
+            json!({ "scope": "_app", "id": "database" }),
+            json!({ "scope": "keep", "id": "sec-listen" }),
+        ];
+        assert_eq!(filter_check_rows(rows.clone(), &[json!({ "id": "keep" })]), rows[3..].to_vec());
     }
 
     #[test]

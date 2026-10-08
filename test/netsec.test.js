@@ -341,3 +341,16 @@ test('現在の台帳で通信を無効にした機体は旧 snapshot とログ�
     { id: 2, scope: 'private', check_id: 'memory', detail: 'ok' },
   ], nodes), [{ id: 2, scope: 'private', check_id: 'memory', detail: 'ok' }]);
 });
+
+
+test('台帳から消した機体の security 履歴を返さず一般所見は保つ', () => {
+  const rows = [
+    { scope: 'removed', id: 'sec-login', detail: '192.0.2.1' },
+    { scope: 'removed', check_id: 'sec-peers', detail: '192.0.2.2' },
+    { scope: '_app', id: 'sec-login', detail: '192.0.2.3' },
+    { scope: 'removed', id: 'memory' },
+    { scope: '_app', id: 'database' },
+    { scope: 'keep', id: 'sec-listen' },
+  ];
+  assert.deepEqual(netsec.filterCheckRows(rows, [{ id: 'keep' }]), rows.slice(3));
+});
