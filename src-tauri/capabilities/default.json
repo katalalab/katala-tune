@@ -37,6 +37,7 @@
     "allow-ai-sessions",
     "allow-ai-sync",
     "allow-live-start",
-    "allow-live-stop"
+    "allow-live-stop",
+    "allow-netsec"
   ]
 }

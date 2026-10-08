@@ -8,7 +8,7 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::{Map, Value, json};
 
-use crate::collect::{self, MAC_LOGS, RunResult, WIN_LOGS, last_json_line, ssh_args};
+use crate::collect::{self, MAC_LOGS, RunResult, WIN_LOGONS, WIN_LOGS, last_json_line, ssh_args};
 use crate::db::{LogRow, Store, now_ms};
 use crate::js::{self, Obj, get, present, string, truthy};
 use crate::nodes::Node;
@@ -99,12 +99,22 @@ pub fn normalize(source: &str, rows: &[Value]) -> Vec<LogRow> {
         .collect()
 }
 
+/// 取り込み元。mac_auth・win_security はログインの記録（provider に送り元のアドレスを入れる。netsec.rs・docs/observability.md の 6）
 pub fn sources(os: &str) -> &'static [&'static str] {
     match os {
-        "macos" => &["mac_diag", "mac_kernel"],
-        "windows" => &["win_system", "win_application", "neonmonitor"],
+        "macos" => &["mac_diag", "mac_kernel", "mac_auth"],
+        "windows" => &["win_system", "win_application", "neonmonitor", "win_security"],
         _ => &[],
     }
+}
+
+/// ログインの記録の取り込み元
+pub const LOGIN_SOURCES: [&str; 2] = ["mac_auth", "win_security"];
+
+/// 機体から取り込む元（lib/logs.js の sourcesOf）。台帳で `"network": false` の機体からは、ログインの記録（送り元のアドレス）も集めない
+pub fn sources_of(node: &Node) -> Vec<&'static str> {
+    let logins = crate::netsec::logins_enabled(&node.raw);
+    sources(&node.os).iter().copied().filter(|s| logins || !LOGIN_SOURCES.contains(s)).collect()
 }
 
 /// `String(Number.parseInt(cursor ?? '0', 10) || 0)` のうち、安全な整数だけを渡す
@@ -145,9 +155,9 @@ pub(crate) fn base64(bytes: &[u8]) -> String {
     out
 }
 
-fn windows_remote_transport(cursors: &Map<String, Value>, script: &[u8]) -> Result<(String, String), String> {
-    let c = |s: &str| cursor_arg(cursors.get(s));
-    let params = format!("-SysCursor {} -AppCursor {} -NeonCursor {}", c("win_system"), c("win_application"), c("neonmonitor"));
+/// スクリプトを Base64 にして標準入力から ScriptBlock として実行する（固定ファイルを使わない）。
+/// コマンド行に載るので 8191 バイトを超えたら送らない（lib/logs.js の windowsScriptTransport）
+fn windows_script_transport(script: &[u8], params: &str) -> Result<(String, String), String> {
     let script = script.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(script);
     let payload = base64(script);
     let bootstrap = format!(
@@ -161,10 +171,51 @@ fn windows_remote_transport(cursors: &Map<String, Value>, script: &[u8]) -> Resu
     Ok((command, bootstrap))
 }
 
+fn windows_remote_transport(cursors: &Map<String, Value>, script: &[u8]) -> Result<(String, String), String> {
+    let c = |s: &str| cursor_arg(cursors.get(s));
+    windows_script_transport(script, &format!("-SysCursor {} -AppCursor {} -NeonCursor {}", c("win_system"), c("win_application"), c("neonmonitor")))
+}
+
+/// ログオンの記録（win_security）は別のスクリプト（probes/win_logons.ps1）。win_logs.ps1 と合わせると 8191 バイトに収まらないため
+fn windows_logons_transport(cursors: &Map<String, Value>, script: &[u8]) -> Result<(String, String), String> {
+    windows_script_transport(script, &format!("-SecCursor {}", cursor_arg(cursors.get("win_security"))))
+}
+
+/// 2つの取り込みの出力を1つにする（win_logs.ps1 の結果に win_security を足す）。ログオンの方が失敗したら、その元だけをエラーにする
+fn merge_logons(main: RunResult, logons: RunResult) -> RunResult {
+    let Some(mut data) = last_json_line(&main.out).filter(|d| d.get("sources").is_some_and(|v| truthy(Some(v)))) else { return main };
+    let sec = last_json_line(&logons.out).and_then(|d| d.get("sources").and_then(|s| s.get("win_security")).cloned()).filter(|v| truthy(Some(v)));
+    let sec = sec.unwrap_or_else(|| {
+        let e = if !logons.err.is_empty() {
+            logons.err.clone()
+        } else if !logons.out.is_empty() {
+            logons.out.clone()
+        } else {
+            format!("exit {}", logons.code_str())
+        };
+        json!({ "error": js::slice16_tail(js::trim(&e), 400) })
+    });
+    if let Some(Value::Object(m)) = data.get_mut("sources") {
+        m.insert("win_security".into(), sec);
+    }
+    RunResult { out: data.to_string(), ..main }
+}
+
+async fn ssh_transport(node: &Node, transport: Result<(String, String), String>, t: Duration) -> RunResult {
+    match transport {
+        Ok((remote, _)) => collect::run("ssh", &ssh_args(&node.alias, &remote), None, t).await,
+        Err(err) => RunResult { code: None, out: String::new(), err },
+    }
+}
+
 async fn fetch_logs(node: &Node, cursors: &Map<String, Value>) -> RunResult {
     let c = |s: &str| cursor_arg(cursors.get(s));
+    let logins = crate::netsec::logins_enabled(&node.raw);
     if node.is_mac() {
-        let args = [c("mac_diag"), c("mac_kernel")];
+        let mut args = vec![c("mac_diag"), c("mac_kernel"), c("mac_auth")];
+        if !logins {
+            args.push("nonet".into());
+        }
         let t = Duration::from_secs(60);
         return if node.local {
             let mut a = vec!["python3".to_string(), "-".to_string()];
@@ -176,24 +227,32 @@ async fn fetch_logs(node: &Node, cursors: &Map<String, Value>) -> RunResult {
             collect::run("ssh", &ssh_args(&node.alias, &remote), Some(MAC_LOGS.as_bytes()), t).await
         };
     }
-    let params = format!("-SysCursor {} -AppCursor {} -NeonCursor {}", c("win_system"), c("win_application"), c("neonmonitor"));
     let t = Duration::from_secs(90);
     if node.local {
-        return collect::local::powershell_file(WIN_LOGS, &params, t).await;
+        let params = format!("-SysCursor {} -AppCursor {} -NeonCursor {}", c("win_system"), c("win_application"), c("neonmonitor"));
+        if !logins {
+            return collect::local::powershell_file(WIN_LOGS, &params, t).await;
+        }
+        let sec_params = format!("-SecCursor {}", c("win_security"));
+        let (main, sec) = tokio::join!(collect::local::powershell_file(WIN_LOGS, &params, t), collect::local::powershell_file(WIN_LOGONS, &sec_params, t));
+        return merge_logons(main, sec);
     }
-    let (remote, _) = match windows_remote_transport(cursors, WIN_LOGS) {
-        Ok(transport) => transport,
-        Err(err) => return RunResult { code: None, out: String::new(), err },
-    };
-    collect::run("ssh", &ssh_args(&node.alias, &remote), None, t).await
+    if !logins {
+        return ssh_transport(node, windows_remote_transport(cursors, WIN_LOGS), t).await;
+    }
+    let (main, sec) = tokio::join!(
+        ssh_transport(node, windows_remote_transport(cursors, WIN_LOGS), t),
+        ssh_transport(node, windows_logons_transport(cursors, WIN_LOGONS), t)
+    );
+    merge_logons(main, sec)
 }
 
 /// 1台分を取り込む。戻り値は `{ node_id, sources: { <source>: { inserted, fetched, dropped, note? } | { error } }, meta, error? }`
 /// db はロックの道具（取り込み中もほかの読み出しを止めない）
 pub async fn sync_node(db: &(impl DbAccess + ?Sized), node: &Node) -> Value {
-    let srcs = sources(&node.os);
+    let srcs = sources_of(node);
     let mut cursors = Map::new();
-    for s in srcs {
+    for s in &srcs {
         let c = db.with(|d| d.cursor(&node.id, s)).ok().flatten();
         cursors.insert((*s).into(), c.and_then(|c| c.get("cursor").cloned()).unwrap_or(Value::Null));
     }
@@ -210,12 +269,12 @@ pub async fn sync_node(db: &(impl DbAccess + ?Sized), node: &Node) -> Value {
             format!("exit {}", res.code_str())
         };
         let err = js::slice16_tail(js::trim(&e), 400);
-        for s in srcs {
+        for s in &srcs {
             let _ = db.with(|d| d.cursor_error(&node.id, s, &err));
         }
         return json!({ "node_id": node.id, "sources": {}, "meta": {}, "error": err });
     };
-    for s in srcs {
+    for s in &srcs {
         let src = data_sources.get(*s);
         let src_err = get(src, "error");
         if !truthy(src) || truthy(src_err) {
@@ -231,16 +290,27 @@ pub async fn sync_node(db: &(impl DbAccess + ?Sized), node: &Node) -> Value {
         };
         let rows = normalize(s, &raw_rows);
         let dropped = js::or(get(src, "dropped"), Some(&Value::from(0))).cloned().unwrap_or(Value::from(0));
+        let note_error = source_error(src);
         let inserted = db.with(|d| {
             let n = d.insert_logs(&node.id, s, &rows, now_ms())?;
-            d.cursor_ok(&node.id, s, js::nullish(get(src, "cursor"), None), rows.len() as i64, &dropped)?;
+            if let Some(e) = &note_error {
+                d.cursor_error(&node.id, s, e)?;
+            } else {
+                d.cursor_ok(&node.id, s, js::nullish(get(src, "cursor"), None), rows.len() as i64, &dropped)?;
+            }
             Ok(n)
         });
         match inserted {
             Ok(n) => {
                 sources_out.insert(
                     (*s).into(),
-                    Obj::new().set("fetched", rows.len()).set("inserted", n).set("dropped", dropped).opt("note", get(src, "note").cloned()).build(),
+                    Obj::new()
+                        .set("fetched", rows.len())
+                        .set("inserted", n)
+                        .set("dropped", dropped)
+                        .opt("note", get(src, "note").cloned())
+                        .opt("error", note_error.map(Value::from))
+                        .build(),
                 );
             }
             Err(e) => {
@@ -254,6 +324,10 @@ pub async fn sync_node(db: &(impl DbAccess + ?Sized), node: &Node) -> Value {
         }
     }
     json!({ "node_id": node.id, "sources": sources_out, "meta": meta })
+}
+
+fn source_error(src: Option<&Value>) -> Option<String> {
+    js::is_str(get(src, "note"), "no-permission").then(|| "no-permission".into())
 }
 
 /// DB を短く借りる道具（アプリでは Mutex 越し、テストでは直接）
@@ -436,6 +510,10 @@ pub fn log_findings(db: &Store, node_id: &str, now: i64) -> rusqlite::Result<Vec
             json!({ "node_id": node_id, "q": q }),
         );
     }
+    for f in login_findings(db, node_id, now)? {
+        let s = |k: &str| js::string(f.get(k));
+        push(&s("id"), &s("severity"), &s("category"), s("title"), &s("detail"), &s("advice"), f["log_query"].clone());
+    }
     let dropped = db.dropped_total(node_id)?;
     if dropped >= 1000 {
         push(
@@ -447,6 +525,77 @@ pub fn log_findings(db: &Store, node_id: &str, now: i64) -> rusqlite::Result<Vec
             "上の「同じエラーの繰り返し」を直すと収まる。",
             json!({ "node_id": node_id }),
         );
+    }
+    Ok(out)
+}
+
+/// ログインの記録（mac_auth・win_security）から（lib/logs.js の loginFindings）。失敗は24時間、外部のアドレスからの成功は7日で見る
+fn login_findings(db: &Store, node_id: &str, now: i64) -> rusqlite::Result<Vec<Value>> {
+    use crate::db::LogCount;
+    use crate::netsec::{LOGIN_CRIT, LOGIN_WARN, is_public};
+    let by_source = |rows: &[&LogCount]| -> Vec<(String, i64)> {
+        let mut order: Vec<String> = Vec::new();
+        let mut m: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for r in rows {
+            let p = r.provider.clone().unwrap_or_default();
+            if !m.contains_key(&p) {
+                order.push(p.clone());
+            }
+            *m.entry(p).or_insert(0) += r.n;
+        }
+        let mut v: Vec<(String, i64)> = order.into_iter().map(|p| (p.clone(), m[&p])).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.encode_utf16().cmp(b.0.encode_utf16())));
+        v
+    };
+    let list = |src: &[(String, i64)]| {
+        let s = src.iter().take(5).map(|(a, k)| format!("{} ×{k}", if a.is_empty() { "-" } else { a })).collect::<Vec<_>>().join("、");
+        format!("{s}{}", if src.len() > 5 { " ほか" } else { "" })
+    };
+    let mut out = Vec::new();
+    let day = db.log_counts(node_id, now - 86_400_000)?;
+    let fails: Vec<&LogCount> = day
+        .iter()
+        .filter(|r| (r.source == "mac_auth" || r.source == "win_security") && matches!(r.event_id.as_deref(), Some("4625") | Some("ssh-fail")))
+        .collect();
+    let n: i64 = fails.iter().map(|r| r.n).sum();
+    if n > 0 {
+        let src = by_source(&fails);
+        let public: i64 = src.iter().filter(|(a, _)| is_public(Some(&Value::from(a.as_str())))).map(|(_, k)| k).sum();
+        let sev = if n >= LOGIN_CRIT {
+            Some("critical")
+        } else if n >= LOGIN_WARN {
+            Some("warn")
+        } else if public > 0 {
+            Some("info")
+        } else {
+            None
+        };
+        if let Some(sev) = sev {
+            let source = if fails.iter().any(|r| r.source == "win_security") { "win_security" } else { "mac_auth" };
+            out.push(json!({
+                "id": "log-login-fail", "severity": sev, "category": "security",
+                "title": format!("ログインの失敗が24時間で {n} 件（送り元 {} か所{}）", src.len(), if public > 0 { format!("、うち外部のアドレスから {public} 件") } else { String::new() }),
+                "detail": list(&src),
+                "advice": "総当たりの疑い。外から届く口（ssh・リモートデスクトップ）を閉じるか、Tailscale など内側の経路だけで受ける。パスワードでのログインを止め、鍵だけにする。この画面からは変更しない。",
+                "log_query": { "node_id": node_id, "source": source },
+            }));
+        }
+    }
+    let week = db.log_counts(node_id, now - 7 * 86_400_000)?;
+    let oks: Vec<&LogCount> = week
+        .iter()
+        .filter(|r| r.source == "win_security" && r.event_id.as_deref() == Some("4624") && is_public(r.provider.as_deref().map(Value::from).as_ref()))
+        .collect();
+    let k: i64 = oks.iter().map(|r| r.n).sum();
+    if k > 0 {
+        let src = by_source(&oks);
+        out.push(json!({
+            "id": "log-login-public", "severity": "warn", "category": "security",
+            "title": format!("外部のアドレスからのログイン成功が7日で {k} 件"),
+            "detail": list(&src),
+            "advice": "自分の操作か確かめる。覚えが無ければパスワードを変え、外から届く口を閉じる。",
+            "log_query": { "node_id": node_id, "source": "win_security" },
+        }));
     }
     Ok(out)
 }
@@ -470,6 +619,14 @@ mod tests {
         assert!(s.contains("<github-token>"));
         assert!(s.contains("<aws-key>"));
         assert!(js::len16(&redact(&"a".repeat(5000))) <= 1001);
+    }
+
+    #[test]
+    fn shared_nodes_do_not_collect_login_metadata_without_opt_in() {
+        let shared = Node::from_value(&json!({ "id": "shared", "os": "windows", "shared": true }), "host");
+        assert_eq!(sources_of(&shared), vec!["win_system", "win_application", "neonmonitor"]);
+        let opted_in = Node::from_value(&json!({ "id": "shared", "os": "windows", "shared": true, "network_logins": true }), "host");
+        assert_eq!(sources_of(&opted_in), vec!["win_system", "win_application", "neonmonitor", "win_security"]);
     }
 
     #[test]
@@ -511,5 +668,31 @@ mod tests {
         }
         assert!(windows_remote_transport(&max_cursors, WIN_LOGS).unwrap().0.len() < 8191);
         assert!(windows_remote_transport(&Map::new(), &[0; 6000]).is_err());
+        // ログオンの記録は別のスクリプトで、同じ運び方・同じ上限
+        max_cursors.insert("win_security".into(), Value::from("9007199254740991"));
+        let (command, bootstrap) = windows_logons_transport(&max_cursors, WIN_LOGONS).unwrap();
+        assert!(command.len() < 8191);
+        assert!(bootstrap.ends_with("-SecCursor 9007199254740991"));
+    }
+
+    #[test]
+    fn logons_are_merged_into_the_log_output() {
+        let r = |out: &str, err: &str| RunResult { code: Some(0), out: out.into(), err: err.into() };
+        let main = r("{\"probe\":\"win_logs\",\"sources\":{\"win_system\":{\"cursor\":\"1\",\"rows\":[]}}}", "");
+        let m = merge_logons(main.clone(), r("noise\n{\"sources\":{\"win_security\":{\"cursor\":\"9\",\"rows\":[],\"note\":\"no-permission\"}}}", ""));
+        let d = last_json_line(&m.out).unwrap();
+        assert_eq!((d["sources"]["win_system"]["cursor"].clone(), d["sources"]["win_security"]["note"].clone()), (json!("1"), json!("no-permission")));
+        // ログオンの方が失敗しても、ほかの元はそのまま取り込む
+        let f = last_json_line(&merge_logons(main.clone(), r("", "ssh: timeout")).out).unwrap();
+        assert_eq!((f["sources"]["win_system"]["cursor"].clone(), f["sources"]["win_security"]["error"].clone()), (json!("1"), json!("ssh: timeout")));
+        // 本体が失敗したら本体のまま（全部の元のエラーになる）
+        let bad = r("", "exit 255");
+        assert_eq!(merge_logons(bad.clone(), r("{}", "")).err, "exit 255");
+    }
+
+    #[test]
+    fn no_permission_note_is_a_cursor_error() {
+        assert_eq!(source_error(Some(&json!({ "rows": [], "note": "no-permission" }))), Some("no-permission".into()));
+        assert_eq!(source_error(Some(&json!({ "rows": [], "note": "ok" }))), None);
     }
 }

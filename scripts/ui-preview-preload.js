@@ -188,7 +188,28 @@ contextBridge.exposeInMainWorld('tune', {
   aiSessions: async (f) => (params.get('electron') ? { unsupported: true, rows: [], total: 0, offset: 0, limit: 0 } : clone(aiSessions(f || {}))),
   aiSync: async () => { await wait(1200); return { ms: 1200, results: aiData.nodes.filter((n) => n.enabled !== false).map((n) => ({ node_id: n.id, ok: !n.no_python, sessions: 3, truncated: !!n.truncated })) }; },
   onAiSynced: () => {},
+  // ネットワークとセキュリティ（Tauri 版だけ。?electron=1 では Electron 版と同じく関数が無い扱い）
+  ...(params.get('electron') ? {} : { netsec: async () => clone(netsecView()) }),
 });
+
+// tune-core の netsec_view と同じ形を、架空の調査結果から lib/netsec.js で作る
+const netsecLib = require('../lib/netsec');
+const secData = load('security.json');
+function netsecView() {
+  const nodes = config.nodes.map((n) => {
+    const f = secData.nodes[n.id];
+    if (!f) return { id: n.id, os: n.os, shared: !!n.shared, enabled: n.network !== false, at: null, netsec: null, checks: [] };
+    const probe = n.os === 'windows' ? 'windows' : 'mac';
+    const at = NOW - 12 * 60000;
+    const prev = f.prev ? netsecLib.normalize(f.prev, probe) : null;
+    const ns = { ...netsecLib.strip(netsecLib.annotate(netsecLib.normalize(f.raw, probe), prev, at)), persist_count: f.persist_count, persist_changes: f.persist_changes, peers: f.peers };
+    if (f.persist_baseline) ns.persist_baseline = f.persist_baseline;
+    const findings = [...netsecLib.findings(ns, n), ...(f.login || [])];
+    const cursors = f.cursor ? [{ node_id: n.id, source: probe === 'windows' ? 'win_security' : 'mac_auth', last_ok_at: at, last_error: null }] : [];
+    return { id: n.id, os: n.os, shared: !!n.shared, enabled: n.network !== false, at, netsec: ns, checks: netsecLib.checks(ns, findings, { cursors }, n) };
+  });
+  return { nodes, events: secData.events, peers: secData.peers, logins: secData.logins, learn_days: netsecLib.LEARN_DAYS, keep_days: netsecLib.PEER_KEEP_DAYS, login_warn: netsecLib.LOGIN_WARN, now: NOW };
+}
 
 function inventoryView({ all = false } = {}) {
   const matchSlug = doguCache ? doguLib.makeMatcher(doguCache.tools) : null;

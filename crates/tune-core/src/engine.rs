@@ -176,17 +176,20 @@ impl Engine {
         let node_id = js::string(result.get("node_id"));
         let node = cfg.node(&node_id);
         let empty = Value::Object(Map::new());
-        let data = result.get("data").unwrap_or(&Value::Null);
-        let mut findings = rules::analyze(data, node.map_or(&empty, |n| &n.raw));
-        findings.extend(logs::log_findings(db, &node_id, now_ms()).unwrap_or_default());
+        let node_raw = node.map_or(&empty, |n| &n.raw);
+        let data = crate::netsec::snapshot_for_node(result.get("data").cloned().unwrap_or(Value::Null), node_raw);
+        let prev_data = prev_data.map(|d| crate::netsec::snapshot_for_node(d.clone(), node_raw));
+        let mut findings = rules::analyze(&data, node_raw);
+        findings.extend(crate::netsec::filter_log_findings(logs::log_findings(db, &node_id, now_ms()).unwrap_or_default(), node_raw));
         rules::sort_findings(&mut findings);
         if node.is_some_and(|n| n.shared) {
             rules::block_actions(&mut findings);
         }
         let mut out = result.as_object().cloned().unwrap_or_default();
         out.insert("score".into(), Value::from(rules::score(&findings)));
-        out.insert("compare".into(), rules::compare(prev_data, Some(data)));
+        out.insert("compare".into(), rules::compare(prev_data.as_ref(), Some(&data)));
         out.insert("findings".into(), Value::Array(findings));
+        out.insert("data".into(), data);
         Value::Object(out)
     }
 
@@ -198,14 +201,31 @@ impl Engine {
         for n in &cfg.nodes {
             let snaps = db.last_snapshots(&n.id, 2).map_err(|e| e.to_string())?;
             let Some(last) = snaps.first() else { continue };
-            let r = json!({ "node_id": n.id, "ok": true, "data": last.data, "at": last.at, "wall_s": last.wall_s });
-            let mut full = self.enrich(&db, &cfg, &r, snaps.get(1).map(|s| &s.data));
+            let data = crate::netsec::snapshot_for_node(last.data.clone(), &n.raw);
+            let prev_data = snaps.get(1).map(|s| crate::netsec::snapshot_for_node(s.data.clone(), &n.raw));
+            let r = json!({ "node_id": n.id, "ok": true, "data": data, "at": last.at, "wall_s": last.wall_s });
+            let mut full = self.enrich(&db, &cfg, &r, prev_data.as_ref());
             if let Value::Object(m) = &mut full {
                 m.insert("stale".into(), Value::Bool(true));
             }
             out.push(full);
         }
         Ok(out)
+    }
+
+    pub fn logs_query(&self, filter: &Value) -> Result<Vec<Value>, String> {
+        let nodes: Vec<Value> = self.config().nodes.into_iter().map(|n| n.raw).collect();
+        self.with_db(|d| d.query_logs(filter)).map(|rows| crate::netsec::filter_log_rows(rows, &nodes))
+    }
+
+    pub fn logs_signatures(&self, filter: &Value) -> Result<Vec<Value>, String> {
+        let nodes: Vec<Value> = self.config().nodes.into_iter().map(|n| n.raw).collect();
+        self.with_db(|d| d.signatures(filter)).map(|rows| crate::netsec::filter_log_signatures(rows, &nodes))
+    }
+
+    pub fn logs_cursors(&self) -> Result<Vec<Value>, String> {
+        let nodes: Vec<Value> = self.config().nodes.into_iter().map(|n| n.raw).collect();
+        self.with_db(|d| d.cursors()).map(|rows| crate::netsec::filter_log_rows(rows, &nodes))
     }
 
     /// 状態（機能チェック）を計算して保存する。
@@ -225,7 +245,8 @@ impl Engine {
                 let last = db.last_snapshots(&n.id, 1).ok().and_then(|v| v.into_iter().next());
                 let (snap, findings) = match &last {
                     Some(l) => {
-                        let snap = json!({ "node_id": n.id, "ok": true, "data": l.data, "at": l.at, "wall_s": l.wall_s });
+                        let data = crate::netsec::snapshot_for_node(l.data.clone(), &n.raw);
+                        let snap = json!({ "node_id": n.id, "ok": true, "data": data, "at": l.at, "wall_s": l.wall_s });
                         let full = self.enrich(&db, &cfg, &snap, None);
                         (Some(snap), js::arr(full.get("findings")).to_vec())
                     }
@@ -285,11 +306,21 @@ impl Engine {
     /// 画面の「状態」（問い合わせでは更新通知を送らない）
     pub fn status(&self) -> Result<Value, String> {
         self.compute_checks(false, false);
+        let cfg = self.config();
+        let nodes: Vec<Value> = cfg.nodes.into_iter().map(|n| n.raw).collect();
         let (checks, events, lp, ll) = self.with_db(|d| Ok((d.checks()?, d.check_events(150)?, d.get_meta("lastProbeAt")?, d.get_meta("lastLogsAt")?)))?;
+        let checks = crate::netsec::filter_check_rows(checks, &nodes);
+        let events = crate::netsec::filter_check_rows(events, &nodes);
+        let mut counts = std::collections::BTreeMap::from([("ok", 0_i64), ("warn", 0), ("fail", 0), ("unknown", 0)]);
+        for row in &checks {
+            if let Some(status) = row.get("status").and_then(Value::as_str) {
+                *counts.entry(status).or_default() += 1;
+            }
+        }
         Ok(json!({
             "checks": checks, "events": events, "schedule": self.schedule(),
             "lastProbeAt": lp, "lastLogsAt": ll, "openAtLogin": self.host.open_at_login(),
-            "counts": self.status_counts(), "probing": self.is_probing(), "syncing": self.is_syncing(),
+            "counts": counts, "probing": self.is_probing(), "syncing": self.is_syncing(),
         }))
     }
 
@@ -337,6 +368,8 @@ impl Engine {
         let full = {
             let db = lock(&self.db);
             let prev = db.last_snapshots(&node_id, 1).ok().and_then(|v| v.into_iter().next());
+            // ネットワークとセキュリティ: 正規化・前回の待ち受けとの比較・常駐の増減・初めての接続先（宛先は DB にだけ置く。netsec.rs）
+            let r = &crate::netsec::ingest(&db, cfg.node(&node_id), r, prev.as_ref().map(|p| &p.data));
             let mut full = self.enrich(&db, &cfg, r, prev.as_ref().map(|p| &p.data));
             if js::truthy(full.get("ok")) {
                 let findings: Vec<Value> = js::arr(full.get("findings")).iter().map(|f| json!({ "id": f.get("id"), "severity": f.get("severity") })).collect();
@@ -543,4 +576,86 @@ fn rand36(n: usize) -> String {
             char::from_digit(d, 36).unwrap_or('0')
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_does_not_return_legacy_peer_addresses_after_opt_out() {
+        let tmp = std::env::temp_dir().join(format!("katala-tune-netsec-test-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config = tmp.join("nodes.json");
+        std::fs::write(&config, r#"{"nodes":[{"id":"shared","alias":"unused","os":"macos","shared":true}]}"#).unwrap();
+        let engine = Engine::open(config, tmp.join("data"), Arc::new(NoHost)).unwrap();
+        engine
+            .with_db(|d| {
+                d.add_snapshot(
+                    "shared",
+                    1,
+                    Some(0.1),
+                    Some(100),
+                    &json!([]),
+                    &json!({ "netsec": { "outbound": [{ "addr": "192.0.2.8" }], "peers": { "new": [{ "addr": "192.0.2.9", "proc": "app" }] } } }),
+                    &json!({}),
+                )
+            })
+            .unwrap();
+        let last = engine.last().unwrap();
+        let text = serde_json::to_string(&last).unwrap();
+        assert!(!text.contains("192.0.2."));
+        assert!(last[0]["data"]["netsec"].get("peers").is_none());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn public_results_apply_current_network_policy_to_stored_data() {
+        let tmp = std::env::temp_dir().join(format!("katala-tune-netsec-policy-test-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config = tmp.join("nodes.json");
+        std::fs::write(&config, r#"{"nodes":[{"id":"private","alias":"unused","os":"windows","network":false}]}"#).unwrap();
+        let engine = Engine::open(config, tmp.join("data"), Arc::new(NoHost)).unwrap();
+        let now = now_ms();
+        engine
+            .with_db(|d| {
+                d.add_snapshot(
+                    "private",
+                    now,
+                    Some(0.1),
+                    Some(100),
+                    &json!([]),
+                    &json!({ "probe": "windows", "netsec": { "os": "windows", "listen": [], "peers": { "new": [{ "proc": "app", "port": 443 }] } } }),
+                    &json!({}),
+                )?;
+                let rows: Vec<Value> = (0..11)
+                    .map(|i| {
+                        json!({ "uid": format!("login-{i}"), "ts": now - i * 1000, "level": "warn", "provider": "192.0.2.1", "event_id": "4625", "message": "failed login" })
+                    })
+                    .collect();
+                d.insert_logs("private", "win_security", &crate::logs::normalize("win_security", &rows), now)?;
+                d.cursor_ok("private", "win_security", Some(&json!("11")), 11, &json!(0))?;
+                d.save_checks(
+                    "private",
+                    &[crate::db::Check { id: "sec-login".into(), name: "login".into(), status: "fail".into(), detail: Some("192.0.2.1".into()) }],
+                    now,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let last = engine.last().unwrap();
+        assert!(last[0]["data"].get("netsec").is_none());
+        assert!(!serde_json::to_string(&last).unwrap().contains("log-login-"));
+        assert!(engine.logs_query(&json!({})).unwrap().is_empty());
+        assert!(engine.logs_signatures(&json!({ "since": 0 })).unwrap().is_empty());
+        assert!(engine.logs_cursors().unwrap().is_empty());
+        let status = engine.status().unwrap();
+        let status_text = serde_json::to_string(&status).unwrap();
+        assert!(!status_text.contains("sec-login"), "{status_text}");
+        assert!(!status_text.contains("192.0.2.1"));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
 }

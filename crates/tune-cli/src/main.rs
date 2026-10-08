@@ -9,6 +9,8 @@
 //!   tune inventory [機体 ...]        道具の棚卸しを DB に保存し、結果を JSON で（DB は KATALA_TUNE_DATA_DIR で写しを指す）
 //!   tune ai [機体 ...]               AI エージェントのセッションを取り込み、結果を JSON で（同上。続きは DB が覚える）
 //!   tune ai-summary [日数]           DB の AI エージェントのセッションの集計を JSON で
+//!   tune netsec [--probe] [機体 ...]  ネットワークとセキュリティ（「セキュリティ」の画面と同じ JSON）。--probe で先に分析して保存する
+//!                                    （DB は KATALA_TUNE_DATA_DIR で写しを指す）
 //!   tune live [--seconds N] 機体 ...  ライブ表示のサンプラーを N 秒（既定 30、最大 300）流し、件数・間隔・遅延・
 //!                                    サンプラー自身の負荷を JSON で（読み取り専用。機体は必ず指定する）
 //!
@@ -24,7 +26,7 @@ use tune_core::engine::{Engine, NoHost};
 use tune_core::{collect, logs, nodes, rules};
 
 fn usage() -> ExitCode {
-    eprintln!("使い方: tune <paths|probe|logs|last|status|analyze|inventory|ai|ai-summary|live> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）");
+    eprintln!("使い方: tune <paths|probe|logs|last|status|analyze|inventory|ai|ai-summary|netsec|live> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）");
     ExitCode::from(2)
 }
 
@@ -223,6 +225,21 @@ async fn main() -> ExitCode {
                 };
                 eprintln!("done {:.1}s db={}", t0.elapsed().as_secs_f64(), e.data_dir().display());
                 v.map(|v| print(&v))
+            }
+            Err(e) => Err(e),
+        },
+        "netsec" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => {
+                let probe = rest.iter().any(|a| a == "--probe");
+                let ids: Vec<String> = rest.iter().filter(|a| *a != "--probe").cloned().collect();
+                if probe {
+                    let t0 = std::time::Instant::now();
+                    e.run_probe(Some(ids), false).await;
+                    eprintln!("probe {:.1}s db={}", t0.elapsed().as_secs_f64(), e.data_dir().display());
+                } else {
+                    e.compute_checks(false, false);
+                }
+                e.netsec_view(&json!({})).map(|v| print(&v))
             }
             Err(e) => Err(e),
         },

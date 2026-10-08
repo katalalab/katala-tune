@@ -42,3 +42,8 @@ test('道具の黄色表示も版の数字部分を機体単位で比較する',
   assert.equal(cellOf({}, duplicates, 'a').diff, true);
   assert.equal(cellOf({}, duplicates, 'b').diff, false);
 });
+
+test('セキュリティの学習中表示も選択した機体だけに絞る', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../renderer/security.js'), 'utf8');
+  assert.match(source, /const learning = pick\(d\.nodes\)\.filter\(\(n\) => n\.netsec\?\.peers\?\.learning\)/);
+});

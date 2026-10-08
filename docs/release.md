@@ -1,6 +1,6 @@
 # リリースと自動更新（Tauri 版）
 
-タグ `v*` を push すると `.github/workflows/release.yml` が macOS（universal: Apple Silicon と Intel）と Windows x64 をビルドし、GitHub Releases に**下書き**として置く。中身を確かめて公開すると、アプリの自動更新の対象になる。
+タグ `v*` を push すると `.github/workflows/release.yml` が macOS（universal: Apple Silicon と Intel）と Windows x64 をビルドし、GitHub Releases に**下書き**として置く。中身を確かめて通常リリースとして公開すると、アプリの更新確認の対象になる。prerelease は手動配布に使い、通常の更新確認には出さない。
 
 ## 自動更新の決まり
 
@@ -39,17 +39,17 @@
 
 1. 版をそろえて上げる（package.json・package-lock.json・Cargo.toml・Cargo.lock・src-tauri/tauri.conf.json）
    ```sh
-   npm run version:set -- 0.4.0
+   npm run version:set -- 0.4.1
    npm test && cargo test --workspace
    ```
 2. PR で main に入れる
 3. main でタグを打って push する
    ```sh
-   git tag v0.4.0 && git push origin v0.4.0
+   git tag v0.4.1 && git push origin v0.4.1
    ```
 4. CI がタグと版の一致・公開鍵が仮の値でないことを確かめてからビルドし、下書きのリリースに置く:
    `KatalaTune_<版>_universal.dmg`（初めて入れる人向け）・`KatalaTune_<版>_universal.app.tar.gz`（と `.sig`）・`KatalaTune_<版>_x64-setup.exe`（と `.sig`）・`latest.json`
-5. 下記の公開前チェックを完了してから下書きを公開する。公開した時点で、動いているアプリの「更新を確認…」に出る。未検証の環境が残る初期配布は prerelease とし、通常の latest 自動更新の対象にしない
+5. 下記の公開前チェックを完了してから下書きを公開する。通常リリースを latest として公開すると、動いているアプリの「更新を確認…」の対象になる。未検証の環境が残る初期配布は prerelease（latest 対象外）とし、リリースページから手動で取得する。prerelease は自動通知にも「更新を確認…」にも出ない
 
 ## 注意
 

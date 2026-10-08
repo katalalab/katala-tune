@@ -96,7 +96,7 @@ pub async fn logs_sync(e: E<'_>, ids: Option<Vec<String>>) -> R {
 #[tauri::command]
 pub async fn logs_query(e: E<'_>, filter: Option<Value>) -> R {
     let f = filter.unwrap_or_else(|| json!({}));
-    Ok(match e.with_db(|d| d.query_logs(&f)) {
+    Ok(match e.logs_query(&f) {
         Ok(rows) => json!({ "rows": rows }),
         Err(err) => json!({ "error": err }),
     })
@@ -105,12 +105,12 @@ pub async fn logs_query(e: E<'_>, filter: Option<Value>) -> R {
 #[tauri::command]
 pub async fn logs_signatures(e: E<'_>, filter: Option<Value>) -> R {
     let f = filter.unwrap_or_else(|| json!({}));
-    e.with_db(|d| d.signatures(&f)).map(Value::Array)
+    e.logs_signatures(&f).map(Value::Array)
 }
 
 #[tauri::command]
 pub async fn logs_cursors(e: E<'_>) -> R {
-    e.with_db(|d| d.cursors()).map(Value::Array)
+    e.logs_cursors().map(Value::Array)
 }
 
 #[tauri::command]
