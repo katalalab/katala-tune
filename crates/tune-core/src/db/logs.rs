@@ -215,7 +215,8 @@ impl Store {
     pub fn top_signatures(&self, node_id: &str, since: i64, limit: i64) -> Result<Vec<TopSignature>> {
         let mut st = self.conn.prepare_cached(
             "SELECT l.fingerprint, l.source, l.provider, l.level, count(*) AS n, max(l.message) AS sample FROM logs l
-             WHERE l.node_id = ? AND l.ts >= ? AND l.level != 'info' GROUP BY l.fingerprint ORDER BY n DESC LIMIT ?",
+             WHERE l.node_id = ? AND l.ts >= ? AND l.level != 'info' AND l.source NOT IN ('mac_auth', 'win_security')
+             GROUP BY l.fingerprint ORDER BY n DESC LIMIT ?",
         )?;
         st.query_map(params![node_id, since, limit], |r| {
             Ok(TopSignature { fingerprint: r.get(0)?, source: r.get(1)?, provider: r.get(2)?, n: r.get(4)?, sample: r.get(5)? })

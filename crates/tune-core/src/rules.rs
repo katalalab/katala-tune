@@ -565,7 +565,8 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
             );
         }
         let defender = get(s, "defender");
-        if matches!(get(defender, "realtime"), Some(Value::Bool(false))) {
+        // netsec の防御（netsec.rs）があれば、そちらがリアルタイム保護の停止を重大として出す
+        if matches!(get(defender, "realtime"), Some(Value::Bool(false))) && !truthy(get(get(s, "netsec"), "defense")) {
             out.simple(
                 "defender-off",
                 "info",
@@ -716,6 +717,9 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
             );
         }
     }
+
+    // ネットワークとセキュリティ（待ち受け・防御・常駐の増減・初めての接続先。netsec.rs）
+    out.0.extend(crate::netsec::findings(get(s, "netsec"), node));
 
     // 共用機では実行を止めて提案だけにする
     let mut out = out.0;

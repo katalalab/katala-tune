@@ -30,6 +30,7 @@
 - **ログ**: 全文検索、同種ログ（数字・ID・パスを伏せて同じ形のものを集計し、何台で出ているかを表示）、取り込みの状態（最終成功・捨てた件数・エラー）
 - **道具**: 全機体の CLI・パッケージ・アプリと版を機体×道具の表で（版の違いを強調）、追加・削除の履歴、Do-gu との照合とデッキの下書き・登録（確認ダイアログつき）
 - **AI**（Tauri 版）: Claude Code・Codex のセッションの要約。機体×日の使用量（トークン・セッション数）、モデル別、失敗の多いツール、長いセッション、PR、機体ごとの版、セッションの一覧。会話の本文は取り出さない
+- **セキュリティ**（Tauri 版）: 機体×項目（待ち受け・防御・常駐の増減・ログイン・初めての接続先）の表と、外から届く待ち受け、防御の状態、自動起動の増減の記録、ログインの送り元、初めての接続先。接続のメタデータと OS の記録だけで、パケットの中身は取らない。Electron 版では、防御と待ち受けの判定が「状態」と各機体の所見にだけ出る
 - **実行記録**: このアプリから実行した操作と、元に戻す操作
 
 ## 自動スキャン
@@ -47,10 +48,11 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 | 分析 | 各機体で読み取り専用の調査を並列に実行。時間は台数・接続状態・計測の設定による。macOS は `probes/mac_probe.py` を python3 の標準入力へ、Windows は `probes/win_probe.ps1` を `~/.katala-tune/` に置いて PowerShell 5.1 で実行。アプリを動かしている機体はローカルで実行 |
 | 判定 | `lib/rules.js`（CPU の飽和と暴走、メモリ圧迫・swap・コミット、メモリの大口、実効の空きによるディスク判定、熱、電源プラン、BSOD、WSL の上限、Defender、colima/Docker の割り当て、キャッシュ）と、ログ由来の所見（`lib/logs.js`: WHEA、GPU ドライバのリセット、メモリ枯渇、ディスクエラー、クラッシュ、カーネルパニック、jetsam、NeonMonitor の自動保護） |
 | ログ | Windows のイベントログ（System / Application）と NeonMonitor の `guard.log`、macOS の DiagnosticReports とカーネルのエラーを、前回の続きから取り込む。冪等・秘密の伏せ字・件数上限つき。開いている間は15分ごとに自動で取り込む |
-| 接続診断 | 開発用の `npm run network` で経路・IP・DNS設定、`-- --probe` でHTTPS疎通を読み取り専用で確認。画面への診断統合・接続先分析は未実装 |
+| 接続診断 | 開発用の `npm run network` で経路・IP・DNS設定、`-- --probe` でHTTPS疎通を読み取り専用で確認。経路診断コマンドの画面統合は未実装。接続先の標本分析は「セキュリティ」画面で確認 |
 | 計測 | 台帳に `"benchmark": false` を指定した機体では負荷計測を実行せず、状態だけを読み取る。省略時は従来どおり1スレッドの固定計算を5回（python）。前回との差で「最適化が効いたか」を見る（±15% 未満は誤差扱い） |
 | 実行 | プロセス終了（同一性・負荷を直前に再確認、終了を確認できなければ「終了未確認」）、Windows の電源プラン切り替え、タスクの無効化／有効化／今すぐ実行、launchd ジョブの停止／読み込み／今すぐ実行（元に戻せるものは戻せる） |
 | 道具 | 各機体のインストール先を読むだけ（`probes/mac_inventory.py`・`probes/win_inventory.ps1`）。パッケージマネージャもネットワークも使わない。読めなかった取り方は削除と見なさない |
+| ネットワークとセキュリティ | 60 分ごとの分析に足す（読み取り専用。docs/observability.md の 6）。待ち受けているポートとプロセス（全部の口・特定のアドレス・この機体の中を分け、前回の分析と比べて新しく外から届くもの）、防御の状態（macOS: アプリケーションファイアウォール・Gatekeeper・XProtect、Windows: Defender・登録されたウイルス対策・ファイアウォールのプロファイル・直近 30 日の検出）、自動起動の増減（LaunchAgents・LaunchDaemons／タスク・サービス・Run キー・スタートアップ。初回は記録だけ）、外向きの接続の標本（機体・プロセスごとに覚え、最初の 7 日は覚えるだけ。宛先は手元の DB にだけ置き 30 日で消す）。ログインは取り込みに足す（macOS の sshd の失敗、Windows のセキュリティログ 4625・4624 のネットワーク／リモート。読めなければ「権限が無い」）。保護が止まっている機体は「状態」で異常。台帳の機体に `"network": false` で全部止める。共用機は接続先とログインを既定で集めない |
 | AI エージェント | `probes/ai_sessions.py` を各機体の python で流し（Windows は python3 → python → py。無ければ「python が無い」）、続きの位置は DB が覚えて渡す。数・時刻・モデル・トークン・PR の URL だけを取り出す。台帳の機体に `"ai_sessions": false` で取り込まない |
 | 保存 | Tauri 版は Rust の SQLite、互換確認用の JS 版は Node 内蔵の `node:sqlite`。`<userData>/data/katala-tune.db` |
 
@@ -66,7 +68,7 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
   "nodes": [
     { "id": "my-mac", "alias": "my-mac", "os": "macos", "local_hostname": "My-MacBook-Pro" },
     { "id": "gpu-pc", "alias": "gpu-pc", "os": "windows", "note": "メモ" },
-    { "id": "family-pc", "alias": "family-pc", "os": "windows", "shared": true }
+    { "id": "family-pc", "alias": "family-pc", "os": "windows", "shared": true, "network": false }
   ]
 }
 ```
@@ -74,6 +76,9 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 - `alias` は `~/.ssh/config` の Host 名。非対話（BatchMode）で入れる鍵が要る。Windows 側は OpenSSH サーバーと、既定シェル（Git Bash または PowerShell）で `powershell.exe` が動くこと
 - `local_hostname` がこの機体の hostname と一致すると、SSH を使わずローカルで実行する
 - `shared: true` は提案のみ。`protect` は終了を提案しても実行しないアプリ名
+- `network`（任意）: `false` でネットワークとセキュリティ（待ち受け・防御・常駐の増減・外向きの接続・ログイン）を集めない
+- `network_peers`（任意）: 外向きの接続先（宛先）を残すか。書いていなければ、共用機（`shared: true`）は残さない（他の人の通信の宛先を集めないため）。`true` で明示すれば共用機でも残す。`false` でどの機体でも残さない
+- `network_logins`（任意）: ログインのアカウント名と送り元を残すか。書いていなければ、共用機（`shared: true`）は集めない。`true` で明示すれば共用機でも集める。`false` でどの機体でも集めない
 - `expect`（任意）: その機体で動いているはずのもの。`{ "services": ["Tailscale"], "jobs": ["\\MyTask", "com.example.job"], "processes": ["ollama"] }`。「状態」で見張る
   - `expect.ignore_jobs`（任意）: 意図どおり 0 以外で終わる定期処理のラベル・タスク名。「状態」の「定期処理」の失敗に数えない（根拠に「既知 N 件を除く」と出る）。例 `{ "ignore_jobs": ["com.example.check-and-exit-1", "MyProbeTask"] }`
 - `schedule`（任意）: `{ "enabled": true, "probe_minutes": 60, "logs_minutes": 15 }`

@@ -32,6 +32,10 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      - name: Windows Security log cursor regression
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: .\test\win-logons-regression.ps1
       - run: npm run version:check
       - run: npm run oss-check
 

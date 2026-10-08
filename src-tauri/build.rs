@@ -29,6 +29,7 @@ const COMMANDS: &[&str] = &[
     "ai_sync",
     "live_start",
     "live_stop",
+    "netsec",
 ];
 
 fn main() {

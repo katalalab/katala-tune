@@ -105,6 +105,8 @@ const SCENES = [
   { name: 'ai', js: [click('[data-tab="matrix"]'), click('[data-view="ai"]')], wait: 700, slices: 5 },
   { name: 'ai-codex-7d', js: [setSelect('#aiTool', 'codex'), setSelect('#aiDays', '7')], wait: 700, slices: 2 },
   { name: 'ai-sessions-errors', js: [setSelect('#aiTool', ''), setSelect('#aiDays', '30'), click('[data-aierr="1"]')], wait: 700, slices: 5 },
+  { name: 'security', js: [click('[data-aierr="0"]'), click('[data-view="security"]')], wait: 700, slices: 4 },
+  { name: 'security-node', js: [setSelect('#secNode', 'gpu-tower')], wait: 500, slices: 2 },
   { name: 'parts', js: [click('[data-aierr="0"]'), `(${partsPage.toString()})()`], slices: 3 },
   { name: 'probing', js: [click('[data-view="overview"]'), click('#btnProbe')], wait: 450 },
   // ライブ表示（プレビューの preload が架空の値を 1 秒ごとに流す）。最後に置く（入れたままだと後の場面にもパネルが出る）
@@ -115,8 +117,8 @@ const SCENES = [
 const VARIANTS = [
   { key: 'mac', platform: 'darwin', width: 1440, height: 920, scenes: SCENES },
   { key: 'win', platform: 'win32', width: 1440, height: 920, scenes: SCENES.filter((s) => ['overview', 'node-findings', 'logs'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
-  { key: 'narrow', platform: 'darwin', width: 1040, height: 700, scenes: SCENES.filter((s) => ['overview', 'status', 'resources', 'jobs', 'logs', 'node-findings', 'node-history', 'tools', 'tools-dogu-empty', 'tools-dogu', 'ai', 'probing', 'resources-live', 'node-live'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
-  { key: 'electron', platform: 'darwin', width: 1440, height: 920, query: { electron: '1' }, scenes: SCENES.filter((s) => s.name === 'ai').map((s) => ({ ...s, slices: 1 })) },
+  { key: 'narrow', platform: 'darwin', width: 1040, height: 700, scenes: SCENES.filter((s) => ['overview', 'status', 'resources', 'jobs', 'logs', 'node-findings', 'node-history', 'tools', 'tools-dogu-empty', 'tools-dogu', 'ai', 'security', 'probing', 'resources-live', 'node-live'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
+  { key: 'electron', platform: 'darwin', width: 1440, height: 920, query: { electron: '1' }, scenes: SCENES.filter((s) => ['ai', 'security'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
 ];
 
 const report = { started: new Date().toISOString(), shots: [], console: [], problems: [] };

@@ -3,9 +3,13 @@
 
 python3 標準ライブラリだけで動く。設定・プロセス・ファイルを変更しない。
 秘密・環境変数・コマンドライン引数・ファイルの中身は集めない（プロセスは実行ファイル名だけ）。
+使い方: python3 - [--skip-benchmark] [nonet]
+  --skip-benchmark  ベンチマークを省く（台帳の "benchmark": false）
+  nonet             ネットワークとセキュリティ（netsec）を集めない（台帳の "network": false）
 """
 import json, os, plistlib, re, shutil, socket, statistics, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor, wait
+from datetime import datetime
 
 HOME = os.path.expanduser("~")
 CACHE_DIRS = [
@@ -286,8 +290,219 @@ def launchd_failing():
     return bad
 
 
+# ---- ネットワークとセキュリティ（docs/observability.md の 6）----
+# パケットの中身は取らない。接続のメタデータ（プロセス・アドレス・ポート）と OS の防御の状態、自動起動の一覧（名前と実行ファイル名）だけ。
+# 台帳で "network": false の機体には `nonet` を渡し、この部分を丸ごと飛ばす。
+NETSEC_BUDGET_S = 15.0  # この部分の合計の上限。各取得はさらに短い上限を持ち、残り時間で打ち切る
+LAUNCHD_ALL = [("~/Library/LaunchAgents", "user"), ("/Library/LaunchAgents", "agent"), ("/Library/LaunchDaemons", "daemon")]
+NET_PROTO = re.compile(r"^(tcp|udp)(4|6|46) ")
+
+
+class NetsecError(Exception):
+    pass
+
+
+def remaining_timeout(deadline, cap):
+    """残り予算を超えない timeout。予算切れを新しい猶予に置き換えない。"""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise NetsecError("skipped: time budget")
+    return min(cap, remaining)
+
+
+def run_checked(cmd, timeout):
+    """打ち切り・失敗を例外にする（取れなかったことを「空」と区別するため）"""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise NetsecError(f"timeout {timeout:.0f}s")
+    except OSError as e:
+        raise NetsecError(f"{type(e).__name__}: {e}")
+    if r.returncode != 0 and not r.stdout:
+        raise NetsecError(f"exit {r.returncode}: {r.stderr.strip()[:120]}")
+    return r.stdout
+
+
+def _hostport(s, v4):
+    """tcp4 は 192.0.2.1:443・*:5000、tcp6 は fe80::1%en0.49241・*.5000（ポートの区切りが違う）"""
+    i = s.rfind(":" if v4 else ".")
+    if i < 0:
+        return s, None
+    p = s[i + 1:]
+    return s[:i], (int(p) if p.isdigit() else None)
+
+
+def _loopback(a):
+    return a.startswith("127.") or a in ("::1", "localhost") or a.startswith("::ffff:127.")
+
+
+VERSION_DIR = re.compile(r"^v?\d+(\.\d+)+([-+_][0-9A-Za-z.]+)?$")
+
+
+def stable_name(path):
+    """実行ファイルの名前。版の番号そのものが名前のもの（…/claude/versions/2.1.0 など）は、版の上の名前にする
+    （更新のたびに「外と初めて通信したプロセス」にならないように）"""
+    parts = [p for p in path.split("/") if p]
+    name = parts[-1] if parts else ""
+    if VERSION_DIR.match(name):
+        for p in reversed(parts[:-1]):
+            if p != "versions" and not VERSION_DIR.match(p):
+                return p
+    return name or None
+
+
+def exe_name(pid, _lib=[]):
+    """実行ファイルの名前（proc_pidpath の basename）。nettop の名前は 15 文字で切れ、ps の comm はプロセスが書き換えた題名
+    （ssh の制御ソケットのハッシュ、node の next-server など）になるので、比べる鍵には実行ファイルの名前を使う"""
+    try:
+        if not _lib:
+            import ctypes
+            _lib.extend([ctypes.CDLL("/usr/lib/libproc.dylib"), ctypes.create_string_buffer(4096)])
+        lib, buf = _lib
+        if pid and lib.proc_pidpath(int(pid), buf, 4096) > 0:
+            return stable_name(buf.value.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 取れなければ nettop の名前を使う
+        pass
+    return None
+
+
+def parse_nettop(text, name_of):
+    """nettop -L 1 -n -x -J state の出力から、待ち受け（TCP の Listen と、相手の無い UDP）と、確立した TCP の (プロセス, 宛先, ポート) の数を作る。
+    行の形: プロセスの行「名前.pid,,」のあとに、その接続の行「tcp4 192.0.2.1:50000<->198.51.100.7:443,Established,」が続く"""
+    proc, pid = "?", None
+    listen, conns, established = [], {}, []
+    for line in text.splitlines():
+        if not line or line.startswith(","):
+            continue
+        cols = line.rsplit(",", 2)
+        head = cols[0]
+        if not NET_PROTO.match(head):
+            name, _, p = head.rpartition(".")
+            pid = int(p) if p.isdigit() else None
+            proc = name_of(pid) or name or head or "?"
+            continue
+        kind, _, rest = head.partition(" ")
+        state = cols[1] if len(cols) > 1 else ""
+        local, _, remote = rest.partition("<->")
+        v4 = kind.endswith("4") and not kind.endswith("46")
+        la, lp = _hostport(local, v4)
+        ra, rp = _hostport(remote, v4)
+        proto = kind[:3]
+        if (proto == "tcp" and state == "Listen") or (proto == "udp" and remote in ("*:*", "*.*")):
+            if lp:
+                listen.append({"proto": proto, "addr": la, "port": lp, "pid": pid, "proc": proc})
+        elif proto == "tcp" and state == "Established" and rp and not _loopback(ra):
+            established.append((proc, ra, rp, lp))
+    # 外向きだけ: 自分の待ち受けの番号で受けた接続は外から来たもの（相手の番号は毎回変わる）
+    lports = {x["port"] for x in listen if x["proto"] == "tcp"}
+    for proc_, ra, rp, lp in established:
+        if lp not in lports:
+            k = (proc_, ra, rp)
+            conns[k] = conns.get(k, 0) + 1
+    top = sorted(conns.items(), key=lambda x: (-x[1], x[0]))[:400]
+    return listen[:600], [{"proc": k[0], "addr": k[1], "port": k[2], "n": n} for k, n in top]
+
+
+def netsec():
+    t0 = time.monotonic()
+    c0 = time.thread_time()
+    deadline = t0 + NETSEC_BUDGET_S
+    res = {"v": 1, "listen": [], "outbound": [], "defense": {}, "persist": [], "errors": {}, "parts_ms": {}}
+
+    def left(cap):
+        return remaining_timeout(deadline, cap)
+
+    def part(name, fn):
+        if time.monotonic() >= deadline:
+            res["errors"][name] = "skipped: time budget"
+            return
+        s = time.monotonic()
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 取れなかった理由を残し、ほかの部分は続ける
+            res["errors"][name] = str(e)[:200] if isinstance(e, NetsecError) else f"{type(e).__name__}: {e}"[:200]
+        res["parts_ms"][name] = int((time.monotonic() - s) * 1000)
+
+    def connections():
+        # nettop は root のプロセス（sshd・tailscaled など）も含めて全部見える（lsof は自分のプロセスだけ）
+        listen, outbound = parse_nettop(run_checked(["nettop", "-L", "1", "-n", "-x", "-J", "state"], left(8)), exe_name)
+        res["listen"], res["outbound"] = listen, outbound
+
+    def firewall():
+        out = run_checked(["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"], left(5))
+        m = re.search(r"State = (\d)", out)
+        res["defense"]["firewall"] = int(m.group(1)) if m else (0 if "disabled" in out else 1 if "enabled" in out else None)
+        st = run_checked(["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getstealthmode"], left(5))
+        res["defense"]["stealth"] = True if " is on" in st else False if " is off" in st else None
+
+    def gatekeeper():
+        out = run_checked(["spctl", "--status"], left(5))
+        res["defense"]["gatekeeper"] = True if "assessments enabled" in out else False if "assessments disabled" in out else None
+
+    def xprotect():
+        # macOS 15 以降は xprotect コマンドが版と入った日時を返す。無ければバンドルの版と更新日時
+        ver, at = None, None
+        if shutil.which("xprotect"):
+            try:
+                out = run_checked(["xprotect", "version"], left(5))
+                m = re.search(r"Version:\s*(\S+)(?:\s+Installed:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}))?", out)
+                if m:
+                    ver = m.group(1)
+                    if m.group(2):
+                        at = int(datetime.strptime(m.group(2), "%Y-%m-%d %H:%M:%S %z").timestamp() * 1000)
+            except NetsecError:
+                pass
+        if ver is None:
+            for p in ("/var/protected/xprotect/XProtect.bundle/Contents/Info.plist",
+                      "/Library/Apple/System/Library/CoreServices/XProtect.bundle/Contents/Info.plist"):
+                try:
+                    with open(p, "rb") as fh:
+                        ver = str(plistlib.load(fh).get("CFBundleShortVersionString") or "") or None
+                    at = int(os.path.getmtime(p) * 1000)
+                    break
+                except Exception:  # noqa: BLE001 次の場所を見る
+                    continue
+        if ver is None:
+            raise NetsecError("XProtect の版が読めない")
+        res["defense"]["xprotect_version"] = ver
+        res["defense"]["xprotect_at"] = at
+
+    def launchd():
+        # com.apple.* も数える（本物の Apple のジョブは /System にあり、ここに置かれた com.apple.* は疑わしい）
+        items = []
+        for d, scope in LAUNCHD_ALL:
+            dd = os.path.expanduser(d)
+            try:
+                names = sorted(os.listdir(dd))
+            except FileNotFoundError:
+                continue
+            for f in names:
+                if not f.endswith(".plist"):
+                    continue
+                label, prog = f[:-6], None
+                try:
+                    with open(os.path.join(dd, f), "rb") as fh:
+                        pl = plistlib.load(fh)
+                    label = str(pl.get("Label") or label)
+                    prog = pl.get("Program") or (pl.get("ProgramArguments") or [None])[0]
+                except Exception:  # noqa: BLE001 読めない plist も「ある」ことは残す
+                    pass
+                items.append({"kind": "launchd", "key": f"{scope}:{label}", "program": os.path.basename(str(prog)) if prog else None})
+        res["persist"] = items[:3000]
+
+    part("listen", connections)
+    part("firewall", firewall)
+    part("gatekeeper", gatekeeper)
+    part("xprotect", xprotect)
+    part("launchd", launchd)
+    res["elapsed_ms"] = int((time.monotonic() - t0) * 1000)
+    res["cpu_ms"] = int((time.thread_time() - c0) * 1000)
+    return res
+
+
 def main():
     t0 = time.time()
+    network = "nonet" not in sys.argv[1:]
     with ThreadPoolExecutor(max_workers=12) as ex:
         f_cpu = ex.submit(cpu_busy)
         f_mem = ex.submit(memory)
@@ -299,6 +514,7 @@ def main():
         f_tm = ex.submit(lambda: "Running = 1" in run(["tmutil", "status"]))
         f_sp = ex.submit(lambda: run(["mdutil", "-s", "/"]).strip().splitlines()[-1:] or [""])
         f_dirs = [ex.submit(dir_size_gb, d) for d in CACHE_DIRS]
+        f_ns = ex.submit(netsec) if network else None
         # 他の調査と並べると計測が乱れるので、ベンチは最後に単独で回す
         boot = re.search(r"sec = (\d+)", sysctl("kern.boottime"))
         data_vol = "/System/Volumes/Data" if os.path.exists("/System/Volumes/Data") else "/"
@@ -332,6 +548,8 @@ def main():
         result["time_machine_running"] = f_tm.result()
         result["spotlight"] = f_sp.result()[0].strip()
         result["caches"] = [r for r in (f.result() for f in f_dirs) if r]
+        if f_ns:
+            result["netsec"] = f_ns.result()
     skip_benchmark = "--skip-benchmark" in sys.argv[1:]
     result["bench"] = None if skip_benchmark else bench()
     if skip_benchmark:
