@@ -142,6 +142,29 @@ fn cursor_arg(c: Option<&Value>) -> String {
     if x.unsigned_abs() > 9_007_199_254_740_991 { "0".into() } else { x.to_string() }
 }
 
+/// Windows Security の cursor は `RecordId:TimeCreatedEpochMs`。2値を個別検証してから引数へ渡す。
+fn security_cursor_args(c: Option<&Value>) -> (String, String) {
+    let s = match c {
+        None | Some(Value::Null) => "0".to_string(),
+        v => string(v),
+    };
+    let parts: Vec<&str> = js::trim(&s).split(':').collect();
+    if parts.is_empty() || parts.len() > 2 || parts.iter().any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit())) {
+        return ("0".into(), "0".into());
+    }
+    let Ok(record_id) = parts[0].parse::<u64>() else { return ("0".into(), "0".into()) };
+    let Ok(at) = parts.get(1).unwrap_or(&"0").parse::<u64>() else { return ("0".into(), "0".into()) };
+    if record_id > i64::MAX as u64 || at > i64::MAX as u64 {
+        return ("0".into(), "0".into());
+    }
+    (record_id.to_string(), at.to_string())
+}
+
+fn windows_logons_params(c: Option<&Value>) -> String {
+    let (record_id, at) = security_cursor_args(c);
+    format!("-SecCursor {record_id} -SecTime {at}")
+}
+
 pub(crate) fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
@@ -178,7 +201,7 @@ fn windows_remote_transport(cursors: &Map<String, Value>, script: &[u8]) -> Resu
 
 /// ログオンの記録（win_security）は別のスクリプト（probes/win_logons.ps1）。win_logs.ps1 と合わせると 8191 バイトに収まらないため
 fn windows_logons_transport(cursors: &Map<String, Value>, script: &[u8]) -> Result<(String, String), String> {
-    windows_script_transport(script, &format!("-SecCursor {}", cursor_arg(cursors.get("win_security"))))
+    windows_script_transport(script, &windows_logons_params(cursors.get("win_security")))
 }
 
 /// 2つの取り込みの出力を1つにする（win_logs.ps1 の結果に win_security を足す）。ログオンの方が失敗したら、その元だけをエラーにする
@@ -233,7 +256,7 @@ async fn fetch_logs(node: &Node, cursors: &Map<String, Value>) -> RunResult {
         if !logins {
             return collect::local::powershell_file(WIN_LOGS, &params, t).await;
         }
-        let sec_params = format!("-SecCursor {}", c("win_security"));
+        let sec_params = windows_logons_params(cursors.get("win_security"));
         let (main, sec) = tokio::join!(collect::local::powershell_file(WIN_LOGS, &params, t), collect::local::powershell_file(WIN_LOGONS, &sec_params, t));
         return merge_logons(main, sec);
     }
@@ -646,6 +669,12 @@ mod tests {
         assert_eq!(cursor_arg(Some(&Value::from(" 12abc"))), "12");
         assert_eq!(cursor_arg(Some(&Value::from("abc"))), "0");
         assert_eq!(cursor_arg(Some(&Value::from("-5"))), "-5");
+        assert_eq!(security_cursor_args(Some(&Value::from("301:1800000000000"))), ("301".into(), "1800000000000".into()));
+        assert_eq!(security_cursor_args(Some(&Value::from("301"))), ("301".into(), "0".into()));
+        assert_eq!(security_cursor_args(Some(&Value::from("9007199254740993:9223372036854775807"))), ("9007199254740993".into(), "9223372036854775807".into()));
+        assert_eq!(security_cursor_args(Some(&Value::from("9223372036854775808:1"))), ("0".into(), "0".into()));
+        assert_eq!(security_cursor_args(Some(&Value::from("301:2; bad"))), ("0".into(), "0".into()));
+        assert_eq!(windows_logons_params(Some(&Value::from("9007199254740993:1800000000000"))), "-SecCursor 9007199254740993 -SecTime 1800000000000");
     }
 
     #[test]
@@ -669,10 +698,10 @@ mod tests {
         assert!(windows_remote_transport(&max_cursors, WIN_LOGS).unwrap().0.len() < 8191);
         assert!(windows_remote_transport(&Map::new(), &[0; 6000]).is_err());
         // ログオンの記録は別のスクリプトで、同じ運び方・同じ上限
-        max_cursors.insert("win_security".into(), Value::from("9007199254740991"));
+        max_cursors.insert("win_security".into(), Value::from("9007199254740991:1800000000000"));
         let (command, bootstrap) = windows_logons_transport(&max_cursors, WIN_LOGONS).unwrap();
         assert!(command.len() < 8191);
-        assert!(bootstrap.ends_with("-SecCursor 9007199254740991"));
+        assert!(bootstrap.ends_with("-SecCursor 9007199254740991 -SecTime 1800000000000"));
     }
 
     #[test]

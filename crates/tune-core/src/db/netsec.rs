@@ -6,7 +6,8 @@
 //!
 //! 判定（増減・初めて）は crate::netsec の純粋な関数（JS 版と同じ）で決め、ここは読み書きだけ。
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{OptionalExtension, params, params_from_iter};
 use serde_json::{Value, json};
 
 use super::{Result, Store, row_json};
@@ -139,6 +140,22 @@ impl Store {
         st.query_map([limit], row_json)?.collect()
     }
 
+    /// 常駐の増減を許可された機体で絞ってから件数を制限する。
+    pub fn net_events_for_nodes(&self, node_ids: &[String], limit: i64) -> Result<Vec<Value>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; node_ids.len()].join(",");
+        let sql = format!(
+            "SELECT ts, node_id, kind, key, change, program, from_program FROM net_events
+             WHERE change != 'baseline' AND node_id IN ({marks}) ORDER BY ts DESC, id DESC LIMIT ?"
+        );
+        let mut args: Vec<SqlValue> = node_ids.iter().cloned().map(SqlValue::Text).collect();
+        args.push(SqlValue::Integer(limit));
+        let mut st = self.conn.prepare(&sql)?;
+        st.query_map(params_from_iter(args), row_json)?.collect()
+    }
+
     /// since 以降に初めて見た宛先（新しい順）
     pub fn net_peers_recent(&self, since: i64, limit: i64) -> Result<Vec<Value>> {
         let mut st = self.conn.prepare_cached(
@@ -146,6 +163,30 @@ impl Store {
              ORDER BY first_seen DESC, node_id, proc, addr, port LIMIT ?",
         )?;
         let rows: Vec<Value> = st.query_map(params![since, limit], row_json)?.collect::<Result<_>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|mut r| {
+                r["public"] = json!(r.get("public").and_then(Value::as_i64) == Some(1));
+                r
+            })
+            .collect())
+    }
+
+    /// 最近の宛先を許可された機体で絞ってから件数を制限する。
+    pub fn net_peers_recent_for_nodes(&self, since: i64, node_ids: &[String], limit: i64) -> Result<Vec<Value>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; node_ids.len()].join(",");
+        let sql = format!(
+            "SELECT node_id, proc, addr, port, first_seen, last_seen, seen, n_max, public FROM net_peers
+             WHERE first_seen >= ? AND node_id IN ({marks}) ORDER BY first_seen DESC, node_id, proc, addr, port LIMIT ?"
+        );
+        let mut args = vec![SqlValue::Integer(since)];
+        args.extend(node_ids.iter().cloned().map(SqlValue::Text));
+        args.push(SqlValue::Integer(limit));
+        let mut st = self.conn.prepare(&sql)?;
+        let rows: Vec<Value> = st.query_map(params_from_iter(args), row_json)?.collect::<Result<_>>()?;
         Ok(rows
             .into_iter()
             .map(|mut r| {
@@ -163,6 +204,24 @@ impl Store {
              ORDER BY n_24h DESC, n_7d DESC, node_id, provider LIMIT 500",
         )?;
         st.query_map(params![now - DAY_MS, now - 7 * DAY_MS], row_json)?.collect()
+    }
+
+    /// ログイン集計を許可された機体で絞ってから件数を制限する。
+    pub fn net_login_counts_for_nodes(&self, now: i64, node_ids: &[String], limit: i64) -> Result<Vec<Value>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; node_ids.len()].join(",");
+        let sql = format!(
+            "SELECT node_id, source, provider, event_id, sum(ts >= ?) AS n_24h, count(*) AS n_7d, max(ts) AS last_ts FROM logs
+             WHERE source IN ('mac_auth', 'win_security') AND ts >= ? AND node_id IN ({marks}) GROUP BY node_id, source, provider, event_id
+             ORDER BY n_24h DESC, n_7d DESC, node_id, provider LIMIT ?"
+        );
+        let mut args = vec![SqlValue::Integer(now - DAY_MS), SqlValue::Integer(now - 7 * DAY_MS)];
+        args.extend(node_ids.iter().cloned().map(SqlValue::Text));
+        args.push(SqlValue::Integer(limit));
+        let mut st = self.conn.prepare(&sql)?;
+        st.query_map(params_from_iter(args), row_json)?.collect()
     }
 
     /// 保持期限を過ぎたもの（増減の記録 180 日、宛先 30 日）
@@ -234,5 +293,54 @@ mod tests {
         d.net_peers_step("n1", &[], 40 * day).unwrap();
         assert_eq!(d.net_peers_count("n1").unwrap(), 0);
         assert_eq!(d.net_baseline_since("n1", "peers").unwrap(), Some(0), "覚え始めた時刻は残す（集計は残す）");
+    }
+
+    #[test]
+    fn allowed_nodes_are_filtered_before_view_limits() {
+        let d = Store::open_in_memory().unwrap();
+        let allowed_id = "allowed') OR 1=1 --";
+        for i in 0..501_i64 {
+            if i < 301 {
+                d.conn
+                    .execute(
+                        "INSERT INTO net_events (ts, node_id, kind, key, change) VALUES (?, 'hidden', 'run', ?, 'added')",
+                        params![10_000 + i, format!("hidden-{i}")],
+                    )
+                    .unwrap();
+                d.conn
+                    .execute(
+                        "INSERT INTO net_peers (node_id, proc, addr, port, first_seen, last_seen, seen, n_max, public) VALUES ('hidden', ?, ?, 443, ?, ?, 1, 1, 1)",
+                        params![format!("hidden-{i}"), format!("192.0.2.{}", i % 250 + 1), 10_000 + i, 10_000 + i],
+                    )
+                    .unwrap();
+            }
+            d.conn
+                .execute(
+                    "INSERT INTO logs (node_id, source, uid, ts, level, provider, event_id, message, fingerprint, ingested_at) VALUES ('hidden', 'win_security', ?, 9999, 'warn', ?, '4625', 'hidden', ?, 9999)",
+                    params![format!("hidden-{i}"), format!("provider-{i}.example"), format!("fp-{i}")],
+                )
+                .unwrap();
+        }
+        d.conn.execute("INSERT INTO net_events (ts, node_id, kind, key, change) VALUES (1, ?, 'run', 'allowed-event', 'added')", [allowed_id]).unwrap();
+        d.conn
+            .execute(
+                "INSERT INTO net_peers (node_id, proc, addr, port, first_seen, last_seen, seen, n_max, public) VALUES (?, 'allowed-proc', '198.51.100.1', 8443, 1, 1, 1, 1, 1)",
+                [allowed_id],
+            )
+            .unwrap();
+        d.conn
+            .execute(
+                "INSERT INTO logs (node_id, source, uid, ts, level, provider, event_id, message, fingerprint, ingested_at) VALUES (?, 'win_security', 'allowed-log', 9999, 'warn', '198.51.100.1', '4625', 'allowed', 'allowed-fp', 9999)",
+                [allowed_id],
+            )
+            .unwrap();
+
+        let allowed = vec![allowed_id.to_string()];
+        assert_eq!(d.net_events_for_nodes(&allowed, 300).unwrap()[0]["key"], "allowed-event");
+        assert_eq!(d.net_peers_recent_for_nodes(0, &allowed, 300).unwrap()[0]["proc"], "allowed-proc");
+        assert_eq!(d.net_login_counts_for_nodes(10_000, &allowed, 500).unwrap()[0]["node_id"], allowed_id);
+        assert!(d.net_events_for_nodes(&[], 300).unwrap().is_empty());
+        assert!(d.net_peers_recent_for_nodes(0, &[], 300).unwrap().is_empty());
+        assert!(d.net_login_counts_for_nodes(10_000, &[], 500).unwrap().is_empty());
     }
 }

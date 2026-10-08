@@ -302,6 +302,14 @@ class NetsecError(Exception):
     pass
 
 
+def remaining_timeout(deadline, cap):
+    """残り予算を超えない timeout。予算切れを新しい猶予に置き換えない。"""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise NetsecError("skipped: time budget")
+    return min(cap, remaining)
+
+
 def run_checked(cmd, timeout):
     """打ち切り・失敗を例外にする（取れなかったことを「空」と区別するため）"""
     try:
@@ -396,24 +404,24 @@ def parse_nettop(text, name_of):
 
 
 def netsec():
-    t0 = time.time()
+    t0 = time.monotonic()
     c0 = time.thread_time()
     deadline = t0 + NETSEC_BUDGET_S
     res = {"v": 1, "listen": [], "outbound": [], "defense": {}, "persist": [], "errors": {}, "parts_ms": {}}
 
     def left(cap):
-        return max(0.5, min(cap, deadline - time.time()))
+        return remaining_timeout(deadline, cap)
 
     def part(name, fn):
-        if time.time() > deadline:
+        if time.monotonic() >= deadline:
             res["errors"][name] = "skipped: time budget"
             return
-        s = time.time()
+        s = time.monotonic()
         try:
             fn()
         except Exception as e:  # noqa: BLE001 取れなかった理由を残し、ほかの部分は続ける
             res["errors"][name] = str(e)[:200] if isinstance(e, NetsecError) else f"{type(e).__name__}: {e}"[:200]
-        res["parts_ms"][name] = int((time.time() - s) * 1000)
+        res["parts_ms"][name] = int((time.monotonic() - s) * 1000)
 
     def connections():
         # nettop は root のプロセス（sshd・tailscaled など）も含めて全部見える（lsof は自分のプロセスだけ）
@@ -487,7 +495,7 @@ def netsec():
     part("gatekeeper", gatekeeper)
     part("xprotect", xprotect)
     part("launchd", launchd)
-    res["elapsed_ms"] = int((time.time() - t0) * 1000)
+    res["elapsed_ms"] = int((time.monotonic() - t0) * 1000)
     res["cpu_ms"] = int((time.thread_time() - c0) * 1000)
     return res
 

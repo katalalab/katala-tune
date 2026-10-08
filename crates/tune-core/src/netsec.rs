@@ -1326,16 +1326,25 @@ impl Engine {
     pub fn netsec_view(&self, _filter: &Value) -> Result<Value, String> {
         let cfg = self.config();
         let now = now_ms();
+        let enabled_node_ids: Vec<String> = cfg.nodes.iter().filter(|n| enabled(&n.raw)).map(|n| n.id.clone()).collect();
+        let peer_node_ids: Vec<String> = cfg.nodes.iter().filter(|n| peers_enabled(&n.raw)).map(|n| n.id.clone()).collect();
+        let login_node_ids: Vec<String> = cfg.nodes.iter().filter(|n| logins_enabled(&n.raw)).map(|n| n.id.clone()).collect();
         let (snaps, checks, events, peers, logins) = self.with_db(|d| {
             let mut snaps = Vec::new();
             for n in &cfg.nodes {
                 snaps.push(d.last_snapshots(&n.id, 1)?.into_iter().next());
             }
-            Ok((snaps, d.checks()?, d.net_events(300)?, d.net_peers_recent(now - LEARN_DAYS * 86_400_000, 300)?, d.net_login_counts(now)?))
+            Ok((
+                snaps,
+                d.checks()?,
+                d.net_events_for_nodes(&enabled_node_ids, 300)?,
+                d.net_peers_recent_for_nodes(now - LEARN_DAYS * 86_400_000, &peer_node_ids, 300)?,
+                d.net_login_counts_for_nodes(now, &login_node_ids, 500)?,
+            ))
         })?;
-        let enabled_nodes: HashSet<String> = cfg.nodes.iter().filter(|n| enabled(&n.raw)).map(|n| n.id.clone()).collect();
-        let peer_nodes: HashSet<String> = cfg.nodes.iter().filter(|n| peers_enabled(&n.raw)).map(|n| n.id.clone()).collect();
-        let login_nodes: HashSet<String> = cfg.nodes.iter().filter(|n| logins_enabled(&n.raw)).map(|n| n.id.clone()).collect();
+        let enabled_nodes: HashSet<String> = enabled_node_ids.into_iter().collect();
+        let peer_nodes: HashSet<String> = peer_node_ids.into_iter().collect();
+        let login_nodes: HashSet<String> = login_node_ids.into_iter().collect();
         let events = rows_for_nodes(events, &enabled_nodes);
         let peers = rows_for_nodes(peers, &peer_nodes);
         let logins = rows_for_nodes(logins, &login_nodes);

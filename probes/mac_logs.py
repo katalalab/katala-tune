@@ -5,10 +5,10 @@
   diag    ~/Library/Logs/DiagnosticReports（と読めれば /Library/...）のクラッシュ・ハング・パニック・資源超過。
           ファイル名と先頭の見出し（app_name, bug_type）だけを読み、中身（スタック等）は送らない。
   kernel  統合ログのうちカーネルのエラー（Sandbox の deny を除く）。fault は1時間に数千件出るので取らない。
-  auth    統合ログのうち sshd のログインの失敗。1回の接続（送り元のアドレスとポート）を1件にまとめ、送り元を provider に入れる。
+  auth    統合ログのうち sshd の Failed 認証試行。1試行を1件にし、送り元を provider に入れる。
           読むのは日時・アカウント名・送り元・認証の方式だけ。範囲は最大7日（初回は24時間）、件数は300件まで。
 """
-import json, os, re, subprocess, sys, time
+import hashlib, json, os, re, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor
 
 MAX_ROWS = 300
@@ -91,17 +91,12 @@ def kernel(cursor_epoch):
     return {"cursor": str(int(newest) + 1), "rows": rows[-MAX_ROWS:], "dropped": dropped}
 
 
-# OpenSSH の失敗の書き方（sshd・sshd-session・sshd-auth）。どれも送り元のアドレスとポートが入る
-SSH_FAIL = [
-    re.compile(r"^Failed (?P<m>\S+) for (?:invalid user )?(?P<u>.*?) from (?P<ip>\S+) port (?P<port>\d+)"),
-    re.compile(r"^Invalid user (?P<u>.*?) from (?P<ip>\S+) port (?P<port>\d+)"),
-    re.compile(r"^(?:Connection closed by|Disconnected from) (?:authenticating|invalid) user (?P<u>.*?) (?P<ip>\S+) port (?P<port>\d+) \[preauth\]"),
-    re.compile(r"^maximum authentication attempts exceeded for (?:invalid user )?(?P<u>.*?) from (?P<ip>\S+) port (?P<port>\d+)"),
-]
+# OpenSSH の Failed 認証試行（sshd・sshd-session・sshd-auth）。Invalid user・preauth close・maximum は同じ試行の補助行なので数えない。
+SSH_FAIL = re.compile(r"^Failed (?P<m>\S+) for (?:invalid user )?(?P<u>.*?) from (?P<ip>\S+) port (?P<port>\d+)")
 
 
 def parse_auth(text):
-    """log show --style ndjson の行から、ssh のログインの失敗を接続（送り元のアドレスとポート）ごとの行にする。戻り値は (rows, 最新の時刻)"""
+    """log show --style ndjson の行から、ssh の Failed 認証試行ごとの行を作る。戻り値は (rows, 最新の時刻)"""
     attempts, newest = {}, 0.0
     for line in text.splitlines():
         try:
@@ -116,19 +111,17 @@ def parse_auth(text):
         except (ValueError, TypeError):
             continue
         msg = e.get("eventMessage") or ""
-        m = next((x for x in (rx.match(msg) for rx in SSH_FAIL) if x), None)
+        m = SSH_FAIL.match(msg)
         if not m:
             continue
         newest = max(newest, t)
-        k = (m.group("ip"), m.group("port"))
-        a = attempts.setdefault(k, {"ts": t, "user": (m.group("u") or "")[:64], "method": None})
-        if m.groupdict().get("m"):
-            a["method"] = m.group("m")[:40]
-    rows = []
-    for (ip, port), a in attempts.items():
-        # 同じ接続の行が2回の読み取りにまたがっても1件になるよう、uid は送り元・ポート・日付
-        rows.append({"uid": f"ssh:{ip}:{port}:{int(a['ts'] // 86400)}", "ts": int(a["ts"] * 1000), "level": "warn", "provider": ip[:120],
-                     "event_id": "ssh-fail", "message": f"ssh login failed: account {a['user'] or '?'}, from {ip}" + (f", {a['method']}" if a["method"] else "")})
+        ip, port = m.group("ip"), m.group("port")
+        stamp = int(t * 1_000_000)
+        digest = hashlib.sha256(msg.encode("utf-8", "replace")).hexdigest()[:12]
+        uid = f"ssh:{ip}:{port}:{stamp}:{digest}"
+        attempts.setdefault(uid, {"uid": uid, "ts": int(t * 1000), "level": "warn", "provider": ip[:120], "event_id": "ssh-fail",
+                                  "message": f"ssh login failed: account {(m.group('u') or '?')[:64]}, from {ip}, {m.group('m')[:40]}"})
+    rows = list(attempts.values())
     rows.sort(key=lambda r: r["ts"])
     return rows, newest
 
@@ -140,8 +133,7 @@ def auth(cursor_epoch):
     since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start))
     try:
         p = subprocess.run(["log", "show", "--style", "ndjson", "--start", since, "--predicate",
-                            'process BEGINSWITH "sshd" AND (eventMessage BEGINSWITH "Failed " OR eventMessage BEGINSWITH "Invalid user "'
-                            ' OR eventMessage ENDSWITH "[preauth]" OR eventMessage BEGINSWITH "maximum authentication")'],
+                            'process BEGINSWITH "sshd" AND eventMessage BEGINSWITH "Failed "'],
                            capture_output=True, text=True, timeout=30)
         if p.returncode != 0:
             return {"error": f"log show exit {p.returncode}"}

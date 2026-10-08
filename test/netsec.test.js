@@ -90,7 +90,40 @@ test('sshd のログイン失敗を接続ごとに1件にまとめ、送り元�
   const [rows] = py('mac_logs.py', `print(json.dumps(m.parse_auth(${JSON.stringify(text)})))`);
   assert.deepEqual(rows.map((r) => [r.provider, r.event_id, r.level]), [['203.0.113.5', 'ssh-fail', 'warn'], ['192.0.2.44', 'ssh-fail', 'warn']]);
   assert.match(rows[0].message, /account admin, from 203\.0\.113\.5, password/);
-  assert.match(rows[0].uid, /^ssh:203\.0\.113\.5:50001:\d+$/);
+  assert.match(rows[0].uid, /^ssh:203\.0\.113\.5:50001:\d+:[0-9a-f]{12}$/);
+});
+
+test('sshd はFailed認証試行を重複なく数え、同じportの後日の再利用を別UIDにする（macOS）', () => {
+  const ln = (ts, msg) => JSON.stringify({ timestamp: ts, eventMessage: msg, process: 'sshd-session' });
+  const first = [
+    ln('2026-10-01 10:00:00.100000+0900', 'Invalid user admin from 203.0.113.8 port 50001'),
+    ln('2026-10-01 10:00:01.100000+0900', 'Failed password for invalid user admin from 203.0.113.8 port 50001 ssh2'),
+    ln('2026-10-01 10:00:02.100000+0900', 'Connection closed by invalid user admin 203.0.113.8 port 50001 [preauth]'),
+  ];
+  const later = ln('2026-10-02 10:00:00.100000+0900', 'Failed password for invalid user admin from 203.0.113.8 port 50001 ssh2');
+  const [rows] = py('mac_logs.py', `print(json.dumps(m.parse_auth(${JSON.stringify([...first, ...first, later].join('\n'))})))`);
+  assert.equal(rows.length, 2, '同じFailed行の重複は1件、翌日のport再利用は別件');
+  assert.equal(new Set(rows.map((r) => r.uid)).size, 2);
+  const [partial] = py('mac_logs.py', `print(json.dumps(m.parse_auth(${JSON.stringify(first.slice(1, 2).join('\n'))})))`);
+  const [expanded] = py('mac_logs.py', `print(json.dumps(m.parse_auth(${JSON.stringify(first.join('\n'))})))`);
+  assert.equal(partial.length, 1);
+  assert.equal(expanded.length, 1);
+  assert.equal(partial[0].uid, expanded[0].uid, '先にFailed行だけを読み、次に前後を重ねてもUIDは安定する');
+});
+
+test('macOS netsec のtimeoutは残り時間だけを渡し、予算切れを追加0.5秒に延ばさない', () => {
+  const result = py('mac_probe.py', `
+m.time.monotonic = lambda: 14.9
+left = m.remaining_timeout(15.0, 8.0)
+m.time.monotonic = lambda: 15.0
+try:
+    m.remaining_timeout(15.0, 8.0)
+    exhausted = False
+except m.NetsecError:
+    exhausted = True
+print(json.dumps([left, exhausted]))`);
+  assert.ok(result[0] > 0 && result[0] <= 0.101, result[0]);
+  assert.equal(result[1], true);
 });
 
 test('macOS の sshd ログ取得が失敗したら cursor を進めない', () => {
@@ -138,9 +171,12 @@ test('台帳の "network": false で止める（ログインの記録も集め�
 
 test('Windows のログオンの記録は別のスクリプトで、同じ運び方（8191 バイトまで）で送り、結果を1つにまとめる', () => {
   const script = fs.readFileSync(path.join(PROBES, 'win_logons.ps1'));
-  const t = logs.windowsLogonsTransport({ win_security: '9007199254740991' }, script);
+  const t = logs.windowsLogonsTransport({ win_security: '9007199254740991:1800000000000' }, script);
   assert.ok(Buffer.byteLength(t.command) < 8191);
-  assert.match(t.bootstrap, /\[ScriptBlock\]::Create\(\$s\)\) -SecCursor 9007199254740991$/);
+  assert.match(t.bootstrap, /\[ScriptBlock\]::Create\(\$s\)\) -SecCursor 9007199254740991 -SecTime 1800000000000$/);
+  assert.match(logs.windowsLogonsTransport({ win_security: '9007199254740993:9223372036854775807' }, script).bootstrap, /-SecCursor 9007199254740993 -SecTime 9223372036854775807$/);
+  assert.match(logs.windowsLogonsTransport({ win_security: '9223372036854775808:1' }, script).bootstrap, /-SecCursor 0 -SecTime 0$/);
+  assert.match(logs.windowsLogonsTransport({ win_security: '42;Write-Error bad:99' }, script).bootstrap, /-SecCursor 0 -SecTime 0$/);
   assert.match(t.command, /^printf %s [A-Za-z0-9+/=]+ \| powershell\.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand [A-Za-z0-9+/=]+$/);
   const main = { code: 0, out: JSON.stringify({ probe: 'win_logs', sources: { win_system: { cursor: '1', rows: [] } } }), err: '' };
   const merged = JSON.parse(logs.mergeLogons(main, { code: 0, out: `noise\n${JSON.stringify({ sources: { win_security: { cursor: '9', rows: [], note: 'no-permission' } } })}`, err: '' }).out);
@@ -152,9 +188,9 @@ test('Windows のログオンの記録は別のスクリプトで、同じ運び
   assert.equal(logs.mergeLogons({ code: 255, out: '', err: 'x' }, main).err, 'x');
   const source = script.subarray(3).toString('ascii');
   assert.match(source, /Get-WinEvent[^\r\n]+-Oldest[^\r\n]+-MaxEvents \(\$MaxRows \+ 1\)/);
-  assert.equal((source.match(/Get-WinEvent -LogName Security -FilterXPath/g) || []).length, 1);
+  assert.equal((source.match(/Get-WinEvent -LogName Security -FilterXPath/g) || []).length, 2);
   assert.match(source, /\$batch = @\(\$ev \| Select-Object -First \$MaxRows\)/);
-  assert.match(source, /foreach \(\$e in \$batch\) \{ if \(\$e\.RecordId -gt \$newest\)/);
+  assert.match(source, /\$batch\[-1\]\.RecordId \+ ':' \+ \[string\]\(EpochMs \$batch\[-1\]\.TimeCreated\)/);
 });
 
 test('Windows netsec は隔離した子だけを止め、完了済みの部分を20秒以内に残す', () => {
