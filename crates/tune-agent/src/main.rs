@@ -140,19 +140,46 @@ const LOCKOUT_FILE: &str = "pair.lockout";
 /// 止まってから次の受付を始められるまで
 const LOCKOUT_COOLDOWN_MS: i64 = 60_000;
 
-/// 止まってからまだ待つ必要があれば、残りのミリ秒
-fn cooldown_remaining(dir: &std::path::Path, now: i64) -> Option<i64> {
-    let at: i64 = std::fs::read_to_string(dir.join(LOCKOUT_FILE)).ok()?.trim().parse().ok()?;
+/// 止まってからまだ待つ必要があれば、残りのミリ秒。記録が無ければ待たない。
+/// 記録があるのに読めない・壊れているときは、待つ必要があるか分からないので受付を始めさせない（fail closed）
+fn cooldown_remaining(dir: &std::path::Path, now: i64) -> Result<Option<i64>, String> {
+    let path = dir.join(LOCKOUT_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("受付停止の記録を読めない（{}）: {e}", path.display())),
+    };
+    let at: i64 = text.trim().parse().map_err(|_| format!("受付停止の記録の形が違う（{}）。確かめてから消してください", path.display()))?;
     let until = at.saturating_add(LOCKOUT_COOLDOWN_MS);
-    (now < until).then(|| until - now)
+    Ok((now < until).then(|| until - now))
 }
 
-fn record_lockout(dir: &std::path::Path, now: i64) {
-    let _ = std::fs::write(dir.join(LOCKOUT_FILE), now.to_string());
+/// 止まった時刻を残す。書けなければエラー（握りつぶすと、1 分の待ちを回避できてしまう）
+fn record_lockout(dir: &std::path::Path, now: i64) -> Result<(), String> {
+    let path = dir.join(LOCKOUT_FILE);
+    keys::write_private(&path, now.to_string().as_bytes(), false).map_err(|e| format!("受付停止の時刻を記録できない（{}）: {e}", path.display()))
+}
+
+/// 受付を始める前に、停止の記録を書けることを確かめる（書けないまま始めると、止まったあとの待ちを守れない）。
+/// 待ちが済んでいる（または記録が無い）ときだけ呼ぶので、時刻 0（＝済み）で書く
+fn ensure_lockout_writable(dir: &std::path::Path) -> Result<(), String> {
+    record_lockout(dir, 0).map_err(|e| format!("{e}。書けないので、受付を始めない"))
+}
+
+/// 受付の結果が「続けて間違えて止まった」なら、時刻を残す。記録に失敗したら、その旨を結果のエラーに足す
+fn settle_lockout(dir: &std::path::Path, result: Result<tune_link::keys::Verified, tune_link::Error>, now: i64) -> Result<tune_link::keys::Verified, String> {
+    match result {
+        Ok(v) => Ok(v),
+        Err(e @ tune_link::Error::Refused(Refusal::Locked)) => match record_lockout(dir, now) {
+            Ok(()) => Err(e.to_string()),
+            Err(w) => Err(format!("{e}。{w}。書けないので、直すまで次の受付を始めない")),
+        },
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 async fn pair_cmd(o: &Opts) -> Result<(), String> {
-    if let Some(ms) = cooldown_remaining(&o.dir, tune_link::now_ms()) {
+    if let Some(ms) = cooldown_remaining(&o.dir, tune_link::now_ms())? {
         return Err(format!("続けて間違えて受付が止まった直後なので、あと {} 秒待ってからやり直してください", (ms + 999) / 1000));
     }
     let mut tty = terminal().map_err(|_| "端末が無いのでコードを表示できない（端末から実行してください）".to_string())?;
@@ -160,6 +187,7 @@ async fn pair_cmd(o: &Opts) -> Result<(), String> {
     if created {
         log(&format!("機体鍵を作った（{}）", o.dir.display()));
     }
+    ensure_lockout_writable(&o.dir)?;
     let addrs = if o.listen.is_empty() { listen::defaults().await } else { o.listen.clone() };
     let port = o.port.unwrap_or(PAIR_PORT);
     let listeners = bind_all(&addrs, port).await;
@@ -205,24 +233,20 @@ async fn pair_cmd(o: &Opts) -> Result<(), String> {
         |ev| match ev {
             PairEvent::Attempt { from } => log(&format!("ペアリングの試行 from={from}")),
             PairEvent::WrongCode { remaining } => log(&format!("コードが違った（あと {remaining} 回）")),
-            PairEvent::Refused(r) => {
-                if matches!(r, Refusal::Locked) {
-                    record_lockout(&o.dir, tune_link::now_ms());
-                }
-                log(&format!("断った: {r}"))
-            }
+            PairEvent::Refused(r) => log(&format!("断った: {r}")),
             PairEvent::Failed(e) => log(&format!("試行が失敗: {e}")),
             PairEvent::Paired { name, fingerprint } => log(&format!("ペアリングした: {name}（指紋 {fingerprint}）")),
         },
     )
     .await;
     let _ = tty.write_all("  ペアリングの受付を閉じた（コードは無効）\n".as_bytes());
-    match r {
+    // 続けて間違えて止まったときは、この場で時刻を残す（serve は止まったことを結果で返すだけで、イベントは出さない）
+    match settle_lockout(&o.dir, r, tune_link::now_ms()) {
         Ok(v) => {
             println!("{}", json!({ "paired": { "name": v.name, "fingerprint": keys::fingerprint(&v.identity), "role": "console" } }));
             Ok(())
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(e),
     }
 }
 
@@ -382,17 +406,60 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    fn lockout_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tune-agent-lockout-{tag}-{}-{}", std::process::id(), tune_link::now_ms()));
+        let _ = std::fs::remove_dir_all(&dir);
+        keys::ensure_private_dir(&dir).unwrap();
+        dir
+    }
+
+    /// 記録のファイルを「中身のあるディレクトリ」にして、書き込み（置き換え）を失敗させる（Unix・Windows 共通）
+    fn make_lockout_unwritable(dir: &std::path::Path) {
+        let p = dir.join(LOCKOUT_FILE);
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("x"), b"x").unwrap();
+    }
+
     #[test]
     fn pairing_waits_a_minute_after_lockout() {
-        let dir = std::env::temp_dir().join(format!("tune-agent-lockout-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(cooldown_remaining(&dir, 1_000_000), None, "止まっていなければ待たない");
-        record_lockout(&dir, 1_000_000);
-        assert_eq!(cooldown_remaining(&dir, 1_000_000), Some(60_000));
-        assert_eq!(cooldown_remaining(&dir, 1_059_999), Some(1));
-        assert_eq!(cooldown_remaining(&dir, 1_060_000), None, "1 分たてばやり直せる");
+        let dir = lockout_dir("wait");
+        assert_eq!(cooldown_remaining(&dir, 1_000_000), Ok(None), "止まっていなければ待たない");
+        record_lockout(&dir, 1_000_000).unwrap();
+        assert_eq!(cooldown_remaining(&dir, 1_000_000), Ok(Some(60_000)));
+        assert_eq!(cooldown_remaining(&dir, 1_059_999), Ok(Some(1)));
+        assert_eq!(cooldown_remaining(&dir, 1_060_000), Ok(None), "1 分たてばやり直せる");
+        // 記録があるのに壊れている・読めないときは、始めさせない
         std::fs::write(dir.join(LOCKOUT_FILE), "壊れた中身").unwrap();
-        assert_eq!(cooldown_remaining(&dir, 1_000_000), None);
+        assert!(cooldown_remaining(&dir, 1_000_000).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lockout_is_recorded_when_the_window_stops_after_repeated_failures() {
+        let dir = lockout_dir("settle");
+        // 続けて間違えると serve は Refused(Locked) を結果で返す（イベントは出ない）。そこで時刻が残ること
+        let r = settle_lockout(&dir, Err(tune_link::Error::Refused(Refusal::Locked)), 5_000_000);
+        assert!(r.is_err());
+        assert_eq!(cooldown_remaining(&dir, 5_000_001), Ok(Some(59_999)), "止まった直後は待つ");
+        // 期限切れなど、止まったのではない終わり方では記録しない
+        let dir2 = lockout_dir("settle2");
+        assert!(settle_lockout(&dir2, Err(tune_link::Error::Refused(Refusal::Expired)), 5_000_000).is_err());
+        assert_eq!(cooldown_remaining(&dir2, 5_000_001), Ok(None));
+        let _ = (std::fs::remove_dir_all(&dir), std::fs::remove_dir_all(&dir2));
+    }
+
+    #[test]
+    fn lockout_write_failure_is_not_swallowed() {
+        let dir = lockout_dir("fail");
+        make_lockout_unwritable(&dir);
+        // 受付を始める前: 書けないなら始めない
+        let e = ensure_lockout_writable(&dir).unwrap_err();
+        assert!(e.contains("受付を始めない"), "{e}");
+        // 止まったとき: 記録できなかったことを結果のエラーに出す（握りつぶさない）
+        let e = settle_lockout(&dir, Err(tune_link::Error::Refused(Refusal::Locked)), 5_000_000).unwrap_err();
+        assert!(e.contains("記録できない") && e.contains("次の受付を始めない"), "{e}");
+        // 書けないままの記録は壊れたものとして、次の受付も始めさせない
+        assert!(cooldown_remaining(&dir, 5_000_001).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
