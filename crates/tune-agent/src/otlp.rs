@@ -396,6 +396,8 @@ impl Sink {
             o.mode(0o600);
         }
         let f = o.open(self.path())?;
+        // 既にあったファイル（前の版・手で作ったもの）の所有者と権限も確かめる。mode(0o600) は新しく作るときにしか効かない
+        tune_link::keys::secure_existing_file(&f, &self.path()).map_err(|e| std::io::Error::other(e.to_string()))?;
         self.size = f.metadata()?.len();
         self.file = Some(f);
         Ok(())
@@ -794,6 +796,26 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(fs::metadata(sink.path()).unwrap().permissions().mode() & 0o777, 0o600);
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_loose_file_is_tightened_when_the_sink_opens_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("existing");
+        let _ = fs::remove_dir_all(&dir);
+        tune_link::keys::ensure_private_dir(&dir).unwrap();
+        fs::write(dir.join(FILE_NAME), b"{\"old\":1}\n").unwrap();
+        fs::set_permissions(dir.join(FILE_NAME), fs::Permissions::from_mode(0o644)).unwrap();
+        let mut sink = Sink::open(&dir, MAX_BYTES, KEEP).unwrap();
+        assert_eq!(fs::metadata(sink.path()).unwrap().permissions().mode() & 0o777, 0o600);
+        sink.write_lines(&[json!({ "a": 1 })]).unwrap();
+        assert_eq!(fs::read_to_string(sink.path()).unwrap().lines().count(), 2, "中身は消さずに追記する");
+        // 緩いディレクトリには開かない
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(Sink::open(&dir, MAX_BYTES, KEEP).is_err());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 

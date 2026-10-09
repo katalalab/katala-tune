@@ -9,7 +9,8 @@
 //! 通信を暗号化するセッション鍵は、接続ごとに作る使い捨ての X25519 の鍵（Noise の ephemeral）から作る。
 //!
 //! 置き場所は本人だけが読めるファイル（Unix は 0600・ディレクトリ 0700、Windows は継承を切って本人だけに許可）。
-//! 読み込むときに他のユーザーが読める状態なら、使わずに止める（ssh と同じ考え方）。
+//! 読み込むときに他のユーザーが読める状態・自分の所有でない（Unix）なら、使わずに止める（ssh と同じ考え方）。
+//! Windows は新しく作るファイルの ACL を絞るだけで、ディレクトリ自体の ACL・既存のファイルの ACL は確かめない（未検証。docs/connectivity.md）。
 
 use std::fs;
 use std::io::Write;
@@ -202,10 +203,14 @@ pub fn ensure_private_dir(dir: &Path) -> Result<()> {
         if !dir.exists() {
             fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| Error::Store(format!("{} を作れない: {e}", dir.display())))?;
         }
-        let mode = fs::metadata(dir).map_err(|e| Error::Store(format!("{} を読めない: {e}", dir.display())))?.permissions().mode();
-        if mode & 0o077 != 0 {
+        let meta = fs::metadata(dir).map_err(|e| Error::Store(format!("{} を読めない: {e}", dir.display())))?;
+        if !meta.is_dir() {
+            return Err(Error::Store(format!("{} はディレクトリではない", dir.display())));
+        }
+        if meta.permissions().mode() & 0o077 != 0 {
             return Err(Error::Store(format!("{} を他のユーザーも開ける（chmod 700 にしてください）", dir.display())));
         }
+        check_owner(&meta, dir)?;
     }
     #[cfg(not(unix))]
     fs::create_dir_all(dir).map_err(|e| Error::Store(format!("{} を作れない: {e}", dir.display())))?;
@@ -248,18 +253,66 @@ fn tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()))
 }
 
-/// 他のユーザーが読めるファイルは使わない（Unix）。Windows は作るときに ACL を絞っている
+/// 他のユーザーが読める・自分の所有でないファイルは使わない（Unix。通常のファイルだけ）。
+/// Windows は作るときに ACL を絞るだけで、既存のファイルの ACL は確かめない（docs/connectivity.md の既知の制約）
 pub fn check_private(path: &Path) -> Result<()> {
     let meta = fs::metadata(path).map_err(|e| Error::Store(format!("{} を読めない: {e}", path.display())))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        if !meta.is_file() {
+            return Err(Error::Store(format!("{} は通常のファイルではない", path.display())));
+        }
         if meta.permissions().mode() & 0o077 != 0 {
             return Err(Error::Store(format!("{} を他のユーザーも読める状態なので使わない（chmod 600 にしてください）", path.display())));
         }
+        check_owner(&meta, path)?;
     }
     let _ = meta;
     Ok(())
+}
+
+/// 追記で開いた既存のファイル（ログなど）を本人だけのものにする（Unix）。自分の所有でなければ断り、
+/// 他のユーザーが読める状態なら 0600 に直す（ログは自分が作ったものなので、鍵のように止めずに直す）。Windows では何もしない
+pub fn secure_existing_file(file: &fs::File, path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = file.metadata().map_err(|e| Error::Store(format!("{} を読めない: {e}", path.display())))?;
+        if !meta.is_file() {
+            return Err(Error::Store(format!("{} は通常のファイルではない", path.display())));
+        }
+        check_owner(&meta, path)?;
+        if meta.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(0o600)).map_err(|e| Error::Store(format!("{} の権限を 0600 に直せない: {e}", path.display())))?;
+        }
+    }
+    let _ = (file, path);
+    Ok(())
+}
+
+/// 自分の所有か（Unix）。std に euid を返す関数が無いので、作ったばかりの一時ファイルの所有者と比べる
+#[cfg(unix)]
+fn check_owner(meta: &fs::Metadata, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    match current_uid() {
+        Some(me) if meta.uid() != me => Err(Error::Store(format!("{} は別のユーザーの所有なので使わない", path.display()))),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    static UID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *UID.get_or_init(|| {
+        let probe = tmp_path(&std::env::temp_dir().join("tune-link-uid"));
+        let f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&probe).ok()?;
+        let uid = f.metadata().ok().map(|m| m.uid());
+        drop(f);
+        let _ = fs::remove_file(&probe);
+        uid
+    })
 }
 
 /// Windows: 継承した権限を外し、いまのユーザーだけに許可する（icacls。引数はパスとユーザー名だけ）
@@ -342,10 +395,39 @@ mod tests {
             // 他のユーザーが読める状態にしたら使わない
             fs::set_permissions(dir.join(KEY_FILE), fs::Permissions::from_mode(0o644)).unwrap();
             assert!(DeviceKeys::load(&dir).is_err());
+            fs::set_permissions(dir.join(KEY_FILE), fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(DeviceKeys::load(&dir).is_ok());
+            // 緩いディレクトリも使わない（勝手に直さない）
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(ensure_private_dir(&dir).is_err());
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         }
         // 一時ファイルを残さない
         let left: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
         assert_eq!(left, vec![std::ffi::OsString::from(KEY_FILE)]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_files_are_checked_and_logs_are_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmpdir("existing");
+        ensure_private_dir(&dir).unwrap();
+        let p = dir.join("log.jsonl");
+        // 既存の緩いファイルを追記で開いても、0600 に直す
+        fs::write(&p, b"old\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        let f = fs::OpenOptions::new().append(true).open(&p).unwrap();
+        assert!(check_private(&p).is_err());
+        secure_existing_file(&f, &p).unwrap();
+        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(check_private(&p).is_ok());
+        // ファイルでないもの（ディレクトリ）は鍵・台帳として使わない
+        fs::create_dir(dir.join("sub")).unwrap();
+        assert!(check_private(&dir.join("sub")).is_err());
+        // 自分の所有であること（uid が取れて、いまの所有者と同じ）
+        assert!(current_uid().is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 

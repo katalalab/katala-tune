@@ -163,6 +163,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 台帳を作ったあとの add・remove は、既にあるファイルを置き換える（Windows の CI でも通る。`std::fs::rename` は
+    /// Windows でも既存の行き先を置き換える）。途中の一時ファイルを残さない
+    #[test]
+    fn repeated_add_and_remove_replace_the_existing_ledger() {
+        let dir = std::env::temp_dir().join(format!("tune-link-peers-replace-{}-{}", std::process::id(), crate::now_ms()));
+        let s = PeerStore::new(&dir);
+        let keys: Vec<DeviceKeys> = (0..3).map(|_| DeviceKeys::generate().unwrap()).collect();
+        for (i, k) in keys.iter().enumerate() {
+            s.add(Peer { role: Role::Console, card: k.card(&format!("c{i}")), paired_at: i as i64, addr: None }).unwrap();
+            assert_eq!(s.list().unwrap().len(), i + 1, "2 回目以降の add も通る");
+        }
+        assert_eq!(s.remove("c1").unwrap(), 1);
+        assert_eq!(s.remove("c0").unwrap(), 1);
+        assert_eq!(s.list().unwrap().len(), 1);
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from(PEERS_FILE)], "一時ファイルを残さない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn hex_of(b: &[u8]) -> String {
         crate::hex::encode(b)
     }
