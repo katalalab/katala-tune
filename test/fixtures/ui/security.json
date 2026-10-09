@@ -1,0 +1,123 @@
+{
+  "_comment": "「セキュリティ」の画面の架空データ。raw は調査スクリプトの netsec の形（プレビューで lib/netsec.js が正規化・判定する）。アドレスは文書用の範囲と私用の範囲だけ",
+  "nodes": {
+    "studio-mac": {
+      "raw": {
+        "listen": [
+          { "proto": "tcp", "addr": "*", "port": 7000, "proc": "ControlCenter" },
+          { "proto": "tcp", "addr": "*", "port": 5000, "proc": "ControlCenter" },
+          { "proto": "tcp", "addr": "*", "port": 22, "proc": "sshd" },
+          { "proto": "tcp", "addr": "*", "port": 3000, "proc": "node" },
+          { "proto": "tcp", "addr": "10.20.30.40", "port": 41641, "proc": "tailscaled" },
+          { "proto": "tcp", "addr": "127.0.0.1", "port": 11434, "proc": "ollama" },
+          { "proto": "udp", "addr": "*", "port": 5353, "proc": "mDNSResponder" }
+        ],
+        "defense": { "firewall": 1, "stealth": true, "gatekeeper": true, "xprotect_version": "5363", "xprotect_at": "@-10080m" }
+      },
+      "prev": { "listen": [
+        { "proto": "tcp", "addr": "*", "port": 7000, "proc": "ControlCenter" },
+        { "proto": "tcp", "addr": "*", "port": 5000, "proc": "ControlCenter" },
+        { "proto": "tcp", "addr": "*", "port": 22, "proc": "sshd" },
+        { "proto": "tcp", "addr": "10.20.30.40", "port": 52011, "proc": "tailscaled" }
+      ] },
+      "persist_count": 41,
+      "persist_changes": [{ "kind": "launchd", "key": "user:com.example.updater", "program": "updater", "change": "added" }],
+      "peers": { "learning": false, "known": 214, "new": [
+        { "proc": "python3", "port": 4444, "why": "proc", "dests": 1, "public": true },
+        { "proc": "ssh", "port": 2222, "why": "port", "dests": 1, "public": false }
+      ] },
+      "cursor": true
+    },
+    "air-m3": {
+      "raw": {
+        "listen": [
+          { "proto": "tcp", "addr": "*", "port": 49231, "proc": "rapportd" },
+          { "proto": "tcp", "addr": "127.0.0.1", "port": 5432, "proc": "postgres" }
+        ],
+        "defense": { "firewall": 0, "stealth": false, "gatekeeper": true, "xprotect_version": "5363", "xprotect_at": "@-14400m" }
+      },
+      "prev": null,
+      "persist_count": 18,
+      "persist_changes": [],
+      "persist_baseline": ["launchd"],
+      "peers": { "learning": true, "until": "@5760m", "known": 63, "new": [] },
+      "cursor": true
+    },
+    "build-mini": {
+      "raw": {
+        "listen": [{ "proto": "tcp", "addr": "*", "port": 22, "proc": "sshd" }, { "proto": "tcp", "addr": "127.0.0.1", "port": 8080, "proc": "java" }],
+        "defense": { "firewall": 2, "stealth": true, "gatekeeper": true, "xprotect_version": "5363", "xprotect_at": "@-2880m" }
+      },
+      "prev": { "listen": [{ "proto": "tcp", "addr": "*", "port": 22, "proc": "sshd" }] },
+      "persist_count": 9,
+      "persist_changes": [],
+      "peers": { "learning": false, "known": 88, "new": [] },
+      "cursor": true
+    },
+    "gpu-tower": {
+      "raw": {
+        "listen": [
+          { "proto": "tcp", "addr": "0.0.0.0", "port": 135, "proc": "svchost" },
+          { "proto": "tcp", "addr": "::", "port": 445, "proc": "System" },
+          { "proto": "tcp", "addr": "0.0.0.0", "port": 22, "proc": "sshd" },
+          { "proto": "tcp", "addr": "0.0.0.0", "port": 3389, "proc": "svchost" },
+          { "proto": "tcp", "addr": "0.0.0.0", "port": 49664, "proc": "lsass" },
+          { "proto": "tcp", "addr": "127.0.0.1", "port": 11434, "proc": "ollama" },
+          { "proto": "udp", "addr": "0.0.0.0", "port": 5353, "proc": "chrome" }
+        ],
+        "defense": {
+          "defender": { "realtime": true, "antivirus": true, "service": true, "mode": "Normal", "sig_age_days": 1, "sig_at": "@-1440m", "tamper": true },
+          "av": [{ "name": "Windows Defender", "enabled": true, "uptodate": true }],
+          "firewall": [{ "name": "Domain", "enabled": true }, { "name": "Private", "enabled": true }, { "name": "Public", "enabled": true }],
+          "active": ["Private"], "detections_30d": 1, "detections_open_30d": 0, "security_log": "ok"
+        }
+      },
+      "prev": { "listen": [
+        { "proto": "tcp", "addr": "0.0.0.0", "port": 135, "proc": "svchost" },
+        { "proto": "tcp", "addr": "::", "port": 445, "proc": "System" },
+        { "proto": "tcp", "addr": "0.0.0.0", "port": 22, "proc": "sshd" },
+        { "proto": "tcp", "addr": "0.0.0.0", "port": 49670, "proc": "lsass" }
+      ] },
+      "persist_count": 362,
+      "persist_changes": [{ "kind": "schtask", "key": "\\ExampleUpdaterTask", "program": "updater.exe", "change": "added" }, { "kind": "run", "key": "HKCU\\OldTool", "program": "oldtool.exe", "change": "removed" }],
+      "peers": { "learning": false, "known": 431, "new": [{ "proc": "chrome", "port": 8443, "why": "port", "dests": 2, "public": true }] },
+      "login": [{ "id": "log-login-fail", "severity": "warn", "title": "ログインの失敗が24時間で 34 件（送り元 2 か所、うち外部のアドレスから 30 件）" }],
+      "cursor": true
+    },
+    "media-pc": {
+      "raw": {
+        "listen": [{ "proto": "tcp", "addr": "::", "port": 445, "proc": "System" }, { "proto": "tcp", "addr": "0.0.0.0", "port": 8009, "proc": "media-server" }],
+        "defense": {
+          "defender": { "realtime": false, "antivirus": false, "service": true, "mode": "Normal", "sig_age_days": 12, "sig_at": "@-17280m", "tamper": false },
+          "av": [{ "name": "Windows Defender", "enabled": false, "uptodate": false }],
+          "firewall": [{ "name": "Domain", "enabled": true }, { "name": "Private", "enabled": true }, { "name": "Public", "enabled": false }],
+          "active": ["Public"], "detections_30d": 0, "detections_open_30d": 0, "security_log": "no-permission"
+        }
+      },
+      "prev": { "listen": [{ "proto": "tcp", "addr": "::", "port": 445, "proc": "System" }, { "proto": "tcp", "addr": "0.0.0.0", "port": 8009, "proc": "media-server" }] },
+      "persist_count": 296,
+      "persist_changes": [],
+      "peers": { "learning": false, "known": 158, "new": [] },
+      "cursor": true
+    }
+  },
+  "events": [
+    { "ts": "@-15m", "node_id": "gpu-tower", "kind": "schtask", "key": "\\ExampleUpdaterTask", "change": "added", "program": "updater.exe", "from_program": null },
+    { "ts": "@-15m", "node_id": "gpu-tower", "kind": "run", "key": "HKCU\\OldTool", "change": "removed", "program": "oldtool.exe", "from_program": null },
+    { "ts": "@-14m", "node_id": "studio-mac", "kind": "launchd", "key": "user:com.example.updater", "change": "added", "program": "updater", "from_program": null },
+    { "ts": "@-1460m", "node_id": "studio-mac", "kind": "launchd", "key": "agent:com.example.helper", "change": "changed", "program": "helper2", "from_program": "helper" },
+    { "ts": "@-4400m", "node_id": "media-pc", "kind": "service", "key": "ExampleMediaService", "change": "added", "program": "media-server.exe", "from_program": null }
+  ],
+  "peers": [
+    { "node_id": "studio-mac", "proc": "python3", "addr": "203.0.113.45", "port": 4444, "first_seen": "@-14m", "last_seen": "@-14m", "seen": 1, "n_max": 1, "public": true },
+    { "node_id": "studio-mac", "proc": "ssh", "addr": "10.0.0.9", "port": 2222, "first_seen": "@-14m", "last_seen": "@-14m", "seen": 1, "n_max": 1, "public": false },
+    { "node_id": "gpu-tower", "proc": "chrome", "addr": "198.51.100.17", "port": 8443, "first_seen": "@-15m", "last_seen": "@-15m", "seen": 1, "n_max": 2, "public": true },
+    { "node_id": "gpu-tower", "proc": "chrome", "addr": "198.51.100.18", "port": 8443, "first_seen": "@-15m", "last_seen": "@-15m", "seen": 1, "n_max": 1, "public": true },
+    { "node_id": "build-mini", "proc": "brew", "addr": "2001:db8::443", "port": 443, "first_seen": "@-2900m", "last_seen": "@-75m", "seen": 3, "n_max": 2, "public": true }
+  ],
+  "logins": [
+    { "node_id": "gpu-tower", "source": "win_security", "provider": "203.0.113.77", "event_id": "4625", "n_24h": 30, "n_7d": 41, "last_ts": "@-25m", "public": true },
+    { "node_id": "gpu-tower", "source": "win_security", "provider": "192.168.1.30", "event_id": "4625", "n_24h": 4, "n_7d": 4, "last_ts": "@-200m", "public": false },
+    { "node_id": "studio-mac", "source": "mac_auth", "provider": "10.0.0.12", "event_id": "ssh-fail", "n_24h": 0, "n_7d": 2, "last_ts": "@-3000m", "public": false }
+  ]
+}

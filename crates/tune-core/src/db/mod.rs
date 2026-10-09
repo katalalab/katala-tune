@@ -12,6 +12,7 @@ mod ai_sessions;
 mod checks;
 mod inventory;
 mod logs;
+mod netsec;
 mod snapshots;
 
 use std::path::Path;
@@ -24,6 +25,7 @@ pub use ai_sessions::{AiIngested, SESSION_PAGE_MAX, Session as AiSession, TOK_KE
 pub use checks::{Change, Check};
 pub use inventory::InventorySaved;
 pub use logs::{LogCount, LogRow, TopSignature};
+pub use netsec::NET_EVENT_DAYS;
 pub use snapshots::Snapshot;
 
 pub const DB_FILE: &str = "katala-tune.db";
@@ -35,7 +37,8 @@ pub const QUERY_LIMIT_MAX: i64 = 2000;
 pub const SIGNATURE_LIMIT_MAX: i64 = 500;
 
 const PRAGMAS: &str = "PRAGMA journal_mode = WAL;\nPRAGMA synchronous = NORMAL;\n";
-const SCHEMA_PARTS: &[&str] = &[snapshots::SCHEMA, actions::SCHEMA, logs::SCHEMA, checks::SCHEMA, META_SCHEMA, inventory::SCHEMA, ai_sessions::SCHEMA];
+const SCHEMA_PARTS: &[&str] =
+    &[snapshots::SCHEMA, actions::SCHEMA, logs::SCHEMA, checks::SCHEMA, META_SCHEMA, inventory::SCHEMA, ai_sessions::SCHEMA, netsec::SCHEMA];
 const META_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT, updated_at INTEGER);\n";
 
 pub type Result<T> = rusqlite::Result<T>;
@@ -169,7 +172,7 @@ impl Store {
         Ok(n)
     }
 
-    /// 保持期限を過ぎたものを消す（ログ30日・状態の記録180日）
+    /// 保持期限を過ぎたものを消す（ログ30日・状態の記録180日・宛先30日）
     pub fn prune(&self, now: i64) -> Result<()> {
         self.conn.execute("DELETE FROM check_events WHERE ts < ?", [now - 180 * 86_400_000])?;
         let cut = now - LOG_RETENTION_DAYS * 86_400_000;
@@ -180,7 +183,9 @@ impl Store {
             )?;
             c.execute("DELETE FROM logs WHERE ts < ?", [cut])?;
             Ok(())
-        })
+        })?;
+        // ネットワークとセキュリティの記録（宛先 30 日・常駐の増減 180 日。db/netsec.rs）
+        self.net_prune(now)
     }
 }
 

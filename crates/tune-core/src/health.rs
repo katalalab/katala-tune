@@ -257,10 +257,12 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
         out.add("stability", "安定性", "ok", "パニックの記録なし");
     }
     let def = get(d, "defender");
-    if truthy(def) {
+    // netsec（netsec.rs）があれば、防御・待ち受け・常駐の増減・ログイン・初めての接続先をそちらで判定する（Defender もそこに含む）
+    if truthy(def) && !truthy(get(get(d, "netsec"), "defense")) {
         let rt = truthy(get(def, "realtime"));
         out.add("defender", "Defender", if rt { "ok" } else { "warn" }, if rt { "リアルタイム保護 有効" } else { "リアルタイム保護 無効" });
     }
+    out.0.extend(crate::netsec::checks(get(d, "netsec"), findings, ctx, node));
     let flood: Vec<&Value> = findings.iter().filter(|f| string(f.get("id")).starts_with("log-flood-")).collect();
     out.add(
         "flood",

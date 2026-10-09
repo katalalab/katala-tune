@@ -15,6 +15,7 @@
 //! | [`ai_sessions`] | AI エージェント（Claude Code・Codex）のセッションの取り込み | （tune-core だけ） |
 //! | [`collate`] | `localeCompare` の近似（並び順を JS 版と揃える） | |
 //! | [`engine_tools`] | 棚卸し・Do-gu・AI の流れ（[`engine::Engine`] のメソッド） | main.js の runInventory・inventoryView・dogu-* |
+//! | [`netsec`] | ネットワークとセキュリティ（待ち受け・防御・常駐の増減・ログイン・初めての接続先。正規化・判定・状態と、DB を使う取り込み・画面） | lib/netsec.js（DB を使う部分は tune-core だけ） |
 //! | [`live`] | ライブ表示（画面が見ているあいだだけ 1〜2 秒ごとに取る。経路・解析・保持・管理） | なし（Tauri 版だけ） |
 //!
 //! 表の定義は `db/` に機能ごとに置く（inventory は Electron 版と同じ表、ai_sessions は tune-core だけの表）。
@@ -32,5 +33,6 @@ pub mod inventory;
 pub mod js;
 pub mod live;
 pub mod logs;
+pub mod netsec;
 pub mod nodes;
 pub mod rules;

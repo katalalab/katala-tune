@@ -1,5 +1,5 @@
 # タグ v* で Tauri 版をビルドし、GitHub Releases に下書きとして置く（docs/release.md）。
-# 公開（下書きを外す）は操作者が中身を確かめてから行う。公開すると latest.json が自動更新の対象になる。
+# 公開（下書きを外す）は操作者が中身を確かめてから行う。通常リリースを latest として公開すると latest.json が更新確認の対象になる。prerelease は手動配布。
 # 第三者の action は使わない（GitHub 公式の checkout・upload-artifact・download-artifact だけ。ツールは runner の rustup・cargo・gh・jq）
 name: release
 

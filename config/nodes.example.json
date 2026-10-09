@@ -46,7 +46,8 @@
       "os": "windows",
       "role": "共用 PC",
       "shared": true,
-      "note": "shared: true の機体は提案だけで、変更を実行しない"
+      "network": false,
+      "note": "shared: true の機体は提案だけで、変更を実行しない。network: false でネットワークとセキュリティ（待ち受け・防御・常駐の増減・接続先・ログイン）を集めない"
     }
   ],
   "schedule": {

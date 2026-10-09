@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { redact, fingerprint, normalize, logFindings, windowsRemoteTransport } = require('../lib/logs');
+const { redact, fingerprint, normalize, logFindings, windowsRemoteTransport, sourceError } = require('../lib/logs');
 const { openDb } = require('../lib/db');
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'kt-test-'));
@@ -76,6 +76,11 @@ test('取り込み位置: 成功で位置と捨てた数を記録し、失敗で
   assert.equal(c2.cursor, '120');
   assert.equal(c2.dropped_total, 7);
   assert.equal(c2.last_error, null);
+});
+
+test('ログオン権限欠測は成功扱いにせず cursor のエラーにする', () => {
+  assert.equal(sourceError({ rows: [], note: 'no-permission' }), 'no-permission');
+  assert.equal(sourceError({ rows: [], note: 'ok' }), null);
 });
 
 test('ログから所見: WHEA・GPU リセット・NeonMonitor の自動保護', () => {

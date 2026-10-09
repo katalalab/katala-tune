@@ -1,5 +1,4 @@
 'use strict';
-// 画面（renderer/agents.js・tools.js）の IIFE を vm で読み、中の関数を取り出して確かめる
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -12,7 +11,7 @@ function load(file, exports, extra = {}) {
   vm.runInContext(source.replace(/\}\)\(\);\s*$/, `window.review = { ${exports} };})();`), context);
   return window.review;
 }
-test('AI の一覧を読めず囲みに置き換わったとき、無い検索・種類・ページ送りにハンドラを付けない', () => {
+test('AI一覧読取エラーでも存在しない検索・種類・pagerを操作しない', () => {
   const missing = new Set(['#aiQ', '#aiKind', '#aiPrev', '#aiNext']);
   const controls = new Map();
   const select = id => missing.has(id) ? null : (controls.get(id) || (controls.set(id, {}), controls.get(id)));
@@ -20,13 +19,13 @@ test('AI の一覧を読めず囲みに置き換わったとき、無い検索�
   assert.doesNotThrow(() => bind());
   assert.equal(typeof controls.get('#aiDays').onchange, 'function');
 });
-test('AI の一覧を読めたときは、ページ送りのハンドラを付ける', () => {
+test('AI一覧成功時はpager操作を登録する', () => {
   const controls = new Map();
   const { bind } = load('agents.js', 'bind', { $: id => controls.get(id) || (controls.set(id, {}), controls.get(id)), $$: () => [], bindSearch: () => {} });
   bind();
   for (const id of ['#aiPrev', '#aiNext']) assert.equal(typeof controls.get(id).onclick, 'function');
 });
-test('道具の黄色の強調と多数決は、版の先頭の数字の並びを機体ごとに1回だけ数えて比べる', () => {
+test('道具の黄色表示も版の数字部分を機体単位で比較する', () => {
   const { cellOf } = load('tools.js', 'cellOf');
   const group = { drift: true, nodes: {
     a: { versions: ['2.51.0'], sources: [] },
@@ -42,4 +41,9 @@ test('道具の黄色の強調と多数決は、版の先頭の数字の並び�
   } };
   assert.equal(cellOf({}, duplicates, 'a').diff, true);
   assert.equal(cellOf({}, duplicates, 'b').diff, false);
+});
+
+test('セキュリティの学習中表示も選択した機体だけに絞る', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../renderer/security.js'), 'utf8');
+  assert.match(source, /const learning = pick\(d\.nodes\)\.filter\(\(n\) => n\.netsec\?\.peers\?\.learning\)/);
 });

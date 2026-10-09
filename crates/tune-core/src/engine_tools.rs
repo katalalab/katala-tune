@@ -13,7 +13,7 @@ use crate::dogu::{self, Http, Matcher};
 use crate::engine::{Confirm, Engine};
 use crate::inventory::{self, items_of, matrix};
 use crate::js;
-use crate::nodes::{Config, Node};
+use crate::nodes::Node;
 
 /// 棚卸し・AI の取り込みの実行中の印と、機体ごとの前回のエラー
 #[derive(Default)]
@@ -31,12 +31,6 @@ static NEXT_DOGU_PUBLISH_ID: AtomicU64 = AtomicU64::new(0);
 
 fn dogu_publish_action_id(at: i64) -> String {
     format!("{at}-dogu-{}-{}", std::process::id(), NEXT_DOGU_PUBLISH_ID.fetch_add(1, Ordering::Relaxed))
-}
-
-/// 今の台帳で AI のセッションを取り込む機体。「続きあり」はこの機体の続きの位置だけで判定する
-/// （台帳から外した機体・`ai_sessions: false` にした機体の古い位置で、空の取り込みを 2 分ごとに回し続けない）
-fn ai_node_ids(cfg: &Config) -> Vec<&str> {
-    cfg.nodes.iter().filter(|n| ai_sessions::enabled(n)).map(|n| n.id.as_str()).collect()
 }
 
 impl Engine {
@@ -274,8 +268,8 @@ impl Engine {
     }
 
     async fn ai_sync_one(&self, n: &Node) -> Value {
-        let files = self.with_db(|d| d.ai_files(&n.id)).unwrap_or_default();
-        let (fetched, wall_s) = ai_sessions::fetch(n, &files).await;
+        let (files, claude_replay) = self.with_db(|d| Ok((d.ai_files(&n.id)?, d.ai_claude_replay(&n.id)?))).unwrap_or_default();
+        let (fetched, wall_s) = ai_sessions::fetch(n, &files, &claude_replay).await;
         let now = now_ms();
         let out = match fetched {
             Fetched::Ok(v) => match self.with_db(|d| d.ai_ingest(&n.id, &v, now)) {
@@ -307,9 +301,9 @@ impl Engine {
     pub fn ai_summary(&self, f: &Value) -> Result<Value, String> {
         let cfg = self.config();
         let now = now_ms();
-        let ids = ai_node_ids(&cfg);
+        let enabled: Vec<String> = cfg.nodes.iter().filter(|n| ai_sessions::enabled(n)).map(|n| n.id.clone()).collect();
         let (mut s, cursors, last_at, pending) =
-            self.with_db(|d| Ok((d.ai_summary(f, now)?, d.ai_cursors()?, d.get_meta("lastAiAt")?, d.ai_pending(&ids)?)))?;
+            self.with_db(|d| Ok((d.ai_summary(f, now)?, d.ai_cursors()?, d.get_meta("lastAiAt")?, d.ai_pending(&enabled)?)))?;
         let nodes: Vec<Value> = cfg
             .nodes
             .iter()
@@ -354,8 +348,8 @@ impl Engine {
             self.run_inventory(None).await;
         }
         if !self.is_ai_syncing() {
-            let cfg = self.reload_config();
-            let pending = self.with_db(|d| d.ai_pending(&ai_node_ids(&cfg))).unwrap_or(false);
+            let enabled: Vec<String> = self.config().nodes.iter().filter(|n| ai_sessions::enabled(n)).map(|n| n.id.clone()).collect();
+            let pending = self.with_db(|d| d.ai_pending(&enabled)).unwrap_or(false);
             let mins = if pending { CATCH_UP_MINUTES as f64 } else { js::num(s.get("ai_minutes")) };
             if mins.is_finite() && since("lastAiAt") >= mins * 60_000.0 {
                 self.ai_sync(None).await;

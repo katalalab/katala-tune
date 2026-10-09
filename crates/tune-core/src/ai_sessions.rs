@@ -24,11 +24,13 @@ pub const DEFAULT_AI_MINUTES: i64 = 30;
 pub const CATCH_UP_MINUTES: i64 = 2;
 const TIMEOUT: Duration = Duration::from_secs(150);
 
-/// 続きの位置を埋め込んだスクリプト。位置は {"files": {鍵: 数}} だけなので、JSON がそのまま Python の辞書として読める
-pub fn script(files: &Map<String, Value>) -> String {
+/// 続きの位置と、旧cursorの一度限りのClaude replay対象を埋め込む。
+pub fn script(files: &Map<String, Value>, claude_replay: &Value) -> String {
     let clean: Map<String, Value> = files.iter().filter(|(_, v)| v.is_u64() || v.is_i64()).map(|(k, v)| (k.clone(), v.clone())).collect();
-    let state = json!({ "files": clean }).to_string();
-    AI_PROBE.replacen("KT_STATE = {}", &format!("KT_STATE = {state}"), 1)
+    let replay = claude_replay.as_array().cloned().unwrap_or_default();
+    let state = json!({ "files": clean, "claude_replay": replay }).to_string();
+    let literal = serde_json::to_string(&state).unwrap_or_else(|_| "\"{}\"".into());
+    AI_PROBE.replacen("KT_STATE = {}", &format!("KT_STATE = json.loads({literal})"), 1)
 }
 
 /// Windows（ssh の既定シェルは Git Bash）で動く python を探して実行する。無ければ印を出す
@@ -75,9 +77,9 @@ pub fn parse(r: &RunResult) -> Fetched {
 }
 
 /// 1台を調べる
-pub async fn fetch(node: &Node, files: &Map<String, Value>) -> (Fetched, f64) {
+pub async fn fetch(node: &Node, files: &Map<String, Value>, claude_replay: &Value) -> (Fetched, f64) {
     let started = Instant::now();
-    let src = script(files);
+    let src = script(files, claude_replay);
     let input = Some(src.as_bytes());
     let res = if node.is_mac() {
         if node.local {
@@ -130,8 +132,9 @@ mod tests {
         let mut m = Map::new();
         m.insert("claude:~-work/a \"b\".jsonl".into(), json!(12));
         m.insert("bad".into(), json!("x"));
-        let s = script(&m);
-        assert!(s.contains("KT_STATE = {\"files\":{\"claude:~-work/a \\\"b\\\".jsonl\":12}}"));
+        let s = script(&m, &json!(["claude:~-work/a \"b\".jsonl"]));
+        assert!(s.contains("KT_STATE = json.loads("));
+        assert!(s.contains("\\\"files\\\":{\\\"claude:~-work/a"));
         assert!(!s.contains("KT_STATE = {}"));
         assert!(!s.contains("\"bad\""));
     }
@@ -169,7 +172,7 @@ mod tests {
         let mut child = c.spawn().unwrap();
         use tokio::io::AsyncWriteExt;
         let mut si = child.stdin.take().unwrap();
-        si.write_all(script(&Map::new()).as_bytes()).await.unwrap();
+        si.write_all(script(&Map::new(), &json!({})).as_bytes()).await.unwrap();
         drop(si);
         let o = child.wait_with_output().await.unwrap();
         let r = RunResult { code: o.status.code(), out: String::from_utf8_lossy(&o.stdout).into(), err: String::new() };

@@ -14,6 +14,7 @@ const logs = require('./lib/logs');
 const health = require('./lib/health');
 const inventory = require('./lib/inventory');
 const dogu = require('./lib/dogu');
+const netsec = require('./lib/netsec');
 
 const IS_MAC = process.platform === 'darwin';
 const IS_WIN = process.platform === 'win32';
@@ -61,11 +62,13 @@ function summarize(e) {
 function enrich(result, prevData) {
   if (!result.ok) return result;
   const node = nodeById(result.node_id);
-  const findings = [...analyze(result.data, node), ...logs.logFindings(db, result.node_id)];
+  const data = netsec.snapshotForNode(result.data, node);
+  const prev = netsec.snapshotForNode(prevData, node);
+  const findings = [...analyze(data, node), ...netsec.filterLogFindings(logs.logFindings(db, result.node_id), node)];
   const SEV = { critical: 0, warn: 1, info: 2 };
   findings.sort((a, b) => SEV[a.severity] - SEV[b.severity]);
   if (node?.shared) for (const f of findings) if (f.action) f.action.blocked = '共用機のため、この画面からは実行しない（持ち主と相談）';
-  return { ...result, findings, score: score(findings), compare: compare(prevData, result.data) };
+  return { ...result, data, findings, score: score(findings), compare: compare(prev, data) };
 }
 
 // ---- 状態（機能チェック） ----
@@ -77,8 +80,9 @@ function computeChecks({ notify = true, broadcast = true } = {}) {
   const changed = [];
   for (const n of cfg.nodes) {
     const [last] = db.lastSnapshots(n.id, 1);
-    const full = last ? enrich({ node_id: n.id, ok: true, data: last.data, at: last.at, wall_s: last.wall_s }) : null;
-    const checks = health.nodeChecks(n, last || null, full?.findings || [], { now, cursors, expect: n.expect, schedule: sch, lastError: lastProbeError[n.id] });
+    const safeLast = last ? { ...last, data: netsec.snapshotForNode(last.data, n) } : null;
+    const full = safeLast ? enrich({ node_id: n.id, ok: true, data: safeLast.data, at: safeLast.at, wall_s: safeLast.wall_s }) : null;
+    const checks = health.nodeChecks(n, safeLast, full?.findings || [], { now, cursors, expect: n.expect, schedule: sch, lastError: lastProbeError[n.id] });
     changed.push(...db.saveChecks(n.id, checks, now));
   }
   const integ = db.integrity();
@@ -120,6 +124,8 @@ async function runProbe(ids, { auto = false } = {}) {
     const targets = cfg.nodes.filter((n) => !ids?.length || ids.includes(n.id));
     const results = await probeAll(targets, (r) => {
       const prev = db.lastSnapshots(r.node_id, 1)[0];
+      // ネットワークとセキュリティ: 正規化して前回の待ち受けと比べ、宛先の一覧は snapshot に残さない（増減と接続先の記録は Tauri 版だけ）
+      if (r.ok && r.data?.netsec) r.data.netsec = netsec.prepare(r.data.netsec, r.data.probe, prev?.data?.netsec, r.at);
       const full = enrich(r, prev?.data);
       if (full.ok) {
         delete lastProbeError[r.node_id];
@@ -222,13 +228,17 @@ ipcMain.handle('probe', (_e, ids) => runProbe(ids).then((r) => { if (!ids?.lengt
 ipcMain.handle('history', (_e, id) => db.history(id, 60));
 ipcMain.handle('logs-sync', (_e, ids) => syncLogs(reloadConfig().nodes.filter((n) => !ids?.length || ids.includes(n.id))));
 ipcMain.handle('logs-query', (_e, f) => {
-  try { return { rows: db.queryLogs(f || {}) }; } catch (e) { return { error: String(e.message || e) }; }
+  try { return { rows: netsec.filterLogRows(db.queryLogs(f || {}), cfg.nodes) }; } catch (e) { return { error: String(e.message || e) }; }
 });
-ipcMain.handle('logs-signatures', (_e, f) => db.signatures(f || {}));
-ipcMain.handle('logs-cursors', () => db.cursors());
+ipcMain.handle('logs-signatures', (_e, f) => netsec.filterLogSignatures(db.signatures(f || {}), cfg.nodes));
+ipcMain.handle('logs-cursors', () => netsec.filterLogRows(db.cursors(), cfg.nodes));
 ipcMain.handle('status', () => {
   computeChecks({ notify: false, broadcast: false });
-  return { checks: db.checks(), events: db.checkEvents(150), schedule: schedule(), lastProbeAt: db.getMeta('lastProbeAt'), lastLogsAt: db.getMeta('lastLogsAt'), openAtLogin: app.getLoginItemSettings().openAtLogin, counts: statusCounts(), probing, syncing };
+  const checks = netsec.filterCheckRows(db.checks(), cfg.nodes);
+  const events = netsec.filterCheckRows(db.checkEvents(150), cfg.nodes);
+  const counts = { ok: 0, warn: 0, fail: 0, unknown: 0 };
+  for (const row of checks) counts[row.status] = (counts[row.status] || 0) + 1;
+  return { checks, events, schedule: schedule(), lastProbeAt: db.getMeta('lastProbeAt'), lastLogsAt: db.getMeta('lastLogsAt'), openAtLogin: app.getLoginItemSettings().openAtLogin, counts, probing, syncing };
 });
 ipcMain.handle('set-schedule', (_e, patch) => {
   const s = { ...(db.getMeta('schedule') || {}) };
