@@ -104,7 +104,10 @@ AI のセッション中に落ちた常駐、負荷の高い時間帯との重�
 
 - 受けるのは `POST /v1/logs`・`POST /v1/metrics` の `application/json` だけ。protobuf・圧縮・トレース（`/v1/traces`）は受けない（依存を増やさないため。断ると 415・404 を返す）
 - 待つのは 127.0.0.1 だけ。Host が 127.0.0.1・localhost・[::1] 以外の要求は断る（ブラウザからの書き込み・DNS rebinding を防ぐ）
-- **落とし方は許可リスト**: 文字列の属性は、決めた名前（`event.name`・`session.id`・`model`・`tool_name`・`decision`・`success`・`error_type` など。一覧は `KEEP_STRING`）で、128 文字までのものだけ残す。数・真偽は残す。配列・入れ子・バイト列は残さない。ログの本文はイベント名の形のときだけ。トレース ID・exemplar は残さない。各行に落とした数（`dropped`）を書く
+- **落とし方は許可リスト**: 文字列の属性は、決めた名前（`event.name`・`session.id`・`model`・`tool_name`・`decision`・`success`・`error_type` など。一覧は `KEEP_STRING`）で、128 文字までのものだけ残す。数・真偽は残す。配列・入れ子・バイト列は残さない。トレース ID・exemplar は残さない
+- **ログの本文は既知のイベント名と一致するときだけ**: `KNOWN_EVENTS`（Claude Code・Codex の公式の一覧）にある名前だけ残し、それ以外（`secret_token` のような識別子の形の本文も）は落とす。形では判断しない。出典（2026-10-09 に確認）: Claude Code は <https://code.claude.com/docs/en/monitoring-usage> の「Event Name」（`claude_code.` 付き）と `event.name` 属性（接頭辞なし。ページに版の記載は無く、属性ごとに最小の版が付く。最新の言及は v2.1.287）、Codex は <https://developers.openai.com/codex/config-advanced> の OpenTelemetry の節（`codex.conversation_starts`・`api_request`・`sse_event`・`websocket_request`・`websocket_event`・`user_prompt`・`tool_decision`・`tool_result`。版・日付の記載なし）。新しい版のイベントは本文として残らない（増えたら一覧に足す）
+- **大きさの上限**: 1 つの属性リストから残すのは 64 個まで（`MAX_ATTRS`。超えた分は落として数える）。リソースの属性は行ごとに複製せず、リソースごとに 1 行（`"kind":"resource"`、`id` つき）だけ書き、各行は `res` でそれを指す。1 回の要求から書く行は 1 万行まで（リソースの行を含む）。8 MiB・1 万件の要求のテストで、出力が膨らまないことを確かめている
+- 各行に落とした数（`dropped`）を書く（リソースの分はリソースの行に）
 - だから `prompt`・`prompt_text`・`tool_parameters`・`tool_input`・`error`（Claude Code）、`arguments`・`output`（Codex の `codex.tool_result`）、`user.email`・`vcs.repository.url.full`・`workspace.host_paths` などは、設定を間違えて本文の出力をオンにしても残らない（`otlp::tests` で確かめている）
 
 ### 各機体での設定（手順だけ。配布は操作者の確認のあと）

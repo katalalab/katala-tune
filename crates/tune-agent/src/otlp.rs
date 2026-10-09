@@ -7,7 +7,10 @@
 //!   （`prompt`・`tool_parameters`・Codex の `arguments`・`output`・`error`・`user.email` などは残らない）
 //! - 数・真偽の属性: 名前が識別子の形なら残す（本文を運べない）
 //! - 配列・入れ子・バイト列の属性: 残さない
-//! - ログの本文（body）: イベント名の形（英数と `._:-`、80 文字まで）のときだけ残す
+//! - ログの本文（body）: 既知のイベント名（[`KNOWN_EVENTS`]。Claude Code・Codex の公式の一覧）と一致するときだけ残す。
+//!   「識別子の形」だけでは `secret_token` のような本文も通るので、形では判断しない
+//! - 1 つのリストから残す属性は [`MAX_ATTRS`] 個まで。リソースの属性は行ごとに複製せず、リソースごとに 1 行（`kind: "resource"`）だけ書き、
+//!   各行は `res` でそれを指す
 //! - トレース ID・スパン ID・exemplar（メトリクスに付く標本）: 残さない
 //!
 //! 受けるのは `POST /v1/logs`・`POST /v1/metrics` の `application/json`（`http/json`）だけ。protobuf と圧縮は受けない
@@ -36,6 +39,84 @@ const MAX_BODY: usize = 8 << 20;
 /// 1 回の要求から書く行の上限
 const MAX_LINES: usize = 10_000;
 const MAX_STRING: usize = 128;
+/// 1 つの属性リストから残す個数の上限（超えた分は落として `dropped` に数える）
+pub const MAX_ATTRS: usize = 64;
+
+/// 本文（body）として残してよいイベント名。出典（2026-10-09 に確認）:
+/// - Claude Code: <https://code.claude.com/docs/en/monitoring-usage> の「Event Name」（`claude_code.` 付き）と、
+///   同じページの `event.name` 属性（接頭辞なし）。ページに版の記載は無く、属性ごとに最小の版（最新の言及は v2.1.287）が付く
+/// - Codex: <https://developers.openai.com/codex/config-advanced> の OpenTelemetry の節（版・日付の記載なし）
+///
+/// 一覧に無い名前（新しい版のイベント）は本文として残らない。増えたら足す。
+pub const KNOWN_EVENTS: &[&str] = &[
+    // Claude Code（接頭辞つき）
+    "claude_code.user_prompt",
+    "claude_code.assistant_response",
+    "claude_code.tool_result",
+    "claude_code.api_request",
+    "claude_code.api_error",
+    "claude_code.api_refusal",
+    "claude_code.api_request_body",
+    "claude_code.api_response_body",
+    "claude_code.api_retries_exhausted",
+    "claude_code.tool_decision",
+    "claude_code.permission_mode_changed",
+    "claude_code.auth",
+    "claude_code.mcp_server_connection",
+    "claude_code.internal_error",
+    "claude_code.plugin_installed",
+    "claude_code.plugin_loaded",
+    "claude_code.skill_activated",
+    "claude_code.at_mention",
+    "claude_code.system_prompt",
+    "claude_code.hook_registered",
+    "claude_code.hook_execution_start",
+    "claude_code.hook_execution_complete",
+    "claude_code.hook_plugin_metrics",
+    "claude_code.compaction",
+    "claude_code.subagent_completed",
+    "claude_code.feedback_survey",
+    "claude_code.retention_sweep",
+    "claude_code.managed_settings_resolved",
+    // Claude Code（`event.name` 属性の形。接頭辞なし）
+    "user_prompt",
+    "assistant_response",
+    "tool_result",
+    "api_request",
+    "api_error",
+    "api_refusal",
+    "api_request_body",
+    "api_response_body",
+    "api_retries_exhausted",
+    "tool_decision",
+    "permission_mode_changed",
+    "auth",
+    "mcp_server_connection",
+    "internal_error",
+    "plugin_installed",
+    "plugin_loaded",
+    "skill_activated",
+    "at_mention",
+    "system_prompt",
+    "hook_registered",
+    "hook_execution_start",
+    "hook_execution_complete",
+    "hook_plugin_metrics",
+    "compaction",
+    "subagent_completed",
+    "feedback_survey",
+    "retention_sweep",
+    "managed_settings_resolved",
+    // Codex
+    "codex.conversation_starts",
+    "codex.api_request",
+    "codex.sse_event",
+    "codex.websocket_request",
+    "codex.websocket_event",
+    "codex.user_prompt",
+    "codex.tool_decision",
+    "codex.tool_result",
+];
 
 /// 文字列のまま残してよい属性の名前（Claude Code・Codex のイベントとメトリクスの、本文でない属性）
 pub const KEEP_STRING: &[&str] = &[
@@ -123,7 +204,7 @@ fn keep_attrs(list: Option<&Value>) -> (Map<String, Value>, usize) {
     let mut dropped = 0;
     for kv in list.and_then(Value::as_array).into_iter().flatten() {
         let key = kv.get("key").and_then(Value::as_str).unwrap_or("");
-        match kv.get("value").filter(|_| ident(key, 64)).and_then(|v| keep_value(key, v)) {
+        match kv.get("value").filter(|_| ident(key, 64) && (out.len() < MAX_ATTRS || out.contains_key(key))).and_then(|v| keep_value(key, v)) {
             Some(v) => {
                 out.insert(key.to_string(), v);
             }
@@ -154,27 +235,54 @@ struct Resource {
     service: Value,
     attrs: Map<String, Value>,
     dropped: usize,
+    /// `res` に書く参照。リソースの行を書いたあとに決まる
+    id: Value,
+    written: bool,
 }
 
 fn resource(r: &Value) -> Resource {
     let (attrs, dropped) = keep_attrs(r.get("resource").and_then(|x| x.get("attributes")));
-    Resource { service: attrs.get("service.name").cloned().unwrap_or(Value::Null), attrs, dropped }
+    Resource { service: attrs.get("service.name").cloned().unwrap_or(Value::Null), attrs, dropped, id: Value::Null, written: false }
+}
+
+impl Resource {
+    /// このリソースの最初のレコードの前に、リソースの行を 1 回だけ足す（レコードごとには複製しない）。
+    /// 足せたら（または書くものが無ければ）true。上限に達していたら false
+    fn emit(&mut self, lines: &mut Vec<Value>, received_ms: i64, seq: &mut usize) -> bool {
+        if self.written {
+            return true;
+        }
+        if self.attrs.is_empty() && self.dropped == 0 {
+            self.written = true;
+            return true;
+        }
+        if lines.len() >= MAX_LINES {
+            return false;
+        }
+        *seq += 1;
+        let id = format!("{received_ms}.{seq}");
+        lines.push(json!({ "kind": "resource", "id": id, "recv": received_ms, "service": self.service, "attrs": self.attrs, "dropped": self.dropped }));
+        self.id = json!(id);
+        self.written = true;
+        true
+    }
 }
 
 /// `ExportLogsServiceRequest`（JSON）→ 1 レコード 1 行
 pub fn logs_to_lines(req: &Value, received_ms: i64) -> Vec<Value> {
     let mut lines = Vec::new();
+    let mut seq = 0;
     for rl in req.get("resourceLogs").and_then(Value::as_array).into_iter().flatten() {
-        let res = resource(rl);
+        let mut res = resource(rl);
         for sl in rl.get("scopeLogs").and_then(Value::as_array).into_iter().flatten() {
             let scope = sl.get("scope").map_or(Value::Null, |s| ident_field(s, "name", 128));
             for rec in sl.get("logRecords").and_then(Value::as_array).into_iter().flatten() {
-                if lines.len() >= MAX_LINES {
+                if !res.emit(&mut lines, received_ms, &mut seq) || lines.len() >= MAX_LINES {
                     return lines;
                 }
                 let (attrs, mut dropped) = keep_attrs(rec.get("attributes"));
-                // 本文はイベント名の形のときだけ残す
-                let body = rec.get("body").and_then(|b| b.get("stringValue")).and_then(Value::as_str).filter(|s| ident(s, 80));
+                // 本文は既知のイベント名と一致するときだけ残す（形が識別子というだけでは残さない）
+                let body = rec.get("body").and_then(|b| b.get("stringValue")).and_then(Value::as_str).filter(|s| KNOWN_EVENTS.contains(s));
                 if rec.get("body").is_some_and(|b| !b.is_null()) && body.is_none() {
                     dropped += 1;
                 }
@@ -190,8 +298,8 @@ pub fn logs_to_lines(req: &Value, received_ms: i64) -> Vec<Value> {
                     "service": res.service,
                     "scope": scope,
                     "attrs": attrs,
-                    "resource": res.attrs,
-                    "dropped": dropped + res.dropped,
+                    "res": res.id,
+                    "dropped": dropped,
                 }));
             }
         }
@@ -202,8 +310,9 @@ pub fn logs_to_lines(req: &Value, received_ms: i64) -> Vec<Value> {
 /// `ExportMetricsServiceRequest`（JSON）→ 1 データ点 1 行
 pub fn metrics_to_lines(req: &Value, received_ms: i64) -> Vec<Value> {
     let mut lines = Vec::new();
+    let mut seq = 0;
     for rm in req.get("resourceMetrics").and_then(Value::as_array).into_iter().flatten() {
-        let res = resource(rm);
+        let mut res = resource(rm);
         for sm in rm.get("scopeMetrics").and_then(Value::as_array).into_iter().flatten() {
             for m in sm.get("metrics").and_then(Value::as_array).into_iter().flatten() {
                 let name = ident_field(m, "name", 128);
@@ -214,7 +323,7 @@ pub fn metrics_to_lines(req: &Value, received_ms: i64) -> Vec<Value> {
                 for kind in ["sum", "gauge", "histogram", "exponentialHistogram", "summary"] {
                     let Some(data) = m.get(kind) else { continue };
                     for dp in data.get("dataPoints").and_then(Value::as_array).into_iter().flatten() {
-                        if lines.len() >= MAX_LINES {
+                        if !res.emit(&mut lines, received_ms, &mut seq) || lines.len() >= MAX_LINES {
                             return lines;
                         }
                         let (attrs, dropped) = keep_attrs(dp.get("attributes"));
@@ -228,7 +337,8 @@ pub fn metrics_to_lines(req: &Value, received_ms: i64) -> Vec<Value> {
                             "unit": unit,
                             "type": kind,
                             "attrs": attrs,
-                            "dropped": dropped + res.dropped,
+                            "res": res.id,
+                            "dropped": dropped,
                         });
                         let num = |k: &str| match dp.get(k) {
                             Some(Value::Number(n)) => n.as_f64().map(|f| json!(f)),
@@ -544,12 +654,16 @@ mod tests {
 
     #[test]
     fn logs_drop_bodies_arguments_and_outputs() {
-        let lines = logs_to_lines(&logs_fixture(), 5);
-        assert_eq!(lines.len(), 3);
-        let text = serde_json::to_string(&lines).unwrap();
+        let all = logs_to_lines(&logs_fixture(), 5);
+        assert_eq!(all.len(), 4, "リソースの行 1 ＋ レコード 3");
+        let text = serde_json::to_string(&all).unwrap();
         for secret in [SECRET_ARGS, SECRET_OUT, SECRET_PROMPT, "someone@example.com", "\"box\"", "0102", "bash_command", "secret-repo"] {
             assert!(!text.contains(secret), "{secret} が残っている: {text}");
         }
+        // リソースは 1 行だけ。メールとホスト名は落ちる
+        assert_eq!((all[0]["kind"].as_str(), all[0]["service"].as_str(), all[0]["dropped"].as_u64()), (Some("resource"), Some("codex_cli_rs"), Some(2)));
+        let (res_id, lines) = (all[0]["id"].clone(), &all[1..]);
+        assert!(lines.iter().all(|l| l["res"] == res_id && l.get("resource").is_none()), "レコードごとにリソースを複製しない");
         // 残すもの: イベント名・ツール名・成否・所要時間・長さ・セッション・モデル以外の数
         assert_eq!(lines[0]["event"], "codex.tool_result");
         assert_eq!(lines[0]["attrs"]["tool_name"], "shell");
@@ -559,7 +673,7 @@ mod tests {
         assert_eq!(lines[0]["scope"], "codex_otel");
         assert_eq!(lines[0]["time"], "1700000000000000000");
         assert!(lines[0]["attrs"].get("arguments").is_none() && lines[0]["attrs"].get("output").is_none());
-        assert_eq!(lines[0]["dropped"], 2 + 2, "引数・出力と、リソースのメールとホスト名");
+        assert_eq!(lines[0]["dropped"], 2, "引数と出力");
         assert_eq!(lines[1]["body"], Value::Null, "本文の文は残さない");
         assert_eq!(lines[1]["attrs"]["prompt_length"], 43);
         assert_eq!(lines[1]["attrs"]["session.id"], "abc-123");
@@ -568,7 +682,69 @@ mod tests {
         assert!(lines[2]["attrs"].get("model").is_none(), "長すぎる文字列は残さない");
         assert!(lines[2]["attrs"].get("bad key!").is_none());
         assert_eq!(lines[2]["attrs"]["error_type"], "permission_denied");
-        assert_eq!(lines[2]["dropped"], 10 + 2);
+        assert_eq!(lines[2]["dropped"], 10);
+    }
+
+    #[test]
+    fn body_is_kept_only_when_it_is_a_known_event_name() {
+        let rec = |body: &str| json!({ "body": s(body), "attributes": [] });
+        let req = json!({ "resourceLogs": [{ "scopeLogs": [{ "logRecords": [
+            rec("claude_code.api_request"),
+            rec("codex.tool_result"),
+            rec("tool_decision"),
+            // 識別子の形でも、既知のイベント名でなければ本文として残さない
+            rec("secret_token"),
+            rec("fix"),
+            rec("claude_code.api_request_but_not_really"),
+            rec("Claude_Code.api_request"),
+            rec(SECRET_PROMPT),
+        ] }] }] });
+        let lines = logs_to_lines(&req, 1);
+        assert_eq!(lines.len(), 8, "リソースの属性が無ければリソースの行は書かない");
+        let bodies: Vec<&Value> = lines.iter().map(|l| &l["body"]).collect();
+        assert_eq!(bodies[..3], [&json!("claude_code.api_request"), &json!("codex.tool_result"), &json!("tool_decision")]);
+        assert!(bodies[3..].iter().all(|b| b.is_null()), "{bodies:?}");
+        assert!(lines[3..].iter().all(|l| l["event"].is_null() && l["dropped"] == 1));
+        let text = serde_json::to_string(&lines).unwrap();
+        for leaked in ["secret_token", "\"fix\"", "not_really", SECRET_PROMPT] {
+            assert!(!text.contains(leaked), "{leaked}");
+        }
+        assert!(KNOWN_EVENTS.iter().all(|e| ident(e, 80)), "一覧の名前は識別子の形");
+    }
+
+    #[test]
+    fn huge_resource_is_bounded_and_not_copied_per_record() {
+        // 約 8 MiB の要求: 大きなリソース（数の属性が 15 万個）に 1 万件のレコード
+        let mut res_attrs: Vec<Value> = vec![kv("service.name", s("claude-code"))];
+        res_attrs.extend((0..150_000).map(|i| kv(&format!("k{i}"), json!({ "intValue": i }))));
+        let records: Vec<Value> = (0..MAX_LINES + 500)
+            .map(|i| json!({ "body": s("claude_code.api_request"), "attributes": [kv("session.id", s("abc")), kv("n", json!({ "intValue": i }))] }))
+            .collect();
+        let req = json!({ "resourceLogs": [{
+            "resource": { "attributes": res_attrs },
+            "scopeLogs": [{ "logRecords": records }]
+        }]});
+        let input = serde_json::to_string(&req).unwrap();
+        assert!(input.len() > 4 << 20 && input.len() <= MAX_BODY, "{}", input.len());
+        let lines = logs_to_lines(&req, 9);
+        assert_eq!(lines.len(), MAX_LINES, "行数の上限（リソースの行を含む）");
+        let res = &lines[0];
+        assert_eq!(res["kind"], "resource");
+        assert_eq!(res["attrs"].as_object().unwrap().len(), MAX_ATTRS);
+        assert_eq!(res["dropped"], 150_001 - MAX_ATTRS, "上限を超えた分は落として数える");
+        assert!(lines[1..].iter().all(|l| l.get("resource").is_none() && l["res"] == res["id"]));
+        let out: usize = lines.iter().map(|l| serde_json::to_string(l).unwrap().len()).sum();
+        assert!(out < 4 << 20, "出力が要求の大きさを超えて膨らまない（{out} バイト）");
+    }
+
+    #[test]
+    fn attribute_count_per_list_is_capped() {
+        let many: Vec<Value> = (0..200).map(|i| kv(&format!("n{i}"), json!({ "intValue": i }))).collect();
+        let (kept, dropped) = keep_attrs(Some(&Value::Array(many)));
+        assert_eq!((kept.len(), dropped), (MAX_ATTRS, 200 - MAX_ATTRS));
+        // 同じ名前の上書きは数が増えないので通る
+        let same: Vec<Value> = (0..200).map(|i| kv("n", json!({ "intValue": i }))).collect();
+        assert_eq!(keep_attrs(Some(&Value::Array(same))).0.len(), 1);
     }
 
     #[test]
@@ -584,8 +760,11 @@ mod tests {
                 { "name": "bad name with spaces", "sum": { "dataPoints": [{ "asInt": 1 }] } }
             ] }]
         }]});
-        let lines = metrics_to_lines(&req, 7);
-        let text = serde_json::to_string(&lines).unwrap();
+        let all = metrics_to_lines(&req, 7);
+        assert_eq!(all[0]["kind"], "resource");
+        let lines = &all[1..];
+        assert!(lines.iter().all(|l| l["res"] == all[0]["id"] && l.get("resource").is_none()));
+        let text = serde_json::to_string(&all).unwrap();
         assert!(!text.contains(SECRET_PROMPT) && !text.contains("someone@example.com"));
         assert_eq!(lines.len(), 3);
         assert_eq!((lines[0]["value"].as_f64(), lines[0]["attrs"]["type"].as_str()), (Some(1200.0), Some("input")));
@@ -666,7 +845,7 @@ mod tests {
         );
         assert_eq!(http(&addr, &post("application/json", &addr, "", "{not json")).await.0, 400);
         let text = fs::read_to_string(dir.join(FILE_NAME)).unwrap();
-        assert_eq!(text.lines().count(), 6, "受けた 2 回 × 3 レコードだけ");
+        assert_eq!(text.lines().count(), 8, "受けた 2 回 × （リソース 1 行 ＋ 3 レコード）だけ");
         for secret in [SECRET_ARGS, SECRET_OUT, SECRET_PROMPT, "someone@example.com"] {
             assert!(!text.contains(secret));
         }
