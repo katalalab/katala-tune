@@ -23,6 +23,7 @@ const LEVEL_SERIES = [
 const LEVEL_BAR = { critical: 'crit', error: 'err', warn: 'warn', info: 'unknown' };
 const STATUS_LABEL = { ok: '正常', warn: '注意', fail: '異常', unknown: '不明' };
 const CAT_LABEL = { cpu: 'CPU', memory: 'メモリ', disk: 'ディスク', thermal: '熱', power: '電源', stability: '安定性', background: '常駐・その他', security: 'セキュリティ' };
+const SOURCE_NOTE_LABEL = { 'not-found-for-account': 'このアカウントでは見つからない', 'not-installed': 'このアカウントでは見つからない', 'no-guard-log': 'ログ無し' };
 const SOURCE_LABEL = { win_system: 'System', win_application: 'Application', neonmonitor: 'NeonMonitor', mac_diag: 'DiagnosticReports', mac_kernel: 'カーネル', mac_auth: 'ログイン（sshd）', win_security: 'ログオン（セキュリティ）' };
 // メーターのしきい値（lib/rules.js の判定に合わせる。ディスクとメモリは使用率に直したもの）
 const TH = { cpu: { warn: 60, crit: 85 }, mem: { warn: 80, crit: 90 }, disk: { warn: 90, crit: 95 } };
@@ -178,7 +179,7 @@ function cardHtml(n) {
     <div class="card-hw">${esc(d ? `${d.host.cpu} · ${d.host.cores} スレッド · ${d.memory.total_gb} GB` : n.os === 'macos' ? 'macOS' : 'Windows')}</div>
     <div class="card-foot">${sev}${d?.bench ? `<span title="1スレッドの固定計算。小さいほど速い">計測 ${esc(d.bench.median_ms)} ms${delta}</span>` : ''}
       <span class="right">${busy ? '分析中…' : r ? esc(ago(r.at)) : '未分析'}</span></div>
-    ${r && !r.ok ? `<div class="err"><b>分析できませんでした</b>\n${esc(r.error)}</div>` : ''}
+    ${r && !r.ok ? `<div class="err"><b>分析できませんでした${r.reason_text ? `（${esc(r.reason_text)}）` : ''}</b>\n${esc(r.error)}</div>` : ''}
   </div>`;
 }
 
@@ -278,7 +279,7 @@ async function renderNode(id) {
   else if (state.tab === 'history') body = await historyHtml(n.id);
   else if (state.tab === 'fleet') body = fleetHtml(n.id);
   else if (!r) body = UI.empty('まだ分析していません。', `<button class="btn primary" id="btnOne">${icon('play')}この機体を分析</button>`);
-  else if (!r.ok) body = UI.callout({ tone: 'red', icon: 'alert', title: '分析できませんでした', body: `<div class="err">${esc(r.error)}</div><p class="note-line">SSH で入れるか（~/.ssh/config の Host 名と鍵）、機体の電源とネットワークを確かめてから「この機体を分析し直す」を押してください。</p>` });
+  else if (!r.ok) body = UI.callout({ tone: 'red', icon: 'alert', title: `分析できませんでした${r.reason_text ? `（${r.reason_text}）` : ''}`, body: `<div class="err">${esc(r.error)}</div><p class="note-line">SSH で入れるか（~/.ssh/config の Host 名と鍵）、機体の電源とネットワークを確かめてから「この機体を分析し直す」を押してください。</p>` });
   else if (state.tab === 'findings') body = findingsHtml(r.findings);
   else if (state.tab === 'procs') body = procsHtml(d);
   else if (state.tab === 'jobs') body = jobsTable(jobsOf([n]), false);
@@ -679,19 +680,22 @@ function renderJobs() {
 
 // ---- ログ ----
 function logRow(l, showNode = true) {
-  const span = l.repeat > 1 ? UI.chip(`×${l.repeat}（${fmtTime(l.first_ts)} から）`, 'default') : '';
+  // repeat は実際の件数（probe が代表1行にまとめた分を含む）。複数の行をまとめたときだけ「から」を付ける
+  const span = l.repeat > 1 ? UI.chip(l.merged > 1 ? `×${l.repeat}（${fmtTime(l.first_ts)} から）` : `×${l.repeat}`, 'default') : '';
   return `<div class="log"><div class="log-when">${esc(fmtTime(l.ts))}</div><div>
     <div class="log-meta">${UI.chip(LEVEL_LABEL[l.level] || l.level, LEVEL_TONE[l.level] || 'default')}${showNode ? `<b>${esc(l.node_id)}</b>` : ''}<span>${esc(l.provider || '')}${l.event_id ? ` · ${esc(l.event_id)}` : ''}</span><span class="faint" title="${esc(l.source)}">${esc(SOURCE_LABEL[l.source] || l.source)}</span>${span}</div>
     <div class="log-msg">${esc(l.message)}</div></div></div>`;
 }
 
-// 連続する同種のログ（同じ機体・同じ指紋）を1行にまとめる。洪水のようなログで一覧が埋まらないように
+// 連続する同種のログ（同じ機体・同じ指紋）を1行にまとめる。洪水のようなログで一覧が埋まらないように。
+// 取り込み時に代表1行にまとめた行は occurrences（実際の件数）を持つので、その分も数える
 function collapse(rows) {
   const out = [];
   for (const r of rows) {
+    const n = r.occurrences > 1 ? r.occurrences : 1;
     const prev = out.at(-1);
-    if (prev && prev.node_id === r.node_id && prev.fingerprint === r.fingerprint) { prev.repeat++; prev.first_ts = r.ts; }
-    else out.push({ ...r, repeat: 1, first_ts: r.ts });
+    if (prev && prev.node_id === r.node_id && prev.fingerprint === r.fingerprint) { prev.repeat += n; prev.merged++; prev.first_ts = r.ts; }
+    else out.push({ ...r, repeat: n, merged: 1, first_ts: r.ts });
   }
   return out;
 }
@@ -790,8 +794,9 @@ async function renderLogs() {
           cols: [{ label: '機体 · 取り込み元' }, { label: '最終成功' }, { label: '前回', cls: 'n' }, { label: '捨てた数', cls: 'n' }],
           rows: cursors,
           empty: 'まだ取り込んでいません',
-          row: (c) => `<td><b>${esc(c.node_id)}</b> <span class="muted">· ${esc(SOURCE_LABEL[c.source] || c.source)}</span>${c.last_error ? `<div class="err cursor-err">${esc(c.last_error.slice(0, 140))}</div>` : ''}</td>`
-            + `<td class="nowrap">${c.last_error ? UI.chip('失敗', 'red', { dot: true }) + ' ' : ''}${c.last_ok_at ? esc(ago(c.last_ok_at)) : '<span class="faint">-</span>'}</td><td class="n">${esc(c.last_count ?? '-')}</td><td class="n">${c.dropped_total ? `<span class="sc-warn">${esc(c.dropped_total)}</span>` : ''}</td>`,
+          // 失敗は連続回数つき。取れても 0 件の元（NeonMonitor がこのアカウントに無い・ログ無し）は、静かなのではなく見るものが無いと分かる印を付ける
+          row: (c) => `<td><b>${esc(c.node_id)}</b> <span class="muted">· ${esc(SOURCE_LABEL[c.source] || c.source)}</span>${c.last_error ? `<div class="err cursor-err">${esc(c.last_error.slice(0, 140))}${c.fail_streak > 1 ? `（連続 ${esc(c.fail_streak)} 回）` : ''}</div>` : ''}</td>`
+            + `<td class="nowrap">${c.last_error ? UI.chip('失敗', 'red', { dot: true }) + ' ' : ''}${!c.last_error && SOURCE_NOTE_LABEL[c.note] ? UI.chip(SOURCE_NOTE_LABEL[c.note], 'gray') + ' ' : ''}${c.last_ok_at ? esc(ago(c.last_ok_at)) : '<span class="faint">-</span>'}</td><td class="n">${esc(c.last_count ?? '-')}</td><td class="n">${c.dropped_total ? `<span class="sc-warn">${esc(c.dropped_total)}</span>` : ''}</td>`,
         })}
       </div>
       <div>
@@ -817,7 +822,7 @@ async function renderActions() {
       cols: [{ label: '日時' }, { label: '機体' }, { label: '操作' }, { label: '', cls: 'acts' }],
       rows: log,
       row: (a) => `<td class="muted nowrap">${esc(fmtTime(a.at))}</td><td class="nowrap"><b>${esc(a.node_id)}</b></td>`
-        + `<td><div class="act-title">${a.ok ? UI.chip('成功', 'green', { dot: true }) : UI.chip('失敗', 'red', { dot: true })}<span>${esc(a.label)}</span></div>${a.output ? `<div class="act-out">${esc(a.output)}</div>` : ''}</td>`
+        + `<td><div class="act-title">${a.state === 'incomplete' ? UI.chip('未完了', 'orange', { dot: true }) : a.ok ? UI.chip('成功', 'green', { dot: true }) : UI.chip('失敗', 'red', { dot: true })}<span>${esc(a.label)}</span></div>${a.output ? `<div class="act-out">${esc(a.output)}</div>` : ''}</td>`
         + `<td class="acts">${a.undo && !log.some((b) => b.undo_of === a.id && b.ok) ? `<button class="btn small" data-undo="${esc(a.id)}">元に戻す</button>` : a.undo ? UI.chip('戻し済み', 'gray') : a.undo_of ? UI.chip('戻し', 'default') : ''}</td>`,
     }) : UI.empty('まだ何も実行していません。所見の提案から実行すると、ここに残ります。')}`);
   $$('[data-undo]').forEach((b) => {
