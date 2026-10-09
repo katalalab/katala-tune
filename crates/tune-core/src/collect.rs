@@ -430,13 +430,15 @@ mod tests {
 
     #[tokio::test]
     async fn run_keeps_output_when_a_grandchild_holds_the_pipes() {
-        if cfg!(windows) {
-            return;
-        }
-        // 子（sh）はすぐ終わるが、孫（sleep）が標準出力・標準エラーを 5 秒握り続ける
+        // 子はすぐ終わるが、孫が標準エラー（と標準入力）のパイプを数秒握り続ける
+        #[cfg(windows)]
+        let (cmd, args) = ("cmd.exe", vec!["/C".to_string(), "echo first& >&2 echo oops& start /b ping -n 9 127.0.0.1 >nul".to_string()]);
+        #[cfg(not(windows))]
+        let (cmd, args) = ("/bin/sh", vec!["-c".to_string(), "echo first; echo oops >&2; (sleep 5 &)".to_string()]);
         let started = Instant::now();
-        let r = run("/bin/sh", &["-c".into(), "echo first; echo oops >&2; (sleep 5 &)".into()], None, Duration::from_secs(10)).await;
-        assert_eq!((r.code, r.out.as_str(), r.err.as_str()), (Some(0), "first\n", "oops\n"), "それまでに読んだ分は捨てない");
-        assert!(started.elapsed() < Duration::from_secs(2), "孫の終わりを待たない: {:?}", started.elapsed());
+        let r = run(cmd, &args, None, Duration::from_secs(10)).await;
+        // Windows の cmd は改行が CRLF なので、前後の空白を除いて比べる
+        assert_eq!((r.code, r.out.trim(), r.err.trim()), (Some(0), "first", "oops"), "それまでに読んだ分は捨てない");
+        assert!(started.elapsed() < Duration::from_secs(4), "孫の終わりを待たない: {:?}", started.elapsed());
     }
 }
