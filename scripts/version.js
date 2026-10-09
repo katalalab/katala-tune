@@ -8,7 +8,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const ROOT = path.join(__dirname, '..');
-const CRATES = ['katala-tune', 'tune-core', 'tune-cli'];
+const CRATES = ['katala-tune', 'tune-core', 'tune-cli', 'tune-link', 'tune-agent'];
 // SemVer 2.0.0 の正規表現（semver.org）。先頭が 0 の数字や空のプレリリース識別子（01.2.3・1.2.3-alpha..1）は通さない
 const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
 const file = (f) => path.join(ROOT, f);
