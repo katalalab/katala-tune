@@ -6,9 +6,9 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
 const { loadConfig, ensureConfig } = require('./lib/nodes');
-const { probeAll } = require('./lib/collect');
+const { probeAll, execOn } = require('./lib/collect');
 const { analyze, score, compare } = require('./lib/rules');
-const actions = require('./lib/actions');
+const { makeRunner } = require('./lib/runner');
 const { openDb } = require('./lib/db');
 const logs = require('./lib/logs');
 const health = require('./lib/health');
@@ -280,34 +280,19 @@ ipcMain.handle('fleet', async () => {
   return fleetCache;
 });
 
-async function confirmAndRun(nodeId, action, title, undoOf = null) {
-  // 実行の直前に台帳（共用機の指定・保護リスト）を読み直す。読めなければ実行しない
-  let fresh;
-  try { fresh = loadConfig(); } catch (e) { return { ok: false, refused: `台帳を読めないので実行しない: ${e.message}` }; }
-  const node = fresh.nodes.find((n) => n.id === nodeId);
-  if (!node) return { ok: false, refused: '台帳に無い機体' };
-  let p;
-  try { p = actions.plan(node, action, { protect: fresh.protect }); } catch (e) { return { ok: false, refused: String(e.message || e) }; }
-  const { response } = await dialog.showMessageBox(win, {
-    type: 'warning', buttons: ['実行する', 'やめる'], defaultId: 1, cancelId: 1,
-    title: 'Katala Tune', message: title, detail: `${p.describe}\n\n実行するコマンド:\n${p.script}`,
-  });
-  if (response !== 0) return { ok: false, cancelled: true };
-  let r;
-  try { r = await actions.execute(node, action, { protect: loadConfig().protect }); } catch (e) { return { ok: false, refused: String(e.message || e) }; }
-  const entry = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, at: Date.now(), node_id: node.id, type: action.type, params: action.params, label: title, ok: r.ok, output: `${r.outcome}\n${r.output}`.trim(), undo: r.undo, undo_of: undoOf };
-  db.addAction(entry);
-  return { ...r, entry };
-}
-
-ipcMain.handle('action', (_e, nodeId, action, label) => confirmAndRun(nodeId, action, `${nodeId}: ${label}`));
-ipcMain.handle('undo', async (_e, entryId) => {
-  const all = db.actions(1000);
-  const entry = all.find((a) => a.id === entryId);
-  if (!entry?.undo) return { ok: false, refused: '元に戻せる記録が無い' };
-  if (all.some((a) => a.undo_of === entryId && a.ok)) return { ok: false, refused: 'すでに元に戻した' };
-  return confirmAndRun(entry.node_id, entry.undo, `${entry.node_id}: 元に戻す（${entry.label}）`, entryId);
+// 変更操作の流れは lib/runner.js（確認 → 台帳の読み直し → 未完了の記録 → 実行 → 結果の記録）。ここは確認ダイアログだけ持つ
+const runner = makeRunner({
+  loadConfig: () => loadConfig(),
+  confirm: async (title, detail) => {
+    const { response } = await dialog.showMessageBox(win, { type: 'warning', buttons: ['実行する', 'やめる'], defaultId: 1, cancelId: 1, title: 'Katala Tune', message: title, detail });
+    return response === 0;
+  },
+  exec: execOn,
+  get db() { return db; },
 });
+
+ipcMain.handle('action', (_e, nodeId, action, label) => runner.confirmAndRun(nodeId, action, `${nodeId}: ${label}`));
+ipcMain.handle('undo', (_e, entryId) => runner.undo(entryId));
 ipcMain.handle('actions-log', () => db.actions(100));
 ipcMain.handle('inventory', (_e, opts) => inventoryView({ all: !!opts?.all }));
 ipcMain.handle('inventory-run', (_e, ids) => runInventory(ids).then(() => inventoryView()));

@@ -9,6 +9,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use regex::Regex;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -130,6 +131,58 @@ pub async fn run(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Dura
     RunResult { code: status.and_then(|s| s.code()), out: decode(&out), err: decode(&err) + &extra }
 }
 
+pub type RunFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = RunResult> + Send + 'a>>;
+
+/// 子プロセスの実行口。本物は [`System`]、テストは偽の ssh に差し替える（呼び出しを数え、台本どおりの結果を返す）
+pub trait Runner: Send + Sync {
+    fn run<'a>(&'a self, cmd: &'a str, args: &'a [String], input: Option<&'a [u8]>, timeout: Duration) -> RunFuture<'a>;
+}
+
+/// 本物の子プロセスを起こす
+pub struct System;
+
+impl Runner for System {
+    fn run<'a>(&'a self, cmd: &'a str, args: &'a [String], input: Option<&'a [u8]>, timeout: Duration) -> RunFuture<'a> {
+        Box::pin(run(cmd, args, input, timeout))
+    }
+}
+
+/// 失敗の理由を、画面と判定が使える種類に分ける（lib/collect.js の classifyFailure と同じ）。
+/// timeout: 接続はできたが、こちらの打ち切り（run が足す `timeout <ms>ms`）まで終わらなかった。
+/// unreachable: ssh が相手に届かない（名前が引けない・拒否・経路なし・接続の時間切れ）。auth: 鍵・ホスト鍵で入れない。error: それ以外
+pub fn classify_failure(res: &RunResult) -> &'static str {
+    static TIMEOUT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"timeout \d+ms\s*$").expect("TIMEOUT"));
+    static AUTH: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)Permission denied|Host key verification failed|Authentication failed|Too many authentication failures").expect("AUTH")
+    });
+    static UNREACHABLE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)Could not resolve hostname|Name or service not known|Connection refused|No route to host|Network is unreachable|Connection timed out|Operation timed out|Host is down|Connection reset|Connection closed by|kex_exchange_identification|banner exchange",
+        )
+        .expect("UNREACHABLE")
+    });
+    let text = format!("{}\n{}", res.err, res.out);
+    if res.code.is_none() && TIMEOUT.is_match(&res.err) {
+        "timeout"
+    } else if AUTH.is_match(&text) {
+        "auth"
+    } else if UNREACHABLE.is_match(&text) {
+        "unreachable"
+    } else {
+        "error"
+    }
+}
+
+/// 失敗の種類の、画面に出す文言
+pub fn reason_text(kind: &str) -> &'static str {
+    match kind {
+        "timeout" => "時間切れ（接続後に応答が返らなかった）",
+        "unreachable" => "接続できない（電源・ネットワーク・Host 名）",
+        "auth" => "認証できない（鍵・ホスト鍵）",
+        _ => "調査の失敗",
+    }
+}
+
 /// 出力の最後の JSON 行（`{` で始まる行を後ろから読めるまで）
 pub fn last_json_line(text: &str) -> Option<Value> {
     let lines: Vec<&str> = text.split('\n').map(|l| js::trim(l.strip_suffix('\r').unwrap_or(l))).filter(|l| l.starts_with('{')).collect();
@@ -240,16 +293,21 @@ fn windows_ssh_command(benchmark: bool, network: bool) -> String {
     parts.join(" ")
 }
 
-/// 1台を調べる。戻り値は `{ node_id, ok, data | error, wall_s, at }`（collect.js と同じ形）
+/// 1台を調べる。戻り値は `{ node_id, ok, data | error, wall_s, at }`（collect.js と同じ形）。失敗には reason・reason_text が付く
 pub async fn probe_node(node: &Node) -> Value {
+    probe_node_with(&System, node).await
+}
+
+/// `probe_node` の子プロセスの実行口を差し替えられる版（テストは偽の ssh を渡す）
+pub async fn probe_node_with(runner: &dyn Runner, node: &Node) -> Value {
     let started = Instant::now();
     let network = crate::netsec::enabled(&node.raw);
     let benchmark = node.get("benchmark") != Some(&Value::Bool(false));
     let res = if node.is_mac() {
         if node.local {
-            run("/usr/bin/env", &mac_probe_args(benchmark, network), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
+            runner.run("/usr/bin/env", &mac_probe_args(benchmark, network), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
         } else {
-            run("ssh", &ssh_args(&node.alias, &mac_ssh_command(benchmark, network)), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
+            runner.run("ssh", &ssh_args(&node.alias, &mac_ssh_command(benchmark, network)), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
         }
     } else if node.local {
         let p = local::powershell_file(WIN_PROBE, if network { "" } else { "-NoNetwork" }, Duration::from_secs(120)).await;
@@ -260,7 +318,7 @@ pub async fn probe_node(node: &Node) -> Value {
             p
         }
     } else {
-        run("ssh", &ssh_args(&node.alias, &windows_ssh_command(benchmark, network)), Some(WIN_PROBE), Duration::from_secs(120)).await
+        runner.run("ssh", &ssh_args(&node.alias, &windows_ssh_command(benchmark, network)), Some(WIN_PROBE), Duration::from_secs(120)).await
     };
     let wall_s = started.elapsed().as_secs_f64();
     let (main, bench) = match res.out.split_once(BENCH_MARK) {
@@ -275,7 +333,8 @@ pub async fn probe_node(node: &Node) -> Value {
         } else {
             format!("exit {}", res.code_str())
         };
-        return json!({ "node_id": node.id, "ok": false, "error": js::slice16_tail(js::trim(&e), 800), "wall_s": wall_s, "at": now_ms() });
+        let reason = classify_failure(&res);
+        return json!({ "node_id": node.id, "ok": false, "reason": reason, "reason_text": reason_text(reason), "error": js::slice16_tail(js::trim(&e), 800), "wall_s": wall_s, "at": now_ms() });
     };
     if let (Some(b), Value::Object(m)) = (bench, &mut data)
         && !js::truthy(m.get("bench"))
@@ -298,12 +357,21 @@ pub async fn probe_all<F>(nodes: &[Node], on_result: F) -> Vec<Value>
 where
     F: Fn(&Value) + Send + Sync + 'static,
 {
+    probe_all_with(std::sync::Arc::new(System), nodes, on_result).await
+}
+
+/// `probe_all` の子プロセスの実行口を差し替えられる版
+pub async fn probe_all_with<F>(runner: std::sync::Arc<dyn Runner>, nodes: &[Node], on_result: F) -> Vec<Value>
+where
+    F: Fn(&Value) + Send + Sync + 'static,
+{
     let on_result = std::sync::Arc::new(on_result);
     let mut set = tokio::task::JoinSet::new();
     for (i, n) in nodes.iter().cloned().enumerate() {
         let cb = on_result.clone();
+        let runner = runner.clone();
         set.spawn(async move {
-            let r = probe_node(&n).await;
+            let r = probe_node_with(runner.as_ref(), &n).await;
             cb(&r);
             (i, r)
         });
@@ -322,7 +390,12 @@ where
 
 /// 機体でコマンドを実行する（actions 用）。ローカルならその OS のシェル、リモートは ssh
 pub async fn exec_on(node: &Node, script: &str, timeout: Duration) -> RunResult {
-    if node.local { local::script(script, timeout).await } else { run("ssh", &ssh_args(&node.alias, script), None, timeout).await }
+    exec_on_with(&System, node, script, timeout).await
+}
+
+/// `exec_on` の子プロセスの実行口を差し替えられる版（変更操作のテストは偽の実行器を渡す）
+pub async fn exec_on_with(runner: &dyn Runner, node: &Node, script: &str, timeout: Duration) -> RunResult {
+    if node.local { local::script(script, timeout).await } else { runner.run("ssh", &ssh_args(&node.alias, script), None, timeout).await }
 }
 
 #[cfg(test)]
