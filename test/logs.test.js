@@ -28,6 +28,20 @@ test('同種ログの集計は期間・機体・繰り返し件数を保ち、�
   assert.deepEqual(db.signatures({ limit: 0 }), []);
   db.insertLogs('node-a', 'example', [row('z', 500, 2, 'z'), row('a', 400, 2, 'a')]);
   assert.equal(db.signatures({ since: 400, node_id: 'node-a', limit: 1 })[0].fingerprint, 'a');
+  assert.equal(db.signatures({ since: 400, node_id: 'node-a', limit: 1, offset: 1 })[0].fingerprint, 'z');
+  assert.deepEqual(db.signatures({ limit: -1 }), []);
+  assert.deepEqual(db.signatures({ limit: 1, offset: -1 }), db.signatures({ limit: 1 }));
+});
+
+test('同種ログは取得上限500件を守り、次ページで残りを取得できる', (t) => {
+  const dir = tmp();
+  const db = openDb(dir);
+  t.after(() => { db.db.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  db.insertLogs('node-a', 'example', Array.from({ length: 501 }, (_, i) => ({
+    uid: String(i), ts: 100, occurrences: 1, fingerprint: String(i).padStart(3, '0'), level: 'warn', message: 'example',
+  })));
+  assert.equal(db.signatures({ limit: 1000 }).length, 500);
+  assert.deepEqual(db.signatures({ limit: 1000, offset: 500 }).map(r => r.fingerprint), ['500']);
 });
 
 test('Windows リモートログは固定ファイルを使わず Base64 stdin から実行する', () => {
