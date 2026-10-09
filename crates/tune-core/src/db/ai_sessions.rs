@@ -3,14 +3,21 @@
 //! - ai_usage_hourly: セッション×時間（epoch の時）ごとの使用量。日ごとの集計に使う（長いセッションも日をまたいで正しく割り振る）
 //! - ai_cursors: 機体ごとの続きの位置（ファイルごとのバイト位置）と、前回の取り込みの様子（続きあり・python が無い・エラー）
 //!
+//! - ai_claude_messages: Claude Code の応答（ID）ごとの量（トークン・モデル・1 時間のキャッシュ書き）。ファイルごとに最大値を保ち、
+//!   どの区間（source_span）で初めて見えたかを持つ。機体ごとの重複除去（ファイルをまたぐ）と費用の推定はここから行う（db/ai_usage.rs）。
+//!   元のファイルが消えても残す（履歴の量と、ほかのファイルとの重複除去が変わらないように）
+//!
 //! 調査（probes/ai_sessions.py）の出力をそのまま受け取り、mode が replace なら置き換え、add なら足す。
 //! tokens_mode が max のトークン（Codex の累計）は最大値を使い、時間ごとの量は前回までの累計との差にする。
+//! 読んだ区間は出どころの台帳（db/provenance.rs）に残す。続き（add）は「前回の終了 = 今回の開始」でなければ拒否し、
+//! そのファイルは次の回に最初から読み直す（続きの位置を 0 に戻す）。調査には続きの位置と一緒に、位置の手前の指紋を渡す（[`Store::ai_state`]）。
 
 use std::collections::{BTreeMap, HashMap};
 
 use rusqlite::{OptionalExtension, Row, params};
 use serde_json::{Map, Value, json};
 
+use super::provenance::{self, RunMeta};
 use super::{Result, Store, row_json};
 use crate::js;
 
@@ -44,9 +51,10 @@ CREATE TABLE IF NOT EXISTS ai_claude_replay (
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS ai_claude_messages (
   node_id TEXT NOT NULL, file TEXT NOT NULL, message_id TEXT NOT NULL,
-  usage TEXT NOT NULL, hour INTEGER,
+  usage TEXT NOT NULL, hour INTEGER, span_id INTEGER, model TEXT, cw1h INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (node_id, file, message_id)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ai_claude_messages_msg ON ai_claude_messages (node_id, message_id);
 CREATE TABLE IF NOT EXISTS ai_claude_tools (
   node_id TEXT NOT NULL, file TEXT NOT NULL, tool_use_id TEXT NOT NULL,
   name TEXT NOT NULL, hour INTEGER,
@@ -57,6 +65,28 @@ CREATE TABLE IF NOT EXISTS ai_claude_tool_errors (
   PRIMARY KEY (node_id, file, tool_use_id)
 ) WITHOUT ROWID;
 ";
+
+/// 出どころの台帳・費用の列を足す前の DB の移行（何度呼んでも同じ。足りない列と索引を足す）。
+/// 台帳より前の DB（old_ai）は、続きの位置を使わず（[`Store::ai_state`] が区間の無いファイルを 0 にする）次の取り込みで各ファイルを最初から読み直し、
+/// 区間の指紋・応答ごとのモデルと 1 時間のキャッシュ書きを揃える。急いで読み直すよう、続きありの印を付ける
+/// （元のファイルが消えたものは読み直せないので、時間ごとの量とモデルはセッションのものをそのまま使う）
+pub(super) fn migrate(c: &rusqlite::Connection, old_ai: bool) -> Result<()> {
+    for (col, ddl) in [("span_id", "INTEGER"), ("model", "TEXT"), ("cw1h", "INTEGER NOT NULL DEFAULT 0")] {
+        let has = c.prepare("SELECT 1 FROM pragma_table_info('ai_claude_messages') WHERE name = ?")?.exists([col])?;
+        if !has {
+            c.execute_batch(&format!("ALTER TABLE ai_claude_messages ADD COLUMN {col} {ddl};"))?;
+        }
+    }
+    c.execute_batch("CREATE INDEX IF NOT EXISTS ai_claude_messages_span ON ai_claude_messages (span_id);")?;
+    let done: Option<i64> = c.query_row("SELECT 1 FROM meta WHERE k = 'migr_ai_provenance_v1'", [], |r| r.get(0)).optional()?;
+    if done.is_none() {
+        if old_ai {
+            c.execute_batch("UPDATE ai_cursors SET truncated = 1;")?;
+        }
+        c.execute("INSERT OR REPLACE INTO meta (k, v, updated_at) VALUES ('migr_ai_provenance_v1', 'true', ?)", [super::now_ms()])?;
+    }
+    Ok(())
+}
 
 /// トークンの5つ（入力・出力・キャッシュ読み・キャッシュ書き・推論）。調査の tokens のキーと表の列
 pub const TOK_KEYS: [&str; 5] = ["in", "out", "cache_read", "cache_write", "reasoning"];
@@ -254,6 +284,12 @@ pub struct AiIngested {
     pub sessions: usize,
     pub hours: usize,
     pub files: usize,
+    /// 出どころの台帳: この回の ID・書いた区間・拒否した区間（次の回に最初から読み直す）・最初から読み直したファイル・新しく数えた応答の数
+    pub run_id: String,
+    pub spans: usize,
+    pub rejected: usize,
+    pub rewound: usize,
+    pub responses: usize,
 }
 
 fn counts_json(m: &BTreeMap<String, i64>) -> String {
@@ -271,10 +307,13 @@ fn add_probe_hour(rec: &mut Value, h: Option<i64>, i: usize, n: i64) -> Result<(
     Ok(())
 }
 
-fn claude_events(c: &rusqlite::Connection, node: &str, rec: &mut Value, out: &Value, replace: bool) -> Result<()> {
+/// Claude Code の応答・ツール呼び出し・失敗を、ファイルごとの ID の台帳へ入れ、増えた分だけ rec に足す。
+/// 返すのは、この回で初めて見えた応答の数（span_id の区間で初めて見えた応答として残す）
+fn claude_events(c: &rusqlite::Connection, node: &str, rec: &mut Value, out: &Value, replace: bool, span_id: Option<i64>) -> Result<i64> {
     if js::string(rec.get("tool")) != "claude" {
-        return Ok(());
+        return Ok(0);
     }
+    let mut fresh_messages = 0i64;
     let file = js::string(rec.get("file"));
     if replace {
         for table in ["ai_claude_messages", "ai_claude_tools", "ai_claude_tool_errors"] {
@@ -292,21 +331,29 @@ fn claude_events(c: &rusqlite::Connection, node: &str, rec: &mut Value, out: &Va
             continue;
         }
         let current: [i64; 5] = std::array::from_fn(|i| int(vals.get(i)).max(0));
-        let old: Option<(String, Option<i64>)> = c
-            .query_row("SELECT usage, hour FROM ai_claude_messages WHERE node_id=? AND file=? AND message_id=?", params![node, file, id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
+        // 1 時間のキャッシュ書き（キャッシュ書きの内数）と、単価を引くモデル名。調査が出さなければ 0・無し（古い調査の出力）
+        let cw1h = int(e.get("cw1h")).clamp(0, current[3]);
+        let model = e.get("model").and_then(Value::as_str).filter(|m| !m.is_empty() && m.len() <= 128).map(str::to_string);
+        let old: Option<(String, Option<i64>, i64)> = c
+            .query_row("SELECT usage, hour, cw1h FROM ai_claude_messages WHERE node_id=? AND file=? AND message_id=?", params![node, file, id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })
             .optional()?;
-        let (prior, at, fresh) = match old {
-            Some((s, h)) => (
+        let (prior, at, fresh, prior_1h) = match old {
+            Some((s, h, w)) => (
                 serde_json::from_str::<Value>(&s).ok().map(|v| std::array::from_fn(|i| int(v.as_array().and_then(|a| a.get(i))).max(0))).unwrap_or([0; 5]),
                 h,
                 false,
+                w,
             ),
-            None => ([0; 5], hour(e.get("hour")), true),
+            None => ([0; 5], hour(e.get("hour")), true, 0),
         };
         let next: [i64; 5] = std::array::from_fn(|i| prior[i].max(current[i]));
-        c.execute("INSERT INTO ai_claude_messages (node_id,file,message_id,usage,hour) VALUES (?,?,?,?,?) ON CONFLICT(node_id,file,message_id) DO UPDATE SET usage=excluded.usage", params![node,file,id,serde_json::to_string(&next).unwrap(),at])?;
+        c.execute(
+            "INSERT INTO ai_claude_messages (node_id,file,message_id,usage,hour,span_id,model,cw1h) VALUES (?,?,?,?,?,?,?,?)
+             ON CONFLICT(node_id,file,message_id) DO UPDATE SET usage=excluded.usage, model=coalesce(excluded.model, model), cw1h=max(cw1h, excluded.cw1h)",
+            params![node, file, id, serde_json::to_string(&next).unwrap(), at, span_id, model, cw1h.max(prior_1h)],
+        )?;
         for i in 0..5 {
             let d = next[i] - prior[i];
             if d > 0 {
@@ -316,6 +363,7 @@ fn claude_events(c: &rusqlite::Connection, node: &str, rec: &mut Value, out: &Va
         }
         if fresh {
             rec["assistant_msgs"] = json!(add_count(int(rec.get("assistant_msgs")), 1)?);
+            fresh_messages += 1;
         }
     }
     for e in js::arr(out.get("claude_tools")) {
@@ -358,7 +406,7 @@ fn claude_events(c: &rusqlite::Connection, node: &str, rec: &mut Value, out: &Va
             rec["tool_error_counts"][&name] = json!(add_count(int(rec["tool_error_counts"].get(&name)), 1)?);
         }
     }
-    Ok(())
+    Ok(fresh_messages)
 }
 
 impl Store {
@@ -366,6 +414,26 @@ impl Store {
     pub fn ai_files(&self, node_id: &str) -> Result<Map<String, Value>> {
         let s: Option<String> = self.conn.query_row("SELECT files FROM ai_cursors WHERE node_id = ?", [node_id], |r| r.get(0)).optional()?;
         Ok(s.and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v.as_object().cloned()).unwrap_or_default())
+    }
+
+    /// 調査に渡す続きの位置（KT_STATE）。{ files: { 鍵: 位置 }, anchors: { 鍵: [長さ, sha256] }, claude_replay: [鍵] }。
+    /// 位置は、出どころの台帳に「終了がちょうどその位置」の生きている区間があるときだけ渡す（前回の終了 = 今回の開始）。
+    /// 無ければ 0（そのファイルは最初から読み直す）。調査は位置の手前の指紋が合わなければ、やはり最初から読み直す
+    pub fn ai_state(&self, node_id: &str) -> Result<Value> {
+        let mut files = Map::new();
+        let mut anchors = Map::new();
+        for (k, v) in self.ai_files(node_id)? {
+            let off = v.as_i64().unwrap_or(0);
+            if off > 0
+                && let Some((n, sha)) = self.span_anchor(node_id, &k, off)?
+            {
+                files.insert(k.clone(), json!(off));
+                anchors.insert(k, json!([n, sha]));
+            } else {
+                files.insert(k, json!(0));
+            }
+        }
+        Ok(json!({ "files": files, "anchors": anchors, "claude_replay": self.ai_claude_replay(node_id)? }))
     }
 
     /// 旧来の数値cursorだけの Claude ファイルは、ID台帳を作るため一度だけ replace で再読する。
@@ -390,12 +458,22 @@ impl Store {
         self.conn.prepare_cached("SELECT * FROM ai_sessions WHERE node_id = ? AND file = ?")?.query_row([node_id, file], Session::from_row).optional()
     }
 
-    /// 調査の出力（out）を取り込む。セッション・時間ごとの量・続きの位置を1つのトランザクションで書く
-    /// （途中で失敗したら何も書かない。次の回に同じ位置から読み直す）
+    /// 調査の出力（out）を取り込む（取り込みの見出しは、いま始まったものとして作る）。[`Store::ai_ingest_run`]
     pub fn ai_ingest(&self, node_id: &str, out: &Value, now: i64) -> Result<AiIngested> {
+        self.ai_ingest_run(node_id, out, &crate::ai_sessions::run_meta(node_id, now, now), now)
+    }
+
+    /// 調査の出力（out）を取り込む。セッション・時間ごとの量・応答ごとの量・続きの位置・出どころの台帳（区間と、この回の行）を
+    /// 1つのトランザクションで書く（途中で失敗したら何も書かない。次の回に同じ位置から読み直す）。
+    /// 続き（add）の区間が前回の終了から始まっていない・同じ区間がすでにあるときは、そのファイルの分を取り込まず、
+    /// 続きの位置を 0 に戻す（次の回に最初から読み直す）
+    pub fn ai_ingest_run(&self, node_id: &str, out: &Value, run: &RunMeta, now: i64) -> Result<AiIngested> {
         let mut files = self.ai_files(node_id)?;
-        let mut res = AiIngested::default();
+        let mut res = AiIngested { run_id: run.run_id.clone(), ..Default::default() };
         self.tx(|c| {
+            let mut rejected: Vec<Value> = Vec::new();
+            let mut rewound: Vec<Value> = Vec::new();
+            let mut reset: Vec<String> = Vec::new();
             for source in js::arr(out.get("sessions")) {
                 let mut rec = source.clone();
                 let file = js::string(rec.get("file"));
@@ -406,8 +484,35 @@ impl Store {
                     if !rec.get(key).is_some_and(Value::is_object) { rec[key] = json!({}); }
                 }
                 let replace = !js::is_str(rec.get("mode"), "add");
+                if let Some(why) = rec.get("rewound").and_then(Value::as_str) {
+                    res.rewound += 1;
+                    if rewound.len() < 20 {
+                        rewound.push(json!({ "file": file, "reason": why }));
+                    }
+                }
+                // 出どころの台帳（区間の無い出力は、台帳より前の調査スクリプトのもの。台帳なしで取り込む）
+                let span = provenance::SpanIn::from_probe(&file, rec.get("span"));
+                let mut span_id = None;
+                if let Some(sp) = &span {
+                    if replace {
+                        provenance::supersede(c, node_id, &file, &run.run_id)?;
+                    }
+                    if sp.end > sp.start {
+                        match provenance::insert_span(c, &run.run_id, node_id, sp, !replace)? {
+                            provenance::SpanOutcome::Inserted(id) => span_id = Some(id),
+                            provenance::SpanOutcome::Rejected(why) => {
+                                res.rejected += 1;
+                                if rejected.len() < 20 {
+                                    rejected.push(json!({ "file": file, "reason": why }));
+                                }
+                                reset.push(file);
+                                continue;
+                            }
+                        }
+                    }
+                }
                 let old = if replace { None } else { c.prepare_cached("SELECT * FROM ai_sessions WHERE node_id = ? AND file = ?")?.query_row(params![node_id, file], Session::from_row).optional()? };
-                claude_events(c, node_id, &mut rec, out, replace)?;
+                let new_messages = claude_events(c, node_id, &mut rec, out, replace, span_id)?;
                 let add = Session::from_probe(&rec);
                 let prev_tokens = old.as_ref().map_or([0; 5], |o| o.tokens);
                 let s = match &old {
@@ -466,6 +571,13 @@ impl Store {
                     .execute(params![node_id, file, s.tool, h, x[0], x[1], x[2], x[3], x[4], x[5], x[6]])?;
                     res.hours += 1;
                 }
+                // この区間から足した量（検算に使う: 初めて見えた応答の数と、出力トークン）
+                if let Some(id) = span_id {
+                    let out_delta = if add.tokens_max { (s.tokens[1] - if replace { 0 } else { prev_tokens[1] }).max(0) } else { add.tokens[1] };
+                    provenance::set_span_counts(c, id, new_messages, out_delta)?;
+                    res.responses += new_messages as usize;
+                    res.spans += 1;
+                }
                 res.sessions += 1;
             }
             if let Some(m) = out.get("cursors").and_then(Value::as_object) {
@@ -473,16 +585,35 @@ impl Store {
                     files.insert(k.clone(), v.clone());
                 }
             }
+            for k in &reset {
+                files.insert(k.clone(), json!(0));
+            }
             for g in js::arr(out.get("gone")) {
                 if let Some(k) = g.as_str() {
                     files.remove(k);
-                    for table in ["ai_claude_messages", "ai_claude_tools", "ai_claude_tool_errors", "ai_claude_replay"] {
+                    // 応答ごとの量（ai_claude_messages）は残す: 履歴の量と、ほかのファイルとの重複除去が、元のファイルが消えても変わらないように
+                    for table in ["ai_claude_tools", "ai_claude_tool_errors", "ai_claude_replay"] {
                         c.execute(&format!("DELETE FROM {table} WHERE node_id = ? AND file = ?"), params![node_id, k])?;
                     }
                 }
             }
             res.files = files.len();
             let errs: Vec<&Value> = js::arr(out.get("errors")).iter().take(5).collect();
+            let mut notes = Map::new();
+            if !rejected.is_empty() {
+                notes.insert("rejected".into(), Value::Array(rejected));
+            }
+            if !rewound.is_empty() {
+                notes.insert("rewound".into(), Value::Array(rewound));
+            }
+            for k in ["truncated", "files_total", "files_changed", "bytes_read", "elapsed_s"] {
+                if let Some(v) = out.get(k).filter(|v| !v.is_null()) {
+                    notes.insert(k.into(), v.clone());
+                }
+            }
+            notes.insert("gone".into(), json!(js::arr(out.get("gone")).len()));
+            notes.insert("errors".into(), json!(js::arr(out.get("errors")).len()));
+            provenance::finish_run(c, run, res.rejected as i64, Some(&Value::Object(notes)))?;
             c.prepare_cached(
                 "INSERT INTO ai_cursors (node_id, files, updated_at, last_ok_at, last_error, file_errors, truncated, no_python, files_total, files_changed, bytes_pending, bytes_read, elapsed_s)
                  VALUES (?, ?, ?, ?, NULL, ?, ?, 0, ?, ?, ?, ?, ?)
@@ -496,7 +627,8 @@ impl Store {
                 now,
                 now,
                 if errs.is_empty() { None } else { Some(serde_json::to_string(&errs).unwrap_or_default()) },
-                i64::from(js::truthy(out.get("truncated"))),
+                // 拒否した区間があれば、最初からの読み直しを急ぐ（続きありと同じ扱い）
+                i64::from(js::truthy(out.get("truncated")) || !reset.is_empty()),
                 opt_int(out.get("files_total")),
                 opt_int(out.get("files_changed")),
                 opt_int(out.get("bytes_pending")),
@@ -612,10 +744,67 @@ impl Store {
                 "SELECT s.tool, s.model, COUNT(DISTINCT h.node_id || char(0) || h.file) AS sessions, {toks},
                         SUM(h.tok_in + h.tok_out) AS io
                  FROM ai_usage_hourly h JOIN ai_sessions s ON s.node_id = h.node_id AND s.file = h.file
-                 WHERE {cond_h} GROUP BY s.tool, s.model ORDER BY io DESC LIMIT 30"
+                 WHERE {cond_h} GROUP BY s.tool, s.model ORDER BY io DESC"
             ),
             since_hour,
         )?;
+        // 重複を除いた量と費用（db/ai_usage.rs）。トークンはこちらに置き換え、除く前の量は raw に残す
+        let w = super::UsageWindow { since_hour, until_hour: i64::MAX / 3_600_000, tz_ms, node: node.clone(), tool: tool.clone() };
+        let (u_tot, u_daily, u_models) = super::summarize_usage(&self.usage_rows(&w, true)?);
+        let (raw_tot, _, _) = super::summarize_usage(&self.usage_rows(&w, false)?);
+        let mut dup = self.dup_stats(&w)?;
+        if let Value::Object(m) = &mut dup {
+            m.insert("removed".into(), super::dup_delta(&raw_tot, &u_tot));
+        }
+        let mut totals = totals;
+        if let (Value::Object(t), Value::Object(u)) = (&mut totals, &u_tot) {
+            for (k, v) in u {
+                t.insert(k.clone(), v.clone());
+            }
+        }
+        let mut seen: std::collections::HashSet<(String, i64)> = std::collections::HashSet::new();
+        let mut daily: Vec<Value> = daily
+            .into_iter()
+            .map(|mut r| {
+                let key = (js::string(r.get("node_id")), r.get("day").and_then(Value::as_i64).unwrap_or(0));
+                if let (Value::Object(m), Some(Value::Object(u))) = (&mut r, u_daily.get(&key)) {
+                    for (k, v) in u {
+                        m.insert(k.clone(), v.clone());
+                    }
+                }
+                seen.insert(key);
+                r
+            })
+            .collect();
+        for ((n, d), u) in &u_daily {
+            if !seen.contains(&(n.clone(), *d)) {
+                let mut r = json!({ "node_id": n, "day": d, "sessions": 0, "prompts": 0, "tool_calls": 0 });
+                if let (Value::Object(m), Value::Object(u)) = (&mut r, u) {
+                    for (k, v) in u {
+                        m.insert(k.clone(), v.clone());
+                    }
+                }
+                daily.push(r);
+            }
+        }
+        daily.sort_by(|a, b| {
+            let k = |r: &Value| (r.get("day").and_then(Value::as_i64).unwrap_or(0), js::string(r.get("node_id")));
+            k(a).cmp(&k(b))
+        });
+        // モデル別: 量と費用は応答（Claude Code）・時間ごとの量（Codex）のモデルで、セッションの数はセッションの最後のモデルで数える
+        let models: Vec<Value> = u_models
+            .into_iter()
+            .take(30)
+            .map(|mut m| {
+                let sessions = models
+                    .iter()
+                    .find(|x| x.get("tool") == m.get("tool") && x.get("model") == m.get("model"))
+                    .and_then(|x| x.get("sessions").cloned())
+                    .unwrap_or(json!(0));
+                m["sessions"] = sessions;
+                m
+            })
+            .collect();
         // 失敗の多いツール（期間内に動いたセッションの、ツール名ごとの呼び出しと失敗）
         let calls = q(
             &format!(
@@ -676,7 +865,8 @@ impl Store {
             .collect::<Result<Vec<_>>>()?;
         Ok(json!({
             "days": days, "since": since, "tz": tz_ms / 60_000,
-            "totals": totals, "daily": daily, "models": models, "tools": tools, "long": long, "prs": prs, "versions": versions,
+            "totals": totals, "raw": raw_tot, "dup": dup, "daily": daily, "models": models, "tools": tools, "long": long, "prs": prs, "versions": versions,
+            "prices": crate::prices::table().meta(),
         }))
     }
 
@@ -855,7 +1045,9 @@ mod tests {
         db.ai_ingest("n", &json!({ "sessions": [], "cursors": {}, "gone": ["claude:x"], "errors": [] }), 5).unwrap();
         assert!(db.ai_session("n", "claude:x").unwrap().is_some(), "gone preserves historical session");
         let ids: i64 = db.conn.query_row("SELECT count(*) FROM ai_claude_messages WHERE node_id='n' AND file='claude:x'", [], |r| r.get(0)).unwrap();
-        assert_eq!(ids, 0);
+        assert_eq!(ids, 1, "応答ごとの量は残す（履歴の量と、ほかのファイルとの重複除去が、元のファイルが消えても変わらない）");
+        let tools: i64 = db.conn.query_row("SELECT count(*) FROM ai_claude_tools WHERE node_id='n' AND file='claude:x'", [], |r| r.get(0)).unwrap();
+        assert_eq!(tools, 0, "ファイルの中の重複除去用の台帳は消す");
     }
 
     #[test]
@@ -991,8 +1183,7 @@ mod tests {
         db.ai_ingest("node", &out(vec![legacy], json!({file:std::fs::metadata(&path).unwrap().len()})), 1).unwrap();
         db.conn.execute("DELETE FROM ai_claude_replay", []).unwrap(); // 旧schema由来の数値cursorだけの状態
         let probe = || {
-            let replay = db.ai_claude_replay("node").unwrap();
-            let src = crate::ai_sessions::script(&db.ai_files("node").unwrap(), &replay);
+            let src = crate::ai_sessions::script(&db.ai_state("node").unwrap());
             let mut child = Command::new(python)
                 .args(["-X", "utf8", "-"])
                 .env("HOME", &home)
@@ -1027,6 +1218,55 @@ mod tests {
         assert_eq!(session.tokens[0], 15);
         assert_eq!(session.counts[1..4], [1, 1, 1]);
         assert_eq!(session.tool_error_counts["Bash"], 1);
+        // 出どころの台帳: 区間は 0 からすき間なくつながり、応答の数と出力トークンがセッションと合う
+        let t = db.ai_trace_file("node", file).unwrap();
+        let c = &t["checks"];
+        assert_eq!((c["contiguous"].clone(), c["responses_match"].clone(), c["tok_out_match"].clone()), (json!(true), json!(true), json!(true)));
+        assert_eq!(t["spans"].as_array().unwrap().len(), 2, "最初からの読み直し 1 つ（旧 cursor の分は置き換え済みにならない）と続き 1 つ");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn probe_output_deduplicates_the_same_response_across_files() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let python = ["python3", "python"]
+            .into_iter()
+            .find(|p| Command::new(p).arg("--version").status().is_ok_and(|s| s.success()))
+            .expect("AI probe tests require Python");
+        let home = std::env::temp_dir().join(format!("kt-ai-dedup-{}-{}", std::process::id(), super::super::now_ms()));
+        let sub = home.join(".claude/projects/project/session/subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let row = |id: &str, out: i64| {
+            json!({"type":"assistant","sessionId":"session","timestamp":"2026-10-07T00:00:00Z","message":{"id":id,"model":"claude-opus-5-5","usage":{"input_tokens":1,"output_tokens":out,"cache_creation_input_tokens":8,"cache_creation":{"ephemeral_1h_input_tokens":8}},"content":[]}}).to_string() + "\n"
+        };
+        std::fs::write(home.join(".claude/projects/project/session.jsonl"), row("shared", 10) + &row("only-parent", 3)).unwrap();
+        // 同じ応答（shared）がサブエージェントのファイルにも書かれる
+        std::fs::write(sub.join("agent.jsonl"), row("shared", 10)).unwrap();
+        let db = Store::open_in_memory().unwrap();
+        let src = crate::ai_sessions::script(&db.ai_state("node").unwrap());
+        let mut child = Command::new(python)
+            .args(["-X", "utf8", "-"])
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(src.as_bytes()).unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        let probe = serde_json::from_slice::<Value>(&result.stdout).unwrap();
+        let r = db.ai_ingest("node", &probe, 1).unwrap();
+        assert_eq!((r.spans, r.rejected, r.responses), (2, 0, 3));
+        let s = db.ai_summary(&json!({ "days": 400, "tz": 0 }), super::super::now_ms()).unwrap();
+        assert_eq!((s["totals"]["tok_out"].clone(), s["raw"]["tok_out"].clone()), (json!(13), json!(23)), "shared は 1 回だけ数える");
+        assert_eq!((s["dup"]["responses"].clone(), s["dup"]["cross_file"].clone()), (json!(2), json!(1)));
+        // 1 時間のキャッシュ書きは、単価の高い 1 時間の分で数える
+        let p = crate::prices::table().lookup("claude-opus-5-5").unwrap().clone();
+        let want = (2.0 * p.input + 13.0 * p.output + 16.0 * p.cache_write_1h.unwrap()) / 1e6;
+        assert!((s["totals"]["cost_usd"].as_f64().unwrap() - want).abs() < 1e-4, "{} vs {want}", s["totals"]["cost_usd"]);
         std::fs::remove_dir_all(home).unwrap();
     }
 

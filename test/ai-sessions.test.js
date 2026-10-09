@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const crypto = require('node:crypto');
 
 const PROBE = fs.readFileSync(path.join(__dirname, '..', 'probes', 'ai_sessions.py'), 'utf8');
 const PY = ['python3', 'python'].find((c) => spawnSync(c, ['--version']).status === 0);
@@ -184,9 +185,13 @@ test('AI セッション: 全ファイル共有のmetadata予算は行境界で�
   assert.equal(one.truncated, true);
   assert.ok(one.cursors[key] > 0 && one.cursors[key] < fs.statSync(file).size);
   assert.ok(one.claude_usage.length <= 4096);
+  // 巻き戻した行は区間の指紋に入れない（区間は続きの位置までのバイト列そのもの）
+  const s1 = one.sessions.find((x) => x.file === key);
+  assert.deepEqual([s1.span.end, s1.span.sha256], [one.cursors[key], crypto.createHash('sha256').update(fs.readFileSync(file).subarray(0, one.cursors[key])).digest('hex')]);
   const two = run(home, { files: one.cursors }).out;
   assert.equal(two.cursors[key], fs.statSync(file).size);
   assert.ok(two.claude_usage.length > 0);
+  assert.equal(two.sessions.find((x) => x.file === key).span.start, one.cursors[key]);
 });
 
 test('AI セッション: 不変サイズの旧Claude cursorも replay 指示で replace する', { skip: !PY && 'python が無い' }, () => {
@@ -271,4 +276,155 @@ test('AI セッション: IDとツール名をUTF-8 byteで検証し欠測を明
   assert.equal(out.claude_usage.filter(e => e.file === key).length, 1);
   assert.equal(out.claude_tools.filter(e => e.file === key).length, 1);
   assert.ok(out.errors.some(e => e.includes(key) && e.includes('metadata unavailable')));
+});
+
+// ---- 出どころの台帳（区間の指紋・続きの検算・検算モード）と、ファイルをまたぐ重複を除くための応答ごとの量 ----
+
+const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
+const nl = (b) => b.toString('utf8').split('\n').length - 1;
+
+test('AI セッション: 区間の指紋・行数と、応答ごとのモデル・1 時間のキャッシュ書き', { skip: !PY && 'python が無い' }, () => {
+  const { home, proj } = fixture();
+  const base = { sessionId: 's1', cwd: path.join(home, 'work', 'demo'), version: '9.9.9' };
+  const usage = { input_tokens: 3, output_tokens: 4, cache_read_input_tokens: 5, cache_creation_input_tokens: 9, cache_creation: { ephemeral_1h_input_tokens: 6, ephemeral_5m_input_tokens: 3 } };
+  // 同じ応答がサブエージェントのファイルにも出る（DB が応答 ID ごとに重複を除く）。高速モードは別のモデル名で数える
+  const rows = [
+    { ...base, type: 'assistant', timestamp: '2026-10-01T00:00:06Z', message: { id: 'rid-1', model: 'model-a', usage, content: [{ type: 'text', text: SECRET }] } },
+    { ...base, type: 'assistant', timestamp: '2026-10-01T00:00:07Z', message: { id: 'rid-2', model: 'model-a', usage: { ...usage, speed: 'fast', inference_geo: 'us' }, content: [] } },
+  ];
+  fs.writeFileSync(path.join(proj, 's1', 'subagents', 'agent-y.jsonl'), jl(rows) + 'not json\n');
+  fs.appendFileSync(path.join(proj, 's1.jsonl'), jl(rows));
+  const { raw, out } = run(home);
+  assert.ok(!raw.includes(SECRET));
+  for (const file of ['claude:-work-demo/s1.jsonl', 'claude:-work-demo/s1/subagents/agent-y.jsonl']) {
+    const ev = out.claude_usage.filter((e) => e.file === file && e.id.startsWith('rid-'));
+    assert.deepEqual(ev.map((e) => [e.id, e.usage, e.cw1h, e.model]), [['rid-1', [3, 4, 5, 9, 0], 6, 'model-a'], ['rid-2', [3, 4, 5, 9, 0], 6, 'model-a@fast@us']]);
+  }
+  // 区間: 開始〜終了のバイト列の SHA-256・行数・数えた行・形の違う行（本文は出さない）
+  const sub = out.sessions.find((s) => s.file.endsWith('agent-y.jsonl'));
+  const file = fs.readFileSync(path.join(proj, 's1', 'subagents', 'agent-y.jsonl'));
+  assert.deepEqual({ ...sub.span, anchor: undefined }, { start: 0, end: file.length, sha256: sha(file), lines: 3, used: 2, skipped: 1, anchor: undefined });
+  assert.deepEqual(sub.span.anchor, [file.length, sha(file)]);
+  const main = out.sessions.find((s) => s.file === 'claude:-work-demo/s1.jsonl');
+  const m = fs.readFileSync(path.join(proj, 's1.jsonl'));
+  assert.deepEqual([main.span.sha256, main.span.lines, main.span.skipped], [sha(m), nl(m), 0]);
+  assert.equal(out.version, PROBE.match(/^KT_VERSION = "([^"]+)"/m)[1]);
+});
+
+test('AI セッション: 上限を超える行も区間の指紋に含める（本文は保持しない）', { skip: !PY && 'python が無い' }, () => {
+  const { home, proj } = fixture();
+  const p = path.join(proj, 's1.jsonl');
+  fs.appendFileSync(p, JSON.stringify({ type: 'user', timestamp: '2026-10-01T00:00:09Z', message: { content: 'x'.repeat(MAX_LINE_BYTES + 10) } }) + '\n');
+  const { out } = run(home);
+  const s = out.sessions.find((x) => x.file === 'claude:-work-demo/s1.jsonl');
+  const bytes = fs.readFileSync(p);
+  assert.deepEqual([s.span.end, s.span.sha256, s.span.lines, s.span.skipped], [bytes.length, sha(bytes), nl(bytes), 1]);
+});
+
+test('AI セッション: 続きは位置の手前の指紋で検算し、合わなければ最初から読み直す', { skip: !PY && 'python が無い' }, () => {
+  const { home, proj } = fixture();
+  const p = path.join(proj, 's1.jsonl');
+  const key = 'claude:-work-demo/s1.jsonl';
+  const first = run(home).out;
+  const s1 = first.sessions.find((s) => s.file === key);
+  const anchors = { [key]: s1.span.anchor };
+  const more = jl([{ type: 'user', sessionId: 's1', timestamp: '2026-10-02T00:00:00Z', message: { role: 'user', content: SECRET } }]);
+  fs.appendFileSync(p, more);
+  // 手前が同じ → 続き（add）。区間は前回の終了から
+  const next = run(home, { files: first.cursors, anchors }).out.sessions.find((s) => s.file === key);
+  assert.deepEqual([next.mode, next.rewound, next.span.start, next.span.lines, next.span.sha256], ['add', null, s1.span.end, 1, sha(Buffer.from(more))]);
+  // 手前を書き換えた（同じ長さ）→ 最初から読み直す
+  const buf = fs.readFileSync(p);
+  buf[s1.span.end - 5] = buf[s1.span.end - 5] === 0x41 ? 0x42 : 0x41;
+  fs.writeFileSync(p, buf);
+  fs.appendFileSync(p, more);
+  const again = run(home, { files: first.cursors, anchors }).out.sessions.find((s) => s.file === key);
+  assert.deepEqual([again.mode, again.rewound, again.span.start], ['replace', 'anchor', 0]);
+  // 短くなった → 最初から
+  fs.writeFileSync(p, more);
+  const shrunk = run(home, { files: first.cursors, anchors }).out.sessions.find((s) => s.file === key);
+  assert.deepEqual([shrunk.mode, shrunk.rewound], ['replace', 'shrunk']);
+});
+
+test('AI セッション: 検算モードは区間を読み直して指紋だけを返す（取り込まない）', { skip: !PY && 'python が無い' }, () => {
+  const { home, proj } = fixture();
+  const p = path.join(proj, 's1.jsonl');
+  const size = fs.statSync(p).size;
+  const src = PROBE.replace('KT_VERIFY = []', `KT_VERIFY = ${JSON.stringify([['claude:-work-demo/s1.jsonl', 0, size], ['claude:-work-demo/s1.jsonl', 10, size + 99], ['claude:gone/x.jsonl', 0, 5], ['claude:../escape', 0, 1]])}`);
+  const r = spawnSync(PY, ['-'], { input: src, env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!r.stdout.includes(SECRET));
+  const v = JSON.parse(r.stdout);
+  assert.equal(v.sessions, undefined, '取り込みはしない');
+  assert.deepEqual(v.verify.map((x) => x.state), ['ok', 'short', 'gone', 'gone']);
+  assert.equal(v.verify[0].sha256, sha(fs.readFileSync(p)));
+  assert.equal(v.verify[0].lines, nl(fs.readFileSync(p)));
+});
+
+// ---- Codex の残り枠（probes/codex_limits.py）。偽の codex で app-server の受け答えを確かめる ----
+
+const LIMITS = fs.readFileSync(path.join(__dirname, '..', 'probes', 'codex_limits.py'), 'utf8');
+
+function fakeCodex(mode) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-codex-'));
+  const bin = path.join(dir, 'codex');
+  fs.writeFileSync(bin, `#!/usr/bin/env python3
+import json, sys
+MODE = ${JSON.stringify(mode)}
+n = 0
+assert sys.argv[1:] == ["app-server"], sys.argv
+for line in sys.stdin:
+    m = json.loads(line)
+    if m.get("method") == "initialize":
+        print(json.dumps({"id": m["id"], "result": {"userAgent": "fake", "codexHome": "/SECRET-HOME"}}), flush=True)
+    elif m.get("method") == "account/rateLimits/read":
+        n += 1
+        print(json.dumps({"method": "account/rateLimits/updated", "params": {"rateLimits": {}}}), flush=True)
+        if MODE == "error":
+            print(json.dumps({"id": m["id"], "error": {"code": -32600, "message": "chatgpt authentication required to read rate limits"}}), flush=True)
+            continue
+        if MODE == "empty" or (MODE == "empty-then-full" and n == 1):
+            res = {"rateLimits": {"primary": None, "secondary": None}}
+        else:
+            res = {"rateLimits": {"limitId": "codex", "planType": "SECRET-PLAN", "credits": {"balance": "SECRET-BALANCE"},
+                                  "primary": {"usedPercent": 25, "windowDurationMins": 300, "resetsAt": 1900000000},
+                                  "secondary": {"usedPercent": 61, "windowDurationMins": 10080, "resetsAt": 1900500000}},
+                   "rateLimitResetCredits": {"availableCount": 2}}
+        print(json.dumps({"id": m["id"], "result": res}), flush=True)
+`);
+  fs.chmodSync(bin, 0o755);
+  return dir;
+}
+
+function limits(dir, src = LIMITS) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-home-'));
+  const r = spawnSync(PY, ['-'], { input: src, env: { ...process.env, HOME: home, PATH: `${dir}${path.delimiter}${process.env.PATH}` }, encoding: 'utf8', timeout: 40000 });
+  assert.equal(r.status, 0, r.stderr);
+  return { raw: r.stdout, out: JSON.parse(r.stdout) };
+}
+
+const NO_FAKE = (!PY || process.platform === 'win32') && '偽の codex は macOS / Linux だけ';
+
+test('Codex の残り枠: 窓の長さ・使用率・リセット時刻だけを出す（起動直後の空は 1 回だけ読み直す）', { skip: NO_FAKE }, () => {
+  const { raw, out } = limits(fakeCodex('empty-then-full'));
+  for (const s of ['SECRET-HOME', 'SECRET-PLAN', 'SECRET-BALANCE', 'availableCount', 'fake']) assert.ok(!raw.includes(s), `${s} が出ている`);
+  assert.deepEqual([out.codex, out.empty, out.error], [true, false, null]);
+  assert.deepEqual(out.windows, [{ mins: 300, used_pct: 25, resets_at: 1900000000 }, { mins: 10080, used_pct: 61, resets_at: 1900500000 }]);
+});
+
+test('Codex の残り枠: 空のまま・失敗・codex が無い', { skip: NO_FAKE }, () => {
+  const empty = limits(fakeCodex('empty')).out;
+  assert.deepEqual([empty.empty, empty.windows, empty.error], [true, [], null]);
+  const err = limits(fakeCodex('error')).out;
+  assert.match(err.error, /authentication required/);
+  // よくある置き場所も見ないようにして、PATH に codex が無い状態を作る
+  const none = LIMITS.replace(/cands = \[[\s\S]*?\]\n/, 'cands = []\n');
+  assert.notEqual(none, LIMITS);
+  // PATH には python だけを置いた空のディレクトリ（本物の codex を見つけて呼ばない）
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-nocodex-'));
+  const exe = spawnSync(PY, ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).stdout.trim();
+  fs.symlinkSync(exe, path.join(dir, PY));
+  const r = spawnSync(path.join(dir, PY), ['-'], { input: none, env: { ...process.env, PATH: dir, HOME: dir }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout).codex, false);
 });

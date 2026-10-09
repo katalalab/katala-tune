@@ -51,6 +51,10 @@
     aiSummary: (filter) => invoke('ai_summary', { filter: filter ?? null }),
     aiSessions: (filter) => invoke('ai_sessions', { filter: filter ?? null }),
     aiSync: (ids) => invoke('ai_sync', { ids: ids ?? null }),
+    // 数字の出どころ（{ node_id, day } か { node_id, file }）・元ファイルとの照合・台帳の様子
+    aiTrace: (filter) => invoke('ai_trace', { filter: filter ?? null }),
+    aiVerify: (filter) => invoke('ai_verify', { filter: filter ?? null }),
+    aiProvenance: () => invoke('ai_provenance'),
     onAiSynced: (fn) => { listen('ai-synced', (r) => fn(r)); },
     // ネットワークとセキュリティ（Tauri 版だけ。待ち受け・防御・常駐の増減・ログイン・初めての接続先）
     netsec: (filter) => invoke('netsec', { filter: filter ?? null }),

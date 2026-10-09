@@ -47,3 +47,20 @@ test('セキュリティの学習中表示も選択した機体だけに絞る',
   const source = fs.readFileSync(path.join(__dirname, '../renderer/security.js'), 'utf8');
   assert.match(source, /const learning = pick\(d\.nodes\)\.filter\(\(n\) => n\.netsec\?\.peers\?\.learning\)/);
 });
+
+test('AI の「この数字はどこから」は、画面で選んでいるツールで絞って問い合わせる', async () => {
+  const calls = [];
+  const window = { tune: { aiTrace: async (f) => { calls.push(f); return { error: 'stub' }; } } };
+  const context = vm.createContext({ window, UI: { ICON: {}, esc: String, section: () => '', chip: () => '' } });
+  const source = fs.readFileSync(path.join(__dirname, '../renderer/agents.js'), 'utf8');
+  vm.runInContext(source.replace(/\}\)\(\);\s*$/, 'window.review = { ai, traceHtml };})();'), context);
+  const { ai, traceHtml } = window.review;
+  ai.tool = 'codex';
+  ai.trace = { node_id: 'n1', day: 123 };
+  await traceHtml();
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0])), { node_id: 'n1', day: 123, tool: 'codex' });
+  // ファイルの区間は、1 つのファイルの話なのでツールで絞らない
+  ai.trace = { node_id: 'n1', file: 'claude:p/a.jsonl' };
+  await traceHtml();
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[1])), { node_id: 'n1', file: 'claude:p/a.jsonl' });
+});

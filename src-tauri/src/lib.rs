@@ -130,6 +130,9 @@ pub fn run() {
             commands_tools::ai_sessions,
             commands_tools::ai_sync,
             commands_netsec::netsec,
+            commands_tools::ai_trace,
+            commands_tools::ai_verify,
+            commands_tools::ai_provenance,
             live::live_start,
             live::live_stop,
         ])

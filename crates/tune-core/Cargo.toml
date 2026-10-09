@@ -16,6 +16,8 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 regex = "1"
 encoding_rs = "0.8"
 sha1_smol = "1"
+# 出どころの台帳（区間の指紋・連鎖・調査スクリプトの指紋）。Tauri がすでに使っている版（Cargo.lock に既にある）
+sha2 = "0.10"
 dirs = "7"
 gethostname = "1"
 
