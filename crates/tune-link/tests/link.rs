@@ -176,6 +176,71 @@ async fn code_is_single_use() {
     assert_eq!(registered, 0);
 }
 
+/// n 回目の送信（1 から数える）から先を失敗させる（ACK だけ届かない通信路の役）
+struct FailSendFrom<T> {
+    inner: T,
+    from: usize,
+    sent: usize,
+}
+
+impl<T: Transport> Transport for FailSendFrom<T> {
+    async fn send(&mut self, frame: &[u8]) -> std::io::Result<()> {
+        self.sent += 1;
+        if self.sent >= self.from {
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "test: send failed"));
+        }
+        self.inner.send(frame).await
+    }
+    async fn recv(&mut self) -> std::io::Result<Vec<u8>> {
+        self.inner.recv().await
+    }
+}
+
+#[tokio::test]
+async fn code_is_used_up_even_if_the_ack_cannot_be_sent_after_registering() {
+    let (agent, console1, console2) = (DeviceKeys::generate().unwrap(), DeviceKeys::generate().unwrap(), DeviceKeys::generate().unwrap());
+    let mut w = PairWindow::new(code("271828"), Instant::now());
+    // agent が送るのは 1 SPAKE2 の返事、2 Noise の返事、3 ACK。3 つ目から失敗させる
+    let (a_raw, mut console_side) = {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        (Framed::new(a), Framed::new(b))
+    };
+    let mut agent_side = FailSendFrom { inner: a_raw, from: 3, sent: 0 };
+    let registered = AtomicUsize::new(0);
+    let reg = &registered;
+    let c = code("271828");
+    let (a, b) = tokio::join!(
+        async {
+            let r = pair::respond(&mut agent_side, &mut w, &agent, "agent-under-test", 47231, |_, _| {
+                reg.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .await;
+            drop(agent_side); // 実際の接続と同じく、返したあとは閉じる（操作卓を待たせない）
+            r
+        },
+        pair::initiate(&mut console_side, &c, &console1, "console-1"),
+    );
+    assert_eq!(registered.load(Ordering::Relaxed), 1, "台帳には足された");
+    assert!(b.is_err(), "操作卓は確認を受け取れない");
+    // 台帳は変わっているので、結果は登録済みとして扱う（相手は誰かが分かっている）
+    assert_eq!(a.unwrap().identity, console1.identity());
+    assert_eq!(w.check(Instant::now()), Err(Refusal::Used), "ACK が届かなくても 1 回限りのコードは使用済み");
+
+    // 同じコードで別の操作卓が登録できない
+    let (mut agent_side, _log, mut console_side) = pipe();
+    let (a, b) = tokio::join!(
+        pair::respond(&mut agent_side, &mut w, &agent, "agent-under-test", 47231, |_, _| {
+            registered.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }),
+        pair::initiate(&mut console_side, &c, &console2, "console-2"),
+    );
+    assert!(matches!(a, Err(Error::Refused(Refusal::Used))), "{a:?}");
+    assert!(b.is_err());
+    assert_eq!(registered.load(Ordering::Relaxed), 1, "2 つ目は台帳に足されない");
+}
+
 /// 127.0.0.1 で待ち受け、接続を `pair::serve` へ順に渡す（tune-agent pair と同じ作り）
 async fn pair_server(
     agent: Arc<DeviceKeys>,
