@@ -9,6 +9,8 @@
 | 分析エンジン（Rust ライブラリ） | 台帳、保存（SQLite）、調査の実行（SSH・ローカル）、判定、状態、ログ、道具の台帳、AI エージェントのセッション、変更操作の計画と検証 | `crates/tune-core`（Tauri に依存しない） |
 | 検証用 CLI | Tauri なしで分析エンジンを動かす | `crates/tune-cli` |
 | 各機体での調査 | 読み取り専用。1 行の JSON を返す | 今は `probes/`（Python・PowerShell）、後で `tune-agent`（Rust の単一バイナリ） |
+| 機体どうしの接続 | 機体鍵・ペアリング（SPAKE2）・端末間暗号化（Noise）・要求と応答。経路に依存しない（docs/connectivity.md） | `crates/tune-link` |
+| 各機体の常駐 | ペア済みの操作卓だけに読み取り専用の調査を返す。OpenTelemetry の受け口（docs/observability.md） | `crates/tune-agent` |
 
 ## なぜこの組み合わせか
 
@@ -59,7 +61,7 @@
 | 3 | 道具の台帳と Do-gu、AI エージェントのセッションを `tune-core` と画面に足す | 道具と Do-gu: `tune-core`（inventory・dogu。JS 版との一致は tests/parity_inventory.rs）と画面「道具」。AI エージェント: `tune-core`（ai_sessions。取り込み・時間ごとの量・集計・ページング。出どころの台帳 provenance・重複を除いた量と費用の推定 ai_usage・prices・Codex の残り枠 codex_limits）と画面「AI」（Tauri 版だけ） |
 | 4 | 画面を TypeScript にする（ビルドは Vite か esbuild） | 未着手 |
 | 5 | SSH の管理（到達性・認証の経路・鍵の種類と古さ・known_hosts） | 設計 |
-| 6 | `tune-agent`（各機体の調査を Rust の単一バイナリに） | 未着手 |
+| 6 | `tune-agent`（各機体の調査を Rust の単一バイナリに） | 土台: `tune-link`（ペアリング・機体鍵・端末間暗号化）と `tune-agent`（pair・run・status、probe を 1 つ、OTLP の受け口）、画面「接続」の骨組み。調査・ライブの経路はまだ SSH |
 | 7 | Electron 版を退役 | 段階 1〜3 が同じことをできてから |
 
 ## 目標値（測って確かめる）

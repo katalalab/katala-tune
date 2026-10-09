@@ -134,6 +134,50 @@ AI のセッション中に落ちた常駐、負荷の高い時間帯との重�
 - 時間: 2026-10-08 の実機検証では macOS の調査全体は 6.105 秒、netsec は 90 ms（CPU 13 ms）。Windows 1 台の調査全体は 13.3 秒、ネットワーク調査に意図的に 30 秒の停止を入れた場合も netsec 部分は 17.1 秒で戻り、完了した待受情報と基本指標を保持し、子プロセスは残らなかった。これは測定した機体と負荷での値で、全機体や長時間稼働の保証ではない。CPU 値には別プロセスの WmiPrvSE の処理を含まない。Windows の netsec は stdin だけを使う専用子プロセスで動かし、部分ごとの結果を逐次返す。内側は 15 秒、親は 20 秒以内に自分が起動した子だけを止め、完了済みの部分を残す（macOS は全体 15 秒）。CIM は部分ごとに 5〜8 秒
 - まだ無いもの: DNS のキャッシュ、Tailscale の接続先と鍵の期限、画面を見ている間の接続の記録（ライブ）
 
+## OpenTelemetry の受け口（tune-agent。実装 2026-10-07）
+
+`tune-agent run` が `http://127.0.0.1:4318`（`--otlp-port`。`--no-otlp` で開かない）で OTLP/HTTP を受け、本文・引数・出力の断片を落としてから `~/.katala-tune/agent/otel/otel.jsonl` に 1 レコード 1 行で書く（16 MiB で回し、3 世代まで。ファイルは 0600）。後で調査がこのファイルを読む（`otlp.read`。次の段階）。中身は `crates/tune-agent/src/otlp.rs`。
+
+- 受けるのは `POST /v1/logs`・`POST /v1/metrics` の `application/json` だけ。protobuf・圧縮・トレース（`/v1/traces`）は受けない（依存を増やさないため。断ると 415・404 を返す）
+- 待つのは 127.0.0.1 だけ。Host が 127.0.0.1・localhost・[::1] 以外の要求は断る（ブラウザからの書き込み・DNS rebinding を防ぐ）
+- **落とし方は許可リスト**: 文字列の属性は、決めた名前（`event.name`・`session.id`・`model`・`tool_name`・`decision`・`success`・`error_type` など。一覧は `KEEP_STRING`）で、128 文字までのものだけ残す。数・真偽は残す。配列・入れ子・バイト列は残さない。トレース ID・exemplar は残さない
+- **ログの本文は既知のイベント名と一致するときだけ**: `KNOWN_EVENTS`（Claude Code・Codex の公式の一覧）にある名前だけ残し、それ以外（`secret_token` のような識別子の形の本文も）は落とす。形では判断しない。出典（2026-10-09 に確認）: Claude Code は <https://code.claude.com/docs/en/monitoring-usage> の「Event Name」（`claude_code.` 付き）と `event.name` 属性（接頭辞なし。ページに版の記載は無く、属性ごとに最小の版が付く。最新の言及は v2.1.287）、Codex は <https://developers.openai.com/codex/config-advanced> の OpenTelemetry の節（`codex.conversation_starts`・`api_request`・`sse_event`・`websocket_request`・`websocket_event`・`user_prompt`・`tool_decision`・`tool_result`。版・日付の記載なし）。新しい版のイベントは本文として残らない（増えたら一覧に足す）
+- **大きさの上限**: 1 つの属性リストから残すのは 64 個まで（`MAX_ATTRS`。超えた分は落として数える）。リソースの属性は行ごとに複製せず、リソースごとに 1 行（`"kind":"resource"`、`id` つき）だけ書き、各行は `res` でそれを指す。1 回の要求から書く行は 1 万行まで（リソースの行を含む）。8 MiB・1 万件の要求のテストで、出力が膨らまないことを確かめている
+- 各行に落とした数（`dropped`）を書く（リソースの分はリソースの行に）
+- だから `prompt`・`prompt_text`・`tool_parameters`・`tool_input`・`error`（Claude Code）、`arguments`・`output`（Codex の `codex.tool_result`）、`user.email`・`vcs.repository.url.full`・`workspace.host_paths` などは、設定を間違えて本文の出力をオンにしても残らない（`otlp::tests` で確かめている）
+
+### 各機体での設定（手順だけ。配布は操作者の確認のあと）
+
+tune-agent は Claude Code・Codex の設定を書き換えない。入れるときは機体ごとに次を足す。
+
+Claude Code（`~/.claude/settings.json` の `env`。リポジトリの `.claude/settings.json` の `OTEL_*` は Claude Code が無視する）:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "OTEL_METRICS_EXPORTER": "otlp",
+    "OTEL_LOGS_EXPORTER": "otlp",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318"
+  }
+}
+```
+
+本文を出す設定（`OTEL_LOG_USER_PROMPTS`・`OTEL_LOG_ASSISTANT_RESPONSES`・`OTEL_LOG_TOOL_DETAILS`・`OTEL_LOG_TOOL_CONTENT`・`OTEL_LOG_RAW_API_BODIES`）は入れない（どれも既定でオフ）。`OTEL_EXPORTER_OTLP_COMPRESSION` とトレースの出力も入れない。
+
+Codex（`~/.codex/config.toml`）:
+
+```toml
+[otel]
+log_user_prompt = false
+exporter = { otlp-http = { endpoint = "http://127.0.0.1:4318/v1/logs", protocol = "json" } }
+```
+
+Codex の `codex.tool_result` には引数と出力の断片が入るが、受け口で落とす。資料の例は endpoint に `/v1/logs` まで書いているが、版によって付け方が違いうるので、入れた後に `tune-agent status` の `otlp.bytes` が増えること（増えなければ endpoint を `http://127.0.0.1:4318` にする）を確かめる。
+
+確かめ方: Claude Code か Codex を 1 回使ったあと、`tune-agent status` の `otlp.bytes` が増え、`otel.jsonl` に `"event":"claude_code.api_request"` などの行が出ること。本文が残っていないことは、使った指示の一部の語で `otel.jsonl` を検索して 0 件であることで見る。
+
 ## 7. ログ収集の耐性（2026-10-09）
 
 実機の DB の分析で見つかった3つの問題への対応。判定は `lib/*.js`（仕様）と `crates/tune-core`（同じ入力に同じ出力。`tests/parity.rs`）の両方に入れてある。

@@ -32,6 +32,8 @@ const COMMANDS: &[&str] = &[
     "ai_provenance",
     "live_start",
     "live_stop",
+    "agent_peers",
+    "agent_pair",
     "netsec",
 ];
 

@@ -67,6 +67,9 @@
     liveStart: (ids) => invoke('live_start', { ids: (Array.isArray(ids) ? ids : []).map(String) }),
     liveStop: (ids) => invoke('live_stop', { ids: Array.isArray(ids) ? ids.map(String) : null }),
     onLive: (fn) => { listen('live', (p) => fn(p)); },
+    // 「接続」（Tauri 版だけ）: tune-agent とのペアリングと、ペア済みの機体の一覧。コードは引数で渡すだけで、どこにも残さない
+    agentPeers: () => invoke('agent_peers'),
+    agentPair: (addr, code) => invoke('agent_pair', { addr: String(addr || ''), code: String(code || '') }),
   };
   Object.defineProperty(window, 'tune', { value: Object.freeze(tune), enumerable: true });
 

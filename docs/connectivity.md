@@ -51,6 +51,124 @@ PAKE を使うのは、6 桁のコードでも盗み見た通信から総当た�
 - TURN は anycast で最寄りの拠点に割り当てられる
 - どちらも遅延の実測値はまだ無い。PoC で、直接接続・Durable Object・TURN の往復時間を測ってから決める
 
+## 実装（段階 B の土台、2026-10-07）
+
+今の調査・ライブは SSH のまま。ここで作ったのは、ペアリング・機体鍵・端末間暗号化と、tune-agent で読み取り専用の調査を 1 つ返すところまで。経路の切り替え（tune-core の `collect`・`live::Route` を tune-agent に載せ替える）は次の段階。
+
+| 部品 | 置き場所 | 中身 |
+|---|---|---|
+| 接続のライブラリ | `crates/tune-link` | 機体鍵（`keys`）・ペア済みの台帳（`peers`）・経路の抽象（`frame`）・ペアリング（`pair`）・端末間暗号化（`channel`）・要求と応答（`proto`）・操作卓の側の TCP の呼び出し（`client`） |
+| 常駐 | `crates/tune-agent` | `tune-agent pair`・`run`・`status`・`unpair`。調査は probes/ を埋め込んで動かす。OTLP の受け口（docs/observability.md） |
+| 操作卓（検証用） | `tune agent-pair`・`agent-peers`・`agent-probe`・`agent-unpair`（`crates/tune-cli/src/agent.rs`） | コードは標準入力から読む |
+| 操作卓（画面） | 「接続」（`renderer/link.js`・`src-tauri/src/agent.rs`。Tauri 版だけ） | アドレスとコードの入力・ペア済みの機体の一覧（骨組み） |
+
+### 鍵
+
+機体ごとに 2 つの鍵ペアを作る。秘密鍵は機体の外に出さない（交換するのは「名刺」= 公開鍵 2 つと署名だけ）。
+
+| 鍵 | 使い道 |
+|---|---|
+| 機体鍵（Ed25519） | 身元。自分の Noise の静的鍵と名前に署名する（名刺）。**署名にしか使わない** |
+| Noise の静的鍵（X25519） | 接続ごとの Noise の鍵交換で、相手に自分を確かめさせる。相手は「機体鍵の署名が付いた静的鍵」だけを受け付ける |
+| セッション鍵 | 接続ごとに作る使い捨ての X25519（Noise の ephemeral）から作る。静的鍵が後で漏れても、過去の通信は読めない（前方秘匿） |
+
+**Ed25519 の鍵を X25519 に変換して流用しない。** 理由:
+
+- 「機体鍵は署名だけ」という上の決定（鍵の役割を分ける）にそのまま沿う
+- 同じ鍵を署名と鍵交換の両方に使うことの安全性は、条件付きで示されている（Thormarker, "On using the same key pair for Ed25519 and an X25519 based KEM", 2021）が、その条件を自分の使い方で確かめる必要があり、変換（クランプ・ハッシュの扱い）を取り違える余地も生まれる。分ければ考えなくてよい
+- 身元（機体鍵）を変えずに、静的鍵だけを入れ替えられる
+- 身元の鍵が Noise の静的鍵に署名する形は、libp2p の Noise（IPFS などで広く使われている）と同じ
+
+**置き場所**（本人だけが読めるファイル。Unix はファイル 0600・ディレクトリ 0700、Windows は継承を外して本人だけに許可（icacls。ディレクトリ自体と既存のファイルの ACL は未検証。下の「Windows の既知の制約」）。読むときに他のユーザーが読める状態・自分の所有でない（Unix）なら使わずに止める（ssh と同じ考え方）。ログ（`otel.jsonl`）は自分で作るものなので、既にあって緩ければ 0600 に直して追記する）:
+
+| 側 | ディレクトリ | ファイル |
+|---|---|---|
+| tune-agent | `~/.katala-tune/agent/`（`--dir`・`KATALA_TUNE_AGENT_DIR`） | `device.key`（目印 8 バイト＋秘密鍵 2 つ。72 バイト）・`peers.json`（ペア済みの操作卓の名刺）・`otel/otel.jsonl`（OTLP の受け口が書くもの） |
+| 操作卓 | アプリのデータの場所の `link/`（`KATALA_TUNE_LINK_DIR`） | `device.key`・`peers.json`（ペア済みの tune-agent の名刺とつなぎ先） |
+
+OS の鍵置き場（Keychain・資格情報マネージャー）は使わない。常駐は画面の無いところで鍵を読むので Keychain の確認が出うること、OS ごとの依存が増えること、同じユーザーで動くプログラムからは結局どちらも読めること、から。台帳（`peers.json`）は秘密ではないが、書き換えられると知らない鍵を受け付けるので同じ扱いにし、読むたびに名刺の署名を確かめ直す。
+
+### ペアリング
+
+```text
+操作卓（SPAKE2 の A）                         tune-agent（B。tune-agent pair がコードを端末に表示して待つ）
+  "KTP1" ‖ SPAKE2(A)                ─────▶  受付中か（期限・使用済み・停止）。だめなら 0x01 ‖ 理由 を返して終わり
+                                    ◀─────  0x00 ‖ SPAKE2(B)                 ← ここから 1 回の試行として数える
+  K = SPAKE2 の鍵                             K = SPAKE2 の鍵
+  Noise_XXpsk0（PSK = K）1 通目       ─────▶  開けない = コードが違う → 0x02 ‖ 残りの回数 を返して終わり
+                                    ◀─────  2 通目 ＋ tune-agent の名刺（暗号化）
+  3 通目 ＋ 操作卓の名刺（暗号化）      ─────▶  署名と静的鍵を確かめて台帳へ
+                                    ◀─────  暗号化した {"ok": true, "run_port": …}
+```
+
+- コードは OS の乱数で一様に作る 6 桁。5 分で失効し、1 回成功したら使えない。**3 回続けて間違えたら受付を止める**（tune-agent pair を機体でやり直す）
+- 受付は接続を **1 つずつ順に** 処理する。SPAKE2 のメッセージを返した時点で 1 回と数え、成功以外（違う・途中で切れた・20 秒の時間切れ）はすべて失敗に数える。だから試せるのはオンラインで 1 回ずつ、1 回の受付で当たる確率は最大 3/1,000,000
+- PSK を最初に混ぜる psk0 なので、コードが違えば 1 通目で分かり、tune-agent は名刺を送らない
+- SPAKE2 の鍵をそのまま使わず、Noise の PSK に入れることで、鍵の確認（両側で同じ鍵か）と、名刺の交換の暗号化・静的鍵を持っていることの証明を Noise に任せる（鍵の確認を自作しない）
+- コードは **端末（`/dev/tty`、Windows は `CONOUT$`）にだけ** 出す。標準出力・標準エラー・ログ・引数には出さない（端末が無ければ pair は動かない）。操作卓は標準入力（tune-cli）か画面の入力欄（Tauri）から受け取り、どこにも保存しない
+- 待ち受けは pair が 47232、run が 47231（`--port`）。既定は 127.0.0.1 と、この機体の Tailscale のアドレス（`tailscale ip` の出力のうち 100.64/10・`fd7a:115c:a1e0::/48` の範囲のもの）だけ。0.0.0.0・`::` は `--listen` で渡されても断る。run は Tailscale が後から上がったら、そのアドレスでも待ち受けを足す
+
+### ペアの後の接続
+
+- `Noise_IK_25519_ChaChaPoly_BLAKE2s`（prologue `katala-tune/link/1`）。操作卓はペアリングで登録した tune-agent の静的鍵を知っているので IK（1 往復）
+- tune-agent は 1 通目で操作卓の静的鍵を知る。**台帳に無ければ名刺も読まず、何も送り返さずに切る**
+- 名刺の署名（機体鍵）が、Noise で確かめた静的鍵と一致することを毎回確かめる。操作卓も、台帳と違う tune-agent にはつながない
+- IK の 1 通目は盗み見た人が再送できる。tune-agent は 1 通目では何も実行せず、ハンドシェイクの後の要求（操作卓の ephemeral 鍵と静的鍵が無いと作れない）だけを処理する
+- 経路の抽象は「最大 65535 バイトのフレームを送る・受け取る」だけ（`frame::Transport`）。TCP は長さ 2 バイト＋本体（`Framed`）。将来の WebSocket 中継は 1 メッセージ = 1 フレーム、QUIC はストリームに同じ `Framed` を載せる
+- 1 つのメッセージは平文を `[続きの印 1 バイト][本体]` に分けて最大 16 MiB。要求は `{"id","op","args"}`、応答は `{"id","ok","result"|"error"}` の JSON。今の操作は `hello`・`probe`（読み取り専用。args を使わない）だけ。`live.start`・`live.stop`・`otlp.read` は名前だけ決めて、次の段階で同じ形に載せる
+- `probe` は今の probe と同じ JSON（probes/mac_probe.py・win_probe.ps1 をバイナリに埋め込んで動かす）。操作卓の `tune agent-probe` は `tune probe` と同じ形（`node_id`・`ok`・`data`・`wall_s`・`at`）で返す
+
+### 選んだクレート（暗号は自作しない）
+
+| クレート | 版 | 使い道 | 選んだ理由 | 監査（README の記載） |
+|---|---|---|---|---|
+| `spake2` | 0.4.0 | PAKE | RustCrypto の PAKEs。Rust の SPAKE2 で最も使われ（magic-wormhole の Rust 版など）、python-spake2 と互換 | 独立した監査は受けていない |
+| `snow` | 0.10.0 | Noise | Rust で最も使われている Noise の実装（libp2p の Noise も使う）。Noise の仕様のテストベクタで試験する仕組みがある | 正式な監査は受けていない。中の暗号は下の RustCrypto と curve25519-dalek |
+| `ed25519-dalek` | 2.2.0 | 機体鍵の署名 | 最も使われている Ed25519。`verify_strict` で小さい位数の鍵などを拒む | 記載なし |
+| `curve25519-dalek` | 4.1.3 | X25519 の公開鍵の計算だけ | spake2・snow・ed25519-dalek と同じ版（クレートは増えない） | 記載なし |
+| `chacha20poly1305`・`blake2` | 0.10.1・0.10.6 | snow の中の AEAD とハッシュ | snow の既定の選択 | chacha20poly1305 は NCC Group の監査あり |
+| `sha2`・`rand_core`（getrandom）・`zeroize` | 0.10・0.6・1 | 指紋・OS の乱数・使い終えた秘密を消す | spake2 などが既に使っているもの | |
+
+snow は `std` の feature を入れない（入れると ring まで入る。alloc だけで動く）。HTTP（OTLP の受け口）の解析だけ `httparse` 1（hyper の中で使われている、依存の無い解析器）を足した。
+
+### 脅威と対策
+
+| 脅威 | 対策 | 確かめているテスト（`crates/tune-link/tests/link.rs` ほか） |
+|---|---|---|
+| 盗聴（同じ網・将来の中継） | 中身は常に Noise で端末間暗号化。ペアリングの名刺も暗号化して運ぶ | `right_code_pairs_and_exchanges_public_keys_only`（通信に公開鍵・名前・コードが平文で出ない） |
+| 盗み見た通信からのコードの総当たり | SPAKE2。盗み見た人は鍵を計算できず、候補を手元で確かめる手段が無い | `eavesdropped_pairing_cannot_be_brute_forced_offline`（正しいコードを含む 301 個の候補のどれでも Noise の 1 通目を開けない。対照として当事者なら同じ方法で開けることも確かめる） |
+| オンラインの総当たり | 1 つずつ順に・3 回で停止・5 分・1 回限り | `consecutive_wrong_codes_stop_the_window_one_attempt_at_a_time`（5 つを同時に投げても 1 つずつ数えられ 3 回で止まる。止まった後は正しいコードでも通らない）・`code_expires_after_five_minutes`・`code_is_single_use` |
+| ペアリングの最中に間に入る | 1 回の接続で 1 つの候補しか試せない。外れると 1 通目が開かず、名刺も届かない | `wrong_code_does_not_pair_and_reveals_nothing` |
+| なりすまし（ペアの後） | IK で静的鍵を確かめ、名刺の署名（機体鍵）と一致することを確かめる | `tampered_or_wrong_agent_is_rejected` |
+| ペアしていない相手からの接続 | 1 通目で切る。名刺も読まず、何も送らない・何も実行しない | `paired_console_can_talk_and_unpaired_keys_are_cut_before_content` |
+| 1 通目の再送 | 要求はハンドシェイクの後だけ処理する | `replayed_first_message_executes_nothing` |
+| 改ざん・順番の入れ替え | AEAD と Noise の nonce。復号できなければ切る | `tampered_or_wrong_agent_is_rejected` |
+| 中継（段階 D） | 中継は外側の TLS を終端しても、内側の Noise は開けない。見えるのは「いつ・どれだけ」だけ | 段階 D で |
+| 鍵の持ち出し | 本人だけが読めるファイル。他人が読めるなら使わない。秘密鍵・コードを Debug・ログ・status に出さない | `key_file_is_private_and_stable`・`debug_never_shows_secrets`・`codes_are_six_digits_and_hidden_in_debug` |
+| 全部のアドレスでの待ち受け | 既定は 127.0.0.1 と Tailscale だけ。0.0.0.0・:: は断る | `never_listen_on_all_addresses` |
+
+残る危険（今は対策していない・確かめていない）:
+
+- 同じユーザーで動くプログラムは鍵のファイルを読める（OS の鍵置き場にしても大きくは変わらない）
+- `spake2` の `Password` は内部の写しを消さない。コードがメモリに少し残りうる（5 分・1 回限りなので影響は小さい）
+- 受付を止めた後に `tune-agent pair` をやり直せば、また 3 回試せる。やり直せるのは機体の端末の前にいる人だけ、という前提に立っている
+- 受付は 1 つずつなので、つないだまま黙る相手がいると 20 秒ずつ受付がふさがる（妨害はできるが、コードは当てられない）。待ち受けは 127.0.0.1 と Tailscale だけなので、相手は tailnet の中に限られる
+- IK の 1 通目（操作卓の名刺だけ。公開鍵と署名）は、tune-agent の静的鍵が漏れると読める
+- 失効は台帳から消すだけ（`tune-agent unpair`・`tune agent-unpair`）。機体をまたいだ失効の一覧は無い
+- Windows の鍵のファイルの ACL（icacls）と、Windows での tune-agent の動作は実機で確かめていない（下の「Windows の既知の制約」）
+- 登録の確認（ACK）が届かなかった操作卓は、機体の台帳には足されているのに「失敗」と見える。コードは使用済みになる（同じコードで別の操作卓は登録できない）。操作卓は新しいコードでやり直す（同じ機体鍵は台帳で置き換わる）。登録されたのが意図しない操作卓なら、機体で `tune-agent unpair` する
+
+### Windows の既知の制約（未検証）
+
+Windows の実機がなく、次は確かめていない。確かめずに書いたコードを増やさないため、**この PR では実装せず、既知の制約として残す**:
+
+- **ディレクトリ自体の ACL**: 今は新しく作るファイルの ACL を `icacls`（継承を外して本人だけに許可）で絞るだけで、`--dir`・`otel/`・`link/` のディレクトリの ACL は絞らず、確かめもしない。共有された・緩いディレクトリを `--dir` に指定すると、別のユーザーがファイルを消したり差し替えたりできうる（Unix はディレクトリ 0700・所有者・ファイル 0600 を作る時と読む時に確かめ、緩いと止める）
+- **既存のファイルの ACL**: 読むとき・追記で開くときに、既にあるファイルの ACL は確かめない（Unix は 0600 と所有者を確かめる）。新しく作るテレメトリのファイルは、親ディレクトリの継承した ACL を受ける
+- **`icacls` の結果・`CONOUT$` への書き込み・埋め込みの probe（`probe.ps1`）の通し**: Windows 実機で確かめていない
+- **ファイルの置き換え（`rename`）**: Rust の `std::fs::rename` は Windows でも既存の行き先を置き換える（`MOVEFILE_REPLACE_EXISTING`）。台帳（`peers.json`）を 2 回以降に add・remove するテスト（`repeated_add_and_remove_replace_the_existing_ledger` など）は Windows の CI でも走る
+
+そのため、**この PR では tune-agent を配布せず、既定でも有効にしない**（Windows への入れ方・常駐の登録は手順だけで、操作者が確かめたあとに）。ディレクトリの ACL の絞りと検証は、Windows 実機で確かめられる段階（段階 B の Windows 検証）で、実機の結果を見ながら足す。
+
 ## 配布と更新
 
 - タグ（`v*`）を打つと CI が macOS（arm64・x64）と Windows（x64）の Tauri 版をビルドし、GitHub Releases に置く
@@ -63,17 +181,26 @@ PAKE を使うのは、6 桁のコードでも盗み見た通信から総当た�
 | 段階 | 中身 |
 |---|---|
 | A | リリースの CI と updater（Tauri 版が入ってから） |
-| B | `tune-agent` と、ペアリング・機体鍵・LAN／Tailscale での直接接続。読み取り専用の調査を今の probe と同じ形で返す。SSH は予備として残す |
+| B | `tune-agent` と、ペアリング・機体鍵・LAN／Tailscale での直接接続。読み取り専用の調査を今の probe と同じ形で返す。SSH は予備として残す（土台は 2026-10-07 に実装。上の「実装」。経路の切り替え・常駐としての登録・配布は未着手） |
 | C | NAT 越えの直接接続（iroh を候補に PoC） |
 | D | 利用者の Cloudflare に置く中継（`wrangler deploy` のテンプレート、帯域の上限、予算アラートの手順） |
 | E | 遅延の実測を docs に残し、既定の経路を決める |
 
 ## 操作者が決めること
 
-- 中継を利用者の Cloudflare に置く方針でよいか（作者は共有中継を運営しない）
+- ~~中継を利用者の Cloudflare に置く方針でよいか~~ → 2026-10-07 に決定（利用者の Cloudflare。作者は共有中継を運営しない）
 - NAT 越えと中継を iroh（QUIC）で組むか、WebRTC（ICE ＋ Cloudflare の TURN）で組むか。PoC の遅延の結果で決める
 - 安い共有経路として n0 の有料 relay を案内するか
 - リモート画面やファイル転送（月数十 GB）を最初の範囲に入れるか
+
+## 操作者の決定（2026-10-08）
+
+- ペアリングと暗号化は `spake2`・`snow` で進める。どちらも正式な第三者監査は受けていないので、作者と操作者の機体だけの試験運用とし、段階 C（NAT 越え）で iroh（QUIC・TLS 1.3）を試すときに、監査済みの選択肢と合わせて見直す
+- 待ち受けの既定: 操作卓との接続 47231、ペアリング 47232、OpenTelemetry 4318（Claude Code・Codex の標準の送り先なので変えない）。どれも設定で変えられる
+- OpenTelemetry は JSON（`http/json`）だけを受ける。各機体で有効にするとき、実物の Claude Code・Codex が JSON で送れることを確かめてから配る
+- 続けて間違えて受付が止まったら、`tune-agent pair` をやり直す前に 1 分待つ（`pair.lockout` に止まった時刻を残す）。時刻を書けない・記録が読めない・壊れているときは、待ちを守れないので受付を始めない（エラーを出す）
+- 機体鍵は当面ファイル（本人だけが読める権限。Windows は ACL）。OS の鍵置き場（Keychain・DPAPI）への対応は後で
+- 名刺の名前の既定はホスト名。暗号化して相手に送り、相手の台帳に残る
 
 ## 出典（2026-10-07 確認）
 
