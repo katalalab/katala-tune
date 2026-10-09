@@ -23,6 +23,7 @@ const LEVEL_SERIES = [
 const LEVEL_BAR = { critical: 'crit', error: 'err', warn: 'warn', info: 'unknown' };
 const STATUS_LABEL = { ok: '正常', warn: '注意', fail: '異常', unknown: '不明' };
 const CAT_LABEL = { cpu: 'CPU', memory: 'メモリ', disk: 'ディスク', thermal: '熱', power: '電源', stability: '安定性', background: '常駐・その他', security: 'セキュリティ' };
+const SOURCE_NOTE_LABEL = { 'not-installed': '対象外（未導入）', 'no-guard-log': 'ログ無し' };
 const SOURCE_LABEL = { win_system: 'System', win_application: 'Application', neonmonitor: 'NeonMonitor', mac_diag: 'DiagnosticReports', mac_kernel: 'カーネル', mac_auth: 'ログイン（sshd）', win_security: 'ログオン（セキュリティ）' };
 // メーターのしきい値（lib/rules.js の判定に合わせる。ディスクとメモリは使用率に直したもの）
 const TH = { cpu: { warn: 60, crit: 85 }, mem: { warn: 80, crit: 90 }, disk: { warn: 90, crit: 95 } };
@@ -679,19 +680,22 @@ function renderJobs() {
 
 // ---- ログ ----
 function logRow(l, showNode = true) {
-  const span = l.repeat > 1 ? UI.chip(`×${l.repeat}（${fmtTime(l.first_ts)} から）`, 'default') : '';
+  // repeat は実際の件数（probe が代表1行にまとめた分を含む）。複数の行をまとめたときだけ「から」を付ける
+  const span = l.repeat > 1 ? UI.chip(l.merged > 1 ? `×${l.repeat}（${fmtTime(l.first_ts)} から）` : `×${l.repeat}`, 'default') : '';
   return `<div class="log"><div class="log-when">${esc(fmtTime(l.ts))}</div><div>
     <div class="log-meta">${UI.chip(LEVEL_LABEL[l.level] || l.level, LEVEL_TONE[l.level] || 'default')}${showNode ? `<b>${esc(l.node_id)}</b>` : ''}<span>${esc(l.provider || '')}${l.event_id ? ` · ${esc(l.event_id)}` : ''}</span><span class="faint" title="${esc(l.source)}">${esc(SOURCE_LABEL[l.source] || l.source)}</span>${span}</div>
     <div class="log-msg">${esc(l.message)}</div></div></div>`;
 }
 
-// 連続する同種のログ（同じ機体・同じ指紋）を1行にまとめる。洪水のようなログで一覧が埋まらないように
+// 連続する同種のログ（同じ機体・同じ指紋）を1行にまとめる。洪水のようなログで一覧が埋まらないように。
+// 取り込み時に代表1行にまとめた行は occurrences（実際の件数）を持つので、その分も数える
 function collapse(rows) {
   const out = [];
   for (const r of rows) {
+    const n = r.occurrences > 1 ? r.occurrences : 1;
     const prev = out.at(-1);
-    if (prev && prev.node_id === r.node_id && prev.fingerprint === r.fingerprint) { prev.repeat++; prev.first_ts = r.ts; }
-    else out.push({ ...r, repeat: 1, first_ts: r.ts });
+    if (prev && prev.node_id === r.node_id && prev.fingerprint === r.fingerprint) { prev.repeat += n; prev.merged++; prev.first_ts = r.ts; }
+    else out.push({ ...r, repeat: n, merged: 1, first_ts: r.ts });
   }
   return out;
 }
@@ -790,8 +794,9 @@ async function renderLogs() {
           cols: [{ label: '機体 · 取り込み元' }, { label: '最終成功' }, { label: '前回', cls: 'n' }, { label: '捨てた数', cls: 'n' }],
           rows: cursors,
           empty: 'まだ取り込んでいません',
-          row: (c) => `<td><b>${esc(c.node_id)}</b> <span class="muted">· ${esc(SOURCE_LABEL[c.source] || c.source)}</span>${c.last_error ? `<div class="err cursor-err">${esc(c.last_error.slice(0, 140))}</div>` : ''}</td>`
-            + `<td class="nowrap">${c.last_error ? UI.chip('失敗', 'red', { dot: true }) + ' ' : ''}${c.last_ok_at ? esc(ago(c.last_ok_at)) : '<span class="faint">-</span>'}</td><td class="n">${esc(c.last_count ?? '-')}</td><td class="n">${c.dropped_total ? `<span class="sc-warn">${esc(c.dropped_total)}</span>` : ''}</td>`,
+          // 失敗は連続回数つき。取れても 0 件の元（NeonMonitor の未導入・ログ無し）は、静かなのではなく見るものが無いと分かる印を付ける
+          row: (c) => `<td><b>${esc(c.node_id)}</b> <span class="muted">· ${esc(SOURCE_LABEL[c.source] || c.source)}</span>${c.last_error ? `<div class="err cursor-err">${esc(c.last_error.slice(0, 140))}${c.fail_streak > 1 ? `（連続 ${esc(c.fail_streak)} 回）` : ''}</div>` : ''}</td>`
+            + `<td class="nowrap">${c.last_error ? UI.chip('失敗', 'red', { dot: true }) + ' ' : ''}${!c.last_error && SOURCE_NOTE_LABEL[c.note] ? UI.chip(SOURCE_NOTE_LABEL[c.note], 'gray') + ' ' : ''}${c.last_ok_at ? esc(ago(c.last_ok_at)) : '<span class="faint">-</span>'}</td><td class="n">${esc(c.last_count ?? '-')}</td><td class="n">${c.dropped_total ? `<span class="sc-warn">${esc(c.dropped_total)}</span>` : ''}</td>`,
         })}
       </div>
       <div>

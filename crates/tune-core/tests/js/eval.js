@@ -44,7 +44,7 @@ function write(db, w) {
   for (const l of w.logs) db.insertLogs(l.node_id, l.source, logs.normalize(l.source, l.rows), l.now);
   for (const c of w.cursors) {
     if (c.error) db.cursorError(c.node_id, c.source, c.error);
-    else db.cursorOk(c.node_id, c.source, c.cursor, c.count, c.dropped);
+    else db.cursorOk(c.node_id, c.source, c.cursor, c.count, c.dropped, c.note ?? null);
   }
   for (const c of w.checks) db.saveChecks(c.scope, c.checks, c.now);
   for (const [k, v] of Object.entries(w.meta)) db.setMeta(k, v);

@@ -14,6 +14,8 @@ use crate::js::{self, Obj, get, present, string, truthy};
 use crate::nodes::Node;
 
 pub const MAX_MESSAGE: usize = 1000;
+/// 1行が表す実際の件数の上限（probe が同種の繰り返しを count にまとめて返す。壊れた値で DB の合計が桁あふれしないように）
+pub const MAX_OCCURRENCES: f64 = 1_000_000_000.0;
 
 fn re(p: &str) -> Regex {
     Regex::new(&p.replace("{WS}", js::WS)).expect("regex")
@@ -76,7 +78,13 @@ pub fn fingerprint(source: &str, provider: Option<&Value>, event_id: Option<&Val
     hex[..16].to_string()
 }
 
-/// 取り込んだ行を正規化する（伏せ字・長さの上限・指紋）
+/// probe が返す count（同じ形のログを代表1行にまとめたときの実際の件数）。無い・不正なら 1
+pub fn occurrences_of(count: Option<&Value>) -> i64 {
+    let n = js::num(count);
+    if n.is_finite() && n >= 1.0 { n.floor().min(MAX_OCCURRENCES) as i64 } else { 1 }
+}
+
+/// 取り込んだ行を正規化する（伏せ字・長さの上限・指紋・件数）
 pub fn normalize(source: &str, rows: &[Value]) -> Vec<LogRow> {
     rows.iter()
         .filter(|r| truthy(Some(r)) && present(r.get("uid")) && truthy(r.get("ts")))
@@ -94,6 +102,7 @@ pub fn normalize(source: &str, rows: &[Value]) -> Vec<LogRow> {
                 event_id: present(event_id).then(|| js::slice16(&string(event_id), 60)),
                 fingerprint: fingerprint(source, provider, event_id, &message),
                 message,
+                occurrences: occurrences_of(r.get("count")),
             }
         })
         .collect()
@@ -270,6 +279,15 @@ async fn fetch_logs(node: &Node, cursors: &Map<String, Value>) -> RunResult {
     merge_logons(main, sec)
 }
 
+/// 取り込み元の note のうち、取れても 0 件になる理由（lib/logs.js の SOURCE_NOTES）。「静か」ではなく「見るものが無い」ことを区別する
+pub const SOURCE_NOTES: [(&str, &str); 2] = [("not-installed", "対象外（未導入）"), ("no-guard-log", "ログ無し")];
+
+/// 取り込み元の note が SOURCE_NOTES にあるときだけ保存する値
+pub fn source_note(src: Option<&Value>) -> Option<&'static str> {
+    let n = get(src, "note")?.as_str()?;
+    SOURCE_NOTES.iter().find(|(k, _)| *k == n).map(|(k, _)| *k)
+}
+
 /// 1台分を取り込む。戻り値は `{ node_id, sources: { <source>: { inserted, fetched, dropped, note? } | { error } }, meta, error? }`
 /// db はロックの道具（取り込み中もほかの読み出しを止めない）
 pub async fn sync_node(db: &(impl DbAccess + ?Sized), node: &Node) -> Value {
@@ -319,7 +337,7 @@ pub async fn sync_node(db: &(impl DbAccess + ?Sized), node: &Node) -> Value {
             if let Some(e) = &note_error {
                 d.cursor_error(&node.id, s, e)?;
             } else {
-                d.cursor_ok(&node.id, s, js::nullish(get(src, "cursor"), None), rows.len() as i64, &dropped)?;
+                d.cursor_ok(&node.id, s, js::nullish(get(src, "cursor"), None), rows.len() as i64, &dropped, source_note(src))?;
             }
             Ok(n)
         });
@@ -332,6 +350,7 @@ pub async fn sync_node(db: &(impl DbAccess + ?Sized), node: &Node) -> Value {
                         .set("inserted", n)
                         .set("dropped", dropped)
                         .opt("note", get(src, "note").cloned())
+                        .opt("events", get(src, "events").filter(|v| truthy(Some(v))).cloned())
                         .opt("error", note_error.map(Value::from))
                         .build(),
                 );
@@ -544,7 +563,7 @@ pub fn log_findings(db: &Store, node_id: &str, now: i64) -> rusqlite::Result<Vec
             "info",
             "background",
             format!("ログが多すぎて {dropped} 件を取り込めなかった"),
-            "1回の取り込みは1か所あたり300件まで",
+            "1回の取り込みは1か所あたり、同じ形のものをまとめた300行まで（まとめた繰り返しは件数に数えている）",
             "上の「同じエラーの繰り返し」を直すと収まる。",
             json!({ "node_id": node_id }),
         );
@@ -723,5 +742,22 @@ mod tests {
     fn no_permission_note_is_a_cursor_error() {
         assert_eq!(source_error(Some(&json!({ "rows": [], "note": "no-permission" }))), Some("no-permission".into()));
         assert_eq!(source_error(Some(&json!({ "rows": [], "note": "ok" }))), None);
+    }
+
+    #[test]
+    fn occurrences_default_to_one_and_are_capped() {
+        let n = |v: Value| occurrences_of(Some(&v));
+        assert_eq!((n(json!(5)), n(json!("7")), n(json!(2.9)), n(json!(1e15))), (5, 7, 2, 1_000_000_000));
+        assert_eq!((n(json!(0)), n(json!(-5)), n(json!("x")), n(Value::Null), occurrences_of(None)), (1, 1, 1, 1, 1));
+    }
+
+    #[test]
+    fn only_known_notes_are_kept() {
+        let src = |n: &str| json!({ "note": n });
+        assert_eq!(source_note(Some(&src("not-installed"))), Some("not-installed"));
+        assert_eq!(source_note(Some(&src("no-guard-log"))), Some("no-guard-log"));
+        assert_eq!(source_note(Some(&src("no-permission"))), None);
+        assert_eq!(source_note(Some(&json!({}))), None);
+        assert_eq!(source_note(None), None);
     }
 }
