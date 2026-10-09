@@ -283,7 +283,7 @@
 
   async function traceHtml() {
     if (!ai.trace || typeof window.tune.aiTrace !== 'function') return '';
-    const t = await window.tune.aiTrace(ai.trace).catch((e) => ({ error: String(e?.message || e) }));
+    const t = await window.tune.aiTrace(ai.trace.file ? ai.trace : { ...ai.trace, tool: ai.tool }).catch((e) => ({ error: String(e?.message || e) }));
     const close = '<button class="btn small" id="aiTraceClose">閉じる</button>';
     const back = ai.trace.file && ai.trace.day != null ? '<button class="btn small" id="aiTraceBack">日の内訳へ戻る</button>' : '';
     const body = t.error ? `<div class="err">${UI.esc(t.error)}</div>` : ai.trace.file ? traceFileHtml(t) : traceDayHtml(t);

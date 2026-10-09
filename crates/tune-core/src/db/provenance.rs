@@ -45,6 +45,9 @@ CREATE INDEX IF NOT EXISTS source_span_end ON source_span (node_id, file, byte_e
 CREATE INDEX IF NOT EXISTS source_span_run ON source_span (run_id);
 ";
 
+/// 連鎖の先頭のハッシュと件数を持つ meta のキー（検算が、末尾の行や全件の削除に気づくため）
+pub const CHAIN_HEAD_KEY: &str = "ingest_chain_head";
+
 /// 連鎖の最初の行の prev_hash
 pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -264,6 +267,12 @@ pub(crate) fn finish_run(c: &Connection, m: &RunMeta, rejected: i64, notes: Opti
         prev,
         hash
     ])?;
+    // 連鎖の先頭と件数を、行とは別に持つ（meta）。残りの表だけを見る検算は、末尾の行を消されても気づけないため
+    let runs: i64 = c.query_row("SELECT count(*) FROM ingest_run", [], |r| r.get(0))?;
+    c.execute(
+        "INSERT OR REPLACE INTO meta (k, v, updated_at) VALUES (?, ?, ?)",
+        params![CHAIN_HEAD_KEY, json!({ "runs": runs, "head": hash }).to_string(), super::now_ms()],
+    )?;
     Ok(hash)
 }
 
@@ -279,8 +288,11 @@ impl Store {
             .optional()
     }
 
-    /// 連鎖を最初からたどって検算する。{ runs, ok, head, broken: { run_id, id, reason } | null }。
-    /// 行の書き換え・削除・入れ替えに気づく。DB を丸ごと作り直せる相手には効かない（ハッシュも計算し直せるため）
+    /// 連鎖を最初からたどって検算する。{ runs, ok, head, anchored, broken: { run_id, id, reason } | null }。
+    /// 行の書き換え・削除・入れ替えに気づく。さらに、取り込みのたびに meta へ書いた「先頭のハッシュと件数」と突き合わせ、
+    /// 末尾の行（や全件）が消されても気づく（anchored = true）。meta が無い DB（この検算を足す前の行）は連鎖だけを見る（anchored = false）。
+    /// 先頭と件数は同じ DB に置いているので、**DB を丸ごと作り直せる相手（ハッシュも meta も書き直せる）には効かない**。
+    /// 外から確かめるには、`head` を DB の外（別の場所の記録）へ控えておき、あとで比べる
     pub fn verify_chain(&self) -> Result<Value> {
         let runs: Vec<Value> = self
             .conn
@@ -293,11 +305,12 @@ impl Store {
             let s = s?;
             by_run.entry(js::string(s.get("run_id"))).or_default().push(s);
         }
+        let anchor = self.get_meta(CHAIN_HEAD_KEY)?;
         let mut prev = GENESIS.to_string();
         let empty = Vec::new();
         for r in &runs {
             let run_id = js::string(r.get("run_id"));
-            let broken = |reason: &str| json!({ "runs": runs.len(), "ok": false, "head": Value::Null, "broken": { "run_id": run_id, "id": r.get("id"), "reason": reason } });
+            let broken = |reason: &str| json!({ "runs": runs.len(), "ok": false, "head": Value::Null, "anchored": anchor.is_some(), "broken": { "run_id": run_id, "id": r.get("id"), "reason": reason } });
             if js::string(r.get("prev_hash")) != prev {
                 return Ok(broken("前の行のハッシュと合わない（行が抜けた・入れ替わった）"));
             }
@@ -307,7 +320,21 @@ impl Store {
             }
             prev = h;
         }
-        Ok(json!({ "runs": runs.len(), "ok": true, "head": if runs.is_empty() { Value::Null } else { Value::from(prev) }, "broken": Value::Null }))
+        if let Some(a) = &anchor {
+            let (n, head) = (a.get("runs").and_then(Value::as_i64).unwrap_or(-1), js::string(a.get("head")));
+            let now_head = if runs.is_empty() { String::new() } else { prev.clone() };
+            if n != runs.len() as i64 || head != now_head {
+                let last = runs.last();
+                return Ok(json!({
+                    "runs": runs.len(), "ok": false, "head": Value::Null, "anchored": true,
+                    "broken": { "run_id": last.and_then(|r| r.get("run_id")).cloned().unwrap_or(Value::Null), "id": last.and_then(|r| r.get("id")).cloned().unwrap_or(Value::Null),
+                                "reason": format!("末尾の行が消された（別に持った件数 {n}・今 {}）か、先頭のハッシュが合わない", runs.len()) }
+                }));
+            }
+        }
+        Ok(
+            json!({ "runs": runs.len(), "ok": true, "head": if runs.is_empty() { Value::Null } else { Value::from(prev) }, "anchored": anchor.is_some(), "broken": Value::Null }),
+        )
     }
 
     /// 元ファイルと照合した結果を残す。state: ok（検証済み）・mismatch（不一致）・gone（元ファイルなし）
@@ -327,7 +354,7 @@ impl Store {
                  FROM source_span s LEFT JOIN ingest_run r ON r.run_id = s.run_id
                  WHERE s.node_id = ? AND s.file = ? ORDER BY s.id DESC LIMIT ?",
             )?
-            .query_map(params![node_id, file, limit.clamp(1, 500)], row_json)?
+            .query_map(params![node_id, file, limit.max(1)], row_json)?
             .collect()
     }
 
@@ -460,6 +487,44 @@ mod tests {
         let v = db.verify_chain().unwrap();
         assert_eq!(v["broken"]["run_id"], json!("r3"));
         assert!(js::string(v["broken"].get("reason")).contains("前の行"));
+    }
+
+    #[test]
+    fn chain_detects_a_deleted_tail_and_a_wiped_table() {
+        let db = Store::open_in_memory().unwrap();
+        for (i, run) in ["r1", "r2", "r3"].iter().enumerate() {
+            let s = i as i64 * 10;
+            db.tx(|c| {
+                insert_span(c, run, "n1", &span("f", s, s + 10), i > 0)?;
+                finish_run(c, &meta(run), 0, None)
+            })
+            .unwrap();
+        }
+        let v = db.verify_chain().unwrap();
+        assert_eq!((v["ok"].clone(), v["anchored"].clone()), (json!(true), json!(true)));
+        // 末尾の行（と、その区間）を消す: 残りの行だけを見ると連鎖は途切れないが、別に持った先頭・件数と合わない
+        db.conn().execute("DELETE FROM ingest_run WHERE run_id = 'r3'", []).unwrap();
+        db.conn().execute("DELETE FROM source_span WHERE run_id = 'r3'", []).unwrap();
+        let v = db.verify_chain().unwrap();
+        assert_eq!(v["ok"], json!(false), "{v}");
+        assert!(js::string(v["broken"].get("reason")).contains("末尾"), "{v}");
+        // 全件を消した
+        db.conn().execute("DELETE FROM ingest_run", []).unwrap();
+        assert_eq!(db.verify_chain().unwrap()["ok"], json!(false));
+    }
+
+    #[test]
+    fn chain_without_a_stored_head_is_ok_but_not_anchored() {
+        // 台帳の連鎖を足す前に作られた行（先頭・件数の保持が無い）は、今までどおり連鎖だけを見る
+        let db = Store::open_in_memory().unwrap();
+        db.tx(|c| {
+            insert_span(c, "r1", "n1", &span("f", 0, 10), false)?;
+            finish_run(c, &meta("r1"), 0, None)
+        })
+        .unwrap();
+        db.conn().execute("DELETE FROM meta WHERE k = 'ingest_chain_head'", []).unwrap();
+        let v = db.verify_chain().unwrap();
+        assert_eq!((v["ok"].clone(), v["anchored"].clone()), (json!(true), json!(false)));
     }
 
     #[test]

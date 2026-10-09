@@ -103,9 +103,11 @@ impl Store {
                SELECT a.node_id, a.message_id, MIN(a.hour) AS hour, MAX(coalesce(a.model, s.model)) AS model,
                       {t0} AS tok_in, {t1} AS tok_out, {t2} AS tok_cache_read, {t3} AS tok_cache_write, {agg}(a.cw1h) AS cw1h, {t4} AS tok_reasoning
                FROM ai_claude_messages a LEFT JOIN ai_sessions s ON s.node_id = a.node_id AND s.file = a.file
-               WHERE a.hour >= ?1 AND a.hour < ?2 AND (?3 = '' OR a.node_id = ?3) GROUP BY a.node_id, a.message_id
+               WHERE (?3 = '' OR a.node_id = ?3) GROUP BY a.node_id, a.message_id
              ), u AS (
+               -- 窓は、写しを全部まとめて「最初に出た時」を決めてから掛ける（窓の手前に写しがある応答を、窓の中に数えない）
                SELECT node_id, 'claude' AS tool, hour, model, tok_in, tok_out, tok_cache_read, tok_cache_write, cw1h, tok_reasoning FROM r
+               WHERE hour >= ?1 AND hour < ?2
                UNION ALL
                SELECT h.node_id, h.tool, h.hour, s.model, h.tok_in, h.tok_out, h.tok_cache_read, h.tok_cache_write, 0, h.tok_reasoning
                FROM ai_usage_hourly h JOIN ai_sessions s ON s.node_id = h.node_id AND s.file = h.file
@@ -152,15 +154,20 @@ impl Store {
                                 SUM(coalesce(json_extract(usage, '$[0]'), 0)) AS raw_in, MAX(coalesce(json_extract(usage, '$[0]'), 0)) AS tok_in,
                                 SUM(coalesce(json_extract(usage, '$[1]'), 0)) AS raw_out, MAX(coalesce(json_extract(usage, '$[1]'), 0)) AS tok_out,
                                 SUM(coalesce(json_extract(usage, '$[2]'), 0)) AS raw_cr, MAX(coalesce(json_extract(usage, '$[2]'), 0)) AS tok_cache_read
-                         FROM ai_claude_messages WHERE hour >= ?1 AND hour < ?2 AND (?3 = '' OR node_id = ?3) AND (?4 = '' OR ?4 = 'claude')
-                         GROUP BY node_id, message_id)";
+                         FROM ai_claude_messages WHERE (?3 = '' OR node_id = ?3) AND (?4 = '' OR ?4 = 'claude')
+                         GROUP BY node_id, message_id HAVING MIN(hour) >= ?1 AND MIN(hour) < ?2)";
         self.conn.prepare(sql)?.query_row(rusqlite::params_from_iter(w.args()), row_json)
     }
 
     /// 1 機体の 1 日（day は集計の day。その日の 0 時の epoch ms）の内訳: どのファイル（セッション）から来たか、
     /// ほかのファイルと重なった応答、重複を除いた量と費用
-    pub fn ai_trace_day(&self, node_id: &str, day: i64) -> Result<Value> {
-        let (h0, h1) = (day.div_euclid(3_600_000), day.div_euclid(3_600_000) + 24);
+    /// tool を渡すと、画面で選んでいるツールだけに絞る（日ごとの行と同じ範囲の数にするため）。
+    /// 時は開始が日の範囲に入るもの（日の 0 時が整時でない UTC+5:30 などでは、0 時以降の最初の整時から）
+    pub fn ai_trace_day(&self, node_id: &str, day: i64, tool: Option<&str>) -> Result<Value> {
+        let ceil_hour = |ms: i64| (ms + 3_599_999).div_euclid(3_600_000);
+        let (h0, h1) = (ceil_hour(day), ceil_hour(day + 86_400_000));
+        let tool = tool.filter(|t| !t.is_empty());
+        let tool_arg = tool.unwrap_or_default().to_string();
         let mut files: Vec<Value> = self
             .conn
             .prepare(
@@ -170,9 +177,10 @@ impl Store {
                         SUM(h.prompts) AS prompts, SUM(h.tool_calls) AS tool_calls,
                         (SELECT count(*) FROM source_span sp WHERE sp.node_id = h.node_id AND sp.file = h.file AND sp.superseded_by IS NULL) AS spans
                  FROM ai_usage_hourly h JOIN ai_sessions s ON s.node_id = h.node_id AND s.file = h.file
-                 WHERE h.node_id = ?1 AND h.hour >= ?2 AND h.hour < ?3 GROUP BY h.file ORDER BY SUM(h.tok_in + h.tok_out) DESC, h.file LIMIT 100",
+                 WHERE h.node_id = ?1 AND h.hour >= ?2 AND h.hour < ?3 AND (?4 = '' OR h.tool = ?4)
+                 GROUP BY h.file ORDER BY SUM(h.tok_in + h.tok_out) DESC, h.file LIMIT 100",
             )?
-            .query_map(params![node_id, h0, h1], row_json)?
+            .query_map(params![node_id, h0, h1, tool_arg], row_json)?
             .collect::<Result<_>>()?;
         let shared: Vec<Value> = self
             .conn
@@ -181,9 +189,9 @@ impl Store {
                         SUM(EXISTS (SELECT 1 FROM ai_claude_messages b WHERE b.node_id = a.node_id AND b.message_id = a.message_id AND b.file != a.file)) AS shared,
                         SUM(CASE WHEN EXISTS (SELECT 1 FROM ai_claude_messages b WHERE b.node_id = a.node_id AND b.message_id = a.message_id AND b.file != a.file)
                             THEN coalesce(json_extract(a.usage, '$[1]'), 0) ELSE 0 END) AS shared_out
-                 FROM ai_claude_messages a WHERE a.node_id = ?1 AND a.hour >= ?2 AND a.hour < ?3 GROUP BY a.file",
+                 FROM ai_claude_messages a WHERE a.node_id = ?1 AND a.hour >= ?2 AND a.hour < ?3 AND (?4 = '' OR ?4 = 'claude') GROUP BY a.file",
             )?
-            .query_map(params![node_id, h0, h1], row_json)?
+            .query_map(params![node_id, h0, h1, tool_arg], row_json)?
             .collect::<Result<_>>()?;
         let live: HashSet<String> = self.ai_files(node_id)?.keys().cloned().collect();
         let has_cursor = self.conn.prepare("SELECT 1 FROM ai_cursors WHERE node_id = ?")?.exists([node_id])?;
@@ -198,7 +206,7 @@ impl Store {
                 m.insert("shared_out".into(), sh.and_then(|s| s.get("shared_out").cloned()).unwrap_or(Value::Null));
             }
         }
-        let w = UsageWindow { since_hour: h0, until_hour: h1, tz_ms: 0, node: Some(node_id.into()), tool: None };
+        let w = UsageWindow { since_hour: h0, until_hour: h1, tz_ms: 0, node: Some(node_id.into()), tool: tool.map(str::to_string) };
         let t = prices::table();
         let mut dedup = CostAcc::default();
         for r in self.usage_rows(&w, true)? {
@@ -230,7 +238,8 @@ impl Store {
         let live: HashSet<String> = self.ai_files(node_id)?.keys().cloned().collect();
         let has_cursor = self.conn.prepare("SELECT 1 FROM ai_cursors WHERE node_id = ?")?.exists([node_id])?;
         let gone = has_cursor && !live.contains(file);
-        let mut spans = self.spans_of(node_id, file, 200)?;
+        // 検算は全部の区間で行い、返す（画面に出す）のは新しい順の先頭だけ
+        let mut spans = self.spans_of(node_id, file, i64::MAX)?;
         for s in &mut spans {
             let st = span_state(s, gone);
             if let Value::Object(m) = s {
@@ -266,9 +275,16 @@ impl Store {
             "tok_out_match": tracked && sess_out == Some(sum("tok_out")),
             "states": states,
         });
-        Ok(json!({ "node_id": node_id, "file": file, "gone": gone, "tracked": tracked, "session": session, "spans": spans, "checks": checks }))
+        let spans_total = spans.len();
+        spans.truncate(TRACE_SPANS_SHOWN);
+        Ok(json!({
+            "node_id": node_id, "file": file, "gone": gone, "tracked": tracked, "session": session, "spans": spans, "spans_total": spans_total, "checks": checks
+        }))
     }
 }
+
+/// 1 ファイルの出どころ画面に返す区間の数の上限（検算は全部の区間で行う）
+const TRACE_SPANS_SHOWN: usize = 200;
 
 /// 区間の状態: superseded（置き換え済み）・mismatch（不一致）・gone（元ファイルなし。指紋のみ）・verified（検証済み）・unverified（未検証）
 pub fn span_state(s: &Value, file_gone: bool) -> &'static str {
@@ -403,7 +419,7 @@ mod tests {
         assert_eq!(s["daily"][0]["tok_out"], json!(42));
         assert!(s["daily"][0]["cost_usd"].is_number());
         // 出どころ: その日の内訳と、1 ファイルの検算
-        let d = db.ai_trace_day("n1", (T / 86_400_000) * 86_400_000).unwrap();
+        let d = db.ai_trace_day("n1", (T / 86_400_000) * 86_400_000, None).unwrap();
         let a = d["files"].as_array().unwrap().iter().find(|f| f["file"] == "claude:p/a.jsonl").unwrap().clone();
         assert_eq!((a["responses"].clone(), a["shared"].clone(), a["shared_out"].clone(), a["spans"].clone()), (json!(2), json!(1), json!(20), json!(1)));
         assert_eq!(d["totals"]["tok_out"], json!(42));
@@ -499,6 +515,95 @@ mod tests {
         ingest(&db, vec![rec(a, "replace", 0, 10, "claude-opus-5-5@fast")], usage(a, "claude-opus-5-5@fast", &[("1", 10)]), json!({ a: 10 }));
         let s = summary(&db);
         assert_eq!((s["totals"]["cost_usd"].clone(), s["totals"]["unpriced_models"].clone()), (Value::Null, json!(["claude:claude-opus-5-5@fast"])));
+    }
+
+    /// 応答（file, id, hour, 出力）の 1 件
+    fn at(file: &str, id: &str, hour: i64, out: i64) -> Value {
+        json!({ "file": file, "id": id, "usage": [1, out, 0, 0, 0], "hour": hour, "cw1h": 0, "model": "claude-opus-5-5" })
+    }
+
+    #[test]
+    fn window_applies_to_the_first_appearance_of_a_response_not_to_any_copy() {
+        let db = Store::open_in_memory().unwrap();
+        let (a, b) = ("claude:p/a.jsonl", "claude:p/b.jsonl");
+        // 同じ応答 x が、窓の手前（H-100）の親のファイルと、窓の中（H）のサブエージェントのファイルに出る
+        ingest(
+            &db,
+            vec![rec(a, "replace", 0, 10, "claude-opus-5-5"), rec(b, "replace", 0, 10, "claude-opus-5-5")],
+            vec![at(a, "x", H - 100, 7), at(b, "x", H, 7), at(b, "y", H, 3)],
+            json!({ a: 10, b: 10 }),
+        );
+        let w = UsageWindow { since_hour: H - 1, until_hour: H + 1, tz_ms: 0, node: None, tool: None };
+        let out: i64 = db.usage_rows(&w, true).unwrap().iter().map(|r| r.tokens.output).sum();
+        assert_eq!(out, 3, "x は窓の手前で初めて出ているので、窓の中には y だけ");
+        assert_eq!(db.dup_stats(&w).unwrap()["responses"], json!(1));
+        let all = UsageWindow { since_hour: H - 101, until_hour: H + 1, ..w };
+        assert_eq!(db.usage_rows(&all, true).unwrap().iter().map(|r| r.tokens.output).sum::<i64>(), 10, "窓を広げれば x も 1 回だけ");
+    }
+
+    #[test]
+    fn trace_day_starts_at_the_first_whole_hour_of_a_local_day() {
+        let db = Store::open_in_memory().unwrap();
+        let a = "claude:p/a.jsonl";
+        // UTC+5:30 の現地 0 時（UTC の 18:30）から始まる日。h_a は UTC 18:00 の時（現地では前の日の 23:30）
+        let day = (T / 86_400_000) * 86_400_000 - 19_800_000;
+        let h_a = day.div_euclid(3_600_000);
+        assert_ne!(day % 3_600_000, 0);
+        ingest(
+            &db,
+            vec![rec(a, "replace", 0, 10, "claude-opus-5-5")],
+            // 前の日の 23:30 の時・その日の最初の時・その日の最後の時・次の日の最初の時
+            vec![at(a, "prev", h_a, 1), at(a, "first", h_a + 1, 10), at(a, "last", h_a + 24, 100), at(a, "next", h_a + 25, 1000)],
+            json!({ a: 10 }),
+        );
+        let d = db.ai_trace_day("n1", day, None).unwrap();
+        assert_eq!(d["totals"]["tok_out"], json!(110), "{d}");
+        // 日ごとの集計の行（tz 付き）と同じ数
+        let s = db.ai_summary(&json!({ "days": 3, "tz": 330 }), T + 86_400_000).unwrap();
+        let row = s["daily"].as_array().unwrap().iter().find(|r| r["day"] == json!(day)).unwrap();
+        assert_eq!(row["tok_out"], d["totals"]["tok_out"]);
+    }
+
+    #[test]
+    fn trace_file_checks_cover_every_span_not_just_the_newest_200() {
+        let db = Store::open_in_memory().unwrap();
+        let a = "claude:p/long.jsonl";
+        ingest(&db, vec![rec(a, "replace", 0, 10, "claude-opus-5-5")], usage(a, "claude-opus-5-5", &[("r0", 1)]), json!({ a: 10 }));
+        for i in 1..250i64 {
+            let id = format!("r{i}");
+            ingest(
+                &db,
+                vec![rec(a, "add", i * 10, i * 10 + 10, "claude-opus-5-5")],
+                usage(a, "claude-opus-5-5", &[(id.as_str(), 1)]),
+                json!({ a: i * 10 + 10 }),
+            );
+        }
+        let f = db.ai_trace_file("n1", a).unwrap();
+        let c = &f["checks"];
+        assert_eq!((c["contiguous"].clone(), c["responses_match"].clone(), c["tok_out_match"].clone()), (json!(true), json!(true), json!(true)), "{c}");
+        assert_eq!((c["covered_to"].clone(), c["tok_out_spans"].clone()), (json!(2500), json!(250)));
+        assert_eq!(f["spans"].as_array().unwrap().len(), 200, "表示は新しい 200 件だけ");
+        assert_eq!(f["spans_total"], json!(250));
+    }
+
+    #[test]
+    fn trace_day_follows_the_selected_tool() {
+        let db = Store::open_in_memory().unwrap();
+        let a = "claude:p/a.jsonl";
+        let mut x = json!({ "tool": "codex", "file": "codex:2026/r.jsonl", "mode": "replace", "session_id": "c1", "model": "gpt-5.5", "first_ts": T, "last_ts": T + 1000,
+            "tokens": { "in": 40, "out": 9, "cache_read": 0, "cache_write": 0, "reasoning": 0 }, "tokens_mode": "max", "tool_counts": {}, "tool_error_counts": {} });
+        x["hours"] = json!({ (H.to_string()): [40, 9, 0, 0, 0, 0, 1] });
+        ingest(&db, vec![rec(a, "replace", 0, 10, "claude-opus-5-5"), x], usage(a, "claude-opus-5-5", &[("1", 5)]), json!({ a: 10, "codex:2026/r.jsonl": 5 }));
+        let day = (T / 86_400_000) * 86_400_000;
+        let files = |d: &Value| d["files"].as_array().unwrap().iter().map(|f| js::string(f.get("tool"))).collect::<Vec<_>>();
+        let all = db.ai_trace_day("n1", day, None).unwrap();
+        assert_eq!((all["totals"]["tok_out"].clone(), files(&all).len()), (json!(14), 2));
+        let codex = db.ai_trace_day("n1", day, Some("codex")).unwrap();
+        assert_eq!((codex["totals"]["tok_out"].clone(), files(&codex)), (json!(9), vec!["codex".to_string()]));
+        assert_eq!(codex["dup"]["responses"], json!(0));
+        let claude = db.ai_trace_day("n1", day, Some("claude")).unwrap();
+        assert_eq!((claude["totals"]["tok_out"].clone(), files(&claude)), (json!(5), vec!["claude".to_string()]));
+        assert_eq!(claude["dup"]["responses"], json!(1));
     }
 
     #[test]

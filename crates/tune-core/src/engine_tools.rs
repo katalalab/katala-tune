@@ -341,7 +341,7 @@ impl Engine {
         json!({ "results": out, "limits": self.with_db(|d| d.ai_limits()).unwrap_or_default() })
     }
 
-    /// 数字の出どころ。f = { node_id, day }（その日の内訳）か { node_id, file }（1 ファイルの区間と検算）
+    /// 数字の出どころ。f = { node_id, day, tool? }（その日の内訳。tool は画面で選んでいるツール）か { node_id, file }（1 ファイルの区間と検算）
     pub fn ai_trace(&self, f: &Value) -> Result<Value, String> {
         let node = js::string(f.get("node_id"));
         if node.is_empty() || node == "undefined" {
@@ -351,7 +351,8 @@ impl Engine {
             return self.with_db(|d| d.ai_trace_file(&node, file));
         }
         let day = f.get("day").and_then(Value::as_f64).filter(|x| x.is_finite()).ok_or("day が無い")? as i64;
-        self.with_db(|d| d.ai_trace_day(&node, day))
+        let tool = f.get("tool").and_then(Value::as_str).filter(|t| !t.is_empty());
+        self.with_db(|d| d.ai_trace_day(&node, day, tool))
     }
 
     /// 1 ファイルの区間を元ファイルと照合する（機体で区間を読み直して指紋だけを受け取る。読み取り専用）。
