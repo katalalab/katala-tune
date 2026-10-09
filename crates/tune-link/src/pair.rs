@@ -217,7 +217,8 @@ where
     // register が成功したら台帳は変わっている。確認（ACK）が届かなくても、時間切れで途中で打ち切られても、
     // 1 回限りのコードは使用済みにする（同じコードで別の操作卓が登録できてはいけない）
     let mut committed: Option<Verified> = None;
-    let result = timeout(ATTEMPT_TIMEOUT, attempt(t, password, msg_a.to_vec(), me, my_name, run_port, register, &mut committed)).await.unwrap_or(Err(Error::Timeout));
+    let result =
+        timeout(ATTEMPT_TIMEOUT, attempt(t, password, msg_a.to_vec(), me, my_name, run_port, register, &mut committed)).await.unwrap_or(Err(Error::Timeout));
     if let Some(v) = committed {
         window.succeed();
         return Ok(v);
@@ -240,7 +241,16 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn attempt<T, R>(t: &mut T, password: Password, msg_a: Vec<u8>, me: &DeviceKeys, my_name: &str, run_port: u16, register: R, committed: &mut Option<Verified>) -> Result<Verified>
+async fn attempt<T, R>(
+    t: &mut T,
+    password: Password,
+    msg_a: Vec<u8>,
+    me: &DeviceKeys,
+    my_name: &str,
+    run_port: u16,
+    register: R,
+    committed: &mut Option<Verified>,
+) -> Result<Verified>
 where
     T: Transport,
     R: FnOnce(&Verified, &Card) -> Result<()>,
