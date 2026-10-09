@@ -432,7 +432,7 @@ fn checks_json(c: &[Check]) -> Value {
 }
 
 fn row_json(r: &LogRow) -> Value {
-    json!({ "uid": r.uid, "ts": js::jnum(r.ts), "level": r.level, "provider": r.provider, "event_id": r.event_id, "message": r.message, "fingerprint": r.fingerprint })
+    json!({ "uid": r.uid, "ts": js::jnum(r.ts), "level": r.level, "provider": r.provider, "event_id": r.event_id, "message": r.message, "fingerprint": r.fingerprint, "occurrences": r.occurrences })
 }
 
 fn node_of(v: &Value) -> Node {
@@ -490,7 +490,29 @@ fn rules_health_logs_actions_match_js() {
                     ("last_ok_at", mb!(r, json!(now - (r.below(200) as i64) * 60_000))),
                     (
                         "last_error",
-                        if r.chance(0.2) { Some(json!(format!("ssh: 接続できない {}", "x".repeat(r.below(120) as usize)))) } else { Some(Value::Null) },
+                        if r.chance(0.35) { Some(json!(format!("ssh: 接続できない {}", "x".repeat(r.below(120) as usize)))) } else { Some(Value::Null) },
+                    ),
+                    // 連続失敗の回数（しきい値の前後・文字列・不正な値）と、取り込み元の状態（対象外・ログ無し・知らない値）
+                    (
+                        "fail_streak",
+                        mb!(r, r.pick(&[json!(0), json!(1), json!(2), json!(3), json!(4), json!("2"), json!("x"), json!(-1), json!(2.5), json!(null)]).clone()),
+                    ),
+                    (
+                        "note",
+                        mb!(
+                            r,
+                            r.pick(&[
+                                json!("not-found-for-account"),
+                                json!("not-installed"),
+                                json!("no-guard-log"),
+                                json!("other"),
+                                json!(""),
+                                json!(null),
+                                json!(7),
+                                json!(["not-installed"])
+                            ])
+                            .clone()
+                        ),
                     ),
                 ])
             })
@@ -604,6 +626,27 @@ fn rules_health_logs_actions_match_js() {
                         ("provider", mb!(r, json!(*r.pick(&["disk", "", "Microsoft-Windows-WHEA-Logger"])))),
                         ("event_id", mb!(r, json!(*r.pick(&["7", "4101"])))),
                         ("message", mb!(r, json!(r.pick(&messages).clone()))),
+                        // 代表行にまとめた実際の件数（無い・小数・文字列・0・負・桁あふれ・不正）
+                        (
+                            "count",
+                            mb!(
+                                r,
+                                r.pick(&[
+                                    json!(1),
+                                    json!(5),
+                                    json!(250),
+                                    json!(2.9),
+                                    json!("7"),
+                                    json!(0),
+                                    json!(-3),
+                                    json!(1e12),
+                                    json!("x"),
+                                    json!(null),
+                                    json!(true)
+                                ])
+                                .clone()
+                            ),
+                        ),
                     ])
                 })
                 .collect();
@@ -695,9 +738,16 @@ fn rules_health_logs_actions_match_js() {
                 _ => 1 + r.below(2),
             };
             let rows: Vec<Value> = (0..n)
-                .map(|i| json!({ "uid": format!("{case}-{k}-{i}"), "ts": now - (r.below(9 * 86_400) as i64) * 1000, "level": level, "provider": provider, "event_id": ev, "message": format!("{provider} {} {i}", ev.unwrap_or("")) }))
+                .map(|i| json!({ "uid": format!("{case}-{k}-{i}"), "ts": now - (r.below(9 * 86_400) as i64) * 1000, "level": level, "provider": provider, "event_id": ev, "message": format!("{provider} {} {i}", ev.unwrap_or(""))
+                    , "count": if r.chance(0.3) { json!(1 + r.below(40)) } else { json!(null) } }))
                 .collect();
             groups.push(json!({ "source": source, "rows": rows }));
+        }
+        if case % 5 == 1 {
+            // probe が代表1行にまとめた洪水（行は1つ、件数が実際の量。200 件の前後）
+            for (j, n) in [(3, 199), (4, 200), (5, 2_280_000)] {
+                groups.push(json!({ "source": "mac_kernel", "rows": [{ "uid": format!("g{j}"), "ts": now - 60_000, "level": "error", "provider": format!("Flood{j}"), "event_id": "com.example.kernel", "message": format!("flood {j} \"same\" error 1"), "count": n }] }));
+            }
         }
         if case % 3 == 0 {
             // 同じエラーの洪水（件数は重ならないようにする）
@@ -771,7 +821,7 @@ fn rules_health_logs_actions_match_js() {
                 db.insert_logs("pc", src, &logs::normalize(src, js::arr(g.get("rows"))), now).unwrap();
             }
             for d in js::arr(c.get("dropped")) {
-                db.cursor_ok("pc", d["source"].as_str().unwrap(), Some(&json!("1")), 0, &d["n"]).unwrap();
+                db.cursor_ok("pc", d["source"].as_str().unwrap(), Some(&json!("1")), 0, &d["n"], None).unwrap();
             }
             Value::Array(logs::log_findings(&db, "pc", now).unwrap())
         })
@@ -803,7 +853,7 @@ fn write_spec(now: i64) -> Value {
     let logs: Vec<Value> = (0..6)
         .map(|k| {
             let rows: Vec<Value> = (0..30)
-                .map(|i| json!({ "uid": format!("{k}-{i}"), "ts": now - (i * 3_600_000) - k, "level": (["error", "warn", "info"][i as usize % 3]), "provider": (["disk", "Display", "Microsoft-Windows-WHEA-Logger"][k as usize % 3]), "event_id": "7", "message": format!("device {} WHEA bad block at 0x{i:X} \"q\" ghp_{}", i, "a".repeat(30)) }))
+                .map(|i| json!({ "uid": format!("{k}-{i}"), "ts": now - (i * 3_600_000) - k, "level": (["error", "warn", "info"][i as usize % 3]), "provider": (["disk", "Display", "Microsoft-Windows-WHEA-Logger"][k as usize % 3]), "event_id": "7", "message": format!("device {} WHEA bad block at 0x{i:X} \"q\" ghp_{}", i, "a".repeat(30)), "count": if i % 4 == 0 { json!(3 + i) } else { json!(null) } }))
                 .collect();
             json!({ "node_id": if k % 2 == 0 { "n1" } else { "n2" }, "source": (["win_system", "win_application", "mac_diag"][k as usize % 3]), "rows": rows, "now": now })
         })
@@ -813,7 +863,11 @@ fn write_spec(now: i64) -> Value {
         "cursors": [
             { "node_id": "n1", "source": "win_system", "cursor": "1791352417838", "count": 30, "dropped": 3 },
             { "node_id": "n1", "source": "win_system", "error": "ssh timeout" },
-            { "node_id": "n2", "source": "mac_diag", "cursor": 12345, "count": 2, "dropped": 0 }
+            { "node_id": "n1", "source": "win_system", "error": "ssh timeout" },
+            { "node_id": "n2", "source": "mac_diag", "cursor": 12345, "count": 2, "dropped": 0 },
+            { "node_id": "n2", "source": "neonmonitor", "cursor": 0, "count": 0, "dropped": 0, "note": "not-found-for-account" },
+            { "node_id": "n1", "source": "neonmonitor", "cursor": 5, "count": 0, "dropped": 0, "note": "no-guard-log" },
+            { "node_id": "n1", "source": "mac_kernel", "error": "ssh timeout" }
         ],
         "checks": [
             { "scope": "n1", "now": now - 1000, "checks": [{ "id": "probe", "name": "分析", "status": "ok", "detail": "1 分前に成功" }, { "id": "disk", "name": "ディスク", "status": "warn", "detail": "C: 8%" }] },
@@ -858,7 +912,7 @@ fn rust_write(db: &Store, w: &Value) {
         let (n, s) = (c["node_id"].as_str().unwrap(), c["source"].as_str().unwrap());
         match c.get("error") {
             Some(e) => db.cursor_error(n, s, e.as_str().unwrap()).unwrap(),
-            None => db.cursor_ok(n, s, c.get("cursor"), c["count"].as_i64().unwrap(), &c["dropped"]).unwrap(),
+            None => db.cursor_ok(n, s, c.get("cursor"), c["count"].as_i64().unwrap(), &c["dropped"], c.get("note").and_then(Value::as_str)).unwrap(),
         }
     }
     for c in js::arr(w.get("checks")) {
