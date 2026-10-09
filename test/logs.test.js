@@ -9,6 +9,27 @@ const { openDb } = require('../lib/db');
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'kt-test-'));
 
+test('同種ログの集計は期間・機体・繰り返し件数を保ち、全期間のtotalと区別する', (t) => {
+  const dir = tmp();
+  const db = openDb(dir);
+  t.after(() => { db.db.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const row = (uid, ts, occurrences, fingerprint = 'shared') => ({ uid, ts, occurrences, fingerprint, level: 'warn', provider: null, message: 'example' });
+  db.insertLogs('node-a', 'example', [row('old', 99, 50), row('edge', 100, 3), row('new', 200, 4), row('other', 300, 1, 'other')]);
+  db.insertLogs('node-b', 'example', [row('b', 150, 9)]);
+  const all = db.signatures({ since: 100 });
+  assert.equal(all.length, 2);
+  assert.deepEqual({ n: all[0].n, nodes: all[0].nodes, ids: all[0].node_ids.split(',').sort(), last: all[0].last_ts, total: all[0].total },
+    { n: 16, nodes: 2, ids: ['node-a', 'node-b'], last: 200, total: 66 });
+  assert.equal(all[0].provider, null);
+  const one = db.signatures({ since: 100, node_id: 'node-a', limit: 1 });
+  assert.deepEqual({ n: one[0].n, nodes: one[0].nodes, ids: one[0].node_ids, total: one[0].total }, { n: 7, nodes: 1, ids: 'node-a', total: 66 });
+  assert.deepEqual(db.signatures({ since: 301 }), []);
+  assert.deepEqual(db.signatures({ node_id: 'missing' }), []);
+  assert.deepEqual(db.signatures({ limit: 0 }), []);
+  db.insertLogs('node-a', 'example', [row('z', 500, 2, 'z'), row('a', 400, 2, 'a')]);
+  assert.equal(db.signatures({ since: 400, node_id: 'node-a', limit: 1 })[0].fingerprint, 'a');
+});
+
 test('Windows リモートログは固定ファイルを使わず Base64 stdin から実行する', () => {
   const script = Buffer.from('\uFEFFparam([long]$SysCursor)\n[Console]::OutputEncoding = [Text.Encoding]::UTF8\n', 'utf8');
   const transport = windowsRemoteTransport({ win_system: '42; Write-Error bad', win_application: ' 7tail', neonmonitor: 'not-a-number' }, script);

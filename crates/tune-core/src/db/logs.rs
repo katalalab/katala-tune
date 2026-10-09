@@ -199,11 +199,13 @@ impl Store {
         }
         args.push(SqlValue::Integer(limit_of(f, 50, SIGNATURE_LIMIT_MAX)));
         args.push(SqlValue::Integer(offset_of(f)));
+        // 説明表はログの各行ではなく、集計した同種ログごとに一度だけ引く。
         let mut st = self.conn.prepare(&format!(
-            "SELECT l.fingerprint, s.level, s.provider, s.source, s.sample, sum(l.occurrences) AS n, count(DISTINCT l.node_id) AS nodes,
-               group_concat(DISTINCT l.node_id) AS node_ids, max(l.ts) AS last_ts, s.total
-             FROM logs l JOIN log_signatures s USING (fingerprint)
-             WHERE l.ts >= ? {node_cond} GROUP BY l.fingerprint ORDER BY n DESC LIMIT ? OFFSET ?"
+            "SELECT l.fingerprint, s.level, s.provider, s.source, s.sample, l.n, l.nodes, l.node_ids, l.last_ts, s.total
+             FROM (SELECT l.fingerprint, sum(l.occurrences) AS n, count(DISTINCT l.node_id) AS nodes,
+                          group_concat(DISTINCT l.node_id) AS node_ids, max(l.ts) AS last_ts
+                   FROM logs l WHERE l.ts >= ? {node_cond} GROUP BY l.fingerprint) l
+             JOIN log_signatures s USING (fingerprint) ORDER BY n DESC, l.fingerprint LIMIT ? OFFSET ?"
         ))?;
         st.query_map(rusqlite::params_from_iter(args), row_json)?.collect()
     }
@@ -267,6 +269,47 @@ mod tests {
         let top = db.top_signatures("node-a", 0, 2).unwrap();
         assert_eq!(top[0].n, 2_280_001);
         assert_eq!(db.query_logs(&json!({})).unwrap().iter().map(|r| r["occurrences"].as_i64().unwrap()).collect::<Vec<_>>().len(), 2);
+    }
+
+    #[test]
+    fn signatures_keep_window_node_counts_and_pagination() {
+        let db = Store::open_in_memory().unwrap();
+        let make = |uid: &str, ts: f64, count: i64, fp: &str| {
+            let mut r = row(uid, count);
+            r.ts = ts;
+            r.fingerprint = fp.into();
+            r.provider = None;
+            r
+        };
+        db.insert_logs(
+            "node-a",
+            "example",
+            &[make("old", 99.0, 50, "shared"), make("edge", 100.0, 3, "shared"), make("new", 200.0, 4, "shared"), make("other", 300.0, 1, "other")],
+            1,
+        )
+        .unwrap();
+        db.insert_logs("node-b", "example", &[make("b", 150.0, 9, "shared")], 1).unwrap();
+        let all = db.signatures(&json!({"since": 100})).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0]["n"], json!(16));
+        assert_eq!(all[0]["nodes"], json!(2));
+        let mut ids: Vec<_> = all[0]["node_ids"].as_str().unwrap().split(',').collect();
+        ids.sort();
+        assert_eq!(ids, ["node-a", "node-b"]);
+        assert_eq!(all[0]["last_ts"], json!(200));
+        assert_eq!(all[0]["total"], json!(66));
+        assert!(all[0]["provider"].is_null());
+        let one = db.signatures(&json!({"since": 100, "node_id": "node-a", "limit": 1})).unwrap();
+        assert_eq!(one[0]["n"], json!(7));
+        assert_eq!(one[0]["nodes"], json!(1));
+        assert_eq!(one[0]["total"], json!(66));
+        assert_eq!(db.signatures(&json!({"since": 100, "limit": 1, "offset": 1})).unwrap(), vec![all[1].clone()]);
+        for filter in [json!({"since": 301}), json!({"node_id": "missing"}), json!({"limit": 0}), json!({"offset": 2})] {
+            assert!(db.signatures(&filter).unwrap().is_empty());
+        }
+        db.insert_logs("node-a", "example", &[make("z", 500.0, 2, "z"), make("a", 400.0, 2, "a")], 1).unwrap();
+        assert_eq!(db.signatures(&json!({"since": 400, "node_id": "node-a", "limit": 1})).unwrap()[0]["fingerprint"], json!("a"));
+        assert_eq!(db.signatures(&json!({"since": 400, "node_id": "node-a", "limit": 1, "offset": 1})).unwrap()[0]["fingerprint"], json!("z"));
     }
 
     #[test]
