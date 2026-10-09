@@ -127,8 +127,24 @@ pub async fn run(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Dura
 pub type RunFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = RunResult> + Send + 'a>>;
 
 /// 子プロセスの実行口。本物は [`System`]、テストは偽の ssh に差し替える（呼び出しを数え、台本どおりの結果を返す）
+///
+/// この機体（local）での実行も同じ口を通す。既定の実装は `run` に `local:script` などの名前で渡すので、
+/// 偽の実行器は本物のローカル実行に迂回されず、呼び出しを数えられる。[`System`] だけが本物のローカル実行をする
 pub trait Runner: Send + Sync {
     fn run<'a>(&'a self, cmd: &'a str, args: &'a [String], input: Option<&'a [u8]>, timeout: Duration) -> RunFuture<'a>;
+
+    /// ローカルの短いスクリプト（actions 用）
+    fn local_script<'a>(&'a self, text: &'a str, timeout: Duration) -> RunFuture<'a> {
+        Box::pin(async move { self.run("local:script", &[text.to_string()], None, timeout).await })
+    }
+    /// ローカルで PowerShell スクリプトを実行する（Windows のローカル調査）
+    fn local_powershell_file<'a>(&'a self, script: &'a [u8], params: &'a str, timeout: Duration) -> RunFuture<'a> {
+        Box::pin(async move { self.run("local:powershell", &[params.to_string()], Some(script), timeout).await })
+    }
+    /// ローカルで python を実行する（Windows のローカル調査のベンチ）
+    fn local_python<'a>(&'a self, code: &'a str, timeout: Duration) -> RunFuture<'a> {
+        Box::pin(async move { self.run("local:python", &[code.to_string()], None, timeout).await })
+    }
 }
 
 /// 本物の子プロセスを起こす
@@ -137,6 +153,15 @@ pub struct System;
 impl Runner for System {
     fn run<'a>(&'a self, cmd: &'a str, args: &'a [String], input: Option<&'a [u8]>, timeout: Duration) -> RunFuture<'a> {
         Box::pin(run(cmd, args, input, timeout))
+    }
+    fn local_script<'a>(&'a self, text: &'a str, timeout: Duration) -> RunFuture<'a> {
+        Box::pin(local::script(text, timeout))
+    }
+    fn local_powershell_file<'a>(&'a self, script: &'a [u8], params: &'a str, timeout: Duration) -> RunFuture<'a> {
+        Box::pin(local::powershell_file(script, params, timeout))
+    }
+    fn local_python<'a>(&'a self, code: &'a str, timeout: Duration) -> RunFuture<'a> {
+        Box::pin(local::python(code, timeout))
     }
 }
 
@@ -330,9 +355,9 @@ pub async fn probe_node_with(runner: &dyn Runner, node: &Node) -> Value {
             runner.run("ssh", &ssh_args(&node.alias, &mac_ssh_command(benchmark, network)), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
         }
     } else if node.local {
-        let p = local::powershell_file(WIN_PROBE, if network { "" } else { "-NoNetwork" }, Duration::from_secs(120)).await;
+        let p = runner.local_powershell_file(WIN_PROBE, if network { "" } else { "-NoNetwork" }, Duration::from_secs(120)).await;
         if benchmark {
-            let b = local::python(BENCH_PY, Duration::from_secs(60)).await;
+            let b = runner.local_python(BENCH_PY, Duration::from_secs(60)).await;
             RunResult { out: format!("{}\n{BENCH_MARK}\n{}", p.out, b.out), ..p }
         } else {
             p
@@ -404,7 +429,11 @@ where
     }
     out.into_iter()
         .enumerate()
-        .map(|(i, r)| r.unwrap_or_else(|| json!({ "node_id": nodes[i].id, "ok": false, "error": "調査の途中で内部エラー", "at": now_ms() })))
+        .map(|(i, r)| {
+            r.unwrap_or_else(|| {
+                json!({ "node_id": nodes[i].id, "ok": false, "reason": "error", "reason_text": reason_text("error"), "error": "調査の途中で内部エラー", "at": now_ms() })
+            })
+        })
         .collect()
 }
 
@@ -415,7 +444,7 @@ pub async fn exec_on(node: &Node, script: &str, timeout: Duration) -> RunResult 
 
 /// `exec_on` の子プロセスの実行口を差し替えられる版（変更操作のテストは偽の実行器を渡す）
 pub async fn exec_on_with(runner: &dyn Runner, node: &Node, script: &str, timeout: Duration) -> RunResult {
-    if node.local { local::script(script, timeout).await } else { runner.run("ssh", &ssh_args(&node.alias, script), None, timeout).await }
+    if node.local { runner.local_script(script, timeout).await } else { runner.run("ssh", &ssh_args(&node.alias, script), None, timeout).await }
 }
 
 #[cfg(test)]

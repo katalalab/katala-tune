@@ -470,3 +470,70 @@ async fn kill_script_stops_before_kill_when_target_identity_or_load_differs() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+// ---- レビュー指摘: この機体（local）も渡された Runner を通る。本物のローカル実行に迂回しない ----
+/// 呼び出しの種類を数えるだけの実行器（本物は何も起こさない）
+struct CountLocal(Mutex<Vec<String>>);
+impl Runner for CountLocal {
+    fn run<'a>(&'a self, cmd: &'a str, _args: &'a [String], _input: Option<&'a [u8]>, _timeout: Duration) -> RunFuture<'a> {
+        Box::pin(async move {
+            self.0.lock().unwrap().push(cmd.to_string());
+            res(Some(0), "{\"probe\":\"windows\"}\n", "")
+        })
+    }
+}
+
+fn local_node() -> Node {
+    Node::from_value(&json!({ "id": "here", "alias": "mock-here", "os": "windows", "local_hostname": "this-host" }), "this-host")
+}
+
+#[tokio::test]
+async fn local_node_execution_and_probe_go_through_the_given_runner() {
+    let n = local_node();
+    assert!(n.local);
+    let r = CountLocal(Mutex::new(Vec::new()));
+    let out = actions::execute_with(&r, &n, &disable(), Some(&[])).await.unwrap();
+    assert!(out.ok);
+    assert_eq!(r.0.lock().unwrap().len(), 1, "ローカルの変更も渡された実行器を通る");
+    let p = tune_core::collect::probe_node_with(&r, &n).await;
+    assert_eq!(p["ok"], json!(true), "{p}");
+    assert!(r.0.lock().unwrap().len() >= 3, "ローカルの調査（調査・ベンチ）も渡された実行器を通る");
+}
+
+// ---- レビュー指摘: 結果の書き込みが「未更新」を返したら成功扱いにしない ----
+/// 実行中に、同じ記録へ別の手で結果を書く実行器
+struct FinishesEarly(Arc<Engine>);
+impl Runner for FinishesEarly {
+    fn run<'a>(&'a self, _cmd: &'a str, _args: &'a [String], _input: Option<&'a [u8]>, _timeout: Duration) -> RunFuture<'a> {
+        Box::pin(async move {
+            let id = actions_of(&self.0)[0]["id"].as_str().unwrap().to_string();
+            assert!(self.0.with_db(|d| d.finish_action(&id, false, "別の手", None)).unwrap());
+            res(Some(0), "Disabled\n", "")
+        })
+    }
+}
+
+#[tokio::test]
+async fn result_write_that_updates_nothing_is_not_reported_as_success() {
+    let s = setup(&[node_json("w")], &[]);
+    let runner = FinishesEarly(s.engine.clone());
+    let r = s.engine.confirm_and_run_with(&runner, "w", &disable(), "t", None, approve(true, || {})).await;
+    let msg = r.expect_err("未更新は成功として返さない");
+    assert!(msg.contains("実行記録を書けなかった"), "{msg}");
+}
+
+// ---- レビュー指摘: 内部エラーで落ちた host にも reason・reason_text が付く ----
+struct Panics;
+impl Runner for Panics {
+    fn run<'a>(&'a self, _cmd: &'a str, _args: &'a [String], _input: Option<&'a [u8]>, _timeout: Duration) -> RunFuture<'a> {
+        panic!("試験用の内部エラー")
+    }
+}
+
+#[tokio::test]
+async fn internal_error_result_has_reason_like_other_failures() {
+    let results = probe_all_with(Arc::new(Panics), &[node("boom")], |_| {}).await;
+    assert_eq!(results[0]["ok"], json!(false));
+    assert_eq!(results[0]["reason"], json!("error"));
+    assert_eq!(results[0]["reason_text"], json!(reason_text("error")));
+}

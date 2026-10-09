@@ -31,15 +31,20 @@
 2. Electron 版は承認後に台帳を読み直さず、承認した内容と別の対象に実行しうる → 流れを `lib/runner.js` に切り出し、Rust 版と同じ読み直しを入れた。承認後に止めた理由は実行記録に残す（Rust 版は記録していなかった）。
 3. 実行中に止まった操作が記録に残らない → 実行の直前に未完了の記録を書き、結果は同じ記録へ書く。`tune_actions.ok` が NULL の行を「未完了」として扱う（表の形は変えていない）。読み出しに `state`（ok / failed / incomplete）を足し、実行記録の画面に「未完了」を出す。
 
+4. レビュー指摘の 4 件（先に再現する試験を書いてから修正）:
+   - この機体（local）の調査・実行が、渡された実行口を迂回して本物のローカル実行に進んでいた → Rust は `Runner` に `local_script`・`local_powershell_file`・`local_python` を足し、`System` だけが本物のローカル実行をする。Electron は `probeNode` の `deps.localShell` を足した。
+   - 結果の書き込みが「未更新（false）」を返しても成功として返していた（Rust・Electron 両方）→ 記録失敗として拒否する。
+   - 内部エラー・例外で落ちた host の結果に `reason`・`reason_text` が無かった（Rust・Electron 両方）→ `error` を付ける。
+
 ## 実行した確認
 
 | コマンド | 結果 |
 |---|---|
-| `npm test` | 137 件 pass（うち新規 17） |
-| `ELECTRON_RUN_AS_NODE=1 electron --test test/*.test.js`（Electron 内蔵 Node） | 137 件 pass |
+| `npm test` | 163 件 pass（main 取り込み後。うちこの PR の試験 19） |
+| `ELECTRON_RUN_AS_NODE=1 electron --test test/*.test.js`（Electron 内蔵 Node） | 158 件 pass・5 件 fail。fail は release・更新署名の試験で、origin/main 単体でも同じ 5 件が落ちる（この PR と無関係） |
 | `cargo fmt --all --check` | 差分なし |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | 警告なし |
-| `cargo test --workspace --locked` | tune-core 89 件・acceptance_issue19 13 件・parity 系・safety を含め全件 pass |
+| `cargo test --workspace --locked` | tune-core 96 件・acceptance_issue19 16 件・parity 系・safety を含め全件 pass |
 | `npm run oss-check`（HEAD） | OK |
 | `npm run oss-check -- --history` | main の履歴にある GitHub ボットのアドレスで既知 NG（PR #20 待ち）。この変更とは無関係 |
 

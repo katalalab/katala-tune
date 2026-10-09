@@ -564,8 +564,12 @@ impl Engine {
         };
         let output = js::trim(&format!("{}\n{}", r.outcome, r.output)).to_string();
         // 書き込みの失敗は成功扱いにしない（画面へエラーとして返す）。記録は未完了のまま残る
-        self.with_db(|d| d.finish_action(&id, r.ok, &output, r.undo.as_ref()))
-            .map_err(|e| format!("実行記録を書けなかった（操作は実行済み: {}）: {e}", r.outcome))?;
+        // 未更新（false）も書けなかったのと同じ。記録が未完了でなくなっていて、結果を書き込めていない
+        match self.with_db(|d| d.finish_action(&id, r.ok, &output, r.undo.as_ref())) {
+            Ok(true) => {}
+            Ok(false) => return Err(format!("実行記録を書けなかった（操作は実行済み: {}）: 記録がすでに未完了ではなく、結果を書き込めなかった", r.outcome)),
+            Err(e) => return Err(format!("実行記録を書けなかった（操作は実行済み: {}）: {e}", r.outcome)),
+        }
         entry["ok"] = Value::Bool(r.ok);
         entry["output"] = Value::String(output);
         entry["undo"] = r.undo.clone().unwrap_or(Value::Null);

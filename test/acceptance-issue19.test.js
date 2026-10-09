@@ -6,7 +6,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { probeAll, classifyFailure, run } = require('../lib/collect');
+const { probeAll, probeNode, classifyFailure, run } = require('../lib/collect');
 const { execute, plan } = require('../lib/actions');
 const { makeRunner } = require('../lib/runner');
 const { openDb } = require('../lib/db');
@@ -82,6 +82,24 @@ test('条件1: ssh を呼べない・例外でも host の失敗として返り�
   assert.equal(results[0].ok, true);
   assert.equal(results[1].ok, false);
   assert.match(results[1].error, /台本に無い host/);
+  // 例外で落ちた host にも、他の失敗と同じ形で種類と文言が付く
+  assert.equal(results[1].reason, 'error');
+  assert.ok(results[1].reason_text);
+});
+
+test('条件1: この機体（local）の調査も、渡された実行口を通り、本物のローカル実行に迂回しない', async () => {
+  const calls = [];
+  const localShell = {
+    async powershellFile() { calls.push('powershellFile'); return { code: 0, out: '{"probe":"windows"}\n', err: '' }; },
+    async python() { calls.push('python'); return { code: 0, out: '{"runs_ms":[1],"median_ms":1}\n', err: '' }; },
+  };
+  const ssh = mockSsh({});
+  const local = nodeOf('here', { local_hostname: 'x' });
+  local.local = true;
+  const r = await probeNode(local, { run: ssh.run, localShell });
+  assert.equal(r.ok, true);
+  assert.deepEqual(calls, ['powershellFile', 'python']);
+  assert.equal(ssh.calls.length, 0);
 });
 
 // ---- 偽の対象: 一時ディレクトリの「タスク」。state ファイルが実体 ----
@@ -291,6 +309,21 @@ test('条件4: 実行記録に書けないときは実行しない（記録が�
   assert.match(r.refused, /実行記録を書けない/);
   assert.equal(t.host.calls.length, 0);
   assert.equal(t.host.state('Backup'), 'Ready');
+});
+
+test('条件4: 結果の書き込みが「未更新」（false）を返したら、成功を返さず記録失敗として拒否する', async () => {
+  const t = setup({ nodes: [nodeOf('w')] });
+  // 実行中に、同じ記録へ別の手で結果が書かれた（未完了でなくなった）状態を作る
+  const exec = async (...a) => {
+    const [row] = t.db.actions();
+    assert.equal(t.db.finishAction(row.id, { ok: false, output: '別の手', undo: null }), true);
+    return t.host.exec(...a);
+  };
+  const runner = makeRunner({ loadConfig: () => loadConfig(t.ledger), confirm: async () => true, exec, db: t.db });
+  const r = await runner.confirmAndRun('w', disable, 't');
+  assert.equal(r.ok, false);
+  assert.match(r.refused, /実行記録を書けなかった/);
+  assert.equal(r.entry, undefined);
 });
 
 test('条件4: 結果を書けなかったら成功を返さず、記録は未完了のまま残る', async () => {
