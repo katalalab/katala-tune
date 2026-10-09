@@ -47,7 +47,7 @@
    ```sh
    git tag v0.4.1 && git push origin v0.4.1
    ```
-4. CI がタグと版の一致・公開鍵が仮の値でないことを確かめてからビルドし、下書きのリリースに置く:
+4. CI がタグと版の一致・公開鍵が仮の値でないことを確かめてからビルドし、更新署名を公開鍵で検証して（下の「配布物の検証と切り戻し」）、下書きのリリースに置く:
    `KatalaTune_<版>_universal.dmg`（初めて入れる人向け）・`KatalaTune_<版>_universal.app.tar.gz`（と `.sig`）・`KatalaTune_<版>_x64-setup.exe`（と `.sig`）・`latest.json`
 5. 下記の公開前チェックを完了してから下書きを公開する。通常リリースを latest として公開すると、動いているアプリの「更新を確認…」の対象になる。未検証の環境が残る初期配布は prerelease（latest 対象外）とし、リリースページから手動で取得する。prerelease は自動通知にも「更新を確認…」にも出ない
 
@@ -70,7 +70,9 @@
 
 ## 配布物の検証と切り戻し
 
-CI は全3 target の feed の版・URL・署名文字列と実ファイルの一致、欠落・空ファイルを検証し、`SHA256SUMS` を同梱する。暗号としての署名検証は updater の責務で、文字列の一致を暗号検証とは呼ばない。公開前は下書きの全 asset を取得し、SHA256 を照合して実機で確認する。
+CI（`scripts/verify-release.js`）は、下書きに置く前に更新ファイル（`.app.tar.gz`・`setup.exe`）の `.sig` を `tauri.conf.json` の公開鍵で暗号として検証する。アプリの updater と同じく、鍵 ID の一致・本体の署名（BLAKE2b-512 の前ハッシュ。旧形式は前ハッシュなし）・trusted comment を覆う global signature の3つを確かめ、`requireSignedVersion` と同じく署名に入った版がリリースの版と同じことも確かめる。合わなければリリースを作らない。
+あわせて全3 target の feed の版・URL・署名が検証した `.sig` と同じこと、欠落・空ファイルを確かめ、`SHA256SUMS` を同梱する。検証は外部の依存を足さず Node の crypto で行う（テストは使い捨ての鍵で作った公開鍵・署名・ファイルだけを `test/fixtures/release` に置き、秘密鍵は残していない）。DMG は自動更新に使わないので更新署名は無い。
+公開前は下書きの全 asset を取得し、SHA256 を照合して実機で確認する。
 
 ### 公開前チェック
 
