@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // 公開前の点検: リポジトリに個人・環境の情報が混ざっていないかを調べる。
 //   node scripts/oss-check.js            … HEAD のファイル
-//   node scripts/oss-check.js --history  … 全コミットのファイルとコミットメッセージ
+//   node scripts/oss-check.js --history  … HEAD から辿れる全コミットのファイルとコミットメッセージ
+//   node scripts/oss-check.js --all-refs … 上を全部の枝・タグで（Dependabot などのマージしていない枝も含む）
 // 機体台帳（~/.config/katala-tune/nodes.json）の id・alias・hostname と、この機体のユーザー名・ホスト名も探す。
 // 探す語は台帳から実行時に読むので、リポジトリに個人の語を書かずに済む。見つかれば終了コード 1。
 'use strict';
@@ -16,7 +17,8 @@ const PATTERNS = [
   ['tailnet-host', /\b[a-z0-9-]+\.[a-z0-9-]+\.ts\.net\b/gi],
   ['op-ref', /\bop:\/\/[^\s'"`)]+/g],
   ['home-path', /(?:\/Users\/|\/home\/|[A-Z]:\\\\?Users\\\\?)(?!(?:me|you|user|username|example|runner|Public|Default|[a-z])\b)[A-Za-z0-9._-]{2,}/g],
-  ['email', /\b(?!noreply@)[A-Za-z0-9._%+-]+@(?!example\.(?:com|org|net)\b|users\.noreply\.github\.com\b)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b/g],
+  // GitHub のボットのアドレス（noreply@github.com・Dependabot の Signed-off-by の support@github.com・*[bot]@users.noreply.github.com）は除く
+  ['email', /\b(?!noreply@|support@github\.com\b)[A-Za-z0-9._%+-]+@(?!example\.(?:com|org|net)\b|users\.noreply\.github\.com\b)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b/g],
 ];
 
 // 一般的すぎて誤検出になる語は台帳由来でも探さない
@@ -73,11 +75,19 @@ function loadLedger() {
   try { return { file, cfg: JSON.parse(fs.readFileSync(file, 'utf8')) }; } catch { return { file, cfg: null }; }
 }
 
+// 履歴を見る範囲。--history は HEAD から辿れるコミット（いま出そうとしているもの）、--all-refs は全部の枝・タグ。どちらも無ければ null（HEAD のファイルだけ）
+function revListArgs(argv) {
+  if (argv.includes('--all-refs')) return ['rev-list', '--all'];
+  if (argv.includes('--history')) return ['rev-list', 'HEAD'];
+  return null;
+}
+
 function main(argv) {
-  const history = argv.includes('--history');
+  const range = revListArgs(argv);
+  const history = !!range;
   const { file, cfg } = loadLedger();
   const terms = ledgerTerms(cfg, [os.userInfo().username, os.hostname()]);
-  const revs = history ? git(['rev-list', '--all']).split('\n').filter(Boolean) : ['HEAD'];
+  const revs = history ? git(range).split('\n').filter(Boolean) : ['HEAD'];
   const short = (rev) => (history ? `@${rev.slice(0, 7)}` : '');
   const findings = [];
 
@@ -99,7 +109,8 @@ function main(argv) {
   const pkg = JSON.parse(git(['show', 'HEAD:package.json']));
   if (!pkg.license) warn.push('package.json に license が無い');
 
-  console.log(`対象: ${history ? `全 ${revs.length} コミット` : 'HEAD'}、台帳の語 ${terms.length} 個`);
+  const scope = !history ? 'HEAD' : `${range.includes('--all') ? '全部の枝の' : 'HEAD から辿れる'} ${revs.length} コミット`;
+  console.log(`対象: ${scope}、台帳の語 ${terms.length} 個`);
   for (const w of warn) console.log(`注意: ${w}`);
   for (const x of findings) console.log(`NG ${x.rule.padEnd(12)} ${x.where}  ${x.match}`);
   console.log(findings.length ? `NG ${findings.length} 件` : 'OK 個人・環境の情報は見つからない');
@@ -107,4 +118,4 @@ function main(argv) {
 }
 
 if (require.main === module) process.exitCode = main(process.argv.slice(2));
-module.exports = { ledgerTerms, scanText };
+module.exports = { ledgerTerms, scanText, revListArgs };

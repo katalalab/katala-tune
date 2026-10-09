@@ -9,7 +9,7 @@
 - AI ログの一行を 1 MiB に制限し、超過分のメタデータ欠測を明示する。
 - ライブの差分描画とログの文字列処理を軽量化。
 - ログ由来のディスク故障の誤判定、launchd 起動制約、意図的な非0終了の扱いを修正。
-- Mac universal / Windows x64 の更新署名つきリリース、版の照合、配布 manifest と SHA256 の検証。
+- Mac universal / Windows x64 の更新署名つきリリース、版の照合、配布 manifest と SHA256 の検証。CI は更新署名を `tauri.conf.json` の公開鍵で暗号として検証する（鍵 ID・本体の署名・global signature・署名に入った版）。
 - Rust / Node の版固定、読取専用の環境点検、3 OS の CI と Mac / Windows のアプリリンク検証。
 
 更新は通知と確認を経て実行する。Apple 公証・Windows 発行元コード署名は別途必要で、現時点の配布物には付かない。Tauri updater の更新署名と OS の発行元署名は異なる。

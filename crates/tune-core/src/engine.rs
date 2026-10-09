@@ -685,7 +685,7 @@ mod tests {
                     })
                     .collect();
                 d.insert_logs("private", "win_security", &crate::logs::normalize("win_security", &rows), now)?;
-                d.cursor_ok("private", "win_security", Some(&json!("11")), 11, &json!(0))?;
+                d.cursor_ok("private", "win_security", Some(&json!("11")), 11, &json!(0), None)?;
                 d.save_checks(
                     "private",
                     &[crate::db::Check { id: "sec-login".into(), name: "login".into(), status: "fail".into(), detail: Some("192.0.2.1".into()) }],

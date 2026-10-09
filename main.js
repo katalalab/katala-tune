@@ -326,7 +326,8 @@ ipcMain.handle('dogu-publish', async (_e, slugs) => {
   if (!dogu.samePlan(plan, fresh)) return { ok: false, refused: '確認のあいだに下書きが変わったので送らなかった。もう一度確認してください' };
   let res, ok = true;
   try { res = await dogu.publish(key, fresh.pick); } catch (e) { ok = false; res = { error: String(e.message || e) }; }
-  db.addAction({ id: `${Date.now()}-dogu`, at: Date.now(), node_id: '_app', type: 'dogu_publish', params: { slugs: fresh.pick }, label: `Do-gu に ${fresh.pick.length} 件を登録`, ok, output: JSON.stringify(res).slice(0, 4000), undo: null, undo_of: null });
+  const at = Date.now();
+  db.addAction({ id: dogu.publishActionId(at), at, node_id: '_app', type: 'dogu_publish', params: { slugs: fresh.pick }, label: `Do-gu に ${fresh.pick.length} 件を登録`, ok, output: JSON.stringify(res).slice(0, 4000), undo: null, undo_of: null });
   return { ok, login, url: `${dogu.BASE}/@${login}`, result: res };
 });
 ipcMain.handle('copy', (_e, text) => { clipboard.writeText(String(text)); return true; });

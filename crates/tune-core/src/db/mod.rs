@@ -67,6 +67,7 @@ impl Store {
         conn.execute_batch(PRAGMAS)?;
         conn.execute_batch(&SCHEMA_PARTS.concat())?;
         let s = Store { conn };
+        s.add_columns()?;
         s.migrate()?;
         Ok(s)
     }
@@ -88,6 +89,21 @@ impl Store {
                 Err(e)
             }
         }
+    }
+
+    // 移行: 後から足した列（CREATE TABLE IF NOT EXISTS は既存の表に列を足さない）。lib/db.js と同じ列を足す
+    fn add_columns(&self) -> Result<()> {
+        for (table, name, ddl) in [
+            ("logs", "occurrences", "INTEGER NOT NULL DEFAULT 1"),
+            ("log_cursors", "fail_streak", "INTEGER NOT NULL DEFAULT 0"),
+            ("log_cursors", "note", "TEXT"),
+        ] {
+            let has: i64 = self.conn.query_row(&format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name = ?"), [name], |r| r.get(0))?;
+            if has == 0 {
+                self.conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {name} {ddl}"))?;
+            }
+        }
+        Ok(())
     }
 
     // 移行: v0.2 までの Windows の取り込みは時刻が UTC との時差ぶんずれていた。lib/db.js と同じ移行（済んでいれば何もしない）

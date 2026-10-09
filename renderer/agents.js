@@ -194,7 +194,7 @@
     const list = await listHtml().catch((e) => UI.callout({ tone: 'red', icon: 'alert', title: 'セッションの一覧を読めません', body: `<div class="err">${UI.esc(e?.message || e)}</div>` }));
     if (stale(t)) return;
     const ingesting = ai.syncing || s.ingesting;
-    const rest = s.nodes.filter((n) => n.truncated).reduce((a, n) => a + Math.max(0, (n.bytes_pending || 0) - (n.bytes_read || 0)), 0);
+    const rest = s.nodes.filter((n) => n.truncated && n.enabled !== false).reduce((a, n) => a + Math.max(0, (n.bytes_pending || 0) - (n.bytes_read || 0)), 0);
     const noPy = s.nodes.filter((n) => n.no_python);
     const errs = s.nodes.filter((n) => n.last_error && !n.no_python);
     const tot = s.totals || {};
