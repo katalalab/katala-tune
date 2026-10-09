@@ -31,6 +31,8 @@ test('同種ログの集計は期間・機体・繰り返し件数を保ち、�
   assert.equal(db.signatures({ since: 400, node_id: 'node-a', limit: 1, offset: 1 })[0].fingerprint, 'z');
   assert.deepEqual(db.signatures({ limit: -1 }), []);
   assert.deepEqual(db.signatures({ limit: 1, offset: -1 }), db.signatures({ limit: 1 }));
+  assert.deepEqual(db.signatures({ offset: 1e20 }), []);
+  assert.deepEqual(db.signatures({ offset: Number.MAX_VALUE }), []);
 });
 
 test('同種ログは取得上限500件を守り、次ページで残りを取得できる', (t) => {
