@@ -280,11 +280,14 @@ async fn fetch_logs(node: &Node, cursors: &Map<String, Value>) -> RunResult {
 }
 
 /// 取り込み元の note のうち、取れても 0 件になる理由（lib/logs.js の SOURCE_NOTES）。「静か」ではなく「見るものが無い」ことを区別する
-pub const SOURCE_NOTES: [(&str, &str); 2] = [("not-installed", "対象外（未導入）"), ("no-guard-log", "ログ無し")];
+pub const SOURCE_NOTES: [(&str, &str); 3] =
+    [("not-found-for-account", "このアカウントでは見つからない"), ("not-installed", "このアカウントでは見つからない"), ("no-guard-log", "ログ無し")];
 
-/// 取り込み元の note が SOURCE_NOTES にあるときだけ保存する値
+/// 取り込み元の note が SOURCE_NOTES にあるときだけ保存する値。旧版の `not-installed` は `not-found-for-account` として受ける
+/// （実行したアカウントの %APPDATA% に無いだけで、未導入とは限らない）
 pub fn source_note(src: Option<&Value>) -> Option<&'static str> {
     let n = get(src, "note")?.as_str()?;
+    let n = if n == "not-installed" { "not-found-for-account" } else { n };
     SOURCE_NOTES.iter().find(|(k, _)| *k == n).map(|(k, _)| *k)
 }
 
@@ -754,7 +757,8 @@ mod tests {
     #[test]
     fn only_known_notes_are_kept() {
         let src = |n: &str| json!({ "note": n });
-        assert_eq!(source_note(Some(&src("not-installed"))), Some("not-installed"));
+        assert_eq!(source_note(Some(&src("not-found-for-account"))), Some("not-found-for-account"));
+        assert_eq!(source_note(Some(&src("not-installed"))), Some("not-found-for-account"));
         assert_eq!(source_note(Some(&src("no-guard-log"))), Some("no-guard-log"));
         assert_eq!(source_note(Some(&src("no-permission"))), None);
         assert_eq!(source_note(Some(&json!({}))), None);

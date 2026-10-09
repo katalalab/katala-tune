@@ -502,6 +502,7 @@ fn rules_health_logs_actions_match_js() {
                         mb!(
                             r,
                             r.pick(&[
+                                json!("not-found-for-account"),
                                 json!("not-installed"),
                                 json!("no-guard-log"),
                                 json!("other"),
@@ -864,7 +865,7 @@ fn write_spec(now: i64) -> Value {
             { "node_id": "n1", "source": "win_system", "error": "ssh timeout" },
             { "node_id": "n1", "source": "win_system", "error": "ssh timeout" },
             { "node_id": "n2", "source": "mac_diag", "cursor": 12345, "count": 2, "dropped": 0 },
-            { "node_id": "n2", "source": "neonmonitor", "cursor": 0, "count": 0, "dropped": 0, "note": "not-installed" },
+            { "node_id": "n2", "source": "neonmonitor", "cursor": 0, "count": 0, "dropped": 0, "note": "not-found-for-account" },
             { "node_id": "n1", "source": "neonmonitor", "cursor": 5, "count": 0, "dropped": 0, "note": "no-guard-log" },
             { "node_id": "n1", "source": "mac_kernel", "error": "ssh timeout" }
         ],

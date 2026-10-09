@@ -272,11 +272,11 @@ mod tests {
     #[test]
     fn cursor_counts_consecutive_failures_and_keeps_note_until_success() {
         let db = Store::open_in_memory().unwrap();
-        db.cursor_ok("n", "neonmonitor", Some(&json!("0")), 0, &json!(0), Some("not-installed")).unwrap();
+        db.cursor_ok("n", "neonmonitor", Some(&json!("0")), 0, &json!(0), Some("not-found-for-account")).unwrap();
         db.cursor_error("n", "neonmonitor", "ssh timeout").unwrap();
         db.cursor_error("n", "neonmonitor", "ssh timeout").unwrap();
         let c = db.cursor("n", "neonmonitor").unwrap().unwrap();
-        assert_eq!((c["fail_streak"].as_i64(), c["note"].as_str()), (Some(2), Some("not-installed")));
+        assert_eq!((c["fail_streak"].as_i64(), c["note"].as_str()), (Some(2), Some("not-found-for-account")));
         db.cursor_ok("n", "neonmonitor", Some(&json!("0")), 0, &json!(0), None).unwrap();
         let c = db.cursor("n", "neonmonitor").unwrap().unwrap();
         assert_eq!((c["fail_streak"].as_i64(), c["note"].is_null()), (Some(0), true));

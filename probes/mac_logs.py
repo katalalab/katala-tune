@@ -61,20 +61,35 @@ def diag(cursor_ms):
     return {"cursor": str(int(newest)), "rows": rows[-MAX_ROWS:], "dropped": dropped}
 
 
-# 同種のログをまとめる鍵。lib/logs.js の fingerprint と同じ伏せ方（GUID・16進・パス・引用符の中身・数字）
+# 同種のログをまとめる鍵。lib/logs.js の redact → fingerprint と同じ手順（秘密らしい値を伏せてから、GUID・16進・パス・引用符の中身・数字を伏せる）。
+# 値だけが違う token=... を別の組にすると、保存側では同じ指紋になるのに300行の枠を使い切ってしまう。JS の \s は Python の \s と範囲が違うので WS で書く
+_WS = "\\t\\n\\x0b\\x0c\\r \\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff"
+_A = re.ASCII
+_REDACT = [(re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})", _A), "<github-token>"),
+           (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}", _A), "<api-key>"),
+           (re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b", _A), "<aws-key>"),
+           (re.compile(r"\bops_[A-Za-z0-9_-]{20,}", _A), "<op-token>"),
+           (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}", _A), "<jwt>"),
+           (re.compile(r"(Bearer|Basic)[" + _WS + r"]+[A-Za-z0-9._~+/=-]{12,}", _A | re.I), r"\1 <redacted>"),
+           (re.compile(r"\b(password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key)([" + _WS + r"]*[=:][" + _WS + r"]*)(\"[^\"]*\"|'[^']*'|[^" + _WS + r"]+)", _A | re.I), r"\1\2<redacted>")]
 _NORM = [(re.compile(r"\{?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}?"), "<guid>"),
          (re.compile(r"0x[0-9a-f]+"), "<hex>"),
-         (re.compile(r"[a-z]:\\[^\s\"']+|/(?:users|home|private|var|tmp|applications|library|system)/[^\s\"']*"), "<path>"),
+         (re.compile(r"[a-z]:\\[^" + _WS + r"\"']+|/(?:users|home|private|var|tmp|applications|library|system)/[^" + _WS + r"\"']*"), "<path>"),
          (re.compile(r"\"[^\"]*\"|'[^']*'"), "<q>"),
          (re.compile(r"[0-9]+(?:\.[0-9]+)?"), "<n>"),
-         (re.compile(r"\s+"), " ")]
+         (re.compile(r"[" + _WS + r"]+"), " ")]
 
 
 def norm_key(provider, event_id, message):
-    s = str(message).lower()
+    s = str(message)
+    for rx, rep in _REDACT:
+        s = rx.sub(rep, s)
+    if len(s) > 1000:  # lib/logs.js の redact（1,000 文字で切って … を付ける）
+        s = s[:1000] + "\u2026"
+    s = s.lower()
     for rx, rep in _NORM:
         s = rx.sub(rep, s)
-    return (provider or "", event_id or "", s.strip()[:MAX_KEY])
+    return (provider or "", event_id or "", s.strip(" ")[:MAX_KEY])
 
 
 def aggregate(rows, limit=MAX_ROWS):

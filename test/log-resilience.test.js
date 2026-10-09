@@ -8,7 +8,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
-const { normalize, fingerprint, logFindings, sourceNote, occurrencesOf } = require('../lib/logs');
+const { normalize, fingerprint, redact, logFindings, sourceNote, occurrencesOf } = require('../lib/logs');
 const { nodeChecks, LOGS_FAIL_STREAK, LOGS_FAIL_AFTER_MIN } = require('../lib/health');
 const { openDb } = require('../lib/db');
 
@@ -171,12 +171,12 @@ test('移行: 件数の列が無い古い DB を開くと列が足され、既�
 
 test('取り込み位置: 失敗は連続回数を数え、成功で 0 に戻して取り込み元の状態を記録する', () => {
   const db = openDb(tmp());
-  db.cursorOk('n', 'neonmonitor', '0', 0, 0, 'not-installed');
-  assert.equal(db.cursor('n', 'neonmonitor').note, 'not-installed');
+  db.cursorOk('n', 'neonmonitor', '0', 0, 0, 'not-found-for-account');
+  assert.equal(db.cursor('n', 'neonmonitor').note, 'not-found-for-account');
   db.cursorError('n', 'neonmonitor', 'ssh timeout');
   db.cursorError('n', 'neonmonitor', 'ssh timeout');
   assert.equal(db.cursor('n', 'neonmonitor').fail_streak, 2);
-  assert.equal(db.cursor('n', 'neonmonitor').note, 'not-installed');
+  assert.equal(db.cursor('n', 'neonmonitor').note, 'not-found-for-account');
   db.cursorOk('n', 'neonmonitor', '0', 0, 0, null);
   assert.equal(db.cursor('n', 'neonmonitor').fail_streak, 0);
   assert.equal(db.cursor('n', 'neonmonitor').note, null);
@@ -231,30 +231,124 @@ test('状態: 一時的な不達のあいだも、回復したあとも、状態
   assert.deepEqual(seen, ['ok', 'ok', 'ok']);
 });
 
-test('取れても 0 件の取り込み元（NeonMonitor の未導入・ログ無し）は、状態の detail で静かな場合と区別する', () => {
-  assert.equal(sourceNote({ note: 'not-installed' }), 'not-installed');
+test('取れても 0 件の取り込み元（NeonMonitor がこのアカウントに無い・ログ無し）は、状態の detail で静かな場合と区別する', () => {
+  assert.equal(sourceNote({ note: 'not-found-for-account' }), 'not-found-for-account');
+  // 旧版が保存した値も読める（同じ意味として扱う）
+  assert.equal(sourceNote({ note: 'not-installed' }), 'not-found-for-account');
   assert.equal(sourceNote({ note: 'no-guard-log' }), 'no-guard-log');
   assert.equal(sourceNote({ note: 'no-permission' }), null);
   assert.equal(sourceNote({ note: 'anything else' }), null);
   assert.equal(sourceNote({}), null);
   const c = logsCheck([
     { source: 'win_system', last_ok_at: NOW - 60000 },
-    { source: 'neonmonitor', last_ok_at: NOW - 60000, note: 'not-installed' },
+    { source: 'neonmonitor', last_ok_at: NOW - 60000, note: 'not-found-for-account' },
   ]);
   assert.equal(c.status, 'ok');
-  assert.match(c.detail, /neonmonitor: 対象外（未導入）（取れても 0 件）/);
+  assert.match(c.detail, /neonmonitor: このアカウントでは見つからない（取れても 0 件）/);
+  assert.doesNotMatch(c.detail, /未導入|対象外/, '未導入とは断定しない');
+  // 旧版が保存した note（not-installed）が DB に残っていても壊れず、同じ文面になる
+  assert.match(logsCheck([{ source: 'neonmonitor', last_ok_at: NOW - 60000, note: 'not-installed' }]).detail, /このアカウントでは見つからない/);
   // note が無い（NeonMonitor があり、静か）なら何も足さない
-  assert.doesNotMatch(logsCheck([{ source: 'neonmonitor', last_ok_at: NOW - 60000 }]).detail, /対象外|ログ無し/);
+  assert.doesNotMatch(logsCheck([{ source: 'neonmonitor', last_ok_at: NOW - 60000 }]).detail, /見つからない|ログ無し/);
   assert.match(logsCheck([{ source: 'neonmonitor', last_ok_at: NOW - 60000, note: 'no-guard-log' }]).detail, /neonmonitor: ログ無し/);
 });
 
-test('Windows の調査スクリプト: 同じ形のイベントを件数にまとめ、NeonMonitor の状態を note で返す（文面の確認。実行は Windows 実機が必要）', () => {
+test('Windows の調査スクリプト: 同じ形のイベントを件数にまとめ、NeonMonitor の状態を note で返す（文面の確認。実行は Windows 実機が必要。実機の確認はこの PR に記録）', () => {
   const ps = fs.readFileSync(path.join(PROBES, 'win_logs.ps1'), 'utf8');
   assert.match(ps, /function Norm/);
   assert.match(ps, /count = 1/);
   assert.match(ps, /\.count\+\+/);
-  assert.match(ps, /'not-installed'/);
+  assert.match(ps, /'not-found-for-account'/);
+  assert.doesNotMatch(ps, /not-installed/);
   assert.match(ps, /'no-guard-log'/);
   // 上限は集約の後（行を切る前に件数にまとめる）
   assert.ok(ps.indexOf('Select-Object -Last $MaxRows') > ps.indexOf('.count++'));
+});
+
+// ---- 集約の鍵が lib/logs.js の redact → fingerprint と同じ分け方になること ----
+// 値だけが違う秘密らしい文字列や、400 文字目以降だけが違う本文を別の組にすると、保存側では同じ指紋になるのに300行の枠を使い切る
+const fakeSecrets = () => ({
+  gh: ['ghp', '_', 'a'.repeat(36)].join(''), gh2: ['ghp', '_', 'b'.repeat(36)].join(''),
+  aws: ['AK', 'IA', 'ABCDEFGHIJKLMNOP'].join(''), aws2: ['AK', 'IA', 'QRSTUVWXYZ012345'].join(''),
+  sk: ['sk', '-', 'x'.repeat(30)].join(''), sk2: ['sk', '-', 'y'.repeat(30)].join(''),
+  jwt: ['eyJ', 'hbGciOiJIUzI1NiJ9', '.', 'eyJzdWIiOiIxIn0', '.', 'sig12345678'].join(''), jwt2: ['eyJ', 'hbGciOiJIUzI1NiJ9', '.', 'eyJzdWIiOiIyIn0', '.', 'sigABCDEFGH'].join(''),
+});
+const keyVectors = () => {
+  const f = fakeSecrets();
+  const long = (tail) => `start ${'word '.repeat(120)}${tail}`;
+  return [
+    'auth failed token=alpha', 'auth failed token=beta', 'auth failed TOKEN: gamma', 'auth failed Token = "delta value"', 'auth failed token=',
+    'login password: "p w" for user', 'login password: "x y z" for user', "login passwd='q' for user", 'login pwd=zzz for user',
+    'call api_key=k1 ok', 'call API-KEY: k2 ok', 'call access_key=k3 ok', 'call secret=s ok',
+    'header Authorization: Bearer abcdefghijkl1', 'header Authorization: Bearer mnopqrstuvwx2', 'header Authorization: Basic dGVzdHRlc3R0ZXN0', 'header Authorization: bearer short',
+    `leak ${f.gh} here`, `leak ${f.gh2} here`, `leak ${f.aws} here`, `leak ${f.aws2} here`, `leak ${f.sk} here`, `leak ${f.sk2} here`, `leak ${f.jwt} here`, `leak ${f.jwt2} here`,
+    'mixed token=abc and password=def', 'mixed token=ghi and password=jkl', 'mixed token=ghi and password=jkl extra',
+    long('tailA'), long('tailB'), long('tail A longer'), `${'x'.repeat(399)}A`, `${'x'.repeat(399)}B`, `${'y '.repeat(600)}end1`, `${'y '.repeat(600)}end2`,
+    'device 12 failed at 0x1F3 in /Users/a/x.txt', 'device 99 failed at 0xAB in /Users/b/y.txt', 'device 12 failed at 0x1F3 in C:\\Users\\a\\x.txt',
+    'port {1C3A4C45-3712-47C5-BAD3-BFD302864317} refused after 3.5 s', 'port {00000000-0000-0000-0000-000000000000} refused after 12 s',
+    'name "first value" rejected', "name 'second value' rejected", 'name "third" rejected', 'Device   FAILED', 'device failed', 'unrelated message', '',
+  ];
+};
+const partitionOf = (keys) => keys.map((k) => keys.indexOf(k)).join(',');
+const jsPartition = (msgs) => partitionOf(msgs.map((m) => fingerprint('s', 'p', 'e', redact(m.length > 1000 ? m.slice(0, 1000) : m))));
+
+test('集約の鍵（mac_logs.py）: 秘密らしい値だけが違う行・400 文字目以降だけが違う行は、lib/logs.js の fingerprint と同じ組になる', () => {
+  const msgs = keyVectors();
+  const keys = py(`print(json.dumps([list(m.norm_key("p", "e", x)) for x in json.load(open(DATA_PATH))]))`, JSON.stringify(msgs)).map((k) => k.join('|'));
+  assert.equal(partitionOf(keys), jsPartition(msgs));
+  // 例: token の値だけ違う2行は同じ鍵
+  assert.equal(keys[0], keys[1]);
+  assert.equal(keys[msgs.findIndex((m) => m.endsWith('tailA'))], keys[msgs.findIndex((m) => m.endsWith('tailB'))]);
+});
+
+// win_logs.ps1 の Norm を、文面から手順（正規表現・置換・切り詰め）を取り出して JS で再現する。PowerShell は実行しない
+// （この環境に無い。.NET と JS の正規表現の違い（\b・\s の Unicode の扱い）は ASCII の範囲では出ない）。実機での実行は PR に記録
+function psNormFromScript() {
+  const ps = fs.readFileSync(path.join(PROBES, 'win_logs.ps1'), 'utf8');
+  const start = ps.indexOf('function Norm');
+  const body = ps.slice(start, ps.indexOf('\n}', start));
+  const lit = "'(?:[^']|'')*'";
+  const ops = (text) => [...text.matchAll(new RegExp(`-(c?)replace\\s+(${lit})\\s*,\\s*(${lit})`, 'g'))].map((m) => {
+    const un = (q) => q.slice(1, -1).replace(/''/g, "'");
+    return { re: new RegExp(un(m[2]), m[1] ? 'g' : 'gi'), rep: un(m[3]) };
+  });
+  const cut1000 = body.indexOf('Substring(0, 1000)');
+  const lower = body.indexOf('ToLowerInvariant()');
+  assert.ok(cut1000 > 0 && lower > cut1000, 'redact → 1000 文字で切る → 小文字 の順');
+  assert.match(body, /\[char\]8230/);
+  assert.match(body, /\$s\.Length -gt 400\) \{ \$s = \$s\.Substring\(0, 400\)/);
+  const redactOps = ops(body.slice(0, cut1000));
+  const maskOps = ops(body.slice(lower));
+  assert.equal(redactOps.length, 7, 'redact の規則は lib/logs.js の REDACT と同じ 7 つ');
+  assert.equal(maskOps.length, 6, '指紋の伏せ字は GUID・16進・パス・引用符・数字・空白の 6 つ');
+  return (m) => {
+    let s = m;
+    for (const o of redactOps) s = s.replace(o.re, o.rep);
+    if (s.length > 1000) s = s.slice(0, 1000) + '\u2026';
+    s = s.toLowerCase();
+    for (const o of maskOps) s = s.replace(o.re, o.rep);
+    s = s.trim();
+    return s.length > 400 ? s.slice(0, 400) : s;
+  };
+}
+
+test('集約の鍵（win_logs.ps1 の Norm）: 文面の手順が lib/logs.js の redact → fingerprint と同じ組を作る', () => {
+  const norm = psNormFromScript();
+  const msgs = keyVectors();
+  assert.equal(partitionOf(msgs.map((m) => norm(m.length > 1000 ? m.slice(0, 1000) : m))), jsPartition(msgs));
+  // 規則ごとの確認（値だけが違う・400 文字目以降だけが違う）
+  assert.equal(norm('auth failed token=alpha'), norm('auth failed token=beta'));
+  assert.equal(norm('login password: "p w" for user'), norm('login password: "x y z" for user'));
+  assert.equal(norm(`start ${'word '.repeat(120)}tailA`), norm(`start ${'word '.repeat(120)}tailB`));
+  assert.notEqual(norm('auth failed token=alpha'), norm('auth failed other=alpha'));
+  assert.ok(norm('x'.repeat(2000)).length <= 400);
+});
+
+test('3 つの正規化（JS の fingerprint・mac_logs.py・win_logs.ps1 の文面）は同じ入力で同じ組になる', () => {
+  const msgs = keyVectors();
+  const js = jsPartition(msgs);
+  const pyKeys = py(`print(json.dumps([list(m.norm_key("p", "e", x)) for x in json.load(open(DATA_PATH))]))`, JSON.stringify(msgs)).map((k) => k.join('|'));
+  const norm = psNormFromScript();
+  assert.equal(partitionOf(pyKeys), js);
+  assert.equal(partitionOf(msgs.map((m) => norm(m.length > 1000 ? m.slice(0, 1000) : m))), js);
 });
