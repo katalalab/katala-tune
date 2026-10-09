@@ -25,3 +25,53 @@ test('一般的な目印を見つけ、例示用の名前は見逃す', () => {
   assert.deepEqual(scanText(ok.join('\n')), []);
   assert.deepEqual(scanText(j('"author": "a.b', '@corp.example', '.jp"'), [], ['email']), []);
 });
+
+test('GitHub のボットのアドレス（Dependabot の Signed-off-by など）はメールとして数えない', () => {
+  const j = (...p) => p.join('');
+  const bots = [
+    j('Signed-off-by: dependabot[bot] <support', '@github', '.com>'),
+    j('GitHub <noreply', '@github', '.com>'),
+    j('dependabot[bot] <49699333+dependabot[bot]', '@users.noreply.github', '.com>'),
+  ];
+  assert.deepEqual(scanText(bots.join('\n')), []);
+  // 同じドメインでも人のアドレス・似た別のドメインは見つける
+  assert.deepEqual(scanText(j('real.person', '@github', '.com')).map((x) => x.rule), ['email']);
+  assert.deepEqual(scanText(j('support', '@github', '.company.jp')).map((x) => x.rule), ['email']);
+});
+
+test('--history は HEAD から辿れるコミットだけ、--all-refs で全部の枝を見る', (t) => {
+  const { execFileSync } = require('node:child_process');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  // 使い捨てのリポジトリ（一時ディレクトリ）を作って、スクリプトをそこで動かす
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-oss-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const cfg = ['-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=' + path.join(dir, 'no-hooks')];
+  const vcs = (...a) => execFileSync('git', [...cfg, ...a], { cwd: dir, encoding: 'utf8' });
+  vcs('init', '-q');
+  vcs('checkout', '-q', '-b', 'trunk');
+  fs.writeFileSync(path.join(dir, 'LICENSE'), 'MIT');
+  fs.writeFileSync(path.join(dir, 'package.json'), '{ "license": "MIT" }');
+  vcs('add', '.');
+  vcs('commit', '-q', '-m', 'init');
+  // 別の枝のコミットメッセージにだけ、人のメールアドレスがある
+  vcs('checkout', '-q', '-b', 'side');
+  const email = ['real.person', '@corp.example', '.jp'].join('');
+  vcs('commit', '-q', '--allow-empty', '-m', `side\n\nSigned-off-by: someone <${email}>`);
+  vcs('checkout', '-q', 'trunk');
+  const script = path.join(__dirname, '..', 'scripts', 'oss-check.js');
+  const run = (...a) => {
+    const env = { ...process.env, KATALA_TUNE_NODES: path.join(dir, 'none.json') };
+    try { return { code: 0, out: execFileSync(process.execPath, [script, ...a], { cwd: dir, encoding: 'utf8', env }) }; }
+    catch (e) { return { code: e.status, out: e.stdout }; }
+  };
+  const head = run('--history');
+  assert.equal(head.code, 0, head.out);
+  assert.match(head.out, /HEAD から辿れる 1 コミット/);
+  const all = run('--history', '--all-refs');
+  assert.equal(all.code, 1, all.out);
+  assert.match(all.out, /全部の枝の 2 コミット/);
+  assert.match(all.out, /NG email\s+commit [0-9a-f]{7} message:3/);
+  assert.equal(run('--all-refs').code, 1, '--all-refs だけでも全部の枝の履歴を見る');
+});

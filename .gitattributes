@@ -1,0 +1,2 @@
+# 署名の検証用 fixture は 1 バイトも変えない（Windows の autocrlf で LF が CRLF になると署名が合わない）
+test/fixtures/release/** -text
