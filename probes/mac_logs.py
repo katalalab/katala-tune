@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """katala-tune の macOS ログ収集。読み取り専用。前回の続きから読み、JSON 1行で出す。
 
-使い方: python3 - <diag_cursor_ms> <kernel_cursor_epoch>
+使い方: python3 - <diag_cursor_ms> <kernel_cursor_epoch> [<auth_cursor_epoch>] [nonet]
   diag    ~/Library/Logs/DiagnosticReports（と読めれば /Library/...）のクラッシュ・ハング・パニック・資源超過。
           ファイル名と先頭の見出し（app_name, bug_type）だけを読み、中身（スタック等）は送らない。
   kernel  統合ログのうちカーネルのエラー（Sandbox の deny を除く）。fault は1時間に数千件出るので取らない。
+  auth    統合ログのうち sshd の Failed 認証試行。1試行を1件にし、送り元を provider に入れる。
+          読むのは日時・アカウント名・送り元・認証の方式だけ。範囲は最大7日（初回は24時間）、件数は300件まで。
 """
-import json, os, re, subprocess, sys, time
+import hashlib, json, os, re, subprocess, sys, time
+from concurrent.futures import ThreadPoolExecutor
 
 MAX_ROWS = 300
 DIAG_DIRS = [os.path.expanduser("~/Library/Logs/DiagnosticReports"), "/Library/Logs/DiagnosticReports"]
@@ -60,10 +63,13 @@ def kernel(cursor_epoch):
     start = cursor_epoch or time.time() - 2 * 3600  # 初回は2時間（24時間だと M2 で25秒を超えた）
     since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start))
     try:
-        out = subprocess.run(["log", "show", "--style", "ndjson", "--start", since, "--predicate",
-                              # Sandbox の deny は作業中のツールが日常的に出すノイズなので除く
-                              'messageType == error AND (process == "kernel" OR subsystem BEGINSWITH "com.apple.kernel") AND NOT (sender == "Sandbox")'],
-                             capture_output=True, text=True, timeout=40).stdout
+        p = subprocess.run(["log", "show", "--style", "ndjson", "--start", since, "--predicate",
+                            # Sandbox の deny は作業中のツールが日常的に出すノイズなので除く
+                            'messageType == error AND (process == "kernel" OR subsystem BEGINSWITH "com.apple.kernel") AND NOT (sender == "Sandbox")'],
+                           capture_output=True, text=True, timeout=40)
+        if p.returncode != 0:
+            return {"error": f"log show exit {p.returncode}"}
+        out = p.stdout
     except Exception as e:  # noqa: BLE001
         return {"error": str(e)}
     rows, newest = [], start
@@ -85,9 +91,73 @@ def kernel(cursor_epoch):
     return {"cursor": str(int(newest) + 1), "rows": rows[-MAX_ROWS:], "dropped": dropped}
 
 
+# OpenSSH の Failed 認証試行（sshd・sshd-session・sshd-auth）。Invalid user・preauth close・maximum は同じ試行の補助行なので数えない。
+SSH_FAIL = re.compile(r"^Failed (?P<m>\S+) for (?:invalid user )?(?P<u>.*?) from (?P<ip>\S+) port (?P<port>\d+)")
+
+
+def parse_auth(text):
+    """log show --style ndjson の行から、ssh の Failed 認証試行ごとの行を作る。戻り値は (rows, 最新の時刻)"""
+    attempts, newest = {}, 0.0
+    for line in text.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(e, dict):
+            continue
+        ts = e.get("timestamp", "")
+        try:
+            t = time.mktime(time.strptime(ts[:19], "%Y-%m-%d %H:%M:%S")) + float("0" + ts[19:26])
+        except (ValueError, TypeError):
+            continue
+        msg = e.get("eventMessage") or ""
+        m = SSH_FAIL.match(msg)
+        if not m:
+            continue
+        newest = max(newest, t)
+        ip, port = m.group("ip"), m.group("port")
+        stamp = int(t * 1_000_000)
+        digest = hashlib.sha256(msg.encode("utf-8", "replace")).hexdigest()[:12]
+        uid = f"ssh:{ip}:{port}:{stamp}:{digest}"
+        attempts.setdefault(uid, {"uid": uid, "ts": int(t * 1000), "level": "warn", "provider": ip[:120], "event_id": "ssh-fail",
+                                  "message": f"ssh login failed: account {(m.group('u') or '?')[:64]}, from {ip}, {m.group('m')[:40]}"})
+    rows = list(attempts.values())
+    rows.sort(key=lambda r: r["ts"])
+    return rows, newest
+
+
+def auth(cursor_epoch):
+    started = time.time()
+    # 初回は24時間。長く止まっていても7日より前は読まない（log show が重くなるため）
+    start = max(cursor_epoch or started - 24 * 3600, started - 7 * 86400)
+    since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start))
+    try:
+        p = subprocess.run(["log", "show", "--style", "ndjson", "--start", since, "--predicate",
+                            'process BEGINSWITH "sshd" AND eventMessage BEGINSWITH "Failed "'],
+                           capture_output=True, text=True, timeout=30)
+        if p.returncode != 0:
+            return {"error": f"log show exit {p.returncode}"}
+        out = p.stdout
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
+    rows, newest = parse_auth(out)
+    dropped = max(0, len(rows) - MAX_ROWS)
+    # 何も無かったときも続きの位置を進める（少し重ねて読み、uid で重複を除く）
+    cursor = max(int(max(newest, start)) + 1, int(started) - 60)
+    return {"cursor": str(cursor), "rows": rows[-MAX_ROWS:], "dropped": dropped}
+
+
 def main():
-    a = sys.argv[1:] + ["0", "0"]
-    res = {"probe": "mac_logs", "sources": {"mac_diag": diag(float(a[0] or 0)), "mac_kernel": kernel(float(a[1] or 0))}}
+    # nonet: 台帳の "network": false。ログインの記録（送り元のアドレス）は読まない
+    network = "nonet" not in sys.argv[1:]
+    a = [x for x in sys.argv[1:] if x != "nonet"] + ["0", "0", "0"]
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        fd = ex.submit(diag, float(a[0] or 0))
+        fk = ex.submit(kernel, float(a[1] or 0))
+        fa = ex.submit(auth, float(a[2] or 0)) if network else None
+        res = {"probe": "mac_logs", "sources": {"mac_diag": fd.result(), "mac_kernel": fk.result()}}
+        if fa:
+            res["sources"]["mac_auth"] = fa.result()
     json.dump(res, sys.stdout, ensure_ascii=False)
     print()
 

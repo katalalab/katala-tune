@@ -52,6 +52,8 @@
     aiSessions: (filter) => invoke('ai_sessions', { filter: filter ?? null }),
     aiSync: (ids) => invoke('ai_sync', { ids: ids ?? null }),
     onAiSynced: (fn) => { listen('ai-synced', (r) => fn(r)); },
+    // ネットワークとセキュリティ（Tauri 版だけ。待ち受け・防御・常駐の増減・ログイン・初めての接続先）
+    netsec: (filter) => invoke('netsec', { filter: filter ?? null }),
     onChecksUpdated: (fn) => { listen('checks-updated', () => fn()); },
     onNavigate: (fn) => { listen('navigate', (v) => fn(v)); },
     onProbeResult: (fn) => { listen('probe-result', (r) => fn(r)); },

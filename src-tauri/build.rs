@@ -31,6 +31,7 @@ const COMMANDS: &[&str] = &[
     "live_stop",
     "agent_peers",
     "agent_pair",
+    "netsec",
 ];
 
 fn main() {

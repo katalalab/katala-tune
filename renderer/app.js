@@ -23,7 +23,7 @@ const LEVEL_SERIES = [
 const LEVEL_BAR = { critical: 'crit', error: 'err', warn: 'warn', info: 'unknown' };
 const STATUS_LABEL = { ok: '正常', warn: '注意', fail: '異常', unknown: '不明' };
 const CAT_LABEL = { cpu: 'CPU', memory: 'メモリ', disk: 'ディスク', thermal: '熱', power: '電源', stability: '安定性', background: '常駐・その他', security: 'セキュリティ' };
-const SOURCE_LABEL = { win_system: 'System', win_application: 'Application', neonmonitor: 'NeonMonitor', mac_diag: 'DiagnosticReports', mac_kernel: 'カーネル' };
+const SOURCE_LABEL = { win_system: 'System', win_application: 'Application', neonmonitor: 'NeonMonitor', mac_diag: 'DiagnosticReports', mac_kernel: 'カーネル', mac_auth: 'ログイン（sshd）', win_security: 'ログオン（セキュリティ）' };
 // メーターのしきい値（lib/rules.js の判定に合わせる。ディスクとメモリは使用率に直したもの）
 const TH = { cpu: { warn: 60, crit: 85 }, mem: { warn: 80, crit: 90 }, disk: { warn: 90, crit: 95 } };
 const NAV = [['overview', '概要', 'overview'], ['status', '状態', 'status'], ['resources', 'リソース', 'resources'], ['procs', 'プロセス', 'procs'],

@@ -39,6 +39,7 @@
     "allow-live-start",
     "allow-live-stop",
     "allow-agent-peers",
-    "allow-agent-pair"
+    "allow-agent-pair",
+    "allow-netsec"
   ]
 }

@@ -247,12 +247,15 @@
     $('#aiDays').onchange = (e) => { ai.days = +e.target.value; ai.list.offset = 0; render(); };
     $('#aiTool').onchange = (e) => { ai.tool = e.target.value; ai.list.offset = 0; render(); };
     $('#aiNode').onchange = (e) => { ai.node = e.target.value; ai.list.offset = 0; render(); };
-    bindSearch('#aiQ', 'ai', (v) => { ai.list.q = v; ai.list.offset = 0; }, render, 300);
-    $('#aiKind').onchange = (e) => { ai.list.kind = e.target.value; ai.list.offset = 0; render(); };
+    if ($('#aiQ')) bindSearch('#aiQ', 'ai', (v) => { ai.list.q = v; ai.list.offset = 0; }, render, 300);
+    const aiKind = $('#aiKind');
+    if (aiKind) aiKind.onchange = (e) => { ai.list.kind = e.target.value; ai.list.offset = 0; render(); };
     $$('[data-aisort]').forEach((b) => { b.onclick = () => { ai.list.sort = b.dataset.aisort; ai.list.offset = 0; render(); }; });
     $$('[data-aierr]').forEach((b) => { b.onclick = () => { ai.list.errors = b.dataset.aierr === '1'; ai.list.offset = 0; render(); }; });
-    $('#aiPrev').onclick = () => { ai.list.offset = Math.max(0, ai.list.offset - ai.list.limit); render(); };
-    $('#aiNext').onclick = () => { ai.list.offset += ai.list.limit; render(); };
+    const aiPrev = $('#aiPrev');
+    if (aiPrev) aiPrev.onclick = () => { ai.list.offset = Math.max(0, ai.list.offset - ai.list.limit); render(); };
+    const aiNext = $('#aiNext');
+    if (aiNext) aiNext.onclick = () => { ai.list.offset += ai.list.limit; render(); };
     $('#aiMinutes').onchange = async (e) => { await window.tune.setSchedule({ ai_minutes: +e.target.value }); toast(`自動の取り込みを ${e.target.value} 分ごとにしました`); render(); };
   }
 
