@@ -18,23 +18,23 @@ test('版: 書き換えは版の行だけで、読み直すと新しい版にな
     const after = h.set(before, '9.8.7-rc.1');
     assert.equal(h.get(after), '9.8.7-rc.1', f);
     const changed = before.split('\n').filter((l, i) => l !== after.split('\n')[i]);
-    assert.ok(changed.length >= 1 && changed.length <= 3, `${f}: ${changed.length} 行`);
+    assert.ok(changed.length >= 1 && changed.length <= (f === 'Cargo.lock' ? 5 : 3), `${f}: ${changed.length} 行`);
     assert.equal(before.split('\n').length, after.split('\n').length, f);
   }
 });
 
-test('版: Cargo.lock は純LF・CRLFそれぞれの改行を保って3 crateを更新する', () => {
+test('版: Cargo.lock は純LF・CRLFそれぞれの改行を保って全5 crateを更新する', () => {
   const h = FILES['Cargo.lock'];
   const source = read('Cargo.lock');
   const expectedBefore = JSON.parse(read('package.json')).version;
   const pureLf = source.replace(/\r?\n/g, '\n');
   const crlf = pureLf.replace(/\n/g, '\r\n');
   for (const [label, before, eol] of [['LF', pureLf, '\n'], ['CRLF', crlf, '\r\n']]) {
-    assert.equal(h.get(before), expectedBefore, `${label}: 変換前も3 crateで同じ版を読む`);
+    assert.equal(h.get(before), expectedBefore, `${label}: 変換前も全crateで同じ版を読む`);
     const after = h.set(before, '9.8.7-rc.1');
 
     assert.equal(h.get(after), '9.8.7-rc.1', `${label}: 書換え後の版を読む`);
-    for (const crate of ['katala-tune', 'tune-core', 'tune-cli']) {
+    for (const crate of ['katala-tune', 'tune-core', 'tune-cli', 'tune-link', 'tune-agent']) {
       const escapedEol = eol === '\n' ? '\\n' : '\\r\\n';
       assert.match(after, new RegExp(`${escapedEol}name = "${crate}"${escapedEol}version = "9\\.8\\.7-rc\\.1"`), `${label}: ${crate}`);
     }

@@ -882,7 +882,8 @@ fn read_spec(now: i64) -> Value {
     json!({
         "nodes": ["n1", "n2", "n3"],
         "queries": [{}, { "q": "WHEA" }, { "node_id": "n1" }, { "level": "error", "limit": 5 }, { "since": now - 5 * 3_600_000 }, { "source": "win_system", "q": "disk OR Display" }, { "q": "bad\"query" }, { "limit": 7 }],
-        "signatures": [{ "since": 0 }, { "node_id": "n1", "limit": 3 }, { "since": now - 2 * 3_600_000 }],
+        "signatures": [{ "since": 0 }, { "node_id": "n1", "limit": 3 }, { "since": now - 2 * 3_600_000 },
+            { "limit": 1, "offset": 1 }, { "limit": -1 }, { "limit": 1000 }, { "limit": 1, "offset": -1 }, { "offset": 1e20 }],
         "meta": ["schedule", "lastProbeAt", "migr_win_ts_v1", "missing"]
     })
 }
