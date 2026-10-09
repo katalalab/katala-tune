@@ -179,7 +179,7 @@ function cardHtml(n) {
     <div class="card-hw">${esc(d ? `${d.host.cpu} · ${d.host.cores} スレッド · ${d.memory.total_gb} GB` : n.os === 'macos' ? 'macOS' : 'Windows')}</div>
     <div class="card-foot">${sev}${d?.bench ? `<span title="1スレッドの固定計算。小さいほど速い">計測 ${esc(d.bench.median_ms)} ms${delta}</span>` : ''}
       <span class="right">${busy ? '分析中…' : r ? esc(ago(r.at)) : '未分析'}</span></div>
-    ${r && !r.ok ? `<div class="err"><b>分析できませんでした</b>\n${esc(r.error)}</div>` : ''}
+    ${r && !r.ok ? `<div class="err"><b>分析できませんでした${r.reason_text ? `（${esc(r.reason_text)}）` : ''}</b>\n${esc(r.error)}</div>` : ''}
   </div>`;
 }
 
@@ -279,7 +279,7 @@ async function renderNode(id) {
   else if (state.tab === 'history') body = await historyHtml(n.id);
   else if (state.tab === 'fleet') body = fleetHtml(n.id);
   else if (!r) body = UI.empty('まだ分析していません。', `<button class="btn primary" id="btnOne">${icon('play')}この機体を分析</button>`);
-  else if (!r.ok) body = UI.callout({ tone: 'red', icon: 'alert', title: '分析できませんでした', body: `<div class="err">${esc(r.error)}</div><p class="note-line">SSH で入れるか（~/.ssh/config の Host 名と鍵）、機体の電源とネットワークを確かめてから「この機体を分析し直す」を押してください。</p>` });
+  else if (!r.ok) body = UI.callout({ tone: 'red', icon: 'alert', title: `分析できませんでした${r.reason_text ? `（${r.reason_text}）` : ''}`, body: `<div class="err">${esc(r.error)}</div><p class="note-line">SSH で入れるか（~/.ssh/config の Host 名と鍵）、機体の電源とネットワークを確かめてから「この機体を分析し直す」を押してください。</p>` });
   else if (state.tab === 'findings') body = findingsHtml(r.findings);
   else if (state.tab === 'procs') body = procsHtml(d);
   else if (state.tab === 'jobs') body = jobsTable(jobsOf([n]), false);
@@ -822,7 +822,7 @@ async function renderActions() {
       cols: [{ label: '日時' }, { label: '機体' }, { label: '操作' }, { label: '', cls: 'acts' }],
       rows: log,
       row: (a) => `<td class="muted nowrap">${esc(fmtTime(a.at))}</td><td class="nowrap"><b>${esc(a.node_id)}</b></td>`
-        + `<td><div class="act-title">${a.ok ? UI.chip('成功', 'green', { dot: true }) : UI.chip('失敗', 'red', { dot: true })}<span>${esc(a.label)}</span></div>${a.output ? `<div class="act-out">${esc(a.output)}</div>` : ''}</td>`
+        + `<td><div class="act-title">${a.state === 'incomplete' ? UI.chip('未完了', 'orange', { dot: true }) : a.ok ? UI.chip('成功', 'green', { dot: true }) : UI.chip('失敗', 'red', { dot: true })}<span>${esc(a.label)}</span></div>${a.output ? `<div class="act-out">${esc(a.output)}</div>` : ''}</td>`
         + `<td class="acts">${a.undo && !log.some((b) => b.undo_of === a.id && b.ok) ? `<button class="btn small" data-undo="${esc(a.id)}">元に戻す</button>` : a.undo ? UI.chip('戻し済み', 'gray') : a.undo_of ? UI.chip('戻し', 'default') : ''}</td>`,
     }) : UI.empty('まだ何も実行していません。所見の提案から実行すると、ここに残ります。')}`);
   $$('[data-undo]').forEach((b) => {

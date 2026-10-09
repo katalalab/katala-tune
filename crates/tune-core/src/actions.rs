@@ -13,7 +13,7 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::{Value, json};
 
-use crate::collect::exec_on;
+use crate::collect::{Runner, System, exec_on_with};
 use crate::js;
 use crate::nodes::Node;
 use crate::rules::no_kill;
@@ -282,9 +282,14 @@ pub struct Outcome {
 
 /// 計画を立て直してから実行する（ここでも許可リスト・共用機・保護リスト・引数を検証する）
 pub async fn execute(node: &Node, action: &Value, protect: Option<&[String]>) -> Result<Outcome, String> {
+    execute_with(&System, node, action, protect).await
+}
+
+/// `execute` の子プロセスの実行口を差し替えられる版（テストは偽の実行器を渡す。承認なしで呼ばれていないことを数えるため）
+pub async fn execute_with(runner: &dyn Runner, node: &Node, action: &Value, protect: Option<&[String]>) -> Result<Outcome, String> {
     let p = plan(node, action, protect)?;
     let cmd = wrap(node, &p)?;
-    let res = exec_on(node, &cmd, Duration::from_secs(30)).await;
+    let res = exec_on_with(runner, node, &cmd, Duration::from_secs(30)).await;
     let ok = res.code == Some(0);
     let outcome = res
         .code

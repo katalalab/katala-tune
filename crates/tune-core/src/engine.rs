@@ -490,9 +490,23 @@ impl Engine {
         cache
     }
 
-    /// 確認してから変更操作を実行し、実行記録に残す（main.js の confirmAndRun）。
-    /// 実行の直前に台帳（共用機の指定・保護リスト）を読み直し、読めなければ実行しない。確認の後にもう一度読み直してから実行する
+    /// 確認してから変更操作を実行し、実行記録に残す（lib/runner.js の confirmAndRun と同じ流れ）。
+    /// 承認が無ければ実行しない。確認の後にもう一度台帳を読み直し、接続先が変わっていたり共用機・保護対象になっていたら実行しない（理由を実行記録に残す）。
+    /// 実行の直前に「未完了」の記録を書く（書けなければ実行しない）。結果を書く前にアプリが止まっても、成功としては残らない
     pub async fn confirm_and_run(&self, node_id: &str, action: &Value, title: &str, undo_of: Option<&str>, confirm: Confirm) -> Result<Value, String> {
+        self.confirm_and_run_with(&collect::System, node_id, action, title, undo_of, confirm).await
+    }
+
+    /// `confirm_and_run` の子プロセスの実行口を差し替えられる版（テストは偽の実行器を渡す）
+    pub async fn confirm_and_run_with(
+        &self,
+        runner: &dyn collect::Runner,
+        node_id: &str,
+        action: &Value,
+        title: &str,
+        undo_of: Option<&str>,
+        confirm: Confirm,
+    ) -> Result<Value, String> {
         let refused = |m: String| Ok(json!({ "ok": false, "refused": m }));
         let fresh = match nodes::load_config(&self.config_path) {
             Ok(c) => c,
@@ -508,30 +522,67 @@ impl Engine {
         if !confirm(title.to_string(), format!("{}\n\n実行するコマンド:\n{}", p.describe, p.script)).await {
             return Ok(json!({ "ok": false, "cancelled": true }));
         }
+        // 承認したあとで止めるときは、理由を実行記録に残す（実行していない）。記録できなくても止めたことは変わらない
+        let abort = |m: String| {
+            let entry = json!({
+                "id": format!("{}-{}", now_ms(), rand36(5)), "at": now_ms(), "node_id": node_id,
+                "type": action.get("type"), "params": action.get("params"), "label": title, "ok": false,
+                "output": format!("中止（実行していない）: {m}"), "undo": null, "undo_of": undo_of,
+            });
+            let _ = self.with_db(|d| d.add_action(&entry));
+            refused(m)
+        };
         let fresh = match nodes::load_config(&self.config_path) {
             Ok(c) => c,
-            Err(e) => return refused(format!("台帳を読めないので実行しない: {e}")),
+            Err(e) => return abort(format!("台帳を読めないので実行しない: {e}")),
         };
-        let Some(node) = fresh.node(node_id) else { return refused("台帳に無い機体".into()) };
+        let Some(node) = fresh.node(node_id) else { return abort("台帳に無い機体".into()) };
         if (node.alias.clone(), node.os.clone(), node.local) != route {
-            return refused("確認のあいだに台帳の接続先（alias・OS・この機体かどうか）が変わったので実行しない。もう一度確認してください".into());
+            return abort("確認のあいだに台帳の接続先（alias・OS・この機体かどうか）が変わったので実行しない。もう一度確認してください".into());
         }
-        let r = match actions::execute(node, action, Some(&fresh.protect)).await {
-            Ok(r) => r,
-            Err(e) => return refused(e),
-        };
-        let entry = json!({
-            "id": format!("{}-{}", now_ms(), rand36(5)), "at": now_ms(), "node_id": node.id,
-            "type": action.get("type"), "params": action.get("params"), "label": title, "ok": r.ok,
-            "output": js::trim(&format!("{}\n{}", r.outcome, r.output)), "undo": r.undo, "undo_of": undo_of,
+        // 共用機・保護リスト・引数は、読み直した台帳でもう一度確かめる（実行するコマンドは接続先と操作で決まるので、承認したものと同じ）
+        if let Err(e) = actions::plan(node, action, Some(&fresh.protect)) {
+            return abort(e);
+        }
+        // 未完了の記録を先に書く。書けなければ実行しない
+        let id = format!("{}-{}", now_ms(), rand36(5));
+        let mut entry = json!({
+            "id": id, "at": now_ms(), "node_id": node.id,
+            "type": action.get("type"), "params": action.get("params"), "label": title, "ok": null,
+            "output": PENDING_OUTPUT, "undo": null, "undo_of": undo_of,
         });
-        // 書き込みの失敗は成功扱いにしない（画面へエラーとして返す）
-        self.with_db(|d| d.add_action(&entry)).map_err(|e| format!("実行記録を書けなかった（操作は実行済み: {}）: {e}", r.outcome))?;
+        if let Err(e) = self.with_db(|d| d.add_action(&entry)) {
+            return refused(format!("実行記録を書けないので実行しない: {e}"));
+        }
+        let r = match actions::execute_with(runner, node, action, Some(&fresh.protect)).await {
+            Ok(r) => r,
+            Err(e) => {
+                let output = format!("実行できなかった: {e}");
+                let _ = self.with_db(|d| d.finish_action(&id, false, &output, None));
+                return refused(output);
+            }
+        };
+        let output = js::trim(&format!("{}\n{}", r.outcome, r.output)).to_string();
+        // 書き込みの失敗は成功扱いにしない（画面へエラーとして返す）。記録は未完了のまま残る
+        // 未更新（false）も書けなかったのと同じ。記録が未完了でなくなっていて、結果を書き込めていない
+        match self.with_db(|d| d.finish_action(&id, r.ok, &output, r.undo.as_ref())) {
+            Ok(true) => {}
+            Ok(false) => return Err(format!("実行記録を書けなかった（操作は実行済み: {}）: 記録がすでに未完了ではなく、結果を書き込めなかった", r.outcome)),
+            Err(e) => return Err(format!("実行記録を書けなかった（操作は実行済み: {}）: {e}", r.outcome)),
+        }
+        entry["ok"] = Value::Bool(r.ok);
+        entry["output"] = Value::String(output);
+        entry["undo"] = r.undo.clone().unwrap_or(Value::Null);
         Ok(json!({ "ok": r.ok, "code": r.code, "outcome": r.outcome, "output": r.output, "undo": r.undo, "entry": entry }))
     }
 
     /// 実行記録から元に戻す
     pub async fn undo(&self, entry_id: &str, confirm: Confirm) -> Result<Value, String> {
+        self.undo_with(&collect::System, entry_id, confirm).await
+    }
+
+    /// `undo` の子プロセスの実行口を差し替えられる版
+    pub async fn undo_with(&self, runner: &dyn collect::Runner, entry_id: &str, confirm: Confirm) -> Result<Value, String> {
         let all = self.with_db(|d| d.actions(1000))?;
         let Some(entry) = all.iter().find(|a| js::is_str(a.get("id"), entry_id)) else {
             return Ok(json!({ "ok": false, "refused": "元に戻せる記録が無い" }));
@@ -543,9 +594,12 @@ impl Engine {
         }
         let node_id = js::string(entry.get("node_id"));
         let title = format!("{node_id}: 元に戻す（{}）", js::string(entry.get("label")));
-        self.confirm_and_run(&node_id, &undo, &title, Some(entry_id), confirm).await
+        self.confirm_and_run_with(runner, &node_id, &undo, &title, Some(entry_id), confirm).await
     }
 }
+
+/// 実行を始めたが結果をまだ書いていない記録の説明（lib/runner.js の PENDING_OUTPUT と同じ）
+pub const PENDING_OUTPUT: &str = "実行を開始した。結果は未確認（アプリが途中で止まった場合は、機体の状態を確かめてから必要なら手で戻す）";
 
 /// 悪くなって異常（fail）になったとき、異常から戻ったときだけ知らせる（同じ状態が続いても繰り返さない）
 pub fn is_important(c: &Change) -> bool {
