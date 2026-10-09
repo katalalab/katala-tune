@@ -28,6 +28,12 @@ pub fn failing_jobs(jobs: &[Value]) -> Vec<&Value> {
         .collect()
 }
 
+/// ログ取り込みの失敗を「状態の変化」にするしきい値（lib/health.js の LOGS_FAIL_STREAK・LOGS_FAIL_AFTER_MIN）。
+/// SSH の1回のタイムアウトなど一時的な不達では判定を変えない。連続でこの回数失敗するか、最後の成功からこの時間
+/// （と取り込み間隔の3倍の大きい方）を超えたら fail にする。最後の成功が無いときは待たずに fail。docs/observability.md の 7
+pub const LOGS_FAIL_STREAK: f64 = 3.0;
+pub const LOGS_FAIL_AFTER_MIN: f64 = 60.0;
+
 fn age_min(ms: Jv<'_>, now: f64) -> String {
     if truthy(ms) { js::num_str(js::round((now - num(ms)) / 60000.0)) } else { "null".into() }
 }
@@ -93,12 +99,27 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
     if cur.is_empty() {
         out.add("logs", "ログ取り込み", "unknown", "まだ取り込んでいない");
     } else {
-        let errs: Vec<&&Value> = cur.iter().filter(|x| truthy(x.get("last_error"))).collect();
+        let streak_of = |x: &Value| {
+            let n = num(x.get("fail_streak"));
+            if n.is_nan() { 0.0 } else { n }
+        };
+        let grace_ms = js::max(&[LOGS_FAIL_AFTER_MIN * 60000.0, logs_every * 3.0]);
+        let persistent = |x: &Value| !truthy(x.get("last_ok_at")) || streak_of(x) >= LOGS_FAIL_STREAK || now - num(x.get("last_ok_at")) > grace_ms;
+        let failing: Vec<&&Value> = cur.iter().filter(|x| truthy(x.get("last_error"))).collect();
+        let errs: Vec<&&Value> = failing.iter().copied().filter(|x| persistent(x)).collect();
+        let transient: Vec<&&Value> = failing.iter().copied().filter(|x| !persistent(x)).collect();
         let stale: Vec<&&Value> =
             cur.iter().filter(|x| !truthy(x.get("last_error")) && truthy(x.get("last_ok_at")) && now - num(x.get("last_ok_at")) > logs_every * 3.0).collect();
         if !errs.is_empty() {
-            let d =
-                errs.iter().map(|x| format!("{}: {}", string(x.get("source")), js::slice16(&string(x.get("last_error")), 80))).collect::<Vec<_>>().join(" / ");
+            let d = errs
+                .iter()
+                .map(|x| {
+                    let n = streak_of(x);
+                    let streak = if n > 1.0 { format!("（連続 {} 回）", js::num_str(n)) } else { String::new() };
+                    format!("{}: {}{streak}", string(x.get("source")), js::slice16(&string(x.get("last_error")), 80))
+                })
+                .collect::<Vec<_>>()
+                .join(" / ");
             out.add("logs", "ログ取り込み", "fail", d);
         } else if !stale.is_empty() {
             let oldest = js::min(&stale.iter().map(|x| num(x.get("last_ok_at"))).collect::<Vec<_>>());
@@ -115,7 +136,29 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
         } else {
             let zero = Value::from(0);
             let newest = js::max(&cur.iter().map(|x| num(js::or(x.get("last_ok_at"), Some(&zero)))).collect::<Vec<_>>());
-            out.add("logs", "ログ取り込み", "ok", format!("{} か所、最新 {} 分前", cur.len(), age_min_f(newest, now)));
+            let wait = if transient.is_empty() {
+                String::new()
+            } else {
+                let sources = js::join(&transient.iter().map(|x| x.get("source").cloned().unwrap_or(Value::Null)).collect::<Vec<_>>(), ", ");
+                let most = js::max(&transient.iter().map(|x| streak_of(x)).collect::<Vec<_>>());
+                format!(
+                    "。{sources} は一時的に届かない（連続 {} 回、{} 回か {} 分で失敗扱い）",
+                    js::num_str(most),
+                    js::num_str(LOGS_FAIL_STREAK),
+                    js::num_str(LOGS_FAIL_AFTER_MIN)
+                )
+            };
+            let notes: Vec<String> = cur
+                .iter()
+                .filter(|x| !truthy(x.get("last_error")))
+                .filter_map(|x| {
+                    let n = x.get("note")?.as_str()?;
+                    let label = crate::logs::SOURCE_NOTES.iter().find(|(k, _)| *k == n)?.1;
+                    Some(format!("{}: {label}", string(x.get("source"))))
+                })
+                .collect();
+            let na = if notes.is_empty() { String::new() } else { format!("。{}（取れても 0 件）", notes.join("、")) };
+            out.add("logs", "ログ取り込み", "ok", format!("{} か所、最新 {} 分前{wait}{na}", cur.len(), age_min_f(newest, now)));
         }
     }
     let Some(d) = d.filter(|v| truthy(Some(v))) else { return out.0 };
