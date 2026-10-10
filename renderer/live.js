@@ -74,7 +74,7 @@ const Live = (() => {
   let maxStreams = 6;
   let hb = null;
   const visible = () => typeof document === 'undefined' || document.visibilityState !== 'hidden';
-  const viewKey = (view) => (view === 'resources' ? 'resources' : String(view || ''));
+  const viewKey = (view) => (view === 'resources' || view === 'power' ? 'resources' : String(view || ''));
 
   const STOP_LABEL = {
     user: '停止', idle: '自動停止', hidden: '停止', disconnected: '接続切れ', limit: '上限のため止めている', app_exit: '終了', unknown: '台帳に無い',
@@ -133,6 +133,8 @@ const Live = (() => {
       row('メモリ', [ser('mem', lvTone(last.mem, TH.mem))], opt({ min: 0, max: 100, label: 'メモリ使用率' }), pctText(last.mem), memSub),
       row('ディスク', [ser('dr', 'info'), ser('dw', 'alt')], opt({ label: 'ディスクの読み書き', floor: 1e6 }), `<span class="rd">読 ${rate(last.dr)}</span><span class="wr">書 ${rate(last.dw)}</span>`),
       row('ネット', [ser('rx', 'info'), ser('tx', 'alt')], opt({ label: 'ネットワークの送受信', floor: 1e5 }), `<span class="rd">受 ${rate(last.rx)}</span><span class="wr">送 ${rate(last.tx)}</span>`),
+      row('CPU電力', [ser('power_cpu_w','info')], opt({label:'CPU package電力'}),num(last.power_cpu_w) ? `${last.power_cpu_w.toFixed(1)} W` : '未取得'),
+      row('GPU電力', [ser('power_gpu_w','info')], opt({label:'GPU電力'}),num(last.power_gpu_w) ? `${last.power_gpu_w.toFixed(1)} W` : '未取得', gpu ? `Graphics ${num(gpu.clocks_graphics_mhz) ? gpu.clocks_graphics_mhz : '未取得'} MHz · Memory ${num(gpu.clocks_memory_mhz) ? gpu.clocks_memory_mhz : '未取得'} MHz` : ''),
       gpu || pts.some((p) => num(p.gpu))
         ? row('GPU', [ser('gpu', 'info')], opt({ min: 0, max: 100, label: 'GPU 使用率' }), pctText(pts.filter((p) => num(p.gpu)).at(-1)?.gpu),
           gpu && num(gpu.mem_total_mb) ? `${big ? 'メモリ ' : ''}${(gpu.mem_used_mb / 1024).toFixed(1)} / ${(gpu.mem_total_mb / 1024).toFixed(1)} GB` : '')

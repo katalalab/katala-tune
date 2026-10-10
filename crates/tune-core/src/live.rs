@@ -166,6 +166,10 @@ pub struct Gpu {
 pub struct Power {
     pub package_w: Option<f64>,
     pub package_source: Option<String>,
+    pub soc_w: Option<f64>,
+    pub soc_source: Option<String>,
+    pub platform_w: Option<f64>,
+    pub platform_source: Option<String>,
     pub available: Option<bool>,
 }
 
@@ -328,7 +332,15 @@ impl Sample {
                 })
                 .collect()
         });
-        let power = r.power.map(|x| Power { package_w: nonneg(x.package_w), package_source: x.package_source.map(|s| short(&s)), available: x.available });
+        let power = r.power.map(|x| Power {
+            package_w: nonneg(x.package_w),
+            package_source: x.package_source.map(|s| short(&s)),
+            soc_w: nonneg(x.soc_w),
+            soc_source: x.soc_source.map(|s| short(&s)),
+            platform_w: nonneg(x.platform_w),
+            platform_source: x.platform_source.map(|s| short(&s)),
+            available: x.available,
+        });
         let s = Sample {
             t: received,
             src_t: r.t.filter(|t| t.is_finite() && *t > 0.0).map(|t| t as i64),
@@ -371,18 +383,28 @@ impl Sample {
         put("rx", self.net.as_ref().and_then(|n| n.rx_bps), 0);
         put("tx", self.net.as_ref().and_then(|n| n.tx_bps), 0);
         put("power_cpu_w", self.power.as_ref().and_then(|p| p.package_w), 1);
+        put("power_soc_w", self.power.as_ref().and_then(|p| p.soc_w), 2);
+        put("power_platform_w", self.power.as_ref().and_then(|p| p.platform_w), 2);
         let power_source = self.power.as_ref().and_then(|p| p.package_source.as_ref());
         if let Some(g) = &self.gpu {
             put("gpu", g.iter().filter_map(|x| x.util).reduce(f64::max), 1);
             let (used, total) = g.iter().fold((0.0, 0.0), |(u, t), x| (u + x.mem_used_mb.unwrap_or(0.0), t + x.mem_total_mb.unwrap_or(0.0)));
             put("gmem", (total > 0.0).then(|| used / total * 100.0), 1);
-            if g.iter().all(|x| x.power_w.is_some()) {
+            if !g.is_empty() && g.iter().all(|x| x.power_w.is_some()) {
                 put("power_gpu_w", Some(g.iter().map(|x| x.power_w.unwrap_or_default()).sum()), 1);
             }
         }
         put("lag", self.src_t.map(|s| (self.t - s) as f64), 0);
         if let Some(source) = power_source {
             m.insert("power_cpu_source".into(), Value::from(source.clone()));
+        }
+        if let Some(source) = self.power.as_ref().and_then(|p| p.soc_source.as_ref()) {
+            m.insert("power_soc_source".into(), Value::from(source.clone()));
+        }
+        if let Some(g) = self.gpu.as_ref()
+            && !g.is_empty()
+        {
+            m.insert("power_gpu_source".into(), Value::from(g.iter().map(|g| g.source.as_deref().unwrap_or("unknown")).collect::<Vec<_>>().join("+")));
         }
         Value::Object(m)
     }

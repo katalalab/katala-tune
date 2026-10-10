@@ -106,6 +106,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::config,
             commands::last,
+            commands::power_report,
+            commands::power_settings,
             commands::probe,
             commands::history,
             commands::fleet,
@@ -137,6 +139,7 @@ pub fn run() {
             commands_tools::ai_provenance,
             live::live_start,
             live::live_stop,
+            live::power_session,
             agent::agent_peers,
             agent::agent_pair,
         ])

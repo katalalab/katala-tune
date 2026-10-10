@@ -15,6 +15,7 @@ const health = require('./lib/health');
 const inventory = require('./lib/inventory');
 const dogu = require('./lib/dogu');
 const netsec = require('./lib/netsec');
+const powerSettings = require('./lib/power-settings');
 
 const IS_MAC = process.platform === 'darwin';
 const IS_WIN = process.platform === 'win32';
@@ -226,6 +227,19 @@ ipcMain.handle('last', () => cfg.nodes.map((n) => {
 
 ipcMain.handle('probe', (_e, ids) => runProbe(ids).then((r) => { if (!ids?.length && !r.busy) syncLogs(cfg.nodes).catch(() => {}); return r; }));
 ipcMain.handle('history', (_e, id) => db.history(id, 60));
+ipcMain.handle('power-report', () => {
+  const nodes = reloadConfig().nodes;
+  const snapshots = nodes.map((n) => { const s = db.lastSnapshots(n.id, 1)[0]; return s ? { node_id: n.id, ok: true, at: s.at, data: netsec.snapshotForNode(s.data, n) } : null; }).filter(Boolean);
+  return powerSettings.report(nodes, snapshots, db.getMeta('power_settings_v1') || {});
+});
+ipcMain.handle('power-settings', (_e, nodeId, patch) => {
+  powerSettings.validate(patch);
+  if (!reloadConfig().nodes.some((n) => n.id === nodeId)) throw new Error('台帳にない機体です');
+  const all = db.getMeta('power_settings_v1') || {};
+  all[nodeId] = { ...(all[nodeId] || {}), ...patch };
+  db.setMeta('power_settings_v1', all);
+  return all[nodeId];
+});
 ipcMain.handle('logs-sync', (_e, ids) => syncLogs(reloadConfig().nodes.filter((n) => !ids?.length || ids.includes(n.id))));
 ipcMain.handle('logs-query', (_e, f) => {
   try { return { rows: netsec.filterLogRows(db.queryLogs(f || {}), cfg.nodes) }; } catch (e) { return { error: String(e.message || e) }; }

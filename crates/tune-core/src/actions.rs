@@ -130,6 +130,7 @@ fn power_plan_script(guid: &str, prev_guid: &str) -> String {
         format!("& powercfg.exe -setactive {guid}; $apply = $LASTEXITCODE"),
         "$after = Read-Plan-Retry".into(),
         format!("if ($apply -eq 0 -and $after -eq \"{guid}\") {{ exit 0 }}"),
+        format!("if ($after -eq \"{prev_guid}\") {{ Write-Output \"power plan was not changed\"; exit 6 }}"),
         format!("if ($after -eq \"{guid}\") {{ & powercfg.exe -setactive {prev_guid}; if ($LASTEXITCODE -eq 0) {{ $rolled = Read-Plan-Retry; if ($rolled -eq \"{prev_guid}\") {{ Write-Output \"power plan verification failed; restored\"; exit 6 }} }} }}"),
         "Write-Output \"power plan verification or rollback unverified\"; exit 7".into(),
     ].join("; ");
@@ -147,6 +148,7 @@ fn gpu_power_script(uuid: &str, watts: f64, min: f64, max: f64, prev_w: f64) -> 
         format!("& nvidia-smi.exe --id={uuid} -pl {watts}; $apply = $LASTEXITCODE"),
         "$after = @(Read-Power-Retry)".into(),
         format!("if ($apply -eq 0 -and $after.Count -eq 3 -and $after[2] -eq {watts}) {{ exit 0 }}"),
+        format!("if ($after.Count -eq 3 -and $after[0] -eq {min} -and $after[1] -eq {max} -and $after[2] -eq {prev_w}) {{ Write-Output \"power limit was not changed\"; exit 6 }}"),
         format!("if ($after.Count -eq 3 -and $after[2] -eq {watts} -and $after[0] -le {prev_w} -and $after[1] -ge {prev_w}) {{ & nvidia-smi.exe --id={uuid} -pl {prev_w}; if ($LASTEXITCODE -eq 0) {{ $rolled = @(Read-Power-Retry); if ($rolled.Count -eq 3 -and $rolled[2] -eq {prev_w}) {{ Write-Output \"power limit verification failed; restored\"; exit 6 }} }} }}"),
         "Write-Output \"power limit verification or rollback unverified\"; exit 7".into(),
     ].join("; ");
@@ -161,18 +163,19 @@ fn low_power_mode_script(source: &str, enabled: bool, prev: bool) -> String {
     let previous = if prev { 1 } else { 0 };
     let raw = |key: &str| format!("pmset -g custom | awk '/^{heading}:/{{f=1;next}} /^[^ ]/{{f=0}} f && /^[[:space:]]*{key} / {{print $2; exit}}'");
     let read = format!(
-        "key=powermode; mode=$({}); [ -n \"$mode\" ] || {{ key=lowpowermode; mode=$({}); }}; case \"$mode\" in 0|1) echo \"$key:$mode\";; *) return 2;; esac",
+        "key=powermode; mode=$({}); [ -n \"$mode\" ] || {{ key=lowpowermode; mode=$({}); }}; if [ \"$mode\" = 0 ] || [ \"$mode\" = 1 ]; then echo \"$key:$mode\"; else exit 2; fi",
         raw("powermode"),
         raw("lowpowermode")
     );
     [
-        "lock=\"$HOME/.katala-tune/power-action.lock\"; mkdir -p -m 700 \"$HOME/.katala-tune\" || exit 6; mkdir \"$lock\" 2>/dev/null || { echo \"another power action is running; remove only after verifying owner PID is gone\"; exit 8; }; printf \"%s\\n\" \"$$\" > \"$lock/pid\"; trap \"rm -f \\\"$lock/pid\\\"; rmdir \\\"$lock\\\"\" EXIT HUP INT TERM".into(),
+        r#"lock="$HOME/.katala-tune/power-action.lock"; mkdir -p -m 700 "$HOME/.katala-tune" || exit 6; mkdir "$lock" 2>/dev/null || { echo "another power action is running; remove only after verifying owner PID is gone"; exit 8; }; trap 'rm -f "$lock/pid"; rmdir "$lock"' EXIT; trap 'exit 7' HUP INT TERM; printf "%s\n" "$$" > "$lock/pid" || exit 6"#.into(),
         format!("before=$({read}) || {{ echo \"low power mode unsupported\"; exit 6; }}; before_key=${{before%%:*}}; before_mode=${{before#*:}}"),
         format!("[ \"$before_mode\" = {previous} ] || {{ echo \"low power mode changed\"; exit 3; }}"),
         format!("pmset {flag} \"$before_key\" {desired}; apply=$?"),
         format!("after=$({read}) || {{ echo \"low power mode verification unverified\"; exit 7; }}; after_key=${{after%%:*}}; after_mode=${{after#*:}}"),
         format!("[ \"$apply\" = 0 ] && [ \"$after_key\" = \"$before_key\" ] && [ \"$after_mode\" = {desired} ] && exit 0"),
-        format!("[ \"$after_key\" = \"$before_key\" ] && [ \"$after_mode\" = {desired} ] && pmset {flag} \"$before_key\" {previous}"),
+        format!(r#"[ "$after_key" = "$before_key" ] && [ "$after_mode" = {previous} ] && exit 6"#),
+        format!(r#"if [ "$after_key" = "$before_key" ] && [ "$after_mode" = {desired} ]; then pmset {flag} "$before_key" {previous}; rolled=$({read}); [ "$rolled" = "$before_key:{previous}" ] && {{ echo "low power mode apply failed; restored"; exit 6; }}; fi"#),
         "echo \"low power mode verification or rollback unverified\"; exit 7".into(),
     ].join("\n")
 }

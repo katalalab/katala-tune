@@ -4,6 +4,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('tune', {
   config: () => ipcRenderer.invoke('config'),
   last: () => ipcRenderer.invoke('last'),
+  powerReport: () => ipcRenderer.invoke('power-report'),
+  powerSettings: (nodeId, patch) => ipcRenderer.invoke('power-settings', nodeId, patch),
   probe: (ids) => ipcRenderer.invoke('probe', ids),
   history: (id) => ipcRenderer.invoke('history', id),
   fleet: () => ipcRenderer.invoke('fleet'),

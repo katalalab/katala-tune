@@ -4,6 +4,7 @@
 //!   tune probe [機体 ...]            調査して JSON を標準出力へ（保存しない。npm run probe と同じ）
 //!   tune logs [--db <dir>] [機体 ...] ログを取り込む（既定は一時ディレクトリの DB。npm run logs と同じ）
 //!   tune last                        DB の前回の分析結果（所見・スコアつき）を JSON で
+//!   tune power                       電力・Clockと計算条件を JSON で（読み取り専用）
 //!   tune status [--recompute]        DB の状態（機能チェック）を JSON で。--recompute で計算し直して保存する
 //!   tune analyze <snapshot.json>     snapshot（probe の data）から所見を作る
 //!   tune inventory [機体 ...]        道具の棚卸しを DB に保存し、結果を JSON で（DB は KATALA_TUNE_DATA_DIR で写しを指す）
@@ -38,7 +39,7 @@ use tune_core::{collect, logs, nodes, rules};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "使い方: tune <paths|probe|logs|last|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
+        "使い方: tune <paths|probe|logs|last|power|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
     );
     ExitCode::from(2)
 }
@@ -123,7 +124,7 @@ async fn live(rest: &[String]) -> Result<(), String> {
                 "state": status[&n.id]["state"],
                 "detail": status[&n.id]["detail"],
                 "info": view["info"],
-                "last": ss.last().map(|s| json!({ "cpu": s.cpu, "cores": s.cores.len(), "mem": s.mem, "disk": s.disk, "net": s.net, "gpu": s.gpu })),
+                "last": ss.last().map(|s| json!({ "cpu": s.cpu, "cores": s.cores.len(), "mem": s.mem, "disk": s.disk, "net": s.net, "gpu": s.gpu, "power":s.power, "power_gpu_w":s.point()["power_gpu_w"] })),
                 "procs": view["procs"].get("count"),
             }),
         );
@@ -208,6 +209,10 @@ async fn main() -> ExitCode {
                 (_, Err(e)) => Err(e.to_string()),
             }
         }
+        "power" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => e.power_report().map(|v| print(&v)),
+            Err(e) => Err(e),
+        },
         "last" | "status" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
             Ok(e) => {
                 if cmd == "last" {
