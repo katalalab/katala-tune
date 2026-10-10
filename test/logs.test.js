@@ -59,6 +59,10 @@ test('Windows リモートログは固定ファイルを使わず Base64 stdin �
   const fullScript = fs.readFileSync(path.join(__dirname, '..', 'probes', 'win_logs.ps1'));
   const maxCursors = { win_system: '9007199254740991', win_application: '9007199254740991', neonmonitor: '9007199254740991' };
   assert.ok(Buffer.byteLength(windowsRemoteTransport(maxCursors, fullScript).command) < 8191);
+  // Windows の checkout（autocrlf で CRLF）でも LF と同じコマンドになる（改行は LF にそろえて送る）
+  const lf = Buffer.from(fullScript.toString('latin1').replace(/\r\n/g, '\n'), 'latin1');
+  const crlf = Buffer.from(lf.toString('latin1').replace(/\n/g, '\r\n'), 'latin1');
+  assert.equal(windowsRemoteTransport(maxCursors, crlf).command, windowsRemoteTransport(maxCursors, lf).command);
   assert.throws(() => windowsRemoteTransport({}, Buffer.alloc(6000)), /8191/);
 });
 
@@ -153,6 +157,17 @@ test('同じエラーの洪水（24時間で200件以上）と .NET の未処理
   assert.ok(f.find((x) => x.id.startsWith('log-flood-') && /250 件/.test(x.title)), JSON.stringify(f.map((x) => x.title)));
   assert.ok(f.find((x) => x.id === 'log-crashes'));
   assert.ok(f.find((x) => x.id === 'log-dropped'));
+});
+
+test('正常な停止の直前のサービス停止（probe が info にしたもの）はサービスの異常に数えない', () => {
+  const db = openDb(tmp());
+  const now = Date.now();
+  const mk = (level, i) => ({ uid: `scm-${level}-${i}`, ts: now - i * 1000, level, provider: 'Service Control Manager', event_id: '7031', message: `The OpenSSH SSH Server service terminated unexpectedly ${i}` });
+  db.insertLogs('pc', 'win_system', normalize('win_system', [...Array(5)].map((_, i) => mk('info', i))));
+  assert.equal(logFindings(db, 'pc', now).find((x) => x.id === 'log-service'), undefined);
+  // 停止と無関係な時刻の分（error のまま）は数える
+  db.insertLogs('pc', 'win_system', normalize('win_system', [...Array(3)].map((_, i) => mk('error', 10 + i))));
+  assert.match(logFindings(db, 'pc', now).find((x) => x.id === 'log-service').title, / 3 件$/);
 });
 
 test('volmgr の 161・162（BSOD 後のクラッシュダンプ作成）はディスクのエラーに数えない', () => {
