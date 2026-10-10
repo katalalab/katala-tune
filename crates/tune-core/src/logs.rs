@@ -191,7 +191,9 @@ pub(crate) fn base64(bytes: &[u8]) -> String {
 /// コマンド行に載るので 8191 バイトを超えたら送らない（lib/logs.js の windowsScriptTransport）
 fn windows_script_transport(script: &[u8], params: &str) -> Result<(String, String), String> {
     let script = script.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(script);
-    let payload = base64(script);
+    // 改行は LF にそろえる。Windows の checkout（autocrlf）では CRLF になり、同じスクリプトが行数分だけ枠を余計に使う
+    let lf: Vec<u8> = script.iter().enumerate().filter(|&(i, &b)| !(b == b'\r' && script.get(i + 1) == Some(&b'\n'))).map(|(_, &b)| b).collect();
+    let payload = base64(&lf);
     let bootstrap = format!(
         "[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false);$s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd()));& ([ScriptBlock]::Create($s)) {params}"
     );
@@ -524,8 +526,9 @@ pub fn log_findings(db: &Store, node_id: &str, now: i64) -> rusqlite::Result<Vec
             json!({ "node_id": node_id, "source": "neonmonitor" }),
         );
     }
-    // サービスの起動失敗・異常終了（7000/7009/7023/7031/7034）
-    let svc = sum(&|r| prov(r, "Service Control Manager") && ["7000", "7009", "7023", "7031", "7034"].iter().any(|e| ev(r, e)));
+    // サービスの起動失敗・異常終了（7000/7009/7023/7031/7034）。正常な停止（6006）の直前60秒の分は probe が info にする
+    // （再起動のたびに sshd が 7031 を出す。PowerShell/Win32-OpenSSH#2171）ので数えない
+    let svc = sum(&|r| prov(r, "Service Control Manager") && ["7000", "7009", "7023", "7031", "7034"].iter().any(|e| ev(r, e)) && r.level != "info");
     if svc >= 3 {
         push(
             "log-service",
@@ -718,6 +721,10 @@ mod tests {
             max_cursors.insert(source.into(), Value::from("9007199254740991"));
         }
         assert!(windows_remote_transport(&max_cursors, WIN_LOGS).unwrap().0.len() < 8191);
+        // Windows の checkout（autocrlf で CRLF）でも LF と同じコマンドになる（改行は LF にそろえて送る）
+        let lf = String::from_utf8_lossy(WIN_LOGS).replace("\r\n", "\n").into_bytes();
+        let crlf = String::from_utf8_lossy(&lf).replace('\n', "\r\n").into_bytes();
+        assert_eq!(windows_remote_transport(&max_cursors, &crlf).unwrap().0, windows_remote_transport(&max_cursors, &lf).unwrap().0);
         assert!(windows_remote_transport(&Map::new(), &[0; 6000]).is_err());
         // ログオンの記録は別のスクリプトで、同じ運び方・同じ上限
         max_cursors.insert("win_security".into(), Value::from("9007199254740991:1800000000000"));

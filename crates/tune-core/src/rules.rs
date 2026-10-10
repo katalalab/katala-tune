@@ -14,6 +14,16 @@ pub const POWER_SAVER_GUID: &str = "a1841308-3541-4fab-bc81-f71556f20b4a";
 /// 登録し直すコマンドに埋めてよいラベル（JS の /^[\w.-]+$/）
 static SAFE_LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.-]+$").expect("SAFE_LABEL"));
 pub const SHARED_BLOCKED: &str = "共用機のため、この画面からは実行しない（持ち主と相談）";
+/// 起動からこれより短いプロセスは暴走に数えない（数十秒で終わるバッチなど）
+const MIN_RUNAWAY_SEC: f64 = 120.0;
+static ETIME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(?:(?:([0-9]+)-)?([0-9]+):)?([0-9]+):([0-9]+)$").expect("ETIME"));
+
+/// ps の etime（[[dd-]hh:]mm:ss）を秒に。読めなければ None（lib/rules.js の etimeSec。JS と同じく f64 で数える）
+fn etime_sec(v: Option<&Value>) -> Option<f64> {
+    let c = ETIME.captures(v?.as_str()?)?;
+    let n = |i: usize| c.get(i).map_or(Some(0.0), |m| m.as_str().parse::<f64>().ok());
+    Some(((n(1)? * 24.0 + n(2)?) * 60.0 + n(3)?) * 60.0 + n(4)?)
+}
 
 /// JS の `.`（行末記号以外の1文字）
 const DOT: &str = r"[^\n\r\x{2028}\x{2029}]";
@@ -262,9 +272,14 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
 
     // 暴走の疑い（1コアを使い切っているプロセス）
     // Windows は瞬間値に加えて、起動からの平均が 1コアの 30% 以上のものだけ（一時的なスパイクを除く）
+    // 起動から2分未満のもの（数十秒で終わるバッチなど）は暴走に数えない。経過が分からないものは数える
     let hogs = arr(get(procs, "top_cpu"))
         .iter()
-        .filter(|p| per_core(p) >= 80.0 && (!is_win || num(js::nullish(p.get("avg_core"), Some(&Value::from(0)))) >= 30.0))
+        .filter(|p| {
+            per_core(p) >= 80.0
+                && (!is_win || num(js::nullish(p.get("avg_core"), Some(&Value::from(0)))) >= 30.0)
+                && etime_sec(p.get("etime")).is_none_or(|s| s >= MIN_RUNAWAY_SEC)
+        })
         .take(4);
     for p in hogs {
         let name = p.get("name");
