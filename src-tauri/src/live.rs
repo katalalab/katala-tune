@@ -46,6 +46,12 @@ pub async fn live_stop(l: State<'_, Arc<Live>>, ids: Option<Vec<String>>) -> Res
     Ok(l.stop(ids.as_deref(), Stop::User))
 }
 
+#[tauri::command]
+pub async fn power_session(e: State<'_, Arc<Engine>>, l: State<'_, Arc<Live>>, node_id: String, save: bool) -> Result<Value, String> {
+    let points: Vec<Value> = l.samples(&node_id).iter().map(tune_core::live::Sample::point).collect();
+    e.power_observation(&node_id, &points, save)
+}
+
 /// ウィンドウを閉じた: 見ている画面が無いので全部止める
 pub fn stop_all(app: &AppHandle) {
     if let Some(l) = app.try_state::<Arc<Live>>() {

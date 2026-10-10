@@ -2,7 +2,7 @@
 """katala-tune のライブ表示用サンプラー（macOS）。読み取り専用。
 
 標準入力でこのスクリプトを受け取り（`python3 - interval=1 procs=5 max=900`）、一定の間隔で 1 行 1 JSON を
-標準出力へ出し続ける。python3 標準ライブラリだけで動き、OS の統計を ctypes で直接読む（子プロセスを作らない）。
+標準出力へ出し続ける。python3 標準ライブラリだけで動き、OS の統計を ctypes で直接読み、任意の macmon がある場合だけ1子プロセスを使う。
 設定・プロセス・ファイルを変更しない。集めるのは数値と、上位プロセスの PID・実行ファイル名・アプリ名だけ
 （引数・環境変数・パス・ファイルの中身は読まない）。
 
@@ -30,9 +30,90 @@ import json
 import os
 import sys
 import time
+import math
+import shutil
+import subprocess
+import selectors
 
 V = 1
 TOP = 8
+MONITOR = None
+
+
+def sensor_number(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0 else None
+
+
+def macmon_metrics(data):
+    if not isinstance(data, dict):
+        return {}
+    num = lambda key: sensor_number(data.get(key))
+    platform = num('sys_power')
+    ratio = num('gpu_scaled_ratio')
+    return {
+        'power': {'package_w': num('cpu_power'), 'package_source': 'macmon IOReport CPU',
+                  'soc_w': num('all_power'), 'soc_source': 'macmon CPU+GPU+ANE',
+                  'platform_w': platform if platform and platform > 0 else None, 'platform_source': 'macmon SMC estimate',
+                  'available': num('all_power') is not None},
+        'gpu': [{'name': 'Apple GPU', 'power_w': num('gpu_power'), 'util': min(100, ratio * 100) if ratio is not None else None,
+                 'clocks_graphics_mhz': num('gpu_freq_mhz'), 'temp_c': sensor_number((data.get('temp') if isinstance(data.get('temp'), dict) else {}).get('gpu_temp_avg')),
+                 'source': 'macmon IOReport'}],
+    }
+
+
+class Macmon:
+    """任意の既存センサーを1子プロセスで読む。最大3秒のTTL、終了時に子も停止する。"""
+    def __init__(self):
+        path = shutil.which('macmon') or os.path.expanduser('~/.katala-tune/bin/macmon')
+        if not os.path.isfile(path):
+            raise FileNotFoundError('macmon unavailable')
+        self.child = subprocess.Popen([path, 'pipe', '--interval', str(round(INTERVAL * 1000))], stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, close_fds=True)
+        self.selector = selectors.DefaultSelector()
+        try:
+            self.selector.register(self.child.stdout, selectors.EVENT_READ)
+        except Exception:
+            self.selector.close()
+            self.child.terminate()
+            self.child.wait(timeout=1)
+            self.child.stdout.close()
+            raise
+        self.buf = b''
+        self.last = None
+        self.last_at = 0
+
+    def sample(self, now):
+        if self.child.poll() is not None:
+            return {}
+        for key, _ in self.selector.select(0):
+            chunk = os.read(key.fileobj.fileno(), 65536)
+            if not chunk:
+                return {}
+            self.buf += chunk
+            if len(self.buf) > 262144:
+                self.buf = b''
+                self.last = None
+                return {}
+            while b'\n' in self.buf:
+                line, self.buf = self.buf.split(b'\n', 1)
+                try:
+                    parsed = macmon_metrics(json.loads(line))
+                    if parsed:
+                        self.last, self.last_at = parsed, now
+                except (ValueError, TypeError, AttributeError):
+                    self.last = None
+        return self.last if self.last and now - self.last_at <= max(3, INTERVAL * 3) else {}
+
+    def close(self):
+        self.selector.close()
+        if self.child.poll() is None:
+            self.child.terminate()
+            try:
+                self.child.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                self.child.kill()
+                self.child.wait(timeout=0.5)
+        self.child.stdout.close()
 
 
 def arg(name, default, conv=float):
@@ -373,6 +454,11 @@ def emit(obj):
 
 
 def finish(code=0):
+    if MONITOR:
+        try:
+            MONITOR.close()
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
     # 読み手が居ないときに終わり際の flush で例外を出さないよう、標準出力を捨て先に向けてから終わる
     try:
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
@@ -390,19 +476,21 @@ def init(name, f):
 
 
 def main():
+    global MONITOR
     ncpu = sysctl("hw.ncpu", C.c_int)
     mem_total = sysctl("hw.memsize", C.c_uint64)
     disk = init("disk", Disk)
     procs = init("procs", Procs)
+    MONITOR = init("power", Macmon)
     t0 = time.monotonic()
     cpu_prev = init("cpu", cpu_ticks)
     net_prev = init("net", net_bytes)
     disk_prev = init("disk", lambda: disk.bytes(t0)) if disk else None
     if procs:
         init("procs", lambda: procs.sample(t0))
-    has = {"cpu": cpu_prev is not None, "mem": True, "disk": disk_prev is not None, "net": net_prev is not None, "procs": procs is not None, "gpu": False}
+    has = {"cpu": cpu_prev is not None, "mem": True, "disk": disk_prev is not None, "net": net_prev is not None, "procs": procs is not None, "gpu": MONITOR is not None}
     hello = {"type": "hello", "v": V, "os": "macos", "cores": ncpu.value if ncpu else None, "interval": INTERVAL, "procs_every": PROCS_EVERY,
-             "mem_total_gb": round(mem_total.value / 2**30, 1) if mem_total else None, "has": has, "errors": ERRORS}
+             "mem_total_gb": round(mem_total.value / 2**30, 1) if mem_total else None, "session_epoch_ms": time.time_ns() // 1_000_000, "has": has, "errors": ERRORS}
     if WATCH:
         import threading
 
@@ -433,6 +521,12 @@ def main():
         dt, last = now - last, now
         seq += 1
         s = {"type": "s", "t": int(time.time() * 1000), "seq": seq}
+        if MONITOR:
+            s.update(MONITOR.sample(now))
+        # 明示的な欠測。以前のGPU値を画面に残さない。
+        if "gpu" not in s:
+            s["gpu"] = []
+            s["power"] = {"available": False}
         cur = cpu_ticks() if has["cpu"] else None
         s["cpu"], s["cores"] = cpu_pct(cpu_prev, cur)
         cpu_prev = cur or cpu_prev

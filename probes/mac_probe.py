@@ -7,7 +7,7 @@ python3 標準ライブラリだけで動く。設定・プロセス・ファイ
   --skip-benchmark  ベンチマークを省く（台帳の "benchmark": false）
   nonet             ネットワークとセキュリティ（netsec）を集めない（台帳の "network": false）
 """
-import json, os, plistlib, re, shutil, socket, statistics, subprocess, sys, time
+import json, math, os, plistlib, re, shutil, socket, statistics, subprocess, sys, time
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
 
@@ -32,7 +32,8 @@ def run(cmd, timeout=8):
 
 
 def sysctl(name):
-    return run(["sysctl", "-n", name]).strip()
+    # SSH の最小 PATH には /usr/sbin がない場合がある。
+    return run(["/usr/sbin/sysctl", "-n", name]).strip()
 
 
 def num(s, default=None):
@@ -176,15 +177,45 @@ def containers():
 def power():
     therm = run(["pmset", "-g", "therm"])
     limit = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", therm)
-    warn = re.search(r"thermal warning level", therm, re.I) and not re.search(r"No thermal warning level", therm, re.I)
+    warn = re.search(r"thermal warning level", therm, re.I) and not re.search(r"No thermal warning level", therm, re.I) if therm else None
     g = run(["pmset", "-g"])
-    lpm = re.search(r"lowpowermode\s+(\d)", g)
+    lpm = re.search(r"(?:lowpowermode|powermode)\s+([01])\b", g)
     batt = run(["pmset", "-g", "batt"])
     return {
+        "package_w": None,
+        "package_source": None,
+        "soc_w": None,
+        "soc_source": None,
         "cpu_speed_limit": int(limit.group(1)) if limit else None,
-        "thermal_warning": bool(warn),
+        "thermal_warning": bool(warn) if warn is not None else None,
         "low_power_mode": (lpm.group(1) == "1") if lpm else None,
-        "on_battery": "Battery Power" in batt,
+        "on_battery": "Battery Power" in batt if batt else None,
+        "availability": {"thermal": bool(therm), "power_mode": bool(g), "battery": bool(batt)},
+        "source": {"thermal": "pmset -g therm", "power_mode": "pmset -g", "battery": "pmset -g batt"},
+    }
+
+
+def macmon_static():
+    path = shutil.which("macmon") or os.path.join(HOME, ".katala-tune", "bin", "macmon")
+    if not path or not os.path.isfile(path):
+        return {"available": False, "source": None}
+    out = run([path, "pipe", "--samples", "1", "--interval", "1000", "--soc-info"], timeout=5)
+    try:
+        rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+        data = rows[-1]
+    except (ValueError, IndexError, TypeError):
+        return {"available": False, "source": "macmon IOReport"}
+    def positive(key):
+        v = num(data.get(key))
+        return round(v, 2) if v is not None and math.isfinite(v) and v >= 0 else None
+    cpu, gpu, ane = positive("cpu_power"), positive("gpu_power"), positive("ane_power")
+    all_power = positive("all_power")
+    return {
+        "available": True, "package_source": "macmon IOReport", "package_w": cpu,
+        "soc_w": all_power, "soc_source": "macmon all_power (CPU+GPU+ANE)",
+        "platform_w": positive("sys_power") or None, "platform_source": "macmon sys_power (SMC estimate)",
+        "ram_w": positive("ram_power"), "cpu_clusters_mhz": {"e": positive("ecpu_freq_mhz"), "p": positive("pcpu_freq_mhz")},
+        "gpu": {"name": "Apple GPU", "power_w": gpu, "util": (min(100,positive("gpu_scaled_ratio") * 100) if positive("gpu_scaled_ratio") is not None else None), "clocks_graphics_mhz": positive("gpu_freq_mhz"), "source": "macmon IOReport"},
     }
 
 
@@ -509,6 +540,7 @@ def main():
         f_ps = ex.submit(processes)
         f_ct = ex.submit(containers)
         f_pw = ex.submit(power)
+        f_macmon = ex.submit(macmon_static)
         f_ld = ex.submit(launchd_failing)
         f_jobs = ex.submit(launchd_jobs)
         f_tm = ex.submit(lambda: "Running = 1" in run(["tmutil", "status"]))
@@ -543,6 +575,11 @@ def main():
         result["processes"] = f_ps.result()
         result["containers"] = f_ct.result()
         result["power"] = f_pw.result()
+        macmon = f_macmon.result()
+        result["power"].update({k: v for k, v in macmon.items() if k not in ("gpu", "cpu_clusters_mhz")})
+        result["cpu_clock"] = {"clusters_mhz": macmon.get("cpu_clusters_mhz"), "source": "macmon frequency residency sample" if macmon.get("available") else None}
+        if macmon.get("gpu"):
+            result["gpus"] = [macmon["gpu"]]
         result["launchd_failing"] = f_ld.result()
         result["jobs"] = f_jobs.result()
         result["time_machine_running"] = f_tm.result()

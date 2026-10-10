@@ -105,6 +105,8 @@ async fn probe_separates_success_timeout_unreachable_and_auth_per_host() {
 fn failure_classification_table_matches_electron() {
     let table = [
         (res(None, "", "\ntimeout 90000ms"), "timeout"),
+        (res(Some(1), "", "\ntimeout 35000ms"), "timeout"),
+        (res(Some(255), "", "Connection closed by remote host\ntimeout 35000ms"), "timeout"),
         (res(Some(255), "", "ssh: connect to host x port 22: Connection refused"), "unreachable"),
         (res(Some(255), "", "ssh: connect to host x port 22: No route to host"), "unreachable"),
         (res(Some(255), "", "kex_exchange_identification: Connection closed by remote host"), "unreachable"),
@@ -339,6 +341,7 @@ async fn reversible_action_on_fake_target_records_before_after_and_rollback() {
     assert_eq!(s.host.state("Backup"), "Ready"); // 実行前
     let r = s.engine.confirm_and_run_with(s.host.as_ref(), "w", &disable(), "w: タスクを止める", None, approve(true, || {})).await.unwrap();
     assert_eq!(r["ok"], json!(true));
+    assert_eq!(r["refresh_required"], json!(true));
     assert_eq!(s.host.state("Backup"), "Disabled"); // 実行後
     let log = actions_of(&s.engine);
     let row = &log[0];
@@ -370,6 +373,7 @@ async fn failed_action_is_recorded_as_failed_without_undo() {
     s.host.fail_next.store(true, Ordering::SeqCst);
     let r = s.engine.confirm_and_run_with(s.host.as_ref(), "w", &disable(), "w: タスクを止める", None, approve(true, || {})).await.unwrap();
     assert_eq!(r["ok"], json!(false));
+    assert_eq!(r["refresh_required"], json!(true));
     let row = &actions_of(&s.engine)[0];
     assert_eq!((row["state"].as_str(), row["ok"].as_bool(), &row["undo"]), (Some("failed"), Some(false), &Value::Null));
     assert!(row["output"].as_str().unwrap().contains("失敗（exit 1）"));

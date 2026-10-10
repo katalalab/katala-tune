@@ -1,7 +1,7 @@
 //! main.js の画面以外の部分（分析・ログ取り込み・状態の計算・自動スキャンの判断・変更操作の流れ）。
 //! 画面・常駐・通知・ダイアログは呼び出し側（src-tauri）が `Host` として渡す。tune-cli も同じものを使う。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -61,12 +61,24 @@ pub struct Engine {
     syncing: AtomicBool,
     last_probe_error: Mutex<HashMap<String, String>>,
     fleet: Mutex<(Option<Value>, Option<i64>)>,
+    action_targets: Mutex<HashSet<String>>,
     /// 道具の棚卸し・AI の取り込みの状態（engine_tools.rs）
     pub(crate) tools: crate::engine_tools::ToolsState,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+struct ActionTargetLock<'a> {
+    targets: &'a Mutex<HashSet<String>>,
+    node_id: String,
+}
+
+impl Drop for ActionTargetLock<'_> {
+    fn drop(&mut self) {
+        lock(self.targets).remove(&self.node_id);
+    }
 }
 
 /// main.js の summarize。履歴の表に入れる要約
@@ -100,6 +112,7 @@ impl Engine {
             syncing: AtomicBool::new(false),
             last_probe_error: Mutex::new(HashMap::new()),
             fleet: Mutex::new((None, None)),
+            action_targets: Mutex::new(HashSet::new()),
             tools: Default::default(),
         });
         e.reload_config();
@@ -353,16 +366,22 @@ impl Engine {
         let all = ids.as_ref().is_none_or(Vec::is_empty);
         let targets: Vec<Node> = cfg.nodes.iter().filter(|n| all || ids.as_ref().is_some_and(|i| i.contains(&n.id))).cloned().collect();
         let me = self.clone();
-        let results = collect::probe_all(&targets, move |r| me.on_probe_result(r)).await;
+        let completed = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let completed2 = completed.clone();
+        let results = collect::probe_all(&targets, move |r| {
+            let full = me.on_probe_result(r);
+            lock(&completed2).push(json!({ "node_id": full.get("node_id"), "ok": full.get("ok"), "at": full.get("at"), "error": full.get("error") }));
+        })
+        .await;
         if all {
             let _ = self.with_db(|d| d.set_meta("lastProbeAt", &Value::from(now_ms())));
         }
         self.probing.store(false, Ordering::SeqCst);
         self.compute_checks(true, true);
-        json!({ "done": results.len(), "auto": auto })
+        json!({ "done": results.len(), "auto": auto, "results": lock(&completed).clone() })
     }
 
-    fn on_probe_result(&self, r: &Value) {
+    fn on_probe_result(&self, r: &Value) -> Value {
         let cfg = self.config();
         let node_id = js::string(r.get("node_id"));
         let full = {
@@ -405,6 +424,7 @@ impl Engine {
             full
         };
         self.host.probe_result(&full);
+        full
     }
 
     /// ログを取り込む。実行中なら `{ busy: true }`
@@ -507,73 +527,86 @@ impl Engine {
         undo_of: Option<&str>,
         confirm: Confirm,
     ) -> Result<Value, String> {
-        let refused = |m: String| Ok(json!({ "ok": false, "refused": m }));
-        let fresh = match nodes::load_config(&self.config_path) {
-            Ok(c) => c,
-            Err(e) => return refused(format!("台帳を読めないので実行しない: {e}")),
-        };
-        let Some(node) = fresh.node(node_id) else { return refused("台帳に無い機体".into()) };
-        let p = match actions::plan(node, action, Some(&fresh.protect)) {
-            Ok(p) => p,
-            Err(e) => return refused(e),
-        };
-        // 承認した接続先（どの機体に、どのシェルで送るか）。確認の後に台帳を読み直したとき、これが変わっていたら実行しない
-        let route = (node.alias.clone(), node.os.clone(), node.local);
-        if !confirm(title.to_string(), format!("{}\n\n実行するコマンド:\n{}", p.describe, p.script)).await {
-            return Ok(json!({ "ok": false, "cancelled": true }));
-        }
-        // 承認したあとで止めるときは、理由を実行記録に残す（実行していない）。記録できなくても止めたことは変わらない
-        let abort = |m: String| {
-            let entry = json!({
-                "id": format!("{}-{}", now_ms(), rand36(5)), "at": now_ms(), "node_id": node_id,
-                "type": action.get("type"), "params": action.get("params"), "label": title, "ok": false,
-                "output": format!("中止（実行していない）: {m}"), "undo": null, "undo_of": undo_of,
-            });
-            let _ = self.with_db(|d| d.add_action(&entry));
-            refused(m)
-        };
-        let fresh = match nodes::load_config(&self.config_path) {
-            Ok(c) => c,
-            Err(e) => return abort(format!("台帳を読めないので実行しない: {e}")),
-        };
-        let Some(node) = fresh.node(node_id) else { return abort("台帳に無い機体".into()) };
-        if (node.alias.clone(), node.os.clone(), node.local) != route {
-            return abort("確認のあいだに台帳の接続先（alias・OS・この機体かどうか）が変わったので実行しない。もう一度確認してください".into());
-        }
-        // 共用機・保護リスト・引数は、読み直した台帳でもう一度確かめる（実行するコマンドは接続先と操作で決まるので、承認したものと同じ）
-        if let Err(e) = actions::plan(node, action, Some(&fresh.protect)) {
-            return abort(e);
-        }
-        // 未完了の記録を先に書く。書けなければ実行しない
-        let id = format!("{}-{}", now_ms(), rand36(5));
-        let mut entry = json!({
-            "id": id, "at": now_ms(), "node_id": node.id,
-            "type": action.get("type"), "params": action.get("params"), "label": title, "ok": null,
-            "output": PENDING_OUTPUT, "undo": null, "undo_of": undo_of,
-        });
-        if let Err(e) = self.with_db(|d| d.add_action(&entry)) {
-            return refused(format!("実行記録を書けないので実行しない: {e}"));
-        }
-        let r = match actions::execute_with(runner, node, action, Some(&fresh.protect)).await {
-            Ok(r) => r,
-            Err(e) => {
-                let output = format!("実行できなかった: {e}");
-                let _ = self.with_db(|d| d.finish_action(&id, false, &output, None));
-                return refused(output);
+        let _target_lock = {
+            let mut targets = lock(&self.action_targets);
+            if !targets.insert(node_id.to_string()) {
+                return Ok(json!({ "ok": false, "refused": "この機体では別の変更操作を確認または実行中" }));
             }
+            ActionTargetLock { targets: &self.action_targets, node_id: node_id.to_string() }
         };
-        let output = js::trim(&format!("{}\n{}", r.outcome, r.output)).to_string();
-        // 書き込みの失敗は成功扱いにしない（画面へエラーとして返す）。記録は未完了のまま残る
-        // 未更新（false）も書けなかったのと同じ。記録が未完了でなくなっていて、結果を書き込めていない
-        match self.with_db(|d| d.finish_action(&id, r.ok, &output, r.undo.as_ref())) {
-            Ok(true) => {}
-            Ok(false) => return Err(format!("実行記録を書けなかった（操作は実行済み: {}）: 記録がすでに未完了ではなく、結果を書き込めなかった", r.outcome)),
-            Err(e) => return Err(format!("実行記録を書けなかった（操作は実行済み: {}）: {e}", r.outcome)),
+        // MutexGuard を await をまたいで保持せず、確認から実行記録までを機体単位で直列化する。
+        async {
+            let refused = |m: String| Ok(json!({ "ok": false, "refused": m }));
+            let fresh = match nodes::load_config(&self.config_path) {
+                Ok(c) => c,
+                Err(e) => return refused(format!("台帳を読めないので実行しない: {e}")),
+            };
+            let Some(node) = fresh.node(node_id) else { return refused("台帳に無い機体".into()) };
+            let p = match actions::plan(node, action, Some(&fresh.protect)) {
+                Ok(p) => p,
+                Err(e) => return refused(e),
+            };
+            // 承認した接続先（どの機体に、どのシェルで送るか）。確認の後に台帳を読み直したとき、これが変わっていたら実行しない
+            let route = (node.alias.clone(), node.os.clone(), node.local);
+            if !confirm(title.to_string(), format!("{}\n\n実行するコマンド:\n{}", p.describe, p.script)).await {
+                return Ok(json!({ "ok": false, "cancelled": true }));
+            }
+            // 承認したあとで止めるときは、理由を実行記録に残す（実行していない）。記録できなくても止めたことは変わらない
+            let abort = |m: String| {
+                let entry = json!({
+                    "id": format!("{}-{}", now_ms(), rand36(5)), "at": now_ms(), "node_id": node_id,
+                    "type": action.get("type"), "params": action.get("params"), "label": title, "ok": false,
+                    "output": format!("中止（実行していない）: {m}"), "undo": null, "undo_of": undo_of,
+                });
+                let _ = self.with_db(|d| d.add_action(&entry));
+                refused(m)
+            };
+            let fresh = match nodes::load_config(&self.config_path) {
+                Ok(c) => c,
+                Err(e) => return abort(format!("台帳を読めないので実行しない: {e}")),
+            };
+            let Some(node) = fresh.node(node_id) else { return abort("台帳に無い機体".into()) };
+            if (node.alias.clone(), node.os.clone(), node.local) != route {
+                return abort("確認のあいだに台帳の接続先（alias・OS・この機体かどうか）が変わったので実行しない。もう一度確認してください".into());
+            }
+            // 共用機・保護リスト・引数は、読み直した台帳でもう一度確かめる（実行するコマンドは接続先と操作で決まるので、承認したものと同じ）
+            if let Err(e) = actions::plan(node, action, Some(&fresh.protect)) {
+                return abort(e);
+            }
+            // 未完了の記録を先に書く。書けなければ実行しない
+            let id = format!("{}-{}", now_ms(), rand36(5));
+            let mut entry = json!({
+                "id": id, "at": now_ms(), "node_id": node.id,
+                "type": action.get("type"), "params": action.get("params"), "label": title, "ok": null,
+                "output": PENDING_OUTPUT, "undo": null, "undo_of": undo_of,
+            });
+            if let Err(e) = self.with_db(|d| d.add_action(&entry)) {
+                return refused(format!("実行記録を書けないので実行しない: {e}"));
+            }
+            let r = match actions::execute_with(runner, node, action, Some(&fresh.protect)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let output = format!("実行できなかった: {e}");
+                    let _ = self.with_db(|d| d.finish_action(&id, false, &output, None));
+                    return Ok(json!({ "ok": false, "refused": output, "refresh_required": true }));
+                }
+            };
+            let output = js::trim(&format!("{}\n{}", r.outcome, r.output)).to_string();
+            // 書き込みの失敗は成功扱いにしない（画面へエラーとして返す）。記録は未完了のまま残る
+            // 未更新（false）も書けなかったのと同じ。記録が未完了でなくなっていて、結果を書き込めていない
+            match self.with_db(|d| d.finish_action(&id, r.ok, &output, r.undo.as_ref())) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!("実行記録を書けなかった（操作は実行済み: {}）: 記録がすでに未完了ではなく、結果を書き込めなかった", r.outcome));
+                }
+                Err(e) => return Err(format!("実行記録を書けなかった（操作は実行済み: {}）: {e}", r.outcome)),
+            }
+            entry["ok"] = Value::Bool(r.ok);
+            entry["output"] = Value::String(output);
+            entry["undo"] = r.undo.clone().unwrap_or(Value::Null);
+            Ok(json!({ "ok": r.ok, "code": r.code, "outcome": r.outcome, "output": r.output, "undo": r.undo, "entry": entry, "refresh_required": true }))
         }
-        entry["ok"] = Value::Bool(r.ok);
-        entry["output"] = Value::String(output);
-        entry["undo"] = r.undo.clone().unwrap_or(Value::Null);
-        Ok(json!({ "ok": r.ok, "code": r.code, "outcome": r.outcome, "output": r.output, "undo": r.undo, "entry": entry }))
+        .await
     }
 
     /// 実行記録から元に戻す
@@ -635,6 +668,33 @@ fn rand36(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn probe_completion_reports_saved_results_and_never_promotes_busy_or_failed_saves() {
+        let tmp = std::env::temp_dir().join(format!("katala-tune-probe-result-test-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config = tmp.join("nodes.json");
+        std::fs::write(&config, r#"{"nodes":[{"id":"test","alias":"unused","os":"windows","network":false}]}"#).unwrap();
+        let engine = Engine::open(config, tmp.join("data"), Arc::new(NoHost)).unwrap();
+        let empty = engine.run_probe(Some(vec!["unknown".into()]), false).await;
+        assert_eq!(empty["done"], json!(0));
+        assert_eq!(empty["results"], json!([]));
+        engine.probing.store(true, Ordering::SeqCst);
+        assert_eq!(engine.run_probe(None, false).await, json!({"busy":true}));
+        engine.probing.store(false, Ordering::SeqCst);
+        let input = json!({"node_id":"test","ok":true,"at":123,"data":{"probe":"windows"}});
+        let saved = engine.on_probe_result(&input);
+        assert_eq!(saved["ok"], json!(true));
+        assert_eq!(engine.with_db(|d| d.last_snapshots("test", 1)).unwrap()[0].at, 123);
+        let db = rusqlite::Connection::open(tmp.join("data").join(crate::db::DB_FILE)).unwrap();
+        db.execute("DROP TABLE tune_snapshots", []).unwrap();
+        let failed = engine.on_probe_result(&input);
+        assert_eq!(failed["ok"], json!(false));
+        assert!(failed["error"].as_str().unwrap().contains("保存できなかった"));
+        drop(db);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
 
     #[test]
     fn last_does_not_return_legacy_peer_addresses_after_opt_out() {

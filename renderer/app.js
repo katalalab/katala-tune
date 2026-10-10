@@ -296,6 +296,7 @@ async function renderNode(id) {
   Live.mount('node', [n.id], state.nodes);
   $$('[data-tab]').forEach((b) => { b.onclick = () => { state.tab = b.dataset.tab; renderNode(id); }; });
   const one = $('#btnOne');
+  $$('[data-power-view]').forEach((b) => { b.onclick = () => go('power'); });
   if (one) one.onclick = () => probe([n.id]);
   bindJobActions();
   $$('.f').forEach((el) => {
@@ -368,6 +369,8 @@ function machineHtml(d, r) {
   if (d.load) rows.push(['load', d.load.join(' / ')]);
   if (d.power?.plan_name) rows.push(['電源プラン', d.power.plan_name]);
   if (d.cpu_perf_pct != null) rows.push(['CPU クロック', `定格の ${d.cpu_perf_pct}%`]);
+  if (d.cpu_clock) rows.push(['CPU Clock', `${d.cpu_clock.effective_mhz ?? '未取得'} MHz（${d.cpu_clock.source || '取得元不明'}） · 基準 ${d.cpu_clock.nominal_mhz ?? '未取得'} MHz`]);
+  if (d.power) rows.push(['CPU package 電力', `${d.power.package_w ?? '未取得'} W · ${d.power.package_source || d.power.package_reason || 'センサー未取得'}`]);
   if (d.wsl) rows.push(['WSL 上限', d.wsl.config ? `memory=${d.wsl.memory ?? '未設定'} processors=${d.wsl.processors ?? '未設定'}` : '.wslconfig なし']);
   if (d.stability_7d) rows.push(['7日間の停止', `BugCheck ${d.stability_7d.bugcheck_1001} · Kernel-Power ${d.stability_7d.kernel_power_41} · 6008 ${d.stability_7d.unexpected_6008}`]);
   if (d.defender) rows.push(['Defender', `リアルタイム ${d.defender.realtime ? '有効' : '無効'} · 除外 ${d.defender.exclusions ?? '不明'}`]);
@@ -384,10 +387,10 @@ function machineHtml(d, r) {
       ${Charts.meter(g.util, { label: '使用率', text: `${g.util}%` })}
       ${Charts.meter(g.mem_total_mb ? (g.mem_used_mb / g.mem_total_mb) * 100 : null, { label: 'メモリ', warn: 90, text: `${g.mem_used_mb} / ${g.mem_total_mb} MB` })}
       ${Charts.meter(g.temp_c, { label: '温度', warn: 80, crit: 85, text: `${g.temp_c}°C` })}
-      ${Charts.meter(g.power_limit_w ? (g.power_w / g.power_limit_w) * 100 : null, { label: '電力', text: `${g.power_w} / ${g.power_limit_w} W` })}</div></div>`).join('');
+      ${Charts.meter(g.power_w != null && g.power_limit_w > 0 ? (g.power_w / g.power_limit_w) * 100 : null, { label: '電力', text: `${g.power_w ?? '未取得'} / ${g.power_limit_w ?? '未取得'} W` })}</div><p class="note-line">Clock (MHz): Graphics ${esc(g.clocks_graphics_mhz ?? '未取得')} / SM ${esc(g.clocks_sm_mhz ?? '未取得')} / Memory ${esc(g.clocks_memory_mhz ?? '未取得')} · ${esc(g.pstate || 'P-state未取得')} · ${esc(g.source || '取得元不明')}</p></div>`).join('');
   return `${UI.props(rows.map(([k, v]) => [k, `<span class="pre">${esc(v)}</span>`]))}
     ${disks ? `${UI.section('ディスク', '使用率。macOS は実効の空き（自動で空く分を含む）')}<div class="meter-list wide">${disks}</div>` : ''}
-    ${gpus ? `${UI.section('GPU', '分析した瞬間の値')}${gpus}` : ''}`;
+    ${gpus ? `${UI.section('GPU', '分析した瞬間の値')}${gpus}` : ''}<button class="btn small" data-power-view>電力の計算条件と設定を開く</button>`;
 }
 
 const withUnit = (v, unit) => (v == null ? '<span class="faint">-</span>' : `${esc(v)}${unit}`);
@@ -519,7 +522,7 @@ function renderResources() {
     ${Live.panel('resources')}
     ${rows.length ? UI.table({
       cols: [{ label: '機体' }, { label: 'CPU', width: '13%' }, { label: 'メモリ使用', width: '13%' }, { label: 'swap / コミット', cls: 'n' }, { label: 'ディスク使用', width: '13%' }, { label: '空き', cls: 'n' },
-        { label: 'GPU', cls: 'n' }, { label: '稼働', cls: 'n' }, { label: '計測', cls: 'n' }, { label: 'スコア', cls: 'n' }],
+        { label: 'GPU', cls: 'n' }, { label: 'GPU電力', cls: 'n' }, { label: 'Graphics Clock', cls: 'n' }, { label: '稼働', cls: 'n' }, { label: '計測', cls: 'n' }, { label: 'スコア', cls: 'n' }],
       rows,
       rowAttrs: ({ n }) => `data-goto="${esc(n.id)}" class="row-link"`,
       row: ({ n, r }) => {
@@ -533,7 +536,7 @@ function renderResources() {
         return `<td><b>${esc(n.id)}</b><span class="sub">${esc(d.host.cpu)}</span></td>
           ${m(d.cpu_busy, TH.cpu)}${m(d.memory.available_pct != null ? 100 - d.memory.available_pct : null, TH.mem)}
           <td class="n mid">${sw}</td>${m(disk ? 100 - disk.free_pct : null, TH.disk)}<td class="n mid">${disk ? esc(disk.free_gb) + ' GB' : '-'}</td>
-          <td class="n mid">${g ? `${esc(g.util)}% · ${esc(g.temp_c)}°C` : '<span class="faint">-</span>'}</td><td class="n mid">${d.host.uptime_h != null ? (d.host.uptime_h / 24).toFixed(1) + ' 日' : '-'}</td>
+          <td class="n mid">${g ? `${esc(g.util ?? '-')}% · ${esc(g.temp_c ?? '-')}°C` : '<span class="faint">-</span>'}</td><td class="n mid">${withUnit(g?.power_w,' W')}</td><td class="n mid">${withUnit(g?.clocks_graphics_mhz,' MHz')}</td><td class="n mid">${d.host.uptime_h != null ? (d.host.uptime_h / 24).toFixed(1) + ' 日' : '-'}</td>
           <td class="n mid">${d.bench ? `${esc(d.bench.median_ms)} ms` : d.benchmark_skipped ? '省略' : '-'}</td><td class="n mid"><span class="score-cell">${Charts.ring(r.score, { size: 26, stroke: 3 })}</span></td>`;
       },
     }) : UI.empty('まだ分析していません。ツールバーの「全機を分析」で始めます。')}

@@ -111,6 +111,7 @@ pub struct Hello {
     pub interval: Option<f64>,
     pub procs_every: Option<f64>,
     pub mem_total_gb: Option<f64>,
+    pub session_epoch_ms: Option<i64>,
     #[serde(default)]
     pub has: Map<String, Value>,
     /// 取れなかったもの（PS の ConvertTo-Json は 1 件だと配列にしないことがあるので Value のまま受ける）
@@ -143,10 +144,33 @@ pub struct Net {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Gpu {
+    pub uuid: Option<String>,
     pub name: Option<String>,
     pub util: Option<f64>,
     pub mem_used_mb: Option<f64>,
     pub mem_total_mb: Option<f64>,
+    pub power_w: Option<f64>,
+    pub power_limit_w: Option<f64>,
+    pub power_min_w: Option<f64>,
+    pub power_max_w: Option<f64>,
+    pub temp_c: Option<f64>,
+    pub clocks_graphics_mhz: Option<f64>,
+    pub clocks_sm_mhz: Option<f64>,
+    pub clocks_memory_mhz: Option<f64>,
+    pub pstate: Option<String>,
+    pub source: Option<String>,
+    pub available: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct Power {
+    pub package_w: Option<f64>,
+    pub package_source: Option<String>,
+    pub soc_w: Option<f64>,
+    pub soc_source: Option<String>,
+    pub platform_w: Option<f64>,
+    pub platform_source: Option<String>,
+    pub available: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -188,6 +212,7 @@ pub struct RawSample {
     pub mem: Option<Mem>,
     pub disk: Option<Disk>,
     pub net: Option<Net>,
+    pub power: Option<Power>,
     pub gpu: Option<Vec<Gpu>>,
     pub procs: Option<Procs>,
     #[serde(rename = "self")]
@@ -259,6 +284,8 @@ pub struct Sample {
     pub t: i64,
     /// サンプラーの時刻（ms）。t との差が遅延の目安（時計が合っているとき）
     pub src_t: Option<i64>,
+    pub seq: Option<u64>,
+    pub session_epoch: Option<String>,
     /// 機体全体の CPU（%）
     pub cpu: Option<f64>,
     /// コアごとの CPU（%）
@@ -266,6 +293,7 @@ pub struct Sample {
     pub mem: Option<Mem>,
     pub disk: Option<Disk>,
     pub net: Option<Net>,
+    pub power: Option<Power>,
     pub gpu: Option<Vec<Gpu>>,
 }
 
@@ -284,17 +312,46 @@ impl Sample {
         let gpu = r.gpu.map(|g| {
             g.into_iter()
                 .take(MAX_GPUS)
-                .map(|x| Gpu { name: x.name.map(|n| short(&n)), util: pct(x.util), mem_used_mb: nonneg(x.mem_used_mb), mem_total_mb: nonneg(x.mem_total_mb) })
+                .map(|x| Gpu {
+                    uuid: x.uuid.map(|s| short(&s)),
+                    name: x.name.map(|n| short(&n)),
+                    util: pct(x.util),
+                    mem_used_mb: nonneg(x.mem_used_mb),
+                    mem_total_mb: nonneg(x.mem_total_mb),
+                    power_w: nonneg(x.power_w),
+                    power_limit_w: nonneg(x.power_limit_w),
+                    power_min_w: nonneg(x.power_min_w),
+                    power_max_w: nonneg(x.power_max_w),
+                    temp_c: nonneg(x.temp_c),
+                    clocks_graphics_mhz: nonneg(x.clocks_graphics_mhz),
+                    clocks_sm_mhz: nonneg(x.clocks_sm_mhz),
+                    clocks_memory_mhz: nonneg(x.clocks_memory_mhz),
+                    pstate: x.pstate.map(|s| short(&s)),
+                    source: x.source.map(|s| short(&s)),
+                    available: x.available,
+                })
                 .collect()
+        });
+        let power = r.power.map(|x| Power {
+            package_w: nonneg(x.package_w),
+            package_source: x.package_source.map(|s| short(&s)),
+            soc_w: nonneg(x.soc_w),
+            soc_source: x.soc_source.map(|s| short(&s)),
+            platform_w: nonneg(x.platform_w),
+            platform_source: x.platform_source.map(|s| short(&s)),
+            available: x.available,
         });
         let s = Sample {
             t: received,
             src_t: r.t.filter(|t| t.is_finite() && *t > 0.0).map(|t| t as i64),
+            seq: r.seq,
+            session_epoch: None,
             cpu: pct(r.cpu),
             cores: r.cores.into_iter().take(MAX_CORES).map(pct).collect(),
             mem,
             disk: r.disk.map(|d| Disk { read_bps: nonneg(d.read_bps), write_bps: nonneg(d.write_bps) }),
             net: r.net.map(|n| Net { rx_bps: nonneg(n.rx_bps), tx_bps: nonneg(n.tx_bps) }),
+            power,
             gpu,
         };
         (s, r.procs.map(clean_procs), r.me)
@@ -304,6 +361,12 @@ impl Sample {
     pub fn point(&self) -> Value {
         let mut m = Map::new();
         m.insert("t".into(), Value::from(self.t));
+        if let Some(seq) = self.seq {
+            m.insert("seq".into(), Value::from(seq));
+        }
+        if let Some(epoch) = &self.session_epoch {
+            m.insert("epoch".into(), Value::from(epoch.clone()));
+        }
         let mut put = |k: &str, v: Option<f64>, digits: i32| {
             if let Some(x) = v {
                 let f = 10f64.powi(digits);
@@ -319,12 +382,30 @@ impl Sample {
         put("dw", self.disk.as_ref().and_then(|d| d.write_bps), 0);
         put("rx", self.net.as_ref().and_then(|n| n.rx_bps), 0);
         put("tx", self.net.as_ref().and_then(|n| n.tx_bps), 0);
+        put("power_cpu_w", self.power.as_ref().and_then(|p| p.package_w), 1);
+        put("power_soc_w", self.power.as_ref().and_then(|p| p.soc_w), 2);
+        put("power_platform_w", self.power.as_ref().and_then(|p| p.platform_w), 2);
+        let power_source = self.power.as_ref().and_then(|p| p.package_source.as_ref());
         if let Some(g) = &self.gpu {
             put("gpu", g.iter().filter_map(|x| x.util).reduce(f64::max), 1);
             let (used, total) = g.iter().fold((0.0, 0.0), |(u, t), x| (u + x.mem_used_mb.unwrap_or(0.0), t + x.mem_total_mb.unwrap_or(0.0)));
             put("gmem", (total > 0.0).then(|| used / total * 100.0), 1);
+            if !g.is_empty() && g.iter().all(|x| x.power_w.is_some()) {
+                put("power_gpu_w", Some(g.iter().map(|x| x.power_w.unwrap_or_default()).sum()), 1);
+            }
         }
         put("lag", self.src_t.map(|s| (self.t - s) as f64), 0);
+        if let Some(source) = power_source {
+            m.insert("power_cpu_source".into(), Value::from(source.clone()));
+        }
+        if let Some(source) = self.power.as_ref().and_then(|p| p.soc_source.as_ref()) {
+            m.insert("power_soc_source".into(), Value::from(source.clone()));
+        }
+        if let Some(g) = self.gpu.as_ref()
+            && !g.is_empty()
+        {
+            m.insert("power_gpu_source".into(), Value::from(g.iter().map(|g| g.source.as_deref().unwrap_or("unknown")).collect::<Vec<_>>().join("+")));
+        }
         Value::Object(m)
     }
 }
@@ -738,6 +819,7 @@ struct NodeLive {
     ring: Ring<Sample>,
     procs: Option<Value>,
     info: Option<Hello>,
+    session_epoch: Option<String>,
     phase: Phase,
     reason: Option<&'static str>,
     detail: Option<String>,
@@ -759,6 +841,7 @@ impl NodeLive {
             ring: Ring::new(cap),
             procs: None,
             info: None,
+            session_epoch: None,
             phase: Phase::Stopped,
             reason: None,
             detail: None,
@@ -1045,6 +1128,7 @@ impl Live {
         let mut st = self.lock();
         if Self::current(&st, id, epoch) {
             let n = self.node(&mut st, id);
+            n.session_epoch = Some(format!("{epoch}:{}", h.session_epoch_ms.unwrap_or_default()));
             n.info = Some(h);
             n.dirty_info = true;
         }
@@ -1056,8 +1140,9 @@ impl Live {
         if !Self::current(&st, id, epoch) {
             return;
         }
-        let (s, procs, me) = Sample::from_raw(raw, now);
         let n = self.node(&mut st, id);
+        let (mut s, procs, me) = Sample::from_raw(raw, now);
+        s.session_epoch = n.session_epoch.clone();
         n.ring.push(s);
         n.new_points = (n.new_points + 1).min(n.ring.cap());
         if let Some(p) = procs {
@@ -1199,7 +1284,7 @@ mod tests {
         Node::from_value(&json!({ "id": id, "alias": id, "os": os }), "this-host")
     }
 
-    const SAMPLE: &str = r#"{"type":"s","t":1700000000000,"seq":3,"cpu":12.5,"cores":[10,20,null,150],"mem":{"used_pct":41.2,"swap_used_gb":1.5,"swap_total_gb":2,"pressure":"normal"},"disk":{"read_bps":1000,"write_bps":-5},"net":{"rx_bps":10,"tx_bps":20},"gpu":[{"name":"G","util":30,"mem_used_mb":1024,"mem_total_mb":4096}],"procs":{"count":3,"top_cpu":[{"pid":7,"name":"a","cpu":150.5,"mem_mb":10}],"top_mem":[]},"self":{"cpu_s":0.5,"rss_mb":20}}"#;
+    const SAMPLE: &str = r#"{"type":"s","t":1700000000000,"seq":3,"cpu":12.5,"cores":[10,20,null,150],"mem":{"used_pct":41.2,"swap_used_gb":1.5,"swap_total_gb":2,"pressure":"normal"},"disk":{"read_bps":1000,"write_bps":-5},"net":{"rx_bps":10,"tx_bps":20},"power":{"package_w":200.8,"package_source":"Energy Meter RAPL package average","available":true},"gpu":[{"uuid":"GPU-a","name":"G","util":30,"mem_used_mb":1024,"mem_total_mb":4096,"power_w":220,"power_limit_w":320,"power_min_w":100,"power_max_w":350,"temp_c":65,"clocks_graphics_mhz":1800,"clocks_sm_mhz":1815,"clocks_memory_mhz":9500,"pstate":"P0","source":"nvidia-smi dmon","available":true}],"procs":{"count":3,"top_cpu":[{"pid":7,"name":"a","cpu":150.5,"mem_mb":10}],"top_mem":[]},"self":{"cpu_s":0.5,"rss_mb":20}}"#;
 
     #[test]
     fn parses_lines_and_ignores_noise() {
@@ -1213,11 +1298,23 @@ mod tests {
         assert_eq!(p.cpu, Some(12.5));
         assert_eq!(p.cores, vec![Some(10.0), Some(20.0), None, Some(100.0)], "コアは 0〜100 に収める");
         assert_eq!(p.disk.as_ref().unwrap().write_bps, None, "負の速度は捨てる");
-        assert_eq!(p.src_t, Some(1_700_000_000_000));
+        assert_eq!((p.src_t, p.seq), (Some(1_700_000_000_000), Some(3)));
+        assert_eq!(p.power.as_ref().and_then(|x| x.package_w), Some(200.8));
+        let gpu = &p.gpu.as_ref().unwrap()[0];
+        assert_eq!(
+            (gpu.uuid.as_deref(), gpu.pstate.as_deref(), gpu.source.as_deref(), gpu.available),
+            (Some("GPU-a"), Some("P0"), Some("nvidia-smi dmon"), Some(true))
+        );
+        assert_eq!((gpu.power_w, gpu.power_limit_w, gpu.temp_c), (Some(220.0), Some(320.0), Some(65.0)));
+        assert_eq!((gpu.power_min_w, gpu.power_max_w), (Some(100.0), Some(350.0)));
+        assert_eq!((gpu.clocks_graphics_mhz, gpu.clocks_sm_mhz, gpu.clocks_memory_mhz), (Some(1800.0), Some(1815.0), Some(9500.0)));
         assert_eq!(procs.unwrap().top_cpu[0].cpu, Some(150.5), "プロセスは 1 コア換算なので 100 を超えてよい");
         assert_eq!(me.unwrap().cpu_s, Some(0.5));
         let pt = p.point();
-        assert_eq!((pt["cpu"].as_f64(), pt["gpu"].as_f64(), pt["gmem"].as_f64(), pt["lag"].as_f64()), (Some(12.5), Some(30.0), Some(25.0), Some(120.0)));
+        assert_eq!(
+            (pt["cpu"].as_f64(), pt["gpu"].as_f64(), pt["gmem"].as_f64(), pt["power_cpu_w"].as_f64(), pt["power_gpu_w"].as_f64(), pt["lag"].as_f64()),
+            (Some(12.5), Some(30.0), Some(25.0), Some(200.8), Some(220.0), Some(120.0))
+        );
         assert!(pt.get("dw").is_none(), "無い値は点に入れない");
         assert!(matches!(parse_line(r#"{"type":"end","reason":"max_age"}"#), Some(Msg::End(r)) if r == "max_age"));
         for bad in ["", "WARNING: something", "{broken", r#"{"type":"other"}"#, r#"{"cpu":1}"#, r#"{"type":"s","cores":"x"}"#] {
@@ -1512,39 +1609,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// この機体の macOS サンプラーを実際に動かす（標準ライブラリだけで、hello・s・end を出す）
+    /// 必須のOS統計を保ち、任意センサーの有無を独立した環境で確かめる。
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn mac_sampler_runs_here() {
-        let mut src = spawn(Launch {
-            program: "/usr/bin/env".into(),
-            args: ["python3", "-", "interval=0.3", "procs=0.3", "count=3"].iter().map(|s| s.to_string()).collect(),
-            stdin: MAC_LIVE.as_bytes().to_vec(),
-            ..Launch::default()
-        })
-        .unwrap();
-        let mut msgs = Vec::new();
-        while let Ok(Some(l)) = tokio::time::timeout(Duration::from_secs(20), src.lines.recv()).await {
-            msgs.push(parse_line(&l).unwrap_or_else(|| panic!("読めない行: {l}")));
-        }
-        let ended = src.close().await;
-        assert_eq!(ended.code, Some(0), "{}", ended.err);
-        let Msg::Hello(h) = &msgs[0] else { panic!("1 行目は hello") };
-        assert_eq!(h.os.as_deref(), Some("macos"));
-        assert_eq!(h.errors, json!([]), "取れないものがある: {:?}", h.errors);
-        let samples: Vec<Sample> = msgs
-            .iter()
-            .filter_map(|m| match m {
-                Msg::Sample(s) => Some(Sample::from_raw((**s).clone(), now_ms()).0),
-                _ => None,
+        use std::os::unix::fs::PermissionsExt;
+        for with_sensor in [false, true] {
+            let (_, dir) = fake("");
+            if with_sensor {
+                let sensor = dir.join("macmon");
+                std::fs::write(
+                    &sensor,
+                    r#"#!/usr/bin/python3
+import json,os,time
+from pathlib import Path
+Path(__file__).with_suffix('.pid').write_text(str(os.getpid()))
+for _ in range(400):
+    print(json.dumps({'cpu_power':0,'gpu_power':3,'all_power':4,'sys_power':0,'gpu_freq_mhz':500}),flush=True)
+    time.sleep(0.05)
+"#,
+                )
+                .unwrap();
+                std::fs::set_permissions(sensor, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let mut src = spawn(Launch {
+                program: "/usr/bin/env".into(),
+                args: [
+                    format!("PATH={}", dir.display()),
+                    format!("HOME={}", dir.display()),
+                    "/usr/bin/python3".into(),
+                    "-".into(),
+                    "interval=0.3".into(),
+                    "procs=0.3".into(),
+                    "count=3".into(),
+                ]
+                .into(),
+                stdin: MAC_LIVE.as_bytes().to_vec(),
+                ..Launch::default()
             })
-            .collect();
-        assert_eq!(samples.len(), 3);
-        let last = samples.last().unwrap();
-        assert!(last.cpu.is_some() && last.cores.len() == h.cores.unwrap() as usize);
-        assert!(last.mem.as_ref().and_then(|m| m.used_pct).is_some());
-        assert!(last.disk.is_some() && last.net.is_some());
-        assert!(matches!(msgs.last(), Some(Msg::End(r)) if r == "count"));
+            .unwrap();
+            let mut msgs = Vec::new();
+            while let Ok(Some(l)) = tokio::time::timeout(Duration::from_secs(20), src.lines.recv()).await {
+                msgs.push(parse_line(&l).unwrap_or_else(|| panic!("読めない行: {l}")));
+            }
+            let ended = src.close().await;
+            assert_eq!(ended.code, Some(0), "{}", ended.err);
+            let Msg::Hello(h) = &msgs[0] else { panic!("1 行目は hello") };
+            assert_eq!(h.os.as_deref(), Some("macos"));
+            assert_eq!(
+                h.errors,
+                if with_sensor { json!([]) } else { json!(["power: FileNotFoundError: macmon unavailable"]) },
+                "予期しない欠測: {:?}",
+                h.errors
+            );
+            assert_eq!(h.has.get("gpu"), Some(&json!(with_sensor)));
+            let samples: Vec<Sample> = msgs
+                .iter()
+                .filter_map(|m| match m {
+                    Msg::Sample(s) => Some(Sample::from_raw((**s).clone(), now_ms()).0),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(samples.len(), 3);
+            let last = samples.last().unwrap();
+            assert!(last.cpu.is_some() && last.cores.len() == h.cores.unwrap() as usize);
+            assert!(last.mem.as_ref().and_then(|m| m.used_pct).is_some());
+            assert!(last.disk.is_some() && last.net.is_some());
+            assert!(matches!(msgs.last(), Some(Msg::End(r)) if r == "count"));
+            if with_sensor {
+                let power = last.power.as_ref().unwrap();
+                assert_eq!((power.package_w, power.soc_w, power.platform_w, power.available), (Some(0.0), Some(4.0), None, Some(true)));
+                assert_eq!(power.package_source.as_deref(), Some("macmon IOReport CPU"));
+                let gpu = &last.gpu.as_ref().unwrap()[0];
+                assert_eq!((gpu.power_w, gpu.clocks_graphics_mhz), (Some(3.0), Some(500.0)));
+                let pid: u32 = std::fs::read_to_string(dir.join("macmon.pid")).unwrap().parse().unwrap();
+                assert!(!alive(pid), "サンプラー終了時にセンサーの子も終わる");
+            } else {
+                for sample in &samples {
+                    assert_eq!(sample.power, Some(Power { available: Some(false), ..Power::default() }));
+                    assert_eq!(sample.gpu, Some(vec![]), "欠測をGPUの0Wとして作らない");
+                }
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// アプリと同じ起動のしかた（標準入力を開いたまま）で動かし、止めると標準入力が閉じてサンプラーが自分で終わる

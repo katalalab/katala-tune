@@ -23,6 +23,8 @@ static PROC_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_ .
 static MAC_LSTART: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z]{3} [A-Za-z]{3} [ 0-9][0-9] [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}$").expect("MAC_LSTART"));
 static WIN_START: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9]{17}$").expect("WIN_START"));
+static NVIDIA_UUID: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").expect("NVIDIA_UUID"));
 static TASK_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\\([A-Za-z0-9_ .-]+\\)*$").expect("TASK_PATH"));
 static TASK_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_ .()+-]{1,120}$").expect("TASK_NAME"));
 static LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.-]{1,150}$").expect("LABEL"));
@@ -115,6 +117,69 @@ fn str_of(v: Option<&Value>) -> Option<&str> {
     v.and_then(Value::as_str)
 }
 
+fn watts(v: Option<&Value>) -> Option<f64> {
+    v.and_then(Value::as_f64).filter(|x| x.is_finite() && *x >= 0.0)
+}
+
+fn power_plan_script(guid: &str, prev_guid: &str) -> String {
+    let body = [
+        "function Read-Plan { $line = & powercfg.exe -getactivescheme; if ($LASTEXITCODE -ne 0) { return $null }; $m = [regex]::Match($line, \"[0-9A-Fa-f-]{36}\"); if (-not $m.Success) { return $null }; return $m.Value }".into(),
+        "function Read-Plan-Retry { $v = Read-Plan; if (-not $v) { Start-Sleep -Milliseconds 200; $v = Read-Plan }; return $v }".into(),
+        "$before = Read-Plan-Retry; if (-not $before) { Write-Output \"power plan unreadable\"; exit 6 }".into(),
+        format!("if ($before -ne \"{prev_guid}\") {{ Write-Output \"power plan changed\"; exit 3 }}"),
+        format!("& powercfg.exe -setactive {guid}; $apply = $LASTEXITCODE"),
+        "$after = Read-Plan-Retry".into(),
+        format!("if ($apply -eq 0 -and $after -eq \"{guid}\") {{ exit 0 }}"),
+        format!("if ($after -eq \"{prev_guid}\") {{ Write-Output \"power plan was not changed\"; exit 6 }}"),
+        format!("if ($after -eq \"{guid}\") {{ & powercfg.exe -setactive {prev_guid}; if ($LASTEXITCODE -eq 0) {{ $rolled = Read-Plan-Retry; if ($rolled -eq \"{prev_guid}\") {{ Write-Output \"power plan verification failed; restored\"; exit 6 }} }} }}"),
+        "Write-Output \"power plan verification or rollback unverified\"; exit 7".into(),
+    ].join("; ");
+    format!(
+        "$mutex = New-Object System.Threading.Mutex($false, \"Global\\KatalaTunePowerControl\"); $held = $false; try {{ try {{ $held = $mutex.WaitOne(0) }} catch [System.Threading.AbandonedMutexException] {{ $held = $true }}; if (-not $held) {{ Write-Output \"another power action is running\"; exit 8 }}; {body}; }} finally {{ if ($held) {{ $mutex.ReleaseMutex() }}; $mutex.Dispose() }}"
+    )
+}
+
+fn gpu_power_script(uuid: &str, watts: f64, min: f64, max: f64, prev_w: f64) -> String {
+    let body = [
+        format!("function Read-Power {{ $line = & nvidia-smi.exe --id={uuid} --query-gpu=power.min_limit,power.max_limit,power.limit --format=csv,noheader,nounits; if ($LASTEXITCODE -ne 0 -or -not $line) {{ return @() }}; try {{ $r = @(); foreach ($x in ($line -split \",\")) {{ $r += [double]::Parse($x.Trim(), [Globalization.CultureInfo]::InvariantCulture) }}; if ($r.Count -ne 3) {{ return @() }}; return $r }} catch {{ return @() }} }}"),
+        "function Read-Power-Retry { $v = @(Read-Power); if ($v.Count -ne 3) { Start-Sleep -Milliseconds 200; $v = @(Read-Power) }; return $v }".into(),
+        "$v = @(Read-Power-Retry); if ($v.Count -ne 3) { Write-Output \"GPU power unreadable\"; exit 6 }".into(),
+        format!("if ($v[0] -ne {min} -or $v[1] -ne {max} -or $v[2] -ne {prev_w}) {{ Write-Output \"GPU power state changed\"; exit 3 }}"),
+        format!("& nvidia-smi.exe --id={uuid} -pl {watts}; $apply = $LASTEXITCODE"),
+        "$after = @(Read-Power-Retry)".into(),
+        format!("if ($apply -eq 0 -and $after.Count -eq 3 -and $after[2] -eq {watts}) {{ exit 0 }}"),
+        format!("if ($after.Count -eq 3 -and $after[0] -eq {min} -and $after[1] -eq {max} -and $after[2] -eq {prev_w}) {{ Write-Output \"power limit was not changed\"; exit 6 }}"),
+        format!("if ($after.Count -eq 3 -and $after[2] -eq {watts} -and $after[0] -le {prev_w} -and $after[1] -ge {prev_w}) {{ & nvidia-smi.exe --id={uuid} -pl {prev_w}; if ($LASTEXITCODE -eq 0) {{ $rolled = @(Read-Power-Retry); if ($rolled.Count -eq 3 -and $rolled[2] -eq {prev_w}) {{ Write-Output \"power limit verification failed; restored\"; exit 6 }} }} }}"),
+        "Write-Output \"power limit verification or rollback unverified\"; exit 7".into(),
+    ].join("; ");
+    format!(
+        "$mutex = New-Object System.Threading.Mutex($false, \"Global\\KatalaTunePowerControl\"); $held = $false; try {{ try {{ $held = $mutex.WaitOne(0) }} catch [System.Threading.AbandonedMutexException] {{ $held = $true }}; if (-not $held) {{ Write-Output \"another power action is running\"; exit 8 }}; {body}; }} finally {{ if ($held) {{ $mutex.ReleaseMutex() }}; $mutex.Dispose() }}"
+    )
+}
+
+fn low_power_mode_script(source: &str, enabled: bool, prev: bool) -> String {
+    let (flag, heading) = if source == "ac" { ("-c", "AC Power") } else { ("-b", "Battery Power") };
+    let desired = if enabled { 1 } else { 0 };
+    let previous = if prev { 1 } else { 0 };
+    let raw = |key: &str| format!("pmset -g custom | awk '/^{heading}:/{{f=1;next}} /^[^ ]/{{f=0}} f && /^[[:space:]]*{key} / {{print $2; exit}}'");
+    let read = format!(
+        "key=powermode; mode=$({}); [ -n \"$mode\" ] || {{ key=lowpowermode; mode=$({}); }}; if [ \"$mode\" = 0 ] || [ \"$mode\" = 1 ]; then echo \"$key:$mode\"; else exit 2; fi",
+        raw("powermode"),
+        raw("lowpowermode")
+    );
+    [
+        r#"lock="/tmp/org.katala.tune-power-control.lock"; mkdir -m 700 "$lock" 2>/dev/null || { echo "another power action is running; remove only after verifying owner PID is gone"; exit 8; }; trap 'rm -f "$lock/pid"; rmdir "$lock"' EXIT; trap 'exit 7' HUP INT TERM; printf "%s\n" "$$" > "$lock/pid" || exit 6"#.into(),
+        format!("before=$({read}) || {{ echo \"low power mode unsupported\"; exit 6; }}; before_key=${{before%%:*}}; before_mode=${{before#*:}}"),
+        format!("[ \"$before_mode\" = {previous} ] || {{ echo \"low power mode changed\"; exit 3; }}"),
+        format!("pmset {flag} \"$before_key\" {desired}; apply=$?"),
+        format!("after=$({read}) || {{ echo \"low power mode verification unverified\"; exit 7; }}; after_key=${{after%%:*}}; after_mode=${{after#*:}}"),
+        format!("[ \"$apply\" = 0 ] && [ \"$after_key\" = \"$before_key\" ] && [ \"$after_mode\" = {desired} ] && exit 0"),
+        format!(r#"[ "$after_key" = "$before_key" ] && [ "$after_mode" = {previous} ] && exit 6"#),
+        format!(r#"if [ "$after_key" = "$before_key" ] && [ "$after_mode" = {desired} ]; then pmset {flag} "$before_key" {previous}; rolled=$({read}); [ "$rolled" = "$before_key:{previous}" ] && {{ echo "low power mode apply failed; restored"; exit 6; }}; fi"#),
+        "echo \"low power mode verification or rollback unverified\"; exit 7".into(),
+    ].join("\n")
+}
+
 fn check_task(p: &Value) -> Result<(String, String), String> {
     let path = str_of(p.get("path")).filter(|s| TASK_PATH.is_match(s)).ok_or("タスクのパスが不正")?;
     let name = str_of(p.get("name")).filter(|s| TASK_NAME.is_match(s)).ok_or("タスク名が不正")?;
@@ -135,8 +200,18 @@ fn check_label(p: &Value) -> Result<(String, Option<String>), String> {
 }
 
 /// 許可リストにある操作の種類
-pub const TYPES: &[&str] =
-    &["kill-process", "set-power-plan", "task-disable", "task-enable", "task-run", "launchd-unload", "launchd-load", "launchd-kickstart"];
+pub const TYPES: &[&str] = &[
+    "kill-process",
+    "set-power-plan",
+    "set-gpu-power-limit",
+    "set-low-power-mode",
+    "task-disable",
+    "task-enable",
+    "task-run",
+    "launchd-unload",
+    "launchd-load",
+    "launchd-kickstart",
+];
 
 /// 計画を立てる。protect は実行の直前に読み直した保護リスト（読めなかったら None を渡す＝実行しない）
 pub fn plan(node: &Node, action: &Value, protect: Option<&[String]>) -> Result<Plan, String> {
@@ -147,8 +222,8 @@ pub fn plan(node: &Node, action: &Value, protect: Option<&[String]>) -> Result<P
     if node.shared {
         return Err(format!("{} は共用機のため、このアプリからは変更しない", node.id));
     }
-    let windows_only = matches!(ty.as_str(), "set-power-plan" | "task-disable" | "task-enable" | "task-run");
-    let mac_only = ty.starts_with("launchd-");
+    let windows_only = matches!(ty.as_str(), "set-power-plan" | "set-gpu-power-limit" | "task-disable" | "task-enable" | "task-run");
+    let mac_only = ty == "set-low-power-mode" || ty.starts_with("launchd-");
     if windows_only && !node.is_windows() {
         return Err("Windows だけの操作".into());
     }
@@ -189,16 +264,47 @@ pub fn plan(node: &Node, action: &Value, protect: Option<&[String]>) -> Result<P
         }
         "set-power-plan" => {
             let guid = str_of(p.get("guid")).filter(|s| GUID.is_match(s)).ok_or("GUID が不正")?;
-            let prev = match p.get("prev_guid") {
-                v if !js::truthy(v) => None,
-                Some(Value::String(s)) if GUID.is_match(s) => Some(s.clone()),
-                _ => return Err("GUID が不正".into()),
-            };
+            let prev = str_of(p.get("prev_guid")).filter(|s| GUID.is_match(s)).ok_or("GUID が不正")?;
             Ok(Plan {
-                describe: format!("{id} の電源プランを切り替える（powercfg -setactive {guid}）。元に戻す操作を記録する。"),
-                script: format!("powercfg.exe -setactive {guid}; powercfg.exe -getactivescheme"),
+                describe: format!("{id} の電源プランを切り替える。直前のプランを再読し、適用後に検証できなければ戻す。"),
+                script: power_plan_script(guid, prev),
                 shell: "ps",
-                undo: prev.map(|g| json!({ "type": "set-power-plan", "params": { "guid": g } })),
+                undo: Some(json!({ "type": "set-power-plan", "params": { "guid": prev, "prev_guid": guid } })),
+                has_exits: false,
+            })
+        }
+        "set-gpu-power-limit" => {
+            let uuid = str_of(p.get("uuid")).filter(|s| NVIDIA_UUID.is_match(s)).ok_or("GPU UUID が不正")?;
+            let watts_value = watts(p.get("watts")).ok_or("GPU 電力の値が不正")?;
+            let min = watts(p.get("min")).ok_or("GPU 電力の値が不正")?;
+            let max = watts(p.get("max")).ok_or("GPU 電力の値が不正")?;
+            let prev_w = watts(p.get("prev_w")).ok_or("GPU 電力の値が不正")?;
+            if min > max || watts_value < min || watts_value > max || prev_w < min || prev_w > max {
+                return Err("GPU 電力の値が不正".into());
+            }
+            Ok(Plan {
+                describe: format!("{id} の GPU 電力上限を {watts_value}W にする。直前に同じ GPU の対応範囲と現在値を確認し、検証できなければ戻す。"),
+                script: gpu_power_script(uuid, watts_value, min, max, prev_w),
+                shell: "ps",
+                undo: Some(
+                    json!({ "type": "set-gpu-power-limit", "params": { "uuid": uuid, "watts": prev_w, "min": min, "max": max, "prev_w": watts_value } }),
+                ),
+                has_exits: false,
+            })
+        }
+        "set-low-power-mode" => {
+            let source = str_of(p.get("source")).filter(|s| *s == "ac" || *s == "battery").ok_or("電源ドメインが不正")?;
+            let enabled = p.get("enabled").and_then(Value::as_bool).ok_or("真偽値が不正")?;
+            let prev = p.get("prev").and_then(Value::as_bool).ok_or("真偽値が不正")?;
+            Ok(Plan {
+                describe: format!(
+                    "{id} の{}時の低電力モードを{}にする。直前の値が変わっていれば実行しない。",
+                    if source == "ac" { "AC" } else { "バッテリー" },
+                    if enabled { "有効" } else { "無効" }
+                ),
+                script: low_power_mode_script(source, enabled, prev),
+                shell: "sh",
+                undo: Some(json!({ "type": "set-low-power-mode", "params": { "source": source, "enabled": prev, "prev": enabled } })),
                 has_exits: false,
             })
         }
@@ -298,5 +404,5 @@ pub async fn execute_with(runner: &dyn Runner, node: &Node, action: &Value, prot
         .map(str::to_string)
         .unwrap_or_else(|| if ok { "完了".into() } else { format!("失敗（exit {}）", res.code_str()) });
     let output = js::slice16_tail(js::trim(&(res.out.clone() + &res.err)), 1500);
-    Ok(Outcome { ok, code: res.code, outcome, output, undo: if ok { p.undo.clone() } else { None } })
+    Ok(Outcome { ok, code: res.code, outcome, output, undo: if ok || res.code == Some(7) { p.undo.clone() } else { None } })
 }

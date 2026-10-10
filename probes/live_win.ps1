@@ -65,11 +65,28 @@ $totalBytes = $null
 try { $totalBytes = [double](Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize * 1024 } catch { }
 if (-not $totalBytes) { $errs.Add('memory: total unknown') }
 
+# CPU package power: Windows Energy Meter exposes RAPL package instances as interval-average mW.
+# Open the counters once; the first NextValue() is only a warmup and is never emitted as a measurement.
+$energyCounters = New-Object System.Collections.Generic.List[object]
+try {
+  $energyCat = New-Object System.Diagnostics.PerformanceCounterCategory('Energy Meter')
+  foreach ($instance in $energyCat.GetInstanceNames()) {
+    if ($instance -match '(?i)^rapl_package\d+_pkg$') {
+      $counter = New-Object System.Diagnostics.PerformanceCounter('Energy Meter', 'Power', $instance, $true)
+      [void]$counter.NextValue()
+      $energyCounters.Add($counter)
+    }
+  }
+} catch { $energyCounters.Clear() }
+$energyWarm = $energyCounters.Count -gt 0
+
 # ---- GPU (nvidia-smi dmon: sm = utilization.gpu, fb = memory used MB) ----
 $smi = $null
 $sc = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 if ($sc) { $smi = $sc.Source }
 $gpuName = @{}; $gpuTotal = @{}; $gpuNow = @{}
+$gpuSampleClock = [Diagnostics.Stopwatch]::StartNew()
+$gpuMaxAgeMs = [math]::Max(2500, 3 * [math]::Max(1, [math]::Round($Interval)) * 1000)
 $dmon = $null; $dmonTask = $null; $dmonCols = $null
 if ($smi) {
   foreach ($line in @(& $smi --query-gpu=index,name,memory.total --format=csv,noheader,nounits 2>$null)) {
@@ -78,7 +95,8 @@ if ($smi) {
   }
 }
 function StartDmon {
-  $psi = New-Object Diagnostics.ProcessStartInfo($smi, ('dmon -s um -d ' + [int][math]::Max(1, [math]::Round($Interval)) + ' -c 120'))
+  $script:gpuNow.Clear(); $script:dmonCols = $null
+  $psi = New-Object Diagnostics.ProcessStartInfo($smi, ('dmon -s pucm -d ' + [int][math]::Max(1, [math]::Round($Interval)) + ' -c 120'))
   $psi.UseShellExecute = $false
   $psi.RedirectStandardOutput = $true
   $psi.CreateNoWindow = $true
@@ -88,6 +106,13 @@ function StartDmon {
 # Read the lines dmon has written so far, without waiting.
 function PollDmon {
   if ($null -eq $script:dmon) { StartDmon; return }
+  try {
+    if ($script:dmon.HasExited) {
+      $script:gpuNow.Clear(); $script:dmonCols = $null
+      $script:dmon.Dispose(); $script:dmon = $null; $script:dmonTask = $null
+      return
+    }
+  } catch { $script:gpuNow.Clear(); $script:dmonCols = $null; $script:dmon = $null; $script:dmonTask = $null; return }
   while ($null -ne $script:dmonTask -and $script:dmonTask.IsCompleted) {
     $line = $null
     try { $line = $script:dmonTask.Result } catch { }
@@ -95,6 +120,7 @@ function PollDmon {
       # dmon ended (sample count reached): start a new one on the next poll
       try { $script:dmon.Dispose() } catch { }
       $script:dmon = $null; $script:dmonTask = $null
+      $script:gpuNow.Clear(); $script:dmonCols = $null
       return
     }
     if ($line -match '^#\s*gpu') { $script:dmonCols = @($line.TrimStart('#').Trim() -split '\s+') }
@@ -104,7 +130,14 @@ function PollDmon {
       if ($gi -ge 0 -and $f.Count -eq $script:dmonCols.Count) {
         $u = $null; if ($si -ge 0) { $u = $f[$si] }
         $m = $null; if ($fi -ge 0) { $m = $f[$fi] }
-        $script:gpuNow[[int]$f[$gi]] = @($u, $m)
+        $pi = [array]::IndexOf($script:dmonCols, 'pwr'); $ti = [array]::IndexOf($script:dmonCols, 'gtemp')
+        $gci = [array]::IndexOf($script:dmonCols, 'gclk'); if ($gci -lt 0) { $gci = [array]::IndexOf($script:dmonCols, 'pclk') }; $sci = [array]::IndexOf($script:dmonCols, 'smclk'); $mci = [array]::IndexOf($script:dmonCols, 'mclk')
+        $script:gpuNow[[int]$f[$gi]] = [ordered]@{
+          received_ms = $script:gpuSampleClock.Elapsed.TotalMilliseconds
+          util = $u; mem = $m
+          power = $(if ($pi -ge 0) { $f[$pi] } else { $null }); temp = $(if ($ti -ge 0) { $f[$ti] } else { $null })
+          graphics = $(if ($gci -ge 0) { $f[$gci] } else { $null }); sm_clock = $(if ($sci -ge 0) { $f[$sci] } else { $null }); memory_clock = $(if ($mci -ge 0) { $f[$mci] } else { $null })
+        }
       }
     }
     $script:dmonTask = $script:dmon.StandardOutput.ReadLineAsync()
@@ -115,7 +148,8 @@ function GpuJson {
   $rows = New-Object System.Collections.Generic.List[string]
   foreach ($k in $gpuNow.Keys) {
     $v = $gpuNow[$k]
-    $rows.Add('{"name":' + (J $gpuName[$k]) + ',"util":' + (N $v[0] 0) + ',"mem_used_mb":' + (N $v[1] 0) + ',"mem_total_mb":' + (N $gpuTotal[$k] 0) + '}')
+    if ($null -eq $v.received_ms -or $script:gpuSampleClock.Elapsed.TotalMilliseconds - $v.received_ms -gt $script:gpuMaxAgeMs) { continue }
+    $rows.Add('{"name":' + (J $gpuName[$k]) + ',"util":' + (N $v.util 0) + ',"mem_used_mb":' + (N $v.mem 0) + ',"mem_total_mb":' + (N $gpuTotal[$k] 0) + ',"power_w":' + (N $v.power) + ',"temp_c":' + (N $v.temp 0) + ',"clocks_graphics_mhz":' + (N $v.graphics 0) + ',"clocks_sm_mhz":' + (N $v.sm_clock 0) + ',"clocks_memory_mhz":' + (N $v.memory_clock 0) + ',"source":"nvidia-smi dmon","available":true}')
   }
   return ('[' + ($rows -join ',') + ']')
 }
@@ -163,9 +197,10 @@ function Procs {
   return ('{"count":' + $k + ',"top_cpu":[' + (TopJson $byCpu $names $pids $cpus $mems $TOP) + '],"top_mem":[' + (TopJson $byMem $names $pids $cpus $mems $TOP) + ']}')
 }
 
-$has = [ordered]@{ cpu = ($null -ne $cpuCat); mem = ($null -ne $memCat); disk = ($null -ne $diskCat); net = ($null -ne $netCat); procs = ($null -ne $procCat); gpu = [bool]$smi }
+$has = [ordered]@{ cpu = ($null -ne $cpuCat); mem = ($null -ne $memCat); disk = ($null -ne $diskCat); net = ($null -ne $netCat); procs = ($null -ne $procCat); gpu = [bool]$smi; power = ($energyCounters.Count -gt 0) }
+$sessionEpochMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $hello = [ordered]@{ type = 'hello'; v = 1; os = 'windows'; cores = [Environment]::ProcessorCount; interval = $Interval; procs_every = $ProcEvery
-  mem_total_gb = $(if ($totalBytes) { [math]::Round($totalBytes / 1GB, 1) } else { $null }); has = $has; errors = @($errs) }
+  mem_total_gb = $(if ($totalBytes) { [math]::Round($totalBytes / 1GB, 1) } else { $null }); session_epoch_ms = $sessionEpochMs; has = $has; errors = @($errs) }
 if (-not (Emit ($hello | ConvertTo-Json -Compress -Depth 3))) { exit 0 }
 
 $me = [Diagnostics.Process]::GetCurrentProcess()
@@ -265,6 +300,22 @@ try {
 
     $line = '{"type":"s","t":' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + ',"seq":' + $seq + ',"cpu":' + $total + ',"cores":[' + ($cores -join ',') + ']'
     $line += ',"mem":{"used_pct":' + $usedPct + ',"commit_pct":' + $commitPct + ',"commit_gb":' + $commitGb + ',"commit_limit_gb":' + $limitGb + '}'
+
+    # Energy Meter Power is mW. Require every package counter to be finite and nonnegative before summing.
+    $packageW = 'null'; $powerAvailable = 'false'
+    if ($energyCounters.Count -gt 0) {
+      if ($energyWarm) { $energyWarm = $false }
+      else {
+        $sumMw = 0.0; $validPower = $true
+        foreach ($counter in $energyCounters) {
+          $value = $null; try { $value = [double]$counter.NextValue() } catch { }
+          if ($null -eq $value -or [double]::IsNaN($value) -or [double]::IsInfinity($value) -or $value -lt 0) { $validPower = $false; break }
+          $sumMw += $value
+        }
+        if ($validPower) { $packageW = ([math]::Round($sumMw / 1000, 1)).ToString('R', $inv); $powerAvailable = 'true' }
+      }
+      $line += ',"power":{"package_w":' + $packageW + ',"package_source":"Energy Meter RAPL package average (mW / 1000)","available":' + $powerAvailable + '}'
+    }
 
     # Disk: all physical disks
     $d = $null; try { $d = $diskCat.ReadCategory() } catch { }

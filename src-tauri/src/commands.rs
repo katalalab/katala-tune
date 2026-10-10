@@ -36,6 +36,21 @@ pub async fn last(e: E<'_>) -> R {
     e.last().map(Value::Array)
 }
 
+#[tauri::command]
+pub async fn power_report(e: E<'_>) -> R {
+    e.power_report()
+}
+
+#[tauri::command]
+pub async fn network_check(e: E<'_>, ids: Option<Vec<String>>, active: Option<bool>) -> R {
+    e.network_check(&ids.unwrap_or_default(), active.unwrap_or(false)).await
+}
+
+#[tauri::command]
+pub async fn power_settings(e: E<'_>, node_id: String, patch: Value) -> R {
+    e.power_settings(&node_id, &patch)
+}
+
 /// 全機（ids が空）を分析したら、続けてログも取り込む（main.js と同じ）
 #[tauri::command]
 pub async fn probe(e: E<'_>, ids: Option<Vec<String>>) -> R {

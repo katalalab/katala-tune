@@ -10,6 +10,15 @@ $ProgressPreference = 'SilentlyContinue'
 $t0 = Get-Date
 
 function R1($x, $d = 1) { if ($null -eq $x) { return $null } return [math]::Round([double]$x, $d) }
+function RNum($x, $d = 1) {
+  if ($null -eq $x) { return $null }
+  $s = ([string]$x).Trim()
+  if (-not $s -or $s -match "^(N/A|Not Supported|\[N/A\])$") { return $null }
+  $v = 0.0
+  if (-not [double]::TryParse($s, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$v)) { return $null }
+  if ([double]::IsNaN($v) -or [double]::IsInfinity($v)) { return $null }
+  return [math]::Round($v, $d)
+}
 # Short reason for a failed read. "no-permission" when the account may not read it (no admin rights are requested).
 function NsErr($e) {
   $x = $e.Exception
@@ -34,6 +43,12 @@ $procs = Get-Process
 $elapsed = $sw.Elapsed.TotalSeconds
 $perf2 = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'"
 $perfInfo = Get-CimInstance Win32_PerfFormattedData_Counters_ProcessorInformation -Filter "Name='_Total'"
+$cpuEffectiveMhz = $null
+if ($perfInfo -and $null -ne $perfInfo.ProcessorFrequency -and $null -ne $perfInfo.PercentProcessorPerformance) {
+  $f = RNum $perfInfo.ProcessorFrequency
+  $p = RNum $perfInfo.PercentProcessorPerformance
+  if ($null -ne $f -and $null -ne $p) { $cpuEffectiveMhz = RNum ($f * $p / 100) }
+}
 
 $list = foreach ($p in $procs) {
   $c = 0
@@ -74,13 +89,42 @@ if ($pref -and $pref.ExclusionPath -and ($pref.ExclusionPath -notmatch 'N/A')) {
 $gpus = @()
 $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 if ($smi) {
-  $q = & nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,clocks_throttle_reasons.active,driver_version --format=csv,noheader,nounits
+  $q = @(& nvidia-smi --query-gpu=uuid,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,power.min_limit,power.max_limit,clocks.current.graphics,clocks.current.sm,clocks.current.memory,pstate,clocks_throttle_reasons.active,driver_version --format=csv,noheader,nounits 2>$null)
+  $full = $q.Count -gt 0
+  if (-not $full) { $q = @(& nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,clocks_throttle_reasons.active,driver_version --format=csv,noheader,nounits 2>$null) }
   foreach ($line in $q) {
     $f = $line -split ',\s*'
-    if ($f.Count -ge 9) {
-      $gpus += [pscustomobject]@{ name = $f[0]; util = (R1 $f[1]); mem_used_mb = (R1 $f[2] 0); mem_total_mb = (R1 $f[3] 0); temp_c = (R1 $f[4] 0); power_w = (R1 $f[5]); power_limit_w = (R1 $f[6]); throttle = $f[7]; driver = $f[8] }
+    if ($full -and $f.Count -ge 16) {
+      $gpus += [pscustomobject]@{ uuid = $f[0]; name = $f[1]; util = (RNum $f[2]); mem_used_mb = (RNum $f[3] 0); mem_total_mb = (RNum $f[4] 0); temp_c = (RNum $f[5] 0); power_w = (RNum $f[6]); power_limit_w = (RNum $f[7]); power_min_w = (RNum $f[8]); power_max_w = (RNum $f[9]); clocks_graphics_mhz = (RNum $f[10] 0); clocks_sm_mhz = (RNum $f[11] 0); clocks_memory_mhz = (RNum $f[12] 0); pstate = $(if ($f[13] -match "^(N/A|Not Supported|\[N/A\])$") { $null } else { $f[13] }); throttle = $f[14]; driver = $f[15]; source = "nvidia-smi"; available = $true }
+    } elseif (-not $full -and $f.Count -ge 9) {
+      $gpus += [pscustomobject]@{ uuid = $null; name = $f[0]; util = (RNum $f[1]); mem_used_mb = (RNum $f[2] 0); mem_total_mb = (RNum $f[3] 0); temp_c = (RNum $f[4] 0); power_w = (RNum $f[5]); power_limit_w = (RNum $f[6]); power_min_w = $null; power_max_w = $null; clocks_graphics_mhz = $null; clocks_sm_mhz = $null; clocks_memory_mhz = $null; pstate = $null; throttle = $f[7]; driver = $f[8]; source = "nvidia-smi-legacy-query"; available = $true }
     }
   }
+}
+
+$cpuPowerW = $null; $cpuPowerSource = $null; $cpuPowerReason = "LibreHardwareMonitor CPU Package unavailable"
+try {
+  $lhm = @(Get-CimInstance -Namespace root/LibreHardwareMonitor -ClassName Sensor -ErrorAction Stop | Where-Object { $_.SensorType -eq "Power" -and $_.Name -match "CPU Package" })
+  if ($lhm.Count -gt 0) {
+    $cpuPowerW = RNum $lhm[0].Value
+    if ($null -ne $cpuPowerW) { $cpuPowerSource = "LibreHardwareMonitor.Sensor"; $cpuPowerReason = $null }
+  }
+} catch {}
+if ($null -eq $cpuPowerW) {
+  try {
+    $samples = @(Get-Counter "\Energy Meter(*)\Power" -ErrorAction Stop).CounterSamples | Where-Object { $_.InstanceName -match "(?i)^rapl_package\d+_pkg$" }
+    $packages = @($samples | Group-Object InstanceName)
+    $watts = @()
+    foreach ($package in $packages) {
+      $sample = @($package.Group | Where-Object { $_.Status -eq 0 -and $null -ne (RNum $_.CookedValue) } | Select-Object -First 1)
+      if ($sample.Count -ne 1) { $watts = @(); break }
+      $watts += (RNum $sample[0].CookedValue) / 1000
+    }
+    if ($packages.Count -gt 0 -and $watts.Count -eq $packages.Count) {
+      $cpuPowerW = RNum (($watts | Measure-Object -Sum).Sum)
+      if ($null -ne $cpuPowerW) { $cpuPowerSource = "Energy Meter RAPL package average (mW / 1000)"; $cpuPowerReason = $null }
+    }
+  } catch {}
 }
 
 # Disks
@@ -384,6 +428,7 @@ $result = [ordered]@{
   host = [ordered]@{ hostname = $env:COMPUTERNAME; os = "$($os.Caption) $($os.BuildNumber)"; cpu = $cpu.Name.Trim(); cores = $ncpu; max_mhz = $cpu.MaxClockSpeed; uptime_h = (R1 (((Get-Date) - $os.LastBootUpTime).TotalHours)) }
   cpu_busy = (R1 ((([double]$perf1.PercentProcessorTime) + ([double]$perf2.PercentProcessorTime)) / 2))
   cpu_perf_pct = (R1 $perfInfo.PercentProcessorPerformance)
+  cpu_clock = [ordered]@{ nominal_mhz = $cpu.MaxClockSpeed; effective_mhz = $cpuEffectiveMhz; source = "Win32_PerfFormattedData_Counters_ProcessorInformation.ProcessorFrequency * PercentProcessorPerformance / 100"; availability = $(if ($null -ne $cpuEffectiveMhz) { "available" } else { "unavailable" }) }
   memory = [ordered]@{ total_gb = (R1 ($totalMb / 1024)); free_gb = (R1 ($os.FreePhysicalMemory / 1MB)); available_pct = (R1 ($os.FreePhysicalMemory / $os.TotalVisibleMemorySize * 100)); commit_pct = $commitPct; pagefile_alloc_mb = $pfa['AllocatedBaseSize']; pagefile_used_mb = $pfa['CurrentUsage']; pagefile_peak_mb = $pfa['PeakUsage'] }
   processes = [ordered]@{
     count = @($list).Count
@@ -393,7 +438,7 @@ $result = [ordered]@{
     apps_cpu = @($groups | Sort-Object cpu -Descending | Select-Object -First 10)
     agent_processes = $agents
   }
-  power = [ordered]@{ plan_guid = $guid; plan_name = $planName; plans = @($plans) }
+  power = [ordered]@{ plan_guid = $guid; plan_name = $planName; plans = @($plans); package_w = $cpuPowerW; package_source = $cpuPowerSource; package_availability = $(if ($null -ne $cpuPowerW) { "available" } else { "unavailable" }); package_reason = $cpuPowerReason; soc_w = $null; soc_source = $null; low_power_mode = $null; on_battery = $null }
   defender = [ordered]@{ realtime = $mp.RealTimeProtectionEnabled; exclusions = $excl }
   gpus = @($gpus)
   disk = @($disks)
