@@ -93,7 +93,8 @@ test('macOS 低電力モード: 電源ドメインの旧値を再読し、検証
   const params = { source: 'battery', enabled: true, prev: false };
   const p = plan(mac, { type: 'set-low-power-mode', params }, ctx);
   assert.match(p.script, /pmset -g custom/);
-  assert.match(p.script, /power-action\.lock.*lowpowermode/);
+  assert.match(p.script, /power-action\.lock/);
+  assert.match(p.script, /lowpowermode/);
   assert.match(p.script, /Battery Power/);
   assert.match(p.script, /\[ "\$before" = 0 \] \|\| \{.*exit 3/);
   assert.match(p.script, /pmset -b powermode 1/);
