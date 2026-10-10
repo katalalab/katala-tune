@@ -40,9 +40,12 @@ pub async fn live_start(e: State<'_, Arc<Engine>>, l: State<'_, Arc<Live>>, ids:
     Ok(l.start(&nodes, &unknown))
 }
 
-/// 止める（ids が無ければ全部）
+/// 止める（ids が無ければ全部）。常時監視で流しているあいだは止めない（画面を移っても数字を集め続ける）
 #[tauri::command]
-pub async fn live_stop(l: State<'_, Arc<Live>>, ids: Option<Vec<String>>) -> Result<Value, String> {
+pub async fn live_stop(e: State<'_, Arc<Engine>>, l: State<'_, Arc<Live>>, ids: Option<Vec<String>>) -> Result<Value, String> {
+    if crate::monitor::collecting(&e) {
+        return Ok(serde_json::json!({ "stopped": [], "monitor": true }));
+    }
     Ok(l.stop(ids.as_deref(), Stop::User))
 }
 
@@ -52,8 +55,11 @@ pub async fn power_session(e: State<'_, Arc<Engine>>, l: State<'_, Arc<Live>>, n
     e.power_observation(&node_id, &points, save)
 }
 
-/// ウィンドウを閉じた: 見ている画面が無いので全部止める
+/// ウィンドウを閉じた: 見ている画面が無いので全部止める（常時監視で流しているあいだは止めない）
 pub fn stop_all(app: &AppHandle) {
+    if app.try_state::<Arc<Engine>>().is_some_and(|e| crate::monitor::collecting(&e)) {
+        return;
+    }
     if let Some(l) = app.try_state::<Arc<Live>>() {
         l.stop(None, Stop::Hidden);
     }

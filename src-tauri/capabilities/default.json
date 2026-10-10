@@ -47,6 +47,9 @@
     "allow-live-stop",
     "allow-agent-peers",
     "allow-agent-pair",
-    "allow-netsec"
+    "allow-netsec",
+    "allow-dashboard",
+    "allow-monitor-settings",
+    "allow-hub-pull"
   ]
 }

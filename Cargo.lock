@@ -2344,7 +2344,7 @@ dependencies = [
 
 [[package]]
 name = "katala-tune"
-version = "0.5.0-power.7"
+version = "0.6.0-rt.1"
 dependencies = [
  "objc2-app-kit",
  "rfd",
@@ -2355,6 +2355,7 @@ dependencies = [
  "tauri-plugin-clipboard-manager",
  "tauri-plugin-notification",
  "tauri-plugin-opener",
+ "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "tokio",
  "tune-core",
@@ -4606,6 +4607,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tauri-plugin-single-instance"
+version = "2.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee2c8fe2d6b75caed0153f91eda30ea1dea3bfb6710d5adb80456d2c035a569d"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
+ "zbus",
+]
+
+[[package]]
 name = "tauri-plugin-updater"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5134,7 +5151,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tune-agent"
-version = "0.5.0-power.7"
+version = "0.6.0-rt.1"
 dependencies = [
  "gethostname",
  "httparse",
@@ -5142,12 +5159,13 @@ dependencies = [
  "serde_json",
  "tokio",
  "tune-link",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
 [[package]]
 name = "tune-cli"
-version = "0.5.0-power.7"
+version = "0.6.0-rt.1"
 dependencies = [
  "serde_json",
  "tokio",
@@ -5158,7 +5176,7 @@ dependencies = [
 
 [[package]]
 name = "tune-core"
-version = "0.5.0-power.7"
+version = "0.6.0-rt.1"
 dependencies = [
  "dirs 7.0.0",
  "encoding_rs",
@@ -5174,7 +5192,7 @@ dependencies = [
 
 [[package]]
 name = "tune-link"
-version = "0.5.0-power.7"
+version = "0.6.0-rt.1"
 dependencies = [
  "curve25519-dalek",
  "ed25519-dalek",

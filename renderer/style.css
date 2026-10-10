@@ -575,3 +575,34 @@ td .databar { margin-top: 5px; }
   .logs-grid { grid-template-columns: minmax(0, 1fr); gap: 0; }
   .summary { grid-template-columns: 168px minmax(0, 1fr); }
 }
+
+/* ---- ダッシュボード（renderer/dashboard.js） ---- */
+.dgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 12px; margin-bottom: 8px; }
+.dtile { position: relative; padding: 12px 14px 10px; border-radius: 8px; background: var(--bg-raised); box-shadow: var(--shadow-card); min-width: 0; }
+.dtile.st-stopped { opacity: .78; }
+.dt-top { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.dt-name { display: inline-flex; align-items: center; gap: 6px; font-size: 14.5px; cursor: pointer; min-width: 0; }
+.dt-name b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dt-name .i { color: var(--text3); }
+.dt-tags { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.dt-state { margin-left: auto; display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--text3); white-space: nowrap; }
+.dt-state .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text3); display: inline-block; }
+.st-running .dt-state .live-dot { background: var(--green, #2e9e5b); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green, #2e9e5b) 22%, transparent); }
+.st-minute .dt-state .live-dot { background: var(--blue, #2f7fd6); }
+.st-connecting .dt-state .live-dot { background: var(--orange, #d9822b); }
+.dt-metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; margin-top: 10px; }
+.dm { min-width: 0; }
+.dm-k { font-size: 11px; color: var(--text3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dm-v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.25; white-space: nowrap; }
+.dm-v small { font-size: 11px; font-weight: 500; color: var(--text3); margin-left: 1px; }
+.dm.lv-warn .dm-v { color: var(--orange, #d9822b); }
+.dm.lv-crit .dm-v { color: var(--red, #d64545); }
+.dm.lv-na .dm-v { color: var(--text3); }
+.dt-spark { margin-top: 6px; height: 40px; }
+.dt-spark svg { width: 100%; height: 40px; display: block; }
+.dt-top2 { display: flex; gap: 12px; margin-top: 6px; font-size: 12px; color: var(--text2); min-width: 0; }
+.dt-top2 span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dt-alerts { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; }
+.dt-foot { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 8px; font-size: 11.5px; color: var(--text3); }
+.dash-mdm td { vertical-align: middle; }
+@media (max-width: 640px) { .dgrid { grid-template-columns: 1fr; } }

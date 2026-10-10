@@ -117,6 +117,11 @@ pub struct Hello {
     /// 取れなかったもの（PS の ConvertTo-Json は 1 件だと配列にしないことがあるので Value のまま受ける）
     #[serde(default)]
     pub errors: Value,
+    /// サンプラーの実装（"rust" はネイティブの `tune-agent sample`。スクリプトは書かない）と、その版
+    #[serde(rename = "impl", default, skip_serializing_if = "Option::is_none")]
+    pub implementation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -390,6 +395,7 @@ impl Sample {
             put("gpu", g.iter().filter_map(|x| x.util).reduce(f64::max), 1);
             let (used, total) = g.iter().fold((0.0, 0.0), |(u, t), x| (u + x.mem_used_mb.unwrap_or(0.0), t + x.mem_total_mb.unwrap_or(0.0)));
             put("gmem", (total > 0.0).then(|| used / total * 100.0), 1);
+            put("gtemp", g.iter().filter_map(|x| x.temp_c).reduce(f64::max), 0);
             if !g.is_empty() && g.iter().all(|x| x.power_w.is_some()) {
                 put("power_gpu_w", Some(g.iter().map(|x| x.power_w.unwrap_or_default()).sum()), 1);
             }
@@ -594,6 +600,27 @@ fn windows_boot(n: usize, params: &str) -> String {
     )
 }
 
+/// 各機体に置くネイティブのサンプラー（`tune-agent sample`。Windows だけ。置き方は docs/architecture.md）
+pub const NATIVE_REMOTE: &str = "~/.katala-tune/bin/tune-agent.exe";
+
+fn native_args(o: &Opts) -> Vec<String> {
+    [
+        "sample".to_string(),
+        format!("interval={}", secs(o.interval)),
+        format!("procs={}", secs(o.procs_every)),
+        format!("max={}", secs(o.sampler_max_age)),
+        "watch=1".into(),
+    ]
+    .to_vec()
+}
+
+/// この機体のネイティブのサンプラー: アプリ（tune・katala-tune）の隣、無ければ ~/.katala-tune/bin
+fn local_native() -> Option<PathBuf> {
+    let beside = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("tune-agent.exe")));
+    let home = dirs::home_dir().map(|h| h.join(".katala-tune").join("bin").join("tune-agent.exe"));
+    [beside, home].into_iter().flatten().find(|p| p.is_file())
+}
+
 /// 機体ごとの起動方法。macOS / Windows とも標準入力でスクリプトを渡す。
 /// 渡した後も stdin を開き、停止時に閉じる。SSH は多重化しない。
 pub fn launch(node: &Node, o: &Opts) -> Result<Launch, String> {
@@ -616,11 +643,21 @@ pub fn launch(node: &Node, o: &Opts) -> Result<Launch, String> {
         let utf16: Vec<u8> = boot.encode_utf16().flat_map(u16::to_le_bytes).collect();
         let encoded = crate::logs::base64(&utf16);
         let stdin = script.to_vec();
+        let native = native_args(o);
         if node.local {
+            // 同じ版のサンプラー（アプリの隣・~/.katala-tune/bin）があればそれを、無ければ PowerShell 版を動かす
+            if let Some(exe) = local_native() {
+                return Ok(Launch { program: exe.to_string_lossy().into_owned(), args: native, stdin: Vec::new(), keep_stdin: true, cleanup: None });
+            }
             let args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded].iter().map(|s| s.to_string()).collect();
             return Ok(Launch { program: "powershell.exe".into(), args, stdin, keep_stdin: true, cleanup: None });
         }
-        let remote = format!("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}");
+        // 既定シェルは Git Bash（collect.rs と同じ）。置いてあるネイティブのサンプラーを先に使い、無ければ PowerShell 版。
+        // どちらになっても標準入力には PowerShell 版を送る（ネイティブは読み捨てる）
+        let remote = format!(
+            "if [ -x {NATIVE_REMOTE} ]; then exec {NATIVE_REMOTE} {}; else exec powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}; fi",
+            native.join(" ")
+        );
         return Ok(Launch { program: "ssh".into(), args: live_ssh_args(&node.alias, &remote), stdin, keep_stdin: true, cleanup: None });
     }
     Err(format!("この OS（{}）はライブ表示に対応していない", node.os))
@@ -1040,6 +1077,31 @@ impl Live {
         Value::Object(m)
     }
 
+    /// ダッシュボード用の短い形: 段階・サンプラーの実装と負荷・最新の 1 点・上位プロセス 3 件ずつ
+    pub fn brief(&self, id: &str) -> Option<Value> {
+        let st = self.lock();
+        let n = st.nodes.get(id)?;
+        let top = |k: &str| n.procs.as_ref().and_then(|p| p.get(k)).and_then(Value::as_array).map(|a| a.iter().take(3).cloned().collect::<Vec<_>>());
+        Some(json!({
+            "state": n.phase.as_str(),
+            "reason": n.reason,
+            "streaming": st.streams.get(id).is_some_and(|s| !s.stopping),
+            "detail": n.detail,
+            "impl": n.info.as_ref().map(|h| h.implementation.as_deref().unwrap_or("script")),
+            "agent": n.info.as_ref().and_then(|h| h.agent.clone()),
+            "load": n.load.map(|x| (x * 100.0).round() / 100.0),
+            "rss_mb": n.rss_mb,
+            "point": n.ring.last().map(Sample::point),
+            "top_cpu": top("top_cpu"),
+            "top_mem": top("top_mem"),
+        }))
+    }
+
+    /// 最新の上位プロセス（常時監視の集計に付ける）
+    pub fn procs(&self, id: &str) -> Option<Value> {
+        self.lock().nodes.get(id)?.procs.clone()
+    }
+
     /// 画面へ渡す形の全体（間引いた点・最新のコア・上位プロセス・hello）。確認用で、送っていない差分の印は変えない
     pub fn view(&self, id: &str) -> Option<Value> {
         let ui = self.opts.ui_points;
@@ -1354,7 +1416,11 @@ mod tests {
         assert!(mac.keep_stdin && mac.stdin == MAC_LIVE.as_bytes());
         let win = launch(&node("w", "windows"), &Opts { interval: Duration::from_millis(1500), ..o.clone() }).unwrap();
         let cmd = win.args.last().unwrap();
-        assert!(cmd.starts_with("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand "), "{cmd}");
+        assert!(
+            cmd.starts_with("if [ -x ~/.katala-tune/bin/tune-agent.exe ]; then exec ~/.katala-tune/bin/tune-agent.exe sample interval=1.5 procs=5 max=900 watch=1; else exec powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand "),
+            "{cmd}"
+        );
+        assert!(cmd.ends_with("; fi"), "{cmd}");
         assert!(!cmd.contains("live.ps1") && !cmd.contains("mkdir") && !cmd.contains("-File"));
         let boot = windows_boot(WIN_LIVE.len() - 3, "-Interval 1.5 -ProcEvery 5 -MaxSeconds 900 -WatchStdin");
         assert!(boot.contains("OpenStandardInput") && boot.contains(".Read($b,$p,"));
@@ -1365,7 +1431,12 @@ mod tests {
         let mut local_node = node("local", "windows");
         local_node.local = true;
         let local = launch(&local_node, &o).unwrap();
-        assert!(local.cleanup.is_none() && local.keep_stdin && local.stdin == WIN_LIVE[3..]);
+        if local.program == "powershell.exe" {
+            assert!(local.cleanup.is_none() && local.keep_stdin && local.stdin == WIN_LIVE[3..]);
+        } else {
+            assert!(local.program.ends_with("tune-agent.exe") && local.keep_stdin && local.stdin.is_empty());
+            assert_eq!(local.args, ["sample", "interval=1", "procs=5", "max=900", "watch=1"]);
+        }
         assert!(WIN_LIVE[3..].iter().all(|b| b.is_ascii()), "probes/live_win.ps1 は ASCII のみ");
         assert!(launch(&node("x", "linux"), &o).is_err());
     }

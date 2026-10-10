@@ -17,6 +17,13 @@
 //!   tune ai-limits [機体 ...]        Codex の残り枠だけを問い合わせる（codex app-server。間隔の下限を見ない。共用機は呼ばない）
 //!   tune netsec [--probe] [機体 ...]  ネットワークとセキュリティ（「セキュリティ」の画面と同じ JSON）。--probe で先に分析して保存する
 //!                                    （DB は KATALA_TUNE_DATA_DIR で写しを指す）
+//!   tune export [--since ms]         常時監視の集計と最新の分析結果を写しの形で（ハブとして写される側。読み取り専用）
+//!   tune hub-pull                    ハブから 1 回写す（台帳の機体へ SSH して tune export を呼ぶ）
+//!   tune monitor ['{"enabled":true,"hub":"id"}']  常時監視とハブの設定を見る・変える
+//!   tune schedule ['{"logs_minutes":60}']          自動スキャンの間隔を見る・変える（画面と同じ範囲だけ受け付ける）
+//!   tune metrics [機体] [--minutes N] 分ごとの集計（既定は直近 60 分）
+//!   tune dashboard [--minutes N]     ダッシュボードと同じ JSON（ライブの段階は入らない）
+//!   tune monitor-run [--seconds N]   常時監視を N 秒（既定 180、最大 3600）だけ画面なしで動かし、ダッシュボードの JSON を出す（確認用）
 //!   tune live [--seconds N] 機体 ...  ライブ表示のサンプラーを N 秒（既定 30、最大 300）流し、件数・間隔・遅延・
 //!                                    サンプラー自身の負荷を JSON で（読み取り専用。機体は必ず指定する）
 //!
@@ -40,9 +47,14 @@ use tune_core::{collect, logs, nodes, rules};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "使い方: tune <paths|probe|logs|last|power|network|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
+        "使い方: tune <paths|probe|logs|last|power|network|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
     );
     ExitCode::from(2)
+}
+
+/// `--name 数` の数（無い・読めなければ None）
+fn flag(rest: &[String], name: &str) -> Option<i64> {
+    rest.iter().position(|a| a == name).and_then(|i| rest.get(i + 1)).and_then(|v| v.parse().ok())
 }
 
 fn print(v: &Value) {
@@ -304,6 +316,64 @@ async fn main() -> ExitCode {
             },
             Some(Err(e)) => Err(e.to_string()),
             None => return usage(),
+        },
+        "export" => {
+            // 1 分ごとに写されるので、台帳・ログの移行などは動かさず DB だけ開く
+            let since = flag(rest, "--since").unwrap_or(0);
+            tune_core::db::Store::open(&nodes::data_dir())
+                .map_err(|e| e.to_string())
+                .and_then(|d| tune_core::monitor::export(&d, since, &nodes::local_host()))
+                .map(|v| print(&v))
+        }
+        "hub-pull" | "monitor" | "schedule" | "metrics" | "dashboard" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => {
+                let patch = || {
+                    rest.first()
+                        .filter(|a| a.starts_with('{'))
+                        .map(|a| serde_json::from_str::<Value>(a).map_err(|x| format!("JSON を読めない: {x}")))
+                        .transpose()
+                };
+                let minutes = flag(rest, "--minutes").unwrap_or(60);
+                match cmd.as_str() {
+                    "hub-pull" => tune_core::monitor::pull(&e).await,
+                    "monitor" => patch().and_then(|p| {
+                        let cfg = e.reload_config();
+                        let s = match p {
+                            Some(p) => e.with_db(|d| Ok(tune_core::monitor::set_settings(d, &cfg, &p)))??,
+                            None => e.with_db(|d| Ok(tune_core::monitor::settings(d)))?,
+                        };
+                        let pull = e.with_db(|d| d.get_meta("hubPull"))?;
+                        Ok(json!({ "monitor": s.json(), "hub_pull": pull }))
+                    }),
+                    "schedule" => patch().and_then(|p| match p {
+                        Some(p) => e.set_schedule(&p),
+                        None => Ok(e.schedule()),
+                    }),
+                    "metrics" => {
+                        let node = rest.first().filter(|a| !a.starts_with("--")).cloned();
+                        let now = tune_core::db::now_ms();
+                        e.with_db(|d| d.metrics(node.as_deref(), now - minutes * 60_000, i64::MAX))
+                            .map(|rows| Value::Array(rows.iter().map(tune_core::db::metrics::MinuteRow::json).collect()))
+                    }
+                    _ => tune_core::monitor::dashboard(&e, None, minutes),
+                }
+                .map(|v| print(&v))
+            }
+            Err(e) => Err(e),
+        },
+        "monitor-run" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => {
+                use tune_core::live::{Live, Opts, ProcessRoute};
+                let secs = flag(rest, "--seconds").unwrap_or(180).clamp(15, 3600) as u64;
+                let live = Live::new(Arc::new(ProcessRoute), Opts::default(), Box::new(|_| {}));
+                tokio::spawn(live.clone().run_ticker());
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+                tune_core::monitor::run(e.clone(), live.clone(), |ev| eprintln!("monitor: {ev}"), Some(until)).await;
+                let v = tune_core::monitor::dashboard(&e, Some(&live), 60);
+                live.shutdown(std::time::Duration::from_secs(3)).await;
+                v.map(|v| print(&v))
+            }
+            Err(e) => Err(e),
         },
         "live" => live(rest).await,
         c if c.starts_with("agent-") => agent::run(c, rest).await,
