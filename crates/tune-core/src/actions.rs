@@ -161,18 +161,18 @@ fn low_power_mode_script(source: &str, enabled: bool, prev: bool) -> String {
     let previous = if prev { 1 } else { 0 };
     let raw = |key: &str| format!("pmset -g custom | awk '/^{heading}:/{{f=1;next}} /^[^ ]/{{f=0}} f && /^[[:space:]]*{key} / {{print $2; exit}}'");
     let read = format!(
-        "mode=$({}); [ -n \"$mode\" ] || mode=$({}); case \"$mode\" in 0|1) echo \"$mode\";; *) return 2;; esac",
+        "key=powermode; mode=$({}); [ -n \"$mode\" ] || {{ key=lowpowermode; mode=$({}); }}; case \"$mode\" in 0|1) echo \"$key:$mode\";; *) return 2;; esac",
         raw("powermode"),
         raw("lowpowermode")
     );
     [
         "lock=\"$HOME/.katala-tune/power-action.lock\"; mkdir -p -m 700 \"$HOME/.katala-tune\" || exit 6; mkdir \"$lock\" 2>/dev/null || { echo \"another power action is running\"; exit 7; }; trap \"rmdir \\\"$lock\\\"\" EXIT HUP INT TERM".into(),
-        format!("before=$({read}) || {{ echo \"low power mode unsupported\"; exit 6; }}"),
-        format!("[ \"$before\" = {previous} ] || {{ echo \"low power mode changed\"; exit 3; }}"),
-        format!("pmset {flag} powermode {desired} || exit 6"),
-        format!("after=$({read}) || {{ echo \"low power mode verification unverified\"; exit 7; }}"),
-        format!("[ \"$after\" = {desired} ] && exit 0"),
-        format!("[ \"$after\" != {previous} ] && pmset {flag} powermode {previous} && rolled=$({read}) && [ \"$rolled\" = {previous} ] && {{ echo \"low power mode verification failed; restored\"; exit 6; }}"),
+        format!("before=$({read}) || {{ echo \"low power mode unsupported\"; exit 6; }}; before_key=${{before%%:*}}; before_mode=${{before#*:}}"),
+        format!("[ \"$before_mode\" = {previous} ] || {{ echo \"low power mode changed\"; exit 3; }}"),
+        format!("pmset {flag} \"$before_key\" {desired} || exit 6"),
+        format!("after=$({read}) || {{ echo \"low power mode verification unverified\"; exit 7; }}; after_key=${{after%%:*}}; after_mode=${{after#*:}}"),
+        format!("[ \"$after_key\" = \"$before_key\" ] && [ \"$after_mode\" = {desired} ] && exit 0"),
+        format!("[ \"$after_key\" = \"$before_key\" ] && [ \"$after_mode\" = {desired} ] && pmset {flag} \"$before_key\" {previous}"),
         "echo \"low power mode verification or rollback unverified\"; exit 7".into(),
     ].join("\n")
 }

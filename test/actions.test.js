@@ -96,10 +96,9 @@ test('macOS 低電力モード: 電源ドメインの旧値を再読し、検証
   assert.match(p.script, /power-action\.lock/);
   assert.match(p.script, /lowpowermode/);
   assert.match(p.script, /Battery Power/);
-  assert.match(p.script, /\[ "\$before" = 0 \] \|\| \{.*exit 3/);
-  assert.match(p.script, /pmset -b powermode 1/);
-  assert.match(p.script, /\[ "\$after" = 1 \] && exit 0/);
-  assert.match(p.script, /\[ "\$after" != 0 \] && pmset -b powermode 0/);
+  assert.match(p.script, /\[ "\$before_mode" = 0 \] \|\| \{.*exit 3/);
+  assert.match(p.script, /pmset -b "\$before_key" 1/);
+  assert.match(p.script, /\[ "\$after_key" = "\$before_key" \].*\[ "\$after_mode" = 1 \].*exit 0/);
   assert.ok(!/sudo|osascript/.test(p.script));
   assert.deepEqual(p.undo, { type: 'set-low-power-mode', params: { source: 'battery', enabled: false, prev: true } });
   assert.throws(() => plan(mac, { type: 'set-low-power-mode', params: { ...params, source: 'usb' } }, ctx), /電源/);
