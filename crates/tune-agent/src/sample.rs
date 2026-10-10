@@ -10,6 +10,8 @@
 //! PowerShell 版は 1 回ごとに .NET の性能カウンタを読み、起動と常駐に CPU とメモリを使う（実機で 1 コア比 4〜7%・
 //! 120〜150MB）。ここでは同じカウンタを PDH で直接読み、プロセスは NtQuerySystemInformation 1 回で全部読む。
 //! macOS は probes/live_mac.py のまま（すでに 1 コア比 0.5% 未満）。
+// 下の部品（行の組み立て・GPU・プロセス）は Windows の取得部分（sample_win.rs）だけが使う。テストはどの OS でも動かす
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -158,7 +160,6 @@ fn run(_a: &Args) -> Result<(), String> {
 }
 
 /// s 行に種類・時刻・番号を付ける（時刻は書き出す直前）
-#[cfg_attr(not(windows), allow(dead_code))]
 fn with_seq(mut v: Value, seq: u64) -> Value {
     if let Some(m) = v.as_object_mut() {
         m.insert("type".into(), json!("s"));
