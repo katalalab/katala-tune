@@ -122,44 +122,58 @@ fn watts(v: Option<&Value>) -> Option<f64> {
 }
 
 fn power_plan_script(guid: &str, prev_guid: &str) -> String {
-    [
-        "function Read-Plan { $line = & powercfg.exe -getactivescheme; if ($LASTEXITCODE -ne 0) { exit 6 }; $m = [regex]::Match($line, \"[0-9A-Fa-f-]{36}\"); if (-not $m.Success) { exit 6 }; return $m.Value }".into(),
-        "$before = Read-Plan".into(),
+    let body = [
+        "function Read-Plan { $line = & powercfg.exe -getactivescheme; if ($LASTEXITCODE -ne 0) { return $null }; $m = [regex]::Match($line, \"[0-9A-Fa-f-]{36}\"); if (-not $m.Success) { return $null }; return $m.Value }".into(),
+        "function Read-Plan-Retry { $v = Read-Plan; if (-not $v) { Start-Sleep -Milliseconds 200; $v = Read-Plan }; return $v }".into(),
+        "$before = Read-Plan-Retry; if (-not $before) { Write-Output \"power plan unreadable\"; exit 6 }".into(),
         format!("if ($before -ne \"{prev_guid}\") {{ Write-Output \"power plan changed\"; exit 3 }}"),
         format!("& powercfg.exe -setactive {guid}; if ($LASTEXITCODE -ne 0) {{ exit 6 }}"),
-        "$after = Read-Plan".into(),
+        "$after = Read-Plan-Retry".into(),
         format!("if ($after -eq \"{guid}\") {{ exit 0 }}"),
-        format!("if ($after -ne \"{prev_guid}\") {{ & powercfg.exe -setactive {prev_guid}; if ($LASTEXITCODE -eq 0) {{ $rolled = Read-Plan; if ($rolled -eq \"{prev_guid}\") {{ Write-Output \"power plan verification failed; restored\"; exit 6 }} }} }}"),
-        "Write-Output \"power plan verification failed\"; exit 6".into(),
-    ].join("; ")
+        format!("if ($after -and $after -ne \"{prev_guid}\") {{ & powercfg.exe -setactive {prev_guid}; if ($LASTEXITCODE -eq 0) {{ $rolled = Read-Plan-Retry; if ($rolled -eq \"{prev_guid}\") {{ Write-Output \"power plan verification failed; restored\"; exit 6 }} }} }}"),
+        "Write-Output \"power plan verification or rollback unverified\"; exit 7".into(),
+    ].join("; ");
+    format!(
+        "$mutex = New-Object System.Threading.Mutex($false, \"Global\\KatalaTunePowerControl\"); $held = $false; try {{ try {{ $held = $mutex.WaitOne(0) }} catch [System.Threading.AbandonedMutexException] {{ $held = $true }}; if (-not $held) {{ Write-Output \"another power action is running\"; exit 7 }}; {body}; }} finally {{ if ($held) {{ $mutex.ReleaseMutex() }}; $mutex.Dispose() }}"
+    )
 }
 
 fn gpu_power_script(uuid: &str, watts: f64, min: f64, max: f64, prev_w: f64) -> String {
-    [
-        format!("function Read-Power {{ $line = & nvidia-smi.exe --id={uuid} --query-gpu=power.min_limit,power.max_limit,power.limit --format=csv,noheader,nounits; if ($LASTEXITCODE -ne 0 -or -not $line) {{ exit 6 }}; $r = @(); foreach ($x in ($line -split \",\")) {{ $r += [double]::Parse($x.Trim(), [Globalization.CultureInfo]::InvariantCulture) }}; if ($r.Count -ne 3) {{ exit 6 }}; return $r }}"),
-        "$v = @(Read-Power)".into(),
+    let body = [
+        format!("function Read-Power {{ $line = & nvidia-smi.exe --id={uuid} --query-gpu=power.min_limit,power.max_limit,power.limit --format=csv,noheader,nounits; if ($LASTEXITCODE -ne 0 -or -not $line) {{ return @() }}; try {{ $r = @(); foreach ($x in ($line -split \",\")) {{ $r += [double]::Parse($x.Trim(), [Globalization.CultureInfo]::InvariantCulture) }}; if ($r.Count -ne 3) {{ return @() }}; return $r }} catch {{ return @() }} }}"),
+        "function Read-Power-Retry { $v = @(Read-Power); if ($v.Count -ne 3) { Start-Sleep -Milliseconds 200; $v = @(Read-Power) }; return $v }".into(),
+        "$v = @(Read-Power-Retry); if ($v.Count -ne 3) { Write-Output \"GPU power unreadable\"; exit 6 }".into(),
         format!("if ($v[0] -ne {min} -or $v[1] -ne {max} -or $v[2] -ne {prev_w}) {{ Write-Output \"GPU power state changed\"; exit 3 }}"),
         format!("& nvidia-smi.exe --id={uuid} -pl {watts}; if ($LASTEXITCODE -ne 0) {{ exit 6 }}"),
-        "$after = @(Read-Power)".into(),
+        "$after = @(Read-Power-Retry)".into(),
         format!("if ($after[2] -eq {watts}) {{ exit 0 }}"),
-        format!("if ($after[2] -ne {prev_w} -and $after[0] -le {prev_w} -and $after[1] -ge {prev_w}) {{ & nvidia-smi.exe --id={uuid} -pl {prev_w}; if ($LASTEXITCODE -eq 0) {{ $rolled = @(Read-Power); if ($rolled[2] -eq {prev_w}) {{ Write-Output \"power limit verification failed; restored\"; exit 6 }} }} }}"),
-        "Write-Output \"power limit verification failed\"; exit 6".into(),
-    ].join("; ")
+        format!("if ($after.Count -eq 3 -and $after[2] -ne {prev_w} -and $after[0] -le {prev_w} -and $after[1] -ge {prev_w}) {{ & nvidia-smi.exe --id={uuid} -pl {prev_w}; if ($LASTEXITCODE -eq 0) {{ $rolled = @(Read-Power-Retry); if ($rolled.Count -eq 3 -and $rolled[2] -eq {prev_w}) {{ Write-Output \"power limit verification failed; restored\"; exit 6 }} }} }}"),
+        "Write-Output \"power limit verification or rollback unverified\"; exit 7".into(),
+    ].join("; ");
+    format!(
+        "$mutex = New-Object System.Threading.Mutex($false, \"Global\\KatalaTunePowerControl\"); $held = $false; try {{ try {{ $held = $mutex.WaitOne(0) }} catch [System.Threading.AbandonedMutexException] {{ $held = $true }}; if (-not $held) {{ Write-Output \"another power action is running\"; exit 7 }}; {body}; }} finally {{ if ($held) {{ $mutex.ReleaseMutex() }}; $mutex.Dispose() }}"
+    )
 }
 
 fn low_power_mode_script(source: &str, enabled: bool, prev: bool) -> String {
     let (flag, heading) = if source == "ac" { ("-c", "AC Power") } else { ("-b", "Battery Power") };
     let desired = if enabled { 1 } else { 0 };
     let previous = if prev { 1 } else { 0 };
-    let read = format!("pmset -g custom | awk '/^{heading}:/{{f=1;next}} /^[^ ]/{{f=0}} f && /^[[:space:]]*powermode / {{print $2; exit}}'");
+    let raw = |key: &str| format!("pmset -g custom | awk '/^{heading}:/{{f=1;next}} /^[^ ]/{{f=0}} f && /^[[:space:]]*{key} / {{print $2; exit}}'");
+    let read = format!(
+        "mode=$({}); [ -n \"$mode\" ] || mode=$({}); case \"$mode\" in 0|1) echo \"$mode\";; *) return 2;; esac",
+        raw("powermode"),
+        raw("lowpowermode")
+    );
     [
-        format!("before=$({read})"),
+        "lock=\"$HOME/.katala-tune/power-action.lock\"; mkdir -p -m 700 \"$HOME/.katala-tune\" || exit 6; mkdir \"$lock\" 2>/dev/null || { echo \"another power action is running\"; exit 7; }; trap \"rmdir \\\"$lock\\\"\" EXIT HUP INT TERM".into(),
+        format!("before=$({read}) || {{ echo \"low power mode unsupported\"; exit 6; }}"),
         format!("[ \"$before\" = {previous} ] || {{ echo \"low power mode changed\"; exit 3; }}"),
         format!("pmset {flag} powermode {desired} || exit 6"),
-        format!("after=$({read})"),
+        format!("after=$({read}) || {{ echo \"low power mode verification unverified\"; exit 7; }}"),
         format!("[ \"$after\" = {desired} ] && exit 0"),
         format!("[ \"$after\" != {previous} ] && pmset {flag} powermode {previous} && rolled=$({read}) && [ \"$rolled\" = {previous} ] && {{ echo \"low power mode verification failed; restored\"; exit 6; }}"),
-        "echo \"low power mode verification failed\"; exit 6".into(),
+        "echo \"low power mode verification or rollback unverified\"; exit 7".into(),
     ].join("\n")
 }
 
@@ -387,5 +401,5 @@ pub async fn execute_with(runner: &dyn Runner, node: &Node, action: &Value, prot
         .map(str::to_string)
         .unwrap_or_else(|| if ok { "完了".into() } else { format!("失敗（exit {}）", res.code_str()) });
     let output = js::slice16_tail(js::trim(&(res.out.clone() + &res.err)), 1500);
-    Ok(Outcome { ok, code: res.code, outcome, output, undo: if ok { p.undo.clone() } else { None } })
+    Ok(Outcome { ok, code: res.code, outcome, output, undo: if ok || res.code == Some(7) { p.undo.clone() } else { None } })
 }

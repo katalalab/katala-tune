@@ -70,6 +70,17 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+struct ActionTargetLock<'a> {
+    targets: &'a Mutex<HashSet<String>>,
+    node_id: String,
+}
+
+impl Drop for ActionTargetLock<'_> {
+    fn drop(&mut self) {
+        lock(self.targets).remove(&self.node_id);
+    }
+}
+
 /// main.js の summarize。履歴の表に入れる要約
 pub fn summarize(data: &Value, findings: &[Value]) -> Value {
     let d = Some(data);
@@ -509,12 +520,13 @@ impl Engine {
         undo_of: Option<&str>,
         confirm: Confirm,
     ) -> Result<Value, String> {
-        {
+        let _target_lock = {
             let mut targets = lock(&self.action_targets);
             if !targets.insert(node_id.to_string()) {
                 return Ok(json!({ "ok": false, "refused": "この機体では別の変更操作を確認または実行中" }));
             }
-        }
+            ActionTargetLock { targets: &self.action_targets, node_id: node_id.to_string() }
+        };
         // MutexGuard を await をまたいで保持せず、確認から実行記録までを機体単位で直列化する。
         let result = async {
             let refused = |m: String| Ok(json!({ "ok": false, "refused": m }));
@@ -588,7 +600,6 @@ impl Engine {
             Ok(json!({ "ok": r.ok, "code": r.code, "outcome": r.outcome, "output": r.output, "undo": r.undo, "entry": entry }))
         }
         .await;
-        lock(&self.action_targets).remove(node_id);
         result
     }
 

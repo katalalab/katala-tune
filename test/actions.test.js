@@ -60,6 +60,7 @@ test('電源プラン: GUID と旧値を検証し、実機で再読・検証・�
   assert.match(p.script, /\$before -ne "381b4222-f694-41f0-9685-ff5bb260df2e".*exit 3/);
   assert.match(p.script, /\$after -eq "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c".*exit 0/);
   assert.match(p.script, /\$after -ne "381b4222-f694-41f0-9685-ff5bb260df2e".*-setactive 381b4222/);
+  assert.match(p.script, /Global\\KatalaTunePowerControl.*WaitOne\(0\).*Read-Plan-Retry/);
   assert.ok(!/ \/setactive/.test(p.script));
   assert.deepEqual(p.undo, { type: 'set-power-plan', params: { guid: '381b4222-f694-41f0-9685-ff5bb260df2e', prev_guid: '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c' } });
   assert.throws(() => plan(win, { type: 'set-power-plan', params: { guid: 'x && shutdown' } }, ctx), /GUID/);
@@ -75,6 +76,7 @@ test('GPU 電力制限: UUID・有限の上下限・旧値を検証し、実機�
   assert.match(p.script, /-pl 180/);
   assert.match(p.script, /\$after\[2\] -eq 180.*exit 0/);
   assert.match(p.script, /\$after\[2\] -ne 200.*\$after\[0\] -le 200.*\$after\[1\] -ge 200.*-pl 200/);
+  assert.match(p.script, /Global\\KatalaTunePowerControl.*WaitOne\(0\).*Read-Power-Retry/);
   assert.ok(!p.script.includes("'"), 'PowerShell 本体にシングルクォートが無い');
   assert.deepEqual(p.undo, { type: 'set-gpu-power-limit', params: { ...params, watts: 200, prev_w: 180 } });
   for (const bad of [
@@ -91,6 +93,7 @@ test('macOS 低電力モード: 電源ドメインの旧値を再読し、検証
   const params = { source: 'battery', enabled: true, prev: false };
   const p = plan(mac, { type: 'set-low-power-mode', params }, ctx);
   assert.match(p.script, /pmset -g custom/);
+  assert.match(p.script, /power-action\.lock.*lowpowermode/);
   assert.match(p.script, /Battery Power/);
   assert.match(p.script, /\[ "\$before" = 0 \] \|\| \{.*exit 3/);
   assert.match(p.script, /pmset -b powermode 1/);
