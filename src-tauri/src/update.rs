@@ -4,6 +4,8 @@
 //! - 自動更新がオン（既定。メニューの「自動で更新する」・meta の update.auto）なら、新しい版を裏でダウンロードして署名を確かめ
 //!   （tauri.conf.json の公開鍵・署名に入った版が知らせの版と同じこと）、ウィンドウを閉じていて分析・取り込み中でないときに入れて再起動する。
 //!   入れる前にライブ・常時監視のサンプラーを止める。ウィンドウを開いているあいだは待ち、通知で知らせる
+//! - 自動で入れるのは公開から2時間たってから（latest.json の pub_date）。そのあいだに問題の版を prerelease・下書きに戻せば、
+//!   どの機体にも入らない（main へのマージから全機体に届くまでの止める余地。docs/release.md）
 //! - オフなら通知だけ。メニューの「更新を確認…」から、確認ダイアログで「入れる」を選んだときだけ入れる
 //! - 状態は meta の updateState（ダッシュボードと `tune update` で見る）
 
@@ -25,6 +27,8 @@ const FIRST_CHECK: Duration = Duration::from_secs(60);
 const EVERY: Duration = Duration::from_secs(6 * 3600);
 /// 入れられる時（ウィンドウを閉じた・分析が終わった）を見る間隔
 const TICK: Duration = Duration::from_secs(60);
+/// 公開から自動で入れるまで（止める余地）
+const SOAK: Duration = Duration::from_secs(2 * 3600);
 
 /// 確認・ダウンロード・入れる途中か（メニューを続けて押しても1つだけ）
 static BUSY: AtomicBool = AtomicBool::new(false);
@@ -98,14 +102,14 @@ pub fn start(app: AppHandle) {
             }
             return;
         }
-        // 開発ビルドの検証用: 確かめる間隔を秒で（KATALA_TUNE_DEV_UPDATE_EVERY）
-        let every = if cfg!(debug_assertions) {
-            std::env::var("KATALA_TUNE_DEV_UPDATE_EVERY").ok().and_then(|s| s.parse().ok()).map_or(EVERY, Duration::from_secs)
-        } else {
-            EVERY
+        // 開発ビルドの検証用: 確かめる間隔・公開から入れるまでを秒で（KATALA_TUNE_DEV_UPDATE_EVERY・KATALA_TUNE_DEV_UPDATE_SOAK）
+        let dev = |k: &str, d: Duration| {
+            if cfg!(debug_assertions) { std::env::var(k).ok().and_then(|s| s.parse().ok()).map_or(d, Duration::from_secs) } else { d }
         };
+        let (every, soak) = (dev("KATALA_TUNE_DEV_UPDATE_EVERY", EVERY), dev("KATALA_TUNE_DEV_UPDATE_SOAK", SOAK));
         tokio::time::sleep(if every < FIRST_CHECK { every } else { FIRST_CHECK }).await;
-        let mut ready: Option<(Update, Vec<u8>)> = None;
+        // 用意した版・その中身・自動で入れてよい時刻（公開日 + soak。公開日が無ければ用意した時から）
+        let mut ready: Option<(Update, Vec<u8>, i64)> = None;
         let mut told: Option<String> = None;
         let mut last_check: Option<Instant> = None;
         loop {
@@ -116,11 +120,13 @@ pub fn start(app: AppHandle) {
                     Ok(Some(u)) => {
                         record(&app, json!({ "checked_at": now_ms(), "available": u.version, "error": null }));
                         let auto = auto(&app);
-                        if auto && ready.as_ref().is_none_or(|(r, _)| r.version != u.version) {
+                        if auto && ready.as_ref().is_none_or(|(r, _, _)| r.version != u.version) {
                             match download(&u).await {
                                 Ok(bytes) => {
-                                    record(&app, json!({ "downloaded": u.version, "downloaded_at": now_ms() }));
-                                    ready = Some((u, bytes));
+                                    let published = u.date.map_or(now_ms(), |d| d.unix_timestamp() * 1000);
+                                    let after = published.saturating_add(soak.as_millis() as i64);
+                                    record(&app, json!({ "downloaded": u.version, "downloaded_at": now_ms(), "install_after": after }));
+                                    ready = Some((u, bytes, after));
                                 }
                                 Err(e) => record(&app, json!({ "error": e })),
                             }
@@ -139,15 +145,15 @@ pub fn start(app: AppHandle) {
             if ready.is_some() && !auto(&app) {
                 ready = None;
             }
-            if let Some((u, bytes)) = ready.take() {
-                if idle(&app) && !BUSY.swap(true, Ordering::SeqCst) {
+            if let Some((u, bytes, after)) = ready.take() {
+                if now_ms() >= after && idle(&app) && !BUSY.swap(true, Ordering::SeqCst) {
                     // 入れたら再起動してここには戻らない。失敗したら状態に残し、次の確認でやり直す
                     if let Err(e) = install(&app, &u, &bytes) {
                         record(&app, json!({ "error": e }));
                     }
                     BUSY.store(false, Ordering::SeqCst);
                 } else {
-                    if told.as_deref() != Some(u.version.as_str()) {
+                    if now_ms() >= after && told.as_deref() != Some(u.version.as_str()) {
                         notify(
                             &app,
                             &format!("Katala Tune: {} を入れる準備ができました", u.version),
@@ -155,7 +161,7 @@ pub fn start(app: AppHandle) {
                         );
                         told = Some(u.version.clone());
                     }
-                    ready = Some((u, bytes));
+                    ready = Some((u, bytes, after));
                 }
             }
             tokio::time::sleep(TICK).await;
