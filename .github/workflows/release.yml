@@ -185,7 +185,7 @@ jobs:
           gh release create "$TAG" dist/* --repo "$REPO" "${mode[@]}" --verify-tag --title "Katala Tune $TAG" --notes-file notes.md --generate-notes
           # 公開したら知らせ（latest.json）を読み返して、版が合っていることを確かめる
           if [ "${mode[0]}" = --latest ]; then
-            for i in 1 2 3 4 5 6; do
+            for _ in 1 2 3 4 5 6; do
               got=$(curl -fsSL "https://github.com/$REPO/releases/latest/download/latest.json" | jq -r .version || true)
               [ "$got" = "$v" ] && { echo "latest.json: $got"; exit 0; }
               sleep 10
