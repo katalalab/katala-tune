@@ -415,8 +415,7 @@ pub fn dashboard(engine: &Engine, live: Option<&Live>, minutes: i64) -> Result<V
     let (s, rows, pull, collecting) = engine.with_db(|d| {
         Ok((settings(d), d.metrics(None, since - 6 * MINUTE, i64::MAX)?, d.get_meta("hubPull")?.unwrap_or(Value::Null), should_collect(d, now)))
     })?;
-    let lasts: HashMap<String, Value> =
-        engine.last()?.into_iter().filter_map(|r| Some((r.get("node_id")?.as_str()?.to_string(), r))).collect();
+    let lasts: HashMap<String, Value> = engine.last()?.into_iter().filter_map(|r| Some((r.get("node_id")?.as_str()?.to_string(), r))).collect();
     let mut by_node: HashMap<&str, Vec<MinuteRow>> = HashMap::new();
     for r in &rows {
         by_node.entry(r.node_id.as_str()).or_default().push(r.clone());
