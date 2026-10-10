@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
 
 fn watts(value: Option<&Value>) -> Option<f64> {
     value.and_then(Value::as_f64).filter(|value| value.is_finite() && *value >= 0.0)
@@ -104,28 +105,47 @@ pub fn integrate(points: &Value, interval_seconds: f64) -> Value {
     let mut covered_seconds = 0.0;
     let mut duration_seconds = 0.0;
     let mut previous: Option<Point> = None;
+    let mut watermarks: HashMap<(String, String), (i64, f64)> = HashMap::new();
+    let mut retired_epochs = HashSet::new();
     for raw in points.as_array().into_iter().flatten() {
         let Some(current) = point(raw) else {
             previous = None;
             continue;
         };
-        if let Some(prior) = &previous {
-            if prior.epoch != current.epoch || prior.source != current.source {
-                previous = Some(current);
-                continue;
-            }
-            if current.seq <= prior.seq || current.t <= prior.t {
-                continue;
-            }
-            let seconds = (current.t - prior.t) / 1000.0;
-            duration_seconds += seconds;
-            if seconds <= interval * 3.0
-                && let (Some(before), Some(after)) = (prior.watts, current.watts)
-            {
-                covered_seconds += seconds;
-                kwh += (before + after) * seconds / 7_200_000.0;
-            }
+        if retired_epochs.contains(&current.epoch) {
+            continue;
         }
+        let current_key = (current.epoch.clone(), current.source.clone());
+        if previous.is_none() {
+            watermarks.insert(current_key, (current.seq, current.t));
+            previous = Some(current);
+            continue;
+        }
+        let prior = previous.as_ref().expect("previous point is set").clone();
+        if prior.epoch != current.epoch || prior.source != current.source {
+            if prior.epoch != current.epoch {
+                retired_epochs.insert(prior.epoch);
+            } else if let Some((seq, t)) = watermarks.get(&current_key)
+                && (current.seq <= *seq || current.t <= *t)
+            {
+                continue;
+            }
+            watermarks.insert(current_key, (current.seq, current.t));
+            previous = Some(current);
+            continue;
+        }
+        if current.seq <= prior.seq || current.t <= prior.t {
+            continue;
+        }
+        let seconds = (current.t - prior.t) / 1000.0;
+        duration_seconds += seconds;
+        if seconds <= interval * 3.0
+            && let (Some(before), Some(after)) = (prior.watts, current.watts)
+        {
+            covered_seconds += seconds;
+            kwh += (before + after) * seconds / 7_200_000.0;
+        }
+        watermarks.insert(current_key, (current.seq, current.t));
         previous = Some(current);
     }
     json!({

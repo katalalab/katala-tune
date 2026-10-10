@@ -79,6 +79,24 @@
       "interval_seconds": 1.7976931348623157e308,
       "points": [{ "t": 0, "seq": 0, "epoch": "a", "source": "meter", "watts": 1.7976931348623157e308 }, { "t": 1.7976931348623157e308, "seq": 1, "epoch": "a", "source": "meter", "watts": 1.7976931348623157e308 }],
       "expected": { "kwh": null, "covered_seconds": 1.7976931348623156e305, "duration_seconds": 1.7976931348623156e305, "coverage": 1 }
+    },
+    {
+      "name": "a delayed replay cannot replace the active source stream",
+      "interval_seconds": 1,
+      "points": [{ "t": 0, "seq": 1, "epoch": "boot", "source": "a", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "boot", "source": "a", "watts": 100 }, { "t": 0, "seq": 1, "epoch": "boot", "source": "b", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "boot", "source": "b", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "boot", "source": "a", "watts": 100 }, { "t": 2000, "seq": 3, "epoch": "boot", "source": "b", "watts": 100 }, { "t": 3000, "seq": 4, "epoch": "boot", "source": "b", "watts": 100 }],
+      "expected": { "kwh": 0.00011111111111111112, "covered_seconds": 4, "duration_seconds": 4, "coverage": 1 }
+    },
+    {
+      "name": "a source may return in the same epoch with newer points",
+      "interval_seconds": 1,
+      "points": [{ "t": 0, "seq": 1, "epoch": "boot", "source": "a", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "boot", "source": "a", "watts": 100 }, { "t": 0, "seq": 1, "epoch": "boot", "source": "b", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "boot", "source": "b", "watts": 100 }, { "t": 2000, "seq": 3, "epoch": "boot", "source": "a", "watts": 100 }, { "t": 3000, "seq": 4, "epoch": "boot", "source": "a", "watts": 100 }],
+      "expected": { "kwh": 0.00008333333333333334, "covered_seconds": 3, "duration_seconds": 3, "coverage": 1 }
+    },
+    {
+      "name": "a retired epoch rejects a delayed higher sequence replay",
+      "interval_seconds": 1,
+      "points": [{ "t": 0, "seq": 1, "epoch": "a", "source": "meter", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "a", "source": "meter", "watts": 100 }, { "t": 0, "seq": 1, "epoch": "b", "source": "meter", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "b", "source": "meter", "watts": 100 }, { "t": 2000, "seq": 100, "epoch": "a", "source": "meter", "watts": 100 }, { "t": 2000, "seq": 3, "epoch": "b", "source": "meter", "watts": 100 }, { "t": 3000, "seq": 4, "epoch": "b", "source": "meter", "watts": 100 }],
+      "expected": { "kwh": 0.00011111111111111112, "covered_seconds": 4, "duration_seconds": 4, "coverage": 1 }
     }
   ]
 }
