@@ -1,5 +1,9 @@
 # 変更履歴
 
+## 未リリース
+
+- リポジトリの衛生監査（opt-in・読み取り専用）: `npm run hygiene` / `tune hygiene`。dirty・未 push・stash・ghq のパスと origin の不一致を機体横断で集め、読めない・上限超過は未観測として残す。
+
 ## 0.4.0
 
 - Rust + Tauri 2 を標準の開発・配布経路にし、OS の WebView を利用する。
