@@ -524,8 +524,9 @@ pub fn log_findings(db: &Store, node_id: &str, now: i64) -> rusqlite::Result<Vec
             json!({ "node_id": node_id, "source": "neonmonitor" }),
         );
     }
-    // サービスの起動失敗・異常終了（7000/7009/7023/7031/7034）
-    let svc = sum(&|r| prov(r, "Service Control Manager") && ["7000", "7009", "7023", "7031", "7034"].iter().any(|e| ev(r, e)));
+    // サービスの起動失敗・異常終了（7000/7009/7023/7031/7034）。正常な停止（6006）の直前60秒の分は probe が info にする
+    // （再起動のたびに sshd が 7031 を出す。PowerShell/Win32-OpenSSH#2171）ので数えない
+    let svc = sum(&|r| prov(r, "Service Control Manager") && ["7000", "7009", "7023", "7031", "7034"].iter().any(|e| ev(r, e)) && r.level != "info");
     if svc >= 3 {
         push(
             "log-service",

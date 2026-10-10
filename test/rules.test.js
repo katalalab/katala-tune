@@ -46,6 +46,17 @@ test('windows: 瞬間値だけ高いプロセスは暴走扱いしない', () =>
   assert.ok(f.find((x) => x.id === 'runaway-PresentMon_x64-11'));
 });
 
+test('起動から2分未満のプロセス（すぐ終わるバッチ）は暴走扱いしない。経過が分からないものは数える', () => {
+  const top_cpu = [
+    { pid: 446, name: 'python3', cpu: 88, etime: '00:32' },
+    { pid: 447, name: 'python3', cpu: 88, etime: '02:00' },
+    { pid: 448, name: 'node', cpu: 95, etime: '1-02:03:04' },
+    { pid: 449, name: 'ruby', cpu: 90 },
+  ];
+  const ids = analyze(mac({ processes: { top_cpu, apps: [], apps_cpu: [] } })).filter((x) => x.id.startsWith('runaway-')).map((x) => x.id);
+  assert.deepEqual(ids, ['runaway-python3-447', 'runaway-node-448', 'runaway-ruby-449']);
+});
+
 test('システムディスクの空き 5% 未満は重大で、掃除コマンドを添える', () => {
   const f = analyze(mac({ disk: [{ mount: '/', total_gb: 460, free_gb: 16, free_pct: 3.5 }], caches: [{ path: '~/.npm/_cacache', gb: 4 }] }));
   const d = f.find((x) => x.id === 'disk-/');

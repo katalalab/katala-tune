@@ -155,6 +155,17 @@ test('同じエラーの洪水（24時間で200件以上）と .NET の未処理
   assert.ok(f.find((x) => x.id === 'log-dropped'));
 });
 
+test('正常な停止の直前のサービス停止（probe が info にしたもの）はサービスの異常に数えない', () => {
+  const db = openDb(tmp());
+  const now = Date.now();
+  const mk = (level, i) => ({ uid: `scm-${level}-${i}`, ts: now - i * 1000, level, provider: 'Service Control Manager', event_id: '7031', message: `The OpenSSH SSH Server service terminated unexpectedly ${i}` });
+  db.insertLogs('pc', 'win_system', normalize('win_system', [...Array(5)].map((_, i) => mk('info', i))));
+  assert.equal(logFindings(db, 'pc', now).find((x) => x.id === 'log-service'), undefined);
+  // 停止と無関係な時刻の分（error のまま）は数える
+  db.insertLogs('pc', 'win_system', normalize('win_system', [...Array(3)].map((_, i) => mk('error', 10 + i))));
+  assert.match(logFindings(db, 'pc', now).find((x) => x.id === 'log-service').title, / 3 件$/);
+});
+
 test('volmgr の 161・162（BSOD 後のクラッシュダンプ作成）はディスクのエラーに数えない', () => {
   const db = openDb(tmp());
   const now = Date.now();

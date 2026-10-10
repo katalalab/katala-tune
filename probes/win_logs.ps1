@@ -1,4 +1,4 @@
-﻿# katala-tune Windows log collector. Read-only, one JSON line. PS 5.1, ASCII only (BOM). No indentation: command-line size limit.
+﻿# katala-tune Windows logs. Read-only. PS 5.1, ASCII+BOM, no indent (cmdline limit).
 param([long]$SysCursor = 0, [long]$AppCursor = 0, [long]$NeonCursor = 0)
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
@@ -17,13 +17,14 @@ if ($s.Length -gt 400) { $s = $s.Substring(0, 400) }
 return $s
 }
 function Read-EventLog($logName, [long]$cursor, [bool]$withWarnings) {
-$lv = if ($withWarnings) { '(Level=1 or Level=2 or Level=3)' } else { '(Level=1 or Level=2)' }
+$lv = if ($withWarnings) { '(Level=1 or Level=2 or Level=3 or EventID=6006)' } else { '(Level=1 or Level=2)' }
 $cond = if ($cursor -gt 0) { "EventRecordID > $cursor" } else { 'TimeCreated[timediff(@SystemTime) <= 259200000]' }
 $xpath = "*[System[$lv and $cond]]"
 $ev = @(Get-WinEvent -LogName $logName -FilterXPath $xpath -MaxEvents 2000 -ErrorAction SilentlyContinue)
 if ($withWarnings) { $ev = @($ev | Where-Object { $_.Level -ne 3 -or $_.ProviderName -match $WarnProviders }) }
 $newest = $cursor
 foreach ($e in $ev) { if ($e.RecordId -gt $newest) { $newest = $e.RecordId } }
+$sd=@($ev|?{$_.Id-eq6006}|%{EpochMs $_.TimeCreated})
 $g = @{}
 $o = @()
 foreach ($e in @($ev | Sort-Object RecordId)) {
@@ -31,9 +32,11 @@ $msg = $e.Message
 if (-not $msg) { $msg = "(no message) " + (($e.Properties | ForEach-Object { $_.Value }) -join ' ') }
 if ($msg.Length -gt 1000) { $msg = $msg.Substring(0, 1000) }
 $ts = EpochMs $e.TimeCreated
-$k = "$($e.ProviderName)|$($e.Id)|" + (Norm $msg)
+$q=$e.ProviderName-eq'Service Control Manager'-and($sd|?{$_-ge$ts-and$_-lt$ts+6e4})
+$k = "$($e.ProviderName)|$($e.Id)|$q|" + (Norm $msg)
 if ($g[$k]) { $g[$k].count++; $g[$k].ts = $ts; continue }
 $lvl = switch ($e.Level) { 1 { 'critical' } 2 { 'error' } 3 { 'warn' } default { 'info' } }
+if($q){$lvl='info'}
 $r = [pscustomobject]@{ uid = [string]$e.RecordId; ts = $ts; level = $lvl; provider = $e.ProviderName; event_id = [string]$e.Id; message = $msg; count = 1 }
 $g[$k] = $r
 $o += $r
