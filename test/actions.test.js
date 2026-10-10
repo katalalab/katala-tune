@@ -59,7 +59,7 @@ test('電源プラン: GUID と旧値を検証し、実機で再読・検証・�
   assert.match(p.script, /powercfg\.exe -setactive 8c5e7fda/);
   assert.match(p.script, /\$before -ne "381b4222-f694-41f0-9685-ff5bb260df2e".*exit 3/);
   assert.match(p.script, /\$after -eq "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c".*exit 0/);
-  assert.match(p.script, /\$after -ne "381b4222-f694-41f0-9685-ff5bb260df2e".*-setactive 381b4222/);
+  assert.match(p.script, /\$after -eq "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c".*-setactive 381b4222/);
   assert.match(p.script, /Global\\KatalaTunePowerControl.*WaitOne\(0\).*Read-Plan-Retry/);
   assert.ok(!/ \/setactive/.test(p.script));
   assert.deepEqual(p.undo, { type: 'set-power-plan', params: { guid: '381b4222-f694-41f0-9685-ff5bb260df2e', prev_guid: '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c' } });
