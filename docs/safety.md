@@ -45,6 +45,13 @@ NeonMonitor（Windows のメモリ監視・自動強制終了ツール）の静�
 - `probes/live_*` も読み取り専用。集めるのは数値と、上位プロセスの PID・実行ファイル名（macOS は .app の名前も）だけで、引数・環境変数・パスは出さない。
 - 機体に常駐させない。画面が見ているあいだだけ動かし、合図が 2 分途切れたら止める。止めた後に機体に残らないよう、標準入力が閉じたら終わる・sshd のプロセスを見張る・15 分で自分から終わる、の 3 つを重ねている（docs/architecture.md。最初の 2 つは、ssh を止めても Windows 機にサンプラーが残った実機の失敗から足した）。
 
+## プロセスの増殖・木の集計
+
+- `probes/mac_probe.py`・`win_probe.ps1` の `processes.groups`（同じ種類の本数・合計・孤児・親・所有者）と `processes.trees`（根ごとの合計・子の数）は読み取り専用で、何も止めない・変えない。所見（`proc-multi-*`・`proc-orphan-*`・`mem-tree-*`）は提案だけで、操作（action）を付けない。`git config --global core.fsmonitor false` なども文面の提案で、実行は承認制の別経路。
+- 「同じ種類」の鍵は実行ファイル名で作る。node・python・git などのインタープリタだけは、種類（MCP サーバなど）を分けるために引数を**その場で一時的に読み**、安全な文字の短いスクリプト名（パス・ユーザー名の部分・引数・値は除く）だけを鍵に使う。引数・環境変数・パスは出力にも保存にも載せない（`test/process-multiplication.test.js`）。
+- 孤児は親が居ない（PPID 1・親の PID が無い・親が子より後に起動した＝PID の再利用）プロセス。デーモン化した常駐（git fsmonitor など）は設計上 PPID 1 になるので、孤児数は所見の参考で、閾値は本数と合計メモリで決める。所有者は macOS が uid 500 未満、Windows がセッション 0（サービスと SSH ログオン）を system とする。
+- 木の根は、OS の起動役（launchd・explorer・services など）の直下まで辿って決める。単一プロセスの RSS だけで止める判断はしない。
+
 ## ログの取り扱い
 
 - 収集元は許可したものだけ: Windows の System（エラー以上と、ハードウェア・ドライバ・ディスク・メモリ枯渇の警告）、Application（エラー以上）、NeonMonitor の `guard.log`。macOS の DiagnosticReports（ファイル名と見出しだけ。スタック等の中身は読まない）と、カーネルのエラー。
