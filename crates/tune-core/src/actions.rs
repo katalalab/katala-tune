@@ -127,14 +127,14 @@ fn power_plan_script(guid: &str, prev_guid: &str) -> String {
         "function Read-Plan-Retry { $v = Read-Plan; if (-not $v) { Start-Sleep -Milliseconds 200; $v = Read-Plan }; return $v }".into(),
         "$before = Read-Plan-Retry; if (-not $before) { Write-Output \"power plan unreadable\"; exit 6 }".into(),
         format!("if ($before -ne \"{prev_guid}\") {{ Write-Output \"power plan changed\"; exit 3 }}"),
-        format!("& powercfg.exe -setactive {guid}; if ($LASTEXITCODE -ne 0) {{ exit 6 }}"),
+        format!("& powercfg.exe -setactive {guid}; $apply = $LASTEXITCODE"),
         "$after = Read-Plan-Retry".into(),
-        format!("if ($after -eq \"{guid}\") {{ exit 0 }}"),
-        format!("if ($after -and $after -ne \"{prev_guid}\") {{ & powercfg.exe -setactive {prev_guid}; if ($LASTEXITCODE -eq 0) {{ $rolled = Read-Plan-Retry; if ($rolled -eq \"{prev_guid}\") {{ Write-Output \"power plan verification failed; restored\"; exit 6 }} }} }}"),
+        format!("if ($apply -eq 0 -and $after -eq \"{guid}\") {{ exit 0 }}"),
+        format!("if ($after -eq \"{guid}\") {{ & powercfg.exe -setactive {prev_guid}; if ($LASTEXITCODE -eq 0) {{ $rolled = Read-Plan-Retry; if ($rolled -eq \"{prev_guid}\") {{ Write-Output \"power plan verification failed; restored\"; exit 6 }} }} }}"),
         "Write-Output \"power plan verification or rollback unverified\"; exit 7".into(),
     ].join("; ");
     format!(
-        "$mutex = New-Object System.Threading.Mutex($false, \"Global\\KatalaTunePowerControl\"); $held = $false; try {{ try {{ $held = $mutex.WaitOne(0) }} catch [System.Threading.AbandonedMutexException] {{ $held = $true }}; if (-not $held) {{ Write-Output \"another power action is running\"; exit 7 }}; {body}; }} finally {{ if ($held) {{ $mutex.ReleaseMutex() }}; $mutex.Dispose() }}"
+        "$mutex = New-Object System.Threading.Mutex($false, \"Global\\KatalaTunePowerControl\"); $held = $false; try {{ try {{ $held = $mutex.WaitOne(0) }} catch [System.Threading.AbandonedMutexException] {{ $held = $true }}; if (-not $held) {{ Write-Output \"another power action is running\"; exit 8 }}; {body}; }} finally {{ if ($held) {{ $mutex.ReleaseMutex() }}; $mutex.Dispose() }}"
     )
 }
 
@@ -151,7 +151,7 @@ fn gpu_power_script(uuid: &str, watts: f64, min: f64, max: f64, prev_w: f64) -> 
         "Write-Output \"power limit verification or rollback unverified\"; exit 7".into(),
     ].join("; ");
     format!(
-        "$mutex = New-Object System.Threading.Mutex($false, \"Global\\KatalaTunePowerControl\"); $held = $false; try {{ try {{ $held = $mutex.WaitOne(0) }} catch [System.Threading.AbandonedMutexException] {{ $held = $true }}; if (-not $held) {{ Write-Output \"another power action is running\"; exit 7 }}; {body}; }} finally {{ if ($held) {{ $mutex.ReleaseMutex() }}; $mutex.Dispose() }}"
+        "$mutex = New-Object System.Threading.Mutex($false, \"Global\\KatalaTunePowerControl\"); $held = $false; try {{ try {{ $held = $mutex.WaitOne(0) }} catch [System.Threading.AbandonedMutexException] {{ $held = $true }}; if (-not $held) {{ Write-Output \"another power action is running\"; exit 8 }}; {body}; }} finally {{ if ($held) {{ $mutex.ReleaseMutex() }}; $mutex.Dispose() }}"
     )
 }
 
@@ -166,12 +166,12 @@ fn low_power_mode_script(source: &str, enabled: bool, prev: bool) -> String {
         raw("lowpowermode")
     );
     [
-        "lock=\"$HOME/.katala-tune/power-action.lock\"; mkdir -p -m 700 \"$HOME/.katala-tune\" || exit 6; mkdir \"$lock\" 2>/dev/null || { echo \"another power action is running\"; exit 7; }; trap \"rmdir \\\"$lock\\\"\" EXIT HUP INT TERM".into(),
+        "lock=\"$HOME/.katala-tune/power-action.lock\"; mkdir -p -m 700 \"$HOME/.katala-tune\" || exit 6; mkdir \"$lock\" 2>/dev/null || { echo \"another power action is running; remove only after verifying owner PID is gone\"; exit 8; }; printf \"%s\\n\" \"$$\" > \"$lock/pid\"; trap \"rm -f \\\"$lock/pid\\\"; rmdir \\\"$lock\\\"\" EXIT HUP INT TERM".into(),
         format!("before=$({read}) || {{ echo \"low power mode unsupported\"; exit 6; }}; before_key=${{before%%:*}}; before_mode=${{before#*:}}"),
         format!("[ \"$before_mode\" = {previous} ] || {{ echo \"low power mode changed\"; exit 3; }}"),
-        format!("pmset {flag} \"$before_key\" {desired} || exit 6"),
+        format!("pmset {flag} \"$before_key\" {desired}; apply=$?"),
         format!("after=$({read}) || {{ echo \"low power mode verification unverified\"; exit 7; }}; after_key=${{after%%:*}}; after_mode=${{after#*:}}"),
-        format!("[ \"$after_key\" = \"$before_key\" ] && [ \"$after_mode\" = {desired} ] && exit 0"),
+        format!("[ \"$apply\" = 0 ] && [ \"$after_key\" = \"$before_key\" ] && [ \"$after_mode\" = {desired} ] && exit 0"),
         format!("[ \"$after_key\" = \"$before_key\" ] && [ \"$after_mode\" = {desired} ] && pmset {flag} \"$before_key\" {previous}"),
         "echo \"low power mode verification or rollback unverified\"; exit 7".into(),
     ].join("\n")
