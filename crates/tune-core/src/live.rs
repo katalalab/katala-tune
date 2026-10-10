@@ -1084,6 +1084,7 @@ impl Live {
         let top = |k: &str| n.procs.as_ref().and_then(|p| p.get(k)).and_then(Value::as_array).map(|a| a.iter().take(3).cloned().collect::<Vec<_>>());
         Some(json!({
             "state": n.phase.as_str(),
+            "reason": n.reason,
             "streaming": st.streams.get(id).is_some_and(|s| !s.stopping),
             "detail": n.detail,
             "impl": n.info.as_ref().map(|h| h.implementation.as_deref().unwrap_or("script")),
