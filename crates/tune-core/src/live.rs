@@ -111,6 +111,7 @@ pub struct Hello {
     pub interval: Option<f64>,
     pub procs_every: Option<f64>,
     pub mem_total_gb: Option<f64>,
+    pub session_epoch_ms: Option<i64>,
     #[serde(default)]
     pub has: Map<String, Value>,
     /// 取れなかったもの（PS の ConvertTo-Json は 1 件だと配列にしないことがあるので Value のまま受ける）
@@ -143,10 +144,22 @@ pub struct Net {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Gpu {
+    pub uuid: Option<String>,
     pub name: Option<String>,
     pub util: Option<f64>,
     pub mem_used_mb: Option<f64>,
     pub mem_total_mb: Option<f64>,
+    pub power_w: Option<f64>,
+    pub power_limit_w: Option<f64>,
+    pub power_min_w: Option<f64>,
+    pub power_max_w: Option<f64>,
+    pub temp_c: Option<f64>,
+    pub clocks_graphics_mhz: Option<f64>,
+    pub clocks_sm_mhz: Option<f64>,
+    pub clocks_memory_mhz: Option<f64>,
+    pub pstate: Option<String>,
+    pub source: Option<String>,
+    pub available: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -259,6 +272,7 @@ pub struct Sample {
     pub t: i64,
     /// サンプラーの時刻（ms）。t との差が遅延の目安（時計が合っているとき）
     pub src_t: Option<i64>,
+    pub seq: Option<u64>,
     /// 機体全体の CPU（%）
     pub cpu: Option<f64>,
     /// コアごとの CPU（%）
@@ -284,12 +298,30 @@ impl Sample {
         let gpu = r.gpu.map(|g| {
             g.into_iter()
                 .take(MAX_GPUS)
-                .map(|x| Gpu { name: x.name.map(|n| short(&n)), util: pct(x.util), mem_used_mb: nonneg(x.mem_used_mb), mem_total_mb: nonneg(x.mem_total_mb) })
+                .map(|x| Gpu {
+                    uuid: x.uuid.map(|s| short(&s)),
+                    name: x.name.map(|n| short(&n)),
+                    util: pct(x.util),
+                    mem_used_mb: nonneg(x.mem_used_mb),
+                    mem_total_mb: nonneg(x.mem_total_mb),
+                    power_w: nonneg(x.power_w),
+                    power_limit_w: nonneg(x.power_limit_w),
+                    power_min_w: nonneg(x.power_min_w),
+                    power_max_w: nonneg(x.power_max_w),
+                    temp_c: nonneg(x.temp_c),
+                    clocks_graphics_mhz: nonneg(x.clocks_graphics_mhz),
+                    clocks_sm_mhz: nonneg(x.clocks_sm_mhz),
+                    clocks_memory_mhz: nonneg(x.clocks_memory_mhz),
+                    pstate: x.pstate.map(|s| short(&s)),
+                    source: x.source.map(|s| short(&s)),
+                    available: x.available,
+                })
                 .collect()
         });
         let s = Sample {
             t: received,
             src_t: r.t.filter(|t| t.is_finite() && *t > 0.0).map(|t| t as i64),
+            seq: r.seq,
             cpu: pct(r.cpu),
             cores: r.cores.into_iter().take(MAX_CORES).map(pct).collect(),
             mem,
@@ -323,6 +355,9 @@ impl Sample {
             put("gpu", g.iter().filter_map(|x| x.util).reduce(f64::max), 1);
             let (used, total) = g.iter().fold((0.0, 0.0), |(u, t), x| (u + x.mem_used_mb.unwrap_or(0.0), t + x.mem_total_mb.unwrap_or(0.0)));
             put("gmem", (total > 0.0).then(|| used / total * 100.0), 1);
+            if g.iter().all(|x| x.power_w.is_some()) {
+                put("power_gpu_w", Some(g.iter().map(|x| x.power_w.unwrap_or_default()).sum()), 1);
+            }
         }
         put("lag", self.src_t.map(|s| (self.t - s) as f64), 0);
         Value::Object(m)
@@ -1199,7 +1234,7 @@ mod tests {
         Node::from_value(&json!({ "id": id, "alias": id, "os": os }), "this-host")
     }
 
-    const SAMPLE: &str = r#"{"type":"s","t":1700000000000,"seq":3,"cpu":12.5,"cores":[10,20,null,150],"mem":{"used_pct":41.2,"swap_used_gb":1.5,"swap_total_gb":2,"pressure":"normal"},"disk":{"read_bps":1000,"write_bps":-5},"net":{"rx_bps":10,"tx_bps":20},"gpu":[{"name":"G","util":30,"mem_used_mb":1024,"mem_total_mb":4096}],"procs":{"count":3,"top_cpu":[{"pid":7,"name":"a","cpu":150.5,"mem_mb":10}],"top_mem":[]},"self":{"cpu_s":0.5,"rss_mb":20}}"#;
+    const SAMPLE: &str = r#"{"type":"s","t":1700000000000,"seq":3,"cpu":12.5,"cores":[10,20,null,150],"mem":{"used_pct":41.2,"swap_used_gb":1.5,"swap_total_gb":2,"pressure":"normal"},"disk":{"read_bps":1000,"write_bps":-5},"net":{"rx_bps":10,"tx_bps":20},"gpu":[{"uuid":"GPU-a","name":"G","util":30,"mem_used_mb":1024,"mem_total_mb":4096,"power_w":220,"power_limit_w":320,"power_min_w":100,"power_max_w":350,"temp_c":65,"clocks_graphics_mhz":1800,"clocks_sm_mhz":1815,"clocks_memory_mhz":9500,"pstate":"P0","source":"nvidia-smi dmon","available":true}],"procs":{"count":3,"top_cpu":[{"pid":7,"name":"a","cpu":150.5,"mem_mb":10}],"top_mem":[]},"self":{"cpu_s":0.5,"rss_mb":20}}"#;
 
     #[test]
     fn parses_lines_and_ignores_noise() {
@@ -1213,11 +1248,22 @@ mod tests {
         assert_eq!(p.cpu, Some(12.5));
         assert_eq!(p.cores, vec![Some(10.0), Some(20.0), None, Some(100.0)], "コアは 0〜100 に収める");
         assert_eq!(p.disk.as_ref().unwrap().write_bps, None, "負の速度は捨てる");
-        assert_eq!(p.src_t, Some(1_700_000_000_000));
+        assert_eq!((p.src_t, p.seq), (Some(1_700_000_000_000), Some(3)));
+        let gpu = &p.gpu.as_ref().unwrap()[0];
+        assert_eq!(
+            (gpu.uuid.as_deref(), gpu.pstate.as_deref(), gpu.source.as_deref(), gpu.available),
+            (Some("GPU-a"), Some("P0"), Some("nvidia-smi dmon"), Some(true))
+        );
+        assert_eq!((gpu.power_w, gpu.power_limit_w, gpu.temp_c), (Some(220.0), Some(320.0), Some(65.0)));
+        assert_eq!((gpu.power_min_w, gpu.power_max_w), (Some(100.0), Some(350.0)));
+        assert_eq!((gpu.clocks_graphics_mhz, gpu.clocks_sm_mhz, gpu.clocks_memory_mhz), (Some(1800.0), Some(1815.0), Some(9500.0)));
         assert_eq!(procs.unwrap().top_cpu[0].cpu, Some(150.5), "プロセスは 1 コア換算なので 100 を超えてよい");
         assert_eq!(me.unwrap().cpu_s, Some(0.5));
         let pt = p.point();
-        assert_eq!((pt["cpu"].as_f64(), pt["gpu"].as_f64(), pt["gmem"].as_f64(), pt["lag"].as_f64()), (Some(12.5), Some(30.0), Some(25.0), Some(120.0)));
+        assert_eq!(
+            (pt["cpu"].as_f64(), pt["gpu"].as_f64(), pt["gmem"].as_f64(), pt["power_gpu_w"].as_f64(), pt["lag"].as_f64()),
+            (Some(12.5), Some(30.0), Some(25.0), Some(220.0), Some(120.0))
+        );
         assert!(pt.get("dw").is_none(), "無い値は点に入れない");
         assert!(matches!(parse_line(r#"{"type":"end","reason":"max_age"}"#), Some(Msg::End(r)) if r == "max_age"));
         for bad in ["", "WARNING: something", "{broken", r#"{"type":"other"}"#, r#"{"cpu":1}"#, r#"{"type":"s","cores":"x"}"#] {

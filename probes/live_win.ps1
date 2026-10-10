@@ -78,7 +78,7 @@ if ($smi) {
   }
 }
 function StartDmon {
-  $psi = New-Object Diagnostics.ProcessStartInfo($smi, ('dmon -s um -d ' + [int][math]::Max(1, [math]::Round($Interval)) + ' -c 120'))
+  $psi = New-Object Diagnostics.ProcessStartInfo($smi, ('dmon -s pucm -d ' + [int][math]::Max(1, [math]::Round($Interval)) + ' -c 120'))
   $psi.UseShellExecute = $false
   $psi.RedirectStandardOutput = $true
   $psi.CreateNoWindow = $true
@@ -104,7 +104,13 @@ function PollDmon {
       if ($gi -ge 0 -and $f.Count -eq $script:dmonCols.Count) {
         $u = $null; if ($si -ge 0) { $u = $f[$si] }
         $m = $null; if ($fi -ge 0) { $m = $f[$fi] }
-        $script:gpuNow[[int]$f[$gi]] = @($u, $m)
+        $pi = [array]::IndexOf($script:dmonCols, 'pwr'); $ti = [array]::IndexOf($script:dmonCols, 'gtemp')
+        $gci = [array]::IndexOf($script:dmonCols, 'gclk'); if ($gci -lt 0) { $gci = [array]::IndexOf($script:dmonCols, 'pclk') }; $sci = [array]::IndexOf($script:dmonCols, 'smclk'); $mci = [array]::IndexOf($script:dmonCols, 'mclk')
+        $script:gpuNow[[int]$f[$gi]] = [ordered]@{
+          util = $u; mem = $m
+          power = $(if ($pi -ge 0) { $f[$pi] } else { $null }); temp = $(if ($ti -ge 0) { $f[$ti] } else { $null })
+          graphics = $(if ($gci -ge 0) { $f[$gci] } else { $null }); sm_clock = $(if ($sci -ge 0) { $f[$sci] } else { $null }); memory_clock = $(if ($mci -ge 0) { $f[$mci] } else { $null })
+        }
       }
     }
     $script:dmonTask = $script:dmon.StandardOutput.ReadLineAsync()
@@ -115,7 +121,7 @@ function GpuJson {
   $rows = New-Object System.Collections.Generic.List[string]
   foreach ($k in $gpuNow.Keys) {
     $v = $gpuNow[$k]
-    $rows.Add('{"name":' + (J $gpuName[$k]) + ',"util":' + (N $v[0] 0) + ',"mem_used_mb":' + (N $v[1] 0) + ',"mem_total_mb":' + (N $gpuTotal[$k] 0) + '}')
+    $rows.Add('{"name":' + (J $gpuName[$k]) + ',"util":' + (N $v.util 0) + ',"mem_used_mb":' + (N $v.mem 0) + ',"mem_total_mb":' + (N $gpuTotal[$k] 0) + ',"power_w":' + (N $v.power) + ',"temp_c":' + (N $v.temp 0) + ',"clocks_graphics_mhz":' + (N $v.graphics 0) + ',"clocks_sm_mhz":' + (N $v.sm_clock 0) + ',"clocks_memory_mhz":' + (N $v.memory_clock 0) + ',"source":"nvidia-smi dmon","available":true}')
   }
   return ('[' + ($rows -join ',') + ']')
 }
@@ -164,8 +170,9 @@ function Procs {
 }
 
 $has = [ordered]@{ cpu = ($null -ne $cpuCat); mem = ($null -ne $memCat); disk = ($null -ne $diskCat); net = ($null -ne $netCat); procs = ($null -ne $procCat); gpu = [bool]$smi }
+$sessionEpochMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $hello = [ordered]@{ type = 'hello'; v = 1; os = 'windows'; cores = [Environment]::ProcessorCount; interval = $Interval; procs_every = $ProcEvery
-  mem_total_gb = $(if ($totalBytes) { [math]::Round($totalBytes / 1GB, 1) } else { $null }); has = $has; errors = @($errs) }
+  mem_total_gb = $(if ($totalBytes) { [math]::Round($totalBytes / 1GB, 1) } else { $null }); session_epoch_ms = $sessionEpochMs; has = $has; errors = @($errs) }
 if (-not (Emit ($hello | ConvertTo-Json -Compress -Depth 3))) { exit 0 }
 
 $me = [Diagnostics.Process]::GetCurrentProcess()

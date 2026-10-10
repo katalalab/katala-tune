@@ -176,15 +176,21 @@ def containers():
 def power():
     therm = run(["pmset", "-g", "therm"])
     limit = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", therm)
-    warn = re.search(r"thermal warning level", therm, re.I) and not re.search(r"No thermal warning level", therm, re.I)
+    warn = re.search(r"thermal warning level", therm, re.I) and not re.search(r"No thermal warning level", therm, re.I) if therm else None
     g = run(["pmset", "-g"])
     lpm = re.search(r"lowpowermode\s+(\d)", g)
     batt = run(["pmset", "-g", "batt"])
     return {
+        "package_w": None,
+        "package_source": None,
+        "soc_w": None,
+        "soc_source": None,
         "cpu_speed_limit": int(limit.group(1)) if limit else None,
-        "thermal_warning": bool(warn),
+        "thermal_warning": bool(warn) if warn is not None else None,
         "low_power_mode": (lpm.group(1) == "1") if lpm else None,
-        "on_battery": "Battery Power" in batt,
+        "on_battery": "Battery Power" in batt if batt else None,
+        "availability": {"thermal": bool(therm), "power_mode": bool(g), "battery": bool(batt)},
+        "source": {"thermal": "pmset -g therm", "power_mode": "pmset -g", "battery": "pmset -g batt"},
     }
 
 
