@@ -194,6 +194,30 @@ def power():
     }
 
 
+def macmon_static():
+    path = shutil.which("macmon") or os.path.join(HOME, ".katala-tune", "bin", "macmon")
+    if not path or not os.path.isfile(path):
+        return {"available": False, "source": None}
+    out = run([path, "pipe", "--samples", "1", "--interval", "1000", "--soc-info"], timeout=5)
+    try:
+        rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+        data = rows[-1]
+    except (ValueError, IndexError, TypeError):
+        return {"available": False, "source": "macmon IOReport"}
+    def positive(key):
+        v = num(data.get(key))
+        return round(v, 2) if v is not None and v >= 0 else None
+    cpu, gpu, ane = positive("cpu_power"), positive("gpu_power"), positive("ane_power")
+    all_power = positive("all_power")
+    return {
+        "available": True, "source": "macmon IOReport", "package_w": cpu,
+        "soc_w": all_power, "soc_source": "macmon all_power (CPU+GPU+ANE)",
+        "platform_w": positive("sys_power"), "platform_source": "macmon sys_power (SMC estimate)",
+        "ram_w": positive("ram_power"), "cpu_clusters_mhz": {"e": positive("ecpu_freq_mhz"), "p": positive("pcpu_freq_mhz")},
+        "gpu": {"util": (positive("gpu_usage") * 100 if positive("gpu_usage") is not None else None), "clocks_graphics_mhz": positive("gpu_freq_mhz"), "source": "macmon IOReport"},
+    }
+
+
 LAUNCHD_DIRS = [("~/Library/LaunchAgents", "user"), ("/Library/LaunchAgents", "agent"), ("/Library/LaunchDaemons", "daemon")]
 
 
@@ -515,6 +539,7 @@ def main():
         f_ps = ex.submit(processes)
         f_ct = ex.submit(containers)
         f_pw = ex.submit(power)
+        f_macmon = ex.submit(macmon_static)
         f_ld = ex.submit(launchd_failing)
         f_jobs = ex.submit(launchd_jobs)
         f_tm = ex.submit(lambda: "Running = 1" in run(["tmutil", "status"]))
@@ -549,6 +574,11 @@ def main():
         result["processes"] = f_ps.result()
         result["containers"] = f_ct.result()
         result["power"] = f_pw.result()
+        macmon = f_macmon.result()
+        result["power"].update({k: v for k, v in macmon.items() if k not in ("gpu", "cpu_clusters_mhz")})
+        result["cpu_clock"] = {"clusters_mhz": macmon.get("cpu_clusters_mhz"), "source": "macmon frequency residency sample" if macmon.get("available") else None}
+        if macmon.get("gpu"):
+            result["gpus"] = [macmon["gpu"]]
         result["launchd_failing"] = f_ld.result()
         result["jobs"] = f_jobs.result()
         result["time_machine_running"] = f_tm.result()
