@@ -1609,39 +1609,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// この機体の macOS サンプラーを実際に動かす（標準ライブラリだけで、hello・s・end を出す）
+    /// 必須のOS統計を保ち、任意センサーの有無を独立した環境で確かめる。
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn mac_sampler_runs_here() {
-        let mut src = spawn(Launch {
-            program: "/usr/bin/env".into(),
-            args: ["python3", "-", "interval=0.3", "procs=0.3", "count=3"].iter().map(|s| s.to_string()).collect(),
-            stdin: MAC_LIVE.as_bytes().to_vec(),
-            ..Launch::default()
-        })
-        .unwrap();
-        let mut msgs = Vec::new();
-        while let Ok(Some(l)) = tokio::time::timeout(Duration::from_secs(20), src.lines.recv()).await {
-            msgs.push(parse_line(&l).unwrap_or_else(|| panic!("読めない行: {l}")));
-        }
-        let ended = src.close().await;
-        assert_eq!(ended.code, Some(0), "{}", ended.err);
-        let Msg::Hello(h) = &msgs[0] else { panic!("1 行目は hello") };
-        assert_eq!(h.os.as_deref(), Some("macos"));
-        assert_eq!(h.errors, json!([]), "取れないものがある: {:?}", h.errors);
-        let samples: Vec<Sample> = msgs
-            .iter()
-            .filter_map(|m| match m {
-                Msg::Sample(s) => Some(Sample::from_raw((**s).clone(), now_ms()).0),
-                _ => None,
+        use std::os::unix::fs::PermissionsExt;
+        for with_sensor in [false, true] {
+            let (_, dir) = fake("");
+            if with_sensor {
+                let sensor = dir.join("macmon");
+                std::fs::write(
+                    &sensor,
+                    r#"#!/usr/bin/python3
+import json,os,time
+from pathlib import Path
+Path(__file__).with_suffix('.pid').write_text(str(os.getpid()))
+for _ in range(400):
+    print(json.dumps({'cpu_power':0,'gpu_power':3,'all_power':4,'sys_power':0,'gpu_freq_mhz':500}),flush=True)
+    time.sleep(0.05)
+"#,
+                )
+                .unwrap();
+                std::fs::set_permissions(sensor, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let mut src = spawn(Launch {
+                program: "/usr/bin/env".into(),
+                args: [
+                    format!("PATH={}", dir.display()),
+                    format!("HOME={}", dir.display()),
+                    "/usr/bin/python3".into(),
+                    "-".into(),
+                    "interval=0.3".into(),
+                    "procs=0.3".into(),
+                    "count=3".into(),
+                ]
+                .into(),
+                stdin: MAC_LIVE.as_bytes().to_vec(),
+                ..Launch::default()
             })
-            .collect();
-        assert_eq!(samples.len(), 3);
-        let last = samples.last().unwrap();
-        assert!(last.cpu.is_some() && last.cores.len() == h.cores.unwrap() as usize);
-        assert!(last.mem.as_ref().and_then(|m| m.used_pct).is_some());
-        assert!(last.disk.is_some() && last.net.is_some());
-        assert!(matches!(msgs.last(), Some(Msg::End(r)) if r == "count"));
+            .unwrap();
+            let mut msgs = Vec::new();
+            while let Ok(Some(l)) = tokio::time::timeout(Duration::from_secs(20), src.lines.recv()).await {
+                msgs.push(parse_line(&l).unwrap_or_else(|| panic!("読めない行: {l}")));
+            }
+            let ended = src.close().await;
+            assert_eq!(ended.code, Some(0), "{}", ended.err);
+            let Msg::Hello(h) = &msgs[0] else { panic!("1 行目は hello") };
+            assert_eq!(h.os.as_deref(), Some("macos"));
+            assert_eq!(
+                h.errors,
+                if with_sensor { json!([]) } else { json!(["power: FileNotFoundError: macmon unavailable"]) },
+                "予期しない欠測: {:?}",
+                h.errors
+            );
+            assert_eq!(h.has.get("gpu"), Some(&json!(with_sensor)));
+            let samples: Vec<Sample> = msgs
+                .iter()
+                .filter_map(|m| match m {
+                    Msg::Sample(s) => Some(Sample::from_raw((**s).clone(), now_ms()).0),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(samples.len(), 3);
+            let last = samples.last().unwrap();
+            assert!(last.cpu.is_some() && last.cores.len() == h.cores.unwrap() as usize);
+            assert!(last.mem.as_ref().and_then(|m| m.used_pct).is_some());
+            assert!(last.disk.is_some() && last.net.is_some());
+            assert!(matches!(msgs.last(), Some(Msg::End(r)) if r == "count"));
+            if with_sensor {
+                let power = last.power.as_ref().unwrap();
+                assert_eq!((power.package_w, power.soc_w, power.platform_w, power.available), (Some(0.0), Some(4.0), None, Some(true)));
+                assert_eq!(power.package_source.as_deref(), Some("macmon IOReport CPU"));
+                let gpu = &last.gpu.as_ref().unwrap()[0];
+                assert_eq!((gpu.power_w, gpu.clocks_graphics_mhz), (Some(3.0), Some(500.0)));
+                let pid: u32 = std::fs::read_to_string(dir.join("macmon.pid")).unwrap().parse().unwrap();
+                assert!(!alive(pid), "サンプラー終了時にセンサーの子も終わる");
+            } else {
+                for sample in &samples {
+                    assert_eq!(sample.power, Some(Power { available: Some(false), ..Power::default() }));
+                    assert_eq!(sample.gpu, Some(vec![]), "欠測をGPUの0Wとして作らない");
+                }
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// アプリと同じ起動のしかた（標準入力を開いたまま）で動かし、止めると標準入力が閉じてサンプラーが自分で終わる
