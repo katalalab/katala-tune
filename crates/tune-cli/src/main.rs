@@ -5,6 +5,7 @@
 //!   tune logs [--db <dir>] [機体 ...] ログを取り込む（既定は一時ディレクトリの DB。npm run logs と同じ）
 //!   tune last                        DB の前回の分析結果（所見・スコアつき）を JSON で
 //!   tune power                       電力・Clockと計算条件を JSON で（読み取り専用）
+//!   tune network [--probe] [機体 ...] 軽量な接続診断（省略はこの機体。--probeだけHTTPS到達性・時間も測る）
 //!   tune status [--recompute]        DB の状態（機能チェック）を JSON で。--recompute で計算し直して保存する
 //!   tune analyze <snapshot.json>     snapshot（probe の data）から所見を作る
 //!   tune inventory [機体 ...]        道具の棚卸しを DB に保存し、結果を JSON で（DB は KATALA_TUNE_DATA_DIR で写しを指す）
@@ -39,7 +40,7 @@ use tune_core::{collect, logs, nodes, rules};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "使い方: tune <paths|probe|logs|last|power|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
+        "使い方: tune <paths|probe|logs|last|power|network|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
     );
     ExitCode::from(2)
 }
@@ -142,6 +143,14 @@ async fn main() -> ExitCode {
     let Some(cmd) = args.first() else { return usage() };
     let rest = &args[1..];
     let res: Result<(), String> = match cmd.as_str() {
+        "network" => {
+            let active = rest.iter().any(|a| a == "--probe");
+            let ids: Vec<_> = rest.iter().filter(|a| a.as_str() != "--probe").cloned().collect();
+            match nodes::load_config(&nodes::user_config_path()).and_then(|cfg| tune_core::network::select(&cfg.nodes, &ids)) {
+                Ok(t) => tune_core::network::check(&t, active).await.map(|v| print(&v)),
+                Err(e) => Err(e),
+            }
+        }
         "paths" => {
             print(
                 &json!({ "config": nodes::user_config_path(), "data_dir": nodes::data_dir(), "db": nodes::data_dir().join(tune_core::db::DB_FILE), "local_host": nodes::local_host() }),

@@ -42,6 +42,11 @@ pub async fn power_report(e: E<'_>) -> R {
 }
 
 #[tauri::command]
+pub async fn network_check(e: E<'_>, ids: Option<Vec<String>>, active: Option<bool>) -> R {
+    e.network_check(&ids.unwrap_or_default(), active.unwrap_or(false)).await
+}
+
+#[tauri::command]
 pub async fn power_settings(e: E<'_>, node_id: String, patch: Value) -> R {
     e.power_settings(&node_id, &patch)
 }

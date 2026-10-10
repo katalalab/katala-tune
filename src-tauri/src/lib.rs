@@ -107,6 +107,7 @@ pub fn run() {
             commands::config,
             commands::last,
             commands::power_report,
+            commands::network_check,
             commands::power_settings,
             commands::probe,
             commands::history,

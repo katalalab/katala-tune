@@ -5,6 +5,7 @@ const COMMANDS: &[&str] = &[
     "probe",
     "history",
     "power_report",
+    "network_check",
     "power_settings",
     "power_session",
     "fleet",

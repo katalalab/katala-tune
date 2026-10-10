@@ -1,7 +1,7 @@
 {
   "name": "katala-tune",
   "productName": "Katala Tune",
-  "version": "0.5.0-power.2",
+  "version": "0.5.0-power.3",
   "description": "Katala フリート（Mac / Windows）を並列に分析し、承認した最適化だけを実行するデスクトップアプリ",
   "license": "MIT",
   "repository": {

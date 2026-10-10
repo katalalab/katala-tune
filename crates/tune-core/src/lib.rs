@@ -39,6 +39,7 @@ pub mod js;
 pub mod live;
 pub mod logs;
 pub mod netsec;
+pub mod network;
 pub mod nodes;
 pub mod power;
 pub mod power_observation;

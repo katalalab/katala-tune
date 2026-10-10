@@ -25,6 +25,7 @@
     config: () => invoke('config'),
     last: () => invoke('last'),
     powerReport: () => invoke('power_report'),
+    networkCheck: (ids, active = false) => invoke('network_check', { ids: ids ?? null, active: !!active }),
     powerSettings: (nodeId, patch) => invoke('power_settings', { nodeId, patch }),
     powerSession: (nodeId, save = false) => invoke('power_session', { nodeId, save }),
     probe: (ids) => invoke('probe', { ids: ids ?? null }),
