@@ -4,6 +4,10 @@ fn watts(value: Option<&Value>) -> Option<f64> {
     value.and_then(Value::as_f64).filter(|value| value.is_finite() && *value >= 0.0)
 }
 
+fn finite(value: f64) -> Option<f64> {
+    value.is_finite().then_some(value)
+}
+
 fn setting_watts(settings: &Value, key: &str) -> Option<f64> {
     watts(settings.get(key))
 }
@@ -17,7 +21,7 @@ pub fn summary(snapshot: &Value, settings: &Value) -> Value {
     let gpu_w: Option<f64> = snapshot
         .get("gpus")
         .and_then(Value::as_array)
-        .and_then(|rows| rows.iter().map(|gpu| watts(gpu.get("power_w"))).collect::<Option<Vec<_>>>().map(|values| values.into_iter().sum()));
+        .and_then(|rows| rows.iter().map(|gpu| watts(gpu.get("power_w"))).collect::<Option<Vec<_>>>().and_then(|values| finite(values.into_iter().sum())));
     let soc_w = power.and_then(|power| watts(power.get("soc_w")));
     let cpu_w = if soc_w.is_none() { power.and_then(|power| watts(power.get("package_w"))) } else { None };
     let wall_w = power.and_then(|power| watts(power.get("wall_w")));
@@ -27,9 +31,21 @@ pub fn summary(snapshot: &Value, settings: &Value) -> Value {
     let (total_w, kind, source) = if let Some(wall_w) = wall_w {
         (Some(wall_w), "measured", Some("wall"))
     } else if let (Some(soc_w), Some(base_w), Some(efficiency)) = (soc_w, base_w, efficiency) {
-        (Some((soc_w + base_w) / efficiency), "estimated", Some("soc"))
+        match finite((soc_w + base_w) / efficiency) {
+            Some(total_w) => (Some(total_w), "estimated", Some("soc")),
+            None => {
+                missing.push("total_w");
+                (None, "missing", None)
+            }
+        }
     } else if let (Some(cpu_w), Some(gpu_w), Some(base_w), Some(efficiency)) = (cpu_w, gpu_w, base_w, efficiency) {
-        (Some((cpu_w + gpu_w + base_w) / efficiency), "estimated", Some("components"))
+        match finite((cpu_w + gpu_w + base_w) / efficiency) {
+            Some(total_w) => (Some(total_w), "estimated", Some("components")),
+            None => {
+                missing.push("total_w");
+                (None, "missing", None)
+            }
+        }
     } else {
         if soc_w.is_none() && gpu_w.is_none() {
             missing.push("gpu_w");
@@ -47,8 +63,8 @@ pub fn summary(snapshot: &Value, settings: &Value) -> Value {
     };
     let hours = setting_watts(settings, "hours");
     let rate = setting_watts(settings, "rate_per_kwh");
-    let projected_kwh = total_w.zip(hours).map(|(watts, hours)| watts * hours / 1000.0);
-    let projected_cost = projected_kwh.zip(rate).map(|(kwh, rate)| kwh * rate);
+    let projected_kwh = total_w.zip(hours).and_then(|(watts, hours)| finite(watts * hours / 1000.0));
+    let projected_cost = projected_kwh.zip(rate).and_then(|(kwh, rate)| finite(kwh * rate));
     json!({
         "gpu_w": if soc_w.is_none() { gpu_w } else { None },
         "cpu_w": cpu_w,
@@ -93,12 +109,14 @@ pub fn integrate(points: &Value, interval_seconds: f64) -> Value {
             previous = None;
             continue;
         };
-        if let Some(prior) = &previous
-            && prior.epoch == current.epoch
-            && prior.source == current.source
-            && current.seq > prior.seq
-            && current.t > prior.t
-        {
+        if let Some(prior) = &previous {
+            if prior.epoch != current.epoch || prior.source != current.source {
+                previous = Some(current);
+                continue;
+            }
+            if current.seq <= prior.seq || current.t <= prior.t {
+                continue;
+            }
             let seconds = (current.t - prior.t) / 1000.0;
             duration_seconds += seconds;
             if seconds <= interval * 3.0
@@ -111,10 +129,10 @@ pub fn integrate(points: &Value, interval_seconds: f64) -> Value {
         previous = Some(current);
     }
     json!({
-        "kwh": kwh,
-        "covered_seconds": covered_seconds,
-        "duration_seconds": duration_seconds,
-        "coverage": if duration_seconds == 0.0 { 0.0 } else { covered_seconds / duration_seconds },
+        "kwh": finite(kwh),
+        "covered_seconds": finite(covered_seconds),
+        "duration_seconds": finite(duration_seconds),
+        "coverage": if duration_seconds == 0.0 { Some(0.0) } else if duration_seconds.is_finite() && covered_seconds.is_finite() { finite(covered_seconds / duration_seconds) } else { None::<f64> },
     })
 }
 

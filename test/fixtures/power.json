@@ -19,6 +19,12 @@
       "expected": { "gpu_w": 0, "cpu_w": 50, "soc_w": null, "wall_w": null, "total_w": 100, "kind": "estimated", "source": "components", "missing": [], "projected_kwh": 0, "projected_cost": 0, "currency": null }
     },
     {
+      "name": "overflowing projections are missing rather than infinite",
+      "snapshot": { "power": { "wall_w": 100 } },
+      "settings": { "hours": 1.7976931348623157e308, "rate_per_kwh": 1, "currency": "USD" },
+      "expected": { "gpu_w": null, "cpu_w": null, "soc_w": null, "wall_w": 100, "total_w": 100, "kind": "measured", "source": "wall", "missing": [], "projected_kwh": null, "projected_cost": null, "currency": "USD" }
+    },
+    {
       "name": "a partial GPU reading never becomes a whole-system estimate",
       "snapshot": { "gpus": [{ "power_w": 100 }, { "power_w": null }], "power": { "package_w": 50 } },
       "settings": { "base_w": 50, "psu_efficiency": 0.8, "hours": 1, "rate_per_kwh": 20, "currency": "USD" },
@@ -54,7 +60,25 @@
       "name": "restarts and retransmissions do not double count later intervals",
       "interval_seconds": 10,
       "points": [{ "t": 0, "seq": 1, "epoch": "a", "source": "meter", "watts": 100 }, { "t": 10000, "seq": 2, "epoch": "a", "source": "meter", "watts": 100 }, { "t": 10000, "seq": 2, "epoch": "a", "source": "meter", "watts": 200 }, { "t": 20000, "seq": 3, "epoch": "a", "source": "meter", "watts": 200 }, { "t": 0, "seq": 1, "epoch": "b", "source": "meter", "watts": 100 }, { "t": 10000, "seq": 2, "epoch": "b", "source": "meter", "watts": 100 }],
-      "expected": { "kwh": 0.0011111111111111111, "covered_seconds": 30, "duration_seconds": 30, "coverage": 1 }
+      "expected": { "kwh": 0.0009722222222222222, "covered_seconds": 30, "duration_seconds": 30, "coverage": 1 }
+    },
+    {
+      "name": "sequence reversals do not replace the last accepted point",
+      "interval_seconds": 1,
+      "points": [{ "t": 0, "seq": 0, "epoch": "a", "source": "meter", "watts": 100 }, { "t": 1000, "seq": 1, "epoch": "a", "source": "meter", "watts": 100 }, { "t": 0, "seq": 0, "epoch": "a", "source": "meter", "watts": 100 }, { "t": 2000, "seq": 2, "epoch": "a", "source": "meter", "watts": 100 }],
+      "expected": { "kwh": 0.00005555555555555556, "covered_seconds": 2, "duration_seconds": 2, "coverage": 1 }
+    },
+    {
+      "name": "timestamp duplicates and reversals do not replace the last accepted point",
+      "interval_seconds": 1,
+      "points": [{ "t": 0, "seq": 0, "epoch": "a", "source": "meter", "watts": 100 }, { "t": 1000, "seq": 1, "epoch": "a", "source": "meter", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "a", "source": "meter", "watts": 200 }, { "t": 0, "seq": 3, "epoch": "a", "source": "meter", "watts": 200 }, { "t": 2000, "seq": 4, "epoch": "a", "source": "meter", "watts": 100 }],
+      "expected": { "kwh": 0.00005555555555555556, "covered_seconds": 2, "duration_seconds": 2, "coverage": 1 }
+    },
+    {
+      "name": "overflowing energy is missing rather than infinite",
+      "interval_seconds": 1.7976931348623157e308,
+      "points": [{ "t": 0, "seq": 0, "epoch": "a", "source": "meter", "watts": 1.7976931348623157e308 }, { "t": 1.7976931348623157e308, "seq": 1, "epoch": "a", "source": "meter", "watts": 1.7976931348623157e308 }],
+      "expected": { "kwh": null, "covered_seconds": 1.7976931348623156e305, "duration_seconds": 1.7976931348623156e305, "coverage": 1 }
     }
   ]
 }
