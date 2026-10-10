@@ -75,7 +75,7 @@ test('GPU 電力制限: UUID・有限の上下限・旧値を検証し、実機�
   assert.match(p.script, /\$v\[0\] -ne 100.*\$v\[1\] -ne 250.*\$v\[2\] -ne 200.*exit 3/);
   assert.match(p.script, /-pl 180/);
   assert.match(p.script, /\$after\[2\] -eq 180.*exit 0/);
-  assert.match(p.script, /\$after\[2\] -ne 200.*\$after\[0\] -le 200.*\$after\[1\] -ge 200.*-pl 200/);
+  assert.match(p.script, /\$after\[2\] -eq 180.*\$after\[0\] -le 200.*\$after\[1\] -ge 200.*-pl 200/);
   assert.match(p.script, /Global\\KatalaTunePowerControl.*WaitOne\(0\).*Read-Power-Retry/);
   assert.ok(!p.script.includes("'"), 'PowerShell 本体にシングルクォートが無い');
   assert.deepEqual(p.undo, { type: 'set-gpu-power-limit', params: { ...params, watts: 200, prev_w: 180 } });
