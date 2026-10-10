@@ -9,6 +9,8 @@
 //!       機体鍵の指紋・ペア済みの相手・待ち受けの状態を JSON で（秘密鍵・コードは出さない）
 //!   tune-agent unpair <指紋|名前> [--dir D]
 //!       ペア済みの相手を台帳から消す
+//!   tune-agent sample [interval=1] [procs=5] [max=900] [count=0] [watch=1]
+//!       ライブ表示のサンプラー（Windows。probes/live_win.ps1 と同じ行を標準出力へ。sample.rs）
 //!
 //! 待ち受けは既定で 127.0.0.1 と Tailscale のアドレスだけ。0.0.0.0・:: では待ち受けない。
 //! 置き場所（--dir）の既定は `~/.katala-tune/agent`（`KATALA_TUNE_AGENT_DIR` で差し替えられる）。
@@ -17,6 +19,9 @@
 mod listen;
 mod otlp;
 mod probe;
+mod sample;
+#[cfg(windows)]
+mod sample_win;
 mod server;
 
 use std::io::Write;
@@ -375,9 +380,22 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // サンプラーは 1 本のスレッドで足りる（tokio の作業スレッドをコアの数だけ作らない）
+    if args.first().map(String::as_str) == Some("sample") {
+        return sample::main(&args[1..]);
+    }
+    match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt.block_on(async_main(args)),
+        Err(e) => {
+            eprintln!("tokio を起動できない: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn async_main(args: Vec<String>) -> ExitCode {
     let Some(cmd) = args.first().cloned() else { return usage() };
     let o = match parse(&args[1..]) {
         Ok(o) => o,
