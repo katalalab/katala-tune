@@ -9,15 +9,15 @@ use std::time::Duration;
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tune_core::engine::Engine;
-use tune_core::live::{Live, Opts, ProcessRoute, Stop};
+use tune_core::live::{Live, ProcessRoute, Stop};
 use tune_core::nodes::Node;
 
-/// 管理を作り、画面へまとめて送る tick を動かし始める（setup から 1 回）
-pub fn create(app: &AppHandle) -> Arc<Live> {
+/// 管理を作り、画面へまとめて送る tick を動かし始める（setup から 1 回）。同時に流せる数は台帳の台数まで（常時監視）
+pub fn create(app: &AppHandle, nodes: usize) -> Arc<Live> {
     let h = app.clone();
     let live = Live::new(
         Arc::new(ProcessRoute),
-        Opts::default(),
+        tune_core::monitor::live_opts(nodes),
         Box::new(move |ev: Value| {
             let _ = h.emit("live", ev);
         }),

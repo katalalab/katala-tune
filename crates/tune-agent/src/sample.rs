@@ -43,8 +43,9 @@ pub fn parse_args(a: &[String]) -> Result<Args, String> {
         let num = || v.parse::<f64>().ok().filter(|x| x.is_finite()).ok_or_else(|| format!("{k} の値が数でない: {v}"));
         match k {
             "interval" => o.interval = num()?.clamp(0.2, 10.0),
-            "procs" => o.procs_every = num()?.max(1.0),
-            "max" => o.max_seconds = num()?.max(1.0),
+            // Duration に直しても溢れない範囲に収める（1 時間・1 日まで）
+            "procs" => o.procs_every = num()?.clamp(1.0, 3600.0),
+            "max" => o.max_seconds = num()?.clamp(1.0, 86_400.0),
             "count" => o.count = num()?.max(0.0) as u64,
             "watch" => o.watch = v == "1",
             _ => return Err(format!("知らない引数: {k}")),
@@ -314,6 +315,9 @@ mod tests {
         let o = parse_args(&a("interval=0.01 procs=0 max=0 count=3 watch=1")).unwrap();
         assert_eq!((o.interval, o.procs_every, o.max_seconds, o.count, o.watch), (0.2, 1.0, 1.0, 3, true));
         assert_eq!(parse_args(&a("interval=99")).unwrap().interval, 10.0);
+        let big = parse_args(&a("procs=1e300 max=1e300")).unwrap();
+        assert_eq!((big.procs_every, big.max_seconds), (3600.0, 86_400.0), "Duration に直しても panic しない範囲");
+        let _ = (std::time::Duration::from_secs_f64(big.procs_every), std::time::Duration::from_secs_f64(big.max_seconds));
         assert!(parse_args(&a("interval=x")).is_err());
         assert!(parse_args(&a("interval=NaN")).is_err());
         assert!(parse_args(&a("what=1")).is_err());

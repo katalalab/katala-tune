@@ -157,7 +157,7 @@ pub fn run() {
             let engine = Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(TauriHost { app: handle.clone() }))?;
             app.manage(engine.clone());
             app.manage(window::Pending::default());
-            let live = live::create(&handle);
+            let live = live::create(&handle, engine.config().nodes.len());
             app.manage(live.clone());
             if let Some(v) = std::env::var("KATALA_TUNE_DEV_VIEW").ok().filter(|_| cfg!(debug_assertions)) {
                 window::navigate_after_load(&handle, &v);

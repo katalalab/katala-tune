@@ -457,8 +457,8 @@ impl Engine {
         let since = |k: &str| now - js::num(js::or(meta(k).as_ref(), Some(&Value::from(0))));
         let mins = |k: &str| js::num(s.get(k)) * 60000.0;
         // ハブの分析結果を写していて新しいあいだは、同じ機体を重ねて分析しない（monitor.rs）
-        let hub_fresh = self.with_db(|d| Ok(crate::monitor::hub_fresh(d, now as i64))).unwrap_or(false);
-        if !hub_fresh && since("lastProbeAt") >= mins("probe_minutes") {
+        let hub_analysis = self.with_db(|d| Ok(crate::monitor::hub_analysis_fresh(d, now as i64))).unwrap_or(false);
+        if !hub_analysis && since("lastProbeAt") >= mins("probe_minutes") {
             self.run_probe(None, true).await;
             let nodes = self.reload_config().nodes;
             self.sync_logs(nodes).await;
