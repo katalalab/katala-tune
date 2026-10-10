@@ -100,6 +100,9 @@ pub fn run() {
     // ログイン時の起動では、ウィンドウを開かずに常駐する
     let hidden = std::env::args().any(|a| a == "--hidden");
     let app = tauri::Builder::default()
+        // 2 回目に開いたとき（スタートメニュー・Finder・ログイン時の起動と重なったとき）は、常駐している方のウィンドウを出すだけ。
+        // 2 つ動くと常時監視の流れ（各機体のサンプラー）が二重になる
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| window::show(app)))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--hidden"])))
         .plugin(tauri_plugin_opener::init())
