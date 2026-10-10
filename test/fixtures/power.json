@@ -97,6 +97,18 @@
       "interval_seconds": 1,
       "points": [{ "t": 0, "seq": 1, "epoch": "a", "source": "meter", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "a", "source": "meter", "watts": 100 }, { "t": 0, "seq": 1, "epoch": "b", "source": "meter", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "b", "source": "meter", "watts": 100 }, { "t": 2000, "seq": 100, "epoch": "a", "source": "meter", "watts": 100 }, { "t": 2000, "seq": 3, "epoch": "b", "source": "meter", "watts": 100 }, { "t": 3000, "seq": 4, "epoch": "b", "source": "meter", "watts": 100 }],
       "expected": { "kwh": 0.00011111111111111112, "covered_seconds": 4, "duration_seconds": 4, "coverage": 1 }
+    },
+    {
+      "name": "an invalid point does not permit a replay to rewind a stream watermark",
+      "interval_seconds": 1,
+      "points": [{ "t": 0, "seq": 1, "epoch": "boot", "source": "meter", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "boot", "source": "meter", "watts": 100 }, {}, { "t": 0, "seq": 1, "epoch": "boot", "source": "meter", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "boot", "source": "meter", "watts": 100 }],
+      "expected": { "kwh": 0.00002777777777777778, "covered_seconds": 1, "duration_seconds": 1, "coverage": 1 }
+    },
+    {
+      "name": "a fresh point after an invalid sample restarts without filling the gap",
+      "interval_seconds": 1,
+      "points": [{ "t": 0, "seq": 1, "epoch": "boot", "source": "meter", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "boot", "source": "meter", "watts": 100 }, {}, { "t": 2000, "seq": 3, "epoch": "boot", "source": "meter", "watts": 100 }, { "t": 3000, "seq": 4, "epoch": "boot", "source": "meter", "watts": 100 }],
+      "expected": { "kwh": 0.00005555555555555556, "covered_seconds": 2, "duration_seconds": 2, "coverage": 1 }
     }
   ]
 }

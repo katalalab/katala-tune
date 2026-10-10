@@ -116,6 +116,11 @@ pub fn integrate(points: &Value, interval_seconds: f64) -> Value {
             continue;
         }
         let current_key = (current.epoch.clone(), current.source.clone());
+        if let Some((seq, t)) = watermarks.get(&current_key)
+            && (current.seq <= *seq || current.t <= *t)
+        {
+            continue;
+        }
         if previous.is_none() {
             watermarks.insert(current_key, (current.seq, current.t));
             previous = Some(current);
@@ -125,10 +130,6 @@ pub fn integrate(points: &Value, interval_seconds: f64) -> Value {
         if prior.epoch != current.epoch || prior.source != current.source {
             if prior.epoch != current.epoch {
                 retired_epochs.insert(prior.epoch);
-            } else if let Some((seq, t)) = watermarks.get(&current_key)
-                && (current.seq <= *seq || current.t <= *t)
-            {
-                continue;
             }
             watermarks.insert(current_key, (current.seq, current.t));
             previous = Some(current);
