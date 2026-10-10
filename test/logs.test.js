@@ -59,6 +59,10 @@ test('Windows リモートログは固定ファイルを使わず Base64 stdin �
   const fullScript = fs.readFileSync(path.join(__dirname, '..', 'probes', 'win_logs.ps1'));
   const maxCursors = { win_system: '9007199254740991', win_application: '9007199254740991', neonmonitor: '9007199254740991' };
   assert.ok(Buffer.byteLength(windowsRemoteTransport(maxCursors, fullScript).command) < 8191);
+  // Windows の checkout（autocrlf で CRLF）でも LF と同じコマンドになる（改行は LF にそろえて送る）
+  const lf = Buffer.from(fullScript.toString('latin1').replace(/\r\n/g, '\n'), 'latin1');
+  const crlf = Buffer.from(lf.toString('latin1').replace(/\n/g, '\r\n'), 'latin1');
+  assert.equal(windowsRemoteTransport(maxCursors, crlf).command, windowsRemoteTransport(maxCursors, lf).command);
   assert.throws(() => windowsRemoteTransport({}, Buffer.alloc(6000)), /8191/);
 });
 

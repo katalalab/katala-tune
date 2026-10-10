@@ -1,4 +1,4 @@
-﻿# katala-tune Windows logs. Read-only. PS 5.1, ASCII+BOM, no indent (cmdline limit).
+﻿# katala-tune Windows logs. Read-only, ASCII+BOM, no indent (cmdline limit).
 param([long]$SysCursor = 0, [long]$AppCursor = 0, [long]$NeonCursor = 0)
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
@@ -20,11 +20,11 @@ function Read-EventLog($logName, [long]$cursor, [bool]$withWarnings) {
 $lv = if ($withWarnings) { '(Level=1 or Level=2 or Level=3 or EventID=6006)' } else { '(Level=1 or Level=2)' }
 $cond = if ($cursor -gt 0) { "EventRecordID > $cursor" } else { 'TimeCreated[timediff(@SystemTime) <= 259200000]' }
 $xpath = "*[System[$lv and $cond]]"
-$ev = @(Get-WinEvent -LogName $logName -FilterXPath $xpath -MaxEvents 2000 -ErrorAction SilentlyContinue)
+$ev = @(Get-WinEvent -LogName $logName -FilterXPath $xpath -MaxEvents 2000)
 if ($withWarnings) { $ev = @($ev | Where-Object { $_.Level -ne 3 -or $_.ProviderName -match $WarnProviders }) }
 $newest = $cursor
 foreach ($e in $ev) { if ($e.RecordId -gt $newest) { $newest = $e.RecordId } }
-$sd=@($ev|?{$_.Id-eq6006}|%{EpochMs $_.TimeCreated})
+$sd=@($ev|?{$_.Id-eq6006-and$_.ProviderName-eq'EventLog'}|%{EpochMs $_.TimeCreated})
 $g = @{}
 $o = @()
 foreach ($e in @($ev | Sort-Object RecordId)) {
