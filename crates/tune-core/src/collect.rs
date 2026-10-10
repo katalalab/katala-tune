@@ -369,6 +369,10 @@ pub async fn probe_node(node: &Node) -> Value {
 
 /// `probe_node` の子プロセスの実行口を差し替えられる版（テストは偽の ssh を渡す）
 pub async fn probe_node_with(runner: &dyn Runner, node: &Node) -> Value {
+    // 運用対象でない機体（retired など）には ssh も probe も実行しない。失敗ではなく「対象外」として返す
+    if let Some(refused) = node.refusal() {
+        return json!({ "node_id": node.id, "ok": false, "skipped": true, "reason": "excluded", "reason_text": refused, "error": refused, "at": now_ms() });
+    }
     let started = Instant::now();
     let network = crate::netsec::enabled(&node.raw);
     let benchmark = node.get("benchmark") != Some(&Value::Bool(false));
@@ -435,6 +439,8 @@ where
     F: Fn(&Value) + Send + Sync + 'static,
 {
     let on_result = std::sync::Arc::new(on_result);
+    let (nodes, _excluded) = crate::nodes::partition(nodes);
+    let nodes = nodes.as_slice();
     let mut set = tokio::task::JoinSet::new();
     for (i, n) in nodes.iter().cloned().enumerate() {
         let cb = on_result.clone();
@@ -468,6 +474,9 @@ pub async fn exec_on(node: &Node, script: &str, timeout: Duration) -> RunResult 
 
 /// `exec_on` の子プロセスの実行口を差し替えられる版（変更操作のテストは偽の実行器を渡す）
 pub async fn exec_on_with(runner: &dyn Runner, node: &Node, script: &str, timeout: Duration) -> RunResult {
+    if let Some(err) = node.refusal() {
+        return RunResult { code: None, out: String::new(), err };
+    }
     if node.local { runner.local_script(script, timeout).await } else { runner.run("ssh", &ssh_args(&node.alias, script), None, timeout).await }
 }
 

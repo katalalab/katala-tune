@@ -78,6 +78,7 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 
 - `alias` は `~/.ssh/config` の Host 名。非対話（BatchMode）で入れる鍵が要る。Windows 側は OpenSSH サーバーと、既定シェル（Git Bash または PowerShell）で `powershell.exe` が動くこと
 - `local_hostname` がこの機体の hostname と一致すると、SSH を使わずローカルで実行する
+- `status`（任意）: 運用状態。`online`（省略時）・`retired`（退役）・`no-ssh`（SSH 対象外）・`paused`（一時停止）・`out-of-scope`（対象外）。`online` 以外の機体には SSH も probe も実行せず（分析・ログ取り込み・棚卸し・AI・接続診断・ライブ・変更操作のすべて）、設定も変えない。過去の履歴は閲覧できる。値が読めないとき（綴り違い）は安全側に倒して対象外にし、「状態」で注意にする。`status_reason`（理由）と `status_date`（判断日）を併記できる。**運用状態は操作者がこの台帳を編集してだけ変わる**。`online` の機体が到達できないときは「到達不能（運用対象）」として異常のまま扱い、`status` を自動で変えない
 - `shared: true` は提案のみ。`protect` は終了を提案しても実行しないアプリ名
 - `network`（任意）: `false` でネットワークとセキュリティ（待ち受け・防御・常駐の増減・外向きの接続・ログイン）を集めない
 - `connectivity`（任意）: `false` で手動の接続診断を止める。既存の詳細収集を制御する `network` とは別の設定
@@ -87,6 +88,8 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
   - `expect.ignore_jobs`（任意）: 意図どおり 0 以外で終わる定期処理のラベル・タスク名。「状態」の「定期処理」の失敗に数えない（根拠に「既知 N 件を除く」と出る）。例 `{ "ignore_jobs": ["com.example.check-and-exit-1", "MyProbeTask"] }`
 - `schedule`（任意）: `{ "enabled": true, "probe_minutes": 60, "logs_minutes": 15 }`
 - `fleet`（任意）: 作者のフリートで使っている常時監視（katala-fleet、非公開）の概況を `op-agent` 経由で表示する連携。設定しなければ使わない
+
+対象台帳（対象・除外・未観測とその理由）は、画面の「状態」の「対象台帳」と `tune ledger`（`--json` で JSON）で見られる。対象は `online` で最後の分析が成功した機体、未観測は `online` なのに観測できていない機体（到達不能・まだ分析していない。理由つき）、除外は `online` 以外の機体（理由と判断日つき）。読み取りだけで、機体へ接続せず台帳も書き換えない。
 
 ## 開発
 

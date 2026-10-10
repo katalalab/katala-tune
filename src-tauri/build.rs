@@ -2,6 +2,7 @@
 const COMMANDS: &[&str] = &[
     "config",
     "last",
+    "ledger",
     "probe",
     "history",
     "power_report",

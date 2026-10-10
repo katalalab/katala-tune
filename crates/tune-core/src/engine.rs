@@ -206,6 +206,22 @@ impl Engine {
         Value::Object(out)
     }
 
+    /// 対象台帳（対象・除外・未観測とその理由）。読み取りだけで、台帳は書き換えない
+    pub fn ledger(&self) -> Result<Value, String> {
+        let cfg = self.reload_config();
+        let errors = lock(&self.last_probe_error).clone();
+        let db = lock(&self.db);
+        let mut last_ok = std::collections::HashMap::new();
+        for n in &cfg.nodes {
+            let at = db.last_snapshots(&n.id, 1).map_err(|e| e.to_string())?.first().map(|s| s.at);
+            last_ok.insert(n.id.clone(), at);
+        }
+        Ok(crate::nodes::target_ledger(&cfg.nodes, |id| crate::nodes::Observation {
+            last_ok_at: last_ok.get(id).copied().flatten(),
+            last_error: errors.get(id).cloned(),
+        }))
+    }
+
     /// 前回の分析結果（画面の `last`）。機体ごとに最新の snapshot と所見
     pub fn last(&self) -> Result<Vec<Value>, String> {
         let cfg = self.config();
@@ -364,7 +380,9 @@ impl Engine {
         self.host.state_changed();
         let cfg = self.reload_config();
         let all = ids.as_ref().is_none_or(Vec::is_empty);
-        let targets: Vec<Node> = cfg.nodes.iter().filter(|n| all || ids.as_ref().is_some_and(|i| i.contains(&n.id))).cloned().collect();
+        let selected: Vec<Node> = cfg.nodes.iter().filter(|n| all || ids.as_ref().is_some_and(|i| i.contains(&n.id))).cloned().collect();
+        // 運用対象でない機体（retired など）には接続しない。除外は失敗ではなく理由つきで返す
+        let (targets, skipped) = crate::nodes::partition(&selected);
         let me = self.clone();
         let completed = Arc::new(Mutex::new(Vec::<Value>::new()));
         let completed2 = completed.clone();
@@ -378,7 +396,7 @@ impl Engine {
         }
         self.probing.store(false, Ordering::SeqCst);
         self.compute_checks(true, true);
-        json!({ "done": results.len(), "auto": auto, "results": lock(&completed).clone() })
+        json!({ "done": results.len(), "auto": auto, "results": lock(&completed).clone(), "skipped": skipped })
     }
 
     fn on_probe_result(&self, r: &Value) -> Value {

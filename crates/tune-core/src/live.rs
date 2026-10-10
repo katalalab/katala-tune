@@ -597,6 +597,9 @@ fn windows_boot(n: usize, params: &str) -> String {
 /// 機体ごとの起動方法。macOS / Windows とも標準入力でスクリプトを渡す。
 /// 渡した後も stdin を開き、停止時に閉じる。SSH は多重化しない。
 pub fn launch(node: &Node, o: &Opts) -> Result<Launch, String> {
+    if let Some(refused) = node.refusal() {
+        return Err(refused);
+    }
     if node.is_mac() {
         let a = format!("interval={} procs={} max={} watch=1", secs(o.interval), secs(o.procs_every), secs(o.sampler_max_age));
         let boot = python_boot(MAC_LIVE.len());
@@ -967,6 +970,11 @@ impl Live {
         }
         let mut active = st.streams.values().filter(|s| !s.stopping).count();
         for n in nodes {
+            // 運用対象でない機体（retired など）には接続しない
+            if let Some(detail) = n.refusal() {
+                refused.push(json!({ "id": n.id, "reason": "excluded", "detail": detail }));
+                continue;
+            }
             if st.closed {
                 refused.push(json!({ "id": n.id, "reason": Stop::AppExit.code(), "detail": Stop::AppExit.detail(&self.opts) }));
                 continue;

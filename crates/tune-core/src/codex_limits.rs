@@ -27,10 +27,11 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 /// 問い合わせる機体か。台帳の "codex_limits" が true / false ならそれに従う。
 /// 書いていなければ、AI の取り込みをする機体で、共用機でないもの
 pub fn enabled(node: &Node) -> bool {
-    match node.get("codex_limits") {
-        Some(Value::Bool(b)) => *b,
-        _ => ai_sessions::enabled(node) && !node.shared,
-    }
+    node.is_active()
+        && match node.get("codex_limits") {
+            Some(Value::Bool(b)) => *b,
+            _ => ai_sessions::enabled(node) && !node.shared,
+        }
 }
 
 /// 問い合わせの結果

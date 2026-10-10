@@ -3,6 +3,8 @@
 //!   tune paths                       台帳と DB の場所
 //!   tune probe [機体 ...]            調査して JSON を標準出力へ（保存しない。npm run probe と同じ）
 //!   tune logs [--db <dir>] [機体 ...] ログを取り込む（既定は一時ディレクトリの DB。npm run logs と同じ）
+//!   tune ledger [--json]             対象台帳（対象・除外・未観測とその理由）。台帳の status（online / retired / no-ssh / paused / out-of-scope）を見る。
+//!                                    読み取りだけで、台帳も DB も書き換えず、機体へ接続もしない
 //!   tune last                        DB の前回の分析結果（所見・スコアつき）を JSON で
 //!   tune power                       電力・Clockと計算条件を JSON で（読み取り専用）
 //!   tune network [--probe] [機体 ...] 軽量な接続診断（省略はこの機体。--probeだけHTTPS到達性・時間も測る）
@@ -40,7 +42,7 @@ use tune_core::{collect, logs, nodes, rules};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "使い方: tune <paths|probe|logs|last|power|network|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
+        "使い方: tune <paths|probe|logs|ledger|last|power|network|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
     );
     ExitCode::from(2)
 }
@@ -49,9 +51,46 @@ fn print(v: &Value) {
     println!("{}", serde_json::to_string(v).unwrap_or_default());
 }
 
+/// 運用対象（online）の機体だけを返す。除外（retired など）には接続せず、理由を標準エラーに出す
 fn targets(ids: &[String]) -> Result<Vec<nodes::Node>, String> {
     let cfg = nodes::load_config(&nodes::user_config_path())?;
-    Ok(cfg.nodes.into_iter().filter(|n| ids.is_empty() || ids.contains(&n.id)).collect())
+    let selected: Vec<nodes::Node> = cfg.nodes.into_iter().filter(|n| ids.is_empty() || ids.contains(&n.id)).collect();
+    let (targets, excluded) = nodes::partition(&selected);
+    for x in &excluded {
+        eprintln!(
+            "{}: 対象外（{}）{}",
+            x["node_id"].as_str().unwrap_or("?"),
+            x["state"].as_str().unwrap_or("?"),
+            x["reason"].as_str().filter(|r| !r.is_empty()).map(|r| format!(" {r}")).unwrap_or_default()
+        );
+    }
+    Ok(targets)
+}
+
+/// 対象台帳を人が読む表にする
+fn ledger_table(v: &Value) -> String {
+    let mut out = String::new();
+    for r in v["rows"].as_array().into_iter().flatten() {
+        let status = match r["status"].as_str() {
+            Some("target") => "対象",
+            Some("unobserved") => "未観測",
+            _ => "除外",
+        };
+        let reason = r["reason"].as_str().unwrap_or("");
+        let date = r["date"].as_str().map(|d| format!(" [{d}]")).unwrap_or_default();
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}{}{}\n",
+            r["node_id"].as_str().unwrap_or("?"),
+            status,
+            r["state"].as_str().unwrap_or("?"),
+            if reason.is_empty() { "-" } else { "" },
+            reason,
+            date
+        ));
+    }
+    let c = &v["counts"];
+    out.push_str(&format!("対象 {} / 未観測 {} / 除外 {}（全 {} 台）\n", c["target"], c["unobserved"], c["excluded"], c["total"]));
+    out
 }
 
 /// 中央値・95 パーセンタイル・最大（ミリ秒）
@@ -220,6 +259,10 @@ async fn main() -> ExitCode {
         }
         "power" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
             Ok(e) => e.power_report().map(|v| print(&v)),
+            Err(e) => Err(e),
+        },
+        "ledger" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => e.ledger().map(|v| if rest.iter().any(|a| a == "--json") { print(&v) } else { print!("{}", ledger_table(&v)) }),
             Err(e) => Err(e),
         },
         "last" | "status" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {

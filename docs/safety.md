@@ -17,6 +17,7 @@ NeonMonitor（Windows のメモリ監視・自動強制終了ツール）の静�
 
 このほか:
 
+- 台帳の `status` が `online` 以外（`retired`・`no-ssh`・`paused`・`out-of-scope`、読めない値）の機体には、SSH も probe も実行せず設定も変えない。入口（probe・ログ取り込み・棚卸し・AI・接続診断・ライブ・`execOn`/`exec_on`・`plan()`）でそれぞれ断るので、呼び出し側の絞り込みが漏れても接続しない。到達できないことから `status` を自動で変えない（台帳は操作者の明示編集でのみ変わる）。`test/ledger.test.js`・`crates/tune-core/tests/ledger.rs`（JS と Rust の一致は `parity_ledger.rs`）
 - OS の中核・セキュリティ・AI エージェント・python/node などの実行環境は、終了を提案しない（`NO_KILL`）。台帳の `protect` で足せる。
 - `shared: true` の機体（家族との共用機など）は提案だけで、実行ボタンを出さない。`plan()` も拒否する。
 - 引数はすべて検証してからコマンドに埋める（PID は整数、名前は英数と一部記号、GUID・起動時刻は形式を固定）。PowerShell 本体にはシングルクォートを含めない（ssh 越しの Git Bash で包むため）。

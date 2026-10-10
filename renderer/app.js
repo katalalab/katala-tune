@@ -146,6 +146,25 @@ function stat(label, value, { sub = '', cls = '', ic = '' } = {}) {
   return `<div class="stat ${cls}"><div class="stat-k">${ic ? icon(ic) : ''}${esc(label)}</div><div class="stat-v">${value}</div>${sub ? `<div class="stat-s">${esc(sub)}</div>` : ''}</div>`;
 }
 
+// 台帳の運用状態（status）。online 以外の機体には接続しない（収集・自動スキャン・変更の対象外）
+const OP_LABEL = { retired: '退役', 'no-ssh': 'SSH 対象外', paused: '一時停止', 'out-of-scope': '対象外', invalid: '状態不明' };
+const opChip = (n) => (n.status && n.status !== 'online' ? UI.chip(OP_LABEL[n.status] || n.status, n.status === 'invalid' ? 'orange' : 'gray', { title: n.status_reason || '' }) : '');
+const LEDGER_TONE = { target: 'green', unobserved: 'orange', excluded: 'gray' };
+const LEDGER_LABEL = { target: '対象', unobserved: '未観測', excluded: '除外' };
+
+function ledgerSection(led) {
+  if (!led?.rows) return '';
+  const c = led.counts;
+  return `${UI.section('対象台帳', `対象 ${c.target}・未観測 ${c.unobserved}・除外 ${c.excluded}。運用状態は台帳（nodes.json）の status で決まり、到達できなくても自動では変わりません`)}
+    ${UI.table({
+      cols: [{ label: '機体' }, { label: '区分' }, { label: '運用状態' }, { label: '理由' }, { label: '判断日' }],
+      rows: led.rows,
+      empty: '台帳に機体がありません',
+      row: (r) => `<td class="nowrap">${esc(r.node_id)}</td><td class="nowrap">${UI.chip(LEDGER_LABEL[r.status] || r.status, LEDGER_TONE[r.status] || 'gray', { dot: true })}</td>`
+        + `<td class="nowrap">${esc(r.state_label || r.state)}</td><td class="muted">${esc(r.reason || '')}</td><td class="muted nowrap">${esc(r.date || '')}</td>`,
+    })}`;
+}
+
 function statusParts(c) {
   return [{ label: '異常', value: c.fail || 0, tone: 'crit' }, { label: '注意', value: c.warn || 0, tone: 'warn' }, { label: '正常', value: c.ok || 0, tone: 'ok' }, { label: '不明', value: c.unknown || 0, tone: 'unknown' }];
 }
@@ -162,7 +181,7 @@ function cardHtml(n) {
   const busy = state.busy.has(n.id);
   const cmp = r?.compare;
   const delta = cmp ? ` <span class="delta ${cmp.verdict}">${cmp.bench_ratio >= 1 ? '+' : ''}${((cmp.bench_ratio - 1) * 100).toFixed(0)}%</span>` : '';
-  const tags = [n.local ? UI.chip('この機体', 'blue') : '', n.shared ? UI.chip('提案のみ', 'gray') : ''].join('');
+  const tags = [n.local ? UI.chip('この機体', 'blue') : '', n.shared ? UI.chip('提案のみ', 'gray') : '', opChip(n)].join('');
   const sev = [c.critical ? UI.chip(`重大 ${c.critical}`, 'red') : '', c.warn ? UI.chip(`注意 ${c.warn}`, 'orange') : '', c.info ? UI.chip(`提案 ${c.info}`, 'blue') : '',
     r?.ok && !c.critical && !c.warn ? UI.chip('良好', 'green') : ''].join('');
   return `<div class="card${busy ? ' busy' : ''}" data-id="${esc(n.id)}" tabindex="0" role="button" aria-label="${esc(n.id)} の詳細を開く">
@@ -445,6 +464,7 @@ function matrixCell(x) {
 async function renderStatus() {
   const t = ticket();
   const st = state.status = await window.tune.status();
+  const led = typeof window.tune.ledger === 'function' ? await window.tune.ledger().catch(() => null) : null;
   if (stale(t)) return;
   renderSidebar();
   const c = st.counts;
@@ -492,6 +512,7 @@ async function renderStatus() {
       cols: nodeIds.map((id) => ({ key: id, html: `<button data-goto="${esc(id)}">${esc(id)}</button>` })),
       cell: (row, col) => matrixCell(byNode[col.key][row.key]),
     }) : UI.empty('まだ機体の状態がありません。分析すると表示します。')}
+    ${ledgerSection(led)}
     ${UI.section('アプリの機能')}
     <div class="list">${app.map((x) => `<div class="li">${UI.status(x.status)}<div class="li-main"><div class="li-title"><span class="node">${esc(x.name)}</span></div><div class="li-sub">${esc(x.detail || '')}</div></div><span class="right">${esc(ago(x.since))}から</span></div>`).join('')}</div>
     ${UI.section('状態の変化', '変わったときだけ記録')}

@@ -1,5 +1,9 @@
 # 変更履歴
 
+## 未リリース
+
+- 台帳に機体の運用状態（`status`: online・retired・no-ssh・paused・out-of-scope）を追加。online 以外には接続も変更もせず、到達不能（online）と退役を区別する。対象台帳を「状態」の画面と `tune ledger` に出す。`status` を持たない従来の台帳はそのまま動く。
+
 ## 0.4.0
 
 - Rust + Tauri 2 を標準の開発・配布経路にし、OS の WebView を利用する。
