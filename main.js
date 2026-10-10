@@ -123,6 +123,7 @@ async function runProbe(ids, { auto = false } = {}) {
   try {
     reloadConfig();
     const targets = cfg.nodes.filter((n) => !ids?.length || ids.includes(n.id));
+    const completed = [];
     const results = await probeAll(targets, (r) => {
       const prev = db.lastSnapshots(r.node_id, 1)[0];
       // ネットワークとセキュリティ: 正規化して前回の待ち受けと比べ、宛先の一覧は snapshot に残さない（増減と接続先の記録は Tauri 版だけ）
@@ -132,10 +133,11 @@ async function runProbe(ids, { auto = false } = {}) {
         delete lastProbeError[r.node_id];
         db.addSnapshot(r.node_id, { at: full.at, wall_s: full.wall_s, score: full.score, findings: full.findings.map(({ id, severity }) => ({ id, severity })), data: full.data, summary: summarize(full) });
       } else lastProbeError[r.node_id] = full.error;
+      completed.push({node_id:full.node_id,ok:full.ok,at:full.at,error:full.error});
       win?.webContents.send('probe-result', full);
     });
     if (!ids?.length) db.setMeta('lastProbeAt', Date.now());
-    return { done: results.length, auto };
+    return { done: results.length, auto, results: completed };
   } finally {
     probing = false;
     computeChecks();

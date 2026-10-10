@@ -41,6 +41,17 @@ test('Mac curl results preserve HTTP status and cumulative timings, discard raw 
   assert.equal(out[0].http_status,403); assert.equal(out[0].timings.total_ms,5); assert.equal(out[0].timings.dns_ms,1);
   assert.equal(out[1].state,'tls_certificate_failed'); assert.doesNotMatch(JSON.stringify(out),/private-error/);
 });
+const addresses = ['fe80::1','fe90::1','febf:ffff::1','fe80::1%en0','::','::1','0.0.0.0','127.0.0.2','169.254.1.2','::ffff:127.0.0.1','::ffff:169.254.1.2','ff02::1','invalid','2001:db8::1','fec0::1','192.0.2.8'];
+const usable = addresses.map((_,i) => i >= 13);
+test('Mac parses full link-local range and rejects unspecified, loopback and malformed addresses', {skip:!pythonReady}, () => {
+  const out=fixture(`addresses=${JSON.stringify(addresses)}\nprint(json.dumps([n.inspect(lambda a:(0,'interface: en0') if a[0].endswith('route') else (0,'en0: flags=1<UP>\\n inet6 '+address) if a[0].endswith('ifconfig') else (None,''))['ip_address_present'] for address in addresses]))`);
+  assert.deepEqual(out,usable);
+});
+test('Windows PS5.1 parses full link-local range instead of a textual prefix', {skip:process.platform!=='win32'}, () => {
+  const source=`. ${JSON.stringify(ps)}; $addresses=@(${addresses.map(a=>JSON.stringify(a.replace('%en0','%1'))).join(',')}); $result=@(foreach($text in $addresses){$address=$null;if([Net.IPAddress]::TryParse($text,[ref]$address)){Test-UsableAddress $address}else{$false}});ConvertTo-Json -InputObject $result -Compress`;
+  const r=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(source,'utf16le').toString('base64')],{encoding:'utf8',timeout:10000,windowsHide:true});
+  assert.equal(r.status,0,r.stderr);assert.deepEqual(JSON.parse(r.stdout.trim()),usable);
+});
 test('Windows native parser excludes persistent routes regardless of localized headings', {skip:process.platform!=='win32'}, () => {
   const source=`. ${JSON.stringify(ps)}; $t="IPv4 ルート テーブル\n===========\nアクティブ ルート:\n  192.0.2.0  255.255.255.0  On-link  192.0.2.8  10\n===========\n固定ルート:\n  0.0.0.0  0.0.0.0  192.0.2.1  192.0.2.8  10\n"; [ordered]@{active=(Active-Table @{status=0;out=$t} 4);unknown=(Active-Table @{status=$null;out=$t} 4)}|ConvertTo-Json -Compress`;
   const r=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(source,'utf16le').toString('base64')],{encoding:'utf8',timeout:10000,windowsHide:true});

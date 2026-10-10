@@ -85,6 +85,8 @@ $smi = $null
 $sc = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 if ($sc) { $smi = $sc.Source }
 $gpuName = @{}; $gpuTotal = @{}; $gpuNow = @{}
+$gpuSampleClock = [Diagnostics.Stopwatch]::StartNew()
+$gpuMaxAgeMs = [math]::Max(2500, 3 * [math]::Max(1, [math]::Round($Interval)) * 1000)
 $dmon = $null; $dmonTask = $null; $dmonCols = $null
 if ($smi) {
   foreach ($line in @(& $smi --query-gpu=index,name,memory.total --format=csv,noheader,nounits 2>$null)) {
@@ -93,6 +95,7 @@ if ($smi) {
   }
 }
 function StartDmon {
+  $script:gpuNow.Clear(); $script:dmonCols = $null
   $psi = New-Object Diagnostics.ProcessStartInfo($smi, ('dmon -s pucm -d ' + [int][math]::Max(1, [math]::Round($Interval)) + ' -c 120'))
   $psi.UseShellExecute = $false
   $psi.RedirectStandardOutput = $true
@@ -103,6 +106,13 @@ function StartDmon {
 # Read the lines dmon has written so far, without waiting.
 function PollDmon {
   if ($null -eq $script:dmon) { StartDmon; return }
+  try {
+    if ($script:dmon.HasExited) {
+      $script:gpuNow.Clear(); $script:dmonCols = $null
+      $script:dmon.Dispose(); $script:dmon = $null; $script:dmonTask = $null
+      return
+    }
+  } catch { $script:gpuNow.Clear(); $script:dmonCols = $null; $script:dmon = $null; $script:dmonTask = $null; return }
   while ($null -ne $script:dmonTask -and $script:dmonTask.IsCompleted) {
     $line = $null
     try { $line = $script:dmonTask.Result } catch { }
@@ -110,6 +120,7 @@ function PollDmon {
       # dmon ended (sample count reached): start a new one on the next poll
       try { $script:dmon.Dispose() } catch { }
       $script:dmon = $null; $script:dmonTask = $null
+      $script:gpuNow.Clear(); $script:dmonCols = $null
       return
     }
     if ($line -match '^#\s*gpu') { $script:dmonCols = @($line.TrimStart('#').Trim() -split '\s+') }
@@ -122,6 +133,7 @@ function PollDmon {
         $pi = [array]::IndexOf($script:dmonCols, 'pwr'); $ti = [array]::IndexOf($script:dmonCols, 'gtemp')
         $gci = [array]::IndexOf($script:dmonCols, 'gclk'); if ($gci -lt 0) { $gci = [array]::IndexOf($script:dmonCols, 'pclk') }; $sci = [array]::IndexOf($script:dmonCols, 'smclk'); $mci = [array]::IndexOf($script:dmonCols, 'mclk')
         $script:gpuNow[[int]$f[$gi]] = [ordered]@{
+          received_ms = $script:gpuSampleClock.Elapsed.TotalMilliseconds
           util = $u; mem = $m
           power = $(if ($pi -ge 0) { $f[$pi] } else { $null }); temp = $(if ($ti -ge 0) { $f[$ti] } else { $null })
           graphics = $(if ($gci -ge 0) { $f[$gci] } else { $null }); sm_clock = $(if ($sci -ge 0) { $f[$sci] } else { $null }); memory_clock = $(if ($mci -ge 0) { $f[$mci] } else { $null })
@@ -136,6 +148,7 @@ function GpuJson {
   $rows = New-Object System.Collections.Generic.List[string]
   foreach ($k in $gpuNow.Keys) {
     $v = $gpuNow[$k]
+    if ($null -eq $v.received_ms -or $script:gpuSampleClock.Elapsed.TotalMilliseconds - $v.received_ms -gt $script:gpuMaxAgeMs) { continue }
     $rows.Add('{"name":' + (J $gpuName[$k]) + ',"util":' + (N $v.util 0) + ',"mem_used_mb":' + (N $v.mem 0) + ',"mem_total_mb":' + (N $gpuTotal[$k] 0) + ',"power_w":' + (N $v.power) + ',"temp_c":' + (N $v.temp 0) + ',"clocks_graphics_mhz":' + (N $v.graphics 0) + ',"clocks_sm_mhz":' + (N $v.sm_clock 0) + ',"clocks_memory_mhz":' + (N $v.memory_clock 0) + ',"source":"nvidia-smi dmon","available":true}')
   }
   return ('[' + ($rows -join ',') + ']')

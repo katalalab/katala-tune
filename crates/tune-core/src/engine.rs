@@ -366,16 +366,22 @@ impl Engine {
         let all = ids.as_ref().is_none_or(Vec::is_empty);
         let targets: Vec<Node> = cfg.nodes.iter().filter(|n| all || ids.as_ref().is_some_and(|i| i.contains(&n.id))).cloned().collect();
         let me = self.clone();
-        let results = collect::probe_all(&targets, move |r| me.on_probe_result(r)).await;
+        let completed = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let completed2 = completed.clone();
+        let results = collect::probe_all(&targets, move |r| {
+            let full = me.on_probe_result(r);
+            lock(&completed2).push(json!({ "node_id": full.get("node_id"), "ok": full.get("ok"), "at": full.get("at"), "error": full.get("error") }));
+        })
+        .await;
         if all {
             let _ = self.with_db(|d| d.set_meta("lastProbeAt", &Value::from(now_ms())));
         }
         self.probing.store(false, Ordering::SeqCst);
         self.compute_checks(true, true);
-        json!({ "done": results.len(), "auto": auto })
+        json!({ "done": results.len(), "auto": auto, "results": lock(&completed).clone() })
     }
 
-    fn on_probe_result(&self, r: &Value) {
+    fn on_probe_result(&self, r: &Value) -> Value {
         let cfg = self.config();
         let node_id = js::string(r.get("node_id"));
         let full = {
@@ -418,6 +424,7 @@ impl Engine {
             full
         };
         self.host.probe_result(&full);
+        full
     }
 
     /// ログを取り込む。実行中なら `{ busy: true }`
@@ -581,7 +588,7 @@ impl Engine {
                 Err(e) => {
                     let output = format!("実行できなかった: {e}");
                     let _ = self.with_db(|d| d.finish_action(&id, false, &output, None));
-                    return refused(output);
+                    return Ok(json!({ "ok": false, "refused": output, "refresh_required": true }));
                 }
             };
             let output = js::trim(&format!("{}\n{}", r.outcome, r.output)).to_string();
@@ -597,7 +604,7 @@ impl Engine {
             entry["ok"] = Value::Bool(r.ok);
             entry["output"] = Value::String(output);
             entry["undo"] = r.undo.clone().unwrap_or(Value::Null);
-            Ok(json!({ "ok": r.ok, "code": r.code, "outcome": r.outcome, "output": r.output, "undo": r.undo, "entry": entry }))
+            Ok(json!({ "ok": r.ok, "code": r.code, "outcome": r.outcome, "output": r.output, "undo": r.undo, "entry": entry, "refresh_required": true }))
         }
         .await
     }
@@ -661,6 +668,33 @@ fn rand36(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn probe_completion_reports_saved_results_and_never_promotes_busy_or_failed_saves() {
+        let tmp = std::env::temp_dir().join(format!("katala-tune-probe-result-test-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config = tmp.join("nodes.json");
+        std::fs::write(&config, r#"{"nodes":[{"id":"test","alias":"unused","os":"windows","network":false}]}"#).unwrap();
+        let engine = Engine::open(config, tmp.join("data"), Arc::new(NoHost)).unwrap();
+        let empty = engine.run_probe(Some(vec!["unknown".into()]), false).await;
+        assert_eq!(empty["done"], json!(0));
+        assert_eq!(empty["results"], json!([]));
+        engine.probing.store(true, Ordering::SeqCst);
+        assert_eq!(engine.run_probe(None, false).await, json!({"busy":true}));
+        engine.probing.store(false, Ordering::SeqCst);
+        let input = json!({"node_id":"test","ok":true,"at":123,"data":{"probe":"windows"}});
+        let saved = engine.on_probe_result(&input);
+        assert_eq!(saved["ok"], json!(true));
+        assert_eq!(engine.with_db(|d| d.last_snapshots("test", 1)).unwrap()[0].at, 123);
+        let db = rusqlite::Connection::open(tmp.join("data").join(crate::db::DB_FILE)).unwrap();
+        db.execute("DROP TABLE tune_snapshots", []).unwrap();
+        let failed = engine.on_probe_result(&input);
+        assert_eq!(failed["ok"], json!(false));
+        assert!(failed["error"].as_str().unwrap().contains("保存できなかった"));
+        drop(db);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
 
     #[test]
     fn last_does_not_return_legacy_peer_addresses_after_opt_out() {

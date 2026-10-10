@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """On-demand connectivity only. Never emits addresses, resolver names or payloads."""
 import json
+import ipaddress
 import re
 import subprocess
 import sys
@@ -15,6 +16,15 @@ def run(args):
         return 28, ""
     except Exception:
         return None, ""
+
+def usable_address(text):
+    try:
+        address = ipaddress.ip_address(text)
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        return not (address.is_loopback or address.is_unspecified or address.is_link_local or address.is_multicast)
+    except ValueError:
+        return False
 
 def inspect(execute=run):
     out = dict(schema="katala_network_check.v1", platform="darwin", default_route_present=None,
@@ -33,7 +43,7 @@ def inspect(execute=run):
         if s == 0 and re.search(r"^\w+: flags=", link, re.M):
             out["interface_up"] = bool(re.search(r"<[^>]*\bUP\b[^>]*>", link))
             out["link_active"] = True if re.search(r"status:\s*active\b", link) else False if re.search(r"status:\s*inactive\b", link) else None
-            out["ip_address_present"] = bool(re.search(r"\binet\s+(?!169\.254\.|127\.)", link) or re.search(r"\binet6\s+(?!fe80:|::1\b)", link, re.I))
+            out["ip_address_present"] = any(usable_address(a) for a in re.findall(r"^\s*inet6?\s+(\S+)", link, re.M))
     status, text = execute(["/usr/sbin/scutil", "--dns"])
     if status == 0:
         if re.search(r"nameserver\[\d+\]", text): out["dns_configured"] = True

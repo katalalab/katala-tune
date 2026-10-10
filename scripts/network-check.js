@@ -2,6 +2,12 @@
 'use strict';
 // 手動実行だけ。設定・サービスを変えず、IP・SSID・DNS名・通信本文を出力しない。
 const { spawnSync } = require('node:child_process');
+const { BlockList, isIP } = require('node:net');
+const { readFileSync } = require('node:fs');
+const { join } = require('node:path');
+const excluded = new BlockList();
+for (const [address,bits,family] of [['127.0.0.0',8,'ipv4'],['169.254.0.0',16,'ipv4'],['0.0.0.0',32,'ipv4'],['224.0.0.0',4,'ipv4'],['fe80::',10,'ipv6'],['::',128,'ipv6'],['::1',128,'ipv6'],['ff00::',8,'ipv6']]) excluded.addSubnet(address,bits,family);
+const usableAddress = address => { const family=isIP(address);return !!family && !excluded.check(address,family===6 ? 'ipv6' : 'ipv4'); };
 function execute(command, args) {
   return spawnSync(command, args, { encoding: 'utf8', timeout: 5000, maxBuffer: 128 * 1024, windowsHide: true });
 }
@@ -26,7 +32,7 @@ function inspect(platform = process.platform, run = execute) {
           if (/^\w+: flags=/m.test(text)) {
             value.interface_up = /<[^>]*\bUP\b[^>]*>/.test(text);
             value.link_active = /status:\s*active\b/.test(text) ? true : /status:\s*inactive\b/.test(text) ? false : null;
-            value.ip_address_present = /\binet\s+(?!169\.254\.|127\.)/.test(text) || /\binet6\s+(?!fe80:|::1\b)/i.test(text);
+            value.ip_address_present = [...text.matchAll(/^\s*inet6?\s+(\S+)/gm)].some((m) => usableAddress(m[1]));
           }
         } else value.link_active = null;
       }
@@ -41,7 +47,9 @@ function inspect(platform = process.platform, run = execute) {
     value.gateway_configured = null;
     value.interfaces_up = null;
     // .NETのNIC状態を読む。CIM棚卸しを避け、仮想NICを含む接続中インターフェースだけを数える。
-    const source = '[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false);$ErrorActionPreference="Stop";$a=@([Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()|Where-Object {$_.OperationalStatus -eq "Up" -and $_.NetworkInterfaceType -ne "Loopback"});$p=@($a|ForEach-Object {$_.GetIPProperties()});$ip=@($p|ForEach-Object {$_.UnicastAddresses}|Where-Object {$_.Address.ToString() -notmatch "^(fe80:|169[.]254[.]|127[.]|::1$)"});$g=@($p|ForEach-Object {$_.GatewayAddresses}|Where-Object {$_.Address.ToString() -notin @("0.0.0.0","::")});$d=@($p|ForEach-Object {$_.DnsAddresses});@{interfaces_up=$a.Count;ip_address_present=($ip.Count -gt 0);gateway_configured=($g.Count -gt 0);dns_configured=($d.Count -gt 0)}|ConvertTo-Json -Compress';
+    const probe=readFileSync(join(__dirname,'../probes/win_network.ps1'),'utf8');
+    const usable=probe.slice(probe.indexOf('function Test-UsableAddress'),probe.indexOf('function Inspect-Network'));
+    const source = '[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false);$ErrorActionPreference="Stop";'+usable+';$a=@([Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()|Where-Object {$_.OperationalStatus -eq "Up" -and $_.NetworkInterfaceType -ne "Loopback"});$p=@($a|ForEach-Object {$_.GetIPProperties()});$ip=@($p|ForEach-Object {$_.UnicastAddresses}|Where-Object {Test-UsableAddress $_.Address});$g=@($p|ForEach-Object {$_.GatewayAddresses}|Where-Object {$_.Address.ToString() -notin @("0.0.0.0","::")});$d=@($p|ForEach-Object {$_.DnsAddresses});@{interfaces_up=$a.Count;ip_address_present=($ip.Count -gt 0);gateway_configured=($g.Count -gt 0);dns_configured=($d.Count -gt 0)}|ConvertTo-Json -Compress';
     const res = run('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(source, 'utf16le').toString('base64')]);
     if (res.status === 0) {
       try {

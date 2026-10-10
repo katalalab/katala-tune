@@ -30,12 +30,22 @@ function Active-Table($Result, $Family) {
     }
     return ""
 }
+function Test-UsableAddress($Address) {
+    try {
+        if ($null -eq $Address) { return $false }
+        if ($Address.IsIPv4MappedToIPv6) { $Address = $Address.MapToIPv4() }
+        if ([Net.IPAddress]::IsLoopback($Address) -or $Address.Equals([Net.IPAddress]::Any) -or $Address.Equals([Net.IPAddress]::IPv6Any) -or $Address.IsIPv6LinkLocal -or $Address.IsIPv6Multicast) { return $false }
+        $b = $Address.GetAddressBytes()
+        if ($b.Length -eq 4 -and (($b[0] -eq 169 -and $b[1] -eq 254) -or $b[0] -ge 224)) { return $false }
+        return $true
+    } catch { return $false }
+}
 function Inspect-Network {
     $out = [ordered]@{schema="katala_network_check.v1";platform="win32";default_route_present=$null;ip_address_present=$null;dns_configured=$null;gateway_configured=$null;interfaces_up=$null}
     try {
         $a = @([Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | Where-Object {$_.OperationalStatus -eq "Up" -and $_.NetworkInterfaceType -ne "Loopback"})
         $p = @($a | ForEach-Object {$_.GetIPProperties()})
-        $ip = @($p | ForEach-Object {$_.UnicastAddresses} | Where-Object {$_.Address.ToString() -notmatch "^(fe80:|169[.]254[.]|127[.]|::1$)"})
+        $ip = @($p | ForEach-Object {$_.UnicastAddresses} | Where-Object {Test-UsableAddress $_.Address})
         $g = @($p | ForEach-Object {$_.GatewayAddresses} | Where-Object {$_.Address.ToString() -notin @("0.0.0.0","::")})
         $d = @($p | ForEach-Object {$_.DnsAddresses})
         $out.interfaces_up=$a.Count; $out.ip_address_present=($ip.Count -gt 0); $out.gateway_configured=($g.Count -gt 0); $out.dns_configured=($d.Count -gt 0)

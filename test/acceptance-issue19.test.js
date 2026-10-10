@@ -268,6 +268,7 @@ test('条件4: 実行が失敗したら失敗として残り、戻し操作は�
   t.host.exec.failNext = true;
   const r = await t.runner.confirmAndRun('w', disable, 'w: タスクを止める');
   assert.equal(r.ok, false);
+  assert.equal(r.refresh_required, true);
   const [row] = t.db.actions();
   assert.deepEqual([row.state, row.ok, row.undo], ['failed', false, null]);
   assert.match(row.output, /失敗（exit 1）/);
@@ -298,6 +299,7 @@ test('条件4: 実行器が例外を投げたら失敗として残す（未完�
   });
   const r = await runner.confirmAndRun('w', disable, 't');
   assert.equal(r.ok, false);
+  assert.equal(r.refresh_required, true);
   const [row] = t.db.actions();
   assert.deepEqual([row.state, row.ok], ['failed', false]);
   assert.match(row.output, /ssh を起動できない/);
@@ -309,6 +311,7 @@ test('条件4: 実行記録に書けないときは実行しない（記録が�
   const runner = makeRunner({ loadConfig: () => loadConfig(t.ledger), confirm: async () => true, exec: t.host.exec, db: brokenDb });
   const r = await runner.confirmAndRun('w', disable, 't');
   assert.match(r.refused, /実行記録を書けない/);
+  assert.equal(r.refresh_required, undefined);
   assert.equal(t.host.calls.length, 0);
   assert.equal(t.host.state('Backup'), 'Ready');
 });
@@ -325,6 +328,7 @@ test('条件4: 結果の書き込みが「未更新」（false）を返したら
   const r = await runner.confirmAndRun('w', disable, 't');
   assert.equal(r.ok, false);
   assert.match(r.refused, /実行記録を書けなかった/);
+  assert.equal(r.refresh_required, true);
   assert.equal(r.entry, undefined);
 });
 
@@ -335,6 +339,7 @@ test('条件4: 結果を書けなかったら成功を返さず、記録は未�
   const r = await runner.confirmAndRun('w', disable, 't');
   assert.equal(r.ok, false);
   assert.match(r.refused, /操作は実行済み/);
+  assert.equal(r.refresh_required, true);
   const [row] = t.db.actions();
   assert.equal(row.state, 'incomplete');
 });

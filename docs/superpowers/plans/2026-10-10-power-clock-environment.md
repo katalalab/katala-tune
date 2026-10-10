@@ -1,5 +1,7 @@
 # 電力・Clock環境 Implementation Plan
 
+実装結果: Clock変更の項目は未実装。現行版はClockを観測・表示するだけで、変更操作は提供しない。
+
 > **For agentic workers:** Use subagent-driven-development for the independent calculation module. Integration and remote application remain owned by the primary session. Steps use checkbox syntax for tracking.
 
 **Goal:** 全機体の電力・Clockを表示し、計測区間の電力量と稼働時間の試算、対応機体の確認付き設定を提供して各機体へ導入する。

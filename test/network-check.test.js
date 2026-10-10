@@ -5,6 +5,13 @@ const { inspect, probeHttps } = require('../scripts/network-check');
 const result = (stdout = '', status = 0) => ({ stdout, status });
 const routeTable = (family, active = '', persistent = '', localized = false) => `IPv${family} ${localized ? 'ルート テーブル' : 'Route Table'}\n===========\n${localized ? 'アクティブ ルート' : 'Active Routes'}:\n${active}\n===========\n${localized ? '固定ルート' : 'Persistent Routes'}:\n${persistent}\n`;
 
+test('Node互換CLIも全IPv6リンクローカル・未指定・loopbackを利用可能にしない', () => {
+  for(const address of ['fe80::1','fe90::1','febf:ffff::1','fe80::1%en0','::','::1','0:0:0:0:0:0:0:1','0.0.0.0','127.0.0.2','169.254.1.2','::ffff:127.0.0.1','::ffff:169.254.1.2','ff02::1','invalid','2001:db8::1','fec0::1','192.0.2.8']) {
+    const value=inspect('darwin',cmd=>cmd==='route' ? result('interface: en0') : cmd==='ifconfig' ? result(`en0: flags=1<UP>\n inet6 ${address}`) : result(''));
+    assert.equal(value.ip_address_present,['2001:db8::1','fec0::1','192.0.2.8'].includes(address),address);
+  }
+});
+
 test('接続断・経路欠落でもDNS状態を取り、IPやSSIDを出力しない', () => {
   const calls = [];
   const execute = (cmd) => {

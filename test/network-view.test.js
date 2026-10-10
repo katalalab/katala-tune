@@ -10,6 +10,20 @@ test('native network command is registered in both Tauri handler and window capa
   assert.ok(permissions.includes('allow-network-check'));
   assert.match(fs.readFileSync('src-tauri/bridge/tune.js','utf8'), /invoke\('network_check'/);
 });
+test('network view shows platform-specific NIC state and preserves unknown values', async () => {
+  let html='',cols=[];const buttons={};
+  const fixtures=[{platform:'win32',interfaces_up:2},{platform:'win32',interfaces_up:0},{platform:'win32',interfaces_up:null},{platform:'darwin',interface_up:true,link_active:false},{platform:'darwin',interface_up:null,link_active:null}];
+  const nodes=fixtures.map((_,i)=>({id:`node${i}`}));
+  const context={Map,state:{view:'network',nodes},fmtTime:()=>'',setCrumbs:()=>{},page:v=>{html=v;},toast:()=>{},document:{querySelector:s=>buttons[s]??={},querySelectorAll:()=>[]},UI:{esc:String,chip:(label,color)=>`<span class="${color}">${label}</span>`,head:()=>'',table:v=>{cols=v.cols;return v.rows.map(n=>`<tr id="${n.id}">${v.row(n)}</tr>`).join('');}},window:{tune:{networkCheck:async([id])=>({nodes:[{node_id:id,ok:true,data:fixtures[Number(id.slice(4))]}]})}}};
+  vm.runInNewContext(fs.readFileSync('renderer/network.js','utf8'),context);
+  context.window.KT_VIEWS[0].render();await buttons['#netBasic'].onclick();
+  assert.ok(cols.some(c=>c.label==='NIC'));
+  const row=i=>html.match(new RegExp(`<tr id="node${i}">(.*?)</tr>`))[1];
+  assert.match(row(0),/2本が有効/);assert.match(row(1),/0本が有効/);
+  assert.doesNotMatch(row(2),/null本|0本/);assert.match(row(2),/未取得/);
+  assert.match(row(3),/経路NIC .*green.*あり.*リンク .*orange.*なし/);
+  assert.match(row(4),/経路NIC .*未取得.*リンク .*未取得/);
+});
 test('network view starts without probing, escapes labels and routes explicit selection through IPC', async () => {
   let html='', calls=[], rejectFirst=false;
   const buttons={};
