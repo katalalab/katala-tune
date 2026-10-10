@@ -8,6 +8,7 @@
 - 詳細なログの取り込みを既定で 1 時間ごとにする（数字は毎分）。
 - 画面「ダッシュボード」: 全機体の今（1 秒）と推移、対応が要るもの、MDM の表（OS・稼働時間・所見・ディスク・防御・電源・停止の回数・サンプラー）。
 - CLI: `export`・`hub-pull`・`monitor`・`schedule`・`metrics`・`dashboard`・`monitor-run`。
+- 2 回目に開いたときは常駐している方のウィンドウを出す（tauri-plugin-single-instance。常時監視の流れを二重にしない）。
 
 ## 0.4.0
 

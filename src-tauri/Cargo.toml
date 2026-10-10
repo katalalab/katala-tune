@@ -31,6 +31,8 @@ tauri-plugin-autostart = "2.7"
 tauri-plugin-opener = "2.7"
 tauri-plugin-clipboard-manager = "2.4"
 tauri-plugin-updater = "2.13"
+# 2 回目の起動は既存の常駐のウィンドウを出すだけ（常時監視を二重にしない）
+tauri-plugin-single-instance = "2.5"
 
 # 確認ダイアログ。tauri-plugin-dialog は「キャンセル系の終わり方」を2番目のボタンの押下に読み替えるため、
 # 安全側（やめる）を既定ボタンにすると取り違えが起きうる。rfd（plugin-dialog と同じもの）を直接使い、結果を自分で判定する
