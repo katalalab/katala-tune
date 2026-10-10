@@ -105,6 +105,8 @@ async fn probe_separates_success_timeout_unreachable_and_auth_per_host() {
 fn failure_classification_table_matches_electron() {
     let table = [
         (res(None, "", "\ntimeout 90000ms"), "timeout"),
+        (res(Some(1), "", "\ntimeout 35000ms"), "timeout"),
+        (res(Some(255), "", "Connection closed by remote host\ntimeout 35000ms"), "timeout"),
         (res(Some(255), "", "ssh: connect to host x port 22: Connection refused"), "unreachable"),
         (res(Some(255), "", "ssh: connect to host x port 22: No route to host"), "unreachable"),
         (res(Some(255), "", "kex_exchange_identification: Connection closed by remote host"), "unreachable"),

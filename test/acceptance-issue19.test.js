@@ -65,6 +65,8 @@ test('条件1: probe は host 別に 成功・timeout・unreachable・認証失�
 test('条件1: 失敗の分類表（Rust の classify_failure と同じ入力・同じ答え）', () => {
   const table = [
     [{ code: null, out: '', err: '\ntimeout 90000ms' }, 'timeout'],
+    [{ code: 1, out: '', err: '\ntimeout 35000ms' }, 'timeout'],
+    [{ code: 255, out: '', err: 'Connection closed by remote host\ntimeout 35000ms' }, 'timeout'],
     [{ code: 255, out: '', err: 'ssh: connect to host x port 22: Connection refused' }, 'unreachable'],
     [{ code: 255, out: '', err: 'ssh: connect to host x port 22: No route to host' }, 'unreachable'],
     [{ code: 255, out: '', err: 'kex_exchange_identification: Connection closed by remote host' }, 'unreachable'],

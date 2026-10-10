@@ -52,11 +52,35 @@ pub static PATH: LazyLock<std::ffi::OsString> = LazyLock::new(|| {
 
 /// 子プロセスを作る（PATH を足し、Windows ではコンソール窓を出さない）
 pub fn command(cmd: &str) -> Command {
+    // Git Bash を既定シェルにする機体では、標準 OpenSSH と Git 同梱版で
+    // 非対話パイプの挙動が異なる。GUI と CLI で同じ実体を選ぶ。
+    #[cfg(windows)]
+    let cmd = if cmd == "ssh" {
+        windows_ssh_program(std::env::var_os("ProgramFiles").as_deref(), std::env::var_os("SystemRoot").as_deref(), |p| p.is_file())
+    } else {
+        cmd.into()
+    };
     let mut c = Command::new(cmd);
     c.env("PATH", &*PATH);
     #[cfg(windows)]
     c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     c
+}
+
+#[cfg(any(windows, test))]
+fn windows_ssh_program(
+    program_files: Option<&std::ffi::OsStr>,
+    system_root: Option<&std::ffi::OsStr>,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> std::ffi::OsString {
+    if let Some(dir) = program_files {
+        let git = PathBuf::from(dir).join("Git").join("usr").join("bin").join("ssh.exe");
+        if exists(&git) {
+            return git.into_os_string();
+        }
+    }
+    let native = system_root.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\Windows")).join("System32").join("OpenSSH").join("ssh.exe");
+    if exists(&native) { native.into_os_string() } else { "ssh".into() }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -180,7 +204,7 @@ pub fn classify_failure(res: &RunResult) -> &'static str {
         .expect("UNREACHABLE")
     });
     let text = format!("{}\n{}", res.err, res.out);
-    if res.code.is_none() && TIMEOUT.is_match(&res.err) {
+    if TIMEOUT.is_match(&res.err) {
         "timeout"
     } else if AUTH.is_match(&text) {
         "auth"
@@ -450,6 +474,25 @@ pub async fn exec_on_with(runner: &dyn Runner, node: &Node, script: &str, timeou
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_ssh_prefers_git_independently_of_parent_path() {
+        let programs = PathBuf::from("programs");
+        let root = PathBuf::from("system");
+        let git = programs.join("Git/usr/bin/ssh.exe");
+        let native = root.join("System32/OpenSSH/ssh.exe");
+        let selected = windows_ssh_program(Some(programs.as_os_str()), Some(root.as_os_str()), |p| p == git || p == native);
+        assert_eq!(PathBuf::from(selected), git);
+    }
+
+    #[test]
+    fn windows_ssh_falls_back_without_installing_or_changing_config() {
+        let programs = PathBuf::from("programs");
+        let root = PathBuf::from("system");
+        let native = root.join("System32/OpenSSH/ssh.exe");
+        assert_eq!(PathBuf::from(windows_ssh_program(Some(programs.as_os_str()), Some(root.as_os_str()), |p| p == native)), native);
+        assert_eq!(windows_ssh_program(None, Some(root.as_os_str()), |_| false), std::ffi::OsString::from("ssh"));
+    }
 
     #[test]
     fn decode_falls_back_to_cp932() {
