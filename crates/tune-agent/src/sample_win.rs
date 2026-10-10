@@ -209,7 +209,7 @@ fn processes(buf: &mut Vec<u64>) -> Result<Vec<ProcRaw>, String> {
             let p = e.image_name.Buffer as usize;
             let n = e.image_name.Length as usize;
             // 名前は buf の中を指しているはず。外を指していたら読まない
-            let image = if p >= base as usize && p.checked_add(n).is_some_and(|x| x <= end) && n % 2 == 0 && p % 2 == 0 {
+            let image = if p >= base as usize && p.checked_add(n).is_some_and(|x| x <= end) && n.is_multiple_of(2) && p.is_multiple_of(2) {
                 // SAFETY: 上で buf の中・2 バイト境界・n バイトを確かめた
                 String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p as *const u16, n / 2) })
             } else {

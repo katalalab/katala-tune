@@ -225,7 +225,7 @@ pub fn procs_json(rows: &[ProcRow], n: usize) -> Value {
     let mut by_cpu: Vec<&ProcRow> = rows.iter().collect();
     by_cpu.sort_by(|a, b| b.cpu.unwrap_or(-1.0).total_cmp(&a.cpu.unwrap_or(-1.0)));
     let mut by_mem: Vec<&ProcRow> = rows.iter().collect();
-    by_mem.sort_by(|a, b| b.mem_bytes.cmp(&a.mem_bytes));
+    by_mem.sort_by_key(|r| std::cmp::Reverse(r.mem_bytes));
     json!({
         "count": rows.len(),
         "top_cpu": by_cpu.iter().take(n).map(|r| row(r)).collect::<Vec<_>>(),
