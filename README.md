@@ -52,6 +52,7 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 | ログ | Windows のイベントログ（System / Application）と NeonMonitor の `guard.log`、macOS の DiagnosticReports とカーネルのエラーを、前回の続きから取り込む。冪等・秘密の伏せ字・件数上限つき。開いている間は15分ごとに自動で取り込む |
 | 接続診断 | 「ネットワーク」画面またはnative CLIの `tune network [--probe] [機体ID ...]` で経路・IP/DNS設定の有無とHTTPS疎通を読み取り専用で確認。自動スキャンには追加しない。開発用の `npm run network` も利用できる。接続先の標本分析は「セキュリティ」画面で確認 |
 | 電力・Clock | 各操作卓から機体を分析し、取得元付きの電力・Clockを表示。計算条件は操作卓ごとの私有DBへ保存し、自動同期しない。未校正・欠測・古い値を全機合計へ含めず、SoCとCPU/GPUの重複加算を避ける。CLIの `tune power` は保存済みの結果を読むだけ |
+| WSL の中 | Windows の分析に足す（読み取り専用。`probes/win_probe.ps1` の `wsl.distros`）。`wsl.exe -l` で distro の一覧と動いているものを読み、**動いている distro だけ**に固定の読み取りコマンド（`/proc/meminfo`・メモリ圧迫 PSI・負荷・メモリ上位のプロセス名・ディスク）を1回流す。停止中の distro は起動も実行もせず `stopped_unobserved`（観測していない。「正常」でも「空」でもない）。一覧を読めなければ `unknown` で何も実行しない。観測の失敗は理由（時間切れなど）つきで残し、Docker Desktop の内部 distro は触らない。所見は、内側のメモリ逼迫（`wsl-inside-memory`）、Windows 側 `vmmem` が内側の実使用より多く持ったまま（`wsl-reclaim`）、観測していない distro（`wsl-unobserved`）。機体の詳細に「WSL の中」を出す |
 | 計測 | 台帳に `"benchmark": false` を指定した機体では負荷計測を実行せず、状態だけを読み取る。省略時は従来どおり1スレッドの固定計算を5回（python）。前回との差で「最適化が効いたか」を見る（±15% 未満は誤差扱い） |
 | 実行 | プロセス終了（同一性・負荷を直前に再確認、終了を確認できなければ「終了未確認」）、Windows の電源プラン切り替え、Mac の電源モード、対応するGPUの電力上限、タスクの無効化／有効化／今すぐ実行、launchd ジョブの停止／読み込み／今すぐ実行。電源設定は対象側ロック・読戻し・現在値を確かめた条件付き復元を通す。Clock変更は未対応 |
 | 道具 | 各機体のインストール先を読むだけ（`probes/mac_inventory.py`・`probes/win_inventory.ps1`）。パッケージマネージャもネットワークも使わない。読めなかった取り方は削除と見なさない |

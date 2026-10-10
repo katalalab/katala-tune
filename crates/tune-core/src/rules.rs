@@ -579,6 +579,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 None,
             );
         }
+        out.0.extend(crate::wsl::findings(snap, vm.and_then(|v| v.get("mem_mb")).and_then(Value::as_f64), total_mb));
         let defender = get(s, "defender");
         // netsec の防御（netsec.rs）があれば、そちらがリアルタイム保護の停止を重大として出す
         if matches!(get(defender, "realtime"), Some(Value::Bool(false))) && !truthy(get(get(s, "netsec"), "defense")) {

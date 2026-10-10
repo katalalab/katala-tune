@@ -45,3 +45,4 @@ pub mod power;
 pub mod power_observation;
 pub mod prices;
 pub mod rules;
+pub mod wsl;
