@@ -51,6 +51,13 @@
 - Windows の SSH（Git Bash 経由）は、セッションが終わってもサンプラーの標準入出力が開いたまま残る。サンプラーは自分の上にいる sshd のプロセスを見張り、終わったら止まる
 - どの場合も、サンプラーは 15 分（`sampler_max_age`）で自分から終わり、続けるなら数えずにつなぎ直す
 
+## 電力・Clockと手動の接続診断
+
+- 電力・Clockは通常のprobeとライブサンプラーに取得元付きの数値を追加する。`tune-core::power` が校正・kWh・費用を計算し、`power_observation` が取得元・欠測・セッション・観測窓を区別して積分する。操作卓ごとの計算条件と観測は `engine_power` が私有DBに保存し、`renderer/power.js` が表示する。[電力・Clock](power-clock.md)
+- 電源設定は既存の確認付きaction経路を使い、対象側ロック・読戻し・条件付き復元を追加する。probeやライブサンプラーから機体を変更しない。
+- 手動診断は `tune-core::network`、`probes/mac_network.py`・`win_network.ps1`、`renderer/network.js`。native CLIも同じエンジンを利用し、DB・台帳・自動スキャンには結果や設定を追加しない。[手動の接続診断](network-connectivity.md)
+- WindowsのSSH選択は既存Git同梱版の絶対パス、OS標準の絶対パス、PATHの順。Windows接続診断のprobeは短い固定loaderとBase64単一行（LF終端）に分け、ReadLineで受信してEOF待ちを避ける。SSH設定やシステムPATHは変更しない。
+
 ## 移行の順番
 
 | 段階 | 中身 | 状態 |
