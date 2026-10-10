@@ -590,9 +590,10 @@ td .databar { margin-top: 5px; }
 .st-running .dt-state .live-dot { background: var(--green, #2e9e5b); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green, #2e9e5b) 22%, transparent); }
 .st-minute .dt-state .live-dot { background: var(--blue, #2f7fd6); }
 .st-connecting .dt-state .live-dot { background: var(--orange, #d9822b); }
-.dt-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(58px, 1fr)); gap: 6px; margin-top: 10px; }
-.dm-k { font-size: 11px; color: var(--text3); white-space: nowrap; }
-.dm-v { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.25; }
+.dt-metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; margin-top: 10px; }
+.dm { min-width: 0; }
+.dm-k { font-size: 11px; color: var(--text3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dm-v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.25; white-space: nowrap; }
 .dm-v small { font-size: 11px; font-weight: 500; color: var(--text3); margin-left: 1px; }
 .dm.lv-warn .dm-v { color: var(--orange, #d9822b); }
 .dm.lv-crit .dm-v { color: var(--red, #d64545); }

@@ -415,6 +415,8 @@ pub fn dashboard(engine: &Engine, live: Option<&Live>, minutes: i64) -> Result<V
     let (s, rows, pull, collecting) = engine.with_db(|d| {
         Ok((settings(d), d.metrics(None, since - 6 * MINUTE, i64::MAX)?, d.get_meta("hubPull")?.unwrap_or(Value::Null), should_collect(d, now)))
     })?;
+    let lasts: HashMap<String, Value> =
+        engine.last()?.into_iter().filter_map(|r| Some((r.get("node_id")?.as_str()?.to_string(), r))).collect();
     let mut by_node: HashMap<&str, Vec<MinuteRow>> = HashMap::new();
     for r in &rows {
         by_node.entry(r.node_id.as_str()).or_default().push(r.clone());
@@ -423,22 +425,23 @@ pub fn dashboard(engine: &Engine, live: Option<&Live>, minutes: i64) -> Result<V
     let mut nodes = Vec::new();
     for n in &cfg.nodes {
         let rs = by_node.remove(n.id.as_str()).unwrap_or_default();
-        let snap = engine.with_db(|d| d.last_snapshots(&n.id, 1))?.into_iter().next();
-        let findings = engine.with_db(|d| d.snapshot_findings(&n.id))?.unwrap_or_default();
+        // 所見は画面の「機体」と同じく、保存した分析結果から作り直したもの（題名・根拠・スコアつき）
+        let r = lasts.get(n.id.as_str());
+        let findings: Vec<Value> = r.and_then(|r| r.get("findings")).and_then(Value::as_array).cloned().unwrap_or_default();
         let count = |s: &str| findings.iter().filter(|f| f.get("severity").and_then(Value::as_str) == Some(s)).count();
-        let last = snap.map(|sn| {
-            let d = &sn.data;
+        let last = r.map(|r| {
+            let d = &r["data"];
             let disks: Vec<&Value> = d.get("disk").and_then(Value::as_array).map(|a| a.iter().collect()).unwrap_or_default();
             let low_disk = disks.iter().filter_map(|x| Some((x.get("mount")?.as_str()?, x.get("free_pct")?.as_f64()?))).min_by(|a, b| a.1.total_cmp(&b.1));
             json!({
-                "at": sn.at,
+                "at": r.get("at"), "score": r.get("score"),
                 "os": d.pointer("/host/os"), "cpu": d.pointer("/host/cpu"), "model": d.pointer("/host/model"),
                 "uptime_h": d.pointer("/host/uptime_h"), "mem_total_gb": d.pointer("/memory/total_gb"),
                 "disk_low": low_disk.map(|(m, p)| json!({ "mount": m, "free_pct": p })),
                 "defender_realtime": d.pointer("/defender/realtime"),
                 "power_plan": d.pointer("/power/plan_name"),
                 "bugchecks_7d": d.pointer("/stability_7d/bugcheck_1001"),
-                "score": crate::rules::score(&findings), "critical": count("critical"), "warn": count("warn"), "info": count("info"),
+                "critical": count("critical"), "warn": count("warn"), "info": count("info"),
             })
         });
         let brief = live.and_then(|l| l.brief(&n.id));

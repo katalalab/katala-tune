@@ -57,13 +57,6 @@ impl Store {
         rows.collect()
     }
 
-    /// 一番新しい分析結果の所見
-    pub fn snapshot_findings(&self, node_id: &str) -> Result<Option<Vec<Value>>> {
-        let mut st = self.conn.prepare_cached("SELECT findings FROM tune_snapshots WHERE node_id = ? ORDER BY at DESC LIMIT 1")?;
-        let mut rows = st.query_map([node_id], |r| r.get::<_, Option<String>>(0))?;
-        Ok(rows.next().transpose()?.flatten().and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok()))
-    }
-
     /// 推移（古い順）。グラフは画面でこの点を描くだけ
     pub fn history(&self, node_id: &str, n: i64) -> Result<Vec<Value>> {
         let mut st = self.conn.prepare_cached(

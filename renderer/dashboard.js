@@ -64,10 +64,15 @@
     const pw = power(v);
     const [st, stLabel] = liveState(n);
     const s = n.series || {};
-    const pts = (k) => (s.t || []).map((t, i) => ({ t, v: s[k]?.[i] })).filter((p) => num(p.v));
-    const win = dash.minutes * 60e3;
+    // 1 分ごとの集計に、それより新しいライブの点（1 秒ごと）をつなげる。描く幅は集計がある分だけ（10 分から選んだ範囲まで）
+    const livePts = (typeof Live !== 'undefined' && Live.store[n.id]?.points) || [];
+    const lastMin = (s.t || []).at(-1) ?? 0;
+    const pts = (k) => [...(s.t || []).map((t, i) => ({ t: t + 30e3, v: s[k]?.[i] })), ...livePts.filter((p) => p.t > lastMin + 60e3).map((p) => ({ t: p.t, v: p[k] }))].filter((p) => num(p.v));
+    const now = Math.max(Date.now(), dash.data.at);
+    const first = (s.t || [])[0] ?? livePts[0]?.t ?? now;
+    const win = Math.min(dash.minutes * 60e3, Math.max(10 * 60e3, now - first + 60e3));
     const spark = Charts.spark([{ points: pts('cpu'), tone: 'accent' }, { points: pts('mem'), tone: 'info' }, { points: pts('gpu'), tone: 'warn' }],
-      { window: win, now: dash.data.at, min: 0, max: 100, gap: (win / 60) * 2.5, height: 40, label: `${n.id} の CPU・メモリ・GPU` });
+      { window: win, now, min: 0, max: 100, gap: Math.max(150e3, (dash.minutes * 60e3 / 60) * 2.5), height: 40, label: `${n.id} の CPU・メモリ・GPU` });
     const impl = n.live?.impl ? UI.chip(n.live.impl === 'rust' ? 'Rust' : 'スクリプト', n.live.impl === 'rust' ? 'green' : 'gray', { title: `サンプラー: ${n.live.impl}${n.live.agent ? ` ${n.live.agent}` : ''}${num(n.live.load) ? `・自身の負荷 ${n.live.load}%（1 コア比）` : ''}` }) : '';
     const top = (k, unit) => {
       const x = n.live?.[k]?.[0] || (n.latest?.v?.[k] && { name: n.latest.v[k][0], [unit]: n.latest.v[k][1] });
@@ -181,7 +186,7 @@
       fresh.innerHTML = tile(n);
       const nt = fresh.firstElementChild;
       el.className = nt.className;
-      for (const sel of ['.dt-metrics', '.dt-state', '.dt-top2']) {
+      for (const sel of ['.dt-metrics', '.dt-state', '.dt-top2', '.dt-spark']) {
         const a = el.querySelector(sel), b = nt.querySelector(sel);
         if (a && b && a.innerHTML !== b.innerHTML) a.innerHTML = b.innerHTML;
       }
