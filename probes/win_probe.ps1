@@ -102,14 +102,30 @@ if ($smi) {
   }
 }
 
-$cpuPowerW = $null; $cpuPowerReason = "LibreHardwareMonitor CPU Package unavailable"
+$cpuPowerW = $null; $cpuPowerSource = $null; $cpuPowerReason = "LibreHardwareMonitor CPU Package unavailable"
 try {
   $lhm = @(Get-CimInstance -Namespace root/LibreHardwareMonitor -ClassName Sensor -ErrorAction Stop | Where-Object { $_.SensorType -eq "Power" -and $_.Name -match "CPU Package" })
   if ($lhm.Count -gt 0) {
     $cpuPowerW = RNum $lhm[0].Value
-    if ($null -ne $cpuPowerW) { $cpuPowerReason = $null }
+    if ($null -ne $cpuPowerW) { $cpuPowerSource = "LibreHardwareMonitor.Sensor"; $cpuPowerReason = $null }
   }
 } catch {}
+if ($null -eq $cpuPowerW) {
+  try {
+    $samples = @(Get-Counter "\Energy Meter(*)\Power" -ErrorAction Stop).CounterSamples | Where-Object { $_.InstanceName -match "(?i)^rapl_package\d+_pkg$" }
+    $packages = @($samples | Group-Object InstanceName)
+    $watts = @()
+    foreach ($package in $packages) {
+      $sample = @($package.Group | Where-Object { $_.Status -eq 0 -and $null -ne (RNum $_.CookedValue) } | Select-Object -First 1)
+      if ($sample.Count -ne 1) { $watts = @(); break }
+      $watts += (RNum $sample[0].CookedValue) / 1000
+    }
+    if ($packages.Count -gt 0 -and $watts.Count -eq $packages.Count) {
+      $cpuPowerW = RNum (($watts | Measure-Object -Sum).Sum)
+      if ($null -ne $cpuPowerW) { $cpuPowerSource = "Energy Meter RAPL package average (mW / 1000)"; $cpuPowerReason = $null }
+    }
+  } catch {}
+}
 
 # Disks
 $disks = foreach ($d in Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3') {
@@ -422,7 +438,7 @@ $result = [ordered]@{
     apps_cpu = @($groups | Sort-Object cpu -Descending | Select-Object -First 10)
     agent_processes = $agents
   }
-  power = [ordered]@{ plan_guid = $guid; plan_name = $planName; plans = @($plans); package_w = $cpuPowerW; package_source = $(if ($null -ne $cpuPowerW) { "LibreHardwareMonitor.Sensor" } else { $null }); package_availability = $(if ($null -ne $cpuPowerW) { "available" } else { "unavailable" }); package_reason = $cpuPowerReason; soc_w = $null; soc_source = $null; low_power_mode = $null; on_battery = $null }
+  power = [ordered]@{ plan_guid = $guid; plan_name = $planName; plans = @($plans); package_w = $cpuPowerW; package_source = $cpuPowerSource; package_availability = $(if ($null -ne $cpuPowerW) { "available" } else { "unavailable" }); package_reason = $cpuPowerReason; soc_w = $null; soc_source = $null; low_power_mode = $null; on_battery = $null }
   defender = [ordered]@{ realtime = $mp.RealTimeProtectionEnabled; exclusions = $excl }
   gpus = @($gpus)
   disk = @($disks)

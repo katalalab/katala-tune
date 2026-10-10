@@ -65,6 +65,21 @@ $totalBytes = $null
 try { $totalBytes = [double](Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize * 1024 } catch { }
 if (-not $totalBytes) { $errs.Add('memory: total unknown') }
 
+# CPU package power: Windows Energy Meter exposes RAPL package instances as interval-average mW.
+# Open the counters once; the first NextValue() is only a warmup and is never emitted as a measurement.
+$energyCounters = New-Object System.Collections.Generic.List[object]
+try {
+  $energyCat = New-Object System.Diagnostics.PerformanceCounterCategory('Energy Meter')
+  foreach ($instance in $energyCat.GetInstanceNames()) {
+    if ($instance -match '(?i)^rapl_package\d+_pkg$') {
+      $counter = New-Object System.Diagnostics.PerformanceCounter('Energy Meter', 'Power', $instance, $true)
+      [void]$counter.NextValue()
+      $energyCounters.Add($counter)
+    }
+  }
+} catch { $energyCounters.Clear() }
+$energyWarm = $energyCounters.Count -gt 0
+
 # ---- GPU (nvidia-smi dmon: sm = utilization.gpu, fb = memory used MB) ----
 $smi = $null
 $sc = Get-Command nvidia-smi -ErrorAction SilentlyContinue
@@ -169,7 +184,7 @@ function Procs {
   return ('{"count":' + $k + ',"top_cpu":[' + (TopJson $byCpu $names $pids $cpus $mems $TOP) + '],"top_mem":[' + (TopJson $byMem $names $pids $cpus $mems $TOP) + ']}')
 }
 
-$has = [ordered]@{ cpu = ($null -ne $cpuCat); mem = ($null -ne $memCat); disk = ($null -ne $diskCat); net = ($null -ne $netCat); procs = ($null -ne $procCat); gpu = [bool]$smi }
+$has = [ordered]@{ cpu = ($null -ne $cpuCat); mem = ($null -ne $memCat); disk = ($null -ne $diskCat); net = ($null -ne $netCat); procs = ($null -ne $procCat); gpu = [bool]$smi; power = ($energyCounters.Count -gt 0) }
 $sessionEpochMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $hello = [ordered]@{ type = 'hello'; v = 1; os = 'windows'; cores = [Environment]::ProcessorCount; interval = $Interval; procs_every = $ProcEvery
   mem_total_gb = $(if ($totalBytes) { [math]::Round($totalBytes / 1GB, 1) } else { $null }); session_epoch_ms = $sessionEpochMs; has = $has; errors = @($errs) }
@@ -272,6 +287,22 @@ try {
 
     $line = '{"type":"s","t":' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + ',"seq":' + $seq + ',"cpu":' + $total + ',"cores":[' + ($cores -join ',') + ']'
     $line += ',"mem":{"used_pct":' + $usedPct + ',"commit_pct":' + $commitPct + ',"commit_gb":' + $commitGb + ',"commit_limit_gb":' + $limitGb + '}'
+
+    # Energy Meter Power is mW. Require every package counter to be finite and nonnegative before summing.
+    $packageW = 'null'; $powerAvailable = 'false'
+    if ($energyCounters.Count -gt 0) {
+      if ($energyWarm) { $energyWarm = $false }
+      else {
+        $sumMw = 0.0; $validPower = $true
+        foreach ($counter in $energyCounters) {
+          $value = $null; try { $value = [double]$counter.NextValue() } catch { }
+          if ($null -eq $value -or [double]::IsNaN($value) -or [double]::IsInfinity($value) -or $value -lt 0) { $validPower = $false; break }
+          $sumMw += $value
+        }
+        if ($validPower) { $packageW = ([math]::Round($sumMw / 1000, 1)).ToString('R', $inv); $powerAvailable = 'true' }
+      }
+      $line += ',"power":{"package_w":' + $packageW + ',"package_source":"Energy Meter RAPL package average (mW / 1000)","available":' + $powerAvailable + '}'
+    }
 
     # Disk: all physical disks
     $d = $null; try { $d = $diskCat.ReadCategory() } catch { }

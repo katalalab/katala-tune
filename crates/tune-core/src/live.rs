@@ -163,6 +163,13 @@ pub struct Gpu {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct Power {
+    pub package_w: Option<f64>,
+    pub package_source: Option<String>,
+    pub available: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Proc {
     #[serde(default)]
     pub pid: i64,
@@ -201,6 +208,7 @@ pub struct RawSample {
     pub mem: Option<Mem>,
     pub disk: Option<Disk>,
     pub net: Option<Net>,
+    pub power: Option<Power>,
     pub gpu: Option<Vec<Gpu>>,
     pub procs: Option<Procs>,
     #[serde(rename = "self")]
@@ -273,6 +281,7 @@ pub struct Sample {
     /// サンプラーの時刻（ms）。t との差が遅延の目安（時計が合っているとき）
     pub src_t: Option<i64>,
     pub seq: Option<u64>,
+    pub session_epoch: Option<String>,
     /// 機体全体の CPU（%）
     pub cpu: Option<f64>,
     /// コアごとの CPU（%）
@@ -280,6 +289,7 @@ pub struct Sample {
     pub mem: Option<Mem>,
     pub disk: Option<Disk>,
     pub net: Option<Net>,
+    pub power: Option<Power>,
     pub gpu: Option<Vec<Gpu>>,
 }
 
@@ -318,15 +328,18 @@ impl Sample {
                 })
                 .collect()
         });
+        let power = r.power.map(|x| Power { package_w: nonneg(x.package_w), package_source: x.package_source.map(|s| short(&s)), available: x.available });
         let s = Sample {
             t: received,
             src_t: r.t.filter(|t| t.is_finite() && *t > 0.0).map(|t| t as i64),
             seq: r.seq,
+            session_epoch: None,
             cpu: pct(r.cpu),
             cores: r.cores.into_iter().take(MAX_CORES).map(pct).collect(),
             mem,
             disk: r.disk.map(|d| Disk { read_bps: nonneg(d.read_bps), write_bps: nonneg(d.write_bps) }),
             net: r.net.map(|n| Net { rx_bps: nonneg(n.rx_bps), tx_bps: nonneg(n.tx_bps) }),
+            power,
             gpu,
         };
         (s, r.procs.map(clean_procs), r.me)
@@ -336,6 +349,12 @@ impl Sample {
     pub fn point(&self) -> Value {
         let mut m = Map::new();
         m.insert("t".into(), Value::from(self.t));
+        if let Some(seq) = self.seq {
+            m.insert("seq".into(), Value::from(seq));
+        }
+        if let Some(epoch) = &self.session_epoch {
+            m.insert("epoch".into(), Value::from(epoch.clone()));
+        }
         let mut put = |k: &str, v: Option<f64>, digits: i32| {
             if let Some(x) = v {
                 let f = 10f64.powi(digits);
@@ -351,6 +370,8 @@ impl Sample {
         put("dw", self.disk.as_ref().and_then(|d| d.write_bps), 0);
         put("rx", self.net.as_ref().and_then(|n| n.rx_bps), 0);
         put("tx", self.net.as_ref().and_then(|n| n.tx_bps), 0);
+        put("power_cpu_w", self.power.as_ref().and_then(|p| p.package_w), 1);
+        let power_source = self.power.as_ref().and_then(|p| p.package_source.as_ref());
         if let Some(g) = &self.gpu {
             put("gpu", g.iter().filter_map(|x| x.util).reduce(f64::max), 1);
             let (used, total) = g.iter().fold((0.0, 0.0), |(u, t), x| (u + x.mem_used_mb.unwrap_or(0.0), t + x.mem_total_mb.unwrap_or(0.0)));
@@ -360,6 +381,9 @@ impl Sample {
             }
         }
         put("lag", self.src_t.map(|s| (self.t - s) as f64), 0);
+        if let Some(source) = power_source {
+            m.insert("power_cpu_source".into(), Value::from(source.clone()));
+        }
         Value::Object(m)
     }
 }
@@ -773,6 +797,7 @@ struct NodeLive {
     ring: Ring<Sample>,
     procs: Option<Value>,
     info: Option<Hello>,
+    session_epoch: Option<String>,
     phase: Phase,
     reason: Option<&'static str>,
     detail: Option<String>,
@@ -794,6 +819,7 @@ impl NodeLive {
             ring: Ring::new(cap),
             procs: None,
             info: None,
+            session_epoch: None,
             phase: Phase::Stopped,
             reason: None,
             detail: None,
@@ -1080,6 +1106,7 @@ impl Live {
         let mut st = self.lock();
         if Self::current(&st, id, epoch) {
             let n = self.node(&mut st, id);
+            n.session_epoch = Some(format!("{epoch}:{}", h.session_epoch_ms.unwrap_or_default()));
             n.info = Some(h);
             n.dirty_info = true;
         }
@@ -1091,8 +1118,9 @@ impl Live {
         if !Self::current(&st, id, epoch) {
             return;
         }
-        let (s, procs, me) = Sample::from_raw(raw, now);
         let n = self.node(&mut st, id);
+        let (mut s, procs, me) = Sample::from_raw(raw, now);
+        s.session_epoch = n.session_epoch.clone();
         n.ring.push(s);
         n.new_points = (n.new_points + 1).min(n.ring.cap());
         if let Some(p) = procs {
@@ -1234,7 +1262,7 @@ mod tests {
         Node::from_value(&json!({ "id": id, "alias": id, "os": os }), "this-host")
     }
 
-    const SAMPLE: &str = r#"{"type":"s","t":1700000000000,"seq":3,"cpu":12.5,"cores":[10,20,null,150],"mem":{"used_pct":41.2,"swap_used_gb":1.5,"swap_total_gb":2,"pressure":"normal"},"disk":{"read_bps":1000,"write_bps":-5},"net":{"rx_bps":10,"tx_bps":20},"gpu":[{"uuid":"GPU-a","name":"G","util":30,"mem_used_mb":1024,"mem_total_mb":4096,"power_w":220,"power_limit_w":320,"power_min_w":100,"power_max_w":350,"temp_c":65,"clocks_graphics_mhz":1800,"clocks_sm_mhz":1815,"clocks_memory_mhz":9500,"pstate":"P0","source":"nvidia-smi dmon","available":true}],"procs":{"count":3,"top_cpu":[{"pid":7,"name":"a","cpu":150.5,"mem_mb":10}],"top_mem":[]},"self":{"cpu_s":0.5,"rss_mb":20}}"#;
+    const SAMPLE: &str = r#"{"type":"s","t":1700000000000,"seq":3,"cpu":12.5,"cores":[10,20,null,150],"mem":{"used_pct":41.2,"swap_used_gb":1.5,"swap_total_gb":2,"pressure":"normal"},"disk":{"read_bps":1000,"write_bps":-5},"net":{"rx_bps":10,"tx_bps":20},"power":{"package_w":200.8,"package_source":"Energy Meter RAPL package average","available":true},"gpu":[{"uuid":"GPU-a","name":"G","util":30,"mem_used_mb":1024,"mem_total_mb":4096,"power_w":220,"power_limit_w":320,"power_min_w":100,"power_max_w":350,"temp_c":65,"clocks_graphics_mhz":1800,"clocks_sm_mhz":1815,"clocks_memory_mhz":9500,"pstate":"P0","source":"nvidia-smi dmon","available":true}],"procs":{"count":3,"top_cpu":[{"pid":7,"name":"a","cpu":150.5,"mem_mb":10}],"top_mem":[]},"self":{"cpu_s":0.5,"rss_mb":20}}"#;
 
     #[test]
     fn parses_lines_and_ignores_noise() {
@@ -1249,6 +1277,7 @@ mod tests {
         assert_eq!(p.cores, vec![Some(10.0), Some(20.0), None, Some(100.0)], "コアは 0〜100 に収める");
         assert_eq!(p.disk.as_ref().unwrap().write_bps, None, "負の速度は捨てる");
         assert_eq!((p.src_t, p.seq), (Some(1_700_000_000_000), Some(3)));
+        assert_eq!(p.power.as_ref().and_then(|x| x.package_w), Some(200.8));
         let gpu = &p.gpu.as_ref().unwrap()[0];
         assert_eq!(
             (gpu.uuid.as_deref(), gpu.pstate.as_deref(), gpu.source.as_deref(), gpu.available),
@@ -1261,8 +1290,8 @@ mod tests {
         assert_eq!(me.unwrap().cpu_s, Some(0.5));
         let pt = p.point();
         assert_eq!(
-            (pt["cpu"].as_f64(), pt["gpu"].as_f64(), pt["gmem"].as_f64(), pt["power_gpu_w"].as_f64(), pt["lag"].as_f64()),
-            (Some(12.5), Some(30.0), Some(25.0), Some(220.0), Some(120.0))
+            (pt["cpu"].as_f64(), pt["gpu"].as_f64(), pt["gmem"].as_f64(), pt["power_cpu_w"].as_f64(), pt["power_gpu_w"].as_f64(), pt["lag"].as_f64()),
+            (Some(12.5), Some(30.0), Some(25.0), Some(200.8), Some(220.0), Some(120.0))
         );
         assert!(pt.get("dw").is_none(), "無い値は点に入れない");
         assert!(matches!(parse_line(r#"{"type":"end","reason":"max_age"}"#), Some(Msg::End(r)) if r == "max_age"));

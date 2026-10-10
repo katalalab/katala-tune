@@ -402,7 +402,7 @@ def main():
         init("procs", lambda: procs.sample(t0))
     has = {"cpu": cpu_prev is not None, "mem": True, "disk": disk_prev is not None, "net": net_prev is not None, "procs": procs is not None, "gpu": False}
     hello = {"type": "hello", "v": V, "os": "macos", "cores": ncpu.value if ncpu else None, "interval": INTERVAL, "procs_every": PROCS_EVERY,
-             "mem_total_gb": round(mem_total.value / 2**30, 1) if mem_total else None, "has": has, "errors": ERRORS}
+             "mem_total_gb": round(mem_total.value / 2**30, 1) if mem_total else None, "session_epoch_ms": time.time_ns() // 1_000_000, "has": has, "errors": ERRORS}
     if WATCH:
         import threading
 
