@@ -109,6 +109,12 @@
       "interval_seconds": 1,
       "points": [{ "t": 0, "seq": 1, "epoch": "boot", "source": "meter", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "boot", "source": "meter", "watts": 100 }, {}, { "t": 2000, "seq": 3, "epoch": "boot", "source": "meter", "watts": 100 }, { "t": 3000, "seq": 4, "epoch": "boot", "source": "meter", "watts": 100 }],
       "expected": { "kwh": 0.00005555555555555556, "covered_seconds": 2, "duration_seconds": 2, "coverage": 1 }
+    },
+    {
+      "name": "an epoch transition after a gap retires the prior epoch before delayed replay",
+      "interval_seconds": 1,
+      "points": [{ "t": 0, "seq": 1, "epoch": "a", "source": "meter", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "a", "source": "meter", "watts": 100 }, {}, { "t": 0, "seq": 1, "epoch": "b", "source": "meter", "watts": 100 }, { "t": 1000, "seq": 2, "epoch": "b", "source": "meter", "watts": 100 }, { "t": 2000, "seq": 3, "epoch": "a", "source": "meter", "watts": 100 }, { "t": 2000, "seq": 3, "epoch": "b", "source": "meter", "watts": 100 }, { "t": 3000, "seq": 4, "epoch": "b", "source": "meter", "watts": 100 }],
+      "expected": { "kwh": 0.00011111111111111112, "covered_seconds": 4, "duration_seconds": 4, "coverage": 1 }
     }
   ]
 }

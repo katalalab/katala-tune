@@ -105,6 +105,7 @@ pub fn integrate(points: &Value, interval_seconds: f64) -> Value {
     let mut covered_seconds = 0.0;
     let mut duration_seconds = 0.0;
     let mut previous: Option<Point> = None;
+    let mut active_epoch: Option<String> = None;
     let mut watermarks: HashMap<(String, String), (i64, f64)> = HashMap::new();
     let mut retired_epochs = HashSet::new();
     for raw in points.as_array().into_iter().flatten() {
@@ -121,6 +122,11 @@ pub fn integrate(points: &Value, interval_seconds: f64) -> Value {
         {
             continue;
         }
+        if active_epoch.as_deref() != Some(current.epoch.as_str())
+            && let Some(epoch) = active_epoch.replace(current.epoch.clone())
+        {
+            retired_epochs.insert(epoch);
+        }
         if previous.is_none() {
             watermarks.insert(current_key, (current.seq, current.t));
             previous = Some(current);
@@ -128,9 +134,6 @@ pub fn integrate(points: &Value, interval_seconds: f64) -> Value {
         }
         let prior = previous.as_ref().expect("previous point is set").clone();
         if prior.epoch != current.epoch || prior.source != current.source {
-            if prior.epoch != current.epoch {
-                retired_epochs.insert(prior.epoch);
-            }
             watermarks.insert(current_key, (current.seq, current.t));
             previous = Some(current);
             continue;
