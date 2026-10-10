@@ -528,7 +528,7 @@ impl Engine {
             ActionTargetLock { targets: &self.action_targets, node_id: node_id.to_string() }
         };
         // MutexGuard を await をまたいで保持せず、確認から実行記録までを機体単位で直列化する。
-        let result = async {
+        async {
             let refused = |m: String| Ok(json!({ "ok": false, "refused": m }));
             let fresh = match nodes::load_config(&self.config_path) {
                 Ok(c) => c,
@@ -599,8 +599,7 @@ impl Engine {
             entry["undo"] = r.undo.clone().unwrap_or(Value::Null);
             Ok(json!({ "ok": r.ok, "code": r.code, "outcome": r.outcome, "output": r.output, "undo": r.undo, "entry": entry }))
         }
-        .await;
-        result
+        .await
     }
 
     /// 実行記録から元に戻す
