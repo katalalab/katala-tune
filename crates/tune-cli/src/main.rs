@@ -23,6 +23,7 @@
 //!   tune schedule ['{"logs_minutes":60}']          自動スキャンの間隔を見る・変える（画面と同じ範囲だけ受け付ける）
 //!   tune metrics [機体] [--minutes N] 分ごとの集計（既定は直近 60 分）
 //!   tune dashboard [--minutes N]     ダッシュボードと同じ JSON（ライブの段階は入らない）
+//!   tune monitor-run [--seconds N]   常時監視を N 秒（既定 180、最大 3600）だけ画面なしで動かし、ダッシュボードの JSON を出す（確認用）
 //!   tune live [--seconds N] 機体 ...  ライブ表示のサンプラーを N 秒（既定 30、最大 300）流し、件数・間隔・遅延・
 //!                                    サンプラー自身の負荷を JSON で（読み取り専用。機体は必ず指定する）
 //!
@@ -357,6 +358,20 @@ async fn main() -> ExitCode {
                     _ => tune_core::monitor::dashboard(&e, None, minutes),
                 }
                 .map(|v| print(&v))
+            }
+            Err(e) => Err(e),
+        },
+        "monitor-run" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => {
+                use tune_core::live::{Live, Opts, ProcessRoute};
+                let secs = flag(rest, "--seconds").unwrap_or(180).clamp(15, 3600) as u64;
+                let live = Live::new(Arc::new(ProcessRoute), Opts::default(), Box::new(|_| {}));
+                tokio::spawn(live.clone().run_ticker());
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+                tune_core::monitor::run(e.clone(), live.clone(), |ev| eprintln!("monitor: {ev}"), Some(until)).await;
+                let v = tune_core::monitor::dashboard(&e, Some(&live), 60);
+                live.shutdown(std::time::Duration::from_secs(3)).await;
+                v.map(|v| print(&v))
             }
             Err(e) => Err(e),
         },

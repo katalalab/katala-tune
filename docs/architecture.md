@@ -38,7 +38,7 @@
 
 | 層 | 中身 | 置き場所 |
 |---|---|---|
-| サンプラー | 読み取り専用。1 行目に hello、以後 1 行 1 JSON を出し続ける。macOS は標準ライブラリだけ（ctypes で OS の統計を読み、他ユーザーのプロセスは setuid の ps を 15 秒ごと）、Windows は .NET の性能カウンタ（英語名なので日本語版でも動く）と、GPU は 120 回で自分から終わる `nvidia-smi dmon` | `probes/live_mac.py`・`probes/live_win.ps1` |
+| サンプラー | 読み取り専用。1 行目に hello、以後 1 行 1 JSON を出し続ける。macOS は標準ライブラリだけ（ctypes で OS の統計を読み、他ユーザーのプロセスは setuid の ps を 15 秒ごと）。Windows は Rust のネイティブ版（`tune-agent sample`。PDH で性能カウンタを直接読み、プロセスは NtQuerySystemInformation 1 回。`~/.katala-tune/bin/tune-agent.exe` に置く）を先に使い、無ければ PowerShell 版（.NET の性能カウンタ）。GPU はどちらも 120 回で自分から終わる `nvidia-smi dmon` | `crates/tune-agent/src/sample*.rs`・`probes/live_mac.py`・`probes/live_win.ps1` |
 | 取得の経路 | 今は子プロセス（この機体はローカル、ほかは SSH）。将来は tune-agent の暗号化通信に差し替える | `tune-core::live::Route` |
 | 解析・保持 | 行を読んで範囲に収め、機体ごとに直近 300 点を Rust 側に持つ | `tune-core::live`（`parse_line`・`Ring`） |
 | 管理 | 開始・停止、画面からの合図（liveStart の呼び直し）が 2 分途切れたら自動停止、同時に 6 台まで、続けての失敗は 3 回までつなぎ直す、アプリの終了・ウィンドウを閉じたときの停止 | `tune-core::live::Live`、`src-tauri/src/live.rs` |
@@ -57,6 +57,17 @@
 - 電源設定は既存の確認付きaction経路を使い、対象側ロック・読戻し・条件付き復元を追加する。probeやライブサンプラーから機体を変更しない。
 - 手動診断は `tune-core::network`、`probes/mac_network.py`・`win_network.ps1`、`renderer/network.js`。native CLIも同じエンジンを利用し、DB・台帳・自動スキャンには結果や設定を追加しない。[手動の接続診断](network-connectivity.md)
 - WindowsのSSH選択は既存Git同梱版の絶対パス、OS標準の絶対パス、PATHの順。Windows接続診断のprobeは短い固定loaderとBase64単一行（LF終端）に分け、ReadLineで受信してEOF待ちを避ける。SSH設定やシステムPATHは変更しない。
+
+## 常時監視とハブ（画面が見ていなくても集める）
+
+ライブと同じサンプラー・同じ管理（`tune-core::live::Live`）を使い、`tune-core::monitor::run` が 15 秒ごとに合図を送って流れを保つ。終わった 1 分ぶんを `metrics_minute`（1 機体 1 分 1 行、項目ごとに [平均, 最大]、14 日）へ集計する。
+
+| 役割 | 動き |
+|---|---|
+| ハブ（常時監視オン・ハブ未選択） | 全機体を流し続けて集計する。分析・詳細なログは 1 時間ごと |
+| 写す側（ハブを選んだ操作卓） | 1 分ごとに `ssh <ハブ> ~/.katala-tune/bin/tune(.exe) export --since <前回>` で集計と最新の分析結果を写す。ハブの数字が 5 分より古い（ハブのアプリが止まっている）ときは、常時監視がオンなら自分で集める。ハブの分析結果が新しいあいだは自分では分析しない。画面を見ているあいだのライブは自分で流す |
+
+写しの形は `{v:1, host, at, latest, metrics:[…], snapshots:[…]}`。時刻はハブの時計で、写す側は `at` を次の起点にする（機体の時計のずれに左右されない）。常駐（startup）の登録はしない。アプリを開いているあいだだけ動く。
 
 ## 移行の順番
 

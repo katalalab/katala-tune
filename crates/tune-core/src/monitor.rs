@@ -7,6 +7,7 @@
 //! - 詳細（分析・ログ）は 1 時間ごと（engine の既定）。ハブの分析結果が新しいあいだ、写す側は分析を重ねない
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
@@ -22,6 +23,8 @@ pub const MINUTE: i64 = 60_000;
 pub const KEEP_DAYS: i64 = 14;
 /// ハブの一番新しい分がハブの時計でこれより古ければ、ハブは集めていないとみなす
 pub const HUB_STALE_MS: i64 = 5 * MINUTE;
+/// つなぎ直しても続かなかった機体（電源が落ちている・オフライン）を次に試すまで
+pub const RETRY_DISCONNECTED_MS: i64 = 5 * MINUTE;
 /// 一度に写す範囲の上限（初回でも 24 時間ぶん）
 pub const EXPORT_MAX_MS: i64 = 24 * 60 * MINUTE;
 /// 集計に使う値（Sample::point のキー）
@@ -321,6 +324,82 @@ pub fn hub_fresh(db: &Store, now: i64) -> bool {
 /// このアプリで集めるか（常時監視が入っていて、写しているハブが新しくないとき）
 pub fn should_collect(db: &Store, now: i64) -> bool {
     settings(db).enabled && !hub_fresh(db, now)
+}
+
+// ---------------------------------------------------------------------------
+// 常時監視の繰り返し（Tauri の殻と `tune monitor-run` が使う）
+// ---------------------------------------------------------------------------
+
+/// 15 秒ごとに: 常時監視が入っていてハブの数字が新しくなければ全機体のライブに合図を送って保ち、
+/// 終わった分を集計して保存し、ハブを選んでいれば 1 分ごとに写す。14 日より古い集計は 1 日 1 回消す。
+/// until（CLI の確認用）を過ぎたら戻る。event には {"rows": n} / {"pulled": true} を渡す
+pub async fn run(engine: Arc<Engine>, live: Arc<Live>, event: impl Fn(Value), until: Option<std::time::Instant>) {
+    let mut rolled: HashMap<String, i64> = HashMap::new();
+    let mut retry_at: HashMap<String, i64> = HashMap::new();
+    let (mut last_pull, mut last_prune) = (0i64, 0i64);
+    let host = crate::nodes::local_host();
+    let mut iv = tokio::time::interval(Duration::from_secs(15));
+    loop {
+        iv.tick().await;
+        let now = now_ms();
+        let (s, collect) = engine.with_db(|d| Ok((settings(d), should_collect(d, now)))).unwrap_or_default();
+        if s.hub.is_some() && now - last_pull >= MINUTE - 5_000 {
+            last_pull = now;
+            if pull(&engine).await.is_ok() {
+                event(json!({ "pulled": true }));
+            }
+        }
+        let cfg = engine.config();
+        if collect {
+            // 流れていれば合図、止まっていれば流し直す。つなぎ直しても続かなかった機体は 5 分おきにだけ試す
+            let targets: Vec<Node> = cfg
+                .nodes
+                .iter()
+                .filter(|n| n.is_mac() || n.is_windows())
+                .filter(|n| {
+                    let down = live.brief(&n.id).is_some_and(|b| b["state"] == "stopped" && b["reason"] == "disconnected");
+                    if !down {
+                        retry_at.remove(&n.id);
+                        return true;
+                    }
+                    let at = *retry_at.entry(n.id.clone()).or_insert(now + RETRY_DISCONNECTED_MS);
+                    if now >= at {
+                        retry_at.insert(n.id.clone(), now + RETRY_DISCONNECTED_MS);
+                        return true;
+                    }
+                    false
+                })
+                .cloned()
+                .collect();
+            live.start(&targets, &[]);
+        }
+        // ハブの数字を写しているあいだは、手元のライブの点で同じ分を上書きしない
+        if collect || s.hub.is_none() {
+            let until_min = now.div_euclid(MINUTE) * MINUTE;
+            let mut rows = Vec::new();
+            for n in &cfg.nodes {
+                let from = rolled.get(&n.id).map_or(until_min - 5 * MINUTE, |m| m + MINUTE);
+                if from >= until_min {
+                    continue;
+                }
+                let got = rollup(&n.id, &live.samples(&n.id), live.procs(&n.id).as_ref(), from, until_min, &host);
+                if let Some(last) = got.last() {
+                    rolled.insert(n.id.clone(), last.minute);
+                }
+                rows.extend(got);
+            }
+            if !rows.is_empty() && engine.with_db(|d| d.add_metrics(&rows)).is_ok() {
+                event(json!({ "rows": rows.len() }));
+            }
+        }
+        if now - last_prune >= 24 * 60 * MINUTE {
+            last_prune = now;
+            let _ = engine.with_db(|d| d.prune_metrics(now - KEEP_DAYS * 24 * 60 * MINUTE));
+        }
+        if until.is_some_and(|u| std::time::Instant::now() >= u) {
+            return;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
