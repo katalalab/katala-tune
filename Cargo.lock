@@ -5142,6 +5142,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tune-link",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
