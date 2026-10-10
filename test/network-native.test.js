@@ -51,3 +51,15 @@ test('Windows recognizes absent default routes only when both active family form
   const r=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(source,'utf16le').toString('base64')],{encoding:'utf8',timeout:10000,windowsHide:true});
   assert.equal(r.status,0,r.stderr); const d=JSON.parse(r.stdout.trim()); assert.equal(d.absent,false); assert.equal(d.unknown,null); assert.equal(d.vpn,true);
 });
+test('Windows stdin loader receives the complete embedded probe with a short command line', {skip:process.platform!=='win32'}, () => {
+  const core=fs.readFileSync('crates/tune-core/src/network.rs','utf8');
+  const loader=/let loader = "([^"]+)";/.exec(core)?.[1]; assert.ok(loader);
+  const encoded=Buffer.from(loader,'utf16le').toString('base64');
+  assert.ok(encoded.length<2000);
+  const source=`& { ${fs.readFileSync(ps,'utf8').replace(/^\uFEFF/,'')}\n }; [Console]::WriteLine("stdin_complete")`;
+  assert.ok(Buffer.from(source,'utf16le').toString('base64').length>8191);
+  const r=spawnSync('powershell.exe',['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',encoded],{input:Buffer.from(source,'utf8').toString('base64'),encoding:'utf8',timeout:20000,windowsHide:true});
+  assert.equal(r.status,0,r.stderr); const lines=r.stdout.trim().split(/\r?\n/);
+  assert.equal(lines.pop(),'stdin_complete'); const data=JSON.parse(lines.pop());
+  assert.equal(data.schema,'katala_network_check.v1'); assert.equal(data.platform,'win32'); assert.equal(data.active_probes,false);
+});
