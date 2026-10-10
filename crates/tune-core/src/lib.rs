@@ -38,6 +38,7 @@ pub mod inventory;
 pub mod js;
 pub mod live;
 pub mod logs;
+pub mod monitor;
 pub mod netsec;
 pub mod network;
 pub mod nodes;

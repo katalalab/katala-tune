@@ -9,6 +9,7 @@
 //! - confirm: 変更操作の確認ダイアログ
 //! - live: ライブ表示（liveStart / liveStop と live イベント。中身は tune-core の live）
 //! - agent: 「接続」の画面（tune-agent とのペアリングの骨組み。中身は tune-link）
+//! - monitor: 常時監視（分ごとの集計）・ハブとの同期・ダッシュボード（中身は tune-core の monitor）
 //! - 自動スキャン（1分ごとに期限を見る）・通知（異常化と回復だけ）・ログイン時の起動
 
 mod accent;
@@ -18,6 +19,7 @@ mod commands_netsec;
 mod commands_tools;
 mod confirm;
 mod live;
+mod monitor;
 mod tray;
 mod update;
 mod window;
@@ -141,6 +143,9 @@ pub fn run() {
             live::live_start,
             live::live_stop,
             live::power_session,
+            monitor::dashboard,
+            monitor::monitor_settings,
+            monitor::hub_pull,
             agent::agent_peers,
             agent::agent_pair,
         ])
@@ -149,13 +154,15 @@ pub fn run() {
             let engine = Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(TauriHost { app: handle.clone() }))?;
             app.manage(engine.clone());
             app.manage(window::Pending::default());
-            app.manage(live::create(&handle));
+            let live = live::create(&handle);
+            app.manage(live.clone());
             if let Some(v) = std::env::var("KATALA_TUNE_DEV_VIEW").ok().filter(|_| cfg!(debug_assertions)) {
                 window::navigate_after_load(&handle, &v);
             }
             window::create(&handle, !hidden)?;
             tray::create(&handle)?;
             engine.compute_checks(false, true);
+            monitor::start(handle.clone(), engine.clone(), live);
             start_scheduler(engine);
             // 新しい版があれば通知だけする（入れるのはメニューから、確認のあとだけ）
             update::start(handle.clone());

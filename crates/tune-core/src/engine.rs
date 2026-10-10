@@ -48,7 +48,8 @@ impl Host for NoHost {}
 pub type Confirm = Box<dyn FnOnce(String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send>;
 
 pub const DEFAULT_PROBE_MINUTES: i64 = 60;
-pub const DEFAULT_LOGS_MINUTES: i64 = 15;
+/// 詳細なログは 1 時間ごと（数字は常時監視で毎分、分析も 1 時間ごと）
+pub const DEFAULT_LOGS_MINUTES: i64 = 60;
 pub const DEFAULT_INVENTORY_HOURS: i64 = 24;
 
 pub struct Engine {
@@ -455,7 +456,9 @@ impl Engine {
         let meta = |k: &str| self.with_db(|d| d.get_meta(k)).ok().flatten();
         let since = |k: &str| now - js::num(js::or(meta(k).as_ref(), Some(&Value::from(0))));
         let mins = |k: &str| js::num(s.get(k)) * 60000.0;
-        if since("lastProbeAt") >= mins("probe_minutes") {
+        // ハブの分析結果を写していて新しいあいだは、同じ機体を重ねて分析しない（monitor.rs）
+        let hub_fresh = self.with_db(|d| Ok(crate::monitor::hub_fresh(d, now as i64))).unwrap_or(false);
+        if !hub_fresh && since("lastProbeAt") >= mins("probe_minutes") {
             self.run_probe(None, true).await;
             let nodes = self.reload_config().nodes;
             self.sync_logs(nodes).await;
