@@ -5,7 +5,7 @@
 
 - 配布版: [GitHub Releases](https://github.com/katalalab/katala-tune/releases)（macOS universal / Windows x64）
 - 開発: `npm run doctor` → `npm start`（Tauri）。[開発手順](docs/development.md)
-- 配布物の作成: `npm run package`。版・署名・更新の手順は [リリース手順](docs/release.md)
+- 配布物の作成: `npm run package`。版・署名・更新の手順は [リリース手順](docs/release.md)（main で版を上げれば自動で公開され、動いているアプリが自動で更新する）
 - 端末から: `cargo run -p tune-cli -- --help`。従来の JS 検証用 CLI は `npm run probe` / `npm run logs`
 
 ## 初めて使うとき

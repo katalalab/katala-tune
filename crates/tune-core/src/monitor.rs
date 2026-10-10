@@ -370,12 +370,24 @@ pub fn live_opts(nodes: usize) -> Opts {
     Opts { max_streams: nodes.max(d.max_streams), ..d }
 }
 
+/// サンプラーを入れ替えた機体を次に試すまで（失敗・入れ替え直後の同じ版の見直し）
+pub const AGENT_PUSH_EVERY_MS: i64 = 60 * MINUTE;
+
 /// 15 秒ごとに: 常時監視が入っていてハブの数字が新しくなければ全機体のライブに合図を送って保ち、
 /// 終わった分を集計して保存し、ハブを選んでいれば 1 分ごとに写す。14 日より古い集計は 1 日 1 回消す。
-/// until（CLI の確認用）を過ぎたら戻る。event には {"rows": n} / {"pulled": true} を渡す
-pub async fn run(engine: Arc<Engine>, live: Arc<Live>, event: impl Fn(Value), until: Option<std::time::Instant>) {
+/// agent（同梱のサンプラー。Windows の操作卓だけ）があれば、hello の版が古い・無い Windows の機体へ入れ替えを送る（helpers.rs）。
+/// until（CLI の確認用）を過ぎたら戻る。event には {"rows": n} / {"pulled": true} / {"agent": …} を渡す
+pub async fn run(
+    engine: Arc<Engine>,
+    live: Arc<Live>,
+    event: impl Fn(Value) + Send + Sync + 'static,
+    until: Option<std::time::Instant>,
+    agent: Option<Arc<Vec<u8>>>,
+) {
+    let event = Arc::new(event);
     let mut rolled: HashMap<String, i64> = HashMap::new();
     let mut retry_at: HashMap<String, i64> = HashMap::new();
+    let mut pushed_at: HashMap<String, i64> = HashMap::new();
     let (mut last_pull, mut last_prune) = (0i64, 0i64);
     let host = crate::nodes::local_host();
     let mut iv = tokio::time::interval(Duration::from_secs(15));
@@ -416,6 +428,23 @@ pub async fn run(engine: Arc<Engine>, live: Arc<Live>, event: impl Fn(Value), un
             let refused: Vec<&Value> = r["refused"].as_array().into_iter().flatten().filter(|x| x["reason"] == "limit").map(|x| &x["id"]).collect();
             if !refused.is_empty() {
                 event(json!({ "refused": refused, "limit": r["limit"] }));
+            }
+            // サンプラーの版が古い・無い Windows の機体へ同梱の物を送り、入れ替わったらつなぎ直す（1 機体 1 時間に 1 回まで）
+            if let Some(bytes) = &agent {
+                for n in cfg.nodes.iter().filter(|n| crate::helpers::agent_outdated(n, live.brief(&n.id).as_ref())) {
+                    if pushed_at.get(&n.id).is_some_and(|t| now - t < AGENT_PUSH_EVERY_MS) {
+                        continue;
+                    }
+                    pushed_at.insert(n.id.clone(), now);
+                    let (n, bytes, live, event) = (n.clone(), bytes.clone(), live.clone(), event.clone());
+                    tokio::spawn(async move {
+                        let r = crate::helpers::push_agent(&n, &bytes).await;
+                        if r.is_ok() {
+                            live.stop(Some(std::slice::from_ref(&n.id)), crate::live::Stop::Restart);
+                        }
+                        event(json!({ "agent": { "node": n.id, "version": crate::helpers::VERSION, "ok": r.is_ok(), "detail": r.unwrap_or_else(|e| e) } }));
+                    });
+                }
             }
         }
         // ハブの数字を写しているあいだは、手元のライブの点で同じ分を上書きしない
@@ -505,8 +534,13 @@ pub fn dashboard(engine: &Engine, live: Option<&Live>, minutes: i64) -> Result<V
             "last": last, "alerts": al,
         }));
     }
+    let (update, auto_update, helpers) = engine.with_db(|d| Ok((d.get_meta("updateState")?, d.get_meta("update")?, d.get_meta("helpers")?)))?;
+    let app = json!({
+        "version": crate::helpers::VERSION, "update": update, "helpers": helpers,
+        "auto_update": auto_update.as_ref().and_then(|u| u.get("auto")).and_then(Value::as_bool).unwrap_or(true),
+    });
     Ok(json!({
-        "at": now, "minutes": minutes, "monitor": s.json(), "collecting": collecting, "hub_pull": pull,
+        "at": now, "minutes": minutes, "monitor": s.json(), "collecting": collecting, "hub_pull": pull, "app": app,
         "local_host": crate::nodes::local_host(), "schedule": engine.schedule(), "nodes": nodes,
     }))
 }

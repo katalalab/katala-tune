@@ -127,6 +127,18 @@
     });
   }
 
+  // 版と自動更新の状態（update.rs が meta の updateState に残す）
+  function updateText(a) {
+    if (!a) return '';
+    const u = a.update || {};
+    const parts = [`${a.version}`, a.auto_update ? '自動更新オン' : '自動更新オフ'];
+    if (u.downloaded && u.downloaded !== a.version) parts.push(`${u.downloaded} を用意済み（ウィンドウを閉じると入れる）`);
+    else if (u.available && u.available !== a.version) parts.push(`${u.available} あり`);
+    else if (u.checked_at) parts.push(`最新（${ago(u.checked_at)}に確認）`);
+    if (u.error) parts.push(`確認できなかった: ${u.error}`);
+    return parts.join('・');
+  }
+
   function sourceText(d) {
     const p = d.hub_pull || {};
     if (d.collecting) return `この機体で集めている（全機体のサンプラーを流し続け、1 分ごとに集計を保存）`;
@@ -159,6 +171,7 @@
         ['対応が要るもの', alerts ? `<b class="t-crit">${alerts}</b>` : '<span class="faint">なし</span>', 'alert'],
         ['数字の出どころ', `<span class="faint">${esc(sourceText(d))}</span>`, 'sync'],
         ['詳細の間隔', `<span class="faint">分析 ${esc(sch.probe_minutes ?? '–')} 分・ログ ${esc(sch.logs_minutes ?? '–')} 分ごと</span>`, 'history'],
+        ['版', `<span class="faint">${esc(updateText(d.app))}</span>`, 'sync'],
       ]) : '',
     });
   }

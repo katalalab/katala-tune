@@ -165,6 +165,7 @@ pub fn run() {
             window::create(&handle, !hidden)?;
             tray::create(&handle)?;
             engine.compute_checks(false, true);
+            monitor::sync_helpers(engine.clone());
             monitor::start(handle.clone(), engine.clone(), live);
             start_scheduler(engine);
             // 新しい版があれば通知だけする（入れるのはメニューから、確認のあとだけ）
