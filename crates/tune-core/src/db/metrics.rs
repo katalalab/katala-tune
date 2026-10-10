@@ -73,6 +73,16 @@ impl Store {
         rows.collect()
     }
 
+    /// 一番古い分（写しの起点を、空の範囲から始めないため）
+    pub fn oldest_metric_minute(&self) -> Result<Option<i64>> {
+        self.conn.query_row("SELECT min(minute) FROM metrics_minute", [], |r| r.get(0))
+    }
+
+    /// 一番新しい分析結果の時刻（全機体）
+    pub fn latest_snapshot_at(&self) -> Result<Option<i64>> {
+        self.conn.query_row("SELECT max(at) FROM tune_snapshots", [], |r| r.get(0))
+    }
+
     /// 古い行を消す
     pub fn prune_metrics(&self, before: i64) -> Result<usize> {
         self.conn.execute("DELETE FROM metrics_minute WHERE minute < ?", [before])

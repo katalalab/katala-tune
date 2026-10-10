@@ -16,7 +16,7 @@ use crate::collect;
 use crate::db::metrics::MinuteRow;
 use crate::db::{Store, now_ms};
 use crate::engine::Engine;
-use crate::live::{Live, Sample};
+use crate::live::{Live, Opts, Sample};
 use crate::nodes::{Config, Node};
 
 pub const MINUTE: i64 = 60_000;
@@ -25,8 +25,12 @@ pub const KEEP_DAYS: i64 = 14;
 pub const HUB_STALE_MS: i64 = 5 * MINUTE;
 /// つなぎ直しても続かなかった機体（電源が落ちている・オフライン）を次に試すまで
 pub const RETRY_DISCONNECTED_MS: i64 = 5 * MINUTE;
-/// 一度に写す範囲の上限（初回でも 24 時間ぶん）
+/// 1 回に写す範囲（1 ページ）。残りは `next` から続けて写す（保持している 14 日ぶんを欠かさない）
 pub const EXPORT_MAX_MS: i64 = 24 * 60 * MINUTE;
+/// 1 回の写しで続けて読むページの上限（14 日ぶん＋余裕）
+pub const PULL_MAX_PAGES: usize = 16;
+/// ハブの分析結果がハブの時計でこれより古ければ、写す側も自分で分析する（分析は 1 時間ごと）
+pub const HUB_ANALYSIS_STALE_MS: i64 = 2 * 60 * MINUTE;
 /// 集計に使う値（Sample::point のキー）
 const KEYS: [&str; 15] =
     ["cpu", "mem", "swap", "commit", "dr", "dw", "rx", "tx", "power_cpu_w", "power_soc_w", "power_platform_w", "power_gpu_w", "gpu", "gmem", "gtemp"];
@@ -199,15 +203,21 @@ pub fn alerts(rows: &[MinuteRow], now: i64, monitoring: bool) -> Vec<Value> {
 // ---------------------------------------------------------------------------
 
 /// この操作卓の集計と最新の分析結果を写しの形で（`tune export`）
+/// 1 回は [since, since + 24 時間) まで。続きがあれば `more: true` と次の起点 `next` を返す（写す側は next から続ける）
 pub fn export(db: &Store, since: i64, host: &str) -> Result<Value, String> {
+    let e = |x: rusqlite::Error| x.to_string();
     let now = now_ms();
-    let since = since.max(now - EXPORT_MAX_MS);
-    let rows = db.metrics(None, since, i64::MAX).map_err(|e| e.to_string())?;
-    let snaps = db.snapshots_since(since).map_err(|e| e.to_string())?;
-    let latest: Map<String, Value> = db.latest_metric_minutes().map_err(|e| e.to_string())?.into_iter().map(|(k, v)| (k, json!(v))).collect();
+    let oldest = db.oldest_metric_minute().map_err(e)?.unwrap_or(now);
+    let since = since.max(now - KEEP_DAYS * 24 * 60 * MINUTE).max(oldest.min(now));
+    let end = since.saturating_add(EXPORT_MAX_MS);
+    let more = end < now;
+    let rows = db.metrics(None, since, if more { end } else { i64::MAX }).map_err(e)?;
+    let snaps = db.snapshots_since(since).map_err(e)?;
+    let latest: Map<String, Value> = db.latest_metric_minutes().map_err(e)?.into_iter().map(|(k, v)| (k, json!(v))).collect();
     Ok(json!({
-        "v": 1, "host": host, "at": now, "since": since, "monitor": settings(db).json(),
-        "latest": latest, "metrics": rows.iter().map(MinuteRow::json).collect::<Vec<_>>(), "snapshots": snaps,
+        "v": 1, "host": host, "at": now, "since": since, "next": if more { end } else { now }, "more": more,
+        "monitor": settings(db).json(), "latest": latest, "latest_snapshot": db.latest_snapshot_at().map_err(e)?,
+        "metrics": rows.iter().map(MinuteRow::json).collect::<Vec<_>>(), "snapshots": snaps,
     }))
 }
 
@@ -253,9 +263,14 @@ pub fn import(db: &Store, x: &Value) -> Result<Value, String> {
         snaps += 1;
     }
     let freshest = x.get("latest").and_then(Value::as_object).and_then(|m| m.values().filter_map(Value::as_i64).max());
-    Ok(
-        json!({ "rows": rows.len(), "snapshots": snaps, "hub_at": at, "freshest_minute": freshest, "fresh": freshest.is_some_and(|f| at - f <= HUB_STALE_MS + MINUTE) }),
-    )
+    let analysis = x.get("latest_snapshot").and_then(Value::as_i64);
+    Ok(json!({
+        "rows": rows.len(), "snapshots": snaps, "hub_at": at, "freshest_minute": freshest,
+        "fresh": freshest.is_some_and(|f| at - f <= HUB_STALE_MS + MINUTE),
+        "latest_snapshot": analysis, "snapshot_fresh": analysis.is_some_and(|s| at - s <= HUB_ANALYSIS_STALE_MS),
+        "more": x.get("more").and_then(Value::as_bool).unwrap_or(false),
+        "next": x.get("next").and_then(Value::as_i64).unwrap_or(at),
+    }))
 }
 
 /// ハブの操作卓に置いた CLI（配布の手順は docs/architecture.md）
@@ -264,37 +279,50 @@ pub fn hub_command(hub: &Node, since: i64) -> String {
     format!("{exe} export --since {since}")
 }
 
-/// ハブから 1 回写す。結果は meta の hubPull に残す（画面に出す）
+/// ハブから写す（続きがあれば next から最大 16 ページまで続ける）。結果は meta の hubPull に残す（画面に出す）
 pub async fn pull(engine: &Engine) -> Result<Value, String> {
     let s = engine.with_db(|d| Ok(settings(d)))?;
     let hub_id = s.hub.ok_or("ハブを選んでいない")?;
     let cfg = engine.reload_config();
     let hub = cfg.node(&hub_id).ok_or_else(|| format!("台帳に無い機体: {hub_id}"))?.clone();
-    let cursor = engine.with_db(|d| d.get_meta("hubCursor"))?.and_then(|v| v.as_i64()).unwrap_or(0);
-    let since = cursor.saturating_sub(2 * MINUTE).max(0);
     let t0 = now_ms();
-    let r = collect::run("ssh", &collect::ssh_args(&hub.alias, &hub_command(&hub, since)), None, Duration::from_secs(60)).await;
-    let res = (|| {
-        let line = r.out.lines().rev().find(|l| l.trim_start().starts_with('{')).ok_or_else(|| {
-            let e = r.err.trim();
-            format!(
-                "ハブから写しが届かない（exit {}）{}",
-                r.code_str(),
-                if e.is_empty() { String::new() } else { format!(": {}", e.lines().last().unwrap_or(e)) }
-            )
-        })?;
-        let x: Value = serde_json::from_str(line).map_err(|e| format!("写しを読めない: {e}"))?;
-        let got = engine.with_db(|d| Ok(import(d, &x)))??;
-        if let Some(at) = x.get("at").and_then(Value::as_i64) {
-            engine.with_db(|d| d.set_meta("hubCursor", &json!(at)))?;
+    let (mut rows, mut snaps, mut pages) = (0u64, 0u64, 0usize);
+    let res: Result<Value, String> = async {
+        let mut last = Value::Null;
+        while pages < PULL_MAX_PAGES {
+            let cursor = engine.with_db(|d| d.get_meta("hubCursor"))?.and_then(|v| v.as_i64()).unwrap_or(0);
+            // 前回の終わりより 2 分前から（その後に書かれた分の集計を取りこぼさない。置き換えなので重なってよい）
+            let since = cursor.saturating_sub(2 * MINUTE).max(0);
+            let r = collect::run("ssh", &collect::ssh_args(&hub.alias, &hub_command(&hub, since)), None, Duration::from_secs(60)).await;
+            let line = r.out.lines().rev().find(|l| l.trim_start().starts_with('{')).ok_or_else(|| {
+                let e = r.err.trim();
+                format!(
+                    "ハブから写しが届かない（exit {}）{}",
+                    r.code_str(),
+                    if e.is_empty() { String::new() } else { format!(": {}", e.lines().last().unwrap_or(e)) }
+                )
+            })?;
+            let x: Value = serde_json::from_str(line).map_err(|e| format!("写しを読めない: {e}"))?;
+            let got = engine.with_db(|d| Ok(import(d, &x)))??;
+            // 取り込めた範囲の終わりまでだけ進める（途中までのページで先へ飛ばない）
+            engine.with_db(|d| d.set_meta("hubCursor", &got["next"]))?;
+            pages += 1;
+            rows += got["rows"].as_u64().unwrap_or(0);
+            snaps += got["snapshots"].as_u64().unwrap_or(0);
+            let more = got["more"].as_bool() == Some(true);
+            last = got;
+            if !more {
+                break;
+            }
         }
-        Ok::<Value, String>(got)
-    })();
-    let mut rec = json!({ "hub": hub_id, "at": now_ms(), "ms": now_ms() - t0 });
+        Ok(last)
+    }
+    .await;
+    let mut rec = json!({ "hub": hub_id, "at": now_ms(), "ms": now_ms() - t0, "pages": pages, "rows": rows, "snapshots": snaps });
     match &res {
         Ok(v) => {
             rec["ok"] = json!(true);
-            for k in ["rows", "snapshots", "hub_at", "freshest_minute", "fresh"] {
+            for k in ["hub_at", "freshest_minute", "fresh", "latest_snapshot", "snapshot_fresh", "more"] {
                 rec[k] = v[k].clone();
             }
         }
@@ -304,21 +332,27 @@ pub async fn pull(engine: &Engine) -> Result<Value, String> {
         }
     }
     engine.with_db(|d| d.set_meta("hubPull", &rec))?;
-    if res.as_ref().is_ok_and(|v| v["snapshots"].as_i64().unwrap_or(0) > 0) {
+    if snaps > 0 {
         engine.compute_checks(true, true);
     }
     res.map(|_| rec)
 }
 
-/// ハブを写していて、ハブの数字が新しい（自分で集めなくてよい）
+/// 最後の写しが成功していて新しい（ハブの数字・分析結果の新しさはこの中身で見る）
+fn last_pull_ok(db: &Store, now: i64) -> Option<Value> {
+    settings(db).hub.as_ref()?;
+    let p = db.get_meta("hubPull").ok().flatten()?;
+    (p.get("ok").and_then(Value::as_bool) == Some(true) && p.get("at").and_then(Value::as_i64).is_some_and(|at| now - at <= HUB_STALE_MS)).then_some(p)
+}
+
+/// ハブを写していて、ハブの数字（1 分ごとの集計）が新しい（自分で集めなくてよい）
 pub fn hub_fresh(db: &Store, now: i64) -> bool {
-    if settings(db).hub.is_none() {
-        return false;
-    }
-    let p = db.get_meta("hubPull").ok().flatten().unwrap_or(Value::Null);
-    p.get("ok").and_then(Value::as_bool) == Some(true)
-        && p.get("fresh").and_then(Value::as_bool) == Some(true)
-        && p.get("at").and_then(Value::as_i64).is_some_and(|at| now - at <= HUB_STALE_MS)
+    last_pull_ok(db, now).is_some_and(|p| p.get("fresh").and_then(Value::as_bool) == Some(true))
+}
+
+/// ハブを写していて、ハブの分析結果が新しい（自分で分析しなくてよい）。数字が新しくても分析が止まっていれば false
+pub fn hub_analysis_fresh(db: &Store, now: i64) -> bool {
+    last_pull_ok(db, now).is_some_and(|p| p.get("snapshot_fresh").and_then(Value::as_bool) == Some(true))
 }
 
 /// このアプリで集めるか（常時監視が入っていて、写しているハブが新しくないとき）
@@ -329,6 +363,12 @@ pub fn should_collect(db: &Store, now: i64) -> bool {
 // ---------------------------------------------------------------------------
 // 常時監視の繰り返し（Tauri の殻と `tune monitor-run` が使う）
 // ---------------------------------------------------------------------------
+
+/// 常時監視は台帳の全機体を流すので、同時に流せる数を台帳の数まで広げる（画面だけのときの既定は 6 台）
+pub fn live_opts(nodes: usize) -> Opts {
+    let d = Opts::default();
+    Opts { max_streams: nodes.max(d.max_streams), ..d }
+}
 
 /// 15 秒ごとに: 常時監視が入っていてハブの数字が新しくなければ全機体のライブに合図を送って保ち、
 /// 終わった分を集計して保存し、ハブを選んでいれば 1 分ごとに写す。14 日より古い集計は 1 日 1 回消す。
@@ -371,7 +411,12 @@ pub async fn run(engine: Arc<Engine>, live: Arc<Live>, event: impl Fn(Value), un
                 })
                 .cloned()
                 .collect();
-            live.start(&targets, &[]);
+            let r = live.start(&targets, &[]);
+            // 上限で断られた機体（アプリを開いたあとで台帳に足したなど）は黙って欠かさず知らせる。画面にも注意として出る
+            let refused: Vec<&Value> = r["refused"].as_array().into_iter().flatten().filter(|x| x["reason"] == "limit").map(|x| &x["id"]).collect();
+            if !refused.is_empty() {
+                event(json!({ "refused": refused, "limit": r["limit"] }));
+            }
         }
         // ハブの数字を写しているあいだは、手元のライブの点で同じ分を上書きしない
         if collect || s.hub.is_none() {
@@ -445,6 +490,10 @@ pub fn dashboard(engine: &Engine, live: Option<&Live>, minutes: i64) -> Result<V
         });
         let brief = live.and_then(|l| l.brief(&n.id));
         let mut al = alerts(&rs, now, monitoring && (collecting || s.hub.is_some()));
+        if brief.as_ref().is_some_and(|b| b["reason"] == "limit") {
+            let limit = live.map_or(0, |l| l.opts().max_streams);
+            al.push(json!({ "id": "limit", "severity": "warn", "title": "同時に流せる台数の上限で集めていない", "detail": format!("上限 {limit} 台。アプリを開き直すと台帳の台数まで広がる") }));
+        }
         for f in findings.iter().filter(|f| f.get("severity").and_then(Value::as_str) == Some("critical")).take(3) {
             al.push(json!({ "id": format!("finding:{}", f.get("id").and_then(Value::as_str).unwrap_or("")), "severity": "critical", "title": f.get("title"), "detail": f.get("detail") }));
         }
@@ -580,5 +629,49 @@ mod tests {
         assert!(!should_collect(&db, now_ms()), "ハブが新しければ自分では集めない");
         db.set_meta("hubPull", &json!({"ok": true, "fresh": true, "at": now_ms() - HUB_STALE_MS - 1})).unwrap();
         assert!(should_collect(&db, now_ms()), "ハブが古ければ自分で集める");
+        // 数字が新しくても、ハブの分析結果が古ければ自分で分析する
+        db.set_meta("hubPull", &json!({"ok": true, "fresh": true, "snapshot_fresh": false, "at": now_ms()})).unwrap();
+        assert!(hub_fresh(&db, now_ms()) && !hub_analysis_fresh(&db, now_ms()));
+        db.set_meta("hubPull", &json!({"ok": true, "fresh": true, "snapshot_fresh": true, "at": now_ms()})).unwrap();
+        assert!(hub_analysis_fresh(&db, now_ms()));
+    }
+
+    #[test]
+    fn export_pages_through_the_retained_range_without_gaps() {
+        let hub = Store::open_in_memory().unwrap();
+        let now = now_ms();
+        let day = 24 * 60 * MINUTE;
+        let row = |m: i64| MinuteRow { node_id: "a".into(), minute: m.div_euclid(MINUTE) * MINUTE, n: 60, v: json!({"cpu": [1.0, 1.0]}), src: None };
+        // 3 日前・2 日前・今の 3 行（24 時間を超える欠け）。14 日より前の行は写さない
+        let minutes = [now - 3 * day, now - 2 * day + MINUTE, now - 2 * MINUTE];
+        hub.add_metrics(&minutes.map(row)).unwrap();
+        hub.add_metrics(&[row(now - 20 * day)]).unwrap();
+        let me = Store::open_in_memory().unwrap();
+        let (mut cursor, mut pages) = (0i64, 0);
+        loop {
+            let x = export(&hub, cursor.saturating_sub(2 * MINUTE), "hub").unwrap();
+            let got = import(&me, &x).unwrap();
+            cursor = got["next"].as_i64().unwrap();
+            pages += 1;
+            if got["more"] != true || pages > PULL_MAX_PAGES {
+                break;
+            }
+        }
+        let have: Vec<i64> = me.metrics(Some("a"), 0, i64::MAX).unwrap().iter().map(|r| r.minute).collect();
+        assert_eq!(have, minutes.map(|m| m.div_euclid(MINUTE) * MINUTE), "24 時間を超えても全部写る（14 日より前は除く）");
+        assert!((2..=PULL_MAX_PAGES).contains(&pages), "{pages} ページ");
+        assert!(cursor >= now - MINUTE, "最後は今まで進む");
+        // 分析結果の新しさは集計とは別に返す
+        let x = export(&hub, cursor, "hub").unwrap();
+        assert_eq!(import(&me, &x).unwrap()["snapshot_fresh"], false, "分析結果が無ければ新しくない");
+        hub.add_snapshot("a", now_ms(), None, None, &json!([]), &json!({}), &json!({})).unwrap();
+        let x = export(&hub, cursor, "hub").unwrap();
+        assert_eq!(import(&me, &x).unwrap()["snapshot_fresh"], true);
+    }
+
+    #[test]
+    fn monitor_streams_cover_the_whole_ledger() {
+        assert_eq!(live_opts(3).max_streams, Opts::default().max_streams);
+        assert_eq!(live_opts(9).max_streams, 9);
     }
 }

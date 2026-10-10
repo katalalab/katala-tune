@@ -363,9 +363,9 @@ async fn main() -> ExitCode {
         },
         "monitor-run" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
             Ok(e) => {
-                use tune_core::live::{Live, Opts, ProcessRoute};
+                use tune_core::live::{Live, ProcessRoute};
                 let secs = flag(rest, "--seconds").unwrap_or(180).clamp(15, 3600) as u64;
-                let live = Live::new(Arc::new(ProcessRoute), Opts::default(), Box::new(|_| {}));
+                let live = Live::new(Arc::new(ProcessRoute), tune_core::monitor::live_opts(e.config().nodes.len()), Box::new(|_| {}));
                 tokio::spawn(live.clone().run_ticker());
                 let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
                 tune_core::monitor::run(e.clone(), live.clone(), |ev| eprintln!("monitor: {ev}"), Some(until)).await;
