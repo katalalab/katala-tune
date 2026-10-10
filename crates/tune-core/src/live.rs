@@ -395,6 +395,7 @@ impl Sample {
             put("gpu", g.iter().filter_map(|x| x.util).reduce(f64::max), 1);
             let (used, total) = g.iter().fold((0.0, 0.0), |(u, t), x| (u + x.mem_used_mb.unwrap_or(0.0), t + x.mem_total_mb.unwrap_or(0.0)));
             put("gmem", (total > 0.0).then(|| used / total * 100.0), 1);
+            put("gtemp", g.iter().filter_map(|x| x.temp_c).reduce(f64::max), 0);
             if !g.is_empty() && g.iter().all(|x| x.power_w.is_some()) {
                 put("power_gpu_w", Some(g.iter().map(|x| x.power_w.unwrap_or_default()).sum()), 1);
             }
@@ -1074,6 +1075,30 @@ impl Live {
             );
         }
         Value::Object(m)
+    }
+
+    /// ダッシュボード用の短い形: 段階・サンプラーの実装と負荷・最新の 1 点・上位プロセス 3 件ずつ
+    pub fn brief(&self, id: &str) -> Option<Value> {
+        let st = self.lock();
+        let n = st.nodes.get(id)?;
+        let top = |k: &str| n.procs.as_ref().and_then(|p| p.get(k)).and_then(Value::as_array).map(|a| a.iter().take(3).cloned().collect::<Vec<_>>());
+        Some(json!({
+            "state": n.phase.as_str(),
+            "streaming": st.streams.get(id).is_some_and(|s| !s.stopping),
+            "detail": n.detail,
+            "impl": n.info.as_ref().map(|h| h.implementation.as_deref().unwrap_or("script")),
+            "agent": n.info.as_ref().and_then(|h| h.agent.clone()),
+            "load": n.load.map(|x| (x * 100.0).round() / 100.0),
+            "rss_mb": n.rss_mb,
+            "point": n.ring.last().map(Sample::point),
+            "top_cpu": top("top_cpu"),
+            "top_mem": top("top_mem"),
+        }))
+    }
+
+    /// 最新の上位プロセス（常時監視の集計に付ける）
+    pub fn procs(&self, id: &str) -> Option<Value> {
+        self.lock().nodes.get(id)?.procs.clone()
     }
 
     /// 画面へ渡す形の全体（間引いた点・最新のコア・上位プロセス・hello）。確認用で、送っていない差分の印は変えない
