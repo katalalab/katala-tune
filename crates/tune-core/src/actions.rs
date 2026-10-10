@@ -144,10 +144,10 @@ fn gpu_power_script(uuid: &str, watts: f64, min: f64, max: f64, prev_w: f64) -> 
         "function Read-Power-Retry { $v = @(Read-Power); if ($v.Count -ne 3) { Start-Sleep -Milliseconds 200; $v = @(Read-Power) }; return $v }".into(),
         "$v = @(Read-Power-Retry); if ($v.Count -ne 3) { Write-Output \"GPU power unreadable\"; exit 6 }".into(),
         format!("if ($v[0] -ne {min} -or $v[1] -ne {max} -or $v[2] -ne {prev_w}) {{ Write-Output \"GPU power state changed\"; exit 3 }}"),
-        format!("& nvidia-smi.exe --id={uuid} -pl {watts}; if ($LASTEXITCODE -ne 0) {{ exit 6 }}"),
+        format!("& nvidia-smi.exe --id={uuid} -pl {watts}; $apply = $LASTEXITCODE"),
         "$after = @(Read-Power-Retry)".into(),
-        format!("if ($after[2] -eq {watts}) {{ exit 0 }}"),
-        format!("if ($after.Count -eq 3 -and $after[2] -ne {prev_w} -and $after[0] -le {prev_w} -and $after[1] -ge {prev_w}) {{ & nvidia-smi.exe --id={uuid} -pl {prev_w}; if ($LASTEXITCODE -eq 0) {{ $rolled = @(Read-Power-Retry); if ($rolled.Count -eq 3 -and $rolled[2] -eq {prev_w}) {{ Write-Output \"power limit verification failed; restored\"; exit 6 }} }} }}"),
+        format!("if ($apply -eq 0 -and $after.Count -eq 3 -and $after[2] -eq {watts}) {{ exit 0 }}"),
+        format!("if ($after.Count -eq 3 -and $after[2] -eq {watts} -and $after[0] -le {prev_w} -and $after[1] -ge {prev_w}) {{ & nvidia-smi.exe --id={uuid} -pl {prev_w}; if ($LASTEXITCODE -eq 0) {{ $rolled = @(Read-Power-Retry); if ($rolled.Count -eq 3 -and $rolled[2] -eq {prev_w}) {{ Write-Output \"power limit verification failed; restored\"; exit 6 }} }} }}"),
         "Write-Output \"power limit verification or rollback unverified\"; exit 7".into(),
     ].join("; ");
     format!(
