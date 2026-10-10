@@ -23,6 +23,7 @@
 //!   tune schedule ['{"logs_minutes":60}']          自動スキャンの間隔を見る・変える（画面と同じ範囲だけ受け付ける）
 //!   tune metrics [機体] [--minutes N] 分ごとの集計（既定は直近 60 分）
 //!   tune dashboard [--minutes N]     ダッシュボードと同じ JSON（ライブの段階は入らない）
+//!   tune update ['{"auto":false}']  自動更新の設定と状態（版・最後に確かめた時刻・用意した版・同梱の道具）を見る・変える
 //!   tune monitor-run [--seconds N]   常時監視を N 秒（既定 180、最大 3600）だけ画面なしで動かし、ダッシュボードの JSON を出す（確認用）
 //!   tune live [--seconds N] 機体 ...  ライブ表示のサンプラーを N 秒（既定 30、最大 300）流し、件数・間隔・遅延・
 //!                                    サンプラー自身の負荷を JSON で（読み取り専用。機体は必ず指定する）
@@ -47,7 +48,7 @@ use tune_core::{collect, logs, nodes, rules};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "使い方: tune <paths|probe|logs|last|power|network|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
+        "使い方: tune <paths|probe|logs|last|power|network|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|update> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
     );
     ExitCode::from(2)
 }
@@ -325,6 +326,26 @@ async fn main() -> ExitCode {
                 .and_then(|d| tune_core::monitor::export(&d, since, &nodes::local_host()))
                 .map(|v| print(&v))
         }
+        "update" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => {
+                let r = match rest.first().filter(|a| a.starts_with('{')).map(|a| serde_json::from_str::<Value>(a)) {
+                    Some(Ok(p)) => match p.get("auto").and_then(Value::as_bool) {
+                        Some(on) => e.with_db(|d| d.set_meta("update", &json!({ "auto": on }))),
+                        None => Err("{\"auto\": true|false} だけ受け付ける".into()),
+                    },
+                    Some(Err(x)) => Err(format!("JSON を読めない: {x}")),
+                    None => Ok(()),
+                };
+                r.and_then(|()| {
+                    e.with_db(|d| {
+                        let auto = d.get_meta("update")?.and_then(|u| u.get("auto").and_then(Value::as_bool)).unwrap_or(true);
+                        Ok(json!({ "version": tune_core::helpers::VERSION, "auto": auto, "state": d.get_meta("updateState")?, "helpers": d.get_meta("helpers")? }))
+                    })
+                })
+                .map(|v| print(&v))
+            }
+            Err(e) => Err(e),
+        },
         "hub-pull" | "monitor" | "schedule" | "metrics" | "dashboard" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
             Ok(e) => {
                 let patch = || {
@@ -368,7 +389,14 @@ async fn main() -> ExitCode {
                 let live = Live::new(Arc::new(ProcessRoute), tune_core::monitor::live_opts(e.config().nodes.len()), Box::new(|_| {}));
                 tokio::spawn(live.clone().run_ticker());
                 let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
-                tune_core::monitor::run(e.clone(), live.clone(), |ev| eprintln!("monitor: {ev}"), Some(until)).await;
+                // 同梱のサンプラー（CLI の隣。Windows だけ）があれば、古い機体へ入れ替えを送る（アプリと同じ）
+                let agent = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.join("tune-agent.exe")))
+                    .filter(|_| cfg!(windows))
+                    .and_then(|p| std::fs::read(p).ok())
+                    .map(Arc::new);
+                tune_core::monitor::run(e.clone(), live.clone(), |ev| eprintln!("monitor: {ev}"), Some(until), agent).await;
                 let v = tune_core::monitor::dashboard(&e, Some(&live), 60);
                 live.shutdown(std::time::Duration::from_secs(3)).await;
                 v.map(|v| print(&v))

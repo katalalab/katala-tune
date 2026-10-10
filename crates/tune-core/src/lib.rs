@@ -34,6 +34,7 @@ pub mod engine;
 pub mod engine_power;
 pub mod engine_tools;
 pub mod health;
+pub mod helpers;
 pub mod inventory;
 pub mod js;
 pub mod live;

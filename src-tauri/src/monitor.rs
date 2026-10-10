@@ -20,7 +20,26 @@ pub fn start(app: AppHandle, engine: Arc<Engine>, live: Arc<Live>) {
             let _ = app.emit("monitor", ev);
         },
         None,
+        bundled_agent(),
     ));
+}
+
+/// アプリに同梱したサンプラー（Windows だけ）。ほかの Windows の機体の古いサンプラーを入れ替えるのに使う
+pub fn bundled_agent() -> Option<Arc<Vec<u8>>> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let p = std::env::current_exe().ok()?.parent()?.join("tune-agent.exe");
+    std::fs::read(p).ok().map(Arc::new)
+}
+
+/// 起動のたびに、アプリの隣の道具（tune・tune-agent）を ~/.katala-tune/bin へ写す（版がそろうように）。結果は meta の helpers
+pub fn sync_helpers(engine: Arc<Engine>) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(std::path::Path::to_path_buf)) else { return };
+        let r = tune_core::helpers::sync(&dir, &tune_core::helpers::bin_dir(), &["tune", "tune-agent"]);
+        let _ = engine.with_db(|d| d.set_meta("helpers", &json!({ "at": now_ms(), "version": tune_core::helpers::VERSION, "tools": r })));
+    });
 }
 
 /// 常時監視でライブを保っているか（ウィンドウを閉じても・画面が止めても流し続ける）

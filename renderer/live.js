@@ -249,7 +249,7 @@ const Live = (() => {
       for (const id of ids) {
         const s = store[id];
         // 接続切れ・自動停止・上限で止まったものは、合図で勝手につなぎ直さない（「再開」で流す）
-        if (s.state === 'stopped' && s.reason && !['user', 'hidden'].includes(s.reason)) { streaming.delete(id); s.held = true; }
+        if (s.state === 'stopped' && s.reason && !['user', 'hidden', 'restart'].includes(s.reason)) { streaming.delete(id); s.held = true; }
       }
       schedule(ids);
     });

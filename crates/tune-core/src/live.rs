@@ -805,6 +805,8 @@ pub enum Stop {
     Limit,
     /// アプリの終了
     AppExit,
+    /// サンプラーを入れ替えたので、つなぎ直す（常時監視が次の合図で流し直す）
+    Restart,
 }
 
 impl Stop {
@@ -816,6 +818,7 @@ impl Stop {
             Stop::Disconnected(_) => "disconnected",
             Stop::Limit => "limit",
             Stop::AppExit => "app_exit",
+            Stop::Restart => "restart",
         }
     }
 
@@ -827,6 +830,7 @@ impl Stop {
             Stop::Disconnected(e) => format!("{} 回つなぎ直しても続かないので止めた: {e}", o.max_retries),
             Stop::Limit => format!("同時に流せるのは {} 台まで", o.max_streams),
             Stop::AppExit => "アプリを終了した".into(),
+            Stop::Restart => "サンプラーを入れ替えたので、つなぎ直す".into(),
         }
     }
 }
