@@ -32,7 +32,8 @@ def run(cmd, timeout=8):
 
 
 def sysctl(name):
-    return run(["sysctl", "-n", name]).strip()
+    # SSH の最小 PATH には /usr/sbin がない場合がある。
+    return run(["/usr/sbin/sysctl", "-n", name]).strip()
 
 
 def num(s, default=None):

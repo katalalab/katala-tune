@@ -3,6 +3,12 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
 const path = require('node:path');
+test('Mac hardware details work with the minimal SSH PATH', {skip:process.platform!=='darwin'}, () => {
+  const script = `import ast,json,subprocess\nfrom pathlib import Path\ns=ast.parse(Path('probes/mac_probe.py').read_text(encoding='utf-8'))\nns={'subprocess':subprocess}\nn=[x for x in s.body if isinstance(x,ast.FunctionDef) and x.name in ['run','sysctl']]\nexec(compile(ast.Module(body=n,type_ignores=[]),'mac_probe.py','exec'),ns)\nf=ns['sysctl']\nassert f('machdep.cpu.brand_string')\nassert int(f('hw.ncpu'))>0\nassert int(f('hw.memsize'))>0\nprint('PASS')\n`;
+  const r=spawnSync('/usr/bin/python3',['-c',script],{cwd:path.join(__dirname,'..'),env:{...process.env,PATH:'/usr/bin:/bin'},encoding:'utf8'});
+  assert.equal(r.status,0,r.stderr);
+  assert.match(r.stdout,/PASS/);
+});
 test('macmon metrics keep scope, zero, missing and finite clock values', (t) => {
   const py = process.platform === 'win32' ? 'python' : 'python3';
   if (spawnSync(py,['--version']).status !== 0) return t.skip('Python is unavailable');
