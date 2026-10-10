@@ -81,10 +81,13 @@ async fn download(update: &Update) -> Result<Vec<u8>, String> {
     update.download(|_, _| {}, || {}).await.map_err(|e| format!("署名を確かめられない・ダウンロードの失敗: {e}"))
 }
 
-/// 入れて再起動する。サンプラーを先に止める（Windows はインストーラーを起こしてこのプロセスがすぐ終わるため）
-fn install(app: &AppHandle, update: &Update, bytes: &[u8]) -> Result<(), String> {
+/// 入れて再起動する。サンプラーを先に止める（Windows はインストーラーを起こしてこのプロセスがすぐ終わるため）。
+/// 非同期の中から呼ぶので、止まるのを await で待つ（live::shutdown の block_on は非同期の中では使えない）
+async fn install(app: &AppHandle, update: &Update, bytes: &[u8]) -> Result<(), String> {
     record(app, json!({ "installing": update.version, "installing_at": now_ms() }));
-    crate::live::shutdown(app);
+    if let Some(l) = app.try_state::<Arc<tune_core::live::Live>>() {
+        l.inner().clone().shutdown(Duration::from_secs(3)).await;
+    }
     update.install(bytes).map_err(|e| format!("入れられなかった: {e}"))?;
     // macOS は入れ替えた .app で起動し直す（Windows はインストーラーが入れ替えて起動し直す。ここには戻らない）
     app.restart()
@@ -148,7 +151,7 @@ pub fn start(app: AppHandle) {
             if let Some((u, bytes, after)) = ready.take() {
                 if now_ms() >= after && idle(&app) && !BUSY.swap(true, Ordering::SeqCst) {
                     // 入れたら再起動してここには戻らない。失敗したら状態に残し、次の確認でやり直す
-                    if let Err(e) = install(&app, &u, &bytes) {
+                    if let Err(e) = install(&app, &u, &bytes).await {
                         record(&app, json!({ "error": e }));
                     }
                     BUSY.store(false, Ordering::SeqCst);
@@ -199,7 +202,7 @@ async fn run(app: &AppHandle) -> Result<String, String> {
         return Ok(format!("取り消した（{}）", update.version));
     }
     let bytes = download(&update).await.map_err(|e| format!("入れなかった（{e}）"))?;
-    install(app, &update, &bytes)?;
+    install(app, &update, &bytes).await?;
     Ok(String::new())
 }
 
