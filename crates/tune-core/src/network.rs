@@ -62,9 +62,10 @@ pub async fn check_one(runner: &dyn Runner, node: &Node, active: bool) -> Value 
         let text = format!("& {{ {script}\n }} {}", if active { "-Probe" } else { "" });
         // Windows sshd の既定シェル経由では長いコマンド行が切られる。
         // 固定の短い loader を呼び、埋め込み probe は ASCII の stdin で渡す。
-        // Runner が書き終わった stdin を閉じ、全体の TIMEOUT も維持する。
-        let payload = crate::logs::base64(text.as_bytes());
-        let loader = "& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd()))))";
+        // Base64 は単一行なので LF を付け、EOF の転送を待たずに読み終える。
+        // Runner の stdin 閉鎖と全体の TIMEOUT も維持する。
+        let payload = format!("{}\n", crate::logs::base64(text.as_bytes()));
+        let loader = "& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadLine()))))";
         let utf16: Vec<u8> = loader.encode_utf16().flat_map(u16::to_le_bytes).collect();
         let encoded = crate::logs::base64(&utf16);
         let command = format!("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}");
@@ -140,8 +141,16 @@ mod tests {
             assert_eq!(timeout, TIMEOUT);
             let platform = if cmd == "powershell.exe" || args.iter().any(|a| a.contains("powershell.exe")) { "win32" } else { "darwin" };
             if platform == "win32" {
-                assert!(args.iter().map(String::len).sum::<usize>() < 2000, "Windows transport must fit the sshd shell command limit");
+                assert!(args.iter().map(String::len).sum::<usize>() < 1000, "Windows transport must fit the sshd shell command limit");
                 assert!(input.is_some_and(|s| s.len() > 6000 && s.is_ascii()), "The complete probe must travel through stdin");
+                assert!(
+                    input.is_some_and(|s| s.ends_with(b"\n") && s.iter().filter(|c| **c == b'\n').count() == 1),
+                    "One complete Base64 line must terminate without waiting for EOF"
+                );
+                assert!(
+                    input.is_some_and(|s| s[..s.len() - 1].iter().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(b))),
+                    "Payload before LF must contain only standard Base64"
+                );
             }
             assert!(!input.is_some_and(|s| s.windows(8).any(|w| w == b"netsec()")));
             self.0.lock().unwrap().push(cmd.into());

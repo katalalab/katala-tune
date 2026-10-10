@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.0-power.5"
+version = "0.5.0-power.6"
 license = "MIT"
 repository = "https://github.com/katalalab/katala-tune"
 edition = "2024"

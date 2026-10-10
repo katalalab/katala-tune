@@ -12,4 +12,4 @@ curlの `dns_ms`, `connect_ms`, `tls_ms`, `first_byte_ms`, `total_ms` はリク�
 
 結果はアプリのメモリ／CLI標準出力だけにあり、DB・台帳を変更しない。必要な記録は操作者がCLI JSONを保存する。`network:false` は従来の詳細netsec収集を止める設定で、この手動の接続診断とは別。接続診断も止める場合は私有台帳の該当機体に `connectivity:false` を指定する。共用機でも宛先・認証ログ・プロセスを集めないこの診断だけを利用できる。OSの変更や電力・Clockの設定は既存の確認付き操作経路を使用する。
 
-Windowsのネイティブアプリ／CLIは、既存の `%ProgramFiles%/Git/usr/bin/ssh.exe` を優先し、存在しなければ `%SystemRoot%/System32/OpenSSH/ssh.exe`、両方なければPATH上の `ssh` を使う。GUIの起動経路によるSSH実体の違いを避けるためで、SSHのインストール、認証、設定、システムPATHは変更しない。Windows probeは短い起動コマンドと標準入力で渡し、コマンド行の長さ制限を避ける。
+Windowsのネイティブアプリ／CLIは、既存の `%ProgramFiles%/Git/usr/bin/ssh.exe` を優先し、存在しなければ `%SystemRoot%/System32/OpenSSH/ssh.exe`、両方なければPATH上の `ssh` を使う。GUIの起動経路によるSSH実体の違いを避けるためで、SSHのインストール、認証、設定、システムPATHは変更しない。Windows probeは短い起動コマンドと標準入力のBase64単一行（LF終端）で渡し、コマンド行の長さ制限とEOF待ちを避ける。

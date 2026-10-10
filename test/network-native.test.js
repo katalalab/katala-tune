@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawnSync, spawn } = require('node:child_process');
 const ps = path.resolve('probes/win_network.ps1');
 const py = path.resolve('probes/mac_network.py');
 const python = process.platform === 'win32' ? 'python' : 'python3';
@@ -58,8 +58,36 @@ test('Windows stdin loader receives the complete embedded probe with a short com
   assert.ok(encoded.length<2000);
   const source=`& { ${fs.readFileSync(ps,'utf8').replace(/^\uFEFF/,'')}\n }; [Console]::WriteLine("stdin_complete")`;
   assert.ok(Buffer.from(source,'utf16le').toString('base64').length>8191);
-  const r=spawnSync('powershell.exe',['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',encoded],{input:Buffer.from(source,'utf8').toString('base64'),encoding:'utf8',timeout:20000,windowsHide:true});
+  const r=spawnSync('powershell.exe',['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',encoded],{input:Buffer.from(source,'utf8').toString('base64')+'\n',encoding:'utf8',timeout:20000,windowsHide:true});
   assert.equal(r.status,0,r.stderr); const lines=r.stdout.trim().split(/\r?\n/);
   assert.equal(lines.pop(),'stdin_complete'); const data=JSON.parse(lines.pop());
   assert.equal(data.schema,'katala_network_check.v1'); assert.equal(data.platform,'win32'); assert.equal(data.active_probes,false);
+});
+
+test('Windows loader finishes a complete probe while the sender keeps stdin open', {skip:process.platform!=='win32'}, async () => {
+  const loader=/let loader = "([^"]+)";/.exec(fs.readFileSync('crates/tune-core/src/network.rs','utf8'))?.[1];assert.ok(loader);
+  const source=`& { ${fs.readFileSync(ps,'utf8').replace(/^\uFEFF/,'')}\n }; [Console]::WriteLine("line_complete")`;
+  const child=spawn('powershell.exe',['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(loader,'utf16le').toString('base64')],{stdio:['pipe','pipe','pipe'],windowsHide:true});
+  let out='',err='',timer;
+  child.stdout.setEncoding('utf8');child.stdout.on('data',v=>{out+=v;});
+  child.stderr.setEncoding('utf8');child.stderr.on('data',v=>{err+=v;});
+  child.stdin.on('error',()=>{});
+  try {
+    const code=await new Promise((resolve,reject)=>{
+      child.once('error',reject);child.once('close',resolve);
+      timer=setTimeout(()=>{child.kill();reject(Error('Loader waited for stdin EOF'));},15000);
+      child.stdin.write(Buffer.from(source,'utf8').toString('base64')+'\n');
+    });
+    assert.equal(code,0,err);assert.equal(child.stdin.writableEnded,false);
+    const lines=out.trim().split(/\r?\n/);assert.equal(lines.pop(),'line_complete');
+    assert.equal(JSON.parse(lines.pop()).schema,'katala_network_check.v1');
+  }finally{clearTimeout(timer);child.stdin.destroy();}
+});
+
+test('Windows loader never accepts empty or malformed input as a network report', {skip:process.platform!=='win32'}, () => {
+  const loader=/let loader = "([^"]+)";/.exec(fs.readFileSync('crates/tune-core/src/network.rs','utf8'))?.[1];assert.ok(loader);
+  for(const input of ['\n','invalid!\n']){
+    const r=spawnSync('powershell.exe',['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(loader,'utf16le').toString('base64')],{input,encoding:'utf8',timeout:5000,windowsHide:true});
+    assert.equal(r.error,undefined);assert.doesNotMatch(r.stdout,/katala_network_check\.v1/);
+  }
 });
