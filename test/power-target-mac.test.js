@@ -10,7 +10,7 @@ function check(key,mode) {
  try {
   const state=path.join(dir,'state');fs.writeFileSync(state,'0');
   const script=plan({id:'test-mac',os:'macos'},{type:'set-low-power-mode',params:{source:'ac',enabled:true,prev:false}},{protect:[]}).script;
-  const body=script.replaceAll('$HOME/.katala-tune','$KATALA_TEST_DIR');
+  const body=script.replaceAll('/tmp/org.katala.tune-power-control.lock','$KATALA_TEST_DIR/power-action.lock');
   const setup=`pmset() {
  if [ "$1" = -g ]; then
   [ "$KATALA_TEST_MODE" = readfail ] && [ -f "$KATALA_TEST_DIR/writes" ] && return 1

@@ -168,7 +168,7 @@ fn low_power_mode_script(source: &str, enabled: bool, prev: bool) -> String {
         raw("lowpowermode")
     );
     [
-        r#"lock="$HOME/.katala-tune/power-action.lock"; mkdir -p -m 700 "$HOME/.katala-tune" || exit 6; mkdir "$lock" 2>/dev/null || { echo "another power action is running; remove only after verifying owner PID is gone"; exit 8; }; trap 'rm -f "$lock/pid"; rmdir "$lock"' EXIT; trap 'exit 7' HUP INT TERM; printf "%s\n" "$$" > "$lock/pid" || exit 6"#.into(),
+        r#"lock="/tmp/org.katala.tune-power-control.lock"; mkdir "$lock" 2>/dev/null || { echo "another power action is running; remove only after verifying owner PID is gone"; exit 8; }; trap 'rm -f "$lock/pid"; rmdir "$lock"' EXIT; trap 'exit 7' HUP INT TERM; printf "%s\n" "$$" > "$lock/pid" || exit 6"#.into(),
         format!("before=$({read}) || {{ echo \"low power mode unsupported\"; exit 6; }}; before_key=${{before%%:*}}; before_mode=${{before#*:}}"),
         format!("[ \"$before_mode\" = {previous} ] || {{ echo \"low power mode changed\"; exit 3; }}"),
         format!("pmset {flag} \"$before_key\" {desired}; apply=$?"),
