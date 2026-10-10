@@ -111,7 +111,18 @@ fn proc(r: &mut Rng, win: bool) -> Value {
         ("app", app),
         ("cpu", Some(if win { r.num(20.0) } else { r.num(220.0) })),
         ("avg_core", if win { mb!(r, r.num(120.0)) } else { None }),
-        ("etime", if r.chance(0.5) { Some(json!(format!("{:02}:{:02}", r.below(24), r.below(60)))) } else { None }),
+        // ps の etime（[[dd-]hh:]mm:ss）。2分の境目の前後と、読めない形（数値・壊れた文字列）も混ぜる
+        (
+            "etime",
+            match r.below(8) {
+                0 => Some(json!(format!("{:02}:{:02}", r.below(24), r.below(60)))),
+                1 => Some(json!(format!("{:02}:{:02}", 1 + r.below(2), r.below(60)))),
+                2 => Some(json!(format!("{:02}:{:02}:{:02}", r.below(24), r.below(60), r.below(60)))),
+                3 => Some(json!(format!("{}-{:02}:{:02}:{:02}", r.below(40), r.below(24), r.below(60), r.below(60)))),
+                4 => Some([json!(90), json!("1:2:3:4"), json!("abc"), json!(""), json!("99999999999999999999-00:00:00")][r.below(5) as usize].clone()),
+                _ => None,
+            },
+        ),
         ("start", mb!(r, start)),
         ("mem_mb", Some(r.num(30_000.0))),
     ])
@@ -713,7 +724,7 @@ fn rules_health_logs_actions_match_js() {
 
     // ログ由来の所見（DB を通す）
     let mut lf_in = Vec::new();
-    let kinds: [(&str, &str, Option<&str>, &str); 17] = [
+    let kinds: [(&str, &str, Option<&str>, &str); 18] = [
         // BSOD 後のクラッシュダンプ作成（161・162）はディスクのエラーに数えない。46 は数える
         ("win_system", "volmgr", Some("161"), "error"),
         ("win_system", "volmgr", Some("162"), "warn"),
@@ -732,6 +743,8 @@ fn rules_health_logs_actions_match_js() {
         ("neonmonitor", "NeonMonitor", None, "warn"),
         ("neonmonitor", "NeonMonitor", None, "info"),
         ("win_system", "Service Control Manager", Some("7031"), "error"),
+        // 正常な停止（6006）の直前の分は probe が info にする。サービスの異常には数えない
+        ("win_system", "Service Control Manager", Some("7031"), "info"),
     ];
     for case in 0..40 {
         let mut groups: Vec<Value> = Vec::new();
