@@ -459,6 +459,13 @@ fn rules_health_logs_actions_match_js() {
 
     // 判定（rules）
     let mut analyze_in: Vec<Value> = fixtures().into_iter().map(|(snap, node)| json!({ "snap": snap, "node": node })).collect();
+    let cache_cases: Value = serde_json::from_str(include_str!("../../../test/fixtures/cache-accounting.json")).unwrap();
+    analyze_in.extend(cache_cases.as_array().unwrap().iter().map(|c| json!({ "snap": c["snap"], "node": {} })));
+    for gb in [Value::Null, json!("20"), json!(-1), json!(true), json!({}), json!([])] {
+        analyze_in.push(json!({ "snap": { "probe": "mac", "caches": [
+            { "path": "~/Library/Caches", "gb": gb }, { "path": "~/Library/Caches/Homebrew", "gb": 12 }
+        ] }, "node": {} }));
+    }
     for _ in 0..4000 {
         let shared = r.chance(0.2);
         analyze_in.push(json!({ "snap": snapshot(&mut r), "node": { "shared": shared } }));
