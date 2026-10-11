@@ -79,7 +79,11 @@ jobs:
           set -euo pipefail
           mkdir -p src-tauri/binaries
           if [ "$RUNNER_OS" = macOS ]; then
-            for t in aarch64-apple-darwin x86_64-apple-darwin; do cargo build --release --locked -p tune-cli --target "$t"; done
+            # universal のビルドは各アーキテクチャを別にビルドする（tauri-build がそれぞれの名前を探す）ので、両方と universal を置く
+            for t in aarch64-apple-darwin x86_64-apple-darwin; do
+              cargo build --release --locked -p tune-cli --target "$t"
+              cp "target/$t/release/tune" "src-tauri/binaries/tune-$t"
+            done
             lipo -create -output src-tauri/binaries/tune-universal-apple-darwin target/aarch64-apple-darwin/release/tune target/x86_64-apple-darwin/release/tune
             echo '{"bundle":{"externalBin":["binaries/tune"]}}' > sidecars.json
           else
