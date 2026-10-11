@@ -26,9 +26,22 @@ pub fn create(app: &AppHandle, nodes: usize) -> Arc<Live> {
     live
 }
 
-/// 流し始める（流れていれば合図として扱う）。台帳を読み直し、台帳に無い id は理由つきで断る
+/// ウィンドウを人が見られる状態か（ある・表示中・最小化でない）
+fn window_shown(exists: bool, visible: bool, minimized: bool) -> bool {
+    exists && visible && !minimized
+}
+
+/// 流し始める（流れていれば合図として扱う）。台帳を読み直し、台帳に無い id は理由つきで断る。
+/// ウィンドウが隠れているあいだは流さず合図にもしない（--hidden の WebView でも document.visibilityState が visible のままで、
+/// 常駐する全部の操作卓が全機体を流し続けていた。2026-10-12 に実機で確認）。止めるのは idle_stop に任せる
 #[tauri::command]
-pub async fn live_start(e: State<'_, Arc<Engine>>, l: State<'_, Arc<Live>>, ids: Vec<String>) -> Result<Value, String> {
+pub async fn live_start(app: AppHandle, e: State<'_, Arc<Engine>>, l: State<'_, Arc<Live>>, ids: Vec<String>) -> Result<Value, String> {
+    let w = app.get_webview_window(crate::window::LABEL);
+    let shown =
+        window_shown(w.is_some(), w.as_ref().is_some_and(|w| w.is_visible().unwrap_or(true)), w.as_ref().is_some_and(|w| w.is_minimized().unwrap_or(false)));
+    if !shown {
+        return Ok(serde_json::json!({ "started": [], "running": [], "refused": [], "hidden": true }));
+    }
     let cfg = e.reload_config();
     let (mut nodes, mut unknown): (Vec<Node>, Vec<String>) = (Vec::new(), Vec::new());
     for id in ids {
@@ -70,5 +83,18 @@ pub fn shutdown(app: &AppHandle) {
     if let Some(l) = app.try_state::<Arc<Live>>() {
         let l = l.inner().clone();
         tauri::async_runtime::block_on(async move { l.shutdown(Duration::from_secs(3)).await });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_shown;
+
+    #[test]
+    fn hidden_or_minimized_window_does_not_stream() {
+        assert!(window_shown(true, true, false));
+        assert!(!window_shown(true, false, false), "--hidden で起動して隠れている");
+        assert!(!window_shown(true, true, true), "最小化");
+        assert!(!window_shown(false, true, false), "ウィンドウが無い");
     }
 }
