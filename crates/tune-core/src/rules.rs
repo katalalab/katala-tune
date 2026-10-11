@@ -223,6 +223,22 @@ impl F {
     }
 }
 
+// probe の caches には保存領域も入る。既存 snapshot も同じ完全一致の分類で扱う。
+const MAC_CACHE_PATHS: &[&str] = &["~/.npm/_cacache", "~/Library/Caches", "~/Library/Caches/Homebrew", "~/.cache", "~/Library/Developer/Xcode/DerivedData"];
+const MAC_STORAGE_PATHS: &[&str] = &["~/Library/Developer/CoreSimulator/Devices", "~/.colima", "~/Library/Containers/com.docker.docker/Data"];
+
+fn measured_dirs<'a>(snap: &'a Value, paths: &[&str]) -> Vec<&'a Value> {
+    let mut seen = std::collections::HashSet::new();
+    arr(snap.get("caches"))
+        .iter()
+        .filter(|c| {
+            c.get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|p| paths.contains(&p) && c.get("gb").and_then(Value::as_f64).is_some_and(|v| v.is_finite() && v >= 0.0) && seen.insert(p))
+        })
+        .collect()
+}
+
 /// 所見を作る。node は台帳の1台（shared を見る）
 pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
     let s = Some(snap);
@@ -415,32 +431,57 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 "disk",
                 title,
                 detail,
-                "システムディスクが埋まると swap とアップデートが止まり、全体が重くなる。下のキャッシュ削除コマンドから始める。".into(),
+                "システムディスクが埋まると swap とアップデートが止まり、全体が重くなる。容量の内訳と利用状況を確認し、再生成可能と確認できたキャッシュだけ整理を検討する。".into(),
                 Some(cache_commands(snap)),
                 None,
             );
         } else if free < 10.0 {
             let advice = if sys {
-                "10% を切ると swap の確保とアップデートに影響する。"
+                "10% を切ると swap の確保とアップデートに影響する。整理する前に対象の内容と再生成可否を確認する。"
             } else {
                 "大きなファイルの置き場所を見直す。"
             };
             out.add(format!("disk-{}", string(mount)), "warn", "disk", title, detail, advice.into(), sys.then(|| cache_commands(snap)), None);
         }
     }
-    let caches: Vec<&Value> = arr(get(s, "caches")).iter().filter(|c| num(c.get("gb")) >= 2.0).collect();
+    let measured: Vec<&Value> = if is_win { arr(get(s, "caches")).iter().collect() } else { measured_dirs(snap, MAC_CACHE_PATHS) };
+    // 親の有効な計測があれば子は内数。項目しきい値より先に除く（0 も計測済み）。
+    let caches: Vec<&Value> = measured
+        .iter()
+        .copied()
+        .filter(|c| (is_win || !measured.iter().any(|p| string(c.get("path")).starts_with(&format!("{}/", string(p.get("path")))))) && num(c.get("gb")) >= 2.0)
+        .collect();
     let cache_total: f64 = caches.iter().map(|c| num(c.get("gb"))).sum();
+    let cache_unit = if is_win { "GB" } else { "GiB" }; // mac probe の du KiB / 2**20
     if cache_total >= 10.0 {
         out.add(
             "caches".into(),
             "info",
             "disk",
-            format!("再生成できるキャッシュが {} GB", to_fixed(cache_total, 0)),
-            caches.iter().map(|c| format!("{} {} GB", string(c.get("path")), string(c.get("gb")))).collect::<Vec<_>>().join("、"),
-            "消しても次に使うとき作り直される。ディスクに余裕があるなら急がない。".into(),
+            format!("{}が {} {cache_unit}", if is_win { "再生成できるキャッシュ" } else { "再生成可能なキャッシュ候補" }, to_fixed(cache_total, 0)),
+            caches.iter().map(|c| format!("{} {} {cache_unit}", string(c.get("path")), string(c.get("gb")))).collect::<Vec<_>>().join("、"),
+            "既知のキャッシュ領域の計測値であり、削除可能な容量の保証ではない。内容・利用状況・再生成可否を確認してから整理を検討する。ディスクに余裕があるなら急がない。".into(),
             Some(cache_commands(snap)),
             None,
         );
+    }
+
+    if !is_win {
+        let storage = measured_dirs(snap, MAC_STORAGE_PATHS);
+        let storage_total: f64 = storage.iter().map(|c| num(c.get("gb"))).sum();
+        if storage_total >= 10.0 {
+            out.simple(
+                "vm-storage",
+                "info",
+                "disk",
+                format!("VM・シミュレータの保存領域（削除候補ではない）: {} GiB", to_fixed(storage_total, 0)),
+                format!(
+                    "{}。ユーザーデータを含むため、再生成可能なキャッシュには数えない。",
+                    storage.iter().map(|c| format!("{} {} GiB", string(c.get("path")), string(c.get("gb")))).collect::<Vec<_>>().join("、")
+                ),
+                "VM ディスク・コンテナの永続データ・シミュレータ内のアプリデータを含みうる保存領域。容量の参考情報であり、削除は提案しない。",
+            );
+        }
     }
 
     // 熱・電源
@@ -759,12 +800,9 @@ fn cache_commands(snap: &Value) -> Vec<String> {
     if js::is_str(get(s, "probe"), "windows") {
         return vec!["cleanmgr /sageset:1  # 対象を選ぶ\ncleanmgr /sagerun:1".into(), "npm cache clean --force".into()];
     }
-    let have: Vec<Option<&Value>> = arr(get(s, "caches")).iter().filter(|c| num(c.get("gb")) >= 1.0).map(|c| c.get("path")).collect();
+    let have: Vec<Option<&Value>> = measured_dirs(snap, MAC_CACHE_PATHS).iter().filter(|c| num(c.get("gb")) >= 1.0).map(|c| c.get("path")).collect();
     let has = |p: &str| have.iter().any(|x| js::is_str(*x, p));
     let mut cmds: Vec<String> = Vec::new();
-    if has("~/Library/Developer/CoreSimulator/Devices") {
-        cmds.push("xcrun simctl delete unavailable".into());
-    }
     if has("~/Library/Developer/Xcode/DerivedData") {
         cmds.push("rm -rf ~/Library/Developer/Xcode/DerivedData/*".into());
     }
@@ -773,17 +811,6 @@ fn cache_commands(snap: &Value) -> Vec<String> {
     }
     if has("~/Library/Caches/Homebrew") {
         cmds.push("brew cleanup --prune=all".into());
-    }
-    let colima_len = match get(get(s, "containers"), "colima") {
-        Some(Value::Array(a)) => !a.is_empty(),
-        Some(Value::String(x)) => !x.is_empty(),
-        _ => false,
-    };
-    if has("~/.colima") || colima_len {
-        cmds.push("docker system df   # 確認してから\ndocker image prune -a".into());
-    }
-    if truthy(get(get(s, "containers"), "docker_desktop")) {
-        cmds.push("docker system df   # 確認してから\ndocker builder prune".into());
     }
     cmds.push("du -sh ~/Library/Caches/* 2>/dev/null | sort -h | tail -15   # 大きいものを確認".into());
     cmds
@@ -825,6 +852,76 @@ pub fn compare(prev: Option<&Value>, cur: Option<&Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_accounting_regressions() {
+        let cases: Value = serde_json::from_str(include_str!("../../../test/fixtures/cache-accounting.json")).unwrap();
+        for c in cases.as_array().unwrap() {
+            let findings = analyze(&c["snap"], &json!({}));
+            let cache = findings.iter().find(|f| f["id"] == "caches");
+            let storage = findings.iter().find(|f| f["id"] == "vm-storage");
+            if c["cache_gib"].is_null() {
+                assert!(cache.is_none(), "{}: {cache:?}", c["name"]);
+            } else {
+                let cache = cache.unwrap_or_else(|| panic!("{}: missing cache", c["name"]));
+                assert_eq!(cache["title"], format!("再生成可能なキャッシュ候補が {} GiB", c["cache_gib"]), "{}", c["name"]);
+                assert_eq!(cache["detail"], c["cache_detail"], "{}", c["name"]);
+                assert!(cache.get("action").is_none());
+            }
+            if c["storage_gib"].is_null() {
+                assert!(storage.is_none(), "{}: {storage:?}", c["name"]);
+            } else {
+                let storage = storage.unwrap_or_else(|| panic!("{}: missing storage", c["name"]));
+                assert_eq!(storage["severity"], "info");
+                assert_eq!(storage["category"], "disk");
+                assert_eq!(storage["title"], format!("VM・シミュレータの保存領域（削除候補ではない）: {} GiB", c["storage_gib"]));
+                assert_eq!(
+                    storage["detail"],
+                    format!("{}。ユーザーデータを含むため、再生成可能なキャッシュには数えない。", c["storage_detail"].as_str().unwrap())
+                );
+                assert!(storage.get("commands").is_none());
+                assert!(storage.get("action").is_none());
+            }
+            for f in &findings {
+                for cmd in arr(f.get("commands")) {
+                    let cmd = cmd.as_str().unwrap();
+                    assert!(!cmd.contains("prune") || !cmd.contains("docker"));
+                    assert!(!cmd.contains("simctl delete"));
+                }
+                if f["id"] == "caches" || f["id"] == "disk-/" {
+                    let advice = f["advice"].as_str().unwrap();
+                    assert!(advice.contains("確認"));
+                    assert!(!advice.contains("消しても") && !advice.contains("削除コマンドから始める"));
+                    if let Some(commands) = c.get("cleanup_commands") {
+                        let mut expected = commands.as_array().unwrap().clone();
+                        expected.push(json!("du -sh ~/Library/Caches/* 2>/dev/null | sort -h | tail -15   # 大きいものを確認"));
+                        assert_eq!(f["commands"], json!(expected), "{}", c["name"]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cache_accounting_invalid_parent_keeps_child() {
+        for gb in [Value::Null, json!("20"), json!(-1), json!(true), json!({}), json!([])] {
+            let findings = analyze(
+                &json!({ "probe": "mac", "caches": [
+                { "path": "~/Library/Caches", "gb": gb }, { "path": "~/Library/Caches/Homebrew", "gb": 12 }
+            ] }),
+                &json!({}),
+            );
+            let cache = findings.iter().find(|f| f["id"] == "caches").unwrap();
+            assert_eq!(cache["detail"], "~/Library/Caches/Homebrew 12 GiB");
+        }
+        let findings = analyze(
+            &json!({ "probe": "mac", "caches": [
+            { "path": "~/Library/Caches" }, { "path": "~/Library/Caches/Homebrew", "gb": 12 }
+        ] }),
+            &json!({}),
+        );
+        assert_eq!(findings[0]["detail"], "~/Library/Caches/Homebrew 12 GiB");
+    }
 
     #[test]
     fn no_kill_matches_like_js() {
