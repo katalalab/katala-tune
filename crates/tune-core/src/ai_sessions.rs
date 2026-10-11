@@ -166,11 +166,14 @@ pub async fn verify(node: &Node, items: &[(String, i64, i64)]) -> Result<Vec<Val
 pub async fn run_python(node: &Node, src: &str, timeout: Duration) -> RunResult {
     let input = Some(src.as_bytes());
     if node.is_mac() {
+        // `python3 -` で標準入力をソースとして読ませると、macOS 標準の Python 3.9 は約 1 KB を超える行のあとの
+        // 多バイト文字で SyntaxError（Non-UTF-8 code）になる（remote-machine で 2026-10-11 に再現）。live.rs と同じくバイト列で読んで compile する
+        const BOOT: &str = "import sys;exec(compile(sys.stdin.buffer.read(),\"ai_sessions.py\",\"exec\"))";
         if node.local {
-            collect::run("/usr/bin/env", &["python3".into(), "-X".into(), "utf8".into(), "-".into()], input, timeout).await
+            collect::run("/usr/bin/env", &["python3".into(), "-X".into(), "utf8".into(), "-c".into(), BOOT.into()], input, timeout).await
         } else {
-            let remote = "command -v python3 >/dev/null && exec python3 -X utf8 - || exec /usr/bin/python3 -X utf8 -";
-            collect::run("ssh", &ssh_args(&node.alias, remote), input, timeout).await
+            let remote = format!("command -v python3 >/dev/null && exec python3 -X utf8 -c '{BOOT}' || exec /usr/bin/python3 -X utf8 -c '{BOOT}'");
+            collect::run("ssh", &ssh_args(&node.alias, &remote), input, timeout).await
         }
     } else if node.local {
         let mut last = RunResult::default();
