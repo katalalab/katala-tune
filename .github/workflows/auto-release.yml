@@ -1,0 +1,42 @@
+# main で版（package.json・Cargo・tauri.conf.json）を上げたら、その版のタグを打ってリリースを動かす（docs/release.md）。
+# GITHUB_TOKEN で push したタグは別のワークフローを起こさないので、release.yml を workflow_dispatch（ref はタグ）で呼ぶ。
+# 第三者の action は使わない（checkout だけ。ツールは runner の gh・node）
+name: auto-release
+
+on:
+  push:
+    branches: [main]
+    paths: ['package.json', 'Cargo.toml', 'src-tauri/tauri.conf.json']
+
+permissions: {}
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # タグを push する
+      actions: write # release.yml を呼ぶ
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 新しい版ならタグを打ってリリースを動かす
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          v=$(node -p "require('./package.json').version")
+          node scripts/version.js --check "$v"
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$v" >/dev/null 2>&1; then
+            echo "v$v はもうある（リリースしない）"
+            exit 0
+          fi
+          # タグは API で作る（資格情報を checkout に残さない）
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/v$v" -f sha="$GITHUB_SHA" >/dev/null
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "v$v"
+          echo "v$v をタグにして release.yml を動かした"
