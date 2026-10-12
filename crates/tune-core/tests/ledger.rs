@@ -17,6 +17,74 @@ use tune_core::{actions, health, inventory, network};
 const FIXTURE: &str = include_str!("../../../test/fixtures/ledger/nodes.json");
 const EXCLUDED: [&str; 6] = ["old-tower", "locked-down", "on-hold", "someone-else", "typo-node", "retired-local"];
 
+struct HeldRoute;
+impl tune_core::live::Route for HeldRoute {
+    fn open(&self, _node: &Node, _opts: &Opts) -> Result<tune_core::live::Source, String> {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let (done, ended) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = tx.send(r#"{"type":"hello","v":1,"os":"fake"}"#.into()).await;
+            let _ = tx.send(r#"{"type":"s","t":1,"cpu":5,"cores":[5],"mem":{"used_pct":50}}"#.into()).await;
+            let _ = stopped.await;
+            drop(tx);
+            let _ = done.send(Default::default());
+        });
+        Ok(tune_core::live::Source::new(rx, stop, ended))
+    }
+}
+
+async fn running(live: &Live, id: &str) {
+    for _ in 0..100 {
+        if live.status()[id]["state"] == "running" {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("sampler did not start: {id}");
+}
+
+#[tokio::test]
+async fn excluded_heartbeat_stops_an_existing_stream() {
+    let live = Live::new(Arc::new(HeldRoute), Opts::default(), Box::new(|_| {}));
+    let mut n = node("active-mac");
+    assert_eq!(live.start(&[n.clone()], &[])["started"], json!([n.id]));
+    running(&live, &n.id).await;
+    n.raw["status"] = json!("retired");
+    assert_eq!(live.start(&[n], &[])["refused"][0]["reason"], "excluded");
+    let active = live.active();
+    live.shutdown(Duration::from_secs(1)).await;
+    assert!(active.is_empty(), "excluded sampler still active: {active:?}");
+}
+
+#[tokio::test]
+async fn monitor_stops_streams_removed_or_excluded_from_the_current_ledger() {
+    let dir = tmp("stream-reload");
+    let cfg_path = dir.join("nodes.json");
+    std::fs::write(&cfg_path, r#"{"nodes":[{"id":"active-mac","os":"macos"}]}"#).unwrap();
+    let e = Engine::open(cfg_path.clone(), dir.join("data"), Arc::new(NoHost)).unwrap();
+    let live = Live::new(Arc::new(HeldRoute), Opts::default(), Box::new(|_| {}));
+    let original = e.config().nodes;
+    for changed in [r#"{"nodes":[{"id":"active-mac","os":"macos","status":"paused"}]}"#, r#"{"nodes":[]}"#] {
+        live.start(&original, &[]);
+        running(&live, "active-mac").await;
+        std::fs::write(&cfg_path, changed).unwrap();
+        // Monitoring is disabled: ledger exclusion still has to close UI streams.
+        tune_core::monitor::run(e.clone(), live.clone(), |_| {}, Some(std::time::Instant::now()), None).await;
+        assert!(live.active().is_empty(), "excluded stream survived reload");
+        for _ in 0..100 {
+            if live.status()["active-mac"]["state"] == "stopped" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(live.status()["active-mac"]["reason"], "excluded");
+    }
+    live.shutdown(Duration::from_secs(1)).await;
+    drop(e);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn config() -> nodes::Config {
     // retired-local はこの機体（local）として読む
     parse_config(FIXTURE, Path::new("nodes.json"), "fixture-local-host").unwrap()

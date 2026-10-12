@@ -102,9 +102,9 @@ $r = Get-KtWslObservation
 Assert-KtEqual (Get-KtEnteredNames).Count 0 'running list failed: nothing may be entered'
 foreach ($x in $r.distros) { Assert-KtEqual $x.state 'unknown' "state of $($x.name)"; Assert-KtEqual $x.reason 'running-list-failed' "reason of $($x.name)" }
 
-# 4. nothing is running (localized message, non-zero exit): every distro is stopped_unobserved
+# 4. successful empty running list: every distro is stopped_unobserved
 $script:Calls.Clear()
-$script:Script['-l --running -q'] = (New-KtRes "There are no running distributions.`r`n" 'exit 1')
+$script:Script['-l --running -q'] = (New-KtRes '')
 $r = Get-KtWslObservation
 Assert-KtEqual (Get-KtEnteredNames).Count 0 'none running: nothing may be entered'
 foreach ($x in $r.distros) { Assert-KtEqual $x.state 'stopped_unobserved' "state of $($x.name)" }
@@ -121,11 +121,12 @@ Assert-KtEqual $u.reason 'timeout' 'timeout: reason'
 Assert-KtTrue ($null -eq $u.inside) 'timeout: no inside data'
 Assert-KtEqual (Get-KtEnteredNames).Count 1 'timeout: one entry only'
 
-# 6. no registered distro (localized message): listed, no distros, nothing entered
+# 6. localized non-zero list response: unknown inventory, nothing entered
 $script:Calls.Clear()
 $script:Script = @{ '-l -q' = (New-KtRes "Windows Subsystem for Linux has no installed distributions.`r`n" 'exit 1') }
 $r = Get-KtWslObservation
-Assert-KtEqual $r.listed $true 'no distros: listed'
+Assert-KtEqual $r.listed $false 'non-zero list: not listed'
+Assert-KtEqual $r.list_error 'exit 1' 'non-zero list: preserve failure'
 Assert-KtEqual $r.distros.Count 0 'no distros: empty'
 Assert-KtEqual $r.ignored_lines 1 'no distros: message is counted, not used as a name'
 Assert-KtEqual (Get-KtEnteredNames).Count 0 'no distros: nothing may be entered'
@@ -137,5 +138,26 @@ $r = Get-KtWslObservation
 Assert-KtEqual $r.listed $false 'list failed: not listed'
 Assert-KtEqual $r.list_error 'timeout' 'list failed: reason'
 Assert-KtEqual $script:Calls.Count 1 'list failed: no further calls'
+
+# 8. A failed running-list command with partial names is never trusted.
+$script:Calls.Clear()
+$script:Script = @{
+  '-l -q' = (New-KtRes "Ubuntu`r`nOld`r`n")
+  '-l --running -q' = (New-KtRes "Ubuntu`r`n" 'exit 1')
+  '-d Ubuntu --exec /bin/sh -s' = (New-KtRes $inner)
+}
+$r = Get-KtWslObservation
+Assert-KtEqual (Get-KtEnteredNames).Count 0 'partial failed list: nothing may be entered'
+foreach ($x in $r.distros) { Assert-KtEqual $x.state 'unknown' 'partial failed list: state unknown' }
+
+# 9. Partial observation stdout from a failed command cannot count as observed.
+$script:Calls.Clear()
+$script:Script['-l --running -q'] = (New-KtRes "Ubuntu`r`n")
+$script:Script['-d Ubuntu --exec /bin/sh -s'] = (New-KtRes $inner 'exit 1')
+$r = Get-KtWslObservation
+$u = $r.distros | Where-Object { $_.name -eq 'Ubuntu' }
+Assert-KtEqual $u.observed $false 'failed inner command: not observed'
+Assert-KtEqual $u.reason 'exit 1' 'failed inner command: preserve reason'
+Assert-KtTrue ($null -eq $u.inside) 'failed inner command: discard partial data'
 
 Write-Output 'win-wsl-regression: ok'

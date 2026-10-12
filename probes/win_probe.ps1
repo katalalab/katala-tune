@@ -272,13 +272,13 @@ function Get-KtWslObservation {
   $all = Invoke-KtWsl @('-l', '-q')
   $parsed = ConvertTo-KtWslNames $all.out
   $r.ignored_lines = $parsed.ignored
-  # timeout / failed = the list could not be read. Otherwise no names means no registered distro (or a localized message, counted in ignored_lines)
-  if ($all.err -eq 'timeout' -or $all.err -eq 'failed') { $r.list_error = [string]$all.err; return $r }
+  # Non-zero exit (including partial stdout) is not a reliable inventory.
+  if (-not $all.ok) { $r.list_error = [string]$all.err; return $r }
   if ($parsed.names.Count -eq 0) { $r.listed = $true; return $r }
   $r.listed = $true
   $verbose = ConvertFrom-KtWslVerbose ((Invoke-KtWsl @('-l', '-v')).out)
   $run = Invoke-KtWsl @('-l', '--running', '-q')
-  $runKnown = ($run.err -ne 'timeout' -and $run.err -ne 'failed')
+  $runKnown = $run.ok
   $runNames = if ($runKnown) { @((ConvertTo-KtWslNames $run.out).names) } else { @() }
   $observed = 0
   foreach ($name in $parsed.names) {
@@ -292,7 +292,7 @@ function Get-KtWslObservation {
       $d.state = 'running'
       $observed++
       $o = Invoke-KtWsl @('-d', $name, '--exec', '/bin/sh', '-s') ($KtWslInnerScript -replace "`r`n", "`n") 10000 $false
-      $inside = if ($o.err -ne 'timeout' -and $o.err -ne 'failed') { ConvertFrom-KtWslInside $o.out } else { $null }
+      $inside = if ($o.ok) { ConvertFrom-KtWslInside $o.out } else { $null }
       if ($inside) { $d.observed = $true; $d.inside = $inside } else { $d.reason = $(if ($o.err) { [string]$o.err } else { 'no-data' }) }
     }
     $r.distros += [pscustomobject]$d

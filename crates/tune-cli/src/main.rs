@@ -80,6 +80,30 @@ fn targets(ids: &[String]) -> Result<Vec<nodes::Node>, String> {
     Ok(targets)
 }
 
+/// 台帳と既存の観測だけ読む。初回閲覧でも見本・DB を作らない
+fn ledger() -> Result<Value, String> {
+    let cfg = nodes::load_config(&nodes::user_config_path())?;
+    let dir = nodes::data_dir();
+    let exists = dir.join(tune_core::db::DB_FILE).try_exists().map_err(|e| e.to_string())?;
+    let db = if exists { Some(Store::open_read_only(&dir).map_err(|e| e.to_string())?) } else { None };
+    let mut observed = std::collections::HashMap::new();
+    let mut errors = std::collections::HashMap::new();
+    for n in &cfg.nodes {
+        let at = match &db {
+            Some(db) => db.last_snapshots(&n.id, 1).map_err(|e| e.to_string())?.first().map(|s| s.at),
+            None => None,
+        };
+        if let Some(db) = &db {
+            errors.insert(n.id.clone(), db.probe_error(&n.id, at).map_err(|e| e.to_string())?);
+        }
+        observed.insert(n.id.clone(), at);
+    }
+    Ok(nodes::target_ledger(&cfg.nodes, |id| nodes::Observation {
+        last_ok_at: observed.get(id).copied().flatten(),
+        last_error: errors.get(id).cloned().flatten(),
+    }))
+}
+
 /// 対象台帳を人が読む表にする
 fn ledger_table(v: &Value) -> String {
     let mut out = String::new();
@@ -274,10 +298,7 @@ async fn main() -> ExitCode {
             Ok(e) => e.power_report().map(|v| print(&v)),
             Err(e) => Err(e),
         },
-        "ledger" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
-            Ok(e) => e.ledger().map(|v| if rest.iter().any(|a| a == "--json") { print(&v) } else { print!("{}", ledger_table(&v)) }),
-            Err(e) => Err(e),
-        },
+        "ledger" => ledger().map(|v| if rest.iter().any(|a| a == "--json") { print(&v) } else { print!("{}", ledger_table(&v)) }),
         "last" | "status" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
             Ok(e) => {
                 if cmd == "last" {

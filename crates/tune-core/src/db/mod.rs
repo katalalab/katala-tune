@@ -81,6 +81,11 @@ impl Store {
         Self::init(Connection::open_in_memory()?)
     }
 
+    /// 既存 DB を読み取り専用で開く。作成・スキーマ移行・過去ログの取り込みはしない
+    pub fn open_read_only(dir: &Path) -> Result<Store> {
+        Ok(Store { conn: Connection::open_with_flags(dir.join(DB_FILE), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)? })
+    }
+
     fn init(conn: Connection) -> Result<Store> {
         conn.execute_batch(PRAGMAS)?;
         // 出どころの台帳・費用の列を足す前の DB の ai_claude_messages / ai_sessions に列が無い（CREATE TABLE IF NOT EXISTS では足されない）ので、後で足す

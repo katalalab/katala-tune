@@ -210,11 +210,14 @@ impl Engine {
     /// 対象台帳（対象・除外・未観測とその理由）。読み取りだけで、台帳は書き換えない
     pub fn ledger(&self) -> Result<Value, String> {
         let cfg = self.reload_config();
-        let errors = lock(&self.last_probe_error).clone();
+        let mut errors = lock(&self.last_probe_error).clone();
         let db = lock(&self.db);
         let mut last_ok = std::collections::HashMap::new();
         for n in &cfg.nodes {
             let at = db.last_snapshots(&n.id, 1).map_err(|e| e.to_string())?.first().map(|s| s.at);
+            if let Some(error) = db.probe_error(&n.id, at).map_err(|e| e.to_string())? {
+                errors.insert(n.id.clone(), error);
+            }
             last_ok.insert(n.id.clone(), at);
         }
         Ok(crate::nodes::target_ledger(&cfg.nodes, |id| crate::nodes::Observation {
@@ -287,7 +290,7 @@ impl Engine {
                     .set("cursors", Value::Array(cursors.clone()))
                     .opt("expect", n.get("expect").cloned())
                     .set("schedule", sch.clone())
-                    .opt("lastError", errors.get(&n.id).cloned().map(Value::from))
+                    .opt("lastError", db.probe_error(&n.id, last.as_ref().map(|s| s.at)).ok().flatten().or_else(|| errors.get(&n.id).cloned()).map(Value::from))
                     .build();
                 let checks = health::node_checks(&n.raw, snap.as_ref(), &findings, &ctx);
                 changed.extend(db.save_checks(&n.id, &checks, now).unwrap_or_default());
@@ -430,15 +433,21 @@ impl Engine {
                     }
                     Err(e) => {
                         let msg = format!("分析は終わったが保存できなかった: {e}");
-                        lock(&self.last_probe_error).insert(node_id.clone(), msg.clone());
                         if let Value::Object(m) = &mut full {
                             m.insert("ok".into(), Value::Bool(false));
                             m.insert("error".into(), Value::String(msg));
                         }
                     }
                 }
-            } else {
-                lock(&self.last_probe_error).insert(node_id, js::string(full.get("error")));
+            }
+            if !js::truthy(full.get("ok")) {
+                let mut error = js::string(full.get("error"));
+                let at = full.get("at").and_then(Value::as_i64).unwrap_or_else(now_ms);
+                if let Err(e) = db.save_probe_failure(&node_id, at, &error) {
+                    error = format!("{error}\n分析の失敗を保存できなかった: {e}");
+                    full["error"] = json!(error);
+                }
+                lock(&self.last_probe_error).insert(node_id, error);
             }
             full
         };
@@ -689,6 +698,28 @@ fn rand36(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_probe_survives_restart_until_a_newer_success() {
+        let tmp = std::env::temp_dir().join(format!("kt-probe-outcome-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config = tmp.join("nodes.json");
+        std::fs::write(&config, r#"{"nodes":[{"id":"dev","os":"windows","network":false}]}"#).unwrap();
+        let e = Engine::open(config.clone(), tmp.join("data"), Arc::new(NoHost)).unwrap();
+        e.on_probe_result(&json!({"node_id":"dev","ok":true,"at":10,"data":{"probe":"windows"}}));
+        e.on_probe_result(&json!({"node_id":"dev","ok":false,"at":20,"error":"ssh: timeout"}));
+        drop(e);
+        let e = Engine::open(config, tmp.join("data"), Arc::new(NoHost)).unwrap();
+        let row = &e.ledger().unwrap()["rows"][0];
+        assert_eq!(row["status"], "unobserved");
+        assert!(row["reason"].as_str().unwrap().contains("ssh: timeout"));
+        e.compute_checks(false, false);
+        assert!(e.with_db(|d| d.checks()).unwrap().iter().any(|c| c["scope"] == "dev" && c["id"] == "probe" && c["status"] == "fail"));
+        e.on_probe_result(&json!({"node_id":"dev","ok":true,"at":30,"data":{"probe":"windows"}}));
+        assert_eq!(e.ledger().unwrap()["rows"][0]["status"], "target");
+        drop(e);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
 
     #[tokio::test]
     async fn probe_completion_reports_saved_results_and_never_promotes_busy_or_failed_saves() {

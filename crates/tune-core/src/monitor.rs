@@ -408,12 +408,13 @@ pub async fn run(
             }
         }
         let cfg = engine.reload_config();
+        live.retain_active(&cfg.nodes);
         if collect {
             // 流れていれば合図、止まっていれば流し直す。つなぎ直しても続かなかった機体は 5 分おきにだけ試す
             let targets: Vec<Node> = cfg
                 .nodes
                 .iter()
-                .filter(|n| n.is_mac() || n.is_windows())
+                .filter(|n| n.is_active() && (n.is_mac() || n.is_windows()))
                 .filter(|n| {
                     let down = live.brief(&n.id).is_some_and(|b| b["state"] == "stopped" && b["reason"] == "disconnected");
                     if !down {

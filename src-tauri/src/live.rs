@@ -30,6 +30,7 @@ pub fn create(app: &AppHandle, nodes: usize) -> Arc<Live> {
 #[tauri::command]
 pub async fn live_start(e: State<'_, Arc<Engine>>, l: State<'_, Arc<Live>>, ids: Vec<String>) -> Result<Value, String> {
     let cfg = e.reload_config();
+    l.retain_active(&cfg.nodes);
     let (mut nodes, mut unknown): (Vec<Node>, Vec<String>) = (Vec::new(), Vec::new());
     for id in ids {
         match cfg.node(&id) {
