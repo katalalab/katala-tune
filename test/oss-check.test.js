@@ -46,7 +46,7 @@ test('--history は HEAD から辿れるコミットだけ、--all-refs で全�
   const path = require('node:path');
   // 使い捨てのリポジトリ（一時ディレクトリ）を作って、スクリプトをそこで動かす
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-oss-'));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
   const cfg = ['-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=' + path.join(dir, 'no-hooks')];
   const vcs = (...a) => execFileSync('git', [...cfg, ...a], { cwd: dir, encoding: 'utf8' });
   vcs('init', '-q');
