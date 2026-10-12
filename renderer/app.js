@@ -31,10 +31,14 @@ const NAV = [['overview', '概要', 'overview'], ['status', '状態', 'status'],
   ['jobs', 'スケジュール', 'jobs'], ['logs', 'ログ', 'logs'], ['actions', '実行記録', 'actions']];
 // 別のファイル（tools.js・agents.js）が足した画面。実行記録の前に並べる
 const EXTRA_VIEWS = window.KT_VIEWS || [];
-for (const v of EXTRA_VIEWS) NAV.splice(NAV.findIndex(([k]) => k === 'actions'), 0, [v.key, v.label, v.icon]);
+// first: 先頭に置く（ダッシュボード）
+for (const v of EXTRA_VIEWS) {
+  if (v.first) NAV.unshift([v.key, v.label, v.icon]);
+  else NAV.splice(NAV.findIndex(([k]) => k === 'actions'), 0, [v.key, v.label, v.icon]);
+}
 
 const state = {
-  cfg: null, nodes: [], results: {}, fleet: null, view: 'overview', tab: 'findings', busy: new Set(), syncing: false,
+  cfg: null, nodes: [], results: {}, fleet: null, view: EXTRA_VIEWS.find((v) => v.home)?.key || 'overview', tab: 'findings', busy: new Set(), syncing: false,
   logFilter: { q: '', node_id: '', level: '', since: 7 },
   jobFilter: { node_id: '', failing: false, q: '' },
   procFilter: { node_id: '', q: '', sort: 'cpu' },
@@ -129,6 +133,7 @@ function go(view) {
 function render() {
   renderSidebar();
   Live.route(state.view); // ライブ表示: 新しい画面で使わないものは止める
+  for (const v of EXTRA_VIEWS) if (v.leave && v.key !== state.view) v.leave();
   if (state.view === 'overview') return renderOverview();
   if (state.view === 'status') return renderStatus();
   if (state.view === 'resources') return renderResources();

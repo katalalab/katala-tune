@@ -244,3 +244,19 @@ async fn engine_with_only_excluded_nodes_probes_nothing_and_leaves_the_ledger_un
     assert_eq!(std::fs::read(&cfg_path).unwrap(), before, "台帳が書き換わった");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn monitor_and_helper_transport_refuse_excluded_nodes() {
+    let dir = tmp("monitor");
+    let cfg_path = dir.join("nodes.json");
+    let cfg = json!({"nodes": [{"id": "hub", "alias": "excluded.invalid", "os": "windows", "status": "retired"}]});
+    std::fs::write(&cfg_path, cfg.to_string()).unwrap();
+    let e = Engine::open(cfg_path, dir.join("data"), Arc::new(NoHost)).unwrap();
+    // Stored settings may outlive a node's online status.
+    e.with_db(|d| d.set_meta("monitor", &json!({"hub": "hub"}))).unwrap();
+    let hub = e.config().node("hub").unwrap().clone();
+    let refusal = hub.refusal().unwrap();
+    assert_eq!(tune_core::monitor::pull(&e).await.unwrap_err(), refusal);
+    assert_eq!(tune_core::helpers::push_agent(&hub, &[]).await.unwrap_err(), refusal);
+    let _ = std::fs::remove_dir_all(&dir);
+}
