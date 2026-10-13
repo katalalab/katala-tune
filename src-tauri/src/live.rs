@@ -31,14 +31,20 @@ fn window_shown(exists: bool, visible: bool, minimized: bool) -> bool {
     exists && visible && !minimized
 }
 
+fn window_state_shown<E>(visible: Option<Result<bool, E>>, minimized: Option<Result<bool, E>>) -> bool {
+    match (visible, minimized) {
+        (Some(Ok(visible)), Some(Ok(minimized))) => window_shown(true, visible, minimized),
+        _ => false,
+    }
+}
+
 /// 流し始める（流れていれば合図として扱う）。台帳を読み直し、台帳に無い id は理由つきで断る。
 /// ウィンドウが隠れているあいだは流さず合図にもしない（--hidden の WebView でも document.visibilityState が visible のままで、
 /// 常駐する全部の操作卓が全機体を流し続けていた。2026-10-12 に実機で確認）。止めるのは idle_stop に任せる
 #[tauri::command]
 pub async fn live_start(app: AppHandle, e: State<'_, Arc<Engine>>, l: State<'_, Arc<Live>>, ids: Vec<String>) -> Result<Value, String> {
     let w = app.get_webview_window(crate::window::LABEL);
-    let shown =
-        window_shown(w.is_some(), w.as_ref().is_some_and(|w| w.is_visible().unwrap_or(true)), w.as_ref().is_some_and(|w| w.is_minimized().unwrap_or(false)));
+    let shown = window_state_shown(w.as_ref().map(|w| w.is_visible()), w.as_ref().map(|w| w.is_minimized()));
     if !shown {
         return Ok(serde_json::json!({ "started": [], "running": [], "refused": [], "hidden": true }));
     }
@@ -88,7 +94,7 @@ pub fn shutdown(app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::window_shown;
+    use super::{window_shown, window_state_shown};
 
     #[test]
     fn hidden_or_minimized_window_does_not_stream() {
@@ -96,5 +102,13 @@ mod tests {
         assert!(!window_shown(true, false, false), "--hidden で起動して隠れている");
         assert!(!window_shown(true, true, true), "最小化");
         assert!(!window_shown(false, true, false), "ウィンドウが無い");
+    }
+
+    #[test]
+    fn unreadable_window_state_does_not_stream() {
+        assert!(!window_state_shown(Some(Err(())), Some(Ok(false))));
+        assert!(!window_state_shown(Some(Ok(true)), Some(Err(()))));
+        assert!(!window_state_shown(None::<Result<bool, ()>>, None));
+        assert!(window_state_shown(Some(Ok::<bool, ()>(true)), Some(Ok(false))));
     }
 }

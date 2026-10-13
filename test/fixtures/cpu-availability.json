@@ -1,0 +1,7 @@
+[
+  {"name":"missing host CPU", "data":{"probe":"windows","host":{"cores":8},"cpu_busy":null}, "status":"unknown", "detail":"CPU 使用率は未取得"},
+  {"name":"absent host CPU", "data":{"probe":"windows","host":{"cores":8}}, "status":"unknown", "detail":"CPU 使用率は未取得"},
+  {"name":"real idle host CPU", "data":{"probe":"windows","host":{"cores":8},"cpu_busy":0}, "status":"ok", "detail":"0%"},
+  {"name":"Windows mixed application readings", "data":{"probe":"windows","host":{"cores":8},"cpu_busy":90,"processes":{"apps_cpu":[{"app":"unknown-app","cpu":null},{"app":"idle-app","cpu":0},{"app":"busy-app","cpu":12.5}]}}, "status":"warn", "detail":"90%", "finding":"上位: unknown-app 未取得、idle-app 0%、busy-app 100%"},
+  {"name":"Mac mixed application readings", "data":{"probe":"mac","host":{"cores":8},"cpu_busy":90,"processes":{"apps_cpu":[{"app":"unknown-app","cpu":null},{"app":"idle-app","cpu":0},{"app":"busy-app","cpu":100}]}}, "status":"warn", "detail":"90%", "finding":"上位: unknown-app 未取得、idle-app 0%、busy-app 100%"}
+]

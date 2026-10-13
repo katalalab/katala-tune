@@ -4,6 +4,26 @@ const assert = require('node:assert/strict');
 const { nodeChecks, appChecks, failingJobs } = require('../lib/health');
 
 const now = 1_800_000_000_000;
+
+test('収集を無効にしたログイン元の旧cursorを失敗・鮮度判定に使わない', () => {
+  for (const source of ['mac_auth', 'win_security']) {
+    for (const node of [{ id: 'pc', network: false }, { id: 'pc', network_logins: false }, { id: 'pc', shared: true }]) {
+      for (const disabled of [{ last_ok_at: now - 86_400_000 }, { last_error: 'denied', fail_streak: 4 }]) {
+        const cursors = [{ node_id: 'pc', source: 'active', last_ok_at: now }, { node_id: 'pc', source, ...disabled }];
+        const logs = nodeChecks(node, null, [], { now, cursors }).find(c => c.id === 'logs');
+        assert.equal(logs.status, 'ok');
+        assert.match(logs.detail, /^1 か所/);
+        assert.equal(nodeChecks({ ...node, network: true, network_logins: true }, null, [], { now, cursors }).find(c => c.id === 'logs').status,
+          disabled.last_error ? 'fail' : 'warn');
+      }
+    }
+  }
+});
+
+test('無効なログイン元の旧cursorだけならログ取り込みは未実施', () => {
+  const logs = nodeChecks({ id: 'pc', network: false }, null, [], { now, cursors: [{ node_id: 'pc', source: 'win_security', last_error: 'denied' }] }).find(c => c.id === 'logs');
+  assert.equal(logs.status, 'unknown');
+});
 const snap = (data, ago = 5) => ({ at: now - ago * 60000, wall_s: 4, data });
 const win = { probe: 'windows', host: { cores: 8 }, cpu_busy: 10, memory: { available_pct: 50, commit_pct: 40 }, disk: [{ mount: 'C:', free_gb: 300, free_pct: 30 }],
   stability_7d: { bugcheck_1001: 0, kernel_power_41: 0 }, defender: { realtime: true }, processes: { apps: [], top_cpu: [] },

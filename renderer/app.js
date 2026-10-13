@@ -343,22 +343,22 @@ function findingHtml(f) {
 function procsHtml(d) {
   const p = d.processes;
   const win = d.probe === 'windows';
-  const cpuOf = (x) => (win ? x.cpu * d.host.cores : x.cpu);
+  const cpuOf = (x) => Number.isFinite(x.cpu) && (!win || (Number.isFinite(d.host.cores) && d.host.cores > 0)) ? (win ? x.cpu * d.host.cores : x.cpu) : null;
   const maxMem = Math.max(1, ...p.apps.map((a) => a.mem_mb));
-  const maxCpu = Math.max(100, ...p.top_cpu.map(cpuOf));
+  const maxCpu = Math.max(100, ...p.top_cpu.map(cpuOf).filter(Number.isFinite));
   return `
     ${UI.section('アプリ別', '同名のプロセスを合算、メモリ順')}
     ${UI.table({
       cols: [{ label: 'アプリ' }, { label: 'メモリ', cls: 'n', width: '24%' }, { label: 'CPU（1コア換算）', cls: 'n' }, { label: '数', cls: 'n' }],
       rows: p.apps,
-      row: (a) => `<td>${esc(a.app)}</td><td class="n">${(a.mem_mb / 1024).toFixed(2)} GB${Charts.dataBar(a.mem_mb, maxMem)}</td><td class="n">${cpuOf(a).toFixed(0)}%</td><td class="n">${esc(a.count)}</td>`,
+      row: (a) => `<td>${esc(a.app)}</td><td class="n">${(a.mem_mb / 1024).toFixed(2)} GB${Charts.dataBar(a.mem_mb, maxMem)}</td><td class="n">${cpuOf(a) == null ? '—' : cpuOf(a).toFixed(0) + '%'}</td><td class="n">${esc(a.count)}</td>`,
     })}
-    ${UI.section('CPU 上位', win ? '1.5秒の瞬間値と起動からの平均' : 'ps の直近平均')}
+    ${UI.section('CPU 上位', win ? '2点間のCPU使用率と起動からの平均' : 'ps の直近平均')}
     ${UI.table({
       cols: [{ label: 'PID', cls: 'n' }, { label: '名前' }, { label: 'CPU', cls: 'n', width: '22%' }, win ? { label: '平均', cls: 'n' } : { label: '起動から' }, { label: 'メモリ', cls: 'n' }],
       rows: p.top_cpu,
       row: (x) => `<td class="n muted">${esc(x.pid)}</td><td>${esc(x.name)}${x.app && x.app !== x.name ? ` <span class="muted">· ${esc(x.app)}</span>` : ''}</td>`
-        + `<td class="n">${cpuOf(x).toFixed(0)}%${Charts.dataBar(cpuOf(x), maxCpu, { tone: cpuOf(x) >= 80 ? 'warn' : 'neutral' })}</td>`
+        + `<td class="n">${cpuOf(x) == null ? '—' : cpuOf(x).toFixed(0) + '%' + Charts.dataBar(cpuOf(x), maxCpu, { tone: cpuOf(x) >= 80 ? 'warn' : 'neutral' })}</td>`
         + `${win ? `<td class="n">${esc(x.avg_core ?? '-')}%</td>` : `<td class="muted">${esc(x.etime)}</td>`}<td class="n">${esc(x.mem_mb)} MB</td>`,
     })}
     <p class="note-line">全 ${esc(p.count ?? '-')} プロセス · AI エージェント ${esc(p.agent_processes ?? '-')}</p>`;
@@ -565,13 +565,14 @@ function renderProcs() {
     const d = r.data, win = d.probe === 'windows', seen = new Set();
     for (const p of [...d.processes.top_cpu, ...(d.processes.top_mem || [])]) {
       if (seen.has(p.pid)) continue; seen.add(p.pid);
-      rows.push({ n, p, core: win ? p.cpu * d.host.cores : p.cpu });
+      const core = Number.isFinite(p.cpu) && (!win || (Number.isFinite(d.host.cores) && d.host.cores > 0)) ? (win ? p.cpu * d.host.cores : p.cpu) : null;
+      rows.push({ n, p, core });
     }
   }
   if (f.q) rows = rows.filter((x) => `${x.p.name} ${x.p.app || ''}`.toLowerCase().includes(f.q.toLowerCase()));
-  rows.sort((a, b) => (f.sort === 'mem' ? b.p.mem_mb - a.p.mem_mb : b.core - a.core));
+  rows.sort((a, b) => (f.sort === 'mem' ? b.p.mem_mb - a.p.mem_mb : (b.core ?? -1) - (a.core ?? -1)));
   const shown = rows.slice(0, 300);
-  const maxCore = Math.max(100, ...shown.map((x) => x.core));
+  const maxCore = Math.max(100, ...shown.map((x) => x.core).filter(Number.isFinite));
   const maxMem = Math.max(1, ...shown.map((x) => x.p.mem_mb));
   page(`
     ${UI.head({ icon: 'procs', title: 'プロセス', desc: '各機体の最新の分析から、CPU 上位とメモリ上位を横断して検索・並べ替えます。終了は確認のうえ、直前に同じプロセスかを確かめてから行います。' })}
@@ -586,7 +587,7 @@ function renderProcs() {
       rows: shown,
       empty: '該当するプロセスはありません',
       row: ({ n, p, core }, i) => `<td class="nowrap"><b>${esc(n.id)}</b></td><td class="n muted">${esc(p.pid)}</td><td>${esc(p.name)}${p.app && p.app !== p.name ? ` <span class="muted">· ${esc(p.app)}</span>` : ''}</td>`
-        + `<td class="n">${core.toFixed(0)}%${Charts.dataBar(core, maxCore, { tone: core >= 80 ? 'warn' : 'neutral' })}</td>`
+        + `<td class="n">${core == null ? '—' : core.toFixed(0) + '%' + Charts.dataBar(core, maxCore, { tone: core >= 80 ? 'warn' : 'neutral' })}</td>`
         + `<td class="n">${p.mem_mb >= 1024 ? (p.mem_mb / 1024).toFixed(1) + ' GB' : esc(p.mem_mb) + ' MB'}${Charts.dataBar(p.mem_mb, maxMem)}</td>`
         + `<td class="acts mid">${n.shared ? '<span class="faint">提案のみ</span>' : `<button class="btn small danger" data-kill="${i}">終了…</button>`}</td>`,
     })}`);

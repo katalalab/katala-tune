@@ -16,9 +16,54 @@ test('子が終了した後も stdout を継承したプロセスで run が止�
   assert.ok(Date.now() - started < 1500, `elapsed=${Date.now() - started}ms`);
 });
 
-test('子の終了後の close 猶予を実行timeoutと誤認しない', { skip: process.platform === 'win32' && 'POSIX shell が必要' }, async () => {
-  const result = await run('/bin/sh', ['-c', '(sleep 2) & printf ok'], { timeoutMs: 100 });
-  assert.deepEqual({ code: result.code, out: result.out, err: result.err }, { code: 0, out: 'ok', err: '' });
+// Isolate timer ordering from OS scheduling: a real shell may not start within
+// 100 ms during the parallel suite. The surrounding tests retain real processes.
+async function exitBeforeTimeout({ regress = false } = {}) {
+  const { EventEmitter } = require('node:events');
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const vm = require('node:vm');
+  const moduleFile = require.resolve('../lib/collect');
+  const realRequire = require('node:module').createRequire(moduleFile);
+  const child = new EventEmitter();
+  for (const name of ['stdin', 'stdout', 'stderr']) {
+    child[name] = Object.assign(new EventEmitter(), { end() {}, destroy() {} });
+  }
+  let killed = false, now = 0, id = 0;
+  const timers = new Map();
+  child.kill = () => { killed = true; };
+  const advance = (ms) => {
+    now += ms;
+    for (const [key, timer] of [...timers]) {
+      if (timer.at <= now && timers.delete(key)) timer.fn();
+    }
+  };
+  const module = { exports: {} };
+  let source = fs.readFileSync(moduleFile, 'utf8');
+  if (regress) source = source.replace('clearTimeout(timer);\n        closeTimer', 'closeTimer');
+  vm.runInNewContext(source, {
+    module, __dirname: path.dirname(moduleFile), process, Buffer, TextDecoder,
+    require: (name) => name === 'node:child_process' ? { spawn: () => child } : realRequire(name),
+    setTimeout: (fn, ms) => { const key = ++id; timers.set(key, { fn, at: now + ms }); return key; },
+    clearTimeout: (key) => timers.delete(key),
+  });
+  const pending = module.exports.run('fixture', [], { timeoutMs: 100 });
+  child.stdout.emit('data', Buffer.from('ok'));
+  child.emit('exit', 0);
+  advance(100);
+  advance(400);
+  const result = await pending;
+  return { code: result.code, out: result.out, err: result.err, killed };
+}
+
+test('子の終了後の close 猶予を実行timeoutと誤認しない', async () => {
+  assert.deepEqual(await exitBeforeTimeout(), { code: 0, out: 'ok', err: '', killed: false });
+});
+
+test('close 猶予の回帰試験は終了時の実行タイマー解除を外すと検知する', async () => {
+  const broken = await exitBeforeTimeout({ regress: true });
+  assert.equal(broken.killed, true);
+  assert.match(broken.err, /timeout 100ms/);
 });
 
 test('close 猶予中も10MiBの出力を保持する', { skip: process.platform === 'win32' && 'POSIX shell が必要' }, async () => {
