@@ -72,7 +72,9 @@ test('CPU fix preserves PS5.1 ASCII/BOM and NoNetwork switch', () => {
 });
 
 test('PS5.1 executes actual isolated CPU helpers with synthetic samples', { skip: process.platform !== 'win32' }, () => {
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', path.join(__dirname, 'win-cpu-sampling-regression.ps1')], { encoding: 'utf8', timeout: 15000, windowsHide: true });
+  // Parallel CI fixtures can delay a cold PowerShell startup; the payload has no host probes or sleeps.
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', path.join(__dirname, 'win-cpu-sampling-regression.ps1')], { encoding: 'utf8', timeout: 60000, windowsHide: true });
+  assert.ifError(r.error);
   assert.equal(r.status, 0, r.stderr || r.stdout);
   assert.match(r.stdout, /CPU sampling regression: PASS/);
 });
