@@ -242,11 +242,7 @@ async fn main() -> ExitCode {
                 } else if rest.iter().any(|a| a == "--recompute") {
                     e.status().map(|v| print(&v))
                 } else {
-                    e.with_db(|d| Ok(json!({ "checks": d.checks()?, "events": d.check_events(150)?, "counts": d.status_counts()?, "lastProbeAt": d.get_meta("lastProbeAt")?, "lastLogsAt": d.get_meta("lastLogsAt")? })))
-                        .map(|mut v| {
-                            v["schedule"] = e.schedule();
-                            print(&v)
-                        })
+                    e.status_snapshot().map(|v| print(&v))
                 }
             }
             Err(e) => Err(e),
