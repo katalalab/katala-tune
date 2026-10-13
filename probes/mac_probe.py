@@ -195,8 +195,13 @@ def power():
     }
 
 
+def macmon_path():
+    managed = os.path.expanduser('~/.katala-tune/bin/macmon')
+    return managed if os.path.isfile(managed) and os.access(managed, os.X_OK) else (shutil.which('macmon') or managed)
+
+
 def macmon_static():
-    path = shutil.which("macmon") or os.path.join(HOME, ".katala-tune", "bin", "macmon")
+    path = macmon_path()
     if not path or not os.path.isfile(path):
         return {"available": False, "source": None}
     out = run([path, "pipe", "--samples", "1", "--interval", "1000", "--soc-info"], timeout=5)

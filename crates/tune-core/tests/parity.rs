@@ -466,6 +466,8 @@ fn rules_health_logs_actions_match_js() {
             { "path": "~/Library/Caches", "gb": gb }, { "path": "~/Library/Caches/Homebrew", "gb": 12 }
         ] }, "node": {} }));
     }
+    let cpu_fixtures: Vec<Value> = serde_json::from_str(include_str!("../../../test/fixtures/cpu-availability.json")).unwrap();
+    analyze_in.extend(cpu_fixtures.iter().map(|f| json!({ "snap": f["data"], "node": {} })));
     for _ in 0..4000 {
         let shared = r.chance(0.2);
         analyze_in.push(json!({ "snap": snapshot(&mut r), "node": { "shared": shared } }));
@@ -492,7 +494,27 @@ fn rules_health_logs_actions_match_js() {
         json!({ "id": "log-flood-abc", "severity": "warn", "title": "洪水 A" }),
         json!({ "id": "log-flood-def", "severity": "warn", "title": "洪水 B" }),
     ];
-    let mut node_in = Vec::new();
+    let mut node_in: Vec<Value> = cpu_fixtures
+        .iter()
+        .map(|f| json!({ "node": { "id": "test-node" }, "snap": { "at": now, "data": f["data"] }, "findings": [], "ctx": { "now": now } }))
+        .collect();
+    for source in ["mac_auth", "win_security"] {
+        for policy in [json!({ "network": false }), json!({ "network_logins": false }), json!({ "shared": true }), json!({ "network_logins": true })] {
+            let mut node = json!({ "id": "pc" });
+            merge(&mut node, policy);
+            for previous in [json!({ "last_ok_at": now - 86_400_000 }), json!({ "last_error": "denied", "fail_streak": 4 })] {
+                let mut cursor = json!({ "node_id": "pc", "source": source });
+                merge(&mut cursor, previous);
+                for active in [true, false] {
+                    let mut cursors = vec![cursor.clone()];
+                    if active {
+                        cursors.push(json!({ "node_id": "pc", "source": "active", "last_ok_at": now }));
+                    }
+                    node_in.push(json!({ "node": node, "snap": null, "findings": [], "ctx": { "now": now, "cursors": cursors } }));
+                }
+            }
+        }
+    }
     for i in 0..1500 {
         let snap = if r.chance(0.15) {
             Value::Null
@@ -588,7 +610,16 @@ fn rules_health_logs_actions_match_js() {
             ])
         })
         .collect();
-    let jobs_in: Vec<Value> = (0..300).map(|i| jobs(&mut r, i % 2 == 0)).collect();
+    let mut jobs_in: Vec<Value> = (0..300).map(|i| jobs(&mut r, i % 2 == 0)).collect();
+    for (id, name, kind, code) in [
+        ("\\nefarius_HidHide_Updater", "nefarius_HidHide_Updater", "schtask", 202),
+        ("\\unrelated", "unrelated", "schtask", 202),
+        ("\\custom\\nefarius_HidHide_Updater", "nefarius_HidHide_Updater", "schtask", 202),
+        ("\\nefarius_HidHide_Updater", "nefarius_HidHide_Updater", "schtask", 201),
+        ("\\nefarius_HidHide_Updater", "nefarius_HidHide_Updater", "launchd", 202),
+    ] {
+        jobs_in.push(json!([{ "id": id, "name": name, "kind": kind, "scope": "user", "state": "ready", "last_result": code }]));
+    }
 
     // ログ（伏せ字・指紋・正規化）
     let fake_aws = ["AKIA", "ABCDEFGHIJKLMNOP"].concat();

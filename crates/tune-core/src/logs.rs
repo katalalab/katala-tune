@@ -120,10 +120,13 @@ pub fn sources(os: &str) -> &'static [&'static str] {
 /// ログインの記録の取り込み元
 pub const LOGIN_SOURCES: [&str; 2] = ["mac_auth", "win_security"];
 
+pub fn source_enabled(node: &Value, source: &str) -> bool {
+    crate::netsec::logins_enabled(node) || !LOGIN_SOURCES.contains(&source)
+}
+
 /// 機体から取り込む元（lib/logs.js の sourcesOf）。台帳で `"network": false` の機体からは、ログインの記録（送り元のアドレス）も集めない
 pub fn sources_of(node: &Node) -> Vec<&'static str> {
-    let logins = crate::netsec::logins_enabled(&node.raw);
-    sources(&node.os).iter().copied().filter(|s| logins || !LOGIN_SOURCES.contains(s)).collect()
+    sources(&node.os).iter().copied().filter(|s| source_enabled(&node.raw, s)).collect()
 }
 
 /// `String(Number.parseInt(cursor ?? '0', 10) || 0)` のうち、安全な整数だけを渡す
