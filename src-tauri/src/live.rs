@@ -38,14 +38,22 @@ fn window_state_shown<E>(visible: Option<Result<bool, E>>, minimized: Option<Res
     }
 }
 
+fn ui_hidden_stop(collecting: bool) -> Option<Stop> {
+    (!collecting).then_some(Stop::Hidden)
+}
+
 /// 流し始める（流れていれば合図として扱う）。台帳を読み直し、台帳に無い id は理由つきで断る。
 /// ウィンドウが隠れているあいだは流さず合図にもしない（--hidden の WebView でも document.visibilityState が visible のままで、
-/// 常駐する全部の操作卓が全機体を流し続けていた。2026-10-12 に実機で確認）。止めるのは idle_stop に任せる
+/// 常駐する全部の操作卓が全機体を流し続けていた。2026-10-12 に実機で確認）。
+/// UI の分は Hidden で止め、復帰後の合図で再開できるようにする。常時監視は止めない
 #[tauri::command]
 pub async fn live_start(app: AppHandle, e: State<'_, Arc<Engine>>, l: State<'_, Arc<Live>>, ids: Vec<String>) -> Result<Value, String> {
     let w = app.get_webview_window(crate::window::LABEL);
     let shown = window_state_shown(w.as_ref().map(|w| w.is_visible()), w.as_ref().map(|w| w.is_minimized()));
     if !shown {
+        if let Some(reason) = ui_hidden_stop(crate::monitor::collecting(&e)) {
+            l.stop(None, reason);
+        }
         return Ok(serde_json::json!({ "started": [], "running": [], "refused": [], "hidden": true }));
     }
     let cfg = e.reload_config();
@@ -76,11 +84,11 @@ pub async fn power_session(e: State<'_, Arc<Engine>>, l: State<'_, Arc<Live>>, n
 
 /// ウィンドウを閉じた: 見ている画面が無いので全部止める（常時監視で流しているあいだは止めない）
 pub fn stop_all(app: &AppHandle) {
-    if app.try_state::<Arc<Engine>>().is_some_and(|e| crate::monitor::collecting(&e)) {
-        return;
-    }
-    if let Some(l) = app.try_state::<Arc<Live>>() {
-        l.stop(None, Stop::Hidden);
+    let collecting = app.try_state::<Arc<Engine>>().is_some_and(|e| crate::monitor::collecting(&e));
+    if let Some(reason) = ui_hidden_stop(collecting)
+        && let Some(l) = app.try_state::<Arc<Live>>()
+    {
+        l.stop(None, reason);
     }
 }
 
@@ -94,7 +102,8 @@ pub fn shutdown(app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{window_shown, window_state_shown};
+    use super::{ui_hidden_stop, window_shown, window_state_shown};
+    use tune_core::live::Stop;
 
     #[test]
     fn hidden_or_minimized_window_does_not_stream() {
@@ -110,5 +119,11 @@ mod tests {
         assert!(!window_state_shown(Some(Ok(true)), Some(Err(()))));
         assert!(!window_state_shown(None::<Result<bool, ()>>, None));
         assert!(window_state_shown(Some(Ok::<bool, ()>(true)), Some(Ok(false))));
+    }
+
+    #[test]
+    fn hidden_ui_pauses_with_resume_reason_but_preserves_monitor() {
+        assert!(matches!(ui_hidden_stop(false), Some(Stop::Hidden)));
+        assert!(ui_hidden_stop(true).is_none());
     }
 }
