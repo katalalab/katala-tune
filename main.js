@@ -110,9 +110,8 @@ function notifyChanges(changes) {
 }
 
 function statusCounts() {
-  const c = { ok: 0, warn: 0, fail: 0, unknown: 0 };
-  for (const r of db.checks()) c[r.status] = (c[r.status] || 0) + 1;
-  return c;
+  const checks = netsec.filterCheckRows(health.currentCheckRows(db.checks(), cfg.nodes), cfg.nodes);
+  return health.statusCounts(checks);
 }
 
 // ---- 分析・ログ取り込み・自動スキャン ----
