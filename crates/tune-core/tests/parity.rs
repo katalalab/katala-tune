@@ -137,6 +137,44 @@ fn app_row(r: &mut Rng) -> Value {
     ])
 }
 
+const GROUP_KEYS: &[&str] = &[
+    "git:fsmonitor--daemon",
+    "node:chrome-devtools-mcp",
+    "chrome-devtools-mcp",
+    "node:mcp",
+    "node:watchdog",
+    "Google Chrome Helper (Renderer)",
+    "svchost",
+    "node",
+    "launchd",
+    "chrome",
+    "MCP-Server",
+];
+
+fn group_row(r: &mut Rng) -> Value {
+    let count = *r.pick(&[1u64, 3, 4, 8, 10, 12, 30, 49, 100, 1020]);
+    obj(vec![
+        ("key", Some(json!(r.pick(GROUP_KEYS).to_string()))),
+        ("count", mb!(r, json!(count))),
+        ("mem_mb", mb!(r, r.num(16_000.0))),
+        ("orphans", mb!(r, json!(r.below(count + 1)))),
+        ("orphan_mb", mb!(r, r.num(1_000.0))),
+        ("parent", mb!(r, json!(r.pick(PROC_NAMES).to_string()))),
+        ("owner", Some(json!(*r.pick(&["user", "system", "mixed"])))),
+    ])
+}
+
+fn tree_row(r: &mut Rng) -> Value {
+    obj(vec![
+        ("root", Some(json!(r.pick(PROC_NAMES).to_string()))),
+        ("pid", Some(json!(r.below(90_000)))),
+        ("owner", Some(json!(*r.pick(&["user", "system"])))),
+        ("count", mb!(r, json!(r.below(60)))),
+        ("children", mb!(r, json!(r.below(30)))),
+        ("mem_mb", mb!(r, r.num(40_000.0))),
+    ])
+}
+
 fn jobs(r: &mut Rng, win: bool) -> Value {
     let n = r.below(6);
     let states = ["ready", "running", "disabled", "queued", "loaded", "not-loaded", "unknown"];
@@ -178,6 +216,8 @@ fn snapshot(r: &mut Rng) -> Value {
     let total = *r.pick(&[8, 16, 18, 32, 64, 128, 0]);
     let top: Vec<Value> = (0..r.below(7)).map(|_| proc(r, win)).collect();
     let apps: Vec<Value> = (0..r.below(5)).map(|_| app_row(r)).collect();
+    let groups: Vec<Value> = (0..r.below(5)).map(|_| group_row(r)).collect();
+    let trees: Vec<Value> = (0..r.below(4)).map(|_| tree_row(r)).collect();
     let apps_cpu: Vec<Value> = (0..r.below(4)).map(|_| obj(vec![("app", Some(json!(r.pick(PROC_NAMES).to_string()))), ("cpu", Some(r.num(30.0)))])).collect();
     let mut disks = vec![obj(vec![
         ("mount", Some(json!(if win { *r.pick(&["C:", "c:\\", "D:"]) } else { *r.pick(&["/", "/Volumes/Data"]) }))),
@@ -233,6 +273,8 @@ fn snapshot(r: &mut Rng) -> Value {
                 ("top_mem", Some(json!([]))),
                 ("apps", Some(Value::Array(apps))),
                 ("apps_cpu", Some(Value::Array(apps_cpu))),
+                ("groups", mb!(r, Value::Array(groups))),
+                ("trees", mb!(r, Value::Array(trees))),
                 ("agent_processes", mb!(r, json!(r.below(120)))),
                 ("count", Some(json!(r.below(900)))),
             ])),
@@ -375,6 +417,26 @@ fn fixtures() -> Vec<(Value, Value)> {
         ),
         (win_fixture(json!({ "power": { "plan_guid": bal, "plan_name": "バランス", "plans": [bal] } })), json!({})),
         (mac_fixture(json!({ "disk": [{ "mount": "/", "total_gb": 460, "free_gb": 108, "free_pct": 23.4, "raw_free_gb": 19 }] })), json!({})),
+        (
+            win_fixture(json!({ "processes": { "top_cpu": [], "apps": [{ "app": "Dup", "mem_mb": 20000, "count": 9 }], "apps_cpu": [], "groups": [
+                { "key": "git:fsmonitor--daemon", "count": 1020, "mem_mb": 12288, "orphans": 1020, "orphan_mb": 12288, "parent": null, "owner": "system" },
+                { "key": "git:fsmonitor--daemon", "count": 8, "mem_mb": 85, "orphans": 0, "orphan_mb": 0, "parent": null, "owner": "user" },
+                { "key": "svchost", "count": 101, "mem_mb": 2006, "orphans": 0, "orphan_mb": 0, "parent": "services", "owner": "mixed" }
+            ], "trees": [
+                { "root": "BigApp", "pid": 4242, "owner": "user", "count": 40, "children": 12, "mem_mb": 20000 },
+                { "root": "Dup", "pid": 8, "owner": "user", "count": 9, "children": 3, "mem_mb": 20000 }
+            ] } })),
+            json!({}),
+        ),
+        (
+            mac_fixture(json!({ "processes": { "top_cpu": [], "apps": [], "apps_cpu": [], "groups": [
+                { "key": "chrome-devtools-mcp", "count": 13, "mem_mb": 1424, "orphans": 0, "orphan_mb": 0, "parent": "claude", "owner": "user" },
+                { "key": "node:mcp-pdf-server", "count": 11, "mem_mb": 552, "orphans": 6, "orphan_mb": 300, "parent": null, "owner": "user" },
+                { "key": "node:old-mcp", "count": 2, "mem_mb": 300, "orphans": 2, "orphan_mb": 300, "parent": "launchd", "owner": "user" },
+                { "key": "Google Chrome Helper (Renderer)", "count": 49, "mem_mb": 7168, "orphans": 0, "orphan_mb": 0, "parent": "Google Chrome", "owner": "user" }
+            ], "trees": [] } })),
+            json!({}),
+        ),
     ]
 }
 
