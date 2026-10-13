@@ -21,7 +21,10 @@ pub fn failing_jobs(jobs: &[Value]) -> Vec<&Value> {
             }
             let lr = j.get("last_result");
             if js::is_str(j.get("kind"), "schtask") {
-                return present(lr) && !sched_ok(num(lr));
+                // vicius の NV_S_UP_TO_DATE。root の正規 updater とこのコードだけ。
+                let updater_current =
+                    js::is_str(j.get("id"), "\\nefarius_HidHide_Updater") && js::is_str(j.get("name"), "nefarius_HidHide_Updater") && num(lr) == 202.0;
+                return present(lr) && !sched_ok(num(lr)) && !updater_current;
             }
             js::is_str(j.get("scope"), "user") && present(lr) && !matches!(lr, Some(Value::Number(n)) if n.as_f64() == Some(0.0))
         })

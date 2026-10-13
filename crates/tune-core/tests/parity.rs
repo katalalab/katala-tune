@@ -610,7 +610,16 @@ fn rules_health_logs_actions_match_js() {
             ])
         })
         .collect();
-    let jobs_in: Vec<Value> = (0..300).map(|i| jobs(&mut r, i % 2 == 0)).collect();
+    let mut jobs_in: Vec<Value> = (0..300).map(|i| jobs(&mut r, i % 2 == 0)).collect();
+    for (id, name, kind, code) in [
+        ("\\nefarius_HidHide_Updater", "nefarius_HidHide_Updater", "schtask", 202),
+        ("\\unrelated", "unrelated", "schtask", 202),
+        ("\\custom\\nefarius_HidHide_Updater", "nefarius_HidHide_Updater", "schtask", 202),
+        ("\\nefarius_HidHide_Updater", "nefarius_HidHide_Updater", "schtask", 201),
+        ("\\nefarius_HidHide_Updater", "nefarius_HidHide_Updater", "launchd", 202),
+    ] {
+        jobs_in.push(json!([{ "id": id, "name": name, "kind": kind, "scope": "user", "state": "ready", "last_result": code }]));
+    }
 
     // ログ（伏せ字・指紋・正規化）
     let fake_aws = ["AKIA", "ABCDEFGHIJKLMNOP"].concat();

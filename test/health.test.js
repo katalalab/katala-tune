@@ -40,6 +40,15 @@ test('失敗した定期処理: SCHED_S_* と無効のタスクは数えない',
   assert.deepEqual(failingJobs([{ kind: 'launchd', scope: 'user', state: 'loaded', last_result: 2, name: 'x' }, { kind: 'launchd', scope: 'user', state: 'running', last_result: 255, name: 'y' }]).map((j) => j.name), ['x']);
 });
 
+test('HidHide updater の最新コードだけは正常とし、未知タスク・別コードを除外しない', () => {
+  const task = { kind: 'schtask', id: '\\nefarius_HidHide_Updater', name: 'nefarius_HidHide_Updater', state: 'ready', last_result: 202 };
+  assert.equal(failingJobs([task]).length, 0);
+  assert.equal(failingJobs([{ ...task, name: 'unrelated', id: '\\unrelated' }]).length, 1);
+  assert.equal(failingJobs([{ ...task, id: '\\custom\\nefarius_HidHide_Updater' }]).length, 1);
+  assert.equal(failingJobs([{ ...task, last_result: 201 }]).length, 1);
+  assert.equal(failingJobs([{ ...task, kind: 'launchd', scope: 'user' }]).length, 1);
+});
+
 test('機能チェック: 期待するサービス・定期処理・Defender・ディスク・取り込みを判定する', () => {
   const c = nodeChecks({ id: 'pc' }, snap(win), [], {
     now, expect: { services: ['beszel-agent', 'stopped-svc', 'missing'], jobs: ['\\bad'] },

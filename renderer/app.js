@@ -615,8 +615,7 @@ function jobsOf(nodes) {
   }
   return out;
 }
-const SCHED_OK = (v) => v == null || v === 0 || (v >= 0x41300 && v <= 0x4130f);
-const isFailing = (j) => !['disabled', 'unknown', 'running'].includes(j.state) && (j.kind === 'schtask' ? !SCHED_OK(j.last_result) : j.scope === 'user' && j.last_result != null && j.last_result !== 0);
+const isFailing = JobResults.isFailing;
 const JOB_STATE = { ready: '待機', running: '実行中', disabled: '無効', queued: '待ち', loaded: '読み込み済み', 'not-loaded': '未読み込み', unknown: '不明' };
 const JOB_TONE = { ready: 'default', running: 'blue', disabled: 'gray', queued: 'yellow', loaded: 'default', 'not-loaded': 'gray', unknown: 'gray' };
 let jobRows = [];
@@ -640,7 +639,7 @@ function jobsTable(rows, showNode = true) {
       return `${showNode ? `<td class="nowrap"><b>${esc(n.id)}</b></td>` : ''}
         <td><b>${wbr(j.name)}</b>${j.kind === 'schtask' && j.path !== '\\' ? `<span class="sub">${wbr(j.path)}</span>` : ''}${j.scope && j.scope !== 'user' ? ` ${UI.chip(j.scope, 'gray')}` : ''}</td>
         <td class="muted">${esc(j.schedule)}</td><td>${UI.chip(JOB_STATE[j.state] || j.state, JOB_TONE[j.state] || 'default')}</td>
-        <td class="nowrap">${j.last_result == null ? '<span class="faint">-</span>' : fail ? UI.chip(`失敗 ${j.last_result}`, 'red') : UI.chip('成功', 'green')}${j.last_run ? `<span class="sub">${esc(fmtTime(j.last_run))}</span>` : ''}</td>
+        <td class="nowrap">${j.last_result == null ? '<span class="faint">-</span>' : UI.chip(JobResults.label(j), fail ? 'red' : 'green')}${j.last_run ? `<span class="sub">${esc(fmtTime(j.last_run))}</span>` : ''}</td>
         <td class="muted nowrap">${j.next_run ? esc(fmtTime(j.next_run)) : '-'}</td><td class="muted">${wbr(j.program || '')}</td><td class="acts">${jobActions(n, j, i)}</td>`;
     },
   });
