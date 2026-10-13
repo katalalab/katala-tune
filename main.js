@@ -250,10 +250,9 @@ ipcMain.handle('logs-signatures', (_e, f) => netsec.filterLogSignatures(db.signa
 ipcMain.handle('logs-cursors', () => netsec.filterLogRows(db.cursors(), cfg.nodes));
 ipcMain.handle('status', () => {
   computeChecks({ notify: false, broadcast: false });
-  const checks = netsec.filterCheckRows(db.checks(), cfg.nodes);
+  const checks = netsec.filterCheckRows(health.currentCheckRows(db.checks(), cfg.nodes), cfg.nodes);
   const events = netsec.filterCheckRows(db.checkEvents(150), cfg.nodes);
-  const counts = { ok: 0, warn: 0, fail: 0, unknown: 0 };
-  for (const row of checks) counts[row.status] = (counts[row.status] || 0) + 1;
+  const counts = health.statusCounts(checks);
   return { checks, events, schedule: schedule(), lastProbeAt: db.getMeta('lastProbeAt'), lastLogsAt: db.getMeta('lastLogsAt'), openAtLogin: app.getLoginItemSettings().openAtLogin, counts, probing, syncing };
 });
 ipcMain.handle('set-schedule', (_e, patch) => {

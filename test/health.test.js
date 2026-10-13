@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { nodeChecks, appChecks, failingJobs } = require('../lib/health');
+const { nodeChecks, appChecks, failingJobs, currentCheckRows, statusCounts } = require('../lib/health');
 
 const now = 1_800_000_000_000;
 
@@ -23,6 +23,18 @@ test('収集を無効にしたログイン元の旧cursorを失敗・鮮度判�
 test('無効なログイン元の旧cursorだけならログ取り込みは未実施', () => {
   const logs = nodeChecks({ id: 'pc', network: false }, null, [], { now, cursors: [{ node_id: 'pc', source: 'win_security', last_error: 'denied' }] }).find(c => c.id === 'logs');
   assert.equal(logs.status, 'unknown');
+});
+
+test('現在の状態は現行台帳とアプリ自身だけを集計し、保存済みの旧行は残す', () => {
+  const rows = [
+    { scope: 'retired', id: 'probe', status: 'fail' },
+    { scope: 'current', id: 'probe', status: 'warn' },
+    { scope: '_app', id: 'db', status: 'ok' },
+  ];
+  const visible = currentCheckRows(rows, [{ id: 'current' }]);
+  assert.deepEqual(visible, rows.slice(1));
+  assert.deepEqual(statusCounts(visible), { ok: 1, warn: 1, fail: 0, unknown: 0 });
+  assert.equal(rows.length, 3);
 });
 const snap = (data, ago = 5) => ({ at: now - ago * 60000, wall_s: 4, data });
 const win = { probe: 'windows', host: { cores: 8 }, cpu_busy: 10, memory: { available_pct: 50, commit_pct: 40 }, disk: [{ mount: 'C:', free_gb: 300, free_pct: 30 }],
