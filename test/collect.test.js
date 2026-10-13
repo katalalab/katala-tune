@@ -18,7 +18,7 @@ test('子が終了した後も stdout を継承したプロセスで run が止�
 
 // Isolate timer ordering from OS scheduling: a real shell may not start within
 // 100 ms during the parallel suite. The surrounding tests retain real processes.
-async function exitBeforeTimeout({ regress = false } = {}) {
+async function exitBeforeTimeout({ regress = false, crlf = false } = {}) {
   const { EventEmitter } = require('node:events');
   const fs = require('node:fs');
   const path = require('node:path');
@@ -40,6 +40,8 @@ async function exitBeforeTimeout({ regress = false } = {}) {
   };
   const module = { exports: {} };
   let source = fs.readFileSync(moduleFile, 'utf8');
+  if (crlf) source = source.replace(/\r?\n/g, '\r\n');
+  source = source.replace(/\r\n/g, '\n');
   if (regress) source = source.replace('clearTimeout(timer);\n        closeTimer', 'closeTimer');
   vm.runInNewContext(source, {
     module, __dirname: path.dirname(moduleFile), process, Buffer, TextDecoder,
@@ -61,9 +63,11 @@ test('子の終了後の close 猶予を実行timeoutと誤認しない', async 
 });
 
 test('close 猶予の回帰試験は終了時の実行タイマー解除を外すと検知する', async () => {
-  const broken = await exitBeforeTimeout({ regress: true });
-  assert.equal(broken.killed, true);
-  assert.match(broken.err, /timeout 100ms/);
+  for (const crlf of [false, true]) {
+    const broken = await exitBeforeTimeout({ regress: true, crlf });
+    assert.equal(broken.killed, true);
+    assert.match(broken.err, /timeout 100ms/);
+  }
 });
 
 test('close 猶予中も10MiBの出力を保持する', { skip: process.platform === 'win32' && 'POSIX shell が必要' }, async () => {
