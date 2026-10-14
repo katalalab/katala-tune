@@ -7,10 +7,15 @@ const os = require('node:os');
 const path = require('node:path');
 const hygiene = require('../lib/hygiene');
 
+// Git for Windows は Node の os.devNull を設定ファイルとして開けない。
+const gitConfigDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-hyg-config-'));
+const gitConfigFile = path.join(gitConfigDir, 'gitconfig');
+fs.writeFileSync(gitConfigFile, '');
+
 // 一時ディレクトリに作る架空のリポジトリだけを使う（実在の機体・リポジトリ名は使わない）
 const GIT_ENV = {
   ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.com', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.com',
-  GIT_CONFIG_GLOBAL: os.devNull, GIT_CONFIG_SYSTEM: os.devNull,
+  GIT_CONFIG_GLOBAL: gitConfigFile, GIT_CONFIG_SYSTEM: gitConfigFile,
 };
 for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE']) delete GIT_ENV[k];
 const git = (cwd, ...args) => {
@@ -83,7 +88,10 @@ function probe(opts, env = {}) {
 
 let FX;
 before(() => { FX = fixture(); });
-after(() => { if (FX) fs.rmSync(FX.base, { recursive: true, force: true }); });
+after(() => {
+  if (FX) fs.rmSync(FX.base, { recursive: true, force: true });
+  fs.rmSync(gitConfigDir, { recursive: true, force: true });
+});
 
 const byPath = (data) => Object.fromEntries(data.repos.map((r) => [r.path.replace(/^.*\/example\.com\//, ''), r]));
 
