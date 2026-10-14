@@ -21,7 +21,10 @@ pub fn failing_jobs(jobs: &[Value]) -> Vec<&Value> {
             }
             let lr = j.get("last_result");
             if js::is_str(j.get("kind"), "schtask") {
-                return present(lr) && !sched_ok(num(lr));
+                // vicius の NV_S_UP_TO_DATE。root の正規 updater とこのコードだけ。
+                let updater_current =
+                    js::is_str(j.get("id"), "\\nefarius_HidHide_Updater") && js::is_str(j.get("name"), "nefarius_HidHide_Updater") && num(lr) == 202.0;
+                return present(lr) && !sched_ok(num(lr)) && !updater_current;
             }
             js::is_str(j.get("scope"), "user") && present(lr) && !matches!(lr, Some(Value::Number(n)) if n.as_f64() == Some(0.0))
         })
@@ -108,7 +111,10 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
 
     // ログの取り込み
     let node_id = get(Some(node), "id");
-    let cur: Vec<&Value> = arr(get(c, "cursors")).iter().filter(|x| js::strict_eq(x.get("node_id"), node_id)).collect();
+    let cur: Vec<&Value> = arr(get(c, "cursors"))
+        .iter()
+        .filter(|x| js::strict_eq(x.get("node_id"), node_id) && crate::logs::source_enabled(node, &string(x.get("source"))))
+        .collect();
     if cur.is_empty() {
         out.add("logs", "ログ取り込み", "unknown", "まだ取り込んでいない");
     } else {
@@ -283,11 +289,22 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
         },
     );
     let busy = get(d, "cpu_busy");
+    let cpu_known = busy.and_then(Value::as_f64).is_some_and(|n| n.is_finite());
     out.add(
         "cpu",
         "CPU",
-        if num(busy) >= 85.0 { "warn" } else { "ok" },
-        format!("{}%{}", string(busy), if has("runaway-").is_some() { "、1コアを使い切るプロセスあり" } else { "" }),
+        if !cpu_known {
+            "unknown"
+        } else if num(busy) >= 85.0 {
+            "warn"
+        } else {
+            "ok"
+        },
+        format!(
+            "{}{}",
+            if cpu_known { format!("{}%", string(busy)) } else { "CPU 使用率は未取得".into() },
+            if has("runaway-").is_some() { "、1コアを使い切るプロセスあり" } else { "" }
+        ),
     );
 
     // 安定性・保護

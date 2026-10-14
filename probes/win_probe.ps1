@@ -34,15 +34,57 @@ $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
 $ncpu = [int]$env:NUMBER_OF_PROCESSORS
 $totalMb = [double]$os.TotalVisibleMemorySize / 1024
 
-# CPU per process: two samples of total processor time.
+# CPU snapshots pair one cumulative read with its own monotonic timestamp.
+# Process objects expose live properties; never defer the second read until after CIM.
+function ReadCpuSample($p) {
+  $ErrorActionPreference = "Stop"
+  try {
+    $start = $p.StartTime
+    if ($null -eq $start) { return $null }
+    # Identity must survive a failed CPU getter: actions use the start guard.
+    $seconds = $null; $ticks = $null
+    try {
+      $seconds = $p.TotalProcessorTime.TotalSeconds
+      $ticks = [Diagnostics.Stopwatch]::GetTimestamp()
+    } catch { $seconds = $null; $ticks = $null }
+    if ($null -eq $seconds) { $ticks = $null }
+    return [pscustomobject]@{ pid = $p.Id; start = $start.ToUniversalTime().Ticks; cpu = $seconds; ticks = $ticks
+      start_time = $start; life = ((Get-Date) - $start).TotalSeconds }
+  } catch { return $null }
+}
+function ProcessCpuPercent($before, $after, $cores, $frequency) {
+  if ($null -eq $before -or $null -eq $after -or $cores -le 0 -or $frequency -le 0) { return $null }
+  foreach ($sample in @($before, $after)) {
+    if ($null -eq $sample.pid -or $null -eq $sample.start -or $null -eq $sample.cpu -or $null -eq $sample.ticks) { return $null }
+  }
+  if ($before.pid -ne $after.pid -or $before.start -ne $after.start) { return $null }
+  foreach ($value in @($before.cpu, $after.cpu, $before.ticks, $after.ticks, $cores, $frequency)) {
+    if ([double]::IsNaN($value) -or [double]::IsInfinity($value)) { return $null }
+  }
+  $elapsed = ($after.ticks - $before.ticks) / $frequency
+  $delta = $after.cpu - $before.cpu
+  if ($delta -lt 0 -or $elapsed -le 0) { return $null }
+  $percent = $delta / $elapsed / $cores * 100
+  foreach ($value in @($delta, $elapsed, $percent)) {
+    if ([double]::IsNaN($value) -or [double]::IsInfinity($value)) { return $null }
+  }
+  return $percent
+}
+function HostCpuSample($first, $second) {
+  $values = @(@($first, $second) | ForEach-Object { $value = RNum $_ 6; if ($null -ne $value) { $value } })
+  if ($values.Count -eq 0) { return [pscustomobject]@{ value = $null; availability = "unavailable"; samples = 0 } }
+  return [pscustomobject]@{ value = ($values | Measure-Object -Average).Average
+    availability = $(if ($values.Count -eq 2) { "available" } else { "partial" }); samples = $values.Count }
+}
 $s1 = @{}
-foreach ($p in Get-Process) { if ($p.CPU -ne $null) { $s1[$p.Id] = $p.CPU } }
+foreach ($p in Get-Process) { $s1[$p.Id] = ReadCpuSample $p }
 $perf1 = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'"
-$sw = [Diagnostics.Stopwatch]::StartNew()
 Start-Sleep -Milliseconds 1500
 $procs = Get-Process
-$elapsed = $sw.Elapsed.TotalSeconds
+$s2 = @{}
+foreach ($p in $procs) { $s2[$p.Id] = ReadCpuSample $p }
 $perf2 = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'"
+$hostCpu = HostCpuSample $perf1.PercentProcessorTime $perf2.PercentProcessorTime
 $perfInfo = Get-CimInstance Win32_PerfFormattedData_Counters_ProcessorInformation -Filter "Name='_Total'"
 $cpuEffectiveMhz = $null
 if ($perfInfo -and $null -ne $perfInfo.ProcessorFrequency -and $null -ne $perfInfo.PercentProcessorPerformance) {
@@ -52,17 +94,19 @@ if ($perfInfo -and $null -ne $perfInfo.ProcessorFrequency -and $null -ne $perfIn
 }
 
 $list = foreach ($p in $procs) {
-  $c = 0
-  if ($p.CPU -ne $null -and $s1.ContainsKey($p.Id)) { $c = ($p.CPU - $s1[$p.Id]) / $elapsed / $ncpu * 100 }
-  # avg = lifetime average, percent of one core (null when StartTime is not readable)
+  $sample = $s2[$p.Id]
+  $c = ProcessCpuPercent $s1[$p.Id] $sample $ncpu ([Diagnostics.Stopwatch]::Frequency)
+  # avg = lifetime average, percent of one core (null when the snapshot is unreadable)
   $avg = $null
-  if ($p.CPU -ne $null -and $p.StartTime) { $life = ((Get-Date) - $p.StartTime).TotalSeconds; if ($life -gt 60) { $avg = $p.CPU / $life * 100 } }
+  if ($null -ne $sample -and $null -ne $sample.cpu -and $sample.life -gt 60) { $avg = $sample.cpu / $sample.life * 100 }
   # start: UTC start time, used to confirm the same process right before a kill (PID reuse guard)
-  $st = $null; if ($p.StartTime) { $st = $p.StartTime.ToUniversalTime().ToString('yyyyMMddHHmmssfff') }
+  $st = $null; if ($null -ne $sample) { $st = $sample.start_time.ToUniversalTime().ToString("yyyyMMddHHmmssfff") }
   [pscustomobject]@{ pid = $p.Id; name = $p.ProcessName; cpu = (R1 $c); avg_core = (R1 $avg); mem_mb = [int]($p.WorkingSet64 / 1MB); start = $st }
 }
 $groups = $list | Group-Object name | ForEach-Object {
-  [pscustomobject]@{ app = $_.Name; cpu = (R1 (($_.Group | Measure-Object cpu -Sum).Sum)); mem_mb = [int](($_.Group | Measure-Object mem_mb -Sum).Sum); count = $_.Count }
+  $groupCpu = $null
+  if (@($_.Group | Where-Object { $null -eq $_.cpu }).Count -eq 0) { $groupCpu = ($_.Group | Measure-Object cpu -Sum).Sum }
+  [pscustomobject]@{ app = $_.Name; cpu = (R1 $groupCpu); mem_mb = [int](($_.Group | Measure-Object mem_mb -Sum).Sum); count = $_.Count }
 }
 $agents = @($list | Where-Object { $_.name -match '^(claude|codex|opencode|cursor-agent|agy|gemini)' }).Count
 
@@ -590,7 +634,9 @@ if (-not $NoNetwork) {
 $result = [ordered]@{
   probe = 'windows'; probe_version = 2
   host = [ordered]@{ hostname = $env:COMPUTERNAME; os = "$($os.Caption) $($os.BuildNumber)"; cpu = $cpu.Name.Trim(); cores = $ncpu; max_mhz = $cpu.MaxClockSpeed; uptime_h = (R1 (((Get-Date) - $os.LastBootUpTime).TotalHours)) }
-  cpu_busy = (R1 ((([double]$perf1.PercentProcessorTime) + ([double]$perf2.PercentProcessorTime)) / 2))
+  cpu_busy = (R1 $hostCpu.value)
+  cpu_busy_availability = $hostCpu.availability
+  cpu_busy_samples = $hostCpu.samples
   cpu_perf_pct = (R1 $perfInfo.PercentProcessorPerformance)
   cpu_clock = [ordered]@{ nominal_mhz = $cpu.MaxClockSpeed; effective_mhz = $cpuEffectiveMhz; source = "Win32_PerfFormattedData_Counters_ProcessorInformation.ProcessorFrequency * PercentProcessorPerformance / 100"; availability = $(if ($null -ne $cpuEffectiveMhz) { "available" } else { "unavailable" }) }
   memory = [ordered]@{ total_gb = (R1 ($totalMb / 1024)); free_gb = (R1 ($os.FreePhysicalMemory / 1MB)); available_pct = (R1 ($os.FreePhysicalMemory / $os.TotalVisibleMemorySize * 100)); commit_pct = $commitPct; pagefile_alloc_mb = $pfa['AllocatedBaseSize']; pagefile_used_mb = $pfa['CurrentUsage']; pagefile_peak_mb = $pfa['PeakUsage'] }

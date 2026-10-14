@@ -1,7 +1,7 @@
 //! main.js の画面以外の部分（分析・ログ取り込み・状態の計算・自動スキャンの判断・変更操作の流れ）。
 //! 画面・常駐・通知・ダイアログは呼び出し側（src-tauri）が `Host` として渡す。tune-cli も同じものを使う。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -95,6 +95,23 @@ pub fn summarize(data: &Value, findings: &[Value]) -> Value {
         "critical": count("critical"),
         "warn": count("warn"),
     })
+}
+
+/// 現在値は現行台帳の機体とアプリ自身だけ。台帳から外れた機体の行は DB と履歴に残す。
+fn current_check_rows(rows: Vec<Value>, nodes: &[Value]) -> Vec<Value> {
+    let mut scopes: HashSet<&str> = nodes.iter().filter_map(|node| node.get("id").and_then(Value::as_str)).collect();
+    scopes.insert("_app");
+    rows.into_iter().filter(|row| row.get("scope").and_then(Value::as_str).is_some_and(|scope| scopes.contains(scope))).collect()
+}
+
+fn status_counts(rows: &[Value]) -> BTreeMap<String, i64> {
+    let mut counts = BTreeMap::from([("ok".into(), 0_i64), ("warn".into(), 0), ("fail".into(), 0), ("unknown".into(), 0)]);
+    for row in rows {
+        if let Some(status) = row.get("status").and_then(Value::as_str) {
+            *counts.entry(status.into()).or_default() += 1;
+        }
+    }
+    counts
 }
 
 impl Engine {
@@ -333,28 +350,30 @@ impl Engine {
 
     /// 状態ごとの件数
     pub fn status_counts(&self) -> Value {
-        json!(self.with_db(|d| d.status_counts()).unwrap_or_default())
+        let nodes: Vec<Value> = self.config().nodes.into_iter().map(|n| n.raw).collect();
+        let checks = self.with_db(|d| d.checks()).unwrap_or_default();
+        let checks = crate::netsec::filter_check_rows(current_check_rows(checks, &nodes), &nodes);
+        json!(status_counts(&checks))
+    }
+
+    /// 保存済みの現在状態。問い合わせだけでは状態を計算し直さない。
+    pub fn status_snapshot(&self) -> Result<Value, String> {
+        let cfg = self.config();
+        let nodes: Vec<Value> = cfg.nodes.into_iter().map(|n| n.raw).collect();
+        let (checks, events, lp, ll) = self.with_db(|d| Ok((d.checks()?, d.check_events(150)?, d.get_meta("lastProbeAt")?, d.get_meta("lastLogsAt")?)))?;
+        let checks = crate::netsec::filter_check_rows(current_check_rows(checks, &nodes), &nodes);
+        let events = crate::netsec::filter_check_rows(events, &nodes);
+        Ok(json!({
+            "checks": checks, "events": events, "schedule": self.schedule(),
+            "lastProbeAt": lp, "lastLogsAt": ll, "openAtLogin": self.host.open_at_login(),
+            "counts": status_counts(&checks), "probing": self.is_probing(), "syncing": self.is_syncing(),
+        }))
     }
 
     /// 画面の「状態」（問い合わせでは更新通知を送らない）
     pub fn status(&self) -> Result<Value, String> {
         self.compute_checks(false, false);
-        let cfg = self.config();
-        let nodes: Vec<Value> = cfg.nodes.into_iter().map(|n| n.raw).collect();
-        let (checks, events, lp, ll) = self.with_db(|d| Ok((d.checks()?, d.check_events(150)?, d.get_meta("lastProbeAt")?, d.get_meta("lastLogsAt")?)))?;
-        let checks = crate::netsec::filter_check_rows(checks, &nodes);
-        let events = crate::netsec::filter_check_rows(events, &nodes);
-        let mut counts = std::collections::BTreeMap::from([("ok", 0_i64), ("warn", 0), ("fail", 0), ("unknown", 0)]);
-        for row in &checks {
-            if let Some(status) = row.get("status").and_then(Value::as_str) {
-                *counts.entry(status).or_default() += 1;
-            }
-        }
-        Ok(json!({
-            "checks": checks, "events": events, "schedule": self.schedule(),
-            "lastProbeAt": lp, "lastLogsAt": ll, "openAtLogin": self.host.open_at_login(),
-            "counts": counts, "probing": self.is_probing(), "syncing": self.is_syncing(),
-        }))
+        self.status_snapshot()
     }
 
     /// 画面で自動スキャンの設定を変える（5〜1440 分の整数だけ受け付ける）
@@ -821,6 +840,42 @@ mod tests {
         let status_text = serde_json::to_string(&status).unwrap();
         assert!(!status_text.contains("sec-login"), "{status_text}");
         assert!(!status_text.contains("192.0.2.1"));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn current_status_excludes_removed_scopes_without_deleting_history() {
+        let tmp = std::env::temp_dir().join(format!("katala-tune-current-status-test-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config = tmp.join("nodes.json");
+        std::fs::write(&config, r#"{"nodes":[{"id":"current","alias":"unused","os":"windows"}]}"#).unwrap();
+        let engine = Engine::open(config.clone(), tmp.join("data"), Arc::new(NoHost)).unwrap();
+        let now = now_ms();
+        engine
+            .with_db(|d| {
+                d.save_checks("removed", &[crate::db::Check { id: "probe".into(), name: "probe".into(), status: "fail".into(), detail: None }], now)?;
+                d.save_checks("current", &[crate::db::Check { id: "probe".into(), name: "probe".into(), status: "warn".into(), detail: None }], now)?;
+                d.save_checks("_app", &[crate::db::Check { id: "db".into(), name: "db".into(), status: "ok".into(), detail: None }], now)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let status = engine.status_snapshot().unwrap();
+        let scopes: Vec<&str> = status["checks"].as_array().unwrap().iter().filter_map(|row| row["scope"].as_str()).collect();
+        assert_eq!(scopes, vec!["_app", "current"]);
+        assert_eq!(status["counts"], json!({ "ok": 1, "warn": 1, "fail": 0, "unknown": 0 }));
+        assert_eq!(engine.status_counts(), status["counts"]);
+        assert!(status["events"].as_array().unwrap().iter().any(|row| row["scope"] == "removed"));
+        let stored = engine.with_db(|d| d.checks()).unwrap();
+        assert!(stored.iter().any(|row| row["scope"] == "removed"));
+
+        std::fs::write(&config, r#"{"nodes":[{"id":"renamed","alias":"unused","os":"windows"}]}"#).unwrap();
+        engine.reload_config();
+        let renamed = engine.status_snapshot().unwrap();
+        assert_eq!(renamed["checks"].as_array().unwrap().iter().map(|row| row["scope"].clone()).collect::<Vec<_>>(), vec![json!("_app")]);
+        assert!(engine.with_db(|d| d.checks()).unwrap().iter().any(|row| row["scope"] == "current"));
+
         drop(engine);
         let _ = std::fs::remove_dir_all(tmp);
     }

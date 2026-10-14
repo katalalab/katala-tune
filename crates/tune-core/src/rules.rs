@@ -258,9 +258,12 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
         let top = arr(get(procs, "apps_cpu"))
             .iter()
             .take(3)
-            .map(|a| {
-                let c = if is_win { num(a.get("cpu")) * cores } else { num(a.get("cpu")) };
-                format!("{} {}%", string(a.get("app")), to_fixed(c, 0))
+            .map(|a| match a.get("cpu").and_then(Value::as_f64).filter(|n| n.is_finite()) {
+                Some(cpu) => {
+                    let c = if is_win { cpu * cores } else { cpu };
+                    format!("{} {}%", string(a.get("app")), to_fixed(c, 0))
+                }
+                None => format!("{} 未取得", string(a.get("app"))),
             })
             .collect::<Vec<_>>()
             .join("、");

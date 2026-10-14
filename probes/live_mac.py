@@ -61,10 +61,15 @@ def macmon_metrics(data):
     }
 
 
+def macmon_path():
+    managed = os.path.expanduser('~/.katala-tune/bin/macmon')
+    return managed if os.path.isfile(managed) and os.access(managed, os.X_OK) else (shutil.which('macmon') or managed)
+
+
 class Macmon:
     """任意の既存センサーを1子プロセスで読む。最大3秒のTTL、終了時に子も停止する。"""
     def __init__(self):
-        path = shutil.which('macmon') or os.path.expanduser('~/.katala-tune/bin/macmon')
+        path = macmon_path()
         if not os.path.isfile(path):
             raise FileNotFoundError('macmon unavailable')
         self.child = subprocess.Popen([path, 'pipe', '--interval', str(round(INTERVAL * 1000))], stdin=subprocess.DEVNULL,

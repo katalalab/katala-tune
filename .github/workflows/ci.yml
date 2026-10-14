@@ -40,6 +40,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: .\test\win-wsl-regression.ps1
+      - name: Windows CPU sampling regression
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: .\test\win-cpu-sampling-regression.ps1
       - run: npm run version:check
       - run: npm run oss-check
 
