@@ -333,11 +333,17 @@ function Get-KtWslObservation {
     elseif ($name -like 'docker-desktop*') { $d.state = 'running'; $d.reason = 'internal-distro-skipped' }
     elseif ($observed -ge 6) { $d.state = 'running'; $d.reason = 'observation-limit' }
     else {
-      $d.state = 'running'
-      $observed++
-      $o = Invoke-KtWsl @('-d', $name, '--exec', '/bin/sh', '-s') ($KtWslInnerScript -replace "`r`n", "`n") 10000 $false
-      $inside = if ($o.ok) { ConvertFrom-KtWslInside $o.out } else { $null }
-      if ($inside) { $d.observed = $true; $d.inside = $inside } else { $d.reason = $(if ($o.err) { [string]$o.err } else { 'no-data' }) }
+      # Earlier detail commands can take seconds. Do not enter from a stale running list.
+      $freshRun = Invoke-KtWsl @('-l', '--running', '-q')
+      if (-not $freshRun.ok) { $d.reason = 'running-list-failed' }
+      elseif (@((ConvertTo-KtWslNames $freshRun.out).names) -notcontains $name) { $d.state = 'stopped_unobserved'; $d.reason = 'not-running' }
+      else {
+        $d.state = 'running'
+        $observed++
+        $o = Invoke-KtWsl @('-d', $name, '--exec', '/bin/sh', '-s') ($KtWslInnerScript -replace "`r`n", "`n") 10000 $false
+        $inside = if ($o.ok) { ConvertFrom-KtWslInside $o.out } else { $null }
+        if ($inside) { $d.observed = $true; $d.inside = $inside } else { $d.reason = $(if ($o.err) { [string]$o.err } else { 'no-data' }) }
+      }
     }
     $r.distros += [pscustomobject]$d
   }

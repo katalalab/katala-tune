@@ -41,7 +41,11 @@ function Test-KtWslInstalled { return $script:Installed }
 function Invoke-KtWsl([string[]]$WslArgs, [string]$InputText = $null, [int]$TimeoutMs = 8000, [bool]$Utf16 = $true) {
   [void]$script:Calls.Add(($WslArgs -join ' '))
   $key = $WslArgs -join ' '
-  if ($script:Script.ContainsKey($key)) { return $script:Script[$key] }
+  if ($script:Script.ContainsKey($key)) {
+    $reply = $script:Script[$key]
+    if ($reply -is [scriptblock]) { return (& $reply $WslArgs) }
+    return $reply
+  }
   return [pscustomobject]@{ ok = $false; code = 1; out = ''; err = 'exit 1' }
 }
 function New-KtRes([string]$Out, $Err = $null) { return [pscustomobject]@{ ok = ($null -eq $Err); code = $(if ($Err) { 1 } else { 0 }); out = $Out; err = $Err } }
@@ -159,5 +163,81 @@ $u = $r.distros | Where-Object { $_.name -eq 'Ubuntu' }
 Assert-KtEqual $u.observed $false 'failed inner command: not observed'
 Assert-KtEqual $u.reason 'exit 1' 'failed inner command: preserve reason'
 Assert-KtTrue ($null -eq $u.inside) 'failed inner command: discard partial data'
+
+# 10-12. The next distro can stop while an earlier detail command is in flight.
+# Re-read the running list immediately before each entry; failed/partial replies must not permit entry.
+$dynamicFailures = New-Object System.Collections.ArrayList
+foreach ($change in @('stopped', 'failed-empty', 'failed-partial')) {
+  try {
+    $script:Calls.Clear()
+    $script:DetailFinished = $false
+    $script:RunningReads = 0
+    $script:Change = $change
+    $script:Script = @{
+      '-l -q' = (New-KtRes "First`r`nNext`r`n")
+      '-l -v' = (New-KtRes '')
+      '-l --running -q' = {
+        param($ArgsIgnored)
+        $script:RunningReads++
+        if (-not $script:DetailFinished) { return (New-KtRes "First`r`nNext`r`n") }
+        if ($script:Change -eq 'stopped') { return (New-KtRes "First`r`n") }
+        if ($script:Change -eq 'failed-partial') { return (New-KtRes "Next`r`n" 'exit 1') }
+        return (New-KtRes '' 'timeout')
+      }
+      '-d First --exec /bin/sh -s' = {
+        param($ArgsIgnored)
+        $script:DetailFinished = $true
+        return (New-KtRes '' 'timeout')
+      }
+      '-d Next --exec /bin/sh -s' = (New-KtRes $inner)
+    }
+    $r = Get-KtWslObservation
+    $next = $r.distros | Where-Object { $_.name -eq 'Next' }
+    Assert-KtEqual ((Get-KtEnteredNames) -join ',') 'First' "$change after earlier detail: Next must never be entered"
+    Assert-KtTrue ($script:RunningReads -ge 3) "${change}: refresh before each detail"
+    Assert-KtEqual $next.observed $false "${change}: Next unobserved"
+    Assert-KtTrue ($null -eq $next.inside) "${change}: Next has no inside data"
+    if ($change -eq 'stopped') {
+      Assert-KtEqual $next.state 'stopped_unobserved' 'refresh sees stopped: state'
+      Assert-KtEqual $next.reason 'not-running' 'refresh sees stopped: reason'
+    } else {
+      Assert-KtEqual $next.state 'unknown' "${change}: state unknown"
+      Assert-KtEqual $next.reason 'running-list-failed' "${change}: reason"
+    }
+    Write-Output "win-wsl-regression: dynamic $change ok"
+  } catch {
+    [void]$dynamicFailures.Add("${change}: $($_.Exception.Message)")
+  }
+}
+
+# 13. Distros rejected by the fresh list do not consume the six-detail budget.
+try {
+  $script:Calls.Clear()
+  $script:RunningReads = 0
+  $script:Script = @{
+    '-l -q' = (New-KtRes "Gone1`r`nGone2`r`nLive1`r`nLive2`r`nLive3`r`nLive4`r`nLive5`r`nLive6`r`n")
+    '-l -v' = (New-KtRes '')
+    '-l --running -q' = {
+      param($ArgsIgnored)
+      $script:RunningReads++
+      if ($script:RunningReads -eq 1) { return (New-KtRes "Gone1`r`nGone2`r`nLive1`r`nLive2`r`nLive3`r`nLive4`r`nLive5`r`nLive6`r`n") }
+      return (New-KtRes "Live1`r`nLive2`r`nLive3`r`nLive4`r`nLive5`r`nLive6`r`n")
+    }
+  }
+  foreach ($name in @('Gone1', 'Gone2', 'Live1', 'Live2', 'Live3', 'Live4', 'Live5', 'Live6')) {
+    $script:Script["-d $name --exec /bin/sh -s"] = (New-KtRes $inner)
+  }
+  $r = Get-KtWslObservation
+  Assert-KtEqual ((Get-KtEnteredNames) -join ',') 'Live1,Live2,Live3,Live4,Live5,Live6' 'fresh-list refusals must not consume detail budget'
+  foreach ($name in @('Gone1', 'Gone2')) {
+    $gone = $r.distros | Where-Object { $_.name -eq $name }
+    Assert-KtEqual $gone.state 'stopped_unobserved' 'budget: stopped state'
+    Assert-KtEqual $gone.reason 'not-running' 'budget: stopped reason'
+  }
+  Write-Output 'win-wsl-regression: dynamic budget ok'
+} catch {
+  [void]$dynamicFailures.Add("budget: $($_.Exception.Message)")
+}
+if ($dynamicFailures.Count -gt 0) { throw ($dynamicFailures -join "`n") }
 
 Write-Output 'win-wsl-regression: ok'
