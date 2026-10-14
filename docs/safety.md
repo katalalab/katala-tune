@@ -29,6 +29,13 @@ NeonMonitor（Windows のメモリ監視・自動強制終了ツール）の静�
 - probe の失敗は `reason`（timeout・unreachable・auth・error）と画面用の `reason_text` に分ける。元のエラー文は残す。
 - 流れは `lib/runner.js`（Electron）と `Engine::confirm_and_run`（Rust）。どちらも子プロセスの実行口を差し替えられ、受入試験は偽の ssh と一時ディレクトリの偽の対象で行う（`test/acceptance-issue19.test.js`・`crates/tune-core/tests/acceptance_issue19.rs`、記録は `docs/acceptance/issue-19.md`）。
 
+## macOS のキャッシュ候補と保存領域
+
+- `caches` という収集項目名だけで削除可能と判断しない。JS/Rustのrulesは既知の再生成候補（npm、Library/Caches、Homebrew cache、.cache、Xcode DerivedData）に完全一致し、容量が有限の非負数値のものだけを候補にする。未知path・欠測・非数値・負値は候補化しない。
+- 親ディレクトリを計測できた場合は、その子（Library/Caches/Homebrew）を合算しない。親が欠測なら計測できた子を採用する。同一pathも重複加算しない。macOSの `gb` はdu由来のGiBであり、候補の項目しきい値は2 GiB、合計しきい値は10 GiB。
+- CoreSimulator/Devices、Colima、Docker Dataはユーザーデータを含む保存領域。キャッシュ合計から除き、計測合計10 GiB以上なら「VM・シミュレータの保存領域（削除候補ではない）」として内訳と根拠のみを示す。commands/actionは付けず、保存領域やコンテナの存在だけでDocker pruneやCoreSimulator削除を提案しない。
+- 候補の容量は削除できる容量の保証ではない。低空きでも内容・利用状況・再生成可否の確認を先に案内する。既存snapshotにも同じrulesを使い、収集・DB・実行許可リストは変えない。回帰例は `test/fixtures/cache-accounting.json` をJS/Rustテストとparityで共有する。
+
 ## 効果の確かめ方
 
 変える前に計測し、変えた後に同じ計測をして、差が誤差の範囲なら元に戻す。電源プランを「高パフォーマンス」にする操作は、2台で 1スレッドの計測が -1.6%（誤差の範囲）だったので戻した（2026-10-03）。この結果は提案文にも書いてある。

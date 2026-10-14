@@ -31,10 +31,14 @@ const NAV = [['overview', '概要', 'overview'], ['status', '状態', 'status'],
   ['jobs', 'スケジュール', 'jobs'], ['logs', 'ログ', 'logs'], ['actions', '実行記録', 'actions']];
 // 別のファイル（tools.js・agents.js）が足した画面。実行記録の前に並べる
 const EXTRA_VIEWS = window.KT_VIEWS || [];
-for (const v of EXTRA_VIEWS) NAV.splice(NAV.findIndex(([k]) => k === 'actions'), 0, [v.key, v.label, v.icon]);
+// first: 先頭に置く（ダッシュボード）
+for (const v of EXTRA_VIEWS) {
+  if (v.first) NAV.unshift([v.key, v.label, v.icon]);
+  else NAV.splice(NAV.findIndex(([k]) => k === 'actions'), 0, [v.key, v.label, v.icon]);
+}
 
 const state = {
-  cfg: null, nodes: [], results: {}, fleet: null, view: 'overview', tab: 'findings', busy: new Set(), syncing: false,
+  cfg: null, nodes: [], results: {}, fleet: null, view: EXTRA_VIEWS.find((v) => v.home)?.key || 'overview', tab: 'findings', busy: new Set(), syncing: false,
   logFilter: { q: '', node_id: '', level: '', since: 7 },
   jobFilter: { node_id: '', failing: false, q: '' },
   procFilter: { node_id: '', q: '', sort: 'cpu' },
@@ -129,6 +133,7 @@ function go(view) {
 function render() {
   renderSidebar();
   Live.route(state.view); // ライブ表示: 新しい画面で使わないものは止める
+  for (const v of EXTRA_VIEWS) if (v.leave && v.key !== state.view) v.leave();
   if (state.view === 'overview') return renderOverview();
   if (state.view === 'status') return renderStatus();
   if (state.view === 'resources') return renderResources();
@@ -338,22 +343,22 @@ function findingHtml(f) {
 function procsHtml(d) {
   const p = d.processes;
   const win = d.probe === 'windows';
-  const cpuOf = (x) => (win ? x.cpu * d.host.cores : x.cpu);
+  const cpuOf = (x) => Number.isFinite(x.cpu) && (!win || (Number.isFinite(d.host.cores) && d.host.cores > 0)) ? (win ? x.cpu * d.host.cores : x.cpu) : null;
   const maxMem = Math.max(1, ...p.apps.map((a) => a.mem_mb));
-  const maxCpu = Math.max(100, ...p.top_cpu.map(cpuOf));
+  const maxCpu = Math.max(100, ...p.top_cpu.map(cpuOf).filter(Number.isFinite));
   return `
     ${UI.section('アプリ別', '同名のプロセスを合算、メモリ順')}
     ${UI.table({
       cols: [{ label: 'アプリ' }, { label: 'メモリ', cls: 'n', width: '24%' }, { label: 'CPU（1コア換算）', cls: 'n' }, { label: '数', cls: 'n' }],
       rows: p.apps,
-      row: (a) => `<td>${esc(a.app)}</td><td class="n">${(a.mem_mb / 1024).toFixed(2)} GB${Charts.dataBar(a.mem_mb, maxMem)}</td><td class="n">${cpuOf(a).toFixed(0)}%</td><td class="n">${esc(a.count)}</td>`,
+      row: (a) => `<td>${esc(a.app)}</td><td class="n">${(a.mem_mb / 1024).toFixed(2)} GB${Charts.dataBar(a.mem_mb, maxMem)}</td><td class="n">${cpuOf(a) == null ? '—' : cpuOf(a).toFixed(0) + '%'}</td><td class="n">${esc(a.count)}</td>`,
     })}
-    ${UI.section('CPU 上位', win ? '1.5秒の瞬間値と起動からの平均' : 'ps の直近平均')}
+    ${UI.section('CPU 上位', win ? '2点間のCPU使用率と起動からの平均' : 'ps の直近平均')}
     ${UI.table({
       cols: [{ label: 'PID', cls: 'n' }, { label: '名前' }, { label: 'CPU', cls: 'n', width: '22%' }, win ? { label: '平均', cls: 'n' } : { label: '起動から' }, { label: 'メモリ', cls: 'n' }],
       rows: p.top_cpu,
       row: (x) => `<td class="n muted">${esc(x.pid)}</td><td>${esc(x.name)}${x.app && x.app !== x.name ? ` <span class="muted">· ${esc(x.app)}</span>` : ''}</td>`
-        + `<td class="n">${cpuOf(x).toFixed(0)}%${Charts.dataBar(cpuOf(x), maxCpu, { tone: cpuOf(x) >= 80 ? 'warn' : 'neutral' })}</td>`
+        + `<td class="n">${cpuOf(x) == null ? '—' : cpuOf(x).toFixed(0) + '%' + Charts.dataBar(cpuOf(x), maxCpu, { tone: cpuOf(x) >= 80 ? 'warn' : 'neutral' })}</td>`
         + `${win ? `<td class="n">${esc(x.avg_core ?? '-')}%</td>` : `<td class="muted">${esc(x.etime)}</td>`}<td class="n">${esc(x.mem_mb)} MB</td>`,
     })}
     <p class="note-line">全 ${esc(p.count ?? '-')} プロセス · AI エージェント ${esc(p.agent_processes ?? '-')}</p>`;
@@ -560,13 +565,14 @@ function renderProcs() {
     const d = r.data, win = d.probe === 'windows', seen = new Set();
     for (const p of [...d.processes.top_cpu, ...(d.processes.top_mem || [])]) {
       if (seen.has(p.pid)) continue; seen.add(p.pid);
-      rows.push({ n, p, core: win ? p.cpu * d.host.cores : p.cpu });
+      const core = Number.isFinite(p.cpu) && (!win || (Number.isFinite(d.host.cores) && d.host.cores > 0)) ? (win ? p.cpu * d.host.cores : p.cpu) : null;
+      rows.push({ n, p, core });
     }
   }
   if (f.q) rows = rows.filter((x) => `${x.p.name} ${x.p.app || ''}`.toLowerCase().includes(f.q.toLowerCase()));
-  rows.sort((a, b) => (f.sort === 'mem' ? b.p.mem_mb - a.p.mem_mb : b.core - a.core));
+  rows.sort((a, b) => (f.sort === 'mem' ? b.p.mem_mb - a.p.mem_mb : (b.core ?? -1) - (a.core ?? -1)));
   const shown = rows.slice(0, 300);
-  const maxCore = Math.max(100, ...shown.map((x) => x.core));
+  const maxCore = Math.max(100, ...shown.map((x) => x.core).filter(Number.isFinite));
   const maxMem = Math.max(1, ...shown.map((x) => x.p.mem_mb));
   page(`
     ${UI.head({ icon: 'procs', title: 'プロセス', desc: '各機体の最新の分析から、CPU 上位とメモリ上位を横断して検索・並べ替えます。終了は確認のうえ、直前に同じプロセスかを確かめてから行います。' })}
@@ -581,7 +587,7 @@ function renderProcs() {
       rows: shown,
       empty: '該当するプロセスはありません',
       row: ({ n, p, core }, i) => `<td class="nowrap"><b>${esc(n.id)}</b></td><td class="n muted">${esc(p.pid)}</td><td>${esc(p.name)}${p.app && p.app !== p.name ? ` <span class="muted">· ${esc(p.app)}</span>` : ''}</td>`
-        + `<td class="n">${core.toFixed(0)}%${Charts.dataBar(core, maxCore, { tone: core >= 80 ? 'warn' : 'neutral' })}</td>`
+        + `<td class="n">${core == null ? '—' : core.toFixed(0) + '%' + Charts.dataBar(core, maxCore, { tone: core >= 80 ? 'warn' : 'neutral' })}</td>`
         + `<td class="n">${p.mem_mb >= 1024 ? (p.mem_mb / 1024).toFixed(1) + ' GB' : esc(p.mem_mb) + ' MB'}${Charts.dataBar(p.mem_mb, maxMem)}</td>`
         + `<td class="acts mid">${n.shared ? '<span class="faint">提案のみ</span>' : `<button class="btn small danger" data-kill="${i}">終了…</button>`}</td>`,
     })}`);
@@ -609,8 +615,7 @@ function jobsOf(nodes) {
   }
   return out;
 }
-const SCHED_OK = (v) => v == null || v === 0 || (v >= 0x41300 && v <= 0x4130f);
-const isFailing = (j) => !['disabled', 'unknown', 'running'].includes(j.state) && (j.kind === 'schtask' ? !SCHED_OK(j.last_result) : j.scope === 'user' && j.last_result != null && j.last_result !== 0);
+const isFailing = JobResults.isFailing;
 const JOB_STATE = { ready: '待機', running: '実行中', disabled: '無効', queued: '待ち', loaded: '読み込み済み', 'not-loaded': '未読み込み', unknown: '不明' };
 const JOB_TONE = { ready: 'default', running: 'blue', disabled: 'gray', queued: 'yellow', loaded: 'default', 'not-loaded': 'gray', unknown: 'gray' };
 let jobRows = [];
@@ -634,7 +639,7 @@ function jobsTable(rows, showNode = true) {
       return `${showNode ? `<td class="nowrap"><b>${esc(n.id)}</b></td>` : ''}
         <td><b>${wbr(j.name)}</b>${j.kind === 'schtask' && j.path !== '\\' ? `<span class="sub">${wbr(j.path)}</span>` : ''}${j.scope && j.scope !== 'user' ? ` ${UI.chip(j.scope, 'gray')}` : ''}</td>
         <td class="muted">${esc(j.schedule)}</td><td>${UI.chip(JOB_STATE[j.state] || j.state, JOB_TONE[j.state] || 'default')}</td>
-        <td class="nowrap">${j.last_result == null ? '<span class="faint">-</span>' : fail ? UI.chip(`失敗 ${j.last_result}`, 'red') : UI.chip('成功', 'green')}${j.last_run ? `<span class="sub">${esc(fmtTime(j.last_run))}</span>` : ''}</td>
+        <td class="nowrap">${j.last_result == null ? '<span class="faint">-</span>' : UI.chip(JobResults.label(j), fail ? 'red' : 'green')}${j.last_run ? `<span class="sub">${esc(fmtTime(j.last_run))}</span>` : ''}</td>
         <td class="muted nowrap">${j.next_run ? esc(fmtTime(j.next_run)) : '-'}</td><td class="muted">${wbr(j.program || '')}</td><td class="acts">${jobActions(n, j, i)}</td>`;
     },
   });

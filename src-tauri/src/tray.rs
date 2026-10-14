@@ -57,6 +57,10 @@ fn on_menu(app: &AppHandle, id: &str) {
             e.compute_checks(false, true);
         }
         "update" => crate::update::from_menu(app),
+        "auto-update" => {
+            crate::update::set_auto(app, !crate::update::auto(app));
+            update(app);
+        }
         "quit" => app.exit(0),
         _ => {}
     }
@@ -88,7 +92,7 @@ pub fn update(app: &AppHandle) {
                 &MenuItem::with_id(app, "status", "状態を開く", true, None::<&str>)?,
                 &MenuItem::with_id(app, "probe", "今すぐ分析", !e.is_probing(), None::<&str>)?,
                 &MenuItem::with_id(app, "logs", "ログを取り込む", !e.is_syncing(), None::<&str>)?,
-                &MenuItem::with_id(app, "update", "更新を確認…", !crate::update::is_busy(), None::<&str>)?,
+                &MenuItem::with_id(app, "update", format!("更新を確認…（{}）", app.package_info().version), !crate::update::is_busy(), None::<&str>)?,
                 &PredefinedMenuItem::separator(app)?,
                 &CheckMenuItem::with_id(
                     app,
@@ -96,6 +100,14 @@ pub fn update(app: &AppHandle) {
                     format!("自動スキャン（分析 {} 分・ログ {} 分ごと）", js::string(s.get("probe_minutes")), js::string(s.get("logs_minutes"))),
                     true,
                     js::truthy(s.get("enabled")),
+                    None::<&str>,
+                )?,
+                &CheckMenuItem::with_id(
+                    app,
+                    "auto-update",
+                    "自動で更新する（署名を確かめ、ウィンドウを閉じているときに入れる）",
+                    true,
+                    crate::update::auto(app),
                     None::<&str>,
                 )?,
                 &PredefinedMenuItem::separator(app)?,

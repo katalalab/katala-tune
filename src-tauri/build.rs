@@ -39,6 +39,9 @@ const COMMANDS: &[&str] = &[
     "agent_peers",
     "agent_pair",
     "netsec",
+    "dashboard",
+    "monitor_settings",
+    "hub_pull",
 ];
 
 fn main() {

@@ -1,11 +1,14 @@
-# タグ v* で Tauri 版をビルドし、GitHub Releases に下書きとして置く（docs/release.md）。
-# 公開（下書きを外す）は操作者が中身を確かめてから行う。通常リリースを latest として公開すると latest.json が更新確認の対象になる。prerelease は手動配布。
+# タグ v* で Tauri 版をビルドし、更新署名を検証してから GitHub Releases に公開する（docs/release.md）。
+# 版に「-」の無い通常リリースは latest として公開し、動いているアプリが自動で更新する（latest.json）。「-」つきは prerelease（自動更新の対象外）。
+# main で版を上げると auto-release.yml がタグを打ってここを呼ぶ（workflow_dispatch、ref はタグ）。手でタグを push しても動く。
+# 緊急時はリポジトリ変数 RELEASE_DRAFT=true で下書きに戻せる（公開しない）。
 # 第三者の action は使わない（GitHub 公式の checkout・upload-artifact・download-artifact だけ。ツールは runner の rustup・cargo・gh・jq）
 name: release
 
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 permissions: {}
 
@@ -52,6 +55,7 @@ jobs:
       - name: タグ・版・公開鍵を確かめる
         shell: bash
         run: |
+          case "$GITHUB_REF" in refs/tags/v*) ;; *) echo "::error::タグ（v*）を ref にして動かす"; exit 1 ;; esac
           git merge-base --is-ancestor HEAD origin/main || { echo "::error::release tag is not contained in main"; exit 1; }
           # タグ（v0.4.0）と package.json・Cargo・tauri.conf.json の版が同じこと
           node scripts/version.js --check "${TAG#v}"
@@ -68,6 +72,27 @@ jobs:
           # shellcheck disable=SC2086 # 複数のターゲットを空白で区切って渡す
           rustup target add $RUST_TARGETS
           cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
+      - name: 同梱する道具（tune CLI・Windows の tune-agent サンプラー）
+        # アプリの隣に置かれ、起動のたびに ~/.katala-tune/bin へ写る。ハブはほかの Windows の機体へサンプラーを配り直す（crates/tune-core/src/helpers.rs）
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src-tauri/binaries
+          if [ "$RUNNER_OS" = macOS ]; then
+            # universal のビルドは各アーキテクチャを別にビルドする（tauri-build がそれぞれの名前を探す）ので、両方と universal を置く
+            for t in aarch64-apple-darwin x86_64-apple-darwin; do
+              cargo build --release --locked -p tune-cli --target "$t"
+              cp "target/$t/release/tune" "src-tauri/binaries/tune-$t"
+            done
+            lipo -create -output src-tauri/binaries/tune-universal-apple-darwin target/aarch64-apple-darwin/release/tune target/x86_64-apple-darwin/release/tune
+            echo '{"bundle":{"externalBin":["binaries/tune"]}}' > sidecars.json
+          else
+            cargo build --release --locked -p tune-cli -p tune-agent --target "$TARGET"
+            cp "target/$TARGET/release/tune.exe" "src-tauri/binaries/tune-$TARGET.exe"
+            cp "target/$TARGET/release/tune-agent.exe" "src-tauri/binaries/tune-agent-$TARGET.exe"
+            echo '{"bundle":{"externalBin":["binaries/tune","binaries/tune-agent"]}}' > sidecars.json
+          fi
+          ls -l src-tauri/binaries
       - name: ビルドと更新用の署名
         shell: bash
         env:
@@ -78,7 +103,13 @@ jobs:
             echo "::error::secret TAURI_SIGNING_PRIVATE_KEY が無い（docs/release.md）"
             exit 1
           fi
-          cargo tauri build --ci --target "$TARGET" --bundles "$BUNDLES" --config src-tauri/tauri.release.conf.json
+          cargo tauri build --ci --target "$TARGET" --bundles "$BUNDLES" --config src-tauri/tauri.release.conf.json --config sidecars.json
+          # 同梱できたことを確かめる（Mac は .app の中、Windows はアプリの隣にコピーされる）
+          if [ "$RUNNER_OS" = macOS ]; then
+            test -x "target/$TARGET/release/bundle/macos/Katala Tune.app/Contents/MacOS/tune"
+          else
+            test -f "target/$TARGET/release/tune.exe" && test -f "target/$TARGET/release/tune-agent.exe"
+          fi
       - name: 配る物を集める（名前から空白をなくす）
         shell: bash
         run: |
@@ -103,11 +134,11 @@ jobs:
           retention-days: 7
 
   release:
-    name: release（下書き）
+    name: release
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 下書きのリリースを作り、ビルドしたものと latest.json を置くため
+      contents: write # リリースを作り、ビルドしたものと latest.json を置くため
     env:
       TAG: ${{ github.ref_name }}
       REPO: ${{ github.repository }}
@@ -141,9 +172,27 @@ jobs:
           cat dist/latest.json
       - name: 配布物と更新 feed の対応・SHA256 を検証
         run: node scripts/verify-release.js dist "${TAG#v}" "$REPO"
-      - name: 下書きのリリースに置く
+      - name: 公開する（通常の版は latest＝自動更新の対象、「-」つきは prerelease）
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_DRAFT: ${{ vars.RELEASE_DRAFT }}
         run: |
-          gh release create "$TAG" dist/* --repo "$REPO" --draft --verify-tag --title "Katala Tune $TAG" --generate-notes
+          set -euo pipefail
+          v="${TAG#v}"
+          # CHANGELOG.md の「## <版>」の節をリリースノートの先頭に置く（無ければ自動生成だけ）
+          awk -v h="## $v" '$0==h{on=1;next} /^## /{if(on)exit} on' CHANGELOG.md > notes.md
+          if [ "${RELEASE_DRAFT:-}" = true ]; then mode=(--draft)
+          elif [[ "$v" == *-* ]]; then mode=(--prerelease --latest=false)
+          else mode=(--latest)
+          fi
+          gh release create "$TAG" dist/* --repo "$REPO" "${mode[@]}" --verify-tag --title "Katala Tune $TAG" --notes-file notes.md --generate-notes
+          # 公開したら知らせ（latest.json）を読み返して、版が合っていることを確かめる
+          if [ "${mode[0]}" = --latest ]; then
+            for _ in 1 2 3 4 5 6; do
+              got=$(curl -fsSL "https://github.com/$REPO/releases/latest/download/latest.json" | jq -r .version || true)
+              [ "$got" = "$v" ] && { echo "latest.json: $got"; exit 0; }
+              sleep 10
+            done
+            echo "::error::latest.json が $v を指していない（$got）"; exit 1
+          fi
