@@ -232,6 +232,9 @@ pub fn matrix(rows: &[Value], match_slug: Option<&SlugFn<'_>>, explicit_only: bo
 
 /// 1台の棚卸し（inventoryNode）。戻り値は `{ node_id, ok, items, errors, failedSources, wall_s, at }` か `{ node_id, ok: false, error, wall_s, at }`
 pub async fn inventory_node(node: &Node) -> Value {
+    if let Some(refused) = node.refusal() {
+        return json!({ "node_id": node.id, "ok": false, "skipped": true, "error": refused, "wall_s": 0.0, "at": crate::db::now_ms() });
+    }
     let started = Instant::now();
     let res: RunResult = if node.is_mac() {
         let script = MAC_INVENTORY.as_bytes();

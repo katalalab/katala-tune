@@ -53,7 +53,7 @@ impl Engine {
         self.host().state_changed();
         let cfg = self.reload_config();
         let all = ids.as_ref().is_none_or(Vec::is_empty);
-        let targets: Vec<Node> = cfg.nodes.iter().filter(|n| all || ids.as_ref().is_some_and(|i| i.contains(&n.id))).cloned().collect();
+        let targets: Vec<Node> = cfg.nodes.iter().filter(|n| n.is_active() && (all || ids.as_ref().is_some_and(|i| i.contains(&n.id)))).cloned().collect();
         let mut set = tokio::task::JoinSet::new();
         for (i, n) in targets.iter().cloned().enumerate() {
             let me = self.clone();

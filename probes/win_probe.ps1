@@ -1,9 +1,11 @@
-﻿# katala-tune Windows probe. Read-only: prints one JSON line to stdout.
+﻿# katala-tune Windows probe. Prints one JSON line; opt-in WSL observation may activate a distro in a stop race.
 # PowerShell 5.1. Keep this file ASCII only (PS 5.1 reads BOM-less UTF-8 as the ANSI code page).
 # Collects no secrets, environment variables, command lines or file contents
-# (except the memory/processors keys of ~/.wslconfig).
+# (except the memory/processors keys of ~/.wslconfig, and the opt-in WSL observation below:
+# /proc memory figures, process names and disk usage inside distros reported as running).
 # -NoNetwork skips the network and security section (nodes.json "network": false).
-param([switch]$NoNetwork)
+# -ObserveWsl enables WSL distro enumeration and inside observation (nodes.json "wsl": true).
+param([switch]$NoNetwork, [switch]$ObserveWsl)
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -177,7 +179,7 @@ $disks = foreach ($d in Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3')
 }
 
 # WSL limits (only two keys are read)
-$wsl = [ordered]@{ config = $false; memory = $null; processors = $null }
+$wsl = [ordered]@{ config = $false; memory = $null; processors = $null; observation_enabled = [bool]$ObserveWsl }
 $wcfg = Join-Path $env:USERPROFILE '.wslconfig'
 if (Test-Path $wcfg) {
   $wsl.config = $true
@@ -186,6 +188,176 @@ if (Test-Path $wcfg) {
     if ($line -match '^\s*processors\s*=\s*(\S+)') { $wsl.processors = $Matches[1] }
   }
 }
+
+# --- WSL observation (read-only) begin ---
+# Lists the registered distros with wsl.exe -l (this never starts a distro). Only a distro that is already Running gets one
+# fixed read-only command (/proc and ps/df). A stopped distro is reported as stopped_unobserved and is never touched:
+# no -d, no --exec, nothing runs inside it. If the running list cannot be read, no distro is touched either.
+# Invoke-KtWsl is the only place that starts wsl.exe, so a regression test can replace it with a fake.
+$KtWslInnerScript = @'
+echo @@mem
+grep -E "^(MemTotal|MemAvailable|SwapTotal|SwapFree):" /proc/meminfo 2>/dev/null
+echo @@psi
+cat /proc/pressure/memory 2>/dev/null
+echo @@load
+cat /proc/loadavg 2>/dev/null
+echo @@ps
+ps -eo pid=,rss=,pcpu=,comm= --sort=-rss 2>/dev/null | head -n 8
+echo @@df
+df -P -k / 2>/dev/null | tail -n +2
+echo @@end
+'@
+function Test-KtWslInstalled { return (Test-Path (Join-Path $env:SystemRoot 'System32\wsl.exe')) }
+function Invoke-KtWsl([string[]]$WslArgs, [string]$InputText = $null, [int]$TimeoutMs = 8000, [bool]$Utf16 = $true) {
+  $res = [pscustomobject]@{ ok = $false; code = $null; out = ''; err = $null }
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = Join-Path $env:SystemRoot 'System32\wsl.exe'
+    $psi.Arguments = ($WslArgs -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.RedirectStandardInput = $true
+    $enc = if ($Utf16) { [System.Text.Encoding]::Unicode } else { New-Object System.Text.UTF8Encoding($false) }
+    $psi.StandardOutputEncoding = $enc
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $psi
+    [void]$p.Start()
+    $so = $p.StandardOutput.ReadToEndAsync()
+    $se = $p.StandardError.ReadToEndAsync()
+    if ($InputText) { $p.StandardInput.Write($InputText) }
+    $p.StandardInput.Close()
+    if (-not $p.WaitForExit($TimeoutMs)) {
+      try { $p.Kill() } catch { }
+      $res.err = 'timeout'
+      return $res
+    }
+    $res.code = $p.ExitCode
+    $res.out = [string]$so.Result
+    $res.ok = ($p.ExitCode -eq 0)
+    if (-not $res.ok) { $res.err = 'exit ' + $p.ExitCode }
+  } catch {
+    $res.err = 'failed'
+  }
+  return $res
+}
+# wsl.exe -l -q prints one name per line (UTF-16). Lines that are not plain distro names (localized messages) are counted, not used.
+function ConvertTo-KtWslNames([string]$Text) {
+  $names = @()
+  $ignored = 0
+  foreach ($line in ($Text -split "`n")) {
+    $t = ($line -replace "[\x00\uFEFF\r]", '').Trim()
+    if (-not $t) { continue }
+    if ($t -match '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { $names += $t } else { $ignored++ }
+  }
+  return [pscustomobject]@{ names = @($names); ignored = $ignored }
+}
+function ConvertFrom-KtWslVerbose([string]$Text) {
+  $map = @{}
+  foreach ($line in ($Text -split "`n")) {
+    $t = ($line -replace "[\x00\uFEFF\r]", '')
+    if ($t -match '^\s*(\*)?\s*([A-Za-z0-9][A-Za-z0-9._-]{0,63})\s+\S+\s+([0-9])\s*$') {
+      $map[$Matches[2]] = [pscustomobject]@{ default = [bool]$Matches[1]; version = [int]$Matches[3] }
+    }
+  }
+  return $map
+}
+function Get-KtWslVhdxGb([string]$Name) {
+  try {
+    $key = Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss' -ErrorAction Stop | Where-Object { (Get-ItemProperty $_.PSPath).DistributionName -eq $Name } | Select-Object -First 1
+    if (-not $key) { return $null }
+    $base = [string](Get-ItemProperty $key.PSPath).BasePath
+    $base = $base -replace '^\\\\\?\\', ''
+    $f = Join-Path $base 'ext4.vhdx'
+    if (Test-Path $f) { return (R1 ((Get-Item $f).Length / 1GB)) }
+  } catch { }
+  return $null
+}
+function ConvertFrom-KtWslInside([string]$Text) {
+  $sec = ''
+  $kv = @{}
+  $psi = @{}
+  $load = $null
+  $top = @()
+  $disk = @()
+  foreach ($line in ($Text -split "`n")) {
+    $t = $line.TrimEnd("`r")
+    if ($t -match '^@@(\w+)$') { $sec = $Matches[1]; continue }
+    if ($sec -eq 'mem' -and $t -match '^(\w+):\s+(\d+)\s*kB') { $kv[$Matches[1]] = [double]$Matches[2] }
+    elseif ($sec -eq 'psi' -and $t -match '^(some|full)\s.*avg10=([0-9.]+)') { $psi[$Matches[1]] = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture) }
+    elseif ($sec -eq 'load' -and $t -match '^([0-9.]+)\s') { $load = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture) }
+    elseif ($sec -eq 'ps' -and $t -match '^\s*(\d+)\s+(\d+)\s+([0-9.]+)\s+(\S.*)$') {
+      $top += [pscustomobject]@{ pid = [int]$Matches[1]; name = $Matches[4].Trim(); mem_mb = [int]([double]$Matches[2] / 1024); cpu = [double]::Parse($Matches[3], [Globalization.CultureInfo]::InvariantCulture) }
+    }
+    elseif ($sec -eq 'df' -and $t -match '^\S+\s+(\d+)\s+(\d+)\s+(\d+)\s+\d+%\s+(\S+)$') {
+      $tot = [double]$Matches[1]
+      if ($tot -gt 0) { $disk += [pscustomobject]@{ mount = $Matches[4]; total_gb = (R1 ($tot / 1048576)); free_gb = (R1 ([double]$Matches[3] / 1048576)); free_pct = (R1 ([double]$Matches[3] / $tot * 100)) } }
+    }
+  }
+  if (-not $kv.ContainsKey('MemTotal') -or -not $kv.ContainsKey('MemAvailable')) { return $null }
+  $swapTotal = if ($kv.ContainsKey('SwapTotal')) { $kv['SwapTotal'] } else { 0 }
+  $swapFree = if ($kv.ContainsKey('SwapFree')) { $kv['SwapFree'] } else { 0 }
+  return [ordered]@{
+    mem_total_mb = [int]($kv['MemTotal'] / 1024)
+    mem_available_mb = [int]($kv['MemAvailable'] / 1024)
+    swap_total_mb = [int]($swapTotal / 1024)
+    swap_used_mb = [int](($swapTotal - $swapFree) / 1024)
+    psi_some_avg10 = $psi['some']
+    psi_full_avg10 = $psi['full']
+    load1 = $load
+    top = @($top)
+    disk = @($disk)
+  }
+}
+function Get-KtWslObservation([bool]$Enabled = $false) {
+  $r = [ordered]@{ enabled = $Enabled; installed = $false; listed = $false; list_error = $null; ignored_lines = 0; distros = @() }
+  if (-not $Enabled) { return $r }
+  if (-not (Test-KtWslInstalled)) { return $r }
+  $r.installed = $true
+  $all = Invoke-KtWsl @('-l', '-q')
+  $parsed = ConvertTo-KtWslNames $all.out
+  $r.ignored_lines = $parsed.ignored
+  # Non-zero exit (including partial stdout) is not a reliable inventory.
+  if (-not $all.ok) { $r.list_error = [string]$all.err; return $r }
+  if ($parsed.names.Count -eq 0) { $r.listed = $true; return $r }
+  $r.listed = $true
+  $verbose = ConvertFrom-KtWslVerbose ((Invoke-KtWsl @('-l', '-v')).out)
+  $run = Invoke-KtWsl @('-l', '--running', '-q')
+  $runKnown = $run.ok
+  $runNames = if ($runKnown) { @((ConvertTo-KtWslNames $run.out).names) } else { @() }
+  $observed = 0
+  foreach ($name in $parsed.names) {
+    $v = $verbose[$name]
+    $d = [ordered]@{ name = $name; default = $(if ($v) { $v.default } else { $false }); version = $(if ($v) { $v.version } else { $null }); state = 'unknown'; observed = $false; reason = $null; vhdx_gb = (Get-KtWslVhdxGb $name); inside = $null }
+    if (-not $runKnown) { $d.reason = 'running-list-failed' }
+    elseif ($runNames -notcontains $name) { $d.state = 'stopped_unobserved'; $d.reason = 'not-running' }
+    elseif ($name -like 'docker-desktop*') { $d.state = 'running'; $d.reason = 'internal-distro-skipped' }
+    elseif ($observed -ge 6) { $d.state = 'running'; $d.reason = 'observation-limit' }
+    else {
+      # Earlier detail commands can take seconds. Do not enter from a stale running list.
+      $freshRun = Invoke-KtWsl @('-l', '--running', '-q')
+      if (-not $freshRun.ok) { $d.reason = 'running-list-failed' }
+      elseif (@((ConvertTo-KtWslNames $freshRun.out).names) -notcontains $name) { $d.state = 'stopped_unobserved'; $d.reason = 'not-running' }
+      else {
+        $d.state = 'running'
+        $observed++
+        $o = Invoke-KtWsl @('-d', $name, '--exec', '/bin/sh', '-s') ($KtWslInnerScript -replace "`r`n", "`n") 10000 $false
+        $inside = if ($o.ok) { ConvertFrom-KtWslInside $o.out } else { $null }
+        if ($inside) { $d.observed = $true; $d.inside = $inside } else { $d.reason = $(if ($o.err) { [string]$o.err } else { 'no-data' }) }
+      }
+    }
+    $r.distros += [pscustomobject]$d
+  }
+  return $r
+}
+# --- WSL observation (read-only) end ---
+$wslObs = Get-KtWslObservation -Enabled:$ObserveWsl
+$wsl.installed = $wslObs.installed
+$wsl.listed = $wslObs.listed
+$wsl.list_error = $wslObs.list_error
+$wsl.ignored_lines = $wslObs.ignored_lines
+$wsl.distros = @($wslObs.distros)
 
 # Stability: unexpected shutdowns / bugchecks in the last 7 days
 $since = (Get-Date).AddDays(-7)

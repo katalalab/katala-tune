@@ -1,5 +1,5 @@
 {
-  "_comment": "~/.config/katala-tune/nodes.json にコピーして編集する。alias は ~/.ssh/config の Host 名。local_hostname がこの機体の hostname と一致するとローカルで実行する",
+  "_comment": "~/.config/katala-tune/nodes.json にコピーして編集する。alias は ~/.ssh/config の Host 名。local_hostname がこの機体の hostname と一致するとローカルで実行する。status は運用状態（online・retired・no-ssh・paused・out-of-scope。省略は online）で、online 以外の機体には接続も変更もしない。到達できないだけでは変わらないので、退役などは操作者がここを編集して決める（status_reason に理由、status_date に判断日）。WSL 内の観測は wsl: true を指定した Windows 機だけで行う（既定は無効）",
   "fleet": null,
   "protect": [
     "python.exe",
@@ -27,6 +27,7 @@
       "alias": "gpu-pc",
       "os": "windows",
       "role": "Windows GPU 機",
+      "wsl": false,
       "note": "任意のメモ。カードと詳細に表示される",
       "expect": {
         "services": [
@@ -48,6 +49,15 @@
       "shared": true,
       "network": false,
       "note": "shared: true の機体は提案だけで、変更を実行しない。network: false でネットワークとセキュリティ（待ち受け・防御・常駐の増減・接続先・ログイン）を集めない"
+    },
+    {
+      "id": "old-pc",
+      "alias": "old-pc",
+      "os": "windows",
+      "role": "退役した PC",
+      "status": "retired",
+      "status_reason": "解体済み。履歴だけ残す",
+      "status_date": "2026-01-15"
     }
   ],
   "schedule": {

@@ -111,6 +111,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::config,
             commands::last,
+            commands::ledger,
             commands::power_report,
             commands::network_check,
             commands::power_settings,

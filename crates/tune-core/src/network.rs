@@ -21,6 +21,9 @@ pub fn select(nodes: &[Node], ids: &[String]) -> Result<Vec<Node>, String> {
     if selected.is_empty() {
         return Err("診断する機体を指定してください".into());
     }
+    if let Some(refused) = selected.iter().find_map(Node::refusal) {
+        return Err(refused);
+    }
     if selected.iter().any(|n| n.get("connectivity") == Some(&Value::Bool(false))) {
         return Err("台帳で接続診断を止めている機体".into());
     }
@@ -43,6 +46,9 @@ pub async fn check(nodes: &[Node], active: bool) -> Result<Value, String> {
 pub async fn check_one(runner: &dyn Runner, node: &Node, active: bool) -> Value {
     let at = now_ms();
     let started = Instant::now();
+    if let Some(refused) = node.refusal() {
+        return json!({ "node_id": node.id, "at": at, "ok": false, "skipped": true, "error": refused });
+    }
     if node.get("connectivity") == Some(&Value::Bool(false)) || (!node.is_mac() && !node.is_windows()) {
         return json!({ "node_id": node.id, "at": at, "ok": false, "error": "disabled_or_unsupported" });
     }

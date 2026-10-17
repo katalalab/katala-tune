@@ -7,7 +7,7 @@ const vm = require('node:vm');
 
 function render({ cpu, probe = 'windows', fleet = false }) {
   const source = fs.readFileSync(path.join(__dirname, '../renderer/app.js'), 'utf8');
-  const start = source.indexOf('function procsHtml(');
+  const start = source.indexOf('function wslHtml(');
   const machine = source.indexOf('\nfunction machineHtml(', start);
   const fleetStart = source.indexOf('function renderProcs(');
   const fleetEnd = source.indexOf('\n// ---- スケジュール', fleetStart);

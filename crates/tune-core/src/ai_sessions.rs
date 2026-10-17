@@ -178,6 +178,9 @@ fn mac_python(local: bool, alias: &str) -> (String, Vec<String>) {
 
 /// python の標準ライブラリだけのスクリプトを、機体で（この機体ならローカル、ほかは ssh で）標準入力に渡して動かす
 pub async fn run_python(node: &Node, src: &str, timeout: Duration) -> RunResult {
+    if let Some(err) = node.refusal() {
+        return RunResult { code: None, out: String::new(), err };
+    }
     let input = Some(src.as_bytes());
     if node.is_mac() {
         let (prog, args) = mac_python(node.local, &node.alias);
@@ -201,10 +204,11 @@ pub async fn run_python(node: &Node, src: &str, timeout: Duration) -> RunResult 
 /// AI セッションを取り込む機体か。台帳の "ai_sessions" が true / false ならそれに従う。
 /// 書いていなければ、共用機（shared）は取り込まない（他の人のセッションの cwd や PR を集めないため）。それ以外は取り込む
 pub fn enabled(node: &Node) -> bool {
-    match node.get("ai_sessions") {
-        Some(Value::Bool(b)) => *b,
-        _ => !node.shared,
-    }
+    node.is_active()
+        && match node.get("ai_sessions") {
+            Some(Value::Bool(b)) => *b,
+            _ => !node.shared,
+        }
 }
 
 #[cfg(test)]
