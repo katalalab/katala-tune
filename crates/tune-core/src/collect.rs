@@ -1,4 +1,4 @@
-//! 各機体で調査スクリプトを走らせ、snapshot を返す。読み取り専用（lib/collect.js と同じやり方）。
+//! 各機体で調査スクリプトを走らせ、snapshot を返す（lib/collect.js と同じやり方）。WSL 内観測は台帳の `wsl: true` でのみ有効だが、停止との競合で起動する可能性がある。
 //! macOS: この機体ならローカル実行、それ以外は ssh で python3 の標準入力へ渡す。
 //! Windows: ssh（既定シェルは Git Bash）で ~/.katala-tune/ に置いて PowerShell 5.1 で実行。この機体が Windows ならローカルで実行。
 //! 機体で動くのは probes/ の読めるスクリプトだけ（ビルド時に埋め込む）。
@@ -347,14 +347,23 @@ fn mac_ssh_command(benchmark: bool, network: bool) -> String {
     format!("command -v python3 >/dev/null && exec python3 -{suffix} || exec /usr/bin/python3 -{suffix}")
 }
 
-fn windows_ssh_command(benchmark: bool, network: bool) -> String {
+fn windows_probe_flags(network: bool, observe_wsl: bool) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if !network {
+        flags.push("-NoNetwork");
+    }
+    if observe_wsl {
+        flags.push("-ObserveWsl");
+    }
+    flags
+}
+
+fn windows_ssh_command(benchmark: bool, network: bool, observe_wsl: bool) -> String {
     let bench = BENCH_PY.replace('\'', "\"");
+    let flags = windows_probe_flags(network, observe_wsl).iter().map(|flag| format!(" {flag}")).collect::<String>();
     let mut parts = vec![
         "mkdir -p ~/.katala-tune && cat > ~/.katala-tune/probe.ps1 &&".to_string(),
-        format!(
-            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$(cygpath -w ~/.katala-tune/probe.ps1)\"{};",
-            if network { "" } else { " -NoNetwork" }
-        ),
+        format!("powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$(cygpath -w ~/.katala-tune/probe.ps1)\"{flags};"),
     ];
     if benchmark {
         parts.extend([format!("echo {BENCH_MARK};"), format!("PY=$(command -v python3 || command -v python); [ -n \"$PY\" ] && \"$PY\" -c '{bench}'")]);
@@ -376,6 +385,7 @@ pub async fn probe_node_with(runner: &dyn Runner, node: &Node) -> Value {
     let started = Instant::now();
     let network = crate::netsec::enabled(&node.raw);
     let benchmark = node.get("benchmark") != Some(&Value::Bool(false));
+    let observe_wsl = node.is_windows() && node.get("wsl") == Some(&Value::Bool(true));
     let res = if node.is_mac() {
         if node.local {
             runner.run("/usr/bin/env", &mac_probe_args(benchmark, network), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
@@ -383,7 +393,8 @@ pub async fn probe_node_with(runner: &dyn Runner, node: &Node) -> Value {
             runner.run("ssh", &ssh_args(&node.alias, &mac_ssh_command(benchmark, network)), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
         }
     } else if node.local {
-        let p = runner.local_powershell_file(WIN_PROBE, if network { "" } else { "-NoNetwork" }, Duration::from_secs(120)).await;
+        let params = windows_probe_flags(network, observe_wsl).join(" ");
+        let p = runner.local_powershell_file(WIN_PROBE, &params, Duration::from_secs(120)).await;
         if benchmark {
             let b = runner.local_python(BENCH_PY, Duration::from_secs(60)).await;
             RunResult { out: format!("{}\n{BENCH_MARK}\n{}", p.out, b.out), ..p }
@@ -391,7 +402,7 @@ pub async fn probe_node_with(runner: &dyn Runner, node: &Node) -> Value {
             p
         }
     } else {
-        runner.run("ssh", &ssh_args(&node.alias, &windows_ssh_command(benchmark, network)), Some(WIN_PROBE), Duration::from_secs(120)).await
+        runner.run("ssh", &ssh_args(&node.alias, &windows_ssh_command(benchmark, network, observe_wsl)), Some(WIN_PROBE), Duration::from_secs(120)).await
     };
     let wall_s = started.elapsed().as_secs_f64();
     let (main, bench) = match res.out.split_once(BENCH_MARK) {
@@ -484,6 +495,58 @@ pub async fn exec_on_with(runner: &dyn Runner, node: &Node, script: &str, timeou
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct CaptureRunner {
+        calls: Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    impl Runner for CaptureRunner {
+        fn run<'a>(&'a self, cmd: &'a str, args: &'a [String], _input: Option<&'a [u8]>, _timeout: Duration) -> RunFuture<'a> {
+            let cmd = cmd.to_string();
+            let args = args.to_vec();
+            Box::pin(async move {
+                self.calls.lock().unwrap().push((cmd, args));
+                RunResult { code: Some(0), out: "{\"probe\":true}\n".into(), err: String::new() }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn wsl_observation_requires_explicit_opt_in_for_local_and_remote_windows() {
+        for local in [true, false] {
+            for configured in [None, Some(false), Some(true)] {
+                let mut value = json!({ "id": "win", "alias": "win", "os": "windows", "benchmark": false });
+                if let Some(enabled) = configured {
+                    value["wsl"] = json!(enabled);
+                    if enabled {
+                        value["network"] = json!(false);
+                    }
+                }
+                if local {
+                    value["local_hostname"] = json!("test-host");
+                }
+                let node = Node::from_value(&value, if local { "test-host" } else { "other-host" });
+                let runner = CaptureRunner::default();
+                let result = probe_node_with(&runner, &node).await;
+                assert_eq!(result["ok"], true);
+                let calls = runner.calls.lock().unwrap();
+                assert_eq!(calls.len(), 1);
+                let (cmd, args) = &calls[0];
+                let invocation = if local {
+                    assert_eq!(cmd, "local:powershell");
+                    args[0].as_str()
+                } else {
+                    assert_eq!(cmd, "ssh");
+                    args.last().unwrap().as_str()
+                };
+                assert_eq!(invocation.contains("-ObserveWsl"), configured == Some(true), "local={local}, configured={configured:?}, invocation={invocation}");
+                if configured == Some(true) {
+                    assert!(invocation.contains("-NoNetwork -ObserveWsl"), "local={local}, invocation={invocation}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn windows_ssh_prefers_git_independently_of_parent_path() {
         let programs = PathBuf::from("programs");
@@ -529,10 +592,10 @@ mod tests {
 
     #[test]
     fn disabled_benchmark_never_sends_fixed_computation() {
-        let enabled = windows_ssh_command(true, true);
+        let enabled = windows_ssh_command(true, true, false);
         assert!(enabled.contains(BENCH_MARK));
         assert!(enabled.contains("3000000"));
-        let disabled = windows_ssh_command(false, true);
+        let disabled = windows_ssh_command(false, true, false);
         assert!(disabled.contains("probe.ps1"));
         assert!(!disabled.contains(BENCH_MARK));
         assert!(!disabled.contains("3000000"));
@@ -548,9 +611,9 @@ mod tests {
         assert_eq!(mac_probe_args(false, false), vec!["python3", "-", "--skip-benchmark", "nonet"]);
         assert_eq!(mac_ssh_command(false, false).matches(" --skip-benchmark nonet").count(), 2);
         assert!(!mac_ssh_command(true, true).contains("nonet"));
-        assert!(windows_ssh_command(true, false).contains("probe.ps1)\" -NoNetwork;"));
-        assert!(windows_ssh_command(true, false).contains(BENCH_MARK));
-        assert!(!windows_ssh_command(false, true).contains("-NoNetwork"));
+        assert!(windows_ssh_command(true, false, false).contains("probe.ps1)\" -NoNetwork;"));
+        assert!(windows_ssh_command(true, false, false).contains(BENCH_MARK));
+        assert!(!windows_ssh_command(false, true, false).contains("-NoNetwork"));
     }
 
     #[test]

@@ -53,10 +53,17 @@ function Get-KtEnteredNames { return @($script:Calls | Where-Object { $_ -like '
 
 $inner = "@@mem`nMemTotal:       32870000 kB`nMemAvailable:   16000000 kB`nSwapTotal:       8388608 kB`nSwapFree:       8388000 kB`n@@psi`nsome avg10=1.25 avg60=0.50 avg300=0.10 total=1234`nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0`n@@load`n0.52 0.40 0.30 1/200 999`n@@ps`n  100  2048000  3.5 python3`n  101  1024000  1.0 node`n@@df`n/dev/sdc 1055762868 123456789 875000000 13% /`n@@end`n"
 
+# 0. no opt-in: no WSL command is called
+$script:Installed = $true
+$script:Calls.Clear()
+$r = Get-KtWslObservation
+Assert-KtEqual $r.enabled $false 'WSL observation disabled by default'
+Assert-KtEqual $script:Calls.Count 0 'default: wsl.exe must not be called'
+
 # 1. wsl.exe not installed: nothing is run
 $script:Installed = $false
 $script:Calls.Clear()
-$r = Get-KtWslObservation
+$r = Get-KtWslObservation -Enabled $true
 Assert-KtEqual $r.installed $false 'not installed'
 Assert-KtEqual $r.distros.Count 0 'not installed: no distros'
 Assert-KtEqual $script:Calls.Count 0 'not installed: wsl.exe must not be called'
@@ -70,7 +77,7 @@ $script:Script = @{
   '-l --running -q' = (New-KtRes "Ubuntu`r`ndocker-desktop`r`n")
   '-d Ubuntu --exec /bin/sh -s' = (New-KtRes $inner)
 }
-$r = Get-KtWslObservation
+$r = Get-KtWslObservation -Enabled $true
 Assert-KtEqual $r.listed $true 'listed'
 Assert-KtEqual $r.distros.Count 3 'three distros'
 $entered = Get-KtEnteredNames
@@ -102,14 +109,14 @@ Assert-KtTrue ($json.Length -gt 100) 'observation must serialize'
 # 3. the running list cannot be read: nothing is entered, every state is unknown
 $script:Calls.Clear()
 $script:Script['-l --running -q'] = (New-KtRes '' 'timeout')
-$r = Get-KtWslObservation
+$r = Get-KtWslObservation -Enabled $true
 Assert-KtEqual (Get-KtEnteredNames).Count 0 'running list failed: nothing may be entered'
 foreach ($x in $r.distros) { Assert-KtEqual $x.state 'unknown' "state of $($x.name)"; Assert-KtEqual $x.reason 'running-list-failed' "reason of $($x.name)" }
 
 # 4. successful empty running list: every distro is stopped_unobserved
 $script:Calls.Clear()
 $script:Script['-l --running -q'] = (New-KtRes '')
-$r = Get-KtWslObservation
+$r = Get-KtWslObservation -Enabled $true
 Assert-KtEqual (Get-KtEnteredNames).Count 0 'none running: nothing may be entered'
 foreach ($x in $r.distros) { Assert-KtEqual $x.state 'stopped_unobserved' "state of $($x.name)" }
 
@@ -117,7 +124,7 @@ foreach ($x in $r.distros) { Assert-KtEqual $x.state 'stopped_unobserved' "state
 $script:Calls.Clear()
 $script:Script['-l --running -q'] = (New-KtRes "Ubuntu`r`n")
 $script:Script['-d Ubuntu --exec /bin/sh -s'] = (New-KtRes '' 'timeout')
-$r = Get-KtWslObservation
+$r = Get-KtWslObservation -Enabled $true
 $u = $r.distros | Where-Object { $_.name -eq 'Ubuntu' }
 Assert-KtEqual $u.state 'running' 'timeout: state'
 Assert-KtEqual $u.observed $false 'timeout: observed'
@@ -128,7 +135,7 @@ Assert-KtEqual (Get-KtEnteredNames).Count 1 'timeout: one entry only'
 # 6. localized non-zero list response: unknown inventory, nothing entered
 $script:Calls.Clear()
 $script:Script = @{ '-l -q' = (New-KtRes "Windows Subsystem for Linux has no installed distributions.`r`n" 'exit 1') }
-$r = Get-KtWslObservation
+$r = Get-KtWslObservation -Enabled $true
 Assert-KtEqual $r.listed $false 'non-zero list: not listed'
 Assert-KtEqual $r.list_error 'exit 1' 'non-zero list: preserve failure'
 Assert-KtEqual $r.distros.Count 0 'no distros: empty'
@@ -138,7 +145,7 @@ Assert-KtEqual (Get-KtEnteredNames).Count 0 'no distros: nothing may be entered'
 # 7. the list itself fails: reported as an error, nothing is entered
 $script:Calls.Clear()
 $script:Script = @{ '-l -q' = (New-KtRes '' 'timeout') }
-$r = Get-KtWslObservation
+$r = Get-KtWslObservation -Enabled $true
 Assert-KtEqual $r.listed $false 'list failed: not listed'
 Assert-KtEqual $r.list_error 'timeout' 'list failed: reason'
 Assert-KtEqual $script:Calls.Count 1 'list failed: no further calls'
@@ -150,7 +157,7 @@ $script:Script = @{
   '-l --running -q' = (New-KtRes "Ubuntu`r`n" 'exit 1')
   '-d Ubuntu --exec /bin/sh -s' = (New-KtRes $inner)
 }
-$r = Get-KtWslObservation
+$r = Get-KtWslObservation -Enabled $true
 Assert-KtEqual (Get-KtEnteredNames).Count 0 'partial failed list: nothing may be entered'
 foreach ($x in $r.distros) { Assert-KtEqual $x.state 'unknown' 'partial failed list: state unknown' }
 
@@ -158,7 +165,7 @@ foreach ($x in $r.distros) { Assert-KtEqual $x.state 'unknown' 'partial failed l
 $script:Calls.Clear()
 $script:Script['-l --running -q'] = (New-KtRes "Ubuntu`r`n")
 $script:Script['-d Ubuntu --exec /bin/sh -s'] = (New-KtRes $inner 'exit 1')
-$r = Get-KtWslObservation
+$r = Get-KtWslObservation -Enabled $true
 $u = $r.distros | Where-Object { $_.name -eq 'Ubuntu' }
 Assert-KtEqual $u.observed $false 'failed inner command: not observed'
 Assert-KtEqual $u.reason 'exit 1' 'failed inner command: preserve reason'
@@ -191,7 +198,7 @@ foreach ($change in @('stopped', 'failed-empty', 'failed-partial')) {
       }
       '-d Next --exec /bin/sh -s' = (New-KtRes $inner)
     }
-    $r = Get-KtWslObservation
+    $r = Get-KtWslObservation -Enabled $true
     $next = $r.distros | Where-Object { $_.name -eq 'Next' }
     Assert-KtEqual ((Get-KtEnteredNames) -join ',') 'First' "$change after earlier detail: Next must never be entered"
     Assert-KtTrue ($script:RunningReads -ge 3) "${change}: refresh before each detail"
@@ -227,7 +234,7 @@ try {
   foreach ($name in @('Gone1', 'Gone2', 'Live1', 'Live2', 'Live3', 'Live4', 'Live5', 'Live6')) {
     $script:Script["-d $name --exec /bin/sh -s"] = (New-KtRes $inner)
   }
-  $r = Get-KtWslObservation
+  $r = Get-KtWslObservation -Enabled $true
   Assert-KtEqual ((Get-KtEnteredNames) -join ',') 'Live1,Live2,Live3,Live4,Live5,Live6' 'fresh-list refusals must not consume detail budget'
   foreach ($name in @('Gone1', 'Gone2')) {
     $gone = $r.distros | Where-Object { $_.name -eq $name }

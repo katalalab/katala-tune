@@ -78,6 +78,13 @@ test('win_probe.ps1 は ASCII・BOM 付きで、WSL の観測区間がある', (
   assert.ok(region.length > 500);
 });
 
+test('WSL の内部観測は ObserveWsl の明示 opt-in が無ければ実行されない', () => {
+  assert.match(text, /param\(\[switch\]\$NoNetwork,\s*\[switch\]\$ObserveWsl\)/);
+  assert.match(region, /function Get-KtWslObservation\(\[bool\]\$Enabled = \$false\)/);
+  assert.match(region, /if \(-not \$Enabled\) \{ return \$r \}/);
+  assert.match(text, /Get-KtWslObservation -Enabled:\$ObserveWsl/);
+});
+
 test('WSL の観測区間は wsl.exe を1か所でしか起動せず、変更系の操作を含まない', () => {
   assert.equal((code.match(/ProcessStartInfo/g) || []).length, 1);
   assert.equal((code.match(/--exec/g) || []).length, 1, '中でコマンドを実行する呼び出しは1つだけ');

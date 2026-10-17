@@ -1,10 +1,11 @@
-﻿# katala-tune Windows probe. Read-only: prints one JSON line to stdout.
+﻿# katala-tune Windows probe. Prints one JSON line; opt-in WSL observation may activate a distro in a stop race.
 # PowerShell 5.1. Keep this file ASCII only (PS 5.1 reads BOM-less UTF-8 as the ANSI code page).
 # Collects no secrets, environment variables, command lines or file contents
-# (except the memory/processors keys of ~/.wslconfig, and the read-only WSL observation below:
-# /proc memory figures, process names and disk usage inside distros that are already running).
+# (except the memory/processors keys of ~/.wslconfig, and the opt-in WSL observation below:
+# /proc memory figures, process names and disk usage inside distros reported as running).
 # -NoNetwork skips the network and security section (nodes.json "network": false).
-param([switch]$NoNetwork)
+# -ObserveWsl enables WSL distro enumeration and inside observation (nodes.json "wsl": true).
+param([switch]$NoNetwork, [switch]$ObserveWsl)
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -178,7 +179,7 @@ $disks = foreach ($d in Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3')
 }
 
 # WSL limits (only two keys are read)
-$wsl = [ordered]@{ config = $false; memory = $null; processors = $null }
+$wsl = [ordered]@{ config = $false; memory = $null; processors = $null; observation_enabled = [bool]$ObserveWsl }
 $wcfg = Join-Path $env:USERPROFILE '.wslconfig'
 if (Test-Path $wcfg) {
   $wsl.config = $true
@@ -309,8 +310,9 @@ function ConvertFrom-KtWslInside([string]$Text) {
     disk = @($disk)
   }
 }
-function Get-KtWslObservation {
-  $r = [ordered]@{ installed = $false; listed = $false; list_error = $null; ignored_lines = 0; distros = @() }
+function Get-KtWslObservation([bool]$Enabled = $false) {
+  $r = [ordered]@{ enabled = $Enabled; installed = $false; listed = $false; list_error = $null; ignored_lines = 0; distros = @() }
+  if (-not $Enabled) { return $r }
   if (-not (Test-KtWslInstalled)) { return $r }
   $r.installed = $true
   $all = Invoke-KtWsl @('-l', '-q')
@@ -350,7 +352,7 @@ function Get-KtWslObservation {
   return $r
 }
 # --- WSL observation (read-only) end ---
-$wslObs = Get-KtWslObservation
+$wslObs = Get-KtWslObservation -Enabled:$ObserveWsl
 $wsl.installed = $wslObs.installed
 $wsl.listed = $wslObs.listed
 $wsl.list_error = $wslObs.list_error

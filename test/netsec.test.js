@@ -159,7 +159,7 @@ test('台帳の "network": false で止める（ログインの記録も集め�
   assert.deepEqual(logs.sourcesOf({ os: 'windows', shared: true, network_logins: true }), ['win_system', 'win_application', 'neonmonitor', 'win_security']);
   const src = fs.readFileSync(path.join(PROBES, 'mac_logs.py'), 'utf8');
   assert.match(src, /"nonet" not in sys\.argv/);
-  assert.match(fs.readFileSync(path.join(PROBES, 'win_probe.ps1'), 'utf8'), /param\(\[switch\]\$NoNetwork\)/);
+  assert.match(fs.readFileSync(path.join(PROBES, 'win_probe.ps1'), 'utf8'), /param\(\[switch\]\$NoNetwork,\s*\[switch\]\$ObserveWsl\)/);
   // 調査スクリプトへの印は benchmark とは別に渡す（lib/collect.js）
   const { macProbeArgs, macSshCommand, windowsSshCommand } = require('../lib/collect');
   assert.deepEqual(macProbeArgs(true, false), ['python3', '-', 'nonet']);

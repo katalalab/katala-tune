@@ -220,13 +220,14 @@ Codex の `codex.tool_result` には引数と出力の断片が入るが、受�
 
 ## 8. WSL の中の観測（2026-10-11、Issue #29 の一部）
 
-Windows の GPU 開発機では、メモリ・CPU・ディスクの実消費の多くが WSL2 の中で起きる。Windows 側からは `vmmem` の1行に見えるため、`probes/win_probe.ps1` が distro ごとの状態と内側の実測を足す（`wsl.distros`。読み取り専用で、変更する処理は入れない）。
+Windows の GPU 開発機では、メモリ・CPU・ディスクの実消費の多くが WSL2 の中で起きる。Windows 側からは `vmmem` の1行に見える。台帳に `"wsl": true` を指定した機体だけで、`probes/win_probe.ps1` が distro ごとの状態と内側の実測を足す（`wsl.distros`）。設定が省略または `false` の機体では WSL コマンドを呼ばない。
 
 - 状態は `running`（中を観測した。観測できなければ `reason`）・`stopped_unobserved`（停止中。起動も実行もしない）・`unknown`（動いているかを読めなかった。何も実行しない）。停止中は「正常」でも「空」でもなく「観測していない」として、所見（`wsl-unobserved`）と機体の詳細に出る。
+- opt-in 時でも、running 確認直後に distro が自然停止すると `wsl -d` が起動しうるOS側の競合は残る。自動起動を許容しない機体では `wsl: true` を設定しない。
 - 内側で読むのは、`/proc/meminfo` の MemTotal・MemAvailable・Swap、`/proc/pressure/memory`（PSI）、`/proc/loadavg`、メモリ上位8件のプロセス名（コマンドラインは読まない）、`/` の使用量。distro の VHDX の大きさは Windows 側のファイルの大きさだけを読む（停止中でも読めるが、中には入らない）。WSL2 の distro は1つの VM を共有するので、内側のメモリは VM 全体の値で、distro を足さずに最大を使う。
 - Windows 側との突き合わせ: 内側の使用が VM の上限の 90% 以上（`wsl-inside-memory`）、`vmmem` が内側の実使用より 4 GB 以上多く、物理メモリの 25% 以上を持っている（`wsl-reclaim`。`.wslconfig` の `autoMemoryReclaim=gradual` の提案）。観測できていない distro があるときは比べない。
 - 判定は `lib/wsl.js`（JS）と `crates/tune-core/src/wsl.rs`（Rust）で同じ。`crates/tune-core/tests/parity.rs` の固定の例で一致を確かめる。
-- まだ無いもの: Docker／コンテナの使用量、台帳の「全件台帳」への WSL の欄、観測を止める台帳の設定、CPU の内側の値。
+- まだ無いもの: Docker／コンテナの使用量、台帳の「全件台帳」への WSL の欄、CPU の内側の値。
 
 ## 順番
 
