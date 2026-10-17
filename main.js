@@ -15,6 +15,7 @@ const health = require('./lib/health');
 const inventory = require('./lib/inventory');
 const dogu = require('./lib/dogu');
 const netsec = require('./lib/netsec');
+const ledger = require('./lib/ledger');
 const powerSettings = require('./lib/power-settings');
 
 const IS_MAC = process.platform === 'darwin';
@@ -48,7 +49,11 @@ function reloadConfig() {
 const schedule = () => ({ ...DEFAULT_SCHEDULE, ...(cfg.schedule || {}), ...(db?.getMeta('schedule') || {}) });
 const isExample = () => cfg.nodes.some((n) => n.id === 'my-mac') && cfg.nodes.some((n) => n.id === 'family-pc');
 const nodeById = (id) => cfg.nodes.find((n) => n.id === id);
-const publicNode = ({ id, alias, os: o, role, note, shared, local, expect }) => ({ id, alias, os: o, role, note, shared: !!shared, local, expect: expect || null });
+const publicNode = (n) => {
+  const { id, alias, os: o, role, note, shared, local, expect } = n;
+  const op = ledger.opState(n);
+  return { id, alias, os: o, role, note, shared: !!shared, local, expect: expect || null, status: op.state, status_reason: op.reason || null, status_date: op.date || null };
+};
 
 function summarize(e) {
   const d = e.data || {};
@@ -83,7 +88,7 @@ function computeChecks({ notify = true, broadcast = true } = {}) {
     const [last] = db.lastSnapshots(n.id, 1);
     const safeLast = last ? { ...last, data: netsec.snapshotForNode(last.data, n) } : null;
     const full = safeLast ? enrich({ node_id: n.id, ok: true, data: safeLast.data, at: safeLast.at, wall_s: safeLast.wall_s }) : null;
-    const checks = health.nodeChecks(n, safeLast, full?.findings || [], { now, cursors, expect: n.expect, schedule: sch, lastError: lastProbeError[n.id] });
+    const checks = health.nodeChecks(n, safeLast, full?.findings || [], { now, cursors, expect: n.expect, schedule: sch, lastError: db.probeError(n.id) || lastProbeError[n.id] });
     changed.push(...db.saveChecks(n.id, checks, now));
   }
   const integ = db.integrity();
@@ -121,7 +126,9 @@ async function runProbe(ids, { auto = false } = {}) {
   updateTray();
   try {
     reloadConfig();
-    const targets = cfg.nodes.filter((n) => !ids?.length || ids.includes(n.id));
+    const selected = cfg.nodes.filter((n) => !ids?.length || ids.includes(n.id));
+    // 運用対象でない機体（retired など）には接続しない。除外は失敗ではなく理由つきで返す
+    const { targets, excluded: skipped } = ledger.partition(selected);
     const completed = [];
     const results = await probeAll(targets, (r) => {
       const prev = db.lastSnapshots(r.node_id, 1)[0];
@@ -129,14 +136,21 @@ async function runProbe(ids, { auto = false } = {}) {
       if (r.ok && r.data?.netsec) r.data.netsec = netsec.prepare(r.data.netsec, r.data.probe, prev?.data?.netsec, r.at);
       const full = enrich(r, prev?.data);
       if (full.ok) {
-        delete lastProbeError[r.node_id];
-        db.addSnapshot(r.node_id, { at: full.at, wall_s: full.wall_s, score: full.score, findings: full.findings.map(({ id, severity }) => ({ id, severity })), data: full.data, summary: summarize(full) });
-      } else lastProbeError[r.node_id] = full.error;
+        try {
+          db.addSnapshot(r.node_id, { at: full.at, wall_s: full.wall_s, score: full.score, findings: full.findings.map(({ id, severity }) => ({ id, severity })), data: full.data, summary: summarize(full) });
+          delete lastProbeError[r.node_id];
+        } catch (e) { full.ok = false; full.error = `分析は終わったが保存できなかった: ${e.message}`; }
+      }
+      if (!full.ok) {
+        try { db.saveProbeFailure(r.node_id, full.at ?? Date.now(), full.error); }
+        catch (e) { full.error += `\n分析の失敗を保存できなかった: ${e.message}`; }
+        lastProbeError[r.node_id] = full.error;
+      }
       completed.push({node_id:full.node_id,ok:full.ok,at:full.at,error:full.error});
       win?.webContents.send('probe-result', full);
     });
     if (!ids?.length) db.setMeta('lastProbeAt', Date.now());
-    return { done: results.length, auto, results: completed };
+    return { done: results.length, auto, results: completed, skipped };
   } finally {
     probing = false;
     computeChecks();
@@ -165,7 +179,7 @@ async function runInventory(ids) {
   inventorying = true;
   try {
     reloadConfig();
-    const targets = cfg.nodes.filter((n) => !ids?.length || ids.includes(n.id));
+    const targets = ledger.partition(cfg.nodes.filter((n) => !ids?.length || ids.includes(n.id))).targets;
     const results = await Promise.all(targets.map(async (n) => {
       const r = await inventory.inventoryNode(n).catch((e) => ({ node_id: n.id, ok: false, error: String(e) }));
       const out = r.ok ? { node_id: n.id, ok: true, wall_s: r.wall_s, errors: r.errors, ...db.saveInventory(n.id, r.items, r.at, { skipSources: r.failedSources }) } : { node_id: n.id, ok: false, error: r.error };
@@ -219,6 +233,12 @@ ipcMain.handle('config', () => ({
   // システムのアクセントカラー（macOS / Windows）。取れなければ既定の青
   accent: (() => { try { const c = systemPreferences.getAccentColor?.(); return c ? `#${c.slice(0, 6)}` : null; } catch { return null; } })(),
 }));
+
+// 対象台帳（対象・除外・未観測とその理由）。読み取りだけで、台帳は書き換えない
+ipcMain.handle('ledger', () => {
+  reloadConfig();
+  return ledger.targetLedger(cfg.nodes, { lastOkAt: (id) => db.lastSnapshots(id, 1)[0]?.at ?? null, lastError: (id) => db.probeError(id) || lastProbeError[id] || null });
+});
 
 ipcMain.handle('last', () => cfg.nodes.map((n) => {
   const [last, prev] = db.lastSnapshots(n.id, 2);

@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::js;
 
@@ -95,6 +95,22 @@ impl Node {
         self.os == "windows"
     }
 
+    /// 運用状態（台帳の `status`。lib/ledger.js の opState と同じ）
+    pub fn op_state(&self) -> OpState {
+        op_state(&self.raw)
+    }
+
+    /// 運用対象（online）か。そうでない機体には SSH も probe も実行しない
+    pub fn is_active(&self) -> bool {
+        self.op_state().active
+    }
+
+    /// 運用対象でないとき、実行を断る理由（呼び出し側は接続も変更もしない）
+    pub fn refusal(&self) -> Option<String> {
+        let st = self.op_state();
+        (!st.active).then(|| format!("{} は運用状態が {}（{}）のため、接続も変更もしない", self.id, st.state, state_label(&st.state)))
+    }
+
     /// 画面に渡す形（main.js の publicNode）
     pub fn public(&self) -> Value {
         let mut m = Map::new();
@@ -105,10 +121,127 @@ impl Node {
         }
         m.insert("shared".into(), Value::Bool(self.shared));
         m.insert("local".into(), Value::Bool(self.local));
+        let op = self.op_state();
+        m.insert("status".into(), Value::String(op.state));
+        m.insert("status_reason".into(), if op.reason.is_empty() { Value::Null } else { Value::String(op.reason) });
+        m.insert("status_date".into(), if op.date.is_empty() { Value::Null } else { Value::String(op.date) });
         let expect = self.raw.get("expect").filter(|v| js::truthy(Some(v))).cloned().unwrap_or(Value::Null);
         m.insert("expect".into(), expect);
         Value::Object(m)
     }
+}
+
+/// 台帳に書ける運用状態。省略は online（この項目を持たない既存の台帳もそのまま動く）
+pub const STATES: [&str; 5] = ["online", "retired", "no-ssh", "paused", "out-of-scope"];
+/// 値が読めないときの状態。安全側に倒して対象外にする（退役機に誤って接続しない）
+pub const INVALID: &str = "invalid";
+
+pub fn state_label(state: &str) -> &'static str {
+    match state {
+        "online" => "運用中",
+        "retired" => "退役",
+        "no-ssh" => "SSH 対象外",
+        "paused" => "一時停止",
+        "out-of-scope" => "対象外",
+        _ => "状態不明",
+    }
+}
+
+/// 台帳の1台の運用状態（到達できるかとは別の情報。調査結果から自動で変えない）
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpState {
+    pub state: String,
+    pub active: bool,
+    pub valid: bool,
+    pub reason: String,
+    pub date: String,
+}
+
+fn trimmed(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// lib/ledger.js の opState と同じ
+pub fn op_state(raw: &Value) -> OpState {
+    let reason = trimmed(raw.get("status_reason"));
+    let date = trimmed(raw.get("status_date"));
+    let status = raw.get("status").filter(|v| !v.is_null());
+    let Some(status) = status else { return OpState { state: "online".into(), active: true, valid: true, reason, date } };
+    let s = trimmed(Some(status)).to_lowercase().replace('_', "-");
+    if STATES.contains(&s.as_str()) {
+        return OpState { active: s == "online", state: s, valid: true, reason, date };
+    }
+    let shown = match status {
+        Value::String(x) => x.chars().take(40).collect::<String>(),
+        Value::Bool(_) => "boolean".into(),
+        Value::Number(_) => "number".into(),
+        Value::Array(_) | Value::Object(_) => "object".into(),
+        Value::Null => "object".into(),
+    };
+    OpState {
+        state: INVALID.into(), active: false, valid: false, reason: format!("status の値が読めない（{shown}）ため対象外にしている。台帳を直す"), date
+    }
+}
+
+/// 収集・自動スキャン・変更操作の対象（online だけ）と、除外（理由つき）に分ける
+pub fn partition(nodes: &[Node]) -> (Vec<Node>, Vec<Value>) {
+    let mut targets = Vec::new();
+    let mut excluded = Vec::new();
+    for n in nodes {
+        let st = n.op_state();
+        if st.active {
+            targets.push(n.clone());
+        } else {
+            excluded.push(json!({ "node_id": n.id, "state": st.state, "reason": st.reason, "date": st.date }));
+        }
+    }
+    (targets, excluded)
+}
+
+/// 機体ごとの最後の観測（対象台帳に使う）
+pub struct Observation {
+    pub last_ok_at: Option<i64>,
+    pub last_error: Option<String>,
+}
+
+/// 対象台帳（lib/ledger.js の targetLedger と同じ）。
+/// target: online で最後の分析が成功。unobserved: online なのに観測できていない（異常として扱う）。excluded: 運用対象外（履歴は残る）
+pub fn target_ledger(nodes: &[Node], obs: impl Fn(&str) -> Observation) -> Value {
+    let mut rows = Vec::new();
+    for n in nodes {
+        let st = n.op_state();
+        let mut row = json!({ "node_id": n.id, "os": if n.raw.get("os").is_some_and(|v| !v.is_null()) { json!(n.os) } else { Value::Null }, "state": st.state, "state_label": state_label(&st.state) });
+        let o = &mut row;
+        if !st.active {
+            o["status"] = json!("excluded");
+            o["reason"] = json!(if st.reason.is_empty() { "理由の記載なし".to_string() } else { st.reason });
+            o["date"] = if st.date.is_empty() { Value::Null } else { json!(st.date) };
+        } else {
+            let ob = obs(&n.id);
+            o["last_ok_at"] = json!(ob.last_ok_at);
+            match (ob.last_error.filter(|e| !e.is_empty()), ob.last_ok_at) {
+                (Some(e), _) => {
+                    o["status"] = json!("unobserved");
+                    o["reason"] = json!(format!("最後の分析が失敗: {}", e.trim().rsplit('\n').next().unwrap_or("").chars().take(120).collect::<String>()));
+                }
+                (None, None) => {
+                    o["status"] = json!("unobserved");
+                    o["reason"] = json!("まだ分析していない");
+                }
+                (None, Some(_)) => {
+                    o["status"] = json!("target");
+                    o["reason"] = Value::Null;
+                }
+            }
+        }
+        rows.push(row);
+    }
+    let count = |s: &str| rows.iter().filter(|r| r["status"] == s).count();
+    let counts = json!({ "target": count("target"), "unobserved": count("unobserved"), "excluded": count("excluded"), "total": rows.len() });
+    json!({ "rows": rows, "counts": counts })
 }
 
 /// katala-fleet 連携（任意）
@@ -188,7 +321,7 @@ mod tests {
     fn example_ledger_parses_and_is_example() {
         let c = parse_config(EXAMPLE, Path::new("nodes.json"), "my-macbook-pro").unwrap();
         assert!(c.is_example());
-        assert_eq!(c.nodes.len(), 3);
+        assert_eq!(c.nodes.len(), 4);
         assert!(c.nodes[0].local, "local_hostname は大文字小文字を問わず一致する");
         assert!(!c.nodes[1].local);
         assert!(c.nodes[2].shared);
@@ -197,6 +330,12 @@ mod tests {
         let p = c.nodes[2].public();
         assert_eq!(p["shared"], Value::Bool(true));
         assert_eq!(p["expect"], Value::Null);
+        assert_eq!(p["status"], json!("online"));
+        assert!(c.nodes[2].is_active());
+        // 見本の退役機は対象外（接続しない）だが、台帳には残る
+        assert_eq!(c.nodes[3].op_state().state, "retired");
+        assert!(!c.nodes[3].is_active());
+        assert_eq!(c.nodes[3].public()["status_date"], json!("2026-01-15"));
     }
 
     #[test]

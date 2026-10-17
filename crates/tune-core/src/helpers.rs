@@ -97,7 +97,7 @@ pub fn older(a: &str, b: &str) -> bool {
 
 /// 機体のサンプラーを入れ替えるべきか（Windows のほかの機体で、hello の版が古い・ネイティブが無い）
 pub fn agent_outdated(node: &Node, brief: Option<&Value>) -> bool {
-    if !node.is_windows() || node.local {
+    if !node.is_active() || !node.is_windows() || node.local {
         return false;
     }
     let Some(b) = brief else { return false };
@@ -110,6 +110,9 @@ pub fn agent_outdated(node: &Node, brief: Option<&Value>) -> bool {
 
 /// サンプラーを SSH の標準入力で送り、SHA-256 を確かめてから入れ替える（既定シェルは Git Bash。collect.rs と同じ）
 pub async fn push_agent(node: &Node, bytes: &[u8]) -> Result<String, String> {
+    if let Some(err) = node.refusal() {
+        return Err(err);
+    }
     let hash = sha256_hex(bytes);
     let stamp = now_ms();
     let remote = format!(
@@ -160,6 +163,15 @@ mod tests {
         assert!(!agent_outdated(&n("windows", true), Some(&rust("0.0.1"))), "この機体は sync で揃える");
         assert!(!agent_outdated(&n("macos", false), Some(&json!({"impl": "script"}))));
         assert!(!agent_outdated(&n("windows", false), None));
+    }
+
+    #[test]
+    fn excluded_agents_are_never_updated() {
+        for status in ["retired", "no-ssh", "paused", "out-of-scope", "invalid"] {
+            let node = Node::from_value(&json!({"id": "x", "alias": "x", "os": "windows", "status": status}), "h");
+            assert!(!agent_outdated(&node, Some(&json!({"impl": "rust", "agent": "0.0.1"}))), "{status}");
+            assert!(!agent_outdated(&node, Some(&json!({"impl": "script"}))), "{status}");
+        }
     }
 
     #[test]

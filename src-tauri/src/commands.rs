@@ -37,6 +37,11 @@ pub async fn last(e: E<'_>) -> R {
 }
 
 #[tauri::command]
+pub async fn ledger(e: E<'_>) -> R {
+    e.ledger()
+}
+
+#[tauri::command]
 pub async fn power_report(e: E<'_>) -> R {
     e.power_report()
 }

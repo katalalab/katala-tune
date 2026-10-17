@@ -55,6 +55,7 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 | ログ | Windows のイベントログ（System / Application）と NeonMonitor の `guard.log`、macOS の DiagnosticReports とカーネルのエラーを、前回の続きから取り込む。冪等・秘密の伏せ字・件数上限つき。開いている間は15分ごとに自動で取り込む |
 | 接続診断 | 「ネットワーク」画面またはnative CLIの `tune network [--probe] [機体ID ...]` で経路・IP/DNS設定の有無とHTTPS疎通を読み取り専用で確認。自動スキャンには追加しない。開発用の `npm run network` も利用できる。接続先の標本分析は「セキュリティ」画面で確認 |
 | 電力・Clock | 各操作卓から機体を分析し、取得元付きの電力・Clockを表示。計算条件は操作卓ごとの私有DBへ保存し、自動同期しない。未校正・欠測・古い値を全機合計へ含めず、SoCとCPU/GPUの重複加算を避ける。CLIの `tune power` は保存済みの結果を読むだけ |
+| WSL の中 | Windows の分析に足す（`probes/win_probe.ps1` の `wsl.distros`）。台帳で `"wsl": true` を指定した機体だけで実行し、省略時・`false` は distro の一覧も内側も呼び出さない。opt-in 時は `wsl.exe -l` で distro の一覧と動いているものを読み、**動いていると直前に確認した distro**だけに固定の読み取りコマンド（`/proc/meminfo`・メモリ圧迫 PSI・負荷・メモリ上位のプロセス名・ディスク）を1回流す。停止中の distro は `-d` で開かず `stopped_unobserved`（観測していない。「正常」でも「空」でもない）。一覧を読めなければ `unknown` で何も実行しない。確認直後に自然停止すると `wsl -d` が起動しうる競合が残るため、自動起動を避ける必要がある機体では opt-in しない。Docker Desktop の内部 distro は触らない。所見は、内側のメモリ逼迫（`wsl-inside-memory`）、Windows 側 `vmmem` が内側の実使用より多く持ったまま（`wsl-reclaim`）、観測していない distro（`wsl-unobserved`）。機体の詳細に「WSL の中」を出す |
 | 計測 | 台帳に `"benchmark": false` を指定した機体では負荷計測を実行せず、状態だけを読み取る。省略時は従来どおり1スレッドの固定計算を5回（python）。前回との差で「最適化が効いたか」を見る（±15% 未満は誤差扱い） |
 | 実行 | プロセス終了（同一性・負荷を直前に再確認、終了を確認できなければ「終了未確認」）、Windows の電源プラン切り替え、Mac の電源モード、対応するGPUの電力上限、タスクの無効化／有効化／今すぐ実行、launchd ジョブの停止／読み込み／今すぐ実行。電源設定は対象側ロック・読戻し・現在値を確かめた条件付き復元を通す。Clock変更は未対応 |
 | 道具 | 各機体のインストール先を読むだけ（`probes/mac_inventory.py`・`probes/win_inventory.ps1`）。パッケージマネージャもネットワークも使わない。読めなかった取り方は削除と見なさない |
@@ -81,6 +82,7 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 
 - `alias` は `~/.ssh/config` の Host 名。非対話（BatchMode）で入れる鍵が要る。Windows 側は OpenSSH サーバーと、既定シェル（Git Bash または PowerShell）で `powershell.exe` が動くこと
 - `local_hostname` がこの機体の hostname と一致すると、SSH を使わずローカルで実行する
+- `status`（任意）: 運用状態。`online`（省略時）・`retired`（退役）・`no-ssh`（SSH 対象外）・`paused`（一時停止）・`out-of-scope`（対象外）。`online` 以外の機体には SSH も probe も実行せず（分析・ログ取り込み・棚卸し・AI・接続診断・ライブ・変更操作のすべて）、設定も変えない。過去の履歴は閲覧できる。値が読めないとき（綴り違い）は安全側に倒して対象外にし、「状態」で注意にする。`status_reason`（理由）と `status_date`（判断日）を併記できる。**運用状態は操作者がこの台帳を編集してだけ変わる**。`online` の機体が到達できないときは「到達不能（運用対象）」として異常のまま扱い、`status` を自動で変えない
 - `shared: true` は提案のみ。`protect` は終了を提案しても実行しないアプリ名
 - `network`（任意）: `false` でネットワークとセキュリティ（待ち受け・防御・常駐の増減・外向きの接続・ログイン）を集めない
 - `connectivity`（任意）: `false` で手動の接続診断を止める。既存の詳細収集を制御する `network` とは別の設定
@@ -90,6 +92,8 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
   - `expect.ignore_jobs`（任意）: 意図どおり 0 以外で終わる定期処理のラベル・タスク名。「状態」の「定期処理」の失敗に数えない（根拠に「既知 N 件を除く」と出る）。例 `{ "ignore_jobs": ["com.example.check-and-exit-1", "MyProbeTask"] }`
 - `schedule`（任意）: `{ "enabled": true, "probe_minutes": 60, "logs_minutes": 15 }`
 - `fleet`（任意）: 作者のフリートで使っている常時監視（katala-fleet、非公開）の概況を `op-agent` 経由で表示する連携。設定しなければ使わない
+
+対象台帳（対象・除外・未観測とその理由）は、画面の「状態」の「対象台帳」と `tune ledger`（`--json` で JSON）で見られる。対象は `online` で最後の分析が成功した機体、未観測は `online` なのに観測できていない機体（到達不能・まだ分析していない。理由つき）、除外は `online` 以外の機体（理由と判断日つき）。読み取りだけで、機体へ接続せず台帳も書き換えない。
 
 ## 開発
 

@@ -151,6 +151,25 @@ function stat(label, value, { sub = '', cls = '', ic = '' } = {}) {
   return `<div class="stat ${cls}"><div class="stat-k">${ic ? icon(ic) : ''}${esc(label)}</div><div class="stat-v">${value}</div>${sub ? `<div class="stat-s">${esc(sub)}</div>` : ''}</div>`;
 }
 
+// 台帳の運用状態（status）。online 以外の機体には接続しない（収集・自動スキャン・変更の対象外）
+const OP_LABEL = { retired: '退役', 'no-ssh': 'SSH 対象外', paused: '一時停止', 'out-of-scope': '対象外', invalid: '状態不明' };
+const opChip = (n) => (n.status && n.status !== 'online' ? UI.chip(OP_LABEL[n.status] || n.status, n.status === 'invalid' ? 'orange' : 'gray', { title: n.status_reason || '' }) : '');
+const LEDGER_TONE = { target: 'green', unobserved: 'orange', excluded: 'gray' };
+const LEDGER_LABEL = { target: '対象', unobserved: '未観測', excluded: '除外' };
+
+function ledgerSection(led) {
+  if (!led?.rows) return '';
+  const c = led.counts;
+  return `${UI.section('対象台帳', `対象 ${c.target}・未観測 ${c.unobserved}・除外 ${c.excluded}。運用状態は台帳（nodes.json）の status で決まり、到達できなくても自動では変わりません`)}
+    ${UI.table({
+      cols: [{ label: '機体' }, { label: '区分' }, { label: '運用状態' }, { label: '理由' }, { label: '判断日' }],
+      rows: led.rows,
+      empty: '台帳に機体がありません',
+      row: (r) => `<td class="nowrap">${esc(r.node_id)}</td><td class="nowrap">${UI.chip(LEDGER_LABEL[r.status] || r.status, LEDGER_TONE[r.status] || 'gray', { dot: true })}</td>`
+        + `<td class="nowrap">${esc(r.state_label || r.state)}</td><td class="muted">${esc(r.reason || '')}</td><td class="muted nowrap">${esc(r.date || '')}</td>`,
+    })}`;
+}
+
 function statusParts(c) {
   return [{ label: '異常', value: c.fail || 0, tone: 'crit' }, { label: '注意', value: c.warn || 0, tone: 'warn' }, { label: '正常', value: c.ok || 0, tone: 'ok' }, { label: '不明', value: c.unknown || 0, tone: 'unknown' }];
 }
@@ -167,7 +186,7 @@ function cardHtml(n) {
   const busy = state.busy.has(n.id);
   const cmp = r?.compare;
   const delta = cmp ? ` <span class="delta ${cmp.verdict}">${cmp.bench_ratio >= 1 ? '+' : ''}${((cmp.bench_ratio - 1) * 100).toFixed(0)}%</span>` : '';
-  const tags = [n.local ? UI.chip('この機体', 'blue') : '', n.shared ? UI.chip('提案のみ', 'gray') : ''].join('');
+  const tags = [n.local ? UI.chip('この機体', 'blue') : '', n.shared ? UI.chip('提案のみ', 'gray') : '', opChip(n)].join('');
   const sev = [c.critical ? UI.chip(`重大 ${c.critical}`, 'red') : '', c.warn ? UI.chip(`注意 ${c.warn}`, 'orange') : '', c.info ? UI.chip(`提案 ${c.info}`, 'blue') : '',
     r?.ok && !c.critical && !c.warn ? UI.chip('良好', 'green') : ''].join('');
   return `<div class="card${busy ? ' busy' : ''}" data-id="${esc(n.id)}" tabindex="0" role="button" aria-label="${esc(n.id)} の詳細を開く">
@@ -340,6 +359,34 @@ function findingHtml(f) {
   });
 }
 
+// WSL の中の観測。停止中は起動せず「未観測」（正常でも空でもない）。中を観測できたのは動いている distro だけ
+const WSL_STATE = { running: ['動いている', 'green'], stopped_unobserved: ['停止中（未観測）', 'gray'], unknown: ['状態を読めない', 'orange'] };
+const WSL_REASON = { 'not-running': '起動しないので観測していない', 'running-list-failed': '動いているかを読めなかった', 'internal-distro-skipped': 'Docker Desktop の内部 distro', 'observation-limit': '観測数の上限', timeout: '時間切れ', failed: '実行できなかった', 'no-data': '内側から値を読めなかった' };
+function wslHtml(d) {
+  const w = d.wsl;
+  const list = Array.isArray(w?.distros) ? w.distros : [];
+  if (!list.length) return w?.list_error ? `${UI.section('WSL の中')}<p class="note-line">distro の一覧を読めなかった（${esc(w.list_error)}）</p>` : '';
+  const gbOf = (mb) => `${(mb / 1024).toFixed(1)} GB`;
+  const inner = (x) => {
+    const i = x.inside;
+    if (!i) return `<span class="muted">${esc(WSL_REASON[x.reason] || x.reason || '')}</span>`;
+    const used = Math.max(0, i.mem_total_mb - i.mem_available_mb);
+    const top = (i.top || []).slice(0, 3).map((p) => `${esc(p.name)} ${esc(p.mem_mb)} MB`).join('、');
+    return `メモリ ${gbOf(used)} / ${gbOf(i.mem_total_mb)}${i.psi_some_avg10 != null ? `（PSI ${esc(i.psi_some_avg10)}%）` : ''}${top ? `<div class="muted">上位: ${top}</div>` : ''}`;
+  };
+  return `${UI.section('WSL の中', '停止中の distro は起動せず観測しません。メモリは WSL の VM 全体（distro は共有）')}
+    ${UI.table({
+      cols: [{ label: 'distro' }, { label: '状態' }, { label: '中の様子' }, { label: 'ディスク', cls: 'n' }],
+      rows: list,
+      row: (x) => {
+        const [label, tone] = WSL_STATE[x.state] || [x.state, 'gray'];
+        const disk = (x.inside?.disk || [])[0];
+        return `<td>${esc(x.name)}${x.default ? ' <span class="muted">· 既定</span>' : ''}</td><td class="nowrap">${UI.chip(label, tone, { dot: true })}</td><td>${inner(x)}</td>`
+          + `<td class="n">${disk ? `${esc(disk.free_pct)}% 空き` : ''}${x.vhdx_gb != null ? `<div class="muted">vhdx ${esc(x.vhdx_gb)} GB</div>` : ''}</td>`;
+      },
+    })}`;
+}
+
 function procsHtml(d) {
   const p = d.processes;
   const win = d.probe === 'windows';
@@ -361,7 +408,8 @@ function procsHtml(d) {
         + `<td class="n">${cpuOf(x) == null ? '—' : cpuOf(x).toFixed(0) + '%' + Charts.dataBar(cpuOf(x), maxCpu, { tone: cpuOf(x) >= 80 ? 'warn' : 'neutral' })}</td>`
         + `${win ? `<td class="n">${esc(x.avg_core ?? '-')}%</td>` : `<td class="muted">${esc(x.etime)}</td>`}<td class="n">${esc(x.mem_mb)} MB</td>`,
     })}
-    <p class="note-line">全 ${esc(p.count ?? '-')} プロセス · AI エージェント ${esc(p.agent_processes ?? '-')}</p>`;
+    <p class="note-line">全 ${esc(p.count ?? '-')} プロセス · AI エージェント ${esc(p.agent_processes ?? '-')}</p>
+    ${wslHtml(d)}`;
 }
 
 function machineHtml(d, r) {
@@ -450,6 +498,7 @@ function matrixCell(x) {
 async function renderStatus() {
   const t = ticket();
   const st = state.status = await window.tune.status();
+  const led = typeof window.tune.ledger === 'function' ? await window.tune.ledger().catch(() => null) : null;
   if (stale(t)) return;
   renderSidebar();
   const c = st.counts;
@@ -497,6 +546,7 @@ async function renderStatus() {
       cols: nodeIds.map((id) => ({ key: id, html: `<button data-goto="${esc(id)}">${esc(id)}</button>` })),
       cell: (row, col) => matrixCell(byNode[col.key][row.key]),
     }) : UI.empty('まだ機体の状態がありません。分析すると表示します。')}
+    ${ledgerSection(led)}
     ${UI.section('アプリの機能')}
     <div class="list">${app.map((x) => `<div class="li">${UI.status(x.status)}<div class="li-main"><div class="li-title"><span class="node">${esc(x.name)}</span></div><div class="li-sub">${esc(x.detail || '')}</div></div><span class="right">${esc(ago(x.since))}から</span></div>`).join('')}</div>
     ${UI.section('状態の変化', '変わったときだけ記録')}

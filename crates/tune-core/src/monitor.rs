@@ -72,6 +72,9 @@ pub fn set_settings(db: &Store, cfg: &Config, patch: &Value) -> Result<Settings,
         Some(Value::String(h)) if h.is_empty() => s.hub = None,
         Some(Value::String(h)) => {
             let n = cfg.node(h).ok_or_else(|| format!("台帳に無い機体: {h}"))?;
+            if let Some(err) = n.refusal() {
+                return Err(err);
+            }
             if n.local {
                 return Err("この機体はハブにできない（自分から写すことになる）".into());
             }
@@ -288,6 +291,9 @@ pub async fn pull(engine: &Engine) -> Result<Value, String> {
     let t0 = now_ms();
     let (mut rows, mut snaps, mut pages) = (0u64, 0u64, 0usize);
     let res: Result<Value, String> = async {
+        if let Some(err) = hub.refusal() {
+            return Err(err);
+        }
         let mut last = Value::Null;
         while pages < PULL_MAX_PAGES {
             let cursor = engine.with_db(|d| d.get_meta("hubCursor"))?.and_then(|v| v.as_i64()).unwrap_or(0);
@@ -401,13 +407,14 @@ pub async fn run(
                 event(json!({ "pulled": true }));
             }
         }
-        let cfg = engine.config();
+        let cfg = engine.reload_config();
+        live.retain_active(&cfg.nodes);
         if collect {
             // 流れていれば合図、止まっていれば流し直す。つなぎ直しても続かなかった機体は 5 分おきにだけ試す
             let targets: Vec<Node> = cfg
                 .nodes
                 .iter()
-                .filter(|n| n.is_mac() || n.is_windows())
+                .filter(|n| n.is_active() && (n.is_mac() || n.is_windows()))
                 .filter(|n| {
                     let down = live.brief(&n.id).is_some_and(|b| b["state"] == "stopped" && b["reason"] == "disconnected");
                     if !down {
@@ -668,6 +675,21 @@ mod tests {
         assert!(hub_fresh(&db, now_ms()) && !hub_analysis_fresh(&db, now_ms()));
         db.set_meta("hubPull", &json!({"ok": true, "fresh": true, "snapshot_fresh": true, "at": now_ms()})).unwrap();
         assert!(hub_analysis_fresh(&db, now_ms()));
+    }
+
+    #[test]
+    fn excluded_nodes_cannot_be_selected_as_hubs() {
+        let db = Store::open_in_memory().unwrap();
+        for status in ["retired", "no-ssh", "paused", "out-of-scope", "invalid"] {
+            let cfg = crate::nodes::parse_config(
+                &json!({"nodes": [{"id": "hub", "alias": "hub", "os": "macos", "status": status}]}).to_string(),
+                std::path::Path::new("x.json"),
+                "h",
+            )
+            .unwrap();
+            assert_eq!(set_settings(&db, &cfg, &json!({"hub": "hub"})).unwrap_err(), cfg.node("hub").unwrap().refusal().unwrap());
+            assert_eq!(settings(&db).hub, None);
+        }
     }
 
     #[test]

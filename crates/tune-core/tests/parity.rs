@@ -375,6 +375,37 @@ fn fixtures() -> Vec<(Value, Value)> {
         ),
         (win_fixture(json!({ "power": { "plan_guid": bal, "plan_name": "バランス", "plans": [bal] } })), json!({})),
         (mac_fixture(json!({ "disk": [{ "mount": "/", "total_gb": 460, "free_gb": 108, "free_pct": 23.4, "raw_free_gb": 19 }] })), json!({})),
+        // WSL の中の観測（running は中を観測、stopped_unobserved は起動も実行もしない、一覧を読めなければ unknown）
+        (
+            win_fixture(json!({
+                "wsl": { "config": true, "memory": "24GB", "distros": [
+                    { "name": "dev-a", "default": true, "version": 2, "state": "running", "observed": true, "reason": null, "inside": { "mem_total_mb": 24000, "mem_available_mb": 1000, "psi_some_avg10": 12.5, "top": [] } },
+                    { "name": "dev-b", "default": false, "version": 2, "state": "running", "observed": true, "reason": null, "inside": { "mem_total_mb": 24000, "mem_available_mb": 1100 } }
+                ] },
+                "processes": { "top_cpu": [], "apps": [{ "app": "vmmemWSL", "mem_mb": 23000, "count": 1 }], "apps_cpu": [] }
+            })),
+            json!({}),
+        ),
+        (
+            win_fixture(json!({
+                "wsl": { "config": true, "memory": "24GB", "distros": [
+                    { "name": "dev-a", "default": true, "version": 2, "state": "running", "observed": true, "reason": null, "inside": { "mem_total_mb": 24000, "mem_available_mb": 20000 } },
+                    { "name": "old", "default": false, "version": 2, "state": "stopped_unobserved", "observed": false, "reason": "not-running", "inside": null },
+                    { "name": "docker-desktop", "default": false, "version": 2, "state": "running", "observed": false, "reason": "internal-distro-skipped", "inside": null }
+                ] },
+                "processes": { "top_cpu": [], "apps": [{ "app": "vmmemWSL", "mem_mb": 20000, "count": 1 }], "apps_cpu": [] }
+            })),
+            json!({}),
+        ),
+        (
+            win_fixture(json!({ "wsl": { "config": false, "memory": null, "distros": [
+                { "name": "dev-a", "state": "unknown", "observed": false, "reason": "running-list-failed", "inside": null },
+                { "name": "dev-b", "state": "running", "observed": false, "reason": "timeout", "inside": null },
+                { "name": "dev-c", "state": "running", "observed": false, "reason": "something-else", "inside": { "mem_total_mb": 0, "mem_available_mb": 5 } }
+            ] } })),
+            json!({}),
+        ),
+        (win_fixture(json!({ "wsl": { "config": false, "memory": null, "installed": true, "listed": true, "distros": [] } })), json!({})),
     ]
 }
 

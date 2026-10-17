@@ -624,6 +624,9 @@ fn local_native() -> Option<PathBuf> {
 /// 機体ごとの起動方法。macOS / Windows とも標準入力でスクリプトを渡す。
 /// 渡した後も stdin を開き、停止時に閉じる。SSH は多重化しない。
 pub fn launch(node: &Node, o: &Opts) -> Result<Launch, String> {
+    if let Some(refused) = node.refusal() {
+        return Err(refused);
+    }
     if node.is_mac() {
         let a = format!("interval={} procs={} max={} watch=1", secs(o.interval), secs(o.procs_every), secs(o.sampler_max_age));
         let boot = python_boot(MAC_LIVE.len());
@@ -807,6 +810,8 @@ pub enum Stop {
     AppExit,
     /// サンプラーを入れ替えたので、つなぎ直す（常時監視が次の合図で流し直す）
     Restart,
+    /// 台帳から削除されたか、運用対象外になった
+    Excluded,
 }
 
 impl Stop {
@@ -819,6 +824,7 @@ impl Stop {
             Stop::Limit => "limit",
             Stop::AppExit => "app_exit",
             Stop::Restart => "restart",
+            Stop::Excluded => "excluded",
         }
     }
 
@@ -831,6 +837,7 @@ impl Stop {
             Stop::Limit => format!("同時に流せるのは {} 台まで", o.max_streams),
             Stop::AppExit => "アプリを終了した".into(),
             Stop::Restart => "サンプラーを入れ替えたので、つなぎ直す".into(),
+            Stop::Excluded => "台帳で運用対象外になったので収集を止めた".into(),
         }
     }
 }
@@ -1000,6 +1007,8 @@ impl Live {
     /// 戻り値: `{ started, running, refused: [{ id, reason, detail }], limit, snapshot: { id: 画面へ渡す形 } }`。
     /// unknown は台帳に無かった id（理由つきで断る）。非同期の実行環境（tokio）の中から呼ぶ
     pub fn start(self: &Arc<Self>, nodes: &[Node], unknown: &[String]) -> Value {
+        let excluded: Vec<String> = nodes.iter().filter(|n| !n.is_active()).map(|n| n.id.clone()).chain(unknown.iter().cloned()).collect();
+        self.stop(Some(&excluded), Stop::Excluded);
         let now = Instant::now();
         let mut st = self.lock();
         let (mut started, mut running, mut refused) = (Vec::new(), Vec::new(), Vec::new());
@@ -1008,6 +1017,11 @@ impl Live {
         }
         let mut active = st.streams.values().filter(|s| !s.stopping).count();
         for n in nodes {
+            // 運用対象でない機体（retired など）には接続しない
+            if let Some(detail) = n.refusal() {
+                refused.push(json!({ "id": n.id, "reason": "excluded", "detail": detail }));
+                continue;
+            }
             if st.closed {
                 refused.push(json!({ "id": n.id, "reason": Stop::AppExit.code(), "detail": Stop::AppExit.detail(&self.opts) }));
                 continue;
@@ -1066,6 +1080,12 @@ impl Live {
         let mut v: Vec<String> = self.lock().streams.iter().filter(|(_, s)| !s.stopping).map(|(k, _)| k.clone()).collect();
         v.sort();
         v
+    }
+
+    /// 最新の全件台帳から外れた既存ストリームも止める（常時監視・画面の合図で再確認）
+    pub fn retain_active(&self, nodes: &[Node]) {
+        let excluded: Vec<String> = self.active().into_iter().filter(|id| !nodes.iter().any(|n| n.id == *id && n.is_active())).collect();
+        self.stop(Some(&excluded), Stop::Excluded);
     }
 
     /// 機体ごとの段階と保持している点の数（確認用）

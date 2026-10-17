@@ -2,7 +2,8 @@
 'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
-const { createHash, createPublicKey, verify: verifyEd25519 } = require('node:crypto');
+const { createHash, createPublicKey, getHashes, verify: verifyEd25519 } = require('node:crypto');
+const { blake2b512 } = require('./blake2b');
 const { SEMVER } = require('./version');
 
 const TAURI_CONF = path.join(__dirname, '..', 'src-tauri', 'tauri.conf.json');
@@ -17,6 +18,7 @@ const TAURI_CONF = path.join(__dirname, '..', 'src-tauri', 'tauri.conf.json');
 const ED25519_SPKI = Buffer.from('302a300506032b6570032100', 'hex');
 const UNTRUSTED = 'untrusted comment: ';
 const TRUSTED = 'trusted comment: ';
+const prehash = getHashes().includes('blake2b512') ? (data) => createHash('blake2b512').update(data).digest() : blake2b512;
 
 // パディングつきの標準の base64 だけを受け付ける（Buffer.from は不正な文字を黙って読み飛ばすので、読み直して一致を見る）
 function strictBase64(text, what) {
@@ -50,7 +52,7 @@ function parseSignature(b64) {
 function verifySignature(data, sigB64, pub, version) {
   const s = parseSignature(sigB64);
   if (!s.keyId.equals(pub.keyId)) throw new Error(`signature: key ID ${s.keyId.toString('hex')} does not match the public key`);
-  const message = s.prehashed ? createHash('blake2b512').update(data).digest() : data;
+  const message = s.prehashed ? prehash(data) : data;
   if (!verifyEd25519(null, message, pub.key, s.signature)) throw new Error('signature: does not verify for this file');
   if (!verifyEd25519(null, Buffer.concat([s.signature, Buffer.from(s.trusted, 'utf8')]), pub.key, s.global)) throw new Error('signature: global signature (trusted comment) does not verify');
   if (version != null) {

@@ -68,7 +68,7 @@ test('host missing samples and app totals remain unknown instead of zero', () =>
 test('CPU fix preserves PS5.1 ASCII/BOM and NoNetwork switch', () => {
   assert.deepEqual([...probe.subarray(0, 3)], [0xef, 0xbb, 0xbf]);
   assert.ok(probe.subarray(3).every(byte => byte < 128));
-  assert.match(source, /param\(\[switch\]\$NoNetwork\)/);
+  assert.match(source, /param\(\[switch\]\$NoNetwork,\s*\[switch\]\$ObserveWsl\)/);
 });
 
 test('PS5.1 executes actual isolated CPU helpers with synthetic samples', { skip: process.platform !== 'win32' }, () => {

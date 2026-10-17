@@ -138,6 +138,10 @@ contextBridge.exposeInMainWorld('tune', {
   onLive: (fn) => { live.fns.push(fn); },
   config: async () => clone(config),
   last: async () => clone(results),
+  ledger: async () => ({
+    rows: config.nodes.map((n) => ({ node_id: n.id, os: n.os, state: n.status || 'online', state_label: '運用中', status: 'target', reason: null, last_ok_at: NOW })),
+    counts: { target: config.nodes.length, unobserved: 0, excluded: 0, total: config.nodes.length },
+  }),
   probe: async (ids) => {
     const targets = results.filter((r) => !ids?.length || ids.includes(r.node_id));
     await wait(1500);

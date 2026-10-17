@@ -36,6 +36,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: .\test\win-logons-regression.ps1
+      - name: Windows WSL observation regression
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: .\test\win-wsl-regression.ps1
       - name: Windows CPU sampling regression
         if: runner.os == 'Windows'
         shell: powershell
