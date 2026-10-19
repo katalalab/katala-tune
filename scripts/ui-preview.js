@@ -72,6 +72,24 @@ function partsPage() {
 // 場面。js を順に実行してから撮る。slices は長い画面を何枚に分けて撮るか
 const SCENES = [
   { name: 'overview', js: [click('[data-view="overview"]')], slices: 3 },
+  { name: 'overview-coverage', js: [`window.overviewBackup = structuredClone({ nodes: state.nodes, results: state.results }); state.nodes.find(n => n.id === 'build-mini').status = 'retired'; delete state.results['studio-mac']; state.results['air-m3'].at = Date.now() - 4 * 3600e3; renderOverview();`],
+    check: `['fresh', 'stale', 'failed', 'missing', 'excluded'].every((key, i) => Number(document.querySelector('[data-coverage="' + key + '"] b').textContent.replace('台', '').trim()) === [2, 1, 1, 1, 1][i])` },
+  { name: 'overview-restored', js: [`state.nodes = window.overviewBackup.nodes; state.results = window.overviewBackup.results; delete window.overviewBackup; renderOverview();`] },
+  { name: 'overview-search', js: [setInput('#overviewQ', 'gpu-tower')], wait: 700,
+    check: `document.querySelectorAll('.gallery .card').length === 1 && document.querySelector('.gallery .card')?.dataset.id === 'gpu-tower'` },
+  { name: 'overview-empty', js: [setInput('#overviewQ', 'no-such-machine')], wait: 700,
+    check: `!document.querySelector('.gallery .card') && !!document.querySelector('#overviewReset')` },
+  { name: 'overview-failed', js: [click('#overviewReset'), click('[data-coverage="failed"]')],
+    check: `document.querySelector('[data-coverage="failed"]').getAttribute('aria-pressed') === 'true' && document.querySelectorAll('.gallery .card').length === 1` },
+  { name: 'overview-os', js: [click('#overviewReset'), setSelect('#overviewOS', 'windows')],
+    check: `document.querySelectorAll('.gallery .card').length === 3` },
+  { name: 'overview-reset', js: [click('#overviewReset')],
+    check: `document.querySelectorAll('.gallery .card').length === 6 && document.querySelector('#overviewQ').value === ''` },
+  { name: 'overview-reset-pending', js: [setInput('#overviewQ', 'no-such-machine'), click('#overviewReset')], wait: 700,
+    check: `document.querySelectorAll('.gallery .card').length === 6 && document.querySelector('#overviewQ').value === '' && document.activeElement.id === 'overviewQ'` },
+  { name: 'overview-focused-freshness', js: [setInput('#overviewQ', 'studio-mac'), `window.overviewBackup = structuredClone(state.results); state.results['studio-mac'].at = Date.now() - 181 * 60000; document.querySelector('#overviewQ').setSelectionRange(1, 4); refreshOverview();`], wait: 700,
+    check: `document.querySelector('[data-coverage="stale"] b').textContent.trim().startsWith('1') && document.activeElement.id === 'overviewQ' && document.activeElement.selectionStart === 1 && document.activeElement.selectionEnd === 4 && document.querySelectorAll('.gallery .card').length === 1` },
+  { name: 'overview-freshness-restored', js: [`state.results = window.overviewBackup; delete window.overviewBackup; document.querySelector('#overviewReset').click();`] },
   { name: 'status', js: [click('[data-view="status"]')], slices: 4 },
   { name: 'resources', js: [click('[data-view="resources"]')] },
   { name: 'procs', js: [click('[data-view="procs"]')], slices: 2 },
@@ -120,8 +138,8 @@ const SCENES = [
 // Windows の配置（キャプションボタンの逃げ）と、最小のウィンドウ幅。electron は AI の API が「未対応」を返す Electron 版の見え方
 const VARIANTS = [
   { key: 'mac', platform: 'darwin', width: 1440, height: 920, scenes: SCENES },
-  { key: 'win', platform: 'win32', width: 1440, height: 920, scenes: SCENES.filter((s) => ['overview', 'node-findings', 'logs'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
-  { key: 'narrow', platform: 'darwin', width: 1040, height: 700, scenes: SCENES.filter((s) => ['overview', 'status', 'resources', 'jobs', 'logs', 'node-findings', 'node-history', 'tools', 'tools-dogu-empty', 'tools-dogu', 'ai', 'ai-trace-day', 'ai-trace-file', 'security', 'probing', 'resources-live', 'node-live'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
+  { key: 'win', platform: 'win32', width: 1440, height: 920, scenes: SCENES.filter((s) => ['overview', 'overview-coverage', 'overview-restored', 'overview-search', 'overview-empty', 'overview-failed', 'overview-os', 'overview-reset', 'overview-reset-pending', 'overview-focused-freshness', 'overview-freshness-restored', 'node-findings', 'logs'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
+  { key: 'narrow', platform: 'darwin', width: 1040, height: 700, scenes: SCENES.filter((s) => ['overview', 'overview-coverage', 'overview-restored', 'overview-search', 'overview-empty', 'overview-failed', 'overview-os', 'overview-reset', 'overview-reset-pending', 'overview-focused-freshness', 'overview-freshness-restored', 'status', 'resources', 'jobs', 'logs', 'node-findings', 'node-history', 'tools', 'tools-dogu-empty', 'tools-dogu', 'ai', 'ai-trace-day', 'ai-trace-file', 'security', 'probing', 'resources-live', 'node-live'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
   { key: 'electron', platform: 'darwin', width: 1440, height: 920, query: { electron: '1' }, scenes: SCENES.filter((s) => ['ai', 'security'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
 ];
 
@@ -186,6 +204,7 @@ async function runVariant(theme, v) {
     }
     for (const js of s.js) { await wc.executeJavaScript(js); await wait(60); }
     await wait(s.wait ?? 350);
+    if (s.check && !await wc.executeJavaScript(s.check)) throw new Error(`UI assertion failed: ${tag}/${s.name}`);
     await shoot(wc, `${theme}-${v.key}-${String(i).padStart(2, '0')}-${s.name}`, s.slices, s.scrollTo);
   }
   await wait(1700); // 分析中の場面の後始末（プレビューの分析は 1.5 秒で終わる）
@@ -208,7 +227,7 @@ async function main() {
 }
 
 app.setName('Katala Tune Preview');
-app.setPath('userData', path.join(os.tmpdir(), 'katala-tune-ui-preview'));
+app.setPath('userData', fs.mkdtempSync(path.join(os.tmpdir(), 'katala-tune-ui-preview-')));
 if (!SHOW) app.dock?.hide();
 app.on('window-all-closed', () => {});
 app.whenReady().then(main).then((code) => app.exit(code), (e) => { console.error(e); app.exit(2); });

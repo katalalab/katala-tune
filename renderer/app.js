@@ -43,6 +43,7 @@ const state = {
   jobFilter: { node_id: '', failing: false, q: '' },
   procFilter: { node_id: '', q: '', sort: 'cpu' },
   status: null,
+  overviewFilter: { q: '', os: '', status: 'all' },
 };
 
 // 非同期で描く画面が、待っている間に別の画面へ移ったら古い結果で上書きしない
@@ -78,14 +79,15 @@ function bindSearch(sel, view, apply, rerender, ms = 250) {
   let t;
   $(sel).oninput = (e) => {
     clearTimeout(t);
+    apply(e.target.value);
     t = setTimeout(async () => {
-      apply(e.target.value);
-      if (state.view !== view) return;
+      if (!e.target.isConnected || state.view !== view) return;
       await rerender();
       const i = $(sel);
       if (i) { i.focus(); i.setSelectionRange(i.value.length, i.value.length); }
     }, ms);
   };
+  return () => clearTimeout(t);
 }
 
 function page(html) { $('#page').innerHTML = `<div class="page-inner">${html}</div>`; }
@@ -174,7 +176,10 @@ function statusParts(c) {
   return [{ label: '異常', value: c.fail || 0, tone: 'crit' }, { label: '注意', value: c.warn || 0, tone: 'warn' }, { label: '正常', value: c.ok || 0, tone: 'ok' }, { label: '不明', value: c.unknown || 0, tone: 'unknown' }];
 }
 
-function cardHtml(n) {
+const COVERAGE_LABEL = { fresh: '新鮮', stale: '古い・時刻不明', failed: '取得失敗', missing: '未分析', excluded: '対象外' };
+const COVERAGE_TONE = { fresh: 'green', stale: 'orange', failed: 'red', missing: 'gray', excluded: 'gray' };
+
+function cardHtml(n, coverage) {
   const r = state.results[n.id];
   const d = r?.ok ? r.data : null;
   const fl = fleetNode(n.id);
@@ -188,7 +193,7 @@ function cardHtml(n) {
   const delta = cmp ? ` <span class="delta ${cmp.verdict}">${cmp.bench_ratio >= 1 ? '+' : ''}${((cmp.bench_ratio - 1) * 100).toFixed(0)}%</span>` : '';
   const tags = [n.local ? UI.chip('この機体', 'blue') : '', n.shared ? UI.chip('提案のみ', 'gray') : '', opChip(n)].join('');
   const sev = [c.critical ? UI.chip(`重大 ${c.critical}`, 'red') : '', c.warn ? UI.chip(`注意 ${c.warn}`, 'orange') : '', c.info ? UI.chip(`提案 ${c.info}`, 'blue') : '',
-    r?.ok && !c.critical && !c.warn ? UI.chip('良好', 'green') : ''].join('');
+    r?.ok && !c.critical && !c.warn && (!coverage || coverage === 'fresh') ? UI.chip('良好', 'green') : ''].join('');
   return `<div class="card${busy ? ' busy' : ''}" data-id="${esc(n.id)}" tabindex="0" role="button" aria-label="${esc(n.id)} の詳細を開く">
     <div class="card-top">
       <div class="card-id"><div class="card-name">${icon(osIcon(n))}<span>${esc(n.id)}</span></div>
@@ -201,34 +206,40 @@ function cardHtml(n) {
       ${Charts.meter(diskUsed, { label: 'ディスク', ...TH.disk, text: disk ? `空き ${disk.free_gb} GB` : diskUsed != null ? `${Math.round(diskUsed)}%` : '-' })}
     </div>
     <div class="card-hw">${esc(d ? `${d.host.cpu} · ${d.host.cores} スレッド · ${d.memory.total_gb} GB` : n.os === 'macos' ? 'macOS' : 'Windows')}</div>
-    <div class="card-foot">${sev}${d?.bench ? `<span title="1スレッドの固定計算。小さいほど速い">計測 ${esc(d.bench.median_ms)} ms${delta}</span>` : ''}
+    <div class="card-foot">${coverage ? UI.chip(COVERAGE_LABEL[coverage], COVERAGE_TONE[coverage]) : ''}${sev}${d?.bench ? `<span title="1スレッドの固定計算。小さいほど速い">計測 ${esc(d.bench.median_ms)} ms${delta}</span>` : ''}
       <span class="right">${busy ? '分析中…' : r ? esc(ago(r.at)) : '未分析'}</span></div>
     ${r && !r.ok ? `<div class="err"><b>分析できませんでした${r.reason_text ? `（${esc(r.reason_text)}）` : ''}</b>\n${esc(r.error)}</div>` : ''}
   </div>`;
 }
 
 function renderOverview() {
+  const focused = document.activeElement;
+  const focusAttr = $('#page').contains(focused) && ['id', 'data-coverage', 'data-overview-status', 'data-id', 'data-view-link', 'data-goto'].find(attr => focused?.hasAttribute(attr));
+  const focusValue = focusAttr ? focused.getAttribute(focusAttr) : null;
+  const selection = typeof focused?.selectionStart === 'number' ? [focused.selectionStart, focused.selectionEnd, focused.selectionDirection] : null;
   ticket();
-  const rs = state.nodes.map((n) => state.results[n.id]).filter((r) => r?.ok);
-  const all = rs.flatMap((r) => r.findings);
+  const sch = state.status?.schedule || state.cfg.schedule;
+  const coverage = Overview.summarize(state.nodes, state.results, sch);
+  const shown = Overview.select(coverage.rows, state.overviewFilter);
+  const rs = coverage.current;
+  const all = rs.flatMap((r) => r.findings || []);
   const crit = all.filter((f) => f.severity === 'critical').length;
   const warn = all.filter((f) => f.severity === 'warn').length;
-  const avg = rs.length ? Math.round(rs.reduce((s, r) => s + r.score, 0) / rs.length) : null;
+  const avg = coverage.average;
   const last = Math.max(0, ...rs.map((r) => r.at || 0));
   const fl = state.fleet?.summary;
   const sc = state.status?.counts;
-  const sch = state.status?.schedule || state.cfg.schedule;
   const worst = rs.length ? rs.reduce((a, b) => (b.score < a.score ? b : a)) : null;
   setCrumbs([{ icon: 'overview', label: '概要' }]);
   page(`
-    ${UI.head({ icon: 'overview', title: '概要', desc: `${state.nodes.length} 台の機体の状態と、優先して見るもの。${last ? `最終分析は ${fmtTime(last)}（${ago(last)}）` : 'まだ分析していません'}${sch ? `。自動スキャンは${sch.enabled ? ` ${sch.probe_minutes} 分ごと` : 'オフ'}` : ''}。` })}
+    ${UI.head({ icon: 'overview', title: '概要', desc: `${state.nodes.length} 台の機体の状態と、優先して見るもの。${last ? `最終分析は ${fmtTime(last)}（${ago(last)}）` : '新鮮な分析結果はありません'}${sch ? `。自動スキャンは${sch.enabled ? ` ${sch.probe_minutes} 分ごと` : 'オフ'}` : ''}。` })}
     ${state.cfg.example ? UI.callout({ tone: 'orange', icon: 'info', title: '機体台帳がまだ見本のままです', body: `サイドバー下の「台帳を開く」で <code>${esc(state.cfg.file)}</code> を開き、~/.ssh/config の Host 名で機体を書いてください。保存したら「全機を分析」で読み直します。` }) : ''}
     ${state.cfg.error ? UI.callout({ tone: 'red', icon: 'alert', title: '台帳を読めません', body: esc(state.cfg.error) }) : ''}
-    <div class="summary">
-      <div class="summary-gauge">${Charts.gauge(avg, { label: '平均スコア', sub: worst && worst.score < 80 ? `最低 ${worst.node_id} ${worst.score}` : '' })}</div>
+    <div class="summary overview-summary">
+      <div class="summary-gauge">${Charts.gauge(avg, { label: '新鮮な結果の平均', sub: worst && worst.score < 80 ? `最低 ${worst.node_id} ${worst.score}` : '' })}</div>
       <div>
         <div class="stats">
-          ${stat('分析済み', `${rs.length}<small>/ ${state.nodes.length} 台</small>`, { sub: rs.length < state.nodes.length ? `${state.nodes.length - rs.length} 台は結果なし` : 'すべての機体', ic: 'machine' })}
+          ${stat('新鮮な分析', `${rs.length}<small>/ 対象 ${coverage.target} 台</small>`, { sub: `台帳 ${state.nodes.length} 台・対象外 ${coverage.counts.excluded} 台`, ic: 'machine' })}
           ${stat('重大', String(crit), { cls: crit ? 'crit' : '', sub: crit ? `${new Set(rs.filter((r) => counts(r).critical).map((r) => r.node_id)).size} 台` : 'なし', ic: 'alert' })}
           ${stat('注意', String(warn), { cls: warn ? 'warn' : '', sub: warn ? `${new Set(rs.filter((r) => counts(r).warn).map((r) => r.node_id)).size} 台` : 'なし', ic: 'info' })}
           ${fl ? stat('katala-fleet 要対応', esc(fl.attention), { ic: 'fleet' }) : ''}
@@ -236,19 +247,48 @@ function renderOverview() {
         ${sc ? `<div class="breakdown"><div class="bd-head"><span>状態の内訳（全機体とアプリの機能）</span><button class="link" data-view-link="status">「状態」を開く</button></div>${Charts.stacked(statusParts(sc), { label: '状態の内訳' })}</div>` : ''}
       </div>
     </div>
-    ${UI.section('機体', 'クリックで詳細')}
-    <div class="gallery">${state.nodes.map(cardHtml).join('')}</div>
-    ${crit + warn ? `${UI.section('優先して見るもの', '重大と注意。クリックで機体の所見へ')}${topFindings()}` : ''}`);
+    <section class="overview-coverage">
+    ${UI.section('分析の取得状況', `新鮮の基準は ${coverage.freshMinutes} 分以内（分析間隔の3倍）。古い結果と対象外は平均・所見件数に含めません`)}
+    <div class="coverage" role="group" aria-label="分析の取得状況で絞り込む">
+      ${Object.entries(coverage.counts).map(([key, count]) => `<button class="coverage-item tone-${COVERAGE_TONE[key]}" data-coverage="${key}" aria-pressed="${state.overviewFilter.status === key}"><span>${esc(COVERAGE_LABEL[key])}</span><b>${count}<small> 台</small></b></button>`).join('')}
+    </div>
+    </section>
+    ${UI.section('機体', 'クリックで詳細。検索と絞り込みは平均・全体の件数を変えません')}
+    <div class="filters">
+      ${UI.search({ id: 'overviewQ', label: '機体の検索', placeholder: '機体名・役割で検索', value: state.overviewFilter.q })}
+      ${UI.select({ id: 'overviewOS', label: 'OS', options: [['', 'すべてのOS'], ['macos', 'macOS'], ['windows', 'Windows']], value: state.overviewFilter.os })}
+      ${UI.seg({ attr: 'overview-status', options: [['all', 'すべて'], ['attention', '要対応']], value: state.overviewFilter.status })}
+      <span class="count" role="status">${shown.length} / ${state.nodes.length} 台</span>
+      <button class="btn ghost" id="overviewReset">絞り込みを解除</button>
+    </div>
+    ${shown.length ? `<div class="gallery">${shown.map(({ node, status }) => cardHtml(node, status)).join('')}</div>` : UI.empty(state.nodes.length ? '条件に一致する機体はありません。絞り込みを解除すると全機体を表示します。' : '台帳に機体がありません。「台帳を開く」から設定してください。')}
+    ${crit + warn ? `${UI.section('優先して見るもの', '新鮮な対象結果の重大と注意。クリックで機体の所見へ')}${topFindings(coverage.rows.filter(r => r.status === 'fresh').map(r => r.node.id))}` : ''}`);
   $$('.card').forEach((el) => {
     el.onclick = () => go('node:' + el.dataset.id);
     el.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go('node:' + el.dataset.id); } };
   });
   $$('[data-view-link]').forEach((el) => { el.onclick = () => go(el.dataset.viewLink); });
+  const cancelSearch = bindSearch('#overviewQ', 'overview', q => { state.overviewFilter.q = q; }, renderOverview);
+  const filter = (patch, focus) => {
+    cancelSearch();
+    state.overviewFilter = { ...state.overviewFilter, q: $('#overviewQ').value, ...patch };
+    renderOverview();
+    $(focus)?.focus();
+  };
+  $('#overviewOS').onchange = e => filter({ os: e.target.value }, '#overviewOS');
+  $$('[data-coverage]').forEach(el => { el.onclick = () => filter({ status: state.overviewFilter.status === el.dataset.coverage ? 'all' : el.dataset.coverage }, `[data-coverage="${el.dataset.coverage}"]`); });
+  $$('[data-overview-status]').forEach(el => { el.onclick = () => filter({ status: el.dataset.overviewStatus }, `[data-overview-status="${el.dataset.overviewStatus}"]`); });
+  $('#overviewReset').onclick = () => filter({ q: '', os: '', status: 'all' }, '#overviewQ');
   bindGoto();
+  if (focusAttr) {
+    const next = $(`#page [${focusAttr}="${CSS.escape(focusValue)}"]`);
+    next?.focus({ preventScroll: true });
+    if (next && selection) next.setSelectionRange(...selection);
+  }
 }
 
-function topFindings() {
-  const items = state.nodes.flatMap((n) => (state.results[n.id]?.findings || []).filter((f) => f.severity !== 'info').map((f) => ({ n, f })));
+function topFindings(ids = state.nodes.map(n => n.id)) {
+  const items = state.nodes.filter(n => ids.includes(n.id)).flatMap((n) => (state.results[n.id]?.findings || []).filter((f) => f.severity !== 'info').map((f) => ({ n, f })));
   items.sort((a, b) => (a.f.severity === 'critical' ? 0 : 1) - (b.f.severity === 'critical' ? 0 : 1));
   return `<div class="list">${items.slice(0, 12).map(({ n, f }) => `<div class="li" data-goto="${esc(n.id)}" tabindex="0">
       ${UI.chip(SEV_LABEL[f.severity], SEV_TONE[f.severity])}
@@ -961,6 +1001,14 @@ window.tune.onChecksUpdated(() => {
   }, 400);
 });
 window.tune.onNavigate((v) => go(v));
+
+// 収集通知がない間も鮮度を更新する。再描画時に操作中のフォーカスと選択範囲を戻す。
+function refreshOverview() {
+  if (state.cfg && state.view === 'overview' && document.visibilityState === 'visible') renderOverview();
+}
+setInterval(refreshOverview, 60000);
+document.addEventListener('visibilitychange', refreshOverview);
+
 
 window.tune.onProbeResult((r) => {
   state.results[r.node_id] = r;
