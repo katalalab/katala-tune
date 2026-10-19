@@ -1,0 +1,66 @@
+{
+  "schema": "task-completion.v1",
+  "tasks": [
+    {
+      "id": "review-example",
+      "goal": "レビュー画面の入力例を表示する",
+      "target": "repository",
+      "revision": "example-revision",
+      "delivery": "repository",
+      "gates": {
+        "implementation": {
+          "status": "pass",
+          "evidence": [{
+            "ref": "https://github.com/example/repository/pull/1",
+            "result": "pass",
+            "observed_at": "2026-01-01T00:00:00Z",
+            "revision": "example-revision",
+            "environment": "local"
+          }]
+        },
+        "verification": {
+          "status": "pass",
+          "evidence": [{
+            "ref": "https://github.com/example/repository/issues/1",
+            "result": "pass",
+            "observed_at": "2026-01-01T00:00:00Z",
+            "revision": "example-revision",
+            "environment": "local"
+          }]
+        },
+        "integration": {
+          "status": "pass",
+          "evidence": [{
+            "ref": "https://github.com/example/repository/pull/1",
+            "result": "pass",
+            "observed_at": "2026-01-01T00:00:00Z",
+            "revision": "example-revision",
+            "environment": "repository"
+          }]
+        },
+        "acceptance": {
+          "status": "pass",
+          "evidence": [{
+            "ref": "https://github.com/example/repository/issues/1",
+            "result": "pass",
+            "observed_at": "2026-01-01T00:00:00Z",
+            "revision": "example-revision",
+            "environment": "repository"
+          }]
+        }
+      },
+      "review": {
+        "status": "accepted",
+        "ref": "https://github.com/example/repository/pull/1",
+        "observed_at": "2026-01-01T00:00:00Z",
+        "revision": "example-revision",
+        "target": "repository"
+      }
+    }
+  ],
+  "coverage": {
+    "expected": ["repository"],
+    "observed": ["repository"],
+    "unobserved": []
+  }
+}

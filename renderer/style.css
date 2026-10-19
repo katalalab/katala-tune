@@ -624,3 +624,24 @@ td .databar { margin-top: 5px; }
   .overview-summary .stat-s { white-space: normal; overflow: visible; }
 }
 @media (max-width: 800px) { .coverage { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+/* ---- レビュー（renderer/review.js） ---- */
+.review-input, .review-source { margin: 18px 0; }
+.review-input label { display: block; margin-bottom: 7px; font-weight: 600; }
+.review-input input[type="file"] { max-width: 100%; }
+.review-task { margin: 28px 0; padding-top: 4px; border-top: 1px solid var(--line); }
+.review-task > h2 { font-size: 18px; overflow-wrap: anywhere; }
+.review-heading { margin: 20px 0 8px; font-size: 15px; }
+.review-gates { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; }
+.review-gate, .review-evidence { min-width: 0; padding: 10px; border: 1px solid var(--line); border-radius: 6px; }
+.review-gate h3, .review-evidence summary { margin: 0; font-size: 13px; cursor: pointer; }
+.review-gate p { margin: 7px 0; overflow-wrap: anywhere; }
+.review-evidence { margin-top: 8px; }
+.review-evidence-row { padding: 9px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.review-evidence-row:first-of-type { margin-top: 8px; }
+.review-warnings { margin-top: 8px; color: var(--orange); font-size: 12.5px; overflow-wrap: anywhere; }
+.review-coverage { display: grid; gap: 6px; padding: 10px; border: 1px solid var(--line); border-radius: 6px; overflow-wrap: anywhere; }
+.review-coverage summary { cursor: pointer; font-weight: 600; }
+.review-coverage-values { display: grid; gap: 6px; margin-top: 10px; }
+.review-pager { display: flex; align-items: center; gap: 8px; margin: 18px 0; font-size: 13px; color: var(--text2); }
+.review-fingerprint { width: min(100%, 38rem); font: 12px var(--mono); color: var(--text); background: var(--input); border: 1px solid var(--line2); border-radius: 4px; padding: 5px 7px; }
