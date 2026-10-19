@@ -1482,7 +1482,7 @@ mod tests {
             cleanup: None,
         })
         .unwrap();
-        let first_line_timeout = Opts::default().first_line_timeout;
+        let first_line_timeout = Duration::from_secs(15);
         let scope = match tokio::time::timeout(first_line_timeout, source.lines.recv()).await {
             Ok(Some(scope)) => scope,
             Ok(None) => panic!("PowerShell stdout closed before the first line"),
@@ -1502,6 +1502,15 @@ mod tests {
         assert_eq!(ended.code, Some(0), "closing the source should close stdin and let PowerShell exit: {ended:?}");
         assert!(ended.err.contains("EEEE"), "spawn must drain the PowerShell stderr flood: {ended:?}");
         assert!(ended.err.len() <= 4096, "spawn must retain only the bounded stderr tail: {} bytes", ended.err.len());
+    }
+
+    /// Bootstrap must retain its remaining-byte loop so short pipe reads cannot truncate the script.
+    #[test]
+    fn windows_boot_accumulates_partial_reads_until_script_length() {
+        let script_len = 7;
+        let boot = windows_boot(script_len, "");
+        let read_loop = format!(";while($p -lt {script_len}){{$r=$i.Read($b,$p,({script_len}-$p));if($r -eq 0){{exit 2}};$p+=$r}};");
+        assert!(boot.contains(&read_loop), "bootstrap must read remaining bytes after each partial read: {boot}");
     }
 
     // ---- 偽のサンプラー（一定間隔で行を出すローカルのスクリプト）で、開始・停止・自動停止・上限・つなぎ直しを確かめる ----
