@@ -1470,7 +1470,7 @@ mod tests {
     #[tokio::test]
     async fn windows_boot_preserves_script_scope_and_stdin_lifetime() {
         use tokio::io::{AsyncBufReadExt, BufReader};
-        let script = b"$value=42;function Scope {$script:value};[Console]::WriteLine((Scope));$io=[Console]::OpenStandardInput();[Console]::WriteLine($io.ReadByte());[Console]::WriteLine($io.ReadByte())";
+        let script = b"[Console]::Error.Write(('E' * 65536));$value=42;function Scope {$script:value};[Console]::WriteLine((Scope));$io=[Console]::OpenStandardInput();[Console]::WriteLine($io.ReadByte());[Console]::WriteLine($io.ReadByte())";
         let boot = windows_boot(script.len(), "");
         let utf16: Vec<u8> = boot.encode_utf16().flat_map(u16::to_le_bytes).collect();
         let mut child = collect::command("powershell.exe")
@@ -1481,6 +1481,7 @@ mod tests {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
+        let stderr_task = tokio::spawn(read_tail(child.stderr.take(), 4096));
         let mut input = child.stdin.take().unwrap();
         for chunk in script.chunks(7) {
             input.write_all(chunk).await.unwrap();
@@ -1489,7 +1490,17 @@ mod tests {
         input.write_all(b"Q").await.unwrap();
         input.flush().await.unwrap();
         let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
-        let scope = tokio::time::timeout(Duration::from_secs(15), output.next_line()).await.unwrap().unwrap();
+        // PowerShellの大きなstderr出力も同時に読み、未読pipeによる停止を防ぐ。
+        let scope = match tokio::time::timeout(Duration::from_secs(60), output.next_line()).await {
+            Ok(Ok(scope)) => scope,
+            Ok(Err(error)) => panic!("PowerShell stdout read failed: {error}"),
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                let stderr = tokio::time::timeout(Duration::from_secs(2), stderr_task).await.ok().and_then(Result::ok).unwrap_or_default();
+                panic!("PowerShell did not produce its first line within 60 seconds; stderr tail: {stderr}");
+            }
+        };
         assert_eq!(scope.as_deref(), Some("42"), "dot-source must preserve $script scope");
         let tail = tokio::time::timeout(Duration::from_secs(5), output.next_line()).await.unwrap().unwrap();
         assert_eq!(tail.as_deref(), Some("81"), "bootstrap must consume exactly script.len() bytes");
@@ -1499,6 +1510,9 @@ mod tests {
         assert_eq!(eof.as_deref(), Some("-1"));
         let status = tokio::time::timeout(Duration::from_secs(5), child.wait()).await.unwrap().unwrap();
         assert!(status.success());
+        let stderr = tokio::time::timeout(Duration::from_secs(2), stderr_task).await.unwrap().unwrap();
+        assert!(stderr.contains("EEEE"), "stderr flood should be drained: {stderr}");
+        assert!(stderr.len() <= 8192, "stderr tail should remain bounded");
     }
 
     // ---- 偽のサンプラー（一定間隔で行を出すローカルのスクリプト）で、開始・停止・自動停止・上限・つなぎ直しを確かめる ----
