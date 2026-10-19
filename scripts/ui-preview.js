@@ -85,8 +85,14 @@ const SCENES = [
     check: `document.querySelectorAll('.gallery .card').length === 3` },
   { name: 'overview-reset', js: [click('#overviewReset')],
     check: `document.querySelectorAll('.gallery .card').length === 6 && document.querySelector('#overviewQ').value === ''` },
+  { name: 'overview-search-selection', js: [setInput('#overviewQ', 'studio-mac'), `document.querySelector('#overviewQ').setSelectionRange(1, 4);`], wait: 700,
+    check: `document.activeElement.id === 'overviewQ' && document.activeElement.selectionStart === 1 && document.activeElement.selectionEnd === 4 && document.querySelectorAll('.gallery .card').length === 1` },
   { name: 'overview-reset-pending', js: [setInput('#overviewQ', 'no-such-machine'), click('#overviewReset')], wait: 700,
     check: `document.querySelectorAll('.gallery .card').length === 6 && document.querySelector('#overviewQ').value === '' && document.activeElement.id === 'overviewQ'` },
+  { name: 'overview-attention', js: [click('[data-overview-status="attention"]')],
+    check: `document.querySelector('[data-overview-status="attention"]').getAttribute('aria-pressed') === 'true' && document.querySelector('[data-overview-status="all"]').getAttribute('aria-pressed') === 'false' && document.querySelectorAll('.gallery .card').length === 5` },
+  { name: 'overview-attention-reset', js: [click('#overviewReset')],
+    check: `document.querySelector('[data-overview-status="all"]').getAttribute('aria-pressed') === 'true' && document.querySelector('[data-overview-status="attention"]').getAttribute('aria-pressed') === 'false'` },
   { name: 'overview-focused-freshness', js: [setInput('#overviewQ', 'studio-mac'), `window.overviewBackup = structuredClone(state.results); state.results['studio-mac'].at = Date.now() - 181 * 60000; document.querySelector('#overviewQ').setSelectionRange(1, 4); refreshOverview();`], wait: 700,
     check: `document.querySelector('[data-coverage="stale"] b').textContent.trim().startsWith('1') && document.activeElement.id === 'overviewQ' && document.activeElement.selectionStart === 1 && document.activeElement.selectionEnd === 4 && document.querySelectorAll('.gallery .card').length === 1` },
   { name: 'overview-freshness-restored', js: [`state.results = window.overviewBackup; delete window.overviewBackup; document.querySelector('#overviewReset').click();`] },
@@ -138,8 +144,8 @@ const SCENES = [
 // Windows の配置（キャプションボタンの逃げ）と、最小のウィンドウ幅。electron は AI の API が「未対応」を返す Electron 版の見え方
 const VARIANTS = [
   { key: 'mac', platform: 'darwin', width: 1440, height: 920, scenes: SCENES },
-  { key: 'win', platform: 'win32', width: 1440, height: 920, scenes: SCENES.filter((s) => ['overview', 'overview-coverage', 'overview-restored', 'overview-search', 'overview-empty', 'overview-failed', 'overview-os', 'overview-reset', 'overview-reset-pending', 'overview-focused-freshness', 'overview-freshness-restored', 'node-findings', 'logs'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
-  { key: 'narrow', platform: 'darwin', width: 1040, height: 700, scenes: SCENES.filter((s) => ['overview', 'overview-coverage', 'overview-restored', 'overview-search', 'overview-empty', 'overview-failed', 'overview-os', 'overview-reset', 'overview-reset-pending', 'overview-focused-freshness', 'overview-freshness-restored', 'status', 'resources', 'jobs', 'logs', 'node-findings', 'node-history', 'tools', 'tools-dogu-empty', 'tools-dogu', 'ai', 'ai-trace-day', 'ai-trace-file', 'security', 'probing', 'resources-live', 'node-live'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
+  { key: 'win', platform: 'win32', width: 1440, height: 920, scenes: SCENES.filter((s) => ['overview', 'overview-coverage', 'overview-restored', 'overview-search', 'overview-empty', 'overview-failed', 'overview-os', 'overview-reset', 'overview-search-selection', 'overview-reset-pending', 'overview-attention', 'overview-attention-reset', 'overview-focused-freshness', 'overview-freshness-restored', 'node-findings', 'logs'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
+  { key: 'narrow', platform: 'darwin', width: 1040, height: 700, scenes: SCENES.filter((s) => ['overview', 'overview-coverage', 'overview-restored', 'overview-search', 'overview-empty', 'overview-failed', 'overview-os', 'overview-reset', 'overview-search-selection', 'overview-reset-pending', 'overview-attention', 'overview-attention-reset', 'overview-focused-freshness', 'overview-freshness-restored', 'status', 'resources', 'jobs', 'logs', 'node-findings', 'node-history', 'tools', 'tools-dogu-empty', 'tools-dogu', 'ai', 'ai-trace-day', 'ai-trace-file', 'security', 'probing', 'resources-live', 'node-live'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
   { key: 'electron', platform: 'darwin', width: 1440, height: 920, query: { electron: '1' }, scenes: SCENES.filter((s) => ['ai', 'security'].includes(s.name)).map((s) => ({ ...s, slices: 1 })) },
 ];
 

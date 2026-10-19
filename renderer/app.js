@@ -74,7 +74,7 @@ function nodeDot(n) {
   return c.critical ? 'crit' : c.warn ? 'warn' : 'ok';
 }
 
-// 検索欄: 打ち終わってから描き直し、カーソルを末尾に戻す。待つ間に別の画面へ移っていたら、値だけ覚えて描き直さない
+// 検索欄: 値はすぐ覚え、打ち終わってから描き直して選択範囲を戻す。破棄済みの入力欄からは描き直さない
 function bindSearch(sel, view, apply, rerender, ms = 250) {
   let t;
   $(sel).oninput = (e) => {
@@ -82,9 +82,10 @@ function bindSearch(sel, view, apply, rerender, ms = 250) {
     apply(e.target.value);
     t = setTimeout(async () => {
       if (!e.target.isConnected || state.view !== view) return;
+      const selection = typeof e.target.selectionStart === 'number' ? [e.target.selectionStart, e.target.selectionEnd, e.target.selectionDirection] : null;
       await rerender();
       const i = $(sel);
-      if (i) { i.focus(); i.setSelectionRange(i.value.length, i.value.length); }
+      if (i) { i.focus({ preventScroll: true }); i.setSelectionRange(...(selection || [i.value.length, i.value.length])); }
     }, ms);
   };
   return () => clearTimeout(t);
@@ -277,7 +278,10 @@ function renderOverview() {
   };
   $('#overviewOS').onchange = e => filter({ os: e.target.value }, '#overviewOS');
   $$('[data-coverage]').forEach(el => { el.onclick = () => filter({ status: state.overviewFilter.status === el.dataset.coverage ? 'all' : el.dataset.coverage }, `[data-coverage="${el.dataset.coverage}"]`); });
-  $$('[data-overview-status]').forEach(el => { el.onclick = () => filter({ status: el.dataset.overviewStatus }, `[data-overview-status="${el.dataset.overviewStatus}"]`); });
+  $$('[data-overview-status]').forEach(el => {
+    el.setAttribute('aria-pressed', String(state.overviewFilter.status === el.dataset.overviewStatus));
+    el.onclick = () => filter({ status: el.dataset.overviewStatus }, `[data-overview-status="${el.dataset.overviewStatus}"]`);
+  });
   $('#overviewReset').onclick = () => filter({ q: '', os: '', status: 'all' }, '#overviewQ');
   bindGoto();
   if (focusAttr) {

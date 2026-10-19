@@ -18,3 +18,13 @@ test('canceling a pending search prevents a later redraw', async()=>{
  vm.runInContext(binding+"\ncancel=bindSearch('#q','overview',apply,render);",ctx);input.oninput({target:input});ctx.cancel();
  for(const fn of timers.values())await fn();assert.equal(renders,0);
 });
+
+test('normal debounced redraw preserves a caret or selection inside the query', async()=>{
+ let next=0;const timers=new Map();let selection;
+ const old={isConnected:true,value:'search-query',selectionStart:2,selectionEnd:5,selectionDirection:'backward'};
+ let input=old;
+ const ctx=vm.createContext({state:{view:'overview'},$:()=>input,setTimeout:fn=>{timers.set(++next,fn);return next;},clearTimeout:id=>timers.delete(id),apply(){},render(){old.isConnected=false;input={value:old.value,focus(){},setSelectionRange(...args){selection=args;}};}});
+ vm.runInContext(binding+"\nbindSearch('#q','overview',apply,render);",ctx);old.oninput({target:old});
+ for(const fn of timers.values())await fn();
+ assert.deepEqual(selection,[2,5,'backward']);
+});
