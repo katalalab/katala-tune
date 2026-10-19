@@ -171,11 +171,11 @@ mod tests {
         let s = PeerStore::new(&dir);
         let keys: Vec<DeviceKeys> = (0..3).map(|_| DeviceKeys::generate().unwrap()).collect();
         for (i, k) in keys.iter().enumerate() {
-            s.add(Peer { role: Role::Console, card: k.card(&format!("c{i}")), paired_at: i as i64, addr: None }).unwrap();
+            s.add(Peer { role: Role::Console, card: k.card(&format!("console-{i}")), paired_at: i as i64, addr: None }).unwrap();
             assert_eq!(s.list().unwrap().len(), i + 1, "2 回目以降の add も通る");
         }
-        assert_eq!(s.remove("c1").unwrap(), 1);
-        assert_eq!(s.remove("c0").unwrap(), 1);
+        assert_eq!(s.remove("console-1").unwrap(), 1);
+        assert_eq!(s.remove("console-0").unwrap(), 1);
         assert_eq!(s.list().unwrap().len(), 1);
         let left: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
         assert_eq!(left, vec![std::ffi::OsString::from(PEERS_FILE)], "一時ファイルを残さない");
