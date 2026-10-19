@@ -250,6 +250,11 @@ impl Engine {
         let mut out = Vec::new();
         for n in &cfg.nodes {
             let snaps = db.last_snapshots(&n.id, 2).map_err(|e| e.to_string())?;
+            if let Some(error) = db.probe_error(&n.id, snaps.first().map(|s| s.at)).map_err(|e| e.to_string())? {
+                let at = db.get_meta(&format!("probeFailure:{}", n.id)).map_err(|e| e.to_string())?.and_then(|v| v["at"].as_i64());
+                out.push(json!({ "node_id": n.id, "ok": false, "at": at, "error": error, "stale": true }));
+                continue;
+            }
             let Some(last) = snaps.first() else { continue };
             let data = crate::netsec::snapshot_for_node(last.data.clone(), &n.raw);
             let prev_data = snaps.get(1).map(|s| crate::netsec::snapshot_for_node(s.data.clone(), &n.raw));
@@ -725,10 +730,16 @@ mod tests {
         let config = tmp.join("nodes.json");
         std::fs::write(&config, r#"{"nodes":[{"id":"dev","os":"windows","network":false}]}"#).unwrap();
         let e = Engine::open(config.clone(), tmp.join("data"), Arc::new(NoHost)).unwrap();
+        e.on_probe_result(&json!({"node_id":"dev","ok":false,"at":5,"error":"initial failure"}));
+        assert_eq!(e.last().unwrap()[0]["ok"], false);
+        assert_eq!(e.last().unwrap()[0]["at"], 5);
         e.on_probe_result(&json!({"node_id":"dev","ok":true,"at":10,"data":{"probe":"windows"}}));
         e.on_probe_result(&json!({"node_id":"dev","ok":false,"at":20,"error":"ssh: timeout"}));
         drop(e);
         let e = Engine::open(config, tmp.join("data"), Arc::new(NoHost)).unwrap();
+        let last = e.last().unwrap();
+        assert_eq!(last[0]["ok"], false);
+        assert_eq!(last[0]["at"], 20);
         let row = &e.ledger().unwrap()["rows"][0];
         assert_eq!(row["status"], "unobserved");
         assert!(row["reason"].as_str().unwrap().contains("ssh: timeout"));
@@ -736,6 +747,7 @@ mod tests {
         assert!(e.with_db(|d| d.checks()).unwrap().iter().any(|c| c["scope"] == "dev" && c["id"] == "probe" && c["status"] == "fail"));
         e.on_probe_result(&json!({"node_id":"dev","ok":true,"at":30,"data":{"probe":"windows"}}));
         assert_eq!(e.ledger().unwrap()["rows"][0]["status"], "target");
+        assert_eq!(e.last().unwrap()[0]["ok"], true);
         drop(e);
         std::fs::remove_dir_all(tmp).unwrap();
     }
