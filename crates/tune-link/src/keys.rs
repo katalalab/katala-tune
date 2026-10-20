@@ -15,6 +15,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use curve25519_dalek::MontgomeryPoint;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -248,9 +249,13 @@ pub fn write_private(path: &Path, bytes: &[u8], create_new: bool) -> Result<()> 
 }
 
 fn tmp_path(path: &Path) -> PathBuf {
+    // 同じナノ秒に複数スレッドが書くと一時ファイル名が衝突し、create_new が
+    // 宛先の既存と誤認される。プロセス内で単調増加する番号も付ける。
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    path.with_file_name(format!(".{name}.{}.{nanos}.tmp", std::process::id()))
+    path.with_file_name(format!(".{name}.{}.{nanos}.{seq}.tmp", std::process::id()))
 }
 
 /// 他のユーザーが読める・自分の所有でないファイルは使わない（Unix。通常のファイルだけ）。
