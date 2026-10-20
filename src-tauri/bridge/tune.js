@@ -75,6 +75,7 @@
     // 常時監視・ハブとの同期・ダッシュボード（tune-core の monitor）
     dashboard: (minutes) => invoke('dashboard', { minutes: minutes ?? null }),
     monitorSettings: (patch) => invoke('monitor_settings', { patch: patch ?? null }),
+    monitorEvents: (filter) => invoke('monitor_events', { filter: filter ?? null }),
     hubPull: () => invoke('hub_pull'),
     onMonitor: (fn) => { listen('monitor', (p) => fn(p)); },
     topologyView: () => invoke('topology_view'),
