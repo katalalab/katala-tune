@@ -6,7 +6,11 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::HashSet, path::Path, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    time::Duration,
+};
 
 const LOG_DRIVERS: &[&str] = &["json-file", "local", "journald", "syslog", "none", "fluentd", "awslogs", "splunk", "gelf", "etwlogs", "gcplogs"];
 const MAX_CONTEXTS: usize = 8;
@@ -404,10 +408,14 @@ impl DockerPacket {
 // Only fixed state labels and numbers enter the persisted observation receipt.
 fn unresolved_network_diagnostic(entities: &[Entity], edges: &[Edge]) -> Option<Failure> {
     const STATES: [&str; 8] = ["created", "running", "paused", "restarting", "removing", "exited", "dead", "unknown"];
+    let mut memberships = HashMap::<&str, usize>::new();
+    for edge in edges.iter().filter(|edge| edge.kind == EdgeKind::DockerNetworkMember) {
+        *memberships.entry(edge.from.as_str()).or_default() += 1;
+    }
     let mut counts = [0usize; 8];
     for container in entities.iter().filter(|entity| entity.kind == EntityKind::DockerContainer) {
         let expected = container.attributes["networks"].as_array().map_or(0, Vec::len);
-        let observed = edges.iter().filter(|edge| edge.kind == EdgeKind::DockerNetworkMember && edge.from == container.id).count();
+        let observed = memberships.get(container.id.as_str()).copied().unwrap_or(0);
         let state = container.attributes["state"].as_str().and_then(|state| STATES.iter().position(|label| *label == state)).unwrap_or(7);
         counts[state] += expected.saturating_sub(observed);
     }
