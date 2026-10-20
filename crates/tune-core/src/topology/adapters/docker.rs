@@ -683,22 +683,15 @@ mod process_tests {
     use super::*;
     #[tokio::test]
     async fn bounded_owned_child_is_reaped_and_output_capped() {
-        let out = DockerRunner
-            .run(
-                "/usr/bin/python3",
-                &["-c".into(), "import os,time;print(os.getpid(),flush=True);time.sleep(10)".into()],
-                b"",
-                Duration::from_millis(150),
-                100,
-                100,
-            )
-            .await;
+        // The PID comes from a shell builtin; exec keeps that owned PID without Python startup.
+        let out =
+            DockerRunner.run("/bin/sh", &["-c".into(), "printf '%s\\n' \"$$\"; exec /bin/sleep 10".into()], b"", Duration::from_millis(150), 100, 100).await;
         assert!(out.timed_out);
         let pid = std::str::from_utf8(&out.stdout).unwrap().trim();
-        assert!(pid.parse::<u32>().is_ok());
+        assert!(pid.parse::<u32>().is_ok(), "owned PID invalid: stdout={:?}, stderr={:?}, code={:?}", out.stdout, out.stderr, out.code);
         let alive = std::process::Command::new("/bin/kill").args(["-0", pid]).output().unwrap();
         assert!(!alive.status.success(), "owned child must be gone after timeout");
-        let out = DockerRunner.run("/usr/bin/python3", &["-c".into(), "print('x'*100000)".into()], b"", Duration::from_secs(2), 4096, 100).await;
+        let out = DockerRunner.run("/bin/sh", &["-c".into(), "printf '%100000s' x".into()], b"", Duration::from_secs(2), 4096, 100).await;
         assert!(out.output_limited);
         assert_eq!(out.stdout.len(), 4096);
     }
