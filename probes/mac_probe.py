@@ -2,7 +2,8 @@
 """katala-tune の macOS 調査。読み取り専用で、結果を JSON 1行で標準出力へ出す。
 
 python3 標準ライブラリだけで動く。設定・プロセス・ファイルを変更しない。
-秘密・環境変数・コマンドライン引数・ファイルの中身は集めない（プロセスは実行ファイル名だけ）。
+秘密・環境変数・コマンドライン引数・ファイルの中身は集めない（プロセスは実行ファイル名だけ。node・python など
+のインタープリタだけは、同じ種類かを分けるために引数を一時的に読み、安全な短いスクリプト名だけを鍵に使う。引数は出力に載せない）。
 使い方: python3 - [--skip-benchmark] [nonet]
   --skip-benchmark  ベンチマークを省く（台帳の "benchmark": false）
   nonet             ネットワークとセキュリティ（netsec）を集めない（台帳の "network": false）
@@ -107,16 +108,150 @@ def app_name(path):
     return os.path.basename(path) or path
 
 
-def processes():
-    out = run(["ps", "-axo", "pid=,pcpu=,rss=,etime=,comm="], timeout=10)
-    procs = []
-    for line in out.splitlines():
-        parts = line.split(None, 4)
-        if len(parts) < 5:
+# 同一コマンドの多重起動・孤児・プロセス木（#38・#30）。
+# 引数はキー（実行ファイル[:スクリプト名]）を作るために一時的に読むだけで、出力に載せるのは安全な短い名前だけ（パス・引数は出さない）
+INTERPRETERS = re.compile(r"^(node|nodejs|bun|deno|python3?(\.\d+)?|uv|uvx|npx|bunx|npm|pnpm|ruby|java|git)$")
+LAUNCHERS = {"launchd", "login", "sshd", "sshd-session"}
+GENERIC_LABELS = {"index", "main", "cli", "server", "bin", "run", "app", "start", "dist", "build", "lib", "src", "out", "node_modules", "__main__"}
+SKIP_WORDS = {"exec", "run", "x", "dlx", "tool", "start"}
+# 値を取らないと分かっているオプション。ほかの「-」で始まる引数は次が値（トークンなど）かもしれないので、そこで読むのをやめる
+VALUELESS = {"-y", "--yes", "-q", "--quiet", "--silent", "-u", "-B", "-E", "-s", "-S", "-I", "-O", "-OO", "-i",
+             "--no-warnings", "--no-deprecation", "--trace-warnings", "--enable-source-maps", "--inspect", "--"}
+LABEL_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@+-]{0,47}$")
+GROUP_MIN_COUNT = 3
+
+
+def script_label(path):
+    """スクリプトのファイル名、汎用名（index.js など）なら node_modules の直下のパッケージ名だけ。
+    任意の親ディレクトリ（プロジェクト・顧客名など）は使わない。安全な文字だけなら返す。"""
+    parts = [x for x in re.split(r"[\\/]+", path) if x]
+    if not parts:
+        return None
+    name = re.sub(r"\.(?:[cm]?[jt]s|py|jar)$", "", parts[-1])
+    if name.lower() not in GENERIC_LABELS and LABEL_OK.match(name):
+        return name
+    for i in range(len(parts) - 2, -1, -1):
+        if parts[i] == "node_modules" and i + 1 < len(parts) - 1:
+            pkg = parts[i + 2] if parts[i + 1].startswith("@") and i + 2 < len(parts) - 1 else parts[i + 1]
+            if pkg.lower() not in GENERIC_LABELS and LABEL_OK.match(pkg):
+                return pkg
+            return None
+    return None
+
+
+def proc_key(exe, tokens):
+    """実行ファイル名と引数（呼び出し側が捨てる）から、同じ種類かを決める鍵を作る。"""
+    if not INTERPRETERS.match(exe):
+        return exe[:48]
+    label = None
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t == "-m" and i + 1 < len(tokens):
+            label = script_label(tokens[i + 1].split(".")[0])
+            break
+        if t == "-c" and exe.startswith("python"):
+            break
+        if t in ("-c", "-C", "-r", "--require") and exe in ("git", "node"):
+            i += 2
             continue
-        pid, cpu, rss, etime, comm = parts
+        if t.startswith("-"):
+            if "=" in t or t in VALUELESS:
+                i += 1
+                continue
+            break
+        if t in SKIP_WORDS:
+            i += 1
+            continue
+        label = script_label(re.sub(r"(?<=.)@[^@/\\]*$", "", t))
+        break
+    return "%s:%s" % (exe, label) if label else exe
+
+
+def etime_s(s):
+    """ps の etime（[[dd-]hh:]mm:ss）を秒に。読めなければ None"""
+    m = re.match(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$", s or "")
+    if not m:
+        return None
+    d, h, mi, se = (int(x) if x else 0 for x in m.groups())
+    return ((d * 24 + h) * 60 + mi) * 60 + se
+
+
+def owner_kind(uid):
+    return "system" if uid < 500 else "user"
+
+
+def multiplication(rows, group_cap=20, tree_cap=10):
+    """rows: pid, ppid, uid, rss_kb, name, key。同じ鍵の本数・合計 RSS・孤児（親が居ない / PPID 1）と、木の根ごとの合計を返す。"""
+    by_pid = {r["pid"]: r for r in rows}
+    for r in rows:
+        r["owner"] = owner_kind(r["uid"])
+        p = by_pid.get(r["ppid"])
+        # 子より後に起動した「親」は PID の使い回し（本当の親は終了済み）
+        if p is not None and r.get("age") is not None and p.get("age") is not None and p["age"] < r["age"]:
+            p = None
+        r["_p"] = p
+        r["orphan"] = r["ppid"] <= 1 or p is None
+        r["_parent"] = p["name"][:48] if p is not None else None
+    groups = {}
+    for r in rows:
+        g = groups.setdefault(r["key"], {"key": r["key"], "count": 0, "kb": 0, "orphans": 0, "orphan_kb": 0, "owners": set(), "parents": {}})
+        g["count"] += 1
+        g["kb"] += r["rss_kb"]
+        g["owners"].add(r["owner"])
+        if r["orphan"] and r["owner"] != "system":
+            g["orphans"] += 1
+            g["orphan_kb"] += r["rss_kb"]
+        if r["_parent"]:
+            g["parents"][r["_parent"]] = g["parents"].get(r["_parent"], 0) + 1
+    out = []
+    for g in groups.values():
+        if g["count"] < GROUP_MIN_COUNT:
+            continue
+        top = sorted(g["parents"].items(), key=lambda kv: (-kv[1], kv[0]))
+        out.append({"key": g["key"], "count": g["count"], "mem_mb": round(g["kb"] / 1024), "orphans": g["orphans"],
+                    "orphan_mb": round(g["orphan_kb"] / 1024), "parent": top[0][0] if top else None,
+                    "owner": next(iter(g["owners"])) if len(g["owners"]) == 1 else "mixed"})
+    out.sort(key=lambda g: (-g["mem_mb"], -g["count"], g["key"]))
+
+    def root_of(r):
+        seen = set()
+        while r["pid"] not in seen:
+            seen.add(r["pid"])
+            p = r["_p"]
+            if p is None or p["pid"] <= 1 or p["name"] in LAUNCHERS:
+                break
+            r = p
+        return r
+    trees = {}
+    kids = {}
+    for r in rows:
+        if r["_p"] is not None:
+            kids[r["_p"]["pid"]] = kids.get(r["_p"]["pid"], 0) + 1
+    for r in rows:
+        root = root_of(r)
+        t = trees.setdefault(root["pid"], {"root": root["name"][:48], "pid": root["pid"], "owner": root["owner"], "count": 0, "kb": 0,
+                                           "children": kids.get(root["pid"], 0)})
+        t["count"] += 1
+        t["kb"] += r["rss_kb"]
+    tr = [{"root": t["root"], "pid": t["pid"], "owner": t["owner"], "count": t["count"], "children": t["children"], "mem_mb": round(t["kb"] / 1024)}
+          for t in trees.values() if t["count"] >= 2]
+    tr.sort(key=lambda t: (-t["mem_mb"], t["pid"]))
+    return out[:group_cap], tr[:tree_cap]
+
+
+def processes():
+    out = run(["ps", "-axo", "pid=,ppid=,uid=,pcpu=,rss=,etime=,comm="], timeout=10)
+    procs = []
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(None, 6)
+        if len(parts) < 7:
+            continue
+        pid, ppid, uid, cpu, rss, etime, comm = parts
         procs.append({"pid": int(pid), "cpu": float(cpu), "mem_mb": round(int(rss) / 1024), "etime": etime,
                       "name": os.path.basename(comm), "app": app_name(comm)})
+        rows.append({"pid": int(pid), "ppid": int(ppid), "uid": int(uid), "rss_kb": int(rss), "name": os.path.basename(comm), "age": etime_s(etime)})
     groups = {}
     for p in procs:
         g = groups.setdefault(p["app"], {"app": p["app"], "cpu": 0.0, "mem_mb": 0, "count": 0})
@@ -132,6 +267,18 @@ def processes():
         for p in top_cpu:
             p["start"] = starts.get(p["pid"])
     agents = sum(1 for p in procs if re.match(r"^(claude|codex|opencode|cursor-agent|agy|gemini)\b", p["name"], re.I))
+    # 同一コマンドの鍵。引数を読むのはインタープリタ（node・python など）だけで、結果は鍵にだけ使う
+    argv = {}
+    interp = [r["pid"] for r in rows if INTERPRETERS.match(r["name"])]
+    for i in range(0, len(interp), 200):  # インタープリタの PID だけを指定して読む（ほかのプロセスの引数は読まない）
+        for line in run(["ps", "-o", "pid=,command=", "-p", ",".join(str(p) for p in interp[i:i + 200])], timeout=10).splitlines():
+            f = line.split(None, 1)
+            if len(f) == 2 and f[0].isdigit():
+                argv[int(f[0])] = f[1]
+    for r in rows:
+        r["key"] = proc_key(r["name"], argv.get(r["pid"], "").split()[1:] if INTERPRETERS.match(r["name"]) else [])
+    argv.clear()
+    pgroups, ptrees = multiplication(rows)
     return {
         "count": len(procs),
         "top_cpu": top_cpu,
@@ -139,6 +286,8 @@ def processes():
         "apps": by(list(groups.values()), "mem_mb", 25),
         "apps_cpu": by(list(groups.values()), "cpu", 10),
         "agent_processes": agents,
+        "groups": pgroups,
+        "trees": ptrees,
     }
 
 
