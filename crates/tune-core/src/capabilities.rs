@@ -59,7 +59,12 @@ pub fn transport(node: &Node) -> (String, Vec<String>, Vec<u8>) {
     } else {
         let mut args = collect::ssh_args(&node.alias, &remote);
         args.insert(args.len() - 2, "--".into());
-        args.splice(0..0, ["-o".into(), "StrictHostKeyChecking=yes".into()]);
+        args.splice(
+            0..0,
+            ["-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no", "-o", "ClearAllForwardings=yes", "-o", "PermitLocalCommand=no"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
         ("ssh".into(), args, input)
     }
 }
@@ -129,6 +134,33 @@ impl Executor for System {
         Box::pin(collect::run_bounded(cmd, args, input, timeout, out, err))
     }
 }
+/// Validate remote lifecycle acknowledgement separately from local transport success.
+fn windows_envelope(value: &Value, node: &Node) -> (Option<Value>, Option<&'static str>, bool, bool) {
+    let invalid = (None, Some("invalid_envelope"), false, false);
+    let Some(object) = value.as_object() else {
+        return invalid;
+    };
+    if object.len() != 6 || value["schema"] != "katala_capabilities_envelope.v1" || value["platform"] != "win32" {
+        return invalid;
+    }
+    let (Some(exit), Some(pipes), Some(lifecycle)) =
+        (value["worker_exit_confirmed"].as_bool(), value["pipes_completed"].as_bool(), value["lifecycle"].as_str())
+    else {
+        return invalid;
+    };
+    match lifecycle {
+        "completed" if exit && pipes && value["report"].is_object() => {
+            let data = sanitize(&value["report"], node);
+            let error = if data.is_none() { Some("invalid_report") } else { None };
+            (data, error, true, true)
+        }
+        "timeout_cleanup_confirmed" | "worker_failed" if exit && pipes && value.get("report").is_some_and(Value::is_null) => {
+            (None, Some(if lifecycle == "worker_failed" { "remote_worker_failed" } else { "remote_timeout" }), true, true)
+        }
+        "cleanup_unconfirmed" if !(exit && pipes) && value.get("report").is_some_and(Value::is_null) => (None, Some("remote_cleanup_unconfirmed"), exit, pipes),
+        _ => invalid,
+    }
+}
 async fn check_one(executor: &impl Executor, node: &Node) -> Value {
     let at = crate::db::now_ms();
     let (cmd, args, input) = transport(node);
@@ -144,6 +176,19 @@ async fn check_one(executor: &impl Executor, node: &Node) -> Value {
     } else {
         None
     };
+    if node.is_windows() {
+        let (data, error, exit, pipes) = if let Some(error) = error {
+            (None, Some(error), false, false)
+        } else {
+            serde_json::from_slice::<Value>(&result.stdout).ok().map(|value| windows_envelope(&value, node)).unwrap_or((
+                None,
+                Some("invalid_envelope"),
+                false,
+                false,
+            ))
+        };
+        return json!({"node_id":node.id,"at":at,"ok":error.is_none(),"data":data,"error":error,"remote_completion":if exit && pipes{"confirmed"}else{"unconfirmed"},"worker_exit":if exit{"confirmed"}else{"unconfirmed"}});
+    }
     let data = if error.is_none() { serde_json::from_slice::<Value>(&result.stdout).ok().and_then(|v| sanitize(&v, node)) } else { None };
     let error = error.or(if data.is_none() { Some("invalid_report") } else { None });
     json!({"node_id":node.id,"at":at,"ok":error.is_none(),"data":data,"error":error})
@@ -228,15 +273,20 @@ mod tests {
             (collect::BoundedResult { output_limited: true, ..Default::default() }, "output_limit"),
             (collect::BoundedResult { spawn_failed: true, ..Default::default() }, "spawn_failed"),
             (collect::BoundedResult { code: Some(1), ..Default::default() }, "transport_failed"),
-            (collect::BoundedResult { code: Some(0), stdout: b"{\"schema\":".to_vec(), ..Default::default() }, "invalid_report"),
-            (collect::BoundedResult { code: Some(0), stdout: b"null".to_vec(), ..Default::default() }, "invalid_report"),
+            (collect::BoundedResult { code: Some(0), stdout: b"{\"schema\":".to_vec(), ..Default::default() }, "invalid_envelope"),
+            (collect::BoundedResult { code: Some(0), stdout: b"null".to_vec(), ..Default::default() }, "invalid_envelope"),
         ];
         for (mut result, error) in results {
+            if result.timed_out || result.output_limited || result.spawn_failed || result.code != Some(0) {
+                result.stdout=json!({"schema":"katala_capabilities_envelope.v1","platform":"win32","lifecycle":"completed","worker_exit_confirmed":true,"pipes_completed":true,"report":{"schema":"katala_capabilities.v1","platform":"win32","inventory_status":"error","secure_boot":{"state":"error"}}}).to_string().into_bytes();
+            }
             result.stderr = b"PRIVATE".to_vec();
             let answer = check_one(&Fake(Mutex::new(Some(result))), &node).await;
             assert_eq!(answer["ok"], false);
             assert_eq!(answer["error"], error);
             assert_eq!(answer["data"], Value::Null);
+            assert_eq!(answer["remote_completion"], "unconfirmed");
+            assert_eq!(answer["worker_exit"], "unconfirmed");
             assert!(!answer.to_string().contains("PRIVATE"));
         }
     }
@@ -244,11 +294,71 @@ mod tests {
     async fn successful_transport_returns_whitelisted_evidence() {
         let node = Node::from_value(&json!({"id":"sample","alias":"sample","os":"windows"}), "local");
         let stdout=json!({"schema":"katala_capabilities.v1","platform":"win32","inventory_status":"ok","manufacturer":"Example","model":"Model","baseboard_manufacturer":"Example","baseboard_product":"Board","bios_version":"1","bios_date":"2026-01-01","secure_boot":{"state":"disabled"},"serial":"PRIVATE"}).to_string().into_bytes();
+        let report: Value = serde_json::from_slice(&stdout).unwrap();
+        let stdout=json!({"schema":"katala_capabilities_envelope.v1","platform":"win32","lifecycle":"completed","worker_exit_confirmed":true,"pipes_completed":true,"report":report}).to_string().into_bytes();
         let answer = check_one(&Fake(Mutex::new(Some(collect::BoundedResult { code: Some(0), stdout, ..Default::default() }))), &node).await;
         assert_eq!(answer["ok"], true);
         assert_eq!(answer["data"]["capabilities"]["firmware_read"]["support"], "observed");
         assert_eq!(answer["data"]["capabilities"]["firmware_write"]["support"], "unknown");
         assert!(!answer.to_string().contains("PRIVATE"));
+    }
+    #[tokio::test]
+    async fn windows_envelope_requires_exit_and_pipe_acknowledgement() {
+        let node = Node::from_value(&json!({"id":"sample","alias":"sample","os":"windows"}), "local");
+        for (lifecycle, exit, pipes, error, completion) in [
+            ("timeout_cleanup_confirmed", true, true, "remote_timeout", "confirmed"),
+            ("worker_failed", true, true, "remote_worker_failed", "confirmed"),
+            ("cleanup_unconfirmed", false, false, "remote_cleanup_unconfirmed", "unconfirmed"),
+            ("cleanup_unconfirmed", true, false, "remote_cleanup_unconfirmed", "unconfirmed"),
+            ("completed", false, true, "invalid_envelope", "unconfirmed"),
+            ("unknown", true, true, "invalid_envelope", "unconfirmed"),
+        ] {
+            let stdout=json!({"schema":"katala_capabilities_envelope.v1","platform":"win32","lifecycle":lifecycle,"worker_exit_confirmed":exit,"pipes_completed":pipes,"report":null}).to_string().into_bytes();
+            let answer = check_one(&Fake(Mutex::new(Some(collect::BoundedResult { code: Some(0), stdout, ..Default::default() }))), &node).await;
+            assert_eq!(answer["ok"], false);
+            assert_eq!(answer["data"], Value::Null);
+            assert_eq!(answer["error"], error);
+            assert_eq!(answer["remote_completion"], completion);
+            assert_eq!(answer["worker_exit"], if exit && lifecycle != "unknown" { "confirmed" } else { "unconfirmed" });
+        }
+    }
+    #[test]
+    fn envelope_rejects_inconsistent_missing_or_extra_lifecycle_fields() {
+        let n = Node::from_value(&json!({"id":"sample","os":"windows"}), "local");
+        let valid = json!({"schema":"katala_capabilities_envelope.v1","platform":"win32","lifecycle":"worker_failed","worker_exit_confirmed":true,"pipes_completed":true,"report":null});
+        for patch in [
+            json!({"schema":"wrong"}),
+            json!({"platform":"darwin"}),
+            json!({"worker_exit_confirmed":"true"}),
+            json!({"pipes_completed":false}),
+            json!({"report":{"private":"PRIVATE"}}),
+            json!({"lifecycle":"cleanup_unconfirmed"}),
+            json!({"extra":"PRIVATE"}),
+        ] {
+            let mut value = valid.clone();
+            for (key, item) in patch.as_object().unwrap() {
+                value[key] = item.clone();
+            }
+            let (data, error, exit, pipes) = windows_envelope(&value, &n);
+            assert!(data.is_none());
+            assert_eq!(error, Some("invalid_envelope"));
+            assert!(!exit && !pipes);
+        }
+        let mut missing = valid;
+        missing.as_object_mut().unwrap().remove("worker_exit_confirmed");
+        assert_eq!(windows_envelope(&missing, &n).1, Some("invalid_envelope"));
+    }
+    #[tokio::test]
+    async fn mac_reports_keep_the_existing_unwrapped_contract() {
+        let n = Node::from_value(&json!({"id":"sample","alias":"sample","os":"macos"}), "local");
+        let stdout =
+            json!({"schema":"katala_capabilities.v1","platform":"darwin","inventory_status":"ok","model":"Model","secure_boot":{"state":"not_collected"}})
+                .to_string()
+                .into_bytes();
+        let answer = check_one(&Fake(Mutex::new(Some(collect::BoundedResult { code: Some(0), stdout, ..Default::default() }))), &n).await;
+        assert_eq!(answer["ok"], true);
+        assert_eq!(answer["data"]["model"], "Model");
+        assert!(answer.get("remote_completion").is_none());
     }
     #[test]
     fn missing_fields_and_inventory_errors_are_explicit() {
@@ -267,10 +377,8 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_script_tests {
     use super::*;
-    /// Execute the actual shipped probe with mock native commands, never hardware writes.
-    #[tokio::test]
-    async fn native_script_classifies_privileges_and_partial_cim_without_localized_messages() {
-        let mock_cim = r#"
+    const MARKER: &str = "# KT_CAPABILITIES_WORKER_TEST_PREFIX";
+    const MOCK_CIM: &str = r#"
 class CimDenied : System.Exception {
     [int]$NativeErrorCode = 5
     CimDenied() : base("localized") { $this.HResult = -2147217405 }
@@ -282,6 +390,20 @@ function Get-CimInstance {
     return @{ SMBIOSBIOSVersion = "1"; ReleaseDate = [datetime]::new(2026,1,1) }
 }
 "#;
+    async fn run_worker_mock(prefix: &str) -> Value {
+        let n = Node::from_value(&json!({"id":"sample","os":"windows","local_hostname":"local"}), "local");
+        let (cmd, args, _) = transport(&n);
+        assert_eq!(WIN.matches(MARKER).count(), 1);
+        let script = WIN.trim_start_matches('\u{feff}').replace(MARKER, &format!("{MARKER}\n{prefix}"));
+        let input = format!("{}\n", crate::logs::base64(script.as_bytes()));
+        let result = collect::run_bounded(&cmd, &args, input.as_bytes(), TIMEOUT, OUT_LIMIT, ERR_LIMIT).await;
+        assert_eq!(result.code, Some(0));
+        assert!(!result.timed_out && !result.output_limited);
+        serde_json::from_slice(&result.stdout).unwrap()
+    }
+    /// Mock native commands inside the actual owned worker, not the supervisor.
+    #[tokio::test]
+    async fn native_script_classifies_privileges_and_partial_cim_without_localized_messages() {
         let cases = [
             ("return $true", "enabled"),
             ("return $false", "disabled"),
@@ -292,28 +414,36 @@ function Get-CimInstance {
             ("throw [System.PlatformNotSupportedException]::new(\"localized\")", "unsupported"),
             ("throw [System.Exception]::new(\"localized\")", "error"),
         ];
-        let n = Node::from_value(&json!({"id":"sample","os":"windows","local_hostname":"local"}), "local");
-        let (cmd, args, _) = transport(&n);
         for (body, state) in cases {
-            let script = format!("{mock_cim}\nfunction Confirm-SecureBootUEFI {{ {body} }}\n{}", WIN.trim_start_matches('\u{feff}'));
-            let input = format!("{}\n", crate::logs::base64(script.as_bytes()));
-            let result = collect::run_bounded(&cmd, &args, input.as_bytes(), TIMEOUT, OUT_LIMIT, ERR_LIMIT).await;
-            assert_eq!(result.code, Some(0));
-            let value: Value = serde_json::from_slice(&result.stdout).unwrap();
-            assert_eq!(value["secure_boot"]["state"], state);
-            assert_eq!(value["model"], "Model");
-            assert!(!String::from_utf8_lossy(&result.stdout).contains("localized"));
+            let value = run_worker_mock(&format!("{MOCK_CIM}\nfunction Confirm-SecureBootUEFI {{ {body} }}")).await;
+            assert_eq!(value["lifecycle"], "completed");
+            assert_eq!(value["worker_exit_confirmed"], true);
+            assert_eq!(value["pipes_completed"], true);
+            assert_eq!(value["report"]["secure_boot"]["state"], state);
+            assert_eq!(value["report"]["model"], "Model");
+            assert!(!value.to_string().contains("localized"));
         }
-        let script = format!(
-            "{mock_cim}\nfunction Get-CimInstance {{ param($ClassName,$Property,$OperationTimeoutSec) if ($ClassName -eq \"Win32_BaseBoard\") {{ throw [CimDenied]::new() }} return @{{ Manufacturer=\"Example\";Model=\"Model\";SMBIOSBIOSVersion=\"1\" }} }}\nfunction Confirm-SecureBootUEFI {{ return $false }}\n{}",
-            WIN.trim_start_matches('\u{feff}')
-        );
-        let input = format!("{}\n", crate::logs::base64(script.as_bytes()));
-        let result = collect::run_bounded(&cmd, &args, input.as_bytes(), TIMEOUT, OUT_LIMIT, ERR_LIMIT).await;
-        let value: Value = serde_json::from_slice(&result.stdout).unwrap();
-        assert_eq!(value["model"], "Model");
-        assert_eq!(value["bios_version"], "1");
-        assert_eq!(value["inventory_reason"], "permission_denied");
-        assert_eq!(value["secure_boot"]["state"], "disabled");
+        let prefix = r#"
+function Get-CimInstance { param($ClassName,$Property,$OperationTimeoutSec)
+    if ($ClassName -eq "Win32_BaseBoard") { throw [CimDenied]::new() }
+    return @{ Manufacturer="Example";Model="Model";SMBIOSBIOSVersion="1" }
+}
+function Confirm-SecureBootUEFI { return $false }
+"#;
+        let value = run_worker_mock(&format!("{MOCK_CIM}\n{prefix}")).await;
+        assert_eq!(value["lifecycle"], "completed");
+        assert_eq!(value["report"]["model"], "Model");
+        assert_eq!(value["report"]["bios_version"], "1");
+        assert_eq!(value["report"]["inventory_reason"], "permission_denied");
+        assert_eq!(value["report"]["secure_boot"]["state"], "disabled");
+    }
+    #[tokio::test]
+    async fn native_worker_sleep_exceeds_production_deadline_and_is_reaped() {
+        let value = run_worker_mock(&format!("{MOCK_CIM}\nfunction Confirm-SecureBootUEFI {{ Start-Sleep -Seconds 45; return $true }}")).await;
+        assert_eq!(value["schema"], "katala_capabilities_envelope.v1");
+        assert_eq!(value["lifecycle"], "timeout_cleanup_confirmed");
+        assert_eq!(value["worker_exit_confirmed"], true);
+        assert_eq!(value["pipes_completed"], true);
+        assert!(value["report"].is_null());
     }
 }
