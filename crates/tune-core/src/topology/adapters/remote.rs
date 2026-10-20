@@ -3,7 +3,6 @@ use super::super::model::{CaptureCounters, RawCapture};
 use super::super::{Failure, FailureCode, TopologyLimits, normalize_git_origin};
 use super::{CommandRunner, SystemRunner, failure_from_process};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 pub const POSIX_PROBE: &str = include_str!("../../../../../probes/topology_posix.py");
@@ -50,7 +49,7 @@ pub struct RemoteRequest {
 }
 
 pub fn identity_hash(hostname: &str) -> String {
-    format!("{:x}", Sha256::digest(hostname.trim().to_ascii_lowercase().trim_end_matches(".local").as_bytes()))
+    crate::db::sha256_hex(hostname.trim().to_ascii_lowercase().trim_end_matches(".local").as_bytes())
 }
 
 pub async fn collect_remote(request: &RemoteRequest) -> RawCapture {
@@ -255,7 +254,7 @@ fn valid_capture(capture: &RawCapture) -> bool {
                 || !matches!(manifest.kind.as_str(), "cargo" | "node" | "python" | "go" | "workflow")
                 || manifest.content.len() > limit.file_bytes
                 || (manifest.kind == "workflow" && manifest.content.len() > limit.workflow_bytes)
-                || format!("{:x}", Sha256::digest(manifest.content.as_bytes())) != manifest.content_sha256
+                || crate::db::sha256_hex(manifest.content.as_bytes()) != manifest.content_sha256
             {
                 return false;
             }
@@ -417,7 +416,7 @@ pub fn hash_json_typed_v1(value: &Value) -> Result<String, Failure> {
     }
     let mut bytes = Vec::new();
     encode(value, &mut bytes, 0)?;
-    Ok(format!("{:x}", Sha256::digest(&bytes)))
+    Ok(crate::db::sha256_hex(&bytes))
 }
 
 #[cfg(test)]
