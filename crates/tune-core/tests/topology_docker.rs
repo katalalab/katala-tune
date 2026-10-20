@@ -207,7 +207,9 @@ async fn projected_collection_drops_private_fields_and_parses_network_boolean_st
     for field in ["{{json .Config}}", ".Env", ".Cmd", ".Labels", ".State.Health.Log", "HostIp", ".IPAddress"] {
         assert!(!template.contains(field), "{field}");
     }
-    assert!(template.contains(".State.Health.Status"));
+    assert!(template.contains("index .State \"Health\""));
+    assert!(template.contains("index . \"Status\""));
+    assert!(template.contains("index . \"Name\""));
 }
 #[test]
 fn malformed_import_and_nested_budget_are_rejected() {
@@ -415,5 +417,23 @@ fn local_zero_and_fractional_zero_log_sizes_remain_observed_policy_facts() {
         assert_eq!(c.health, None);
         let packet = DockerPacket { engines: vec![DockerEngine { id: "e".repeat(64), containers: vec![c], networks: vec![], volumes: vec![] }] };
         assert_eq!(packet.snapshot("test".into(), 1).unwrap().status, ScopeStatus::Complete);
+    }
+}
+
+#[test]
+fn optional_projection_nulls_and_zero_keep_their_dto_meanings() {
+    for value in [json!(null), json!(0)] {
+        let row = json!({"id":"fixture","state":"running","health":null,"memory":value,"nano_cpus":value,"log_driver":"json-file","max_size":null,"max_file":"0","mounts":[{"kind":"bind","source":null,"target":"/fixture","name":null,"rw":false}],"networks":[null],"ports":[null]});
+        let dto = parse_container(&row).unwrap();
+        assert_eq!(dto.health, None);
+        assert!(!dto.current_unhealthy);
+        assert_eq!(dto.memory_bytes, value.as_u64());
+        assert_eq!(dto.nano_cpus, value.as_u64());
+        assert_eq!(dto.log_max_size, None);
+        assert_eq!(dto.log_max_file, Some(0));
+        assert!(dto.log_unbounded_candidate);
+        assert_eq!(dto.mounts[0].volume_hash, None);
+        assert_eq!(dto.mounts[0].source_hash, None);
+        assert_eq!(dto.mounts[0].writable, Some(false));
     }
 }

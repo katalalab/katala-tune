@@ -120,3 +120,7 @@ jobs:
           retention-days: 7
           overwrite: false
           include-hidden-files: false
+      - name: Docker Go-template regression without a daemon
+        if: runner.os == 'Linux'
+        timeout-minutes: 1
+        run: node --test test/docker-template/docker-cli.test.js
