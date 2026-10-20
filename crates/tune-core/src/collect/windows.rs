@@ -915,7 +915,25 @@ mod tests {
             .map(|(index, process)| {
                 // SAFETY: zero wait only on a retained observer handle from this owned Job.
                 let wait = unsafe { WaitForSingleObject(process.handle.as_raw_handle(), 0) };
-                (process.identity.clone(), index == 0, wait, if wait == windows_sys::Win32::Foundation::WAIT_FAILED { os_error().raw_os_error() } else { None })
+                let wait_error = if wait == windows_sys::Win32::Foundation::WAIT_FAILED { os_error().raw_os_error() } else { None };
+                let mut image = vec![0u16; 32768];
+                let mut image_len = image.len() as u32;
+                // SAFETY: retained query-capable process handle and bounded writable UTF-16 buffer.
+                let image_ok = unsafe {
+                    windows_sys::Win32::System::Threading::QueryFullProcessImageNameW(process.handle.as_raw_handle(), 0, image.as_mut_ptr(), &mut image_len)
+                };
+                let image_error = if image_ok == 0 { os_error().raw_os_error() } else { None };
+                // Never place the full image path in diagnostic output, including on errors.
+                let image_basename = if image_ok != 0 && (image_len as usize) < image.len() {
+                    Path::new(&OsString::from_wide(&image[..image_len as usize])).file_name().map(OsStr::to_owned)
+                } else {
+                    None
+                };
+                let mut code = 0;
+                // SAFETY: read-only exit query on that same retained handle; wait remains the liveness evidence.
+                let code_ok = unsafe { GetExitCodeProcess(process.handle.as_raw_handle(), &mut code) };
+                let code_error = if code_ok == 0 { os_error().raw_os_error() } else { None };
+                (process.identity.clone(), index == 0, wait, wait_error, image_basename, image_error, (code_ok != 0).then_some(code as i32), code_error)
             })
             .collect();
         let mut current_accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
@@ -935,7 +953,7 @@ mod tests {
         let root_code_ok = unsafe { GetExitCodeProcess(job.processes[0].handle.as_raw_handle(), &mut current_root_code) };
         let root_code_error = if root_code_ok == 0 { os_error().raw_os_error() } else { None };
         eprintln!(
-            "accounting race metadata: fixture={fixture_name} receipt={receipt:?} observed_count={} retained_count={} retained_identity_is_root_wait_error={retained:?} hook_root_wait={} raw_accounting_ok={accounting_ok} raw_accounting_error={accounting_error:?} raw_active={} raw_total={} root_code_ok={root_code_ok} root_code_error={root_code_error:?} current_root_code={}",
+            "accounting race metadata: fixture={fixture_name} receipt={receipt:?} observed_count={} retained_count={} retained_identity_is_root_wait_error_basename_image_error_exit_code_error={retained:?} hook_root_wait={} raw_accounting_ok={accounting_ok} raw_accounting_error={accounting_error:?} raw_active={} raw_total={} root_code_ok={root_code_ok} root_code_error={root_code_error:?} current_root_code={}",
             receipt.observed.len(),
             job.processes.len(),
             hook_root_wait.load(Ordering::SeqCst),
