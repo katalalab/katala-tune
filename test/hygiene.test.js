@@ -171,6 +171,48 @@ test('git が時間内に返らないリポジトリは timeout の未観測に�
   assert.ok(data.elapsed_s < 30);
 });
 
+// 本物の git の前に挟む偽の git（引数に pattern を含む呼び出しだけ body を実行する）
+function fakeGit(name, pattern, body) {
+  const bin = path.join(FX.base, name);
+  fs.mkdirSync(bin);
+  const real = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+  fs.writeFileSync(path.join(bin, 'git'), `#!/bin/sh\ncase "$*" in *"${pattern}"*) ${body};; esac\nexec "${real}" "$@"\n`, { mode: 0o755 });
+  return { PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+}
+
+test('status の後の git が時間切れなら、きれいとは数えず未観測にする', { skip: process.platform === 'win32' }, () => {
+  const env = fakeGit('bin-revlist', 'rev-list', 'sleep 5');
+  const { data } = probe({ ghq_root: FX.ghq, cmd_s: 1, budget_s: 30 }, env);
+  const r = byPath(hygiene.normalize(data));
+  assert.deepEqual([r['acme/localonly'].state, r['acme/localonly'].reason], ['unobserved', 'timeout']);
+  assert.equal(r['acme/clean'].state, 'ok', 'upstream のあるリポジトリは rev-list を呼ばない');
+});
+
+test('標準出力が上限を超える git は止めて over_limit の未観測にする', { skip: process.platform === 'win32' }, () => {
+  const env = fakeGit('bin-flood', 'status --porcelain=v2', 'head -c 17000000 /dev/zero; exit 0');
+  const { data } = probe({ ghq_root: FX.ghq, cmd_s: 20, budget_s: 60, max_repos: 1 }, env);
+  assert.equal(data.repos.length, 1);
+  assert.deepEqual([data.repos[0].state, data.repos[0].reason], ['unobserved', 'over_limit']);
+});
+
+test('detached HEAD の remote に無いコミットも数える', () => {
+  const base = tmp();
+  try {
+    const d = path.join(base, 'ghq', 'example.com', 'acme', 'detached');
+    fs.mkdirSync(d, { recursive: true });
+    git(d, 'init', '-q', '-b', 'main');
+    commit(d, 'a.txt');
+    git(d, 'checkout', '-q', '--detach');
+    commit(d, 'b.txt');
+    const { data } = probe({ ghq_root: path.join(base, 'ghq') });
+    const r = hygiene.normalize(data).repos[0];
+    assert.deepEqual([r.state, r.detached, r.local_only], ['ok', true, 2]);
+    assert.ok(hygiene.analyze(hygiene.normalize(data)).some((x) => x.id === 'repo-unpushed'));
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test('差分本文・ファイル内容・認証情報入りの URL を出力に含めない', () => {
   const { ghq } = FX;
   // scp 形式・ユーザー名とパスワードの両方・パスワードに @ を含む形も

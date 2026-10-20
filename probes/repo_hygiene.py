@@ -13,7 +13,7 @@
 #     branch, detached, upstream（bool）, ahead, behind（upstream が無い・消えたなら null）, local_only（そのときの、どの remote にも無い commit 数）,
 #     tracked, untracked, conflicted, dirty_age_s（変更ファイルの最古の更新からの秒。測れなければ null）, head_age_s,
 #     stash（数。読めなければ null）, origin, origin_host, origin_path（owner/repo。origin が無い・読めない・パスと見なせなければ null）, has_origin }
-import json, os, re, shutil, subprocess, sys, time
+import json, os, re, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 
 KT_VERSION = "2026-10-11.1"   # 調査スクリプトの版（数え方を変えたら上げる）
@@ -28,6 +28,7 @@ MAX_WALK_DIRS = 20000
 GHQ_DEPTH = 5          # ghq root の下を歩く深さ（host/owner/repo と、GitLab のサブグループ）
 EXTRA_DEPTH = 2
 MAX_DIRTY_STAT = 200   # 更新時刻を測る変更ファイルの上限
+MAX_OUT = 16 * 1024 * 1024  # 1 コマンドの標準出力の上限（超えたら止めて over_limit）
 SKIP_DIRS = {"node_modules", "target", "venv", ".venv", "__pycache__", "Library", "AppData", "Applications", "Pictures", "Music", "Movies"}
 KEEP_DOT = {".worktrees"}
 
@@ -51,15 +52,39 @@ def shorten(p):
 
 
 def run(cmd, timeout):
-    # 戻り値: (終了コード, stdout) / 失敗は (None, "timeout" | "oserror")。stderr は捨てる（URL などの秘密が入りうる）
+    # 戻り値: (終了コード, stdout) / 失敗は (None, "timeout" | "over_limit" | "oserror")。stderr は捨てる（URL などの秘密が入りうる）
+    # 標準出力は MAX_OUT までしか持たない（巨大な untracked 一覧などでメモリを使い切らない）
     t = min(timeout, max(0.5, DEADLINE - time.time() + 5))
     try:
-        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=t, env=ENV, creationflags=NOWIN)
-        return r.returncode, r.stdout.decode("utf-8", "replace")
-    except subprocess.TimeoutExpired:
-        return None, "timeout"
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=ENV, creationflags=NOWIN)
     except OSError:
         return None, "oserror"
+    buf, over = bytearray(), [False]
+
+    def read():
+        while True:
+            c = p.stdout.read(65536)
+            if not c:
+                return
+            if len(buf) + len(c) > MAX_OUT:
+                over[0] = True
+                p.kill()
+                return
+            buf.extend(c)
+
+    th = threading.Thread(target=read, daemon=True)
+    th.start()
+    try:
+        p.wait(timeout=t)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
+        th.join(1)
+        return None, "timeout"
+    th.join(5)
+    if over[0]:
+        return None, "over_limit"
+    return p.returncode, bytes(buf).decode("utf-8", "replace")
 
 
 def git(path, *args):
@@ -161,18 +186,22 @@ def parse_status(out, now):
             pass
         elif t[0] == "?":
             info["untracked"] += 1
-            paths.append(t[2:])
+            if len(paths) < MAX_DIRTY_STAT:
+                paths.append(t[2:])
         elif t[0] == "1":
             info["tracked"] += 1
-            paths.append(t.split(" ", 8)[-1])
+            if len(paths) < MAX_DIRTY_STAT:
+                paths.append(t.split(" ", 8)[-1])
         elif t[0] == "2":
             info["tracked"] += 1
-            paths.append(t.split(" ", 9)[-1])
+            if len(paths) < MAX_DIRTY_STAT:
+                paths.append(t.split(" ", 9)[-1])
             i += 1  # 改名の元のパス
         elif t[0] == "u":
             info["tracked"] += 1
             info["conflicted"] += 1
-            paths.append(t.split(" ", 10)[-1])
+            if len(paths) < MAX_DIRTY_STAT:
+                paths.append(t.split(" ", 10)[-1])
     return info, paths
 
 
@@ -187,8 +216,9 @@ def scan(path, root):
         return d
     rc, out = git(path, "status", "--porcelain=v2", "--branch", "--show-stash", "-z", "--untracked-files=normal")
     if rc != 0:
-        d["reason"] = "timeout" if out == "timeout" else "git_failed"
+        d["reason"] = out if rc is None and out in ("timeout", "over_limit") else "git_failed"
         return d
+    unborn = "\0# branch.oid (initial)\0" in "\0" + out
     now = time.time()
     info, files = parse_status(out, now)
     d.update(info)
@@ -200,16 +230,32 @@ def scan(path, root):
             continue
         oldest = m if oldest is None else min(oldest, m)
     d["dirty_age_s"] = int(now - oldest) if oldest is not None else None
+    def failed(rc, out):
+        # 続きの git が時間切れ・失敗したら、きれいとは数えず未観測にする
+        d["state"] = "unobserved"
+        d["reason"] = out if rc is None and out in ("timeout", "over_limit") else "git_failed"
+        return d
+
     if d["stash"] is None:
         rc, out = git(path, "stash", "list", "--format=%gd")
-        d["stash"] = len(out.splitlines()) if rc == 0 else None
+        if rc != 0:
+            return failed(rc, out)
+        d["stash"] = len(out.splitlines())
     d["local_only"] = None
-    if d["ahead"] is None and not d["detached"]:  # upstream が無い（または消えた）
+    if d["ahead"] is None and not unborn:  # upstream が無い（または消えた）・detached HEAD
         rc, out = git(path, "rev-list", "--count", "HEAD", "--not", "--remotes")
-        d["local_only"] = int(out.strip()) if rc == 0 and out.strip().isdigit() else None
-    rc, out = git(path, "log", "-1", "--format=%ct")
-    d["head_age_s"] = int(now - int(out.strip())) if rc == 0 and out.strip().isdigit() else None
+        if rc != 0 or not out.strip().isdigit():
+            return failed(rc, out)
+        d["local_only"] = int(out.strip())
+    d["head_age_s"] = None
+    if not unborn:
+        rc, out = git(path, "log", "-1", "--format=%ct")
+        if rc != 0:
+            return failed(rc, out)
+        d["head_age_s"] = int(now - int(out.strip())) if out.strip().isdigit() else None
     rc, out = git(path, "config", "--get", "remote.origin.url")
+    if rc is None:
+        return failed(rc, out)
     d["origin"], d["origin_host"], d["origin_path"] = None, None, None
     if rc == 0 and out.strip():
         d["origin"], d["origin_host"], d["origin_path"] = sanitize(out.strip().splitlines()[0])

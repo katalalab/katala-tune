@@ -13,10 +13,21 @@ function parse(argv) {
   const o = { roots: [], ids: [], repos: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--ghq-root') o.ghq_root = argv[++i];
-    else if (a === '--root') o.roots.push(argv[++i]);
-    else if (a === '--max-repos') o.max_repos = Number(argv[++i]);
-    else if (a === '--budget') o.budget_s = Number(argv[++i]);
+    // 値が抜けた・数でないときは既定の範囲にすり替えず止める（tune hygiene と同じ）
+    const val = () => {
+      const v = argv[++i];
+      if (v === undefined || v === '' || v.startsWith('--')) throw new Error(`${a} に値が要る`);
+      return v;
+    };
+    const num = () => {
+      const v = val();
+      if (!/^\d+$/.test(v)) throw new Error(`${a} は正の整数で指定する: ${v}`);
+      return Number(v);
+    };
+    if (a === '--ghq-root') o.ghq_root = val();
+    else if (a === '--root') o.roots.push(val());
+    else if (a === '--max-repos') o.max_repos = num();
+    else if (a === '--budget') o.budget_s = num();
     else if (a === '--repos') o.repos = true;
     else if (a.startsWith('--')) throw new Error(`知らない引数: ${a}`);
     else o.ids.push(a);
