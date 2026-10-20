@@ -186,7 +186,7 @@ fn public_view(source: &Value, view: ExportView) -> Value {
         })
         .flatten()
         .collect::<Vec<_>>();
-    edges.sort_by(|(left, _), (right, _)| left.cmp(right));
+    edges.sort_by_key(|(left, _)| *left);
     let edges = edges
         .into_iter()
         .enumerate()
