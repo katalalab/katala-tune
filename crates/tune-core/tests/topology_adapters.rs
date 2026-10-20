@@ -1,5 +1,4 @@
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::Mutex,
@@ -87,7 +86,7 @@ fn capture(request: &RemoteRequest) -> RawCapture {
                 relative_path: "package.json".into(),
                 kind: "node".into(),
                 content: text.into(),
-                content_sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
+                content_sha256: tune_core::db::sha256_hex(text.as_bytes()),
                 revision: Some("a".repeat(40)),
             }],
             configs: vec![],
@@ -536,7 +535,7 @@ async fn approved_remote_smoke_receipts() {
         };
         let started = std::time::Instant::now();
         let capture = collect_remote(&request).await;
-        receipts.push(json!({"schema":"topology_adapter_live_receipt.v1","scope_id":request.scope_id,"observed_at_ms":request.observed_at_ms,"duration_ms":started.elapsed().as_millis(),"identity_matches":capture.target_identity==request.expected_identity_hash,"target_identity":capture.target_identity,"limits":capture.limits,"repositories":capture.repositories.len(),"manifests":capture.repositories.iter().map(|repo|repo.manifests.len()).sum::<usize>(),"counters":capture.counters,"failures":capture.failures,"probe_sha256":format!("{:x}",Sha256::digest(if request.platform==RemotePlatform::Windows { WINDOWS_PROBE.as_bytes() } else { POSIX_PROBE.as_bytes() })),"raw_content_persisted":false,"transport":"existing_strict_ssh_stdin"}));
+        receipts.push(json!({"schema":"topology_adapter_live_receipt.v1","scope_id":request.scope_id,"observed_at_ms":request.observed_at_ms,"duration_ms":started.elapsed().as_millis(),"identity_matches":capture.target_identity==request.expected_identity_hash,"target_identity":capture.target_identity,"limits":capture.limits,"repositories":capture.repositories.len(),"manifests":capture.repositories.iter().map(|repo|repo.manifests.len()).sum::<usize>(),"counters":capture.counters,"failures":capture.failures,"probe_sha256":tune_core::db::sha256_hex(if request.platform==RemotePlatform::Windows { WINDOWS_PROBE.as_bytes() } else { POSIX_PROBE.as_bytes() }),"raw_content_persisted":false,"transport":"existing_strict_ssh_stdin"}));
     }
     std::fs::write(output, serde_json::to_vec_pretty(&receipts).unwrap()).unwrap();
     assert!(
