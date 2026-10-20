@@ -41,6 +41,8 @@ L = '/ho' + 'me/alice'
 cases = [
   ('node', [H + '/.npm/_npx/ab12/node_modules/.bin/chrome-devtools-mcp', '--token', 'sk-SECRET']),
   ('node', ['--max-old-space-size=4096', '/opt/srv/mcp-pdf-server/dist/index.js', '--stdio']),
+  ('node', ['/opt/srv/customer-secret/dist/index.js']),
+  ('node', ['/opt/x/node_modules/@scope/pdf-mcp/dist/index.js']),
   ('node', [H + '/index.js']),
   ('node', [L + '/app/main.js']),
   ('python3', ['-m', 'some_module.sub', '--password=hunter2']),
@@ -60,7 +62,9 @@ print(json.dumps([m.proc_key(e, a) for e, a in cases]))
 `);
   assert.deepEqual(k, [
     'node:chrome-devtools-mcp',
-    'node:mcp-pdf-server',
+    'node',
+    'node',
+    'node:pdf-mcp',
     'node',
     'node',
     'python3:some_module',
@@ -77,7 +81,7 @@ print(json.dumps([m.proc_key(e, a) for e, a in cases]))
     'npx:some-mcp-server',
   ]);
   const text = JSON.stringify(k);
-  assert.doesNotMatch(text, /alice|SECRET|hunter2|secret|zzz|ghp_|4096|ignore/);
+  assert.doesNotMatch(text, /alice|SECRET|hunter2|secret|zzz|ghp_|4096|ignore|mcp-pdf-server/);
 });
 
 test('probe(Windows): MxKey も値付きオプションの値を鍵に入れない', { skip: process.platform !== 'win32' }, () => {
@@ -89,7 +93,8 @@ test('probe(Windows): MxKey も値付きオプションの値を鍵に入れな�
   const cases = [
     ['node', ['--token', 'ghp_' + 'A'.repeat(36), 'app.js'], 'node'],
     ['node', ['--max-old-space-size', '4096', 'server.js'], 'node'],
-    ['node', ['--max-old-space-size=4096', 'C:\\srv\\mcp-pdf-server\\dist\\index.js'], 'node:mcp-pdf-server'],
+    ['node', ['--max-old-space-size=4096', 'C:\\srv\\customer-secret\\dist\\index.js'], 'node'],
+    ['node', ['C:\\x\\node_modules\\@scope\\pdf-mcp\\dist\\index.js'], 'node:pdf-mcp'],
     ['npx', ['-y', 'some-mcp-server'], 'npx:some-mcp-server'],
     ['git', ['-c', 'core.fsmonitor=true', 'fsmonitor--daemon', 'run'], 'git:fsmonitor--daemon'],
   ];
@@ -126,6 +131,26 @@ print(json.dumps({'g': g, 't': t}))
   assert.deepEqual(claude, { root: 'claude', pid: 100, owner: 'user', count: 6, children: 5, mem_mb: 549 });
 });
 
+test('probe: 子より後に起動した親は PID の使い回しとして孤児に数え、子の数にも入れない', () => {
+  const r = runPy(`
+rows = []
+def add(pid, ppid, age, name, key=None):
+    rows.append({'pid': pid, 'ppid': ppid, 'uid': 501, 'rss_kb': 1024, 'name': name, 'key': key or name, 'age': age})
+add(50, 1, 100, 'newer')                        # 使い回された PID（子より新しい）
+for i in range(3): add(60 + i, 50, 1000, 'node', 'node:x-mcp')
+add(70, 1, 5000, 'older')                       # 本当の親（子より古い）
+for i in range(3): add(80 + i, 70, 1000, 'node', 'node:y-mcp')
+g, t = m.multiplication(rows)
+print(json.dumps({'g': g, 't': t}))
+`);
+  const x = r.g.find((g) => g.key === 'node:x-mcp');
+  const y = r.g.find((g) => g.key === 'node:y-mcp');
+  assert.deepEqual([x.orphans, x.parent], [3, null]);
+  assert.deepEqual([y.orphans, y.parent], [0, 'older']);
+  assert.equal(r.t.find((t) => t.root === 'older').children, 3);
+  assert.equal(r.t.some((t) => t.root === 'newer' && t.children > 0), false);
+});
+
 test('probe: 親子の循環があっても止まり、本数が少ない群は出さない', () => {
   const r = runPy(`
 rows = [
@@ -143,6 +168,7 @@ test('所見: git fsmonitor が機体で増殖していれば本数・合計・�
   const f = multi(analyze(win({ groups: [grp('git:fsmonitor--daemon', 1020, 12 * 1024, { orphans: 1020, parent: null, owner: 'system' })] })));
   assert.equal(f.length, 1);
   assert.equal(f[0].id, 'proc-multi-git:fsmonitor--daemon');
+  assert.match(f[0].detail, /所有者 システム（Windows はセッション 0・SSH を含む）/);
   assert.equal(f[0].severity, 'warn');
   assert.match(f[0].title, /1020 本.*12\.0 GB/);
   assert.match(f[0].detail, /親が終了済み.*1020 本/);

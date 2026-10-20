@@ -506,7 +506,13 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
             format!(
                 "親の多数派: {parent}、親が終了済み（PPID 1 など）{} 本、所有者 {}、合計{ws_note}",
                 js::num_str(orphans),
-                if js::is_str(g.get("owner"), "mixed") { "ユーザーとシステム" } else { "ユーザー" }
+                if js::is_str(g.get("owner"), "mixed") {
+                    "ユーザーとシステム"
+                } else if js::is_str(g.get("owner"), "system") {
+                    "システム（Windows はセッション 0・SSH を含む）"
+                } else {
+                    "ユーザー"
+                }
             ),
             format!(
                 "{}{}",

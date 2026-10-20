@@ -120,19 +120,21 @@ $mxSkip = @('exec', 'run', 'x', 'dlx', 'tool', 'start')
 # Options known to take no value. Any other option may be followed by a value (a token etc.), so stop reading there.
 $mxValueless = @('-y', '--yes', '-q', '--quiet', '--silent', '-u', '-B', '-E', '-s', '-S', '-I', '-O', '-OO', '-i', '--no-warnings', '--no-deprecation', '--trace-warnings', '--enable-source-maps', '--inspect', '--')
 $mxLaunchers = @('explorer', 'services', 'wininit', 'winlogon', 'svchost', 'sihost', 'csrss', 'smss', 'userinit', 'System', 'Idle', 'sshd')
+# Label = the script file name; for a generic name (index.js ...) only the package directly under node_modules.
+# Arbitrary parent directories (project or customer names) are never used.
 function MxLabel([string]$path) {
   $parts = @($path -split '[\\/]+' | Where-Object { $_ })
-  for ($i = 0; $i -lt $parts.Count; $i++) {
-    if ($parts[$i] -ieq 'users' -or $parts[$i] -ieq 'home') {
-      if ($i + 2 -lt $parts.Count) { $parts = @($parts[($i + 2)..($parts.Count - 1)]) } else { $parts = @() }
-      break
+  if ($parts.Count -eq 0) { return $null }
+  $ok = '^[A-Za-z0-9][A-Za-z0-9_.@+-]{0,47}$'
+  $n = $parts[$parts.Count - 1] -replace '\.([cm]?[jt]s|py|jar)$', ''
+  if (-not ($mxGeneric -contains $n) -and ($n -cmatch $ok)) { return $n }
+  for ($j = $parts.Count - 2; $j -ge 0; $j--) {
+    if ($parts[$j] -ieq 'node_modules' -and $j + 1 -lt $parts.Count - 1) {
+      $pkg = $parts[$j + 1]
+      if ($pkg.StartsWith('@') -and $j + 2 -lt $parts.Count - 1) { $pkg = $parts[$j + 2] }
+      if (-not ($mxGeneric -contains $pkg) -and ($pkg -cmatch $ok)) { return $pkg }
+      return $null
     }
-  }
-  $low = [Math]::Max(0, $parts.Count - 6)
-  for ($j = $parts.Count - 1; $j -ge $low; $j--) {
-    $n = $parts[$j] -replace '\.([cm]?[jt]s|py|jar)$', ''
-    if (($mxGeneric -contains $n) -or ($n -notmatch '^[A-Za-z0-9][A-Za-z0-9_.@+-]{0,47}$')) { continue }
-    return $n
   }
   return $null
 }
@@ -159,13 +161,20 @@ function MxKey([string]$exe, [string[]]$tokens) {
 $mxGroups = @(); $mxTrees = @(); $mxAvail = 'unavailable'; $mxReason = $null
 try {
   $mx = @{}
-  $mxCim = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, WorkingSetSize, CommandLine, SessionId, CreationDate -ErrorAction Stop)
+  $mxCim = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, WorkingSetSize, SessionId, CreationDate -ErrorAction Stop)
   if ($mxCim.Count -eq 0) { throw 'no-data' }
+  # Command lines are queried only for interpreter executables (other processes' arguments are never read)
+  $mxCmd = @{}
+  $mxNames = @($mxCim | ForEach-Object { [string]$_.Name } | Where-Object { ($_ -replace '\.exe$', '') -match $mxInterp -and $_ -match '^[A-Za-z0-9._-]+$' } | Sort-Object -Unique)
+  if ($mxNames.Count -gt 0) {
+    $flt = ($mxNames | ForEach-Object { "Name = '$_'" }) -join ' OR '
+    foreach ($c in @(Get-CimInstance Win32_Process -Filter $flt -Property ProcessId, CommandLine)) { if ($c.CommandLine) { $mxCmd[[int]$c.ProcessId] = [string]$c.CommandLine } }
+  }
   foreach ($w in $mxCim) {
     $nm = ([string]$w.Name) -replace '\.exe$', ''
     $tok = @()
-    if ($nm -match $mxInterp -and $w.CommandLine) {
-      $tok = @([regex]::Matches([string]$w.CommandLine, '"([^"]*)"|(\S+)') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value } } | Select-Object -Skip 1)
+    if ($nm -match $mxInterp -and $mxCmd.ContainsKey([int]$w.ProcessId)) {
+      $tok = @([regex]::Matches($mxCmd[[int]$w.ProcessId], '"([^"]*)"|(\S+)') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value } } | Select-Object -Skip 1)
     }
     $mx[[int]$w.ProcessId] = @{ pid = [int]$w.ProcessId; ppid = [int]$w.ParentProcessId; name = $nm; kb = ([double]$w.WorkingSetSize / 1KB); sys = ([int]$w.SessionId -eq 0); born = $w.CreationDate; key = (MxKey $nm $tok) }
   }
@@ -175,7 +184,7 @@ try {
     if ($p -and $r.born -and $p.born -and $p.born -gt $r.born) { $p = $null }
     $r.parent = $p
     $r.orphan = (($r.ppid -le 0) -or (-not $p))
-    $kids[$r.ppid] = 1 + [int]$kids[$r.ppid]
+    if ($p) { $kids[$p.pid] = 1 + [int]$kids[$p.pid] }
   }
   $gh = @{}
   $th = @{}
@@ -211,7 +220,7 @@ try {
 } catch {
   $mxReason = NsErr $_
 }
-$mx = $null; $mxCim = $null; $gh = $null; $th = $null; $kids = $null
+$mx = $null; $mxCim = $null; $mxCmd = $null; $gh = $null; $th = $null; $kids = $null
 
 # Memory
 $commitPct = $null

@@ -122,17 +122,20 @@ GROUP_MIN_COUNT = 3
 
 
 def script_label(path):
-    """パスの最後の意味のある名前（ユーザー名より上は見ない）。安全な文字だけなら返す。"""
+    """スクリプトのファイル名、汎用名（index.js など）なら node_modules の直下のパッケージ名だけ。
+    任意の親ディレクトリ（プロジェクト・顧客名など）は使わない。安全な文字だけなら返す。"""
     parts = [x for x in re.split(r"[\\/]+", path) if x]
-    for i, x in enumerate(parts):
-        if x.lower() in ("users", "home"):
-            parts = parts[i + 2:]
-            break
-    for x in reversed(parts[-6:]):
-        name = re.sub(r"\.(?:[cm]?[jt]s|py|jar)$", "", x)
-        if name.lower() in GENERIC_LABELS or not LABEL_OK.match(name):
-            continue
+    if not parts:
+        return None
+    name = re.sub(r"\.(?:[cm]?[jt]s|py|jar)$", "", parts[-1])
+    if name.lower() not in GENERIC_LABELS and LABEL_OK.match(name):
         return name
+    for i in range(len(parts) - 2, -1, -1):
+        if parts[i] == "node_modules" and i + 1 < len(parts) - 1:
+            pkg = parts[i + 2] if parts[i + 1].startswith("@") and i + 2 < len(parts) - 1 else parts[i + 1]
+            if pkg.lower() not in GENERIC_LABELS and LABEL_OK.match(pkg):
+                return pkg
+            return None
     return None
 
 
@@ -165,6 +168,15 @@ def proc_key(exe, tokens):
     return "%s:%s" % (exe, label) if label else exe
 
 
+def etime_s(s):
+    """ps の etime（[[dd-]hh:]mm:ss）を秒に。読めなければ None"""
+    m = re.match(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$", s or "")
+    if not m:
+        return None
+    d, h, mi, se = (int(x) if x else 0 for x in m.groups())
+    return ((d * 24 + h) * 60 + mi) * 60 + se
+
+
 def owner_kind(uid):
     return "system" if uid < 500 else "user"
 
@@ -175,6 +187,10 @@ def multiplication(rows, group_cap=20, tree_cap=10):
     for r in rows:
         r["owner"] = owner_kind(r["uid"])
         p = by_pid.get(r["ppid"])
+        # 子より後に起動した「親」は PID の使い回し（本当の親は終了済み）
+        if p is not None and r.get("age") is not None and p.get("age") is not None and p["age"] < r["age"]:
+            p = None
+        r["_p"] = p
         r["orphan"] = r["ppid"] <= 1 or p is None
         r["_parent"] = p["name"][:48] if p is not None else None
     groups = {}
@@ -202,7 +218,7 @@ def multiplication(rows, group_cap=20, tree_cap=10):
         seen = set()
         while r["pid"] not in seen:
             seen.add(r["pid"])
-            p = by_pid.get(r["ppid"])
+            p = r["_p"]
             if p is None or p["pid"] <= 1 or p["name"] in LAUNCHERS:
                 break
             r = p
@@ -210,7 +226,8 @@ def multiplication(rows, group_cap=20, tree_cap=10):
     trees = {}
     kids = {}
     for r in rows:
-        kids[r["ppid"]] = kids.get(r["ppid"], 0) + 1
+        if r["_p"] is not None:
+            kids[r["_p"]["pid"]] = kids.get(r["_p"]["pid"], 0) + 1
     for r in rows:
         root = root_of(r)
         t = trees.setdefault(root["pid"], {"root": root["name"][:48], "pid": root["pid"], "owner": root["owner"], "count": 0, "kb": 0,
@@ -234,7 +251,7 @@ def processes():
         pid, ppid, uid, cpu, rss, etime, comm = parts
         procs.append({"pid": int(pid), "cpu": float(cpu), "mem_mb": round(int(rss) / 1024), "etime": etime,
                       "name": os.path.basename(comm), "app": app_name(comm)})
-        rows.append({"pid": int(pid), "ppid": int(ppid), "uid": int(uid), "rss_kb": int(rss), "name": os.path.basename(comm)})
+        rows.append({"pid": int(pid), "ppid": int(ppid), "uid": int(uid), "rss_kb": int(rss), "name": os.path.basename(comm), "age": etime_s(etime)})
     groups = {}
     for p in procs:
         g = groups.setdefault(p["app"], {"app": p["app"], "cpu": 0.0, "mem_mb": 0, "count": 0})
@@ -252,8 +269,9 @@ def processes():
     agents = sum(1 for p in procs if re.match(r"^(claude|codex|opencode|cursor-agent|agy|gemini)\b", p["name"], re.I))
     # 同一コマンドの鍵。引数を読むのはインタープリタ（node・python など）だけで、結果は鍵にだけ使う
     argv = {}
-    if any(INTERPRETERS.match(r["name"]) for r in rows):
-        for line in run(["ps", "-axo", "pid=,command="], timeout=10).splitlines():
+    interp = [r["pid"] for r in rows if INTERPRETERS.match(r["name"])]
+    for i in range(0, len(interp), 200):  # インタープリタの PID だけを指定して読む（ほかのプロセスの引数は読まない）
+        for line in run(["ps", "-o", "pid=,command=", "-p", ",".join(str(p) for p in interp[i:i + 200])], timeout=10).splitlines():
             f = line.split(None, 1)
             if len(f) == 2 and f[0].isdigit():
                 argv[int(f[0])] = f[1]
