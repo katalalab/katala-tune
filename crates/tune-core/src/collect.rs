@@ -148,17 +148,10 @@ pub async fn run(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Dura
     RunResult { code: status.and_then(|s| s.code()), out: decode(&out), err: decode(&err) + &extra }
 }
 
-/// Bounded binary transport used by topology collection. It never formats raw
-/// output because manifests and command errors may contain private material.
-#[derive(Default)]
-pub struct BoundedResult {
-    pub code: Option<i32>,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub timed_out: bool,
-    pub output_limited: bool,
-    pub spawn_failed: bool,
-}
+mod bounded;
+pub use bounded::{BoundedResult, ProcessIdentity, ProcessReceipt, ProcessStop};
+#[cfg(windows)]
+mod windows;
 
 /// Explicit process environment for a bounded transport invocation.
 pub struct BoundedEnvironment<'a> {
@@ -199,6 +192,14 @@ pub async fn run_bounded_with_env_clean(
         command.env_remove(key);
     }
     command.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    #[cfg(windows)]
+    return windows::run(command.as_std(), input, timeout, stdout_limit, stderr_limit).await;
+    #[cfg(not(windows))]
+    run_bounded_portable(command, input, timeout, stdout_limit, stderr_limit).await
+}
+
+#[cfg(not(windows))]
+async fn run_bounded_portable(mut command: Command, input: &[u8], timeout: Duration, stdout_limit: usize, stderr_limit: usize) -> BoundedResult {
     let Ok(mut child) = command.spawn() else {
         return BoundedResult { spawn_failed: true, ..Default::default() };
     };
@@ -233,6 +234,7 @@ pub async fn run_bounded_with_env_clean(
     answer
 }
 
+#[cfg(not(windows))]
 fn read_bounded<R: AsyncRead + Unpin + Send + 'static>(pipe: Option<R>, limit: usize, signal: tokio::sync::mpsc::Sender<()>) -> (SharedBuf, JoinHandle<()>) {
     let output = Arc::new(Mutex::new(Vec::new()));
     let buffer = Arc::clone(&output);
