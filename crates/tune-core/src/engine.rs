@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
@@ -57,6 +57,7 @@ pub const DEFAULT_INVENTORY_HOURS: i64 = 24;
 pub struct Engine {
     host: Arc<dyn Host>,
     pub db: Arc<Mutex<Store>>,
+    monitor_journal: OnceLock<crate::monitor_journal::Journal>,
     cfg: RwLock<(Config, Option<String>)>,
     config_path: PathBuf,
     data_dir: PathBuf,
@@ -126,6 +127,7 @@ impl Engine {
         let e = Arc::new(Engine {
             host,
             db: Arc::new(Mutex::new(store)),
+            monitor_journal: OnceLock::new(),
             cfg: RwLock::new((Config::default(), None)),
             config_path,
             data_dir,
@@ -183,6 +185,31 @@ impl Engine {
     /// DB を短く借りる
     pub fn with_db<T>(&self, f: impl FnOnce(&Store) -> rusqlite::Result<T>) -> Result<T, String> {
         f(&lock(&self.db)).map_err(|e| e.to_string())
+    }
+
+    /// monitor::runのruntime内から1回。照会はwriterを開始しない。
+    pub fn start_monitor_journal(&self) -> crate::monitor_journal::Journal {
+        self.monitor_journal.get_or_init(|| crate::monitor_journal::Journal::start(self.db.clone())).clone()
+    }
+
+    pub fn monitor_journal_health(&self) -> Value {
+        self.monitor_journal.get().map_or_else(
+            || json!({ "status": "unknown", "running": false, "summary": "収集記録は開始していません", "dropped_total": null, "db_failures": null }),
+            |j| j.health(),
+        )
+    }
+
+    pub fn monitor_events(&self, filter: &crate::monitor_journal::Filter) -> Result<Value, String> {
+        let mut v = self.with_db(|d| d.monitor_events(filter)).map_err(|_| "収集記録を読み出せません".to_string())?;
+        v["health"] = self.monitor_journal_health();
+        Ok(v)
+    }
+
+    pub async fn finish_monitor_journal(&self, budget: Duration) -> bool {
+        match self.monitor_journal.get() {
+            Some(j) => j.shutdown(budget).await,
+            None => true,
+        }
     }
 
     /// 自動スキャンの設定（既定 → 台帳の schedule → 画面で変えた値 の順に上書き）

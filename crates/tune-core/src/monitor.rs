@@ -17,6 +17,7 @@ use crate::db::metrics::MinuteRow;
 use crate::db::{Store, now_ms};
 use crate::engine::Engine;
 use crate::live::{Live, Opts, Sample};
+use crate::monitor_journal::{Category, Data, Kind, Policy};
 use crate::nodes::{Config, Node};
 
 pub const MINUTE: i64 = 60_000;
@@ -64,11 +65,15 @@ impl Settings {
 }
 
 pub fn settings(db: &Store) -> Settings {
-    let v = db.get_meta("monitor").ok().flatten().unwrap_or(Value::Null);
-    Settings {
+    checked_settings(db).unwrap_or_default()
+}
+
+fn checked_settings(db: &Store) -> rusqlite::Result<Settings> {
+    let v = db.get_meta("monitor")?.unwrap_or(Value::Null);
+    Ok(Settings {
         enabled: v.get("enabled").and_then(Value::as_bool).unwrap_or(false),
         hub: v.get("hub").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
-    }
+    })
 }
 
 /// 変える。hub は台帳にあり、この機体でないものだけ（"" か null で外す）
@@ -358,7 +363,13 @@ pub async fn pull(engine: &Engine) -> Result<Value, String> {
 
 /// 最後の写しが成功していて新しい（ハブの数字・分析結果の新しさはこの中身で見る）
 fn last_pull_ok(db: &Store, now: i64) -> Option<Value> {
-    settings(db).hub.as_ref()?;
+    last_pull_ok_for(db, now, settings(db).hub.is_some())
+}
+
+fn last_pull_ok_for(db: &Store, now: i64, has_hub: bool) -> Option<Value> {
+    if !has_hub {
+        return None;
+    }
     let p = db.get_meta("hubPull").ok().flatten()?;
     (p.get("ok").and_then(Value::as_bool) == Some(true) && p.get("at").and_then(Value::as_i64).is_some_and(|at| now - at <= HUB_STALE_MS)).then_some(p)
 }
@@ -391,6 +402,67 @@ pub fn live_opts(nodes: usize) -> Opts {
 /// サンプラーを入れ替えた機体を次に試すまで（失敗・入れ替え直後の同じ版の見直し）
 pub const AGENT_PUSH_EVERY_MS: i64 = 60 * MINUTE;
 
+fn collection_decision(db: &Store, now: i64) -> rusqlite::Result<(Settings, bool)> {
+    let s = checked_settings(db)?;
+    let fresh = last_pull_ok_for(db, now, s.hub.is_some()).is_some_and(|p| p.get("fresh").and_then(Value::as_bool) == Some(true));
+    let collect = s.enabled && !fresh;
+    Ok((s, collect))
+}
+
+/// 既存の5分policy。時計/再試行動作は変更せず決定だけを記録する。
+fn disconnected_ready(id: &str, down: bool, now: i64, retry_at: &mut HashMap<String, i64>, journal: &crate::monitor_journal::Journal) -> bool {
+    if !down {
+        retry_at.remove(id);
+        return true;
+    }
+    let initial = !retry_at.contains_key(id);
+    let at = *retry_at.entry(id.to_string()).or_insert(now + RETRY_DISCONNECTED_MS);
+    if initial {
+        journal.record(
+            Some(id),
+            0,
+            0,
+            Kind::Retry,
+            Data { policy: Some(Policy::MonitorDisconnected), delay_ms: Some(RETRY_DISCONNECTED_MS as u64), ..Data::default() },
+        );
+    }
+    if now >= at {
+        retry_at.insert(id.to_string(), now + RETRY_DISCONNECTED_MS);
+        journal.record(Some(id), 0, 0, Kind::Retry, Data { policy: Some(Policy::MonitorDisconnected), delay_ms: Some(0), ..Data::default() });
+        true
+    } else {
+        false
+    }
+}
+
+/// 保存ACKと失敗を分ける。rolled watermarkの更新順は従来の呼出し側のまま。
+fn save_minute_rows(engine: &Engine, journal: &crate::monitor_journal::Journal, rows: &[MinuteRow]) -> bool {
+    let result = engine.with_db(|d| Ok(d.add_metrics(rows).map_err(|e| Category::database(&e))));
+    let category = match &result {
+        Ok(Ok(_)) => None,
+        Ok(Err(c)) => Some(*c),
+        Err(_) => Some(Category::Unknown),
+    };
+    for row in rows {
+        // minuteは複数attemptを含み得る。generation/attempt=0は個別producer未対応を示す。
+        journal.record(
+            Some(&row.node_id),
+            0,
+            0,
+            Kind::MinuteCommit,
+            Data {
+                minute: Some(row.minute),
+                rows: Some(1),
+                samples: Some(row.n.max(0) as u64),
+                committed: Some(category.is_none()),
+                category,
+                ..Data::default()
+            },
+        );
+    }
+    category.is_none()
+}
+
 /// 15 秒ごとに: 常時監視が入っていてハブの数字が新しくなければ全機体のライブに合図を送って保ち、
 /// 終わった分を集計して保存し、ハブを選んでいれば 1 分ごとに写す。14 日より古い集計は 1 日 1 回消す。
 /// agent（同梱のサンプラー。Windows の操作卓だけ）があれば、hello の版が古い・無い Windows の機体へ入れ替えを送る（helpers.rs）。
@@ -403,6 +475,9 @@ pub async fn run(
     agent: Option<Arc<Vec<u8>>>,
 ) {
     let event = Arc::new(event);
+    let journal = engine.start_monitor_journal();
+    live.bind_journal(journal.clone());
+    let mut previous_policy = None;
     let mut rolled: HashMap<String, i64> = HashMap::new();
     let mut retry_at: HashMap<String, i64> = HashMap::new();
     let mut pushed_at: HashMap<String, i64> = HashMap::new();
@@ -412,7 +487,22 @@ pub async fn run(
     loop {
         iv.tick().await;
         let now = now_ms();
-        let (s, collect) = engine.with_db(|d| Ok((settings(d), should_collect(d, now)))).unwrap_or_default();
+        let decision = engine.with_db(|d| collection_decision(d, now));
+        let unknown = decision.is_err();
+        let (s, collect) = decision.unwrap_or_default();
+        let policy = if unknown {
+            Policy::SettingsUnknown
+        } else if collect {
+            Policy::Local
+        } else if s.enabled {
+            Policy::Hub
+        } else {
+            Policy::Disabled
+        };
+        if previous_policy != Some(policy) {
+            journal.record(None, 0, 0, Kind::Policy, Data { policy: Some(policy), ..Data::default() });
+            previous_policy = Some(policy);
+        }
         if s.hub.is_some() && now - last_pull >= MINUTE - 5_000 {
             last_pull = now;
             if pull(&engine).await.is_ok() {
@@ -429,16 +519,7 @@ pub async fn run(
                 .filter(|n| n.is_active() && (n.is_mac() || n.is_windows()))
                 .filter(|n| {
                     let down = live.brief(&n.id).is_some_and(|b| b["state"] == "stopped" && b["reason"] == "disconnected");
-                    if !down {
-                        retry_at.remove(&n.id);
-                        return true;
-                    }
-                    let at = *retry_at.entry(n.id.clone()).or_insert(now + RETRY_DISCONNECTED_MS);
-                    if now >= at {
-                        retry_at.insert(n.id.clone(), now + RETRY_DISCONNECTED_MS);
-                        return true;
-                    }
-                    false
+                    disconnected_ready(&n.id, down, now, &mut retry_at, &journal)
                 })
                 .cloned()
                 .collect();
@@ -481,7 +562,7 @@ pub async fn run(
                 }
                 rows.extend(got);
             }
-            if !rows.is_empty() && engine.with_db(|d| d.add_metrics(&rows)).is_ok() {
+            if !rows.is_empty() && save_minute_rows(&engine, &journal, &rows) {
                 event(json!({ "rows": rows.len() }));
             }
         }
@@ -561,6 +642,7 @@ pub fn dashboard(engine: &Engine, live: Option<&Live>, minutes: i64) -> Result<V
     Ok(json!({
         "at": now, "minutes": minutes, "monitor": s.json(), "collecting": collecting, "hub_pull": pull, "app": app,
         "local_host": crate::nodes::local_host(), "schedule": engine.schedule(), "nodes": nodes,
+        "journal": engine.monitor_journal_health(),
     }))
 }
 
@@ -762,5 +844,138 @@ mod tests {
     fn monitor_streams_cover_the_whole_ledger() {
         assert_eq!(live_opts(3).max_streams, Opts::default().max_streams);
         assert_eq!(live_opts(9).max_streams, 9);
+    }
+    #[tokio::test]
+    async fn minute_commit_ack_reports_only_actual_database_success() {
+        use crate::{
+            engine::NoHost,
+            monitor_journal::{Filter, Journal},
+        };
+        let dir = std::env::temp_dir().join(format!("monitor-commit-{}-{}", std::process::id(), now_ms()));
+        let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(NoHost)).unwrap();
+        let journal = Journal::start(engine.db.clone());
+        let row = MinuteRow { node_id: "fixture".into(), minute: 60_000, n: 60, v: json!({"cpu":[5,5]}), src: None };
+        assert!(save_minute_rows(&engine, &journal, std::slice::from_ref(&row)));
+        engine.with_db(|d| d.conn().execute_batch("PRAGMA query_only=ON")).unwrap();
+        let mut failed = row;
+        failed.minute = 120_000;
+        assert!(!save_minute_rows(&engine, &journal, &[failed]));
+        engine.with_db(|d| d.conn().execute_batch("PRAGMA query_only=OFF")).unwrap();
+        assert!(journal.flush(Duration::from_secs(2)).await);
+        let records = engine.with_db(|d| d.monitor_events(&Filter { kind: Some(Kind::MinuteCommit), ..Default::default() })).unwrap();
+        let xs = records["events"].as_array().unwrap();
+        assert_eq!(xs.len(), 2);
+        assert_eq!(xs[0]["data"]["committed"], false);
+        assert_eq!(xs[0]["data"]["minute"], 120_000);
+        assert_eq!(xs[1]["data"]["committed"], true);
+        assert_eq!(xs[1]["data"]["minute"], 60_000);
+        assert_eq!(engine.with_db(|d| d.metrics(Some("fixture"), 0, 180_000)).unwrap().len(), 1);
+        assert!(journal.shutdown(Duration::from_secs(2)).await);
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    // 同じ変換/rollup/Store経路を通す小さいmicrobenchmark。OS/SSH/driver性能の証明ではない。
+    async fn journal_microbench(enabled: bool) {
+        use crate::{
+            engine::NoHost,
+            live::{Msg, parse_line},
+            monitor_journal::{Filter, Journal},
+        };
+        let dir = std::env::temp_dir().join(format!("monitor-cost-{}-{}", std::process::id(), now_ms()));
+        let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(NoHost)).unwrap();
+        let journal: Option<Journal> = enabled.then(|| engine.start_monitor_journal());
+        let start = std::time::Instant::now();
+        let base = now_ms().div_euclid(MINUTE) * MINUTE - 10 * MINUTE;
+        let mut processed = 0;
+        let mut peak = 0;
+        let mut seq_drops = 0;
+        for minute in 0..10 {
+            let mut rows = Vec::new();
+            for node in 0..6 {
+                let id = format!("fixture-{node}");
+                let mut samples = Vec::new();
+                let mut previous = None;
+                for second in 0..60 {
+                    let seq = (minute * 60 + second) as u64;
+                    let line = format!(
+                        r#"{{"type":"s","seq":{seq},"cpu":5,"mem":{{"used_pct":25}},"gpu":[{{"adapter_index":0,"mem_used_mb":0,"mem_total_mb":8192,"mem_free_mb":8000,"mem_used_pct":0}}]}}"#
+                    );
+                    let Some(Msg::Sample(raw)) = parse_line(&line) else { panic!("fixture parse") };
+                    let (sample, _, _) = Sample::from_raw(*raw, base + minute * MINUTE + second * 1000);
+                    if previous.is_some_and(|p| sample.seq != Some(p + 1)) {
+                        seq_drops += 1;
+                    }
+                    previous = sample.seq;
+                    samples.push(sample);
+                    processed += 1;
+                }
+                rows.extend(rollup(&id, &samples, None, base + minute * MINUTE, base + (minute + 1) * MINUTE, "fixture"));
+            }
+            if let Some(j) = &journal {
+                assert!(save_minute_rows(&engine, j, &rows));
+                peak = peak.max(j.health()["queue_depth"].as_u64().unwrap());
+            } else {
+                engine.with_db(|d| d.add_metrics(&rows)).unwrap();
+            }
+        }
+        if let Some(j) = &journal {
+            assert!(j.flush(Duration::from_secs(5)).await);
+            assert_eq!(j.health()["dropped_total"], 0);
+        }
+        let elapsed = start.elapsed().as_micros();
+        let events = engine.with_db(|d| d.monitor_events(&Filter::default())).unwrap()["retention"]["rows"].as_i64().unwrap();
+        let rows = engine.with_db(|d| d.metrics(None, base, base + 10 * MINUTE)).unwrap();
+        assert_eq!(rows.len(), 60);
+        assert_eq!(processed, 3600);
+        assert_eq!(seq_drops, 0);
+        let bytes = ["katala-tune.db", "katala-tune.db-wal", "katala-tune.db-shm"]
+            .iter()
+            .filter_map(|p| std::fs::metadata(dir.join("data").join(p)).ok())
+            .map(|m| m.len())
+            .sum::<u64>();
+        println!(
+            "{}",
+            json!({"enabled":enabled,"nodes":6,"logical_minutes":10,"samples":processed,"metric_rows":rows.len(),"seq_drops":seq_drops,"queue_peak":peak,"event_rows":events,"elapsed_us":elapsed,"database_plus_wal_shm_bytes":bytes})
+        );
+        if let Some(j) = journal {
+            assert!(j.shutdown(Duration::from_secs(2)).await);
+        }
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "bounded synthetic performance receipt, run explicitly"]
+    async fn journal_microbench_off() {
+        journal_microbench(false).await;
+    }
+    #[tokio::test]
+    #[ignore = "bounded synthetic performance receipt, run explicitly"]
+    async fn journal_microbench_on() {
+        journal_microbench(true).await;
+    }
+    #[tokio::test]
+    async fn disconnected_retry_waits_five_minutes_without_polling_the_host() {
+        let db = Arc::new(std::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let journal = crate::monitor_journal::Journal::start(db.clone());
+        let mut retry = HashMap::new();
+        let now = 1000;
+        assert!(!disconnected_ready("fixture", true, now, &mut retry, &journal));
+        assert!(!disconnected_ready("fixture", true, now + RETRY_DISCONNECTED_MS - 1, &mut retry, &journal));
+        assert!(disconnected_ready("fixture", true, now + RETRY_DISCONNECTED_MS, &mut retry, &journal));
+        assert!(!disconnected_ready("fixture", true, now + RETRY_DISCONNECTED_MS + 1, &mut retry, &journal));
+        assert!(disconnected_ready("fixture", false, now + RETRY_DISCONNECTED_MS + 1, &mut retry, &journal));
+        assert!(retry.is_empty());
+        assert!(journal.flush(Duration::from_secs(2)).await);
+        let v = db.lock().unwrap().monitor_events(&crate::monitor_journal::Filter { kind: Some(Kind::Retry), ..Default::default() }).unwrap();
+        assert_eq!(v["events"].as_array().unwrap().len(), 2);
+        assert_eq!(v["events"][0]["data"]["delay_ms"], 0);
+        assert_eq!(v["events"][1]["data"]["delay_ms"], RETRY_DISCONNECTED_MS);
+        assert!(journal.shutdown(Duration::from_secs(2)).await);
+    }
+    #[test]
+    fn settings_read_failure_is_unknown_instead_of_intentional_disabled() {
+        let db = Store::open_in_memory().unwrap();
+        db.conn().execute_batch("DROP TABLE meta").unwrap();
+        assert!(collection_decision(&db, 1000).is_err(), "a failed settings read must not be labelled disabled");
     }
 }
