@@ -24,7 +24,19 @@ impl ExportView {
     fn entity(self, kind: &str) -> bool {
         match self {
             Self::All => true,
-            Self::Hosts => matches!(kind, "host" | "environment" | "repository" | "checkout" | "worktree"),
+            Self::Hosts => matches!(
+                kind,
+                "docker_engine"
+                    | "docker_container"
+                    | "docker_network"
+                    | "docker_volume"
+                    | "docker_mount"
+                    | "host"
+                    | "environment"
+                    | "repository"
+                    | "checkout"
+                    | "worktree"
+            ),
             Self::Dependencies => matches!(kind, "repository" | "checkout" | "workspace" | "package"),
             Self::Cicd => matches!(kind, "repository" | "workflow" | "job" | "artifact" | "deployment"),
         }
@@ -33,7 +45,17 @@ impl ExportView {
     fn edge(self, kind: &str) -> bool {
         match self {
             Self::All => true,
-            Self::Hosts => matches!(kind, "contains_environment" | "contains_checkout" | "checkout_of" | "worktree_of" | "contains_workspace"),
+            Self::Hosts => matches!(
+                kind,
+                "docker_contains"
+                    | "docker_network_member"
+                    | "docker_mounts"
+                    | "contains_environment"
+                    | "contains_checkout"
+                    | "checkout_of"
+                    | "worktree_of"
+                    | "contains_workspace"
+            ),
             Self::Dependencies => {
                 matches!(kind, "contains_checkout" | "contains_workspace" | "contains_package" | "workspace_member" | "declares_dependency" | "resolves_to")
             }
@@ -45,7 +67,12 @@ impl ExportView {
 fn known_entity(kind: &str) -> bool {
     matches!(
         kind,
-        "host"
+        "docker_engine"
+            | "docker_container"
+            | "docker_network"
+            | "docker_volume"
+            | "docker_mount"
+            | "host"
             | "environment"
             | "repository"
             | "checkout"
@@ -64,7 +91,10 @@ fn known_entity(kind: &str) -> bool {
 fn known_edge(kind: &str) -> bool {
     matches!(
         kind,
-        "contains_environment"
+        "docker_contains"
+            | "docker_network_member"
+            | "docker_mounts"
+            | "contains_environment"
             | "contains_checkout"
             | "checkout_of"
             | "worktree_of"
