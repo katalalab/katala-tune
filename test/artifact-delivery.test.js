@@ -44,7 +44,8 @@ function fixture(t) {
 }
 
 // A real PE resource tree (RT_MANIFEST/name/language), not a string-search mock.
-function pe(gui) {
+const GUI_MANIFEST = '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"><dependency><dependentAssembly><assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/></dependentAssembly></dependency></assembly>';
+function pe(gui, manifest = GUI_MANIFEST) {
   const b = Buffer.alloc(2048); b.write('MZ'); b.writeUInt32LE(128, 60);
   b.write('PE\0\0', 128); b.writeUInt16LE(0x8664, 132); b.writeUInt16LE(1, 134);
   b.writeUInt16LE(240, 148); b.writeUInt16LE(2, 150);
@@ -56,7 +57,7 @@ function pe(gui) {
     b.writeUInt16LE(1, 512 + offset + 14); b.writeUInt32LE(id, 512 + offset + 16);
     b.writeUInt32LE(offset === 48 ? next : (next + 0x80000000), 512 + offset + 20);
   }
-  const xml = Buffer.from('<assembly manifestVersion="1.0"><dependency><dependentAssembly><assemblyIdentity name="Microsoft.Windows.Common-Controls" version="6.0.0.0"/></dependentAssembly></dependency></assembly>');
+  const xml = Buffer.isBuffer(manifest) ? manifest : Buffer.from(manifest);
   b.writeUInt32LE(4096 + 88, 512 + 72); b.writeUInt32LE(xml.length, 512 + 76); xml.copy(b, 512 + 88);
   return b;
 }
@@ -123,6 +124,81 @@ test('PE parser requires executable x64 PE32+, correct subsystem and embedded GU
   ]) { const b = pe(true); mutate(b); assert.throws(() => inspectPE(b, true)); }
   for (const bytes of [0, 63, 140, 400, 550, 620]) assert.throws(() => inspectPE(pe(true).subarray(0, bytes), true));
   assert.throws(() => inspectPE(Buffer.from('MZ fake text Microsoft.Windows.Common-Controls version="6.0.0.0"'), true));
+});
+
+test('GUI manifest must use active executable resource ID 1', () => {
+  const otherId = pe(true); otherId.writeUInt32LE(2, 512 + 24 + 16);
+  assert.throws(() => inspectPE(otherId, true), /manifest/i);
+  const namedPartition = pe(true); namedPartition.writeUInt16LE(1, 512 + 24 + 12); namedPartition.writeUInt16LE(0, 512 + 24 + 14);
+  assert.throws(() => inspectPE(namedPartition, true), /manifest resource name partition/);
+});
+
+test('GUI manifest cannot satisfy its dependency with a commented identity', () => {
+  const identity = GUI_MANIFEST.match(/<assemblyIdentity[^>]*\/>/)[0];
+  const commented = GUI_MANIFEST.replace(identity, `<!--${identity}-->`);
+  assert.throws(() => inspectPE(pe(true, commented), true), /manifest/i);
+});
+
+test('GUI manifest reader rejects inactive text, unsupported XML, namespace tricks and malformed structure', () => {
+  const identity = GUI_MANIFEST.match(/<assemblyIdentity[^>]*\/>/)[0];
+  const invalid = [
+    GUI_MANIFEST.replace('<dependency>', '<!--<dependency>').replace('</dependency>', '</dependency>-->'),
+    GUI_MANIFEST.replace(identity, `<![CDATA[${identity}]]>`),
+    GUI_MANIFEST.replace(identity, identity.replaceAll('<', '&lt;').replaceAll('>', '&gt;')),
+    GUI_MANIFEST.replace(identity, `<?fake ${identity}?>`),
+    '<!DOCTYPE assembly [<!ENTITY controls SYSTEM "https://example.com/never-fetched">]>' + GUI_MANIFEST,
+    GUI_MANIFEST.replace('Microsoft.Windows.Common-Controls', '&controls;'),
+    GUI_MANIFEST.replace('Microsoft.Windows.Common-Controls', '&#0;'),
+    GUI_MANIFEST.replace('urn:schemas-microsoft-com:asm.v1', 'urn:wrong'),
+    GUI_MANIFEST.replace('<assemblyIdentity ', '<assemblyIdentity xmlns="urn:wrong" '),
+    GUI_MANIFEST.replace('<assemblyIdentity ', '<unbound:assemblyIdentity '),
+    GUI_MANIFEST.replace('<dependentAssembly>', '').replace('</dependentAssembly>', ''),
+    GUI_MANIFEST.replace('</dependency>', '</different>'),
+    GUI_MANIFEST.replace('<dependency>', '<dependency><!-- invalid--comment -->'),
+    GUI_MANIFEST.replace('type="win32"', 'type="win32" type="win32"'),
+    GUI_MANIFEST.replace('<assemblyIdentity ', '<assemblyIdentity xmlns:p="urn:same" xmlns:q="urn:same" p:a="1" q:a="2" '),
+    GUI_MANIFEST.replace('<dependency>', '<dependency>unexpected text'),
+    GUI_MANIFEST + GUI_MANIFEST,
+    GUI_MANIFEST.replace('</assembly>', ''),
+    '<?xml version="1.0" standalone="yes" encoding="UTF-8"?>' + GUI_MANIFEST,
+    '<?xml version="1.0" encoding=""?>' + GUI_MANIFEST,
+    '<?xml version="&#49;.0"?>' + GUI_MANIFEST,
+    '&#32;' + GUI_MANIFEST,
+    GUI_MANIFEST.replace('</dependentAssembly>', '<invalid/></dependentAssembly>'),
+  ];
+  for (const xml of invalid) assert.throws(() => inspectPE(pe(true, xml), true), undefined, xml);
+});
+
+test('Common Controls binding checks all required identity values and rejects duplicate active resources', () => {
+  for (const attribute of ['type', 'name', 'version', 'processorArchitecture', 'publicKeyToken']) {
+    const xml = GUI_MANIFEST.replace(new RegExp(` ${attribute}="[^"]*"`), '');
+    assert.throws(() => inspectPE(pe(true, xml), true), /manifest/i, attribute);
+  }
+  for (const [before, after] of [['win32', 'win64'], ['6.0.0.0', '6.1.0.0'], ['6595b64144ccf1df', '0000000000000000'], ['processorArchitecture="*"', 'processorArchitecture="x86"'], ['<dependency>', '<dependency optional="yes">']]) {
+    assert.throws(() => inspectPE(pe(true, GUI_MANIFEST.replace(before, after)), true), /manifest/i, after);
+  }
+  const duplicate = pe(true); duplicate.fill(0, 512);
+  for (const [offset, id, next] of [[0, 24, 64], [64, 1, 88], [88, 1033, 112]]) {
+    duplicate.writeUInt16LE(1, 512 + offset + 14); duplicate.writeUInt32LE(id, 512 + offset + 16);
+    duplicate.writeUInt32LE(offset === 88 ? next : next + 0x80000000, 512 + offset + 20);
+  }
+  duplicate.writeUInt16LE(2, 512 + 14); duplicate.writeUInt32LE(24, 512 + 24); duplicate.writeUInt32LE(64 + 0x80000000, 512 + 28);
+  duplicate.writeUInt32LE(4096 + 128, 512 + 112); duplicate.writeUInt32LE(Buffer.byteLength(GUI_MANIFEST), 512 + 116);
+  duplicate.write(GUI_MANIFEST, 512 + 128);
+  assert.throws(() => inspectPE(duplicate, true), /duplicate manifest resource ID|ambiguous embedded manifest/);
+});
+
+test('valid Tauri-style manifests retain comments, namespace binding, declarations and UTF encodings', () => {
+  for (const xml of [
+    GUI_MANIFEST,
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n<!-- harmless -->' + GUI_MANIFEST,
+    GUI_MANIFEST.replace('processorArchitecture="*"', 'processorArchitecture="amd64"'),
+    GUI_MANIFEST.replace('processorArchitecture="*"', 'processorArchitecture="&#x2a;"'),
+    GUI_MANIFEST.replace('xmlns=', 'xmlns:a=').replace(/<(\/?)(assembly|dependency|dependentAssembly|assemblyIdentity)(?=[ >])/g, '<$1a:$2'),
+  ]) assert.equal(inspectPE(pe(true, xml), true).subsystem, 'windows');
+  const utf16 = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('<?xml version="1.0" encoding="UTF-16"?>' + GUI_MANIFEST, 'utf16le')]);
+  assert.equal(inspectPE(pe(true, utf16), true).subsystem, 'windows');
+  assert.equal(inspectPE(pe(true, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(GUI_MANIFEST)])), true).subsystem, 'windows');
 });
 
 test('Windows payload is exactly three release executables bound to helper input hashes', t => {

@@ -144,6 +144,126 @@ function inventory(root) {
   walk(''); return files;
 }
 
+// Restricted XML 1.0 reader for build manifests. Comments never create elements;
+// DTD, entities beyond XML's built-ins/numeric references, CDATA and other PIs fail closed.
+function checkCommonControlsManifest(bytes) {
+  need(bytes.length > 0 && bytes.length <= 65536, 'manifest size out of bounds');
+  const encoding = bytes[0] === 0xfe && bytes[1] === 0xff ? 'utf-16be'
+    : (bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0x3c && bytes[1] === 0) ? 'utf-16le' : 'utf-8';
+  const xml = new TextDecoder(encoding, { fatal: true }).decode(bytes).replace(/\r\n?/g, '\n');
+  need(!/[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]/u.test(xml), 'invalid manifest XML character');
+  const name = '[A-Za-z_][A-Za-z0-9_.-]*(?::[A-Za-z_][A-Za-z0-9_.-]*)?';
+  const attribute = new RegExp(`(${name})[ \\t\\r\\n]*=[ \\t\\r\\n]*(?:"([^"<]*)"|'([^'<]*)')`, 'y');
+  function decode(text) {
+    need(!/&(?!(?:amp|lt|gt|quot|apos|#(?:[0-9]+|x[a-fA-F0-9]+));)/.test(text), 'unknown manifest XML entity');
+    return text.replace(/&([^;]+);/g, (_, value) => {
+      const predefined = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+      if (Object.hasOwn(predefined, value)) return predefined[value];
+      const cp = value[1] === 'x' ? Number.parseInt(value.slice(2), 16) : Number(value.slice(1));
+      need(Number.isInteger(cp) && ([9, 10, 13].includes(cp) || (cp >= 32 && cp <= 0xd7ff)
+        || (cp >= 0xe000 && cp <= 0xfffd) || (cp >= 0x10000 && cp <= 0x10ffff)), 'invalid manifest XML reference');
+      return String.fromCodePoint(cp);
+    });
+  }
+  function attributes(text, declaration = false) {
+    const result = new Map(); let offset = 0;
+    while (offset < text.length) {
+      const space = /^[ \t\r\n]+/.exec(text.slice(offset)); need(space, 'invalid manifest XML attributes'); offset += space[0].length;
+      if (offset === text.length) break;
+      attribute.lastIndex = offset; const match = attribute.exec(text);
+      need(match && !result.has(match[1]), 'invalid/duplicate manifest XML attribute');
+      const value = (match[2] ?? match[3]).replace(/[\t\r\n]/g, ' ');
+      need(!declaration || !value.includes('&'), 'entity in manifest XML declaration');
+      result.set(match[1], declaration ? value : decode(value)); offset = attribute.lastIndex;
+    }
+    return result;
+  }
+  const stack = []; let root, position = 0, elements = 0;
+  const XML_NS = 'http://www.w3.org/XML/1998/namespace', XMLNS_NS = 'http://www.w3.org/2000/xmlns/';
+  while (position < xml.length) {
+    if (xml.startsWith('<!--', position)) {
+      const end = xml.indexOf('-->', position + 4); need(end >= 0, 'unclosed manifest XML comment');
+      const body = xml.slice(position + 4, end); need(!body.includes('--') && !body.endsWith('-'), 'invalid manifest XML comment');
+      position = end + 3; continue;
+    }
+    if (xml[position] !== '<') {
+      const end = xml.indexOf('<', position), stop = end < 0 ? xml.length : end, raw = xml.slice(position, stop);
+      need(!raw.includes(']]>'), 'invalid manifest XML text');
+      need(stack.length || !/[^ \t\r\n]/.test(raw), 'text outside manifest root'); const text = decode(raw);
+      if (stack.length && /[^ \t\r\n]/.test(text)) stack.at(-1).hasText = true;
+      position = stop; continue;
+    }
+    if (xml.startsWith('<?', position)) {
+      const end = xml.indexOf('?>', position); need(position === 0 && end >= 0 && /^<\?xml[ \t\r\n]/.test(xml), 'unsupported manifest XML PI');
+      const declaration = attributes(xml.slice(5, end), true);
+      need(['version', 'version,encoding', 'version,standalone', 'version,encoding,standalone'].includes([...declaration.keys()].join(','))
+        && declaration.get('version') === '1.0'
+        && (!declaration.has('standalone') || ['yes', 'no'].includes(declaration.get('standalone'))), 'invalid manifest XML declaration');
+      const declared = declaration.get('encoding')?.toLowerCase();
+      need(!declaration.has('encoding') || declared === encoding || (declared === 'utf-16' && encoding.startsWith('utf-16')), 'manifest XML encoding mismatch');
+      position = end + 2; continue;
+    }
+    need(!xml.startsWith('<!', position), 'unsupported manifest XML declaration');
+    let end = position + 1, quote = '';
+    for (; end < xml.length; end++) {
+      const c = xml[end];
+      if (quote) { if (c === quote) quote = ''; }
+      else if (c === '"' || c === "'") quote = c;
+      else if (c === '>') break;
+    }
+    need(end < xml.length && !quote, 'unclosed manifest XML tag');
+    let tag = xml.slice(position + 1, end); position = end + 1;
+    if (tag.startsWith('/')) {
+      const close = new RegExp(`^/(${name})[ \\t\\r\\n]*$`).exec(tag);
+      need(close && stack.length && stack.at(-1).qualified === close[1], 'mismatched manifest XML tag'); stack.pop(); continue;
+    }
+    const selfClosing = tag.endsWith('/'); if (selfClosing) tag = tag.slice(0, -1);
+    const open = new RegExp(`^(${name})`).exec(tag); need(open, 'invalid manifest XML element');
+    const raw = attributes(tag.slice(open[0].length)), parent = stack.at(-1);
+    need(parent || !root, 'multiple manifest XML roots');
+    const namespaces = new Map(parent ? parent.namespaces : [['xml', XML_NS]]);
+    for (const [key, value] of raw) if (key === 'xmlns' || key.startsWith('xmlns:')) {
+      const prefix = key === 'xmlns' ? '' : key.slice(6);
+      need(prefix !== 'xmlns' && value !== XMLNS_NS && (prefix === 'xml' ? value === XML_NS : value !== XML_NS)
+        && (!prefix || value.length > 0), 'invalid manifest XML namespace'); namespaces.set(prefix, value);
+    }
+    function expanded(qualified, isAttribute) {
+      const [prefix, local] = qualified.split(':');
+      if (local) { need(prefix !== 'xmlns' && namespaces.has(prefix), 'unbound manifest XML prefix'); return [namespaces.get(prefix), local]; }
+      return [isAttribute ? '' : namespaces.get('') || '', prefix];
+    }
+    const [namespace, local] = expanded(open[1], false), attrs = new Map(), expandedAttrs = new Set();
+    for (const [key, value] of raw) if (key !== 'xmlns' && !key.startsWith('xmlns:')) {
+      const [ns, attr] = expanded(key, true), identity = `${ns}\0${attr}`;
+      need(!expandedAttrs.has(identity), 'duplicate expanded manifest XML attribute'); expandedAttrs.add(identity);
+      if (!ns) attrs.set(attr, value);
+    }
+    const node = { qualified: open[1], namespace, local, attrs, children: [], namespaces, hasText: false };
+    need(++elements <= 2048 && stack.length < 32, 'manifest XML complexity limit');
+    if (parent) parent.children.push(node); else root = node;
+    if (!selfClosing) stack.push(node);
+  }
+  const ASSEMBLY_NS = 'urn:schemas-microsoft-com:asm.v1';
+  const is = (node, local) => node.namespace === ASSEMBLY_NS && node.local === local;
+  need(root && !stack.length && is(root, 'assembly') && !root.hasText && root.attrs.get('manifestVersion') === '1.0', 'invalid manifest XML assembly');
+  const controls = [];
+  for (const dependency of root.children.filter(n => is(n, 'dependency'))) {
+    for (const dependent of dependency.children.filter(n => is(n, 'dependentAssembly'))) {
+      const identities = dependent.children.filter(n => is(n, 'assemblyIdentity'));
+      for (const identity of identities.filter(n => n.attrs.get('name') === 'Microsoft.Windows.Common-Controls')) {
+        const a = identity.attrs;
+        need(!dependency.hasText && !dependent.hasText && dependency.children.length === 1 && dependent.children.length === 1 && dependent.children[0] === identity
+          && identities.length === 1 && !identity.children.length && !identity.hasText
+          && (!dependency.attrs.has('optional') || dependency.attrs.get('optional') === 'no')
+          && a.get('type') === 'win32' && a.get('version') === '6.0.0.0' && a.get('publicKeyToken')?.toLowerCase() === '6595b64144ccf1df'
+          && ['*', 'amd64'].includes(a.get('processorArchitecture')) && (!a.has('language') || a.get('language') === '*'), 'invalid Common Controls manifest dependency');
+        controls.push(identity);
+      }
+    }
+  }
+  need(controls.length === 1, 'missing/ambiguous Common Controls manifest dependency');
+}
+
 function inspectPE(buffer, gui) {
   function range(offset, bytes) { need(Number.isSafeInteger(offset) && offset >= 0 && offset + bytes <= buffer.length, 'truncated PE'); return offset; }
   need(buffer.length >= 64 && buffer.toString('ascii', 0, 2) === 'MZ', 'invalid DOS header');
@@ -167,20 +287,21 @@ function inspectPE(buffer, gui) {
   let leaves = [];
   function visit(offset, depth) {
     need(depth <= 2, 'invalid resource depth');
-    const dir = at(offset, 16), entries = buffer.readUInt16LE(dir + 12) + buffer.readUInt16LE(dir + 14); at(offset + 16, entries * 8);
+    const dir = at(offset, 16), named = buffer.readUInt16LE(dir + 12), entries = named + buffer.readUInt16LE(dir + 14); at(offset + 16, entries * 8);
+    let previousId = -1;
     for (let i = 0; i < entries; i++) {
       const e = dir + 16 + i * 8, id = buffer.readUInt32LE(e), next = buffer.readUInt32LE(e + 4);
+      need(Boolean(id & 0x80000000) === (i < named), 'invalid manifest resource name partition');
+      if (i >= named) { need(id <= 0xffff && id > previousId, 'invalid/duplicate manifest resource ID'); previousId = id; }
       if (depth === 0 && id !== 24) continue;
+      if (depth === 1 && id !== 1) continue; // CREATEPROCESS_MANIFEST_RESOURCE_ID for an executable.
+      if (depth === 2) need(id <= 0xffff, 'invalid manifest resource language');
       if (next & 0x80000000) visit(next & 0x7fffffff, depth + 1);
       else { need(depth === 2, 'invalid manifest leaf'); const d = at(next, 16); leaves.push(buffer.subarray(rva(buffer.readUInt32LE(d), buffer.readUInt32LE(d + 4)), rva(buffer.readUInt32LE(d), buffer.readUInt32LE(d + 4)) + buffer.readUInt32LE(d + 4))); }
     }
   }
   visit(0, 0); need(leaves.length === 1, 'missing/ambiguous embedded manifest');
-  const manifest = leaves[0]; const xml = manifest.toString(manifest.includes(0) ? 'utf16le' : 'utf8');
-  const identities = xml.match(/<assemblyIdentity\b[^>]*>/g) || [];
-  need(/<assembly\b[^>]*\bmanifestVersion\s*=\s*["']1\.0["']/.test(xml)
-    && identities.some(tag => /\bname\s*=\s*["']Microsoft\.Windows\.Common-Controls["']/.test(tag)
-      && /\bversion\s*=\s*["']6\.0\.0\.0["']/.test(tag)), 'Common Controls v6 manifest missing');
+  const manifest = leaves[0]; checkCommonControlsManifest(manifest);
   return { machine: 'x86_64', subsystem: 'windows', embeddedManifestSha256: sha256(manifest) };
 }
 
