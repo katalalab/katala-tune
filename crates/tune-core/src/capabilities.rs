@@ -379,6 +379,10 @@ mod windows_script_tests {
     use super::*;
     const MARKER: &str = "# KT_CAPABILITIES_WORKER_TEST_PREFIX";
     const MOCK_CIM: &str = r#"
+class CimDenied : System.Exception {
+    [int]$NativeErrorCode = 5
+    CimDenied() : base("localized") { $this.HResult = -2147217405 }
+}
 function Get-CimInstance {
     param($ClassName,$Property,$OperationTimeoutSec)
     if ($ClassName -eq "Win32_ComputerSystem") { return @{ Manufacturer = "Example"; Model = "Model" } }
@@ -404,6 +408,7 @@ function Get-CimInstance {
             ("return $true", "enabled"),
             ("return $false", "disabled"),
             ("throw [System.UnauthorizedAccessException]::new(\"localized\")", "permission_denied"),
+            ("throw [CimDenied]::new()", "permission_denied"),
             ("throw [System.ComponentModel.Win32Exception]::new(1314)", "permission_denied"),
             ("throw [System.ComponentModel.Win32Exception]::new(5)", "permission_denied"),
             ("throw [System.PlatformNotSupportedException]::new(\"localized\")", "unsupported"),
@@ -420,12 +425,12 @@ function Get-CimInstance {
         }
         let prefix = r#"
 function Get-CimInstance { param($ClassName,$Property,$OperationTimeoutSec)
-    if ($ClassName -eq "Win32_BaseBoard") { throw [System.UnauthorizedAccessException]::new() }
+    if ($ClassName -eq "Win32_BaseBoard") { throw [CimDenied]::new() }
     return @{ Manufacturer="Example";Model="Model";SMBIOSBIOSVersion="1" }
 }
 function Confirm-SecureBootUEFI { return $false }
 "#;
-        let value = run_worker_mock(prefix).await;
+        let value = run_worker_mock(&format!("{MOCK_CIM}\n{prefix}")).await;
         assert_eq!(value["lifecycle"], "completed");
         assert_eq!(value["report"]["model"], "Model");
         assert_eq!(value["report"]["bios_version"], "1");

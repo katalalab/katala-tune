@@ -7,7 +7,8 @@ $ErrorActionPreference = "Stop"
 function ErrorState($failure) {
     $id = $failure.FullyQualifiedErrorId
     $exception = $failure.Exception
-    if ($exception -is [System.UnauthorizedAccessException] -or $exception.HResult -eq -2147024891 -or $exception.HResult -eq -2147023582 -or ($exception -is [System.ComponentModel.Win32Exception] -and $exception.NativeErrorCode -in @(5,1314)) -or $id -match "UnauthorizedAccess|AccessDenied|PrivilegeNotHeld|SetPrivilegeFailed") {
+    # CIM access denial can be CimException NativeErrorCode 5 / HRESULT 0x80041003.
+    if ($exception -is [System.UnauthorizedAccessException] -or $exception.HResult -eq -2147024891 -or $exception.HResult -eq -2147023582 -or $exception.HResult -eq -2147217405 -or $exception.NativeErrorCode -eq 5 -or [string]$exception.NativeErrorCode -eq "AccessDenied" -or ($exception -is [System.ComponentModel.Win32Exception] -and $exception.NativeErrorCode -in @(5,1314)) -or $id -match "UnauthorizedAccess|AccessDenied|PrivilegeNotHeld|SetPrivilegeFailed") {
         return "permission_denied"
     }
     if ($id -match "CommandNotFound") { return "tool_missing" }
