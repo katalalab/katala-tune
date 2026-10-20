@@ -45,8 +45,11 @@ fn lower_ascii(s: &str) -> String {
     s.to_ascii_lowercase()
 }
 
-/// 台帳の機体で集めるか。書いていなければ共用機は集めない（他の人のリポジトリのパスを集めないため）
+/// 台帳の機体で集めるか。運用対象（online）でなければ集めない。書いていなければ共用機は集めない（他の人のリポジトリのパスを集めないため）
 pub fn enabled(node: &Node) -> bool {
+    if !node.is_active() {
+        return false;
+    }
     let h = node.get("repo_hygiene");
     h == Some(&Value::Bool(true)) || (h != Some(&Value::Bool(false)) && node.get("shared") != Some(&Value::Bool(true)))
 }
@@ -80,6 +83,10 @@ pub fn script(opts: &Value) -> String {
 
 /// 1台を調べる（この機体ならローカル、ほかは ssh で標準入力へ）。opts は [`script`] と同じ（roots は台帳の repo_roots を足す）
 pub async fn audit_node(node: &Node, opts: &Value) -> Value {
+    // 運用対象でない機体（retired など）には接続しない
+    if node.refusal().is_some() {
+        return json!({ "node_id": node.id, "ok": false, "error": "excluded", "wall_s": 0.0, "at": now_ms() });
+    }
     let started = Instant::now();
     let mut o = opts.clone();
     let mut roots: Vec<Value> = js::arr(js::get(Some(opts), "roots")).to_vec();
@@ -489,5 +496,17 @@ mod tests {
         assert!(!enabled(&n(json!({ "id": "a", "alias": "a", "os": "macos", "repo_hygiene": false }))));
         assert!(!enabled(&n(json!({ "id": "s", "alias": "s", "os": "windows", "shared": true }))));
         assert!(enabled(&n(json!({ "id": "s", "alias": "s", "os": "windows", "shared": true, "repo_hygiene": true }))));
+    }
+
+    #[tokio::test]
+    async fn inactive_nodes_are_never_contacted() {
+        let n = |v: Value| Node::from_value(&v, "other-host");
+        for status in ["retired", "no-ssh", "paused", "out-of-scope", "bogus"] {
+            let node = n(json!({ "id": "x", "alias": "x", "os": "macos", "status": status, "repo_hygiene": true }));
+            assert!(!enabled(&node), "{status} must not be audited");
+            let r = audit_node(&node, &json!({})).await;
+            assert_eq!((r["ok"].clone(), r["error"].clone()), (json!(false), json!("excluded")), "{status}");
+        }
+        assert!(enabled(&n(json!({ "id": "a", "alias": "a", "os": "macos", "status": "online" }))));
     }
 }

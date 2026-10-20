@@ -237,6 +237,16 @@ test('台帳: 共用機は既定で対象外、repo_hygiene で切り替える',
   assert.equal(hygiene.enabled({ id: 's', shared: true, repo_hygiene: true }), true);
 });
 
+test('台帳: 運用対象でない機体は対象外で、接続せずに断る', async () => {
+  for (const status of ['retired', 'no-ssh', 'paused', 'out-of-scope', 'bogus']) {
+    const node = { id: 'x', alias: 'x', os: 'macos', status, repo_hygiene: true };
+    assert.equal(hygiene.enabled(node), false, status);
+    const r = await hygiene.auditNode(node, {});
+    assert.deepEqual([r.ok, r.error], [false, 'excluded'], status);
+  }
+  assert.equal(hygiene.enabled({ id: 'a', status: 'online' }), true);
+});
+
 const row = (o = {}) => ({ path: '~/ghq/example.com/o/r', rel: 'example.com/o/r', linked: false, state: 'ok', reason: null, branch: 'main', detached: false, upstream: true, ahead: 0, behind: 0, local_only: null, tracked: 0, untracked: 0, conflicted: 0, dirty_age_s: null, head_age_s: 5, stash: 0, origin: 'https://example.com/o/r.git', origin_host: 'example.com', origin_path: 'o/r', has_origin: true, ...o });
 
 test('所見: dirty は古さで重大度を分け、上位だけを並べる', () => {

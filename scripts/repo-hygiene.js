@@ -7,6 +7,7 @@
 'use strict';
 const { loadConfig } = require('../lib/nodes');
 const hygiene = require('../lib/hygiene');
+const { partition } = require('../lib/ledger');
 
 function parse(argv) {
   const o = { roots: [], ids: [], repos: false };
@@ -26,9 +27,12 @@ function parse(argv) {
 (async () => {
   const o = parse(process.argv.slice(2));
   const { nodes } = loadConfig();
-  const want = o.ids.length ? nodes.filter((n) => o.ids.includes(n.id)) : nodes;
+  const selected = o.ids.length ? nodes.filter((n) => o.ids.includes(n.id)) : nodes;
+  // 運用対象でない機体（retired など）には接続しない
+  const { targets: want, excluded } = partition(selected);
+  for (const x of excluded) process.stderr.write(`${x.node_id}: 対象外（${x.state}）${x.reason ? ` ${x.reason}` : ''}\n`);
   const targets = want.filter(hygiene.enabled);
-  const skipped = want.filter((n) => !targets.includes(n)).map((n) => n.id);
+  const skipped = [...excluded.map((x) => x.node_id), ...want.filter((n) => !targets.includes(n)).map((n) => n.id)];
   const results = await Promise.all(targets.map((n) => hygiene.auditNode(n, o)));
   const out = { nodes: [], skipped_nodes: skipped, matrix: [] };
   for (const r of results) {
