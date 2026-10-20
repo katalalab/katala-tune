@@ -26,6 +26,7 @@ fn remote_generation(request: &RemoteRequest) -> String {
             serde_json::to_vec(&json!({
                 "roots": request.roots,
                 "configs": request.configs,
+                "source_allowlist": request.source_allowlist,
                 "limits": request.limits,
                 "platform": match request.platform {
                     RemotePlatform::Posix => "posix",
@@ -238,6 +239,7 @@ impl Engine {
                                 cursor: None,
                                 roots,
                                 configs: configs.clone(),
+                                source_allowlist: env.get("source_allowlist").cloned().and_then(|value| serde_json::from_value(value).ok()),
                                 python_program,
                                 git_program,
                                 observed_at_ms: now_ms(),
@@ -508,12 +510,16 @@ mod tests {
             cursor: None,
             roots: vec!["/allowed".into()],
             configs: vec![json!({"path":"/selected.json","keys":[]})],
+            source_allowlist: None,
             python_program: python.into(),
             git_program: Some(git.into()),
             observed_at_ms: 1,
             limits: crate::topology::TopologyLimits::default(),
         };
         let baseline = remote_generation(&request("direct-ssh", "identity", "/usr/bin/python3", "/usr/bin/git"));
+        let mut approved = request("direct-ssh", "identity", "/usr/bin/python3", "/usr/bin/git");
+        approved.source_allowlist = Some(vec![]);
+        assert_ne!(baseline, remote_generation(&approved));
         for changed in [
             remote_generation(&request("other-ssh", "identity", "/usr/bin/python3", "/usr/bin/git")),
             remote_generation(&request("direct-ssh", "other", "/usr/bin/python3", "/usr/bin/git")),
