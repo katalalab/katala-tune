@@ -847,12 +847,12 @@ mod tests {
     #[test]
     fn root_exit_between_accounting_and_root_query_refreshes_the_job_sample() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-        let name = format!("{}::accounting_exit_fixture", module_path!().split_once("::").unwrap().1);
+        let fixture_name = format!("{}::accounting_exit_fixture", module_path!().split_once("::").unwrap().1);
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command.args(["--exact", &name, "--nocapture", "--", "--owned-accounting-exit"]);
+        command.args(["--exact", &fixture_name, "--nocapture", "--", "--owned-accounting-exit"]);
         let name = wide(OsStr::new("NUL")).unwrap();
         let security = SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: null_mut(), bInheritHandle: 1 };
         let stdio: Vec<_> = (0..3)
@@ -886,6 +886,8 @@ mod tests {
         job.processes.push(root);
         let old_order_would_report_lingering = Arc::new(AtomicBool::new(false));
         let observed_old_order = Arc::clone(&old_order_would_report_lingering);
+        let hook_root_wait = Arc::new(AtomicU32::new(u32::MAX));
+        let observed_hook_wait = Arc::clone(&hook_root_wait);
         job.after_first_accounting = Some(Box::new(move |job, first| {
             assert!(!first.job_empty, "suspended real root must be active at the first sample");
             assert_eq!(first.total_processes, 1);
@@ -895,7 +897,9 @@ mod tests {
             }
             let root = &job.processes[0];
             // SAFETY: finite wait on our retained real root; no PID selection or unrelated termination.
-            if unsafe { WaitForSingleObject(root.handle.as_raw_handle(), 5000) } != WAIT_OBJECT_0 {
+            let wait = unsafe { WaitForSingleObject(root.handle.as_raw_handle(), 5000) };
+            observed_hook_wait.store(wait, Ordering::SeqCst);
+            if wait != WAIT_OBJECT_0 {
                 return Err(io::Error::from(io::ErrorKind::TimedOut));
             }
             // The old decision combines this actual root-exit query with the earlier active sample.
@@ -903,6 +907,42 @@ mod tests {
             Ok(())
         }));
         job.observe(&mut receipt).unwrap();
+        // Diagnostics are separate later observations; never overwrite the receipt under test.
+        let retained: Vec<_> = job
+            .processes
+            .iter()
+            .enumerate()
+            .map(|(index, process)| {
+                // SAFETY: zero wait only on a retained observer handle from this owned Job.
+                let wait = unsafe { WaitForSingleObject(process.handle.as_raw_handle(), 0) };
+                (process.identity.clone(), index == 0, wait, if wait == windows_sys::Win32::Foundation::WAIT_FAILED { os_error().raw_os_error() } else { None })
+            })
+            .collect();
+        let mut current_accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: read-only query on the owned Job into a correctly sized aligned local output.
+        let accounting_ok = unsafe {
+            QueryInformationJobObject(
+                job.handle.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                std::ptr::from_mut(&mut current_accounting).cast(),
+                size_of_val(&current_accounting) as u32,
+                null_mut(),
+            )
+        };
+        let accounting_error = if accounting_ok == 0 { os_error().raw_os_error() } else { None };
+        let mut current_root_code = 0;
+        // SAFETY: query the same retained root handle; code alone is not a liveness test.
+        let root_code_ok = unsafe { GetExitCodeProcess(job.processes[0].handle.as_raw_handle(), &mut current_root_code) };
+        let root_code_error = if root_code_ok == 0 { os_error().raw_os_error() } else { None };
+        eprintln!(
+            "accounting race metadata: fixture={fixture_name} receipt={receipt:?} observed_count={} retained_count={} retained_identity_is_root_wait_error={retained:?} hook_root_wait={} raw_accounting_ok={accounting_ok} raw_accounting_error={accounting_error:?} raw_active={} raw_total={} root_code_ok={root_code_ok} root_code_error={root_code_error:?} current_root_code={}",
+            receipt.observed.len(),
+            job.processes.len(),
+            hook_root_wait.load(Ordering::SeqCst),
+            current_accounting.ActiveProcesses,
+            current_accounting.TotalProcesses,
+            current_root_code as i32
+        );
         assert!(old_order_would_report_lingering.load(Ordering::SeqCst), "the real interleaving must reproduce the old false-positive predicate");
         assert!(receipt.root_exited && receipt.observed_exited);
         assert_eq!(receipt.root_exit_code, Some(0));
