@@ -264,15 +264,25 @@ fn exited(handle: &OwnedHandle) -> io::Result<bool> {
     }
 }
 
+#[cfg(test)]
+type AccountingHook = Box<dyn FnOnce(&Job, &ProcessReceipt) -> io::Result<()> + Send>;
+
 struct Job {
     handle: OwnedHandle,
     processes: Vec<Process>,
+    #[cfg(test)]
+    after_first_accounting: Option<AccountingHook>,
 }
 impl Job {
     fn new() -> io::Result<Self> {
         // SAFETY: null name creates a fresh unnamed Job; null attributes prevent inheritance.
         let handle = owned(unsafe { CreateJobObjectW(null(), null()) })?;
-        let job = Self { handle, processes: Vec::new() };
+        let job = Self {
+            handle,
+            processes: Vec::new(),
+            #[cfg(test)]
+            after_first_accounting: None,
+        };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         // SAFETY: exact documented structure and size; only the newly owned Job is modified.
@@ -290,7 +300,7 @@ impl Job {
         // SAFETY: terminate only this new Job, never a parent/shared Job or a PID.
         check(unsafe { TerminateJobObject(self.handle.as_raw_handle(), 124) })
     }
-    fn observe(&mut self, receipt: &mut ProcessReceipt) -> io::Result<()> {
+    fn accounting(&self, receipt: &mut ProcessReceipt) -> io::Result<()> {
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         // SAFETY: explicit owned Job and correctly sized aligned output structure; never use null hJob.
         check(unsafe {
@@ -304,6 +314,14 @@ impl Job {
         })?;
         receipt.total_processes = accounting.TotalProcesses;
         receipt.job_empty = accounting.ActiveProcesses == 0;
+        Ok(())
+    }
+    fn observe(&mut self, receipt: &mut ProcessReceipt) -> io::Result<()> {
+        self.accounting(receipt)?;
+        #[cfg(test)]
+        if let Some(hook) = self.after_first_accounting.take() {
+            hook(self, receipt)?;
+        }
         #[repr(C)]
         struct Pids {
             assigned: u32,
@@ -533,7 +551,7 @@ struct SpawnContext<'a> {
     deadline: Instant,
 }
 
-fn spawn_owned(context: SpawnContext<'_>, job: &Job, input: &Pipe, out: &Pipe, err: &Pipe, spawn_failed: &mut bool) -> io::Result<(Process, OwnedHandle)> {
+fn spawn_owned(context: SpawnContext<'_>, job: &Job, stdio: [&OwnedHandle; 3], spawn_failed: &mut bool) -> io::Result<(Process, OwnedHandle)> {
     let SpawnContext { command, environment: values, deadline } = context;
     let env = environment(command, values)?;
     let executable = user_executable_path(executable(command, values)?)?;
@@ -542,7 +560,7 @@ fn spawn_owned(context: SpawnContext<'_>, job: &Job, input: &Pipe, out: &Pipe, e
     let cwd = command.get_current_dir().map(|p| wide(p.as_os_str())).transpose()?;
     // Value arrays are declared before Attributes and remain alive until its destructor.
     let jobs = [job.handle.as_raw_handle()];
-    let handles = [input.client.as_raw_handle(), out.client.as_raw_handle(), err.client.as_raw_handle()];
+    let handles = stdio.map(AsRawHandle::as_raw_handle);
     let mut attributes = Attributes::new(&jobs, &handles)?;
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -665,7 +683,12 @@ pub(super) async fn run(
             stdout.server.connect().await?;
             stderr.server.connect().await?;
             let mut job = Job::new()?;
-            let spawn = spawn_owned(SpawnContext { command, environment, deadline }, &job, &input_pipe, &stdout, &stderr, &mut answer.spawn_failed);
+            let spawn = spawn_owned(
+                SpawnContext { command, environment, deadline },
+                &job,
+                [&input_pipe.client, &stdout.client, &stderr.client],
+                &mut answer.spawn_failed,
+            );
             if let Err(error) = &spawn {
                 answer.spawn_failed |= error.kind() == io::ErrorKind::NotFound;
                 if error.kind() == io::ErrorKind::TimedOut {
@@ -811,6 +834,80 @@ pub(super) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accounting_exit_fixture() {
+        if std::env::args().any(|arg| arg == "--owned-accounting-exit") {
+            std::process::exit(0);
+        }
+    }
+
+    #[test]
+    fn root_exit_between_accounting_and_root_query_refreshes_the_job_sample() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let name = format!("{}::accounting_exit_fixture", module_path!().split_once("::").unwrap().1);
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", &name, "--nocapture", "--", "--owned-accounting-exit"]);
+        let name = wide(OsStr::new("NUL")).unwrap();
+        let security = SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: null_mut(), bInheritHandle: 1 };
+        let stdio: Vec<_> = (0..3)
+            .map(|_| {
+                // SAFETY: fixed NUL device, owned inheritable stdio handles, no pipe or filesystem payload.
+                owned(unsafe {
+                    CreateFileW(
+                        name.as_ptr(),
+                        GENERIC_READ_ACCESS | GENERIC_WRITE_ACCESS,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        &security,
+                        OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL,
+                        null_mut(),
+                    )
+                })
+                .unwrap()
+            })
+            .collect();
+        let mut job = Job::new().unwrap();
+        let mut spawn_failed = false;
+        let (root, thread) = spawn_owned(
+            SpawnContext { command: &command, environment: &[], deadline: Instant::now() + Duration::from_secs(5) },
+            &job,
+            [&stdio[0], &stdio[1], &stdio[2]],
+            &mut spawn_failed,
+        )
+        .unwrap();
+        let mut receipt =
+            ProcessReceipt { root: Some(root.identity.clone()), observed: vec![root.identity.clone()], stop: ProcessStop::Completed, ..Default::default() };
+        job.processes.push(root);
+        let old_order_would_report_lingering = Arc::new(AtomicBool::new(false));
+        let observed_old_order = Arc::clone(&old_order_would_report_lingering);
+        job.after_first_accounting = Some(Box::new(move |job, first| {
+            assert!(!first.job_empty, "suspended real root must be active at the first sample");
+            assert_eq!(first.total_processes, 1);
+            // SAFETY: this is the retained primary thread returned for our suspended Job-owned root.
+            if unsafe { ResumeThread(thread.as_raw_handle()) } != 1 {
+                return Err(os_error());
+            }
+            let root = &job.processes[0];
+            // SAFETY: finite wait on our retained real root; no PID selection or unrelated termination.
+            if unsafe { WaitForSingleObject(root.handle.as_raw_handle(), 5000) } != WAIT_OBJECT_0 {
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            // The old decision combines this actual root-exit query with the earlier active sample.
+            observed_old_order.store(exited(&root.handle)? && !first.job_empty, Ordering::SeqCst);
+            Ok(())
+        }));
+        job.observe(&mut receipt).unwrap();
+        assert!(old_order_would_report_lingering.load(Ordering::SeqCst), "the real interleaving must reproduce the old false-positive predicate");
+        assert!(receipt.root_exited && receipt.observed_exited);
+        assert_eq!(receipt.root_exit_code, Some(0));
+        assert_eq!(receipt.total_processes, 1);
+        assert!(receipt.job_empty, "post-root-exit accounting must replace the stale active sample");
+        assert!(!spawn_failed);
+    }
+
     #[test]
     fn compatible_short_executable_paths_drop_only_a_safe_verbatim_prefix() {
         for (original, expected) in [
