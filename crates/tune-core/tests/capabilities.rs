@@ -160,3 +160,35 @@ fn isolated_python_ignores_cwd_and_pythonpath_traps() {
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["isolated"], true);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn ssh_effective_options_disable_implicit_mutations_and_forwardings() {
+    use std::process::Command;
+    let root = std::env::temp_dir().join(format!("kt-cap-ssh-{}-{}", std::process::id(), tune_core::db::now_ms()));
+    std::fs::create_dir_all(&root).unwrap();
+    let config = root.join("config");
+    std::fs::write(&config,"Host sample\n HostName example.invalid\n User fixture-user\n IdentityFile /fixture/key\n ProxyCommand true\n ControlMaster yes\n ControlPath /fixture/control\n UpdateHostKeys yes\n ClearAllForwardings no\n PermitLocalCommand yes\n LocalCommand true\n LocalForward 127.0.0.1:54321 example.invalid:9\n RemoteForward 54322 example.invalid:9\n DynamicForward 127.0.0.1:54323\n").unwrap();
+    let (_, args, _) = capabilities::transport(&node("windows", false));
+    let out = Command::new("ssh").arg("-G").arg("-F").arg(&config).args(args).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    let option = |key: &str| text.lines().find_map(|line| line.strip_prefix(&format!("{key} "))).unwrap_or("");
+    for (key, want) in [
+        ("stricthostkeychecking", "true"),
+        ("batchmode", "yes"),
+        ("controlmaster", "false"),
+        ("updatehostkeys", "false"),
+        ("clearallforwardings", "yes"),
+        ("permitlocalcommand", "no"),
+    ] {
+        assert_eq!(option(key), want, "effective {key}");
+    }
+    assert_eq!(option("controlpath"), "", "disabled ControlPath is omitted by ssh -G");
+    assert!(!text.lines().any(|line| ["localforward ", "remoteforward ", "dynamicforward "].iter().any(|prefix| line.starts_with(prefix))));
+    assert_eq!(option("hostname"), "example.invalid");
+    assert_eq!(option("user"), "fixture-user");
+    assert_eq!(option("identityfile"), "/fixture/key");
+    assert_eq!(option("proxycommand"), "true");
+    std::fs::remove_dir_all(root).unwrap();
+}
