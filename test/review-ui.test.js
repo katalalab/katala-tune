@@ -14,16 +14,17 @@ const valid = {
 
 function loadView({ crypto = webcrypto } = {}) {
   let html = '';
+  let tickets = 0;
   const controls = new Map();
   const document = {
     querySelector(selector) { if (!controls.has(selector)) controls.set(selector, {}); return controls.get(selector); },
   };
   const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
   const window = { KT_VIEWS: [], KT_REVIEW_MODEL: null };
-  const context = vm.createContext({ window, document, UI: { ICON: {}, esc, head: ({ title, desc }) => `<h1>${esc(title)}</h1><p>${esc(desc)}</p>` }, state: { view: 'review' }, setCrumbs: () => {}, page: (value) => { html = value; }, Date, URL, JSON, TextDecoder, crypto, console });
+  const context = vm.createContext({ window, document, UI: { ICON: {}, esc, head: ({ title, desc }) => `<h1>${esc(title)}</h1><p>${esc(desc)}</p>` }, state: { view: 'review' }, setCrumbs: () => {}, ticket: () => { tickets++; }, page: (value) => { html = value; }, Date, URL, JSON, TextDecoder, crypto, console });
   vm.runInContext(fs.readFileSync('renderer/review-model.js', 'utf8'), context);
   vm.runInContext(fs.readFileSync('renderer/review.js', 'utf8'), context);
-  return { view: window.KT_VIEWS[0], controls, get html() { return html; } };
+  return { view: window.KT_VIEWS[0], controls, get html() { return html; }, get tickets() { return tickets; } };
 }
 
 function file(source, name = 'ledger.json', onRead = () => {}) {
@@ -56,6 +57,13 @@ test('2 MiB超は読み込み前に拒否し、入力例はエスケープ済み
   assert.match(app.html, /target="_blank" rel="noopener noreferrer"/);
   const link = app.html.match(/<a href="([^"]+)" target="_blank" rel="noopener noreferrer">([^<]+)<\/a>/);
   assert.equal(link[1], link[2]);
+});
+
+test('レビューへ入ると前の画面の遅延描画を無効化する', () => {
+  const app = loadView();
+  const before = app.tickets;
+  app.view.render();
+  assert.equal(app.tickets, before + 1);
 });
 
 test('読み込み中はエラー文言を出さず、失敗時だけ読み込めなかったと表示する', async () => {
@@ -99,7 +107,7 @@ test('証跡の警告は段階ごとに一度だけ表示する', async () => {
   app.view.render();
   const source = { schema: 'task-completion.v1', tasks: [{
     id: 'warnings', target: 'repository', revision: 'head',
-    gates: { deployment: { status: 'pass', evidence: [{ ref: 'text', result: 'pass', observed_at: '2026-10-21T00:00:00Z', revision: 'other', environment: 'local' }] } },
+    gates: { deployment: { status: 'pass', evidence: [{ ref: 'text', result: 'pass', observed_at: new Date(Date.now() + 86400000).toISOString(), revision: 'other', environment: 'local' }] } },
   }] };
   await app.controls.get('#reviewFile').onchange({ target: { files: [file(JSON.stringify(source))] } });
   assert.equal((app.html.match(/未来の日時です/g) || []).length, 1);

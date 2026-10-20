@@ -122,6 +122,7 @@
   }
 
   function render() {
+    ticket();
     setCrumbs([{ icon: 'review', label: 'レビュー' }]);
     draw();
   }
