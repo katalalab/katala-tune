@@ -2,7 +2,8 @@
 # PowerShell 5.1. Keep this file ASCII only (PS 5.1 reads BOM-less UTF-8 as the ANSI code page).
 # Collects no secrets, environment variables, command lines or file contents
 # (except the memory/processors keys of ~/.wslconfig, and the opt-in WSL observation below:
-# /proc memory figures, process names and disk usage inside distros reported as running).
+# /proc memory figures, process names and disk usage inside distros reported as running;
+# command lines of interpreters are read only to build a short key and are never output).
 # -NoNetwork skips the network and security section (nodes.json "network": false).
 # -ObserveWsl enables WSL distro enumeration and inside observation (nodes.json "wsl": true).
 param([switch]$NoNetwork, [switch]$ObserveWsl)
@@ -110,6 +111,116 @@ $groups = $list | Group-Object name | ForEach-Object {
   [pscustomobject]@{ app = $_.Name; cpu = (R1 $groupCpu); mem_mb = [int](($_.Group | Measure-Object mem_mb -Sum).Sum); count = $_.Count }
 }
 $agents = @($list | Where-Object { $_.name -match '^(claude|codex|opencode|cursor-agent|agy|gemini)' }).Count
+
+# Process multiplication and trees (issues 38 and 30). Read-only. Command lines are read only for interpreters (node, python, git ...)
+# to build a short key (exe:script name); the command line itself is never output. Owner: session 0 (services and SSH logons) = system, otherwise user.
+$mxInterp = '^(node|nodejs|bun|deno|python3?|py|uv|uvx|npx|bunx|npm|pnpm|ruby|java|javaw|git)$'
+$mxGeneric = @('index', 'main', 'cli', 'server', 'bin', 'run', 'app', 'start', 'dist', 'build', 'lib', 'src', 'out', 'node_modules', '__main__')
+$mxSkip = @('exec', 'run', 'x', 'dlx', 'tool', 'start')
+# Options known to take no value. Any other option may be followed by a value (a token etc.), so stop reading there.
+$mxValueless = @('-y', '--yes', '-q', '--quiet', '--silent', '-u', '-B', '-E', '-s', '-S', '-I', '-O', '-OO', '-i', '--no-warnings', '--no-deprecation', '--trace-warnings', '--enable-source-maps', '--inspect', '--')
+$mxLaunchers = @('explorer', 'services', 'wininit', 'winlogon', 'svchost', 'sihost', 'csrss', 'smss', 'userinit', 'System', 'Idle', 'sshd')
+# Label = the script file name; for a generic name (index.js ...) only the package directly under node_modules.
+# Arbitrary parent directories (project or customer names) are never used.
+function MxLabel([string]$path) {
+  $parts = @($path -split '[\\/]+' | Where-Object { $_ })
+  if ($parts.Count -eq 0) { return $null }
+  $ok = '^[A-Za-z0-9][A-Za-z0-9_.@+-]{0,47}$'
+  $n = $parts[$parts.Count - 1] -replace '\.([cm]?[jt]s|py|jar)$', ''
+  if (-not ($mxGeneric -contains $n) -and ($n -cmatch $ok)) { return $n }
+  for ($j = $parts.Count - 2; $j -ge 0; $j--) {
+    if ($parts[$j] -ieq 'node_modules' -and $j + 1 -lt $parts.Count - 1) {
+      $pkg = $parts[$j + 1]
+      if ($pkg.StartsWith('@') -and $j + 2 -lt $parts.Count - 1) { $pkg = $parts[$j + 2] }
+      if (-not ($mxGeneric -contains $pkg) -and ($pkg -cmatch $ok)) { return $pkg }
+      return $null
+    }
+  }
+  return $null
+}
+function MxKey([string]$exe, [string[]]$tokens) {
+  if ($exe -notmatch $mxInterp) { return $exe.Substring(0, [Math]::Min(48, $exe.Length)) }
+  $label = $null
+  $i = 0
+  while ($i -lt $tokens.Count) {
+    $t = [string]$tokens[$i]
+    if ($t -ceq '-m' -and $i + 1 -lt $tokens.Count) { $label = MxLabel (($tokens[$i + 1] -split '\.')[0]); break }
+    if ($t -ceq '-c' -and $exe -like 'python*') { break }
+    if (($t -ceq '-c' -or $t -ceq '-C' -or $t -ceq '-r' -or $t -ceq '--require') -and ($exe -eq 'git' -or $exe -eq 'node')) { $i += 2; continue }
+    if ($t.StartsWith('-')) {
+      if ($t.Contains('=') -or ($mxValueless -ccontains $t)) { $i++; continue }
+      break
+    }
+    if ($mxSkip -contains $t) { $i++; continue }
+    $label = MxLabel ($t -replace '(?<=.)@[^@/\\]*$', '')
+    break
+  }
+  if ($label) { return ($exe + ':' + $label) }
+  return $exe
+}
+$mxGroups = @(); $mxTrees = @(); $mxAvail = 'unavailable'; $mxReason = $null
+try {
+  $mx = @{}
+  $mxCim = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, WorkingSetSize, SessionId, CreationDate -ErrorAction Stop)
+  if ($mxCim.Count -eq 0) { throw 'no-data' }
+  # Command lines are queried only for interpreter executables (other processes' arguments are never read)
+  $mxCmd = @{}
+  $mxNames = @($mxCim | ForEach-Object { [string]$_.Name } | Where-Object { ($_ -replace '\.exe$', '') -match $mxInterp -and $_ -match '^[A-Za-z0-9._-]+$' } | Sort-Object -Unique)
+  if ($mxNames.Count -gt 0) {
+    $flt = ($mxNames | ForEach-Object { "Name = '$_'" }) -join ' OR '
+    foreach ($c in @(Get-CimInstance Win32_Process -Filter $flt -Property ProcessId, CommandLine)) { if ($c.CommandLine) { $mxCmd[[int]$c.ProcessId] = [string]$c.CommandLine } }
+  }
+  foreach ($w in $mxCim) {
+    $nm = ([string]$w.Name) -replace '\.exe$', ''
+    $tok = @()
+    if ($nm -match $mxInterp -and $mxCmd.ContainsKey([int]$w.ProcessId)) {
+      $tok = @([regex]::Matches($mxCmd[[int]$w.ProcessId], '"([^"]*)"|(\S+)') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value } } | Select-Object -Skip 1)
+    }
+    $mx[[int]$w.ProcessId] = @{ pid = [int]$w.ProcessId; ppid = [int]$w.ParentProcessId; name = $nm; kb = ([double]$w.WorkingSetSize / 1KB); sys = ([int]$w.SessionId -eq 0); born = $w.CreationDate; key = (MxKey $nm $tok) }
+  }
+  $kids = @{}
+  foreach ($r in $mx.Values) {
+    $p = $mx[$r.ppid]
+    if ($p -and $r.born -and $p.born -and $p.born -gt $r.born) { $p = $null }
+    $r.parent = $p
+    $r.orphan = (($r.ppid -le 0) -or (-not $p))
+    if ($p) { $kids[$p.pid] = 1 + [int]$kids[$p.pid] }
+  }
+  $gh = @{}
+  $th = @{}
+  foreach ($r in $mx.Values) {
+    $g = $gh[$r.key]
+    if (-not $g) { $g = @{ key = $r.key; count = 0; kb = 0.0; orphans = 0; orphan_kb = 0.0; sys = 0; usr = 0; parents = @{} }; $gh[$r.key] = $g }
+    $g.count++; $g.kb += $r.kb
+    if ($r.sys) { $g.sys++ } else { $g.usr++ }
+    if ($r.orphan) { $g.orphans++; $g.orphan_kb += $r.kb }
+    if ($r.parent) { $pn = ([string]$r.parent.name); $g.parents[$pn] = 1 + [int]$g.parents[$pn] }
+    $x = $r; $seen = @{}
+    while (-not $seen.ContainsKey($x.pid)) {
+      $seen[$x.pid] = 1
+      $p = $x.parent
+      if ((-not $p) -or $p.pid -le 4 -or ($mxLaunchers -contains $p.name)) { break }
+      $x = $p
+    }
+    $t = $th[$x.pid]
+    if (-not $t) { $t = @{ root = $x.name; pid = $x.pid; sys = $x.sys; count = 0; kb = 0.0; children = [int]$kids[$x.pid] }; $th[$x.pid] = $t }
+    $t.count++; $t.kb += $r.kb
+  }
+  $mxGroups = @($gh.Values | Where-Object { $_.count -ge 3 } | ForEach-Object {
+    $top = $null
+    if ($_.parents.Count -gt 0) { $top = ($_.parents.GetEnumerator() | Sort-Object @{ e = 'Value'; Descending = $true }, @{ e = 'Name'; Descending = $false } | Select-Object -First 1).Key }
+    $own = 'mixed'; if ($_.sys -eq 0) { $own = 'user' } elseif ($_.usr -eq 0) { $own = 'system' }
+    [pscustomobject]@{ key = $_.key; count = $_.count; mem_mb = [int][Math]::Round($_.kb / 1024); orphans = $_.orphans; orphan_mb = [int][Math]::Round($_.orphan_kb / 1024); parent = $top; owner = $own }
+  } | Sort-Object @{ e = 'mem_mb'; Descending = $true }, @{ e = 'count'; Descending = $true }, key | Select-Object -First 20)
+  $mxTrees = @($th.Values | Where-Object { $_.count -ge 2 } | ForEach-Object {
+    $own = 'user'; if ($_.sys) { $own = 'system' }
+    [pscustomobject]@{ root = $_.root; pid = $_.pid; owner = $own; count = $_.count; children = $_.children; mem_mb = [int][Math]::Round($_.kb / 1024) }
+  } | Sort-Object @{ e = 'mem_mb'; Descending = $true }, pid | Select-Object -First 10)
+  $mxAvail = 'available'
+} catch {
+  $mxReason = NsErr $_
+}
+$mx = $null; $mxCim = $null; $mxCmd = $null; $gh = $null; $th = $null; $kids = $null
 
 # Memory
 $commitPct = $null
@@ -708,6 +819,10 @@ $result = [ordered]@{
     apps = @($groups | Sort-Object mem_mb -Descending | Select-Object -First 25)
     apps_cpu = @($groups | Sort-Object cpu -Descending | Select-Object -First 10)
     agent_processes = $agents
+    groups = @($mxGroups)
+    trees = @($mxTrees)
+    groups_availability = $mxAvail
+    groups_reason = $mxReason
   }
   power = [ordered]@{ plan_guid = $guid; plan_name = $planName; plans = @($plans); package_w = $cpuPowerW; package_source = $cpuPowerSource; package_availability = $(if ($null -ne $cpuPowerW) { "available" } else { "unavailable" }); package_reason = $cpuPowerReason; soc_w = $null; soc_source = $null; low_power_mode = $null; on_battery = $null }
   defender = [ordered]@{ realtime = $mp.RealTimeProtectionEnabled; exclusions = $excl }

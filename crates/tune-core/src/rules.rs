@@ -174,6 +174,55 @@ fn advice_for(names: &[Jv<'_>]) -> Option<&'static str> {
     None
 }
 
+/// JS の `+v || 0`
+fn num0(v: Jv<'_>) -> f64 {
+    let x = num(v);
+    if x.is_nan() { 0.0 } else { x }
+}
+
+fn fmt_mb(mb: f64) -> String {
+    if mb >= 1024.0 { format!("{} GB", to_fixed(mb / 1024.0, 1)) } else { format!("{} MB", js::num_str(mb)) }
+}
+
+/// 多重起動の種類。key（実行ファイル[:スクリプト名]）から決める（lib/rules.js の multiKind）
+#[derive(PartialEq, Clone, Copy)]
+enum MultiKind {
+    Fsmonitor,
+    Mcp,
+    Other,
+}
+
+fn multi_kind(key: &str) -> MultiKind {
+    if key == "git:fsmonitor--daemon" {
+        MultiKind::Fsmonitor
+    } else if key.to_ascii_lowercase().contains("mcp") {
+        MultiKind::Mcp
+    } else {
+        MultiKind::Other
+    }
+}
+
+/// （本数, 合計 MB）の両方を超えたら所見にする
+fn multi_threshold(k: MultiKind) -> (f64, f64) {
+    match k {
+        MultiKind::Fsmonitor => (10.0, 100.0),
+        MultiKind::Mcp => (4.0, 256.0),
+        MultiKind::Other => (30.0, 2048.0),
+    }
+}
+
+fn multi_advice(k: MultiKind) -> &'static str {
+    match k {
+        MultiKind::Fsmonitor => {
+            "git の fsmonitor デーモンがリポジトリごとに常駐している。`git config --global core.fsmonitor false` で新しく増えなくなる（提案であり、自動では変更しない）。すでに常駐しているものは各リポジトリで `git fsmonitor--daemon stop` するまで残るので、設定の保存と、実際の本数・空きメモリが減ったことを分けて確かめる。大きなリポジトリだけで使うなら、そこだけローカル設定で有効にする。"
+        }
+        MultiKind::Mcp => {
+            "MCP サーバが AI セッションごとに複製されている。使っていないセッション・エディタを閉じると、親が終了したものから消える。親が終了済みで残っているものは持ち主を確かめてから止める（自動では終了しない）。共有できるサーバは 1 つに寄せる設定を検討する。"
+        }
+        MultiKind::Other => "同じ実行ファイルが多数起動している。親（セッション・アプリ）を確かめ、不要な親を閉じる。個々のプロセスを RSS だけで止めない。",
+    }
+}
+
 fn gb(mb: Jv<'_>) -> String {
     to_fixed(num(mb) / 1024.0, 1)
 }
@@ -420,6 +469,107 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 if is_win { "（ワーキングセット）" } else { "（RSS。共有分を重ねて数えるため実際より大きめ）" }
             ),
             advice_for(&[a.get("app")]).unwrap_or("このアプリの使い方を見直す。"),
+        );
+    }
+
+    // 同一コマンドの多重起動・孤児（processes.groups）と、プロセス木の根ごとの合計（processes.trees）
+    let ws_note = if is_win { "（ワーキングセット）" } else { "（RSS。共有分を重ねて数えるため実際より大きめ）" };
+    for g in arr(get(procs, "groups")) {
+        if !truthy(Some(g)) {
+            continue;
+        }
+        let key = string(g.get("key"));
+        let kind = multi_kind(&key);
+        // OS・実行環境の定常的な多重（svchost・launchd 系など）と、システム所有で種類の分からないものは数えない
+        if no_kill(&key) || (js::is_str(g.get("owner"), "system") && kind == MultiKind::Other) {
+            continue;
+        }
+        let (min, mb) = multi_threshold(kind);
+        let count = num0(g.get("count"));
+        let mem = num0(g.get("mem_mb"));
+        let orphans = num0(g.get("orphans"));
+        let orphan_mb = num0(g.get("orphan_mb"));
+        let multi = count >= min && mem >= mb;
+        let orphan_only = !multi && kind == MultiKind::Mcp && orphans >= 2.0 && orphan_mb >= 100.0;
+        if !multi && !orphan_only {
+            continue;
+        }
+        let parent = string(js::nullish(g.get("parent"), Some(&Value::from("不明"))));
+        let mostly_orphan = orphans >= 2.0 && orphans * 2.0 >= count;
+        let severity = if orphan_only || (total_mb_truthy && mem >= total_mb * 0.1) || count >= 100.0 { "warn" } else { "info" };
+        out.add(
+            format!("{}-{key}", if multi { "proc-multi" } else { "proc-orphan" }),
+            severity,
+            "memory",
+            if multi {
+                format!("{key} が {} 本同時に動いている（合計 {}）", js::num_str(count), fmt_mb(mem))
+            } else {
+                format!("{key} の孤児が {} 本残っている（{}）", js::num_str(orphans), fmt_mb(orphan_mb))
+            },
+            format!(
+                "親の多数派: {parent}、親が終了済み（PPID 1 など）{} 本、所有者 {}、合計{ws_note}",
+                js::num_str(orphans),
+                if js::is_str(g.get("owner"), "mixed") {
+                    "ユーザーとシステム"
+                } else if js::is_str(g.get("owner"), "system") {
+                    "システム（Windows はセッション 0・SSH を含む）"
+                } else {
+                    "ユーザー"
+                }
+            ),
+            format!(
+                "{}{}",
+                if kind == MultiKind::Mcp && (mostly_orphan || orphan_only) {
+                    "半数前後以上が親を失って残っている。セッション終了後の取り残しの可能性が高い。"
+                } else {
+                    ""
+                },
+                multi_advice(kind)
+            ),
+            None,
+            None,
+        );
+    }
+    let tree_dup = |t: &Value| {
+        arr(get(procs, "apps")).iter().any(|a| {
+            matches!((a.get("app"), t.get("root")), (Some(Value::String(x)), Some(Value::String(y))) if x == y)
+                && total_mb_truthy
+                && num(a.get("mem_mb")) >= total_mb * 0.2
+        })
+    };
+    for t in arr(get(procs, "trees"))
+        .iter()
+        .filter(|t| {
+            truthy(Some(t))
+                && !js::is_str(t.get("owner"), "system")
+                && total_mb_truthy
+                && num0(t.get("count")) >= 3.0
+                && num0(t.get("mem_mb")) >= total_mb * 0.2
+                && !tree_dup(t)
+        })
+        .take(2)
+    {
+        out.add(
+            format!("mem-tree-{}", string(t.get("root"))),
+            "info",
+            "memory",
+            format!(
+                "{} を根とするプロセス群が {} GB（実メモリの {}%、{} プロセス）",
+                string(t.get("root")),
+                gb(t.get("mem_mb")),
+                to_fixed(num(t.get("mem_mb")) / total_mb * 100.0, 0),
+                string(t.get("count"))
+            ),
+            format!(
+                "根: {}（PID {}）、直下の子 {} 本、所有者 {}、群の合計{ws_note}",
+                string(t.get("root")),
+                string(t.get("pid")),
+                string(js::nullish(t.get("children"), Some(&Value::from(0)))),
+                if js::is_str(t.get("owner"), "user") { "ユーザー".to_string() } else { string(t.get("owner")) }
+            ),
+            "単一プロセスの RSS だけで止める判断はしない。根のアプリを作業中でないか確かめてから通常終了する。サービス・コンテナ・待ち受け中のものは、依存先を確かめるまで止めない。".into(),
+            None,
+            None,
         );
     }
 
