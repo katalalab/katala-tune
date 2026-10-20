@@ -437,3 +437,89 @@ fn optional_projection_nulls_and_zero_keep_their_dto_meanings() {
         assert_eq!(dto.mounts[0].writable, Some(false));
     }
 }
+
+#[test]
+fn unresolved_network_receipts_distinguish_observation_from_graph_application() {
+    use tune_core::{
+        db::Store,
+        topology::{
+            EntityKind, FailureCode,
+            adapters::docker::{DockerEngine, DockerPacket, Network, engine_snapshots},
+        },
+    };
+    let container =
+        parse_container(&json!({"id":"a".repeat(64),"state":"exited","health":null,"log_driver":"local","mounts":[],"networks":["b".repeat(64)],"ports":[]}))
+            .unwrap();
+    let network = Network { id: container.networks[0].clone(), driver: Some("bridge".into()), internal: Some(false) };
+    let old = DockerPacket {
+        engines: vec![
+            DockerEngine { id: "e".repeat(64), containers: vec![container], networks: vec![network], volumes: vec![] },
+            DockerEngine { id: "f".repeat(64), containers: vec![], networks: vec![], volumes: vec![] },
+        ],
+    };
+    let previous = engine_snapshots(old.snapshot("fixture:native:docker".into(), 1).unwrap());
+    let mut next = old;
+    next.engines[0].networks.clear();
+    next.engines[1].networks.push(Network { id: "c".repeat(64), driver: Some("bridge".into()), internal: Some(false) });
+    let candidate = next.snapshot("fixture:native:docker".into(), 2).unwrap();
+    let private_network = next.engines[0].containers[0].networks[0].clone();
+    let assert_diagnostic = |s: &tune_core::topology::TopologySnapshot, observed_entities: usize, observed_edges: usize, state: &str| {
+        assert_eq!(s.status, ScopeStatus::Partial);
+        let failures = s.failures.iter().filter(|f| f.code == FailureCode::Truncated).collect::<Vec<_>>();
+        assert_eq!(failures.len(), 1);
+        let message = &failures[0].message;
+        for expected in [
+            format!("observed_entities={observed_entities}"),
+            format!("observed_edges={observed_edges}"),
+            "unresolved_references=1".into(),
+            format!("{state}=1"),
+            "scope_graph_applied=false".into(),
+        ] {
+            assert!(message.contains(&expected), "missing {expected}: {message}");
+        }
+        assert!(message.len() < 512);
+        for private in ["a".repeat(64), "b".repeat(64), private_network.clone()] {
+            assert!(!message.contains(&private));
+        }
+    };
+    assert_diagnostic(&candidate, candidate.entities.len(), candidate.edges.len(), "exited");
+    let snapshots = engine_snapshots(candidate);
+    assert_diagnostic(&snapshots[0], 4, 2, "exited");
+    assert_diagnostic(&snapshots[1], snapshots[1].entities.len(), snapshots[1].edges.len(), "exited");
+    assert_eq!(snapshots[2].status, ScopeStatus::Complete);
+    let fresh = Store::open_in_memory().unwrap();
+    for s in &snapshots[..2] {
+        fresh.record_topology("new", s, 2).unwrap();
+    }
+    let view = fresh.topology_view().unwrap();
+    assert!(view["entities"].as_array().unwrap().is_empty());
+    assert!(view["edges"].as_array().unwrap().is_empty());
+    let receipt = view["scopes"].as_array().unwrap().iter().find(|receipt| receipt["scope_id"] == snapshots[1].scope_id).unwrap();
+    assert_eq!(receipt["counters"]["entries"], snapshots[1].entities.len());
+    assert!(receipt["failures"][0]["message"].as_str().unwrap().contains("scope_graph_applied=false"));
+    let retained = Store::open_in_memory().unwrap();
+    for s in &previous {
+        retained.record_topology("old", s, 1).unwrap();
+    }
+    let affected_before = retained.topology_entities(&snapshots[1].scope_id).unwrap();
+    assert!(!affected_before.is_empty());
+    let previous_member =
+        retained.topology_view().unwrap()["edges"].as_array().unwrap().iter().find(|edge| edge["kind"] == "docker_network_member").unwrap().clone();
+    for s in &snapshots {
+        retained.record_topology("new", s, 2).unwrap();
+    }
+    let view = retained.topology_view().unwrap();
+    assert_eq!(retained.topology_entities(&snapshots[1].scope_id).unwrap(), affected_before);
+    assert!(view["edges"].as_array().unwrap().contains(&previous_member));
+    let public = tune_core::topology::export::public_json(&view, tune_core::topology::export::ExportView::All);
+    for private in ["scope_graph_applied", "unresolved_references", "observed_entities", "observed_edges"] {
+        assert!(!public.contains(private));
+    }
+    assert_eq!(retained.topology_latest_success(&snapshots[1].scope_id).unwrap().unwrap()["run_id"], "old");
+    assert_eq!(retained.topology_latest_success(&snapshots[2].scope_id).unwrap().unwrap()["run_id"], "new");
+    assert_eq!(view["entities"].as_array().unwrap().iter().filter(|e| e["kind"] == "docker_network").count(), 2);
+    next.engines[0].containers[0].state = None;
+    let unknown = engine_snapshots(next.snapshot("fixture:native:docker".into(), 3).unwrap());
+    assert_diagnostic(&unknown[1], unknown[1].entities.len(), unknown[1].edges.len(), "unknown");
+    assert!(unknown[1].entities.iter().any(|e| e.kind == EntityKind::DockerContainer));
+}

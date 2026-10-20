@@ -165,6 +165,16 @@ unobserved previous engines retain their graph with a partial receipt. Docker
 uses existing topology leases, fenced writes, retention, public anonymous export,
 and the existing refresh scheduler; it adds no background service or DB schema.
 
+Refresh `entities`/`edges` count observed candidate objects, not applied DB rows.
+An unresolved network membership remains partial even for an exited container;
+its observation receipt records candidate entity/edge counts, unresolved reference
+counts by fixed container state (unknown included), and `scope_graph_applied=false`.
+This applies only to that partial scope: other complete engines can still update.
+A fresh DB receives no graph from the partial scope; an existing complete graph
+is retained. Missing targets do not establish why or when a network disappeared.
+Diagnostics contain no network/container identities and public exports omit
+receipt failure text.
+
 A missing named-volume target or volume identity is a partial observation. The
 affected engine retains its previous complete graph, while other complete
 engines may update. Log size values accept bounded decimal/scientific numeric

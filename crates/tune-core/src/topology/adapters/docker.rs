@@ -360,8 +360,6 @@ impl DockerPacket {
                     if engine.networks.iter().any(|n| &n.id == network) {
                         let n = Entity::with_key(EntityKind::DockerNetwork, "Docker network", &format!("{}:{}", engine.id, network));
                         snapshot.edges.push(Edge::new(EdgeKind::DockerNetworkMember, &entity.id, &n.id));
-                    } else {
-                        snapshot.failures.push(Failure::new(FailureCode::Truncated, "network membership target not observed"));
                     }
                 }
                 for (i, m) in c.mounts.iter().enumerate() {
@@ -392,11 +390,39 @@ impl DockerPacket {
             snapshot.entities.push(e);
         }
         snapshot.counters.entries = snapshot.entities.len();
+        if let Some(failure) = unresolved_network_diagnostic(&snapshot.entities, &snapshot.edges) {
+            snapshot.failures.push(failure);
+        }
         if !snapshot.failures.is_empty() {
             snapshot.status = ScopeStatus::Partial;
         }
         Ok(snapshot)
     }
+}
+
+// Counts describe this candidate scope, not a graph write or a deletion cause.
+// Only fixed state labels and numbers enter the persisted observation receipt.
+fn unresolved_network_diagnostic(entities: &[Entity], edges: &[Edge]) -> Option<Failure> {
+    const STATES: [&str; 8] = ["created", "running", "paused", "restarting", "removing", "exited", "dead", "unknown"];
+    let mut counts = [0usize; 8];
+    for container in entities.iter().filter(|entity| entity.kind == EntityKind::DockerContainer) {
+        let expected = container.attributes["networks"].as_array().map_or(0, Vec::len);
+        let observed = edges.iter().filter(|edge| edge.kind == EdgeKind::DockerNetworkMember && edge.from == container.id).count();
+        let state = container.attributes["state"].as_str().and_then(|state| STATES.iter().position(|label| *label == state)).unwrap_or(7);
+        counts[state] += expected.saturating_sub(observed);
+    }
+    let unresolved = counts.iter().sum::<usize>();
+    (unresolved > 0).then(|| {
+        let states = STATES.iter().zip(counts).map(|(state, count)| format!("{state}={count}")).collect::<Vec<_>>().join(",");
+        Failure::new(
+            FailureCode::Truncated,
+            format!(
+                "network membership target not observed; observed_entities={}; observed_edges={}; unresolved_references={unresolved}; {states}; scope_graph_applied=false",
+                entities.len(),
+                edges.len()
+            ),
+        )
+    })
 }
 
 /// Coverage is separate from each fully observed engine: an excluded context
@@ -418,14 +444,7 @@ pub fn engine_snapshots(mut coverage: TopologySnapshot) -> Vec<TopologySnapshot>
         }
         let entities = coverage.entities.iter().filter(|e| ids.contains(&e.id)).cloned().collect::<Vec<_>>();
         let edges = coverage.edges.iter().filter(|e| ids.contains(&e.from) && ids.contains(&e.to)).cloned().collect::<Vec<_>>();
-        let mut failures = if entities.iter().filter(|e| e.kind == EntityKind::DockerContainer).any(|c| {
-            let count = c.attributes["networks"].as_array().map_or(0, Vec::len);
-            edges.iter().filter(|e| e.kind == EdgeKind::DockerNetworkMember && e.from == c.id).count() < count
-        }) {
-            vec![Failure::new(FailureCode::Truncated, "network membership target not observed")]
-        } else {
-            vec![]
-        };
+        let mut failures = vec![];
         if entities.iter().filter(|e| e.kind == EntityKind::DockerMount && e.attributes["kind"] == "volume").any(|mount| {
             !mount.attributes["volume_hash"].is_string()
                 || !edges.iter().any(|edge| {
@@ -453,6 +472,10 @@ pub fn engine_snapshots(mut coverage: TopologySnapshot) -> Vec<TopologySnapshot>
         snapshot.edges.push(Edge::new(EdgeKind::DockerContains, &environment.id, &engine.id));
         snapshot.entities.push(environment);
         snapshot.counters.entries = snapshot.entities.len();
+        if let Some(failure) = unresolved_network_diagnostic(&snapshot.entities, &snapshot.edges) {
+            snapshot.failures.push(failure);
+            snapshot.status = ScopeStatus::Partial;
+        }
         result.push(snapshot);
     }
     coverage.entities.clear();
