@@ -17,6 +17,8 @@ NeonMonitor（Windows のメモリ監視・自動強制終了ツール）の静�
 
 このほか:
 
+- 台帳の `status` が `online` 以外（`retired`・`no-ssh`・`paused`・`out-of-scope`、読めない値）の機体には、SSH も probe も実行せず設定も変えない。入口（probe・ログ取り込み・棚卸し・AI・接続診断・ライブ・`execOn`/`exec_on`・`plan()`）でそれぞれ断るので、呼び出し側の絞り込みが漏れても接続しない。到達できないことから `status` を自動で変えない（台帳は操作者の明示編集でのみ変わる）。`test/ledger.test.js`・`crates/tune-core/tests/ledger.rs`（JS と Rust の一致は `parity_ledger.rs`）
+- WSL distro の一覧・内部観測（`probes/win_probe.ps1` の `wsl.distros`）は台帳の Windows 機で `"wsl": true` を明示したときだけ行う。省略時・`false` は WSL コマンドを呼ばない。opt-in 時は `wsl.exe -l` で動いている distro を確認し、直前に running と確認したものだけに `wsl.exe -d <名前> --exec /bin/sh -s` で固定の読み取りスクリプト（`/proc`・`ps`・`df`）を標準入力から1回流す。停止中と一覧を読めない場合は distro に入らない。確認直後に自然停止すると `wsl -d` が distro を起動しうる競合はOS側に残るため、自動起動を避ける必要がある機体では `wsl: true` を設定しない。変更系の `wsl.exe` の操作（`--shutdown`・`--terminate`・`--unregister` など）は行わない。起動の口は `Invoke-KtWsl` の1か所で、`test/win-wsl-regression.ps1`（Windows PowerShell 5.1。偽の `Invoke-KtWsl` が呼び出しを記録）と `test/wsl.test.js`（区間の構造）が守る。
 - OS の中核・セキュリティ・AI エージェント・python/node などの実行環境は、終了を提案しない（`NO_KILL`）。台帳の `protect` で足せる。
 - `shared: true` の機体（家族との共用機など）は提案だけで、実行ボタンを出さない。`plan()` も拒否する。
 - 引数はすべて検証してからコマンドに埋める（PID は整数、名前は英数と一部記号、GUID・起動時刻は形式を固定）。PowerShell 本体にはシングルクォートを含めない（ssh 越しの Git Bash で包むため）。
@@ -28,6 +30,13 @@ NeonMonitor（Windows のメモリ監視・自動強制終了ツール）の静�
 - 実行の直前に「未完了」の記録を書く（書けなければ実行しない）。実行が終わったら同じ記録に結果と戻し操作を書く。結果を書く前にアプリが止まった操作は、再起動後も「未完了」のままで、成功にも失敗にも数えない。戻す操作も出さない（状態が分からないものを戻さない）。
 - probe の失敗は `reason`（timeout・unreachable・auth・error）と画面用の `reason_text` に分ける。元のエラー文は残す。
 - 流れは `lib/runner.js`（Electron）と `Engine::confirm_and_run`（Rust）。どちらも子プロセスの実行口を差し替えられ、受入試験は偽の ssh と一時ディレクトリの偽の対象で行う（`test/acceptance-issue19.test.js`・`crates/tune-core/tests/acceptance_issue19.rs`、記録は `docs/acceptance/issue-19.md`）。
+
+## macOS のキャッシュ候補と保存領域
+
+- `caches` という収集項目名だけで削除可能と判断しない。JS/Rustのrulesは既知の再生成候補（npm、Library/Caches、Homebrew cache、.cache、Xcode DerivedData）に完全一致し、容量が有限の非負数値のものだけを候補にする。未知path・欠測・非数値・負値は候補化しない。
+- 親ディレクトリを計測できた場合は、その子（Library/Caches/Homebrew）を合算しない。親が欠測なら計測できた子を採用する。同一pathも重複加算しない。macOSの `gb` はdu由来のGiBであり、候補の項目しきい値は2 GiB、合計しきい値は10 GiB。
+- CoreSimulator/Devices、Colima、Docker Dataはユーザーデータを含む保存領域。キャッシュ合計から除き、計測合計10 GiB以上なら「VM・シミュレータの保存領域（削除候補ではない）」として内訳と根拠のみを示す。commands/actionは付けず、保存領域やコンテナの存在だけでDocker pruneやCoreSimulator削除を提案しない。
+- 候補の容量は削除できる容量の保証ではない。低空きでも内容・利用状況・再生成可否の確認を先に案内する。既存snapshotにも同じrulesを使い、収集・DB・実行許可リストは変えない。回帰例は `test/fixtures/cache-accounting.json` をJS/Rustテストとparityで共有する。
 
 ## 効果の確かめ方
 

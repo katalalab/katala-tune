@@ -120,10 +120,13 @@ pub fn sources(os: &str) -> &'static [&'static str] {
 /// ログインの記録の取り込み元
 pub const LOGIN_SOURCES: [&str; 2] = ["mac_auth", "win_security"];
 
+pub fn source_enabled(node: &Value, source: &str) -> bool {
+    crate::netsec::logins_enabled(node) || !LOGIN_SOURCES.contains(&source)
+}
+
 /// 機体から取り込む元（lib/logs.js の sourcesOf）。台帳で `"network": false` の機体からは、ログインの記録（送り元のアドレス）も集めない
 pub fn sources_of(node: &Node) -> Vec<&'static str> {
-    let logins = crate::netsec::logins_enabled(&node.raw);
-    sources(&node.os).iter().copied().filter(|s| logins || !LOGIN_SOURCES.contains(s)).collect()
+    sources(&node.os).iter().copied().filter(|s| source_enabled(&node.raw, s)).collect()
 }
 
 /// `String(Number.parseInt(cursor ?? '0', 10) || 0)` のうち、安全な整数だけを渡す
@@ -296,6 +299,10 @@ pub fn source_note(src: Option<&Value>) -> Option<&'static str> {
 /// 1台分を取り込む。戻り値は `{ node_id, sources: { <source>: { inserted, fetched, dropped, note? } | { error } }, meta, error? }`
 /// db はロックの道具（取り込み中もほかの読み出しを止めない）
 pub async fn sync_node(db: &(impl DbAccess + ?Sized), node: &Node) -> Value {
+    // 運用対象でない機体には接続せず、取り込みの失敗（cursor の error）も作らない
+    if let Some(refused) = node.refusal() {
+        return json!({ "node_id": node.id, "skipped": true, "sources": {}, "meta": {}, "reason": refused });
+    }
     let srcs = sources_of(node);
     let mut cursors = Map::new();
     for s in &srcs {
@@ -396,6 +403,8 @@ where
     F: Fn(&Value) + Send + Sync + 'static,
 {
     let on_result = std::sync::Arc::new(on_result);
+    let (nodes, _excluded) = crate::nodes::partition(nodes);
+    let nodes = nodes.as_slice();
     let mut set = tokio::task::JoinSet::new();
     for (i, n) in nodes.iter().cloned().enumerate() {
         let (db, cb) = (db.clone(), on_result.clone());

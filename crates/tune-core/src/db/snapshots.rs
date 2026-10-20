@@ -24,6 +24,23 @@ pub struct Snapshot {
 }
 
 impl Store {
+    /// 最新の失敗だけを保存する（成功 snapshot はそのまま残す）。JS 版と同じ meta キー
+    pub fn save_probe_failure(&self, node_id: &str, at: i64, error: &str) -> Result<()> {
+        let key = format!("probeFailure:{node_id}");
+        if self.get_meta(&key)?.and_then(|v| v["at"].as_i64()).is_some_and(|old| old > at) {
+            return Ok(());
+        }
+        self.set_meta(&key, &serde_json::json!({ "at": at, "error": error }))
+    }
+
+    /// 成功より新しい失敗があれば返す。再起動・互換版でも同じ判定にする
+    pub fn probe_error(&self, node_id: &str, last_ok_at: Option<i64>) -> Result<Option<String>> {
+        let failed = self.get_meta(&format!("probeFailure:{node_id}"))?;
+        Ok(failed
+            .filter(|v| v["at"].as_i64().is_some_and(|at| last_ok_at.is_none_or(|ok| at >= ok)))
+            .and_then(|v| v["error"].as_str().filter(|s| !s.is_empty()).map(str::to_string)))
+    }
+
     /// summary = main.js の summarize（bench_ms, cpu, mem_avail, swap_gb, critical, warn）
     #[allow(clippy::too_many_arguments)] // lib/db.js の addSnapshot と同じ並び
     pub fn add_snapshot(&self, node_id: &str, at: i64, wall_s: Option<f64>, score: Option<i64>, findings: &Value, data: &Value, summary: &Value) -> Result<()> {

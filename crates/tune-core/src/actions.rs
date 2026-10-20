@@ -222,6 +222,9 @@ pub fn plan(node: &Node, action: &Value, protect: Option<&[String]>) -> Result<P
     if node.shared {
         return Err(format!("{} は共用機のため、このアプリからは変更しない", node.id));
     }
+    if let Some(refused) = node.refusal() {
+        return Err(refused);
+    }
     let windows_only = matches!(ty.as_str(), "set-power-plan" | "set-gpu-power-limit" | "task-disable" | "task-enable" | "task-run");
     let mac_only = ty == "set-low-power-mode" || ty.starts_with("launchd-");
     if windows_only && !node.is_windows() {

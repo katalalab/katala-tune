@@ -19,6 +19,60 @@ const win = (over = {}) => ({
   stability_7d: { bugcheck_1001: 0, kernel_power_41: 0, unexpected_6008: 0 }, defender: { realtime: true }, ...over,
 });
 
+const cacheCases = require('./fixtures/cache-accounting.json');
+const cacheInspect = 'du -sh ~/Library/Caches/* 2>/dev/null | sort -h | tail -15   # 大きいものを確認';
+for (const c of cacheCases) test(`cache accounting: ${c.name}`, () => {
+  const findings = analyze(c.snap);
+  const cache = findings.find((f) => f.id === 'caches');
+  const storage = findings.find((f) => f.id === 'vm-storage');
+  if (c.cache_gib == null) assert.equal(cache, undefined);
+  else {
+    assert.ok(cache);
+    assert.equal(cache.title, `再生成可能なキャッシュ候補が ${c.cache_gib} GiB`);
+    assert.equal(cache.detail, c.cache_detail);
+    assert.match(cache.advice, /確認/);
+    assert.equal(cache.action, undefined);
+  }
+  if (c.storage_gib == null) assert.equal(storage, undefined);
+  else {
+    assert.ok(storage);
+    assert.equal(storage.severity, 'info');
+    assert.equal(storage.category, 'disk');
+    assert.equal(storage.title, `VM・シミュレータの保存領域（削除候補ではない）: ${c.storage_gib} GiB`);
+    assert.equal(storage.detail, `${c.storage_detail}。ユーザーデータを含むため、再生成可能なキャッシュには数えない。`);
+    assert.equal(storage.commands, undefined);
+    assert.equal(storage.action, undefined);
+  }
+  for (const f of findings) {
+    assert.doesNotMatch((f.commands || []).join('\n'), /docker .*prune|simctl delete/);
+    if (f.id === 'caches' || f.id === 'disk-/') {
+      assert.match(f.advice, /確認/);
+      assert.doesNotMatch(f.advice, /消しても|削除コマンドから始める/);
+      if (c.cleanup_commands) assert.deepEqual(f.commands, [...c.cleanup_commands, cacheInspect]);
+    }
+  }
+});
+
+test('cache accounting: invalid or missing parents do not suppress a measured child', () => {
+  for (const gb of [undefined, null, '20', -1, true, {}, [], NaN, Infinity, -Infinity]) {
+    const f = analyze({ probe: 'mac', caches: [
+      { path: '~/Library/Caches', gb }, { path: '~/Library/Caches/Homebrew', gb: 12 },
+    ] }).find((f) => f.id === 'caches');
+    assert.ok(f);
+    assert.equal(f.detail, '~/Library/Caches/Homebrew 12 GiB');
+  }
+});
+
+test('cache accounting: non-finite measurements never produce findings or cleanup commands', () => {
+  for (const gb of [NaN, Infinity, -Infinity]) {
+    const findings = analyze({ probe: 'mac', caches: [
+      { path: '~/.npm/_cacache', gb }, { path: '~/.colima', gb },
+    ], disk: [{ mount: '/', total_gb: 500, free_gb: 10, free_pct: 2 }] });
+    assert.equal(findings.length, 1);
+    assert.deepEqual(findings[0].commands, [cacheInspect]);
+  }
+});
+
 test('健全な機体は所見なしで 100 点', () => {
   assert.deepEqual(analyze(mac()), []);
   assert.equal(score(analyze(win())), 100);

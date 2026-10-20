@@ -162,16 +162,29 @@ pub async fn verify(node: &Node, items: &[(String, i64, i64)]) -> Result<Vec<Val
     })
 }
 
+/// macOS で標準入力のスクリプトを動かす python。`python3 -` でソースとして読ませると、macOS 標準の Python 3.9 は
+/// 約 1 KB を超える行のあとの多バイト文字で SyntaxError（Non-UTF-8 code）になる（実機で再現）。live.rs と同じくバイト列で読んで compile する
+const MAC_BOOT: &str = "import sys;exec(compile(sys.stdin.buffer.read(),\"ai_sessions.py\",\"exec\"))";
+
+/// (プログラム, 引数)。ローカルは env 経由、リモートは ssh の先のシェルで '…' に包む（MAC_BOOT にシングルクォートを含めない）
+fn mac_python(local: bool, alias: &str) -> (String, Vec<String>) {
+    if local {
+        ("/usr/bin/env".into(), ["python3", "-X", "utf8", "-c", MAC_BOOT].map(String::from).to_vec())
+    } else {
+        let remote = format!("command -v python3 >/dev/null && exec python3 -X utf8 -c '{MAC_BOOT}' || exec /usr/bin/python3 -X utf8 -c '{MAC_BOOT}'");
+        ("ssh".into(), ssh_args(alias, &remote))
+    }
+}
+
 /// python の標準ライブラリだけのスクリプトを、機体で（この機体ならローカル、ほかは ssh で）標準入力に渡して動かす
 pub async fn run_python(node: &Node, src: &str, timeout: Duration) -> RunResult {
+    if let Some(err) = node.refusal() {
+        return RunResult { code: None, out: String::new(), err };
+    }
     let input = Some(src.as_bytes());
     if node.is_mac() {
-        if node.local {
-            collect::run("/usr/bin/env", &["python3".into(), "-X".into(), "utf8".into(), "-".into()], input, timeout).await
-        } else {
-            let remote = "command -v python3 >/dev/null && exec python3 -X utf8 - || exec /usr/bin/python3 -X utf8 -";
-            collect::run("ssh", &ssh_args(&node.alias, remote), input, timeout).await
-        }
+        let (prog, args) = mac_python(node.local, &node.alias);
+        collect::run(&prog, &args, input, timeout).await
     } else if node.local {
         let mut last = RunResult::default();
         for py in ["python3", "python", "py"] {
@@ -191,10 +204,11 @@ pub async fn run_python(node: &Node, src: &str, timeout: Duration) -> RunResult 
 /// AI セッションを取り込む機体か。台帳の "ai_sessions" が true / false ならそれに従う。
 /// 書いていなければ、共用機（shared）は取り込まない（他の人のセッションの cwd や PR を集めないため）。それ以外は取り込む
 pub fn enabled(node: &Node) -> bool {
-    match node.get("ai_sessions") {
-        Some(Value::Bool(b)) => *b,
-        _ => !node.shared,
-    }
+    node.is_active()
+        && match node.get("ai_sessions") {
+            Some(Value::Bool(b)) => *b,
+            _ => !node.shared,
+        }
 }
 
 #[cfg(test)]
@@ -253,6 +267,36 @@ mod tests {
         assert!(c.contains("for c in python3 python py") && c.contains("-X utf8 -") && c.ends_with(NO_PYTHON));
         // PowerShell を通さない（シングルクォートを含めない）
         assert!(!c.contains('\''));
+    }
+
+    #[tokio::test]
+    async fn mac_boot_runs_long_state_with_non_ascii() {
+        if cfg!(windows) || std::process::Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        assert!(!MAC_BOOT.contains('\''));
+        // 続きの位置の行を 1 KB より十分長くし、そのあとに日本語のコメント行が来る形（実機で落ちた形）
+        let files: Map<String, Value> = (0..200).map(|i| (format!("claude:~-作業/{i}.jsonl"), json!(0))).collect();
+        let src = script(&json!({ "files": files }));
+        assert!(src.lines().any(|l| l.starts_with("KT_STATE = ") && l.len() > 4096));
+        let home = std::env::temp_dir().join(format!("kt-ai-boot-{}-{}", std::process::id(), crate::db::now_ms()));
+        std::fs::create_dir_all(&home).unwrap();
+        let (prog, args) = mac_python(true, "unused");
+        let remote = mac_python(false, "unused").1.last().unwrap().clone();
+        // ローカルの形と、リモートのシェルに渡る文字列（sh -c で引用を確かめる）の両方
+        for (p, a) in [(prog, args), ("sh".to_string(), vec!["-c".to_string(), remote])] {
+            let mut c = collect::command(&p);
+            c.args(&a).env("HOME", &home).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+            let mut child = c.spawn().unwrap();
+            use tokio::io::AsyncWriteExt;
+            let mut si = child.stdin.take().unwrap();
+            si.write_all(src.as_bytes()).await.unwrap();
+            drop(si);
+            let o = child.wait_with_output().await.unwrap();
+            let r = RunResult { code: o.status.code(), out: String::from_utf8_lossy(&o.stdout).into(), err: String::from_utf8_lossy(&o.stderr).into() };
+            assert!(matches!(parse(&r), Fetched::Ok(_)), "{p}: {r:?}");
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[tokio::test]

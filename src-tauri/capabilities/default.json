@@ -11,6 +11,7 @@
     "notification:allow-is-permission-granted",
     "allow-config",
     "allow-last",
+    "allow-ledger",
     "allow-probe",
     "allow-history",
     "allow-power-report",
@@ -47,6 +48,9 @@
     "allow-live-stop",
     "allow-agent-peers",
     "allow-agent-pair",
-    "allow-netsec"
+    "allow-netsec",
+    "allow-dashboard",
+    "allow-monitor-settings",
+    "allow-hub-pull"
   ]
 }

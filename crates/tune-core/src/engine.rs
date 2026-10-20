@@ -1,7 +1,7 @@
 //! main.js の画面以外の部分（分析・ログ取り込み・状態の計算・自動スキャンの判断・変更操作の流れ）。
 //! 画面・常駐・通知・ダイアログは呼び出し側（src-tauri）が `Host` として渡す。tune-cli も同じものを使う。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -48,7 +48,8 @@ impl Host for NoHost {}
 pub type Confirm = Box<dyn FnOnce(String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> + Send>;
 
 pub const DEFAULT_PROBE_MINUTES: i64 = 60;
-pub const DEFAULT_LOGS_MINUTES: i64 = 15;
+/// 詳細なログは 1 時間ごと（数字は常時監視で毎分、分析も 1 時間ごと）
+pub const DEFAULT_LOGS_MINUTES: i64 = 60;
 pub const DEFAULT_INVENTORY_HOURS: i64 = 24;
 
 pub struct Engine {
@@ -94,6 +95,23 @@ pub fn summarize(data: &Value, findings: &[Value]) -> Value {
         "critical": count("critical"),
         "warn": count("warn"),
     })
+}
+
+/// 現在値は現行台帳の機体とアプリ自身だけ。台帳から外れた機体の行は DB と履歴に残す。
+fn current_check_rows(rows: Vec<Value>, nodes: &[Value]) -> Vec<Value> {
+    let mut scopes: HashSet<&str> = nodes.iter().filter_map(|node| node.get("id").and_then(Value::as_str)).collect();
+    scopes.insert("_app");
+    rows.into_iter().filter(|row| row.get("scope").and_then(Value::as_str).is_some_and(|scope| scopes.contains(scope))).collect()
+}
+
+fn status_counts(rows: &[Value]) -> BTreeMap<String, i64> {
+    let mut counts = BTreeMap::from([("ok".into(), 0_i64), ("warn".into(), 0), ("fail".into(), 0), ("unknown".into(), 0)]);
+    for row in rows {
+        if let Some(status) = row.get("status").and_then(Value::as_str) {
+            *counts.entry(status.into()).or_default() += 1;
+        }
+    }
+    counts
 }
 
 impl Engine {
@@ -206,6 +224,25 @@ impl Engine {
         Value::Object(out)
     }
 
+    /// 対象台帳（対象・除外・未観測とその理由）。読み取りだけで、台帳は書き換えない
+    pub fn ledger(&self) -> Result<Value, String> {
+        let cfg = self.reload_config();
+        let mut errors = lock(&self.last_probe_error).clone();
+        let db = lock(&self.db);
+        let mut last_ok = std::collections::HashMap::new();
+        for n in &cfg.nodes {
+            let at = db.last_snapshots(&n.id, 1).map_err(|e| e.to_string())?.first().map(|s| s.at);
+            if let Some(error) = db.probe_error(&n.id, at).map_err(|e| e.to_string())? {
+                errors.insert(n.id.clone(), error);
+            }
+            last_ok.insert(n.id.clone(), at);
+        }
+        Ok(crate::nodes::target_ledger(&cfg.nodes, |id| crate::nodes::Observation {
+            last_ok_at: last_ok.get(id).copied().flatten(),
+            last_error: errors.get(id).cloned(),
+        }))
+    }
+
     /// 前回の分析結果（画面の `last`）。機体ごとに最新の snapshot と所見
     pub fn last(&self) -> Result<Vec<Value>, String> {
         let cfg = self.config();
@@ -213,6 +250,11 @@ impl Engine {
         let mut out = Vec::new();
         for n in &cfg.nodes {
             let snaps = db.last_snapshots(&n.id, 2).map_err(|e| e.to_string())?;
+            if let Some(error) = db.probe_error(&n.id, snaps.first().map(|s| s.at)).map_err(|e| e.to_string())? {
+                let at = db.get_meta(&format!("probeFailure:{}", n.id)).map_err(|e| e.to_string())?.and_then(|v| v["at"].as_i64());
+                out.push(json!({ "node_id": n.id, "ok": false, "at": at, "error": error, "stale": true }));
+                continue;
+            }
             let Some(last) = snaps.first() else { continue };
             let data = crate::netsec::snapshot_for_node(last.data.clone(), &n.raw);
             let prev_data = snaps.get(1).map(|s| crate::netsec::snapshot_for_node(s.data.clone(), &n.raw));
@@ -270,7 +312,7 @@ impl Engine {
                     .set("cursors", Value::Array(cursors.clone()))
                     .opt("expect", n.get("expect").cloned())
                     .set("schedule", sch.clone())
-                    .opt("lastError", errors.get(&n.id).cloned().map(Value::from))
+                    .opt("lastError", db.probe_error(&n.id, last.as_ref().map(|s| s.at)).ok().flatten().or_else(|| errors.get(&n.id).cloned()).map(Value::from))
                     .build();
                 let checks = health::node_checks(&n.raw, snap.as_ref(), &findings, &ctx);
                 changed.extend(db.save_checks(&n.id, &checks, now).unwrap_or_default());
@@ -313,28 +355,30 @@ impl Engine {
 
     /// 状態ごとの件数
     pub fn status_counts(&self) -> Value {
-        json!(self.with_db(|d| d.status_counts()).unwrap_or_default())
+        let nodes: Vec<Value> = self.config().nodes.into_iter().map(|n| n.raw).collect();
+        let checks = self.with_db(|d| d.checks()).unwrap_or_default();
+        let checks = crate::netsec::filter_check_rows(current_check_rows(checks, &nodes), &nodes);
+        json!(status_counts(&checks))
+    }
+
+    /// 保存済みの現在状態。問い合わせだけでは状態を計算し直さない。
+    pub fn status_snapshot(&self) -> Result<Value, String> {
+        let cfg = self.config();
+        let nodes: Vec<Value> = cfg.nodes.into_iter().map(|n| n.raw).collect();
+        let (checks, events, lp, ll) = self.with_db(|d| Ok((d.checks()?, d.check_events(150)?, d.get_meta("lastProbeAt")?, d.get_meta("lastLogsAt")?)))?;
+        let checks = crate::netsec::filter_check_rows(current_check_rows(checks, &nodes), &nodes);
+        let events = crate::netsec::filter_check_rows(events, &nodes);
+        Ok(json!({
+            "checks": checks, "events": events, "schedule": self.schedule(),
+            "lastProbeAt": lp, "lastLogsAt": ll, "openAtLogin": self.host.open_at_login(),
+            "counts": status_counts(&checks), "probing": self.is_probing(), "syncing": self.is_syncing(),
+        }))
     }
 
     /// 画面の「状態」（問い合わせでは更新通知を送らない）
     pub fn status(&self) -> Result<Value, String> {
         self.compute_checks(false, false);
-        let cfg = self.config();
-        let nodes: Vec<Value> = cfg.nodes.into_iter().map(|n| n.raw).collect();
-        let (checks, events, lp, ll) = self.with_db(|d| Ok((d.checks()?, d.check_events(150)?, d.get_meta("lastProbeAt")?, d.get_meta("lastLogsAt")?)))?;
-        let checks = crate::netsec::filter_check_rows(checks, &nodes);
-        let events = crate::netsec::filter_check_rows(events, &nodes);
-        let mut counts = std::collections::BTreeMap::from([("ok", 0_i64), ("warn", 0), ("fail", 0), ("unknown", 0)]);
-        for row in &checks {
-            if let Some(status) = row.get("status").and_then(Value::as_str) {
-                *counts.entry(status).or_default() += 1;
-            }
-        }
-        Ok(json!({
-            "checks": checks, "events": events, "schedule": self.schedule(),
-            "lastProbeAt": lp, "lastLogsAt": ll, "openAtLogin": self.host.open_at_login(),
-            "counts": counts, "probing": self.is_probing(), "syncing": self.is_syncing(),
-        }))
+        self.status_snapshot()
     }
 
     /// 画面で自動スキャンの設定を変える（5〜1440 分の整数だけ受け付ける）
@@ -364,7 +408,9 @@ impl Engine {
         self.host.state_changed();
         let cfg = self.reload_config();
         let all = ids.as_ref().is_none_or(Vec::is_empty);
-        let targets: Vec<Node> = cfg.nodes.iter().filter(|n| all || ids.as_ref().is_some_and(|i| i.contains(&n.id))).cloned().collect();
+        let selected: Vec<Node> = cfg.nodes.iter().filter(|n| all || ids.as_ref().is_some_and(|i| i.contains(&n.id))).cloned().collect();
+        // 運用対象でない機体（retired など）には接続しない。除外は失敗ではなく理由つきで返す
+        let (targets, skipped) = crate::nodes::partition(&selected);
         let me = self.clone();
         let completed = Arc::new(Mutex::new(Vec::<Value>::new()));
         let completed2 = completed.clone();
@@ -378,7 +424,7 @@ impl Engine {
         }
         self.probing.store(false, Ordering::SeqCst);
         self.compute_checks(true, true);
-        json!({ "done": results.len(), "auto": auto, "results": lock(&completed).clone() })
+        json!({ "done": results.len(), "auto": auto, "results": lock(&completed).clone(), "skipped": skipped })
     }
 
     fn on_probe_result(&self, r: &Value) -> Value {
@@ -411,15 +457,21 @@ impl Engine {
                     }
                     Err(e) => {
                         let msg = format!("分析は終わったが保存できなかった: {e}");
-                        lock(&self.last_probe_error).insert(node_id.clone(), msg.clone());
                         if let Value::Object(m) = &mut full {
                             m.insert("ok".into(), Value::Bool(false));
                             m.insert("error".into(), Value::String(msg));
                         }
                     }
                 }
-            } else {
-                lock(&self.last_probe_error).insert(node_id, js::string(full.get("error")));
+            }
+            if !js::truthy(full.get("ok")) {
+                let mut error = js::string(full.get("error"));
+                let at = full.get("at").and_then(Value::as_i64).unwrap_or_else(now_ms);
+                if let Err(e) = db.save_probe_failure(&node_id, at, &error) {
+                    error = format!("{error}\n分析の失敗を保存できなかった: {e}");
+                    full["error"] = json!(error);
+                }
+                lock(&self.last_probe_error).insert(node_id, error);
             }
             full
         };
@@ -455,7 +507,9 @@ impl Engine {
         let meta = |k: &str| self.with_db(|d| d.get_meta(k)).ok().flatten();
         let since = |k: &str| now - js::num(js::or(meta(k).as_ref(), Some(&Value::from(0))));
         let mins = |k: &str| js::num(s.get(k)) * 60000.0;
-        if since("lastProbeAt") >= mins("probe_minutes") {
+        // ハブの分析結果を写していて新しいあいだは、同じ機体を重ねて分析しない（monitor.rs）
+        let hub_analysis = self.with_db(|d| Ok(crate::monitor::hub_analysis_fresh(d, now as i64))).unwrap_or(false);
+        if !hub_analysis && since("lastProbeAt") >= mins("probe_minutes") {
             self.run_probe(None, true).await;
             let nodes = self.reload_config().nodes;
             self.sync_logs(nodes).await;
@@ -669,6 +723,35 @@ fn rand36(n: usize) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn failed_probe_survives_restart_until_a_newer_success() {
+        let tmp = std::env::temp_dir().join(format!("kt-probe-outcome-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config = tmp.join("nodes.json");
+        std::fs::write(&config, r#"{"nodes":[{"id":"dev","os":"windows","network":false}]}"#).unwrap();
+        let e = Engine::open(config.clone(), tmp.join("data"), Arc::new(NoHost)).unwrap();
+        e.on_probe_result(&json!({"node_id":"dev","ok":false,"at":5,"error":"initial failure"}));
+        assert_eq!(e.last().unwrap()[0]["ok"], false);
+        assert_eq!(e.last().unwrap()[0]["at"], 5);
+        e.on_probe_result(&json!({"node_id":"dev","ok":true,"at":10,"data":{"probe":"windows"}}));
+        e.on_probe_result(&json!({"node_id":"dev","ok":false,"at":20,"error":"ssh: timeout"}));
+        drop(e);
+        let e = Engine::open(config, tmp.join("data"), Arc::new(NoHost)).unwrap();
+        let last = e.last().unwrap();
+        assert_eq!(last[0]["ok"], false);
+        assert_eq!(last[0]["at"], 20);
+        let row = &e.ledger().unwrap()["rows"][0];
+        assert_eq!(row["status"], "unobserved");
+        assert!(row["reason"].as_str().unwrap().contains("ssh: timeout"));
+        e.compute_checks(false, false);
+        assert!(e.with_db(|d| d.checks()).unwrap().iter().any(|c| c["scope"] == "dev" && c["id"] == "probe" && c["status"] == "fail"));
+        e.on_probe_result(&json!({"node_id":"dev","ok":true,"at":30,"data":{"probe":"windows"}}));
+        assert_eq!(e.ledger().unwrap()["rows"][0]["status"], "target");
+        assert_eq!(e.last().unwrap()[0]["ok"], true);
+        drop(e);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
     #[tokio::test]
     async fn probe_completion_reports_saved_results_and_never_promotes_busy_or_failed_saves() {
         let tmp = std::env::temp_dir().join(format!("katala-tune-probe-result-test-{}-{}", std::process::id(), now_ms()));
@@ -769,6 +852,42 @@ mod tests {
         let status_text = serde_json::to_string(&status).unwrap();
         assert!(!status_text.contains("sec-login"), "{status_text}");
         assert!(!status_text.contains("192.0.2.1"));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn current_status_excludes_removed_scopes_without_deleting_history() {
+        let tmp = std::env::temp_dir().join(format!("katala-tune-current-status-test-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config = tmp.join("nodes.json");
+        std::fs::write(&config, r#"{"nodes":[{"id":"current","alias":"unused","os":"windows"}]}"#).unwrap();
+        let engine = Engine::open(config.clone(), tmp.join("data"), Arc::new(NoHost)).unwrap();
+        let now = now_ms();
+        engine
+            .with_db(|d| {
+                d.save_checks("removed", &[crate::db::Check { id: "probe".into(), name: "probe".into(), status: "fail".into(), detail: None }], now)?;
+                d.save_checks("current", &[crate::db::Check { id: "probe".into(), name: "probe".into(), status: "warn".into(), detail: None }], now)?;
+                d.save_checks("_app", &[crate::db::Check { id: "db".into(), name: "db".into(), status: "ok".into(), detail: None }], now)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let status = engine.status_snapshot().unwrap();
+        let scopes: Vec<&str> = status["checks"].as_array().unwrap().iter().filter_map(|row| row["scope"].as_str()).collect();
+        assert_eq!(scopes, vec!["_app", "current"]);
+        assert_eq!(status["counts"], json!({ "ok": 1, "warn": 1, "fail": 0, "unknown": 0 }));
+        assert_eq!(engine.status_counts(), status["counts"]);
+        assert!(status["events"].as_array().unwrap().iter().any(|row| row["scope"] == "removed"));
+        let stored = engine.with_db(|d| d.checks()).unwrap();
+        assert!(stored.iter().any(|row| row["scope"] == "removed"));
+
+        std::fs::write(&config, r#"{"nodes":[{"id":"renamed","alias":"unused","os":"windows"}]}"#).unwrap();
+        engine.reload_config();
+        let renamed = engine.status_snapshot().unwrap();
+        assert_eq!(renamed["checks"].as_array().unwrap().iter().map(|row| row["scope"].clone()).collect::<Vec<_>>(), vec![json!("_app")]);
+        assert!(engine.with_db(|d| d.checks()).unwrap().iter().any(|row| row["scope"] == "current"));
+
         drop(engine);
         let _ = std::fs::remove_dir_all(tmp);
     }

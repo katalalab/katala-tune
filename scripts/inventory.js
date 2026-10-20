@@ -14,7 +14,7 @@ const dogu = require('../lib/dogu');
   const results = await Promise.all(targets.map((n) => inventoryNode(n)));
   const rows = [];
   for (const r of results) {
-    if (!r.ok) { process.stderr.write(`${r.node_id}: NG ${r.error.split('\n').pop()}\n`); continue; }
+    if (!r.ok) { process.stderr.write(`${r.node_id}: ${r.skipped ? '対象外' : 'NG'} ${r.error.split('\n').pop()}\n`); continue; }
     const by = {};
     for (const it of r.items) { by[it.source] = (by[it.source] || 0) + 1; rows.push({ ...it, node_id: r.node_id }); }
     process.stderr.write(`${r.node_id}: ${r.items.length} 件 ${r.wall_s.toFixed(1)}s ${JSON.stringify(by)}${r.errors.length ? ' errors=' + JSON.stringify(r.errors) : ''}\n`);

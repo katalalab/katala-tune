@@ -437,6 +437,37 @@ fn fixtures() -> Vec<(Value, Value)> {
             ], "trees": [] } })),
             json!({}),
         ),
+        // WSL の中の観測（running は中を観測、stopped_unobserved は起動も実行もしない、一覧を読めなければ unknown）
+        (
+            win_fixture(json!({
+                "wsl": { "config": true, "memory": "24GB", "distros": [
+                    { "name": "dev-a", "default": true, "version": 2, "state": "running", "observed": true, "reason": null, "inside": { "mem_total_mb": 24000, "mem_available_mb": 1000, "psi_some_avg10": 12.5, "top": [] } },
+                    { "name": "dev-b", "default": false, "version": 2, "state": "running", "observed": true, "reason": null, "inside": { "mem_total_mb": 24000, "mem_available_mb": 1100 } }
+                ] },
+                "processes": { "top_cpu": [], "apps": [{ "app": "vmmemWSL", "mem_mb": 23000, "count": 1 }], "apps_cpu": [] }
+            })),
+            json!({}),
+        ),
+        (
+            win_fixture(json!({
+                "wsl": { "config": true, "memory": "24GB", "distros": [
+                    { "name": "dev-a", "default": true, "version": 2, "state": "running", "observed": true, "reason": null, "inside": { "mem_total_mb": 24000, "mem_available_mb": 20000 } },
+                    { "name": "old", "default": false, "version": 2, "state": "stopped_unobserved", "observed": false, "reason": "not-running", "inside": null },
+                    { "name": "docker-desktop", "default": false, "version": 2, "state": "running", "observed": false, "reason": "internal-distro-skipped", "inside": null }
+                ] },
+                "processes": { "top_cpu": [], "apps": [{ "app": "vmmemWSL", "mem_mb": 20000, "count": 1 }], "apps_cpu": [] }
+            })),
+            json!({}),
+        ),
+        (
+            win_fixture(json!({ "wsl": { "config": false, "memory": null, "distros": [
+                { "name": "dev-a", "state": "unknown", "observed": false, "reason": "running-list-failed", "inside": null },
+                { "name": "dev-b", "state": "running", "observed": false, "reason": "timeout", "inside": null },
+                { "name": "dev-c", "state": "running", "observed": false, "reason": "something-else", "inside": { "mem_total_mb": 0, "mem_available_mb": 5 } }
+            ] } })),
+            json!({}),
+        ),
+        (win_fixture(json!({ "wsl": { "config": false, "memory": null, "installed": true, "listed": true, "distros": [] } })), json!({})),
     ]
 }
 
@@ -521,6 +552,15 @@ fn rules_health_logs_actions_match_js() {
 
     // 判定（rules）
     let mut analyze_in: Vec<Value> = fixtures().into_iter().map(|(snap, node)| json!({ "snap": snap, "node": node })).collect();
+    let cache_cases: Value = serde_json::from_str(include_str!("../../../test/fixtures/cache-accounting.json")).unwrap();
+    analyze_in.extend(cache_cases.as_array().unwrap().iter().map(|c| json!({ "snap": c["snap"], "node": {} })));
+    for gb in [Value::Null, json!("20"), json!(-1), json!(true), json!({}), json!([])] {
+        analyze_in.push(json!({ "snap": { "probe": "mac", "caches": [
+            { "path": "~/Library/Caches", "gb": gb }, { "path": "~/Library/Caches/Homebrew", "gb": 12 }
+        ] }, "node": {} }));
+    }
+    let cpu_fixtures: Vec<Value> = serde_json::from_str(include_str!("../../../test/fixtures/cpu-availability.json")).unwrap();
+    analyze_in.extend(cpu_fixtures.iter().map(|f| json!({ "snap": f["data"], "node": {} })));
     for _ in 0..4000 {
         let shared = r.chance(0.2);
         analyze_in.push(json!({ "snap": snapshot(&mut r), "node": { "shared": shared } }));
@@ -547,7 +587,27 @@ fn rules_health_logs_actions_match_js() {
         json!({ "id": "log-flood-abc", "severity": "warn", "title": "洪水 A" }),
         json!({ "id": "log-flood-def", "severity": "warn", "title": "洪水 B" }),
     ];
-    let mut node_in = Vec::new();
+    let mut node_in: Vec<Value> = cpu_fixtures
+        .iter()
+        .map(|f| json!({ "node": { "id": "test-node" }, "snap": { "at": now, "data": f["data"] }, "findings": [], "ctx": { "now": now } }))
+        .collect();
+    for source in ["mac_auth", "win_security"] {
+        for policy in [json!({ "network": false }), json!({ "network_logins": false }), json!({ "shared": true }), json!({ "network_logins": true })] {
+            let mut node = json!({ "id": "pc" });
+            merge(&mut node, policy);
+            for previous in [json!({ "last_ok_at": now - 86_400_000 }), json!({ "last_error": "denied", "fail_streak": 4 })] {
+                let mut cursor = json!({ "node_id": "pc", "source": source });
+                merge(&mut cursor, previous);
+                for active in [true, false] {
+                    let mut cursors = vec![cursor.clone()];
+                    if active {
+                        cursors.push(json!({ "node_id": "pc", "source": "active", "last_ok_at": now }));
+                    }
+                    node_in.push(json!({ "node": node, "snap": null, "findings": [], "ctx": { "now": now, "cursors": cursors } }));
+                }
+            }
+        }
+    }
     for i in 0..1500 {
         let snap = if r.chance(0.15) {
             Value::Null
@@ -643,7 +703,16 @@ fn rules_health_logs_actions_match_js() {
             ])
         })
         .collect();
-    let jobs_in: Vec<Value> = (0..300).map(|i| jobs(&mut r, i % 2 == 0)).collect();
+    let mut jobs_in: Vec<Value> = (0..300).map(|i| jobs(&mut r, i % 2 == 0)).collect();
+    for (id, name, kind, code) in [
+        ("\\nefarius_HidHide_Updater", "nefarius_HidHide_Updater", "schtask", 202),
+        ("\\unrelated", "unrelated", "schtask", 202),
+        ("\\custom\\nefarius_HidHide_Updater", "nefarius_HidHide_Updater", "schtask", 202),
+        ("\\nefarius_HidHide_Updater", "nefarius_HidHide_Updater", "schtask", 201),
+        ("\\nefarius_HidHide_Updater", "nefarius_HidHide_Updater", "launchd", 202),
+    ] {
+        jobs_in.push(json!([{ "id": id, "name": name, "kind": kind, "scope": "user", "state": "ready", "last_result": code }]));
+    }
 
     // ログ（伏せ字・指紋・正規化）
     let fake_aws = ["AKIA", "ABCDEFGHIJKLMNOP"].concat();

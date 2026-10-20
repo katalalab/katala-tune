@@ -14,6 +14,7 @@ mod ai_usage;
 mod checks;
 mod inventory;
 mod logs;
+pub mod metrics;
 mod netsec;
 pub mod provenance;
 mod snapshots;
@@ -54,6 +55,7 @@ const SCHEMA_PARTS: &[&str] = &[
     netsec::SCHEMA,
     provenance::SCHEMA,
     ai_limits::SCHEMA,
+    metrics::SCHEMA,
 ];
 const META_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT, updated_at INTEGER);\n";
 
@@ -77,6 +79,11 @@ impl Store {
 
     pub fn open_in_memory() -> Result<Store> {
         Self::init(Connection::open_in_memory()?)
+    }
+
+    /// 既存 DB を読み取り専用で開く。作成・スキーマ移行・過去ログの取り込みはしない
+    pub fn open_read_only(dir: &Path) -> Result<Store> {
+        Ok(Store { conn: Connection::open_with_flags(dir.join(DB_FILE), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)? })
     }
 
     fn init(conn: Connection) -> Result<Store> {

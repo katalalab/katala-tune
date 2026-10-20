@@ -218,6 +218,17 @@ Codex の `codex.tool_result` には引数と出力の断片が入るが、受�
 - 対応: probe が note を返す（`not-found-for-account`: 実行したアカウントの `%APPDATA%\NeonMonitor` が無い。`no-guard-log`: フォルダはあるが `guard.log` が無い）。`not-found-for-account` は「未導入」ではない（別のアカウントで動いていることがある）ので、画面は「このアカウントでは見つからない」と書き、未導入とは断定しない。`log_cursors.note` に保存し、「取り込みの状態」の表に印を付け、状態の detail にも「取れても 0 件」と書く。状態（ok / warn / fail）は変えない。旧版が保存した `not-installed` も同じ意味・同じ文面で読む。note が無い（フォルダとログがあり、静か）ときは何も足さない
 - 実機への変更はしていない。見つからない機体で、NeonMonitor を動かしているアカウントの `guard.log` を読ませるか、台帳で対象外にするかは操作者が決める
 
+## 8. WSL の中の観測（2026-10-11、Issue #29 の一部）
+
+Windows の GPU 開発機では、メモリ・CPU・ディスクの実消費の多くが WSL2 の中で起きる。Windows 側からは `vmmem` の1行に見える。台帳に `"wsl": true` を指定した機体だけで、`probes/win_probe.ps1` が distro ごとの状態と内側の実測を足す（`wsl.distros`）。設定が省略または `false` の機体では WSL コマンドを呼ばない。
+
+- 状態は `running`（中を観測した。観測できなければ `reason`）・`stopped_unobserved`（停止中。起動も実行もしない）・`unknown`（動いているかを読めなかった。何も実行しない）。停止中は「正常」でも「空」でもなく「観測していない」として、所見（`wsl-unobserved`）と機体の詳細に出る。
+- opt-in 時でも、running 確認直後に distro が自然停止すると `wsl -d` が起動しうるOS側の競合は残る。自動起動を許容しない機体では `wsl: true` を設定しない。
+- 内側で読むのは、`/proc/meminfo` の MemTotal・MemAvailable・Swap、`/proc/pressure/memory`（PSI）、`/proc/loadavg`、メモリ上位8件のプロセス名（コマンドラインは読まない）、`/` の使用量。distro の VHDX の大きさは Windows 側のファイルの大きさだけを読む（停止中でも読めるが、中には入らない）。WSL2 の distro は1つの VM を共有するので、内側のメモリは VM 全体の値で、distro を足さずに最大を使う。
+- Windows 側との突き合わせ: 内側の使用が VM の上限の 90% 以上（`wsl-inside-memory`）、`vmmem` が内側の実使用より 4 GB 以上多く、物理メモリの 25% 以上を持っている（`wsl-reclaim`。`.wslconfig` の `autoMemoryReclaim=gradual` の提案）。観測できていない distro があるときは比べない。
+- 判定は `lib/wsl.js`（JS）と `crates/tune-core/src/wsl.rs`（Rust）で同じ。`crates/tune-core/tests/parity.rs` の固定の例で一致を確かめる。
+- まだ無いもの: Docker／コンテナの使用量、台帳の「全件台帳」への WSL の欄、CPU の内側の値。
+
 ## 順番
 
 1. 出どころの台帳と「この数字はどこから」画面（済み 2026-10-07。夜間の自動の照合は 7 で）

@@ -22,5 +22,9 @@ httparse = "1"
 gethostname = "1"
 zeroize = "1"
 
+# sample（ライブ表示のサンプラー）の性能カウンタ・プロセス一覧。Tauri・tokio がすでに使っている版（Cargo.lock に既にある）
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Performance", "Win32_System_SystemInformation", "Win32_System_Threading", "Wdk_System_SystemInformation"] }
+
 [lints]
 workspace = true

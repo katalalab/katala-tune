@@ -2,6 +2,7 @@
 const COMMANDS: &[&str] = &[
     "config",
     "last",
+    "ledger",
     "probe",
     "history",
     "power_report",
@@ -39,6 +40,9 @@ const COMMANDS: &[&str] = &[
     "agent_peers",
     "agent_pair",
     "netsec",
+    "dashboard",
+    "monitor_settings",
+    "hub_pull",
 ];
 
 fn main() {

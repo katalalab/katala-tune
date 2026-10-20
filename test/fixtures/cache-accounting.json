@@ -1,0 +1,164 @@
+[
+  {
+    "name": "VM-only: persistent storage is not cache or a deletion candidate",
+    "snap": {
+      "probe": "mac",
+      "disk": [{ "mount": "/", "total_gb": 500, "free_gb": 10, "free_pct": 2 }],
+      "containers": { "colima": [{ "name": "example", "status": "Stopped" }], "docker_desktop": {} },
+      "caches": [
+        { "path": "~/Library/Developer/CoreSimulator/Devices", "gb": 10 },
+        { "path": "~/.colima", "gb": 10 },
+        { "path": "~/Library/Containers/com.docker.docker/Data", "gb": 10 }
+      ]
+    },
+    "cache_gib": null,
+    "storage_gib": 30,
+    "storage_detail": "~/Library/Developer/CoreSimulator/Devices 10 GiB、~/.colima 10 GiB、~/Library/Containers/com.docker.docker/Data 10 GiB",
+    "cleanup_commands": []
+  },
+  {
+    "name": "measured cache parent excludes its child",
+    "snap": { "probe": "mac", "caches": [
+      { "path": "~/Library/Caches", "gb": 12 },
+      { "path": "~/Library/Caches/Homebrew", "gb": 4 }
+    ] },
+    "cache_gib": 12,
+    "cache_detail": "~/Library/Caches 12 GiB",
+    "storage_gib": null,
+    "cleanup_commands": ["brew cleanup --prune=all"]
+  },
+  {
+    "name": "parent exclusion does not depend on snapshot order",
+    "snap": { "probe": "mac", "caches": [
+      { "path": "~/Library/Caches/Homebrew", "gb": 4 },
+      { "path": "~/Library/Caches", "gb": 12 }
+    ] },
+    "cache_gib": 12,
+    "cache_detail": "~/Library/Caches 12 GiB",
+    "storage_gib": null,
+    "cleanup_commands": ["brew cleanup --prune=all"]
+  },
+  {
+    "name": "absent parent allows the measured child",
+    "snap": { "probe": "mac", "caches": [{ "path": "~/Library/Caches/Homebrew", "gb": 12 }] },
+    "cache_gib": 12,
+    "cache_detail": "~/Library/Caches/Homebrew 12 GiB",
+    "storage_gib": null,
+    "cleanup_commands": ["brew cleanup --prune=all"]
+  },
+  {
+    "name": "missing parent measurement allows the child",
+    "snap": { "probe": "mac", "caches": [
+      { "path": "~/Library/Caches", "gb": null, "timeout": true },
+      { "path": "~/Library/Caches/Homebrew", "gb": 12 }
+    ] },
+    "cache_gib": 12,
+    "cache_detail": "~/Library/Caches/Homebrew 12 GiB",
+    "storage_gib": null,
+    "cleanup_commands": ["brew cleanup --prune=all"]
+  },
+  {
+    "name": "zero parent is measured, not missing",
+    "snap": { "probe": "mac", "caches": [
+      { "path": "~/Library/Caches", "gb": 0 },
+      { "path": "~/Library/Caches/Homebrew", "gb": 12 }
+    ] },
+    "cache_gib": null,
+    "storage_gib": null
+  },
+  {
+    "name": "parent below item threshold still excludes its child",
+    "snap": { "probe": "mac", "caches": [
+      { "path": "~/Library/Caches", "gb": 1 },
+      { "path": "~/Library/Caches/Homebrew", "gb": 12 }
+    ] },
+    "cache_gib": null,
+    "storage_gib": null
+  },
+  {
+    "name": "unknown paths and prefix lookalikes are not cache",
+    "snap": { "probe": "mac", "caches": [
+      { "path": "~/other", "gb": 40 },
+      { "path": "~/Library/Caches-old", "gb": 40 },
+      { "path": "~/.cache/project", "gb": 40 }
+    ] },
+    "cache_gib": null,
+    "storage_gib": null
+  },
+  {
+    "name": "non-numeric and negative measurements cannot propose cleanup",
+    "snap": {
+      "probe": "mac",
+      "disk": [{ "mount": "/", "total_gb": 500, "free_gb": 10, "free_pct": 2 }],
+      "caches": [
+        { "path": "~/.npm/_cacache", "gb": "12" },
+        { "path": "~/Library/Caches/Homebrew", "gb": [12] },
+        { "path": "~/Library/Developer/Xcode/DerivedData", "gb": -12 },
+        { "path": "~/Library/Caches", "gb": null },
+        { "path": "~/.cache", "gb": true },
+        { "path": "~/.colima", "gb": "12" },
+        { "path": "~/Library/Developer/CoreSimulator/Devices", "gb": -12 },
+        { "path": "~/Library/Containers/com.docker.docker/Data" }
+      ]
+    },
+    "cache_gib": null,
+    "storage_gib": null,
+    "cleanup_commands": []
+  },
+  {
+    "name": "mixed snapshot separates cache from VM storage and unknown paths",
+    "snap": {
+      "probe": "mac",
+      "disk": [{ "mount": "/", "total_gb": 500, "free_gb": 10, "free_pct": 2 }],
+      "caches": [
+        { "path": "~/Library/Caches", "gb": 12 },
+        { "path": "~/Library/Caches/Homebrew", "gb": 4 },
+        { "path": "~/.npm/_cacache", "gb": 3 },
+        { "path": "~/.cache", "gb": 2 },
+        { "path": "~/Library/Developer/Xcode/DerivedData", "gb": 5 },
+        { "path": "~/Library/Developer/CoreSimulator/Devices", "gb": 10 },
+        { "path": "~/.colima", "gb": 10 },
+        { "path": "~/Library/Containers/com.docker.docker/Data", "gb": 10 },
+        { "path": "~/other", "gb": 40 }
+      ]
+    },
+    "cache_gib": 22,
+    "cache_detail": "~/Library/Caches 12 GiB、~/.npm/_cacache 3 GiB、~/.cache 2 GiB、~/Library/Developer/Xcode/DerivedData 5 GiB",
+    "storage_gib": 30,
+    "storage_detail": "~/Library/Developer/CoreSimulator/Devices 10 GiB、~/.colima 10 GiB、~/Library/Containers/com.docker.docker/Data 10 GiB",
+    "cleanup_commands": ["rm -rf ~/Library/Developer/Xcode/DerivedData/*", "npm cache clean --force", "brew cleanup --prune=all"]
+  },
+  {
+    "name": "duplicate measurements are counted once",
+    "snap": { "probe": "mac", "caches": [
+      { "path": "~/.cache", "gb": 10 },
+      { "path": "~/.cache", "gb": 10 },
+      { "path": "~/.colima", "gb": 10 },
+      { "path": "~/.colima", "gb": 10 }
+    ] },
+    "cache_gib": 10,
+    "cache_detail": "~/.cache 10 GiB",
+    "storage_gib": 10,
+    "storage_detail": "~/.colima 10 GiB",
+    "cleanup_commands": []
+  },
+  {
+    "name": "below finding thresholds emits no storage or cache finding",
+    "snap": { "probe": "mac", "caches": [
+      { "path": "~/.cache", "gb": 9.99 },
+      { "path": "~/.colima", "gb": 9.99 }
+    ] },
+    "cache_gib": null,
+    "storage_gib": null
+  },
+  {
+    "name": "storage total includes small measured directories at the boundary",
+    "snap": { "probe": "mac", "caches": [
+      { "path": "~/.colima", "gb": 8.5 },
+      { "path": "~/Library/Developer/CoreSimulator/Devices", "gb": 1.5 }
+    ] },
+    "cache_gib": null,
+    "storage_gib": 10,
+    "storage_detail": "~/.colima 8.5 GiB、~/Library/Developer/CoreSimulator/Devices 1.5 GiB"
+  }
+]

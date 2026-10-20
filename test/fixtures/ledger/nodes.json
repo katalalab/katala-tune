@@ -1,0 +1,13 @@
+{
+  "protect": ["Code"],
+  "nodes": [
+    { "id": "active-mac", "alias": "active-mac", "os": "macos", "role": "運用中の Mac" },
+    { "id": "explicit-online", "alias": "explicit-online", "os": "windows", "status": "online" },
+    { "id": "old-tower", "alias": "old-tower", "os": "windows", "status": "retired", "status_reason": "2026-09 に解体", "status_date": "2026-09-30" },
+    { "id": "locked-down", "alias": "locked-down", "os": "windows", "status": "no-ssh", "status_reason": "SSH を開けない方針" },
+    { "id": "on-hold", "alias": "on-hold", "os": "macos", "status": "Paused", "status_date": "2026-10-01" },
+    { "id": "someone-else", "alias": "someone-else", "os": "windows", "status": "out_of_scope" },
+    { "id": "typo-node", "alias": "typo-node", "os": "windows", "status": "retried" },
+    { "id": "retired-local", "alias": "retired-local", "os": "macos", "status": "retired", "local_hostname": "fixture-local-host" }
+  ]
+}
