@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { run, SSH_OPTS, windowsSshCommand, macProbeArgs, macSshCommand } = require('../lib/collect');
+const { run, probeNode, SSH_OPTS, windowsSshCommand, macProbeArgs, macSshCommand } = require('../lib/collect');
 
 test('SSH は既存の ControlPersist master を使わない', () => {
   assert.ok(SSH_OPTS.includes('-T'));
@@ -84,6 +84,28 @@ test('benchmark:false では Windows に固定計算を送らない', () => {
   const disabled = windowsSshCommand(false);
   assert.match(disabled, /probe\.ps1/);
   assert.doesNotMatch(disabled, /KATALA_TUNE_BENCH|3000000|command -v python/);
+});
+
+test('WSL 内部観測は明示 opt-in の機体だけに渡す', async () => {
+  const calls = [];
+  const localShell = {
+    async powershellFile(_script, params) { calls.push(params); return { code: 0, out: '{"ok":true}\n', err: '' }; },
+  };
+  for (const node of [
+    { id: 'default', os: 'windows', local: true, benchmark: false },
+    { id: 'disabled', os: 'windows', local: true, benchmark: false, wsl: false },
+    { id: 'enabled', os: 'windows', local: true, benchmark: false, network: false, wsl: true },
+  ]) await probeNode(node, { localShell });
+  assert.doesNotMatch(calls[0], /ObserveWsl/);
+  assert.doesNotMatch(calls[1], /ObserveWsl/);
+  assert.equal(calls[2], '-NoNetwork -ObserveWsl');
+});
+
+test('WSL 内部観測はリモート Windows にも明示 opt-in でだけ渡す', () => {
+  const disabled = windowsSshCommand(false, true, false);
+  const enabled = windowsSshCommand(false, false, true);
+  assert.doesNotMatch(disabled, /ObserveWsl/);
+  assert.match(enabled, /probe\.ps1\)" -NoNetwork -ObserveWsl;/);
 });
 
 test('benchmark:false をローカル・リモート Mac に同じく渡す', () => {

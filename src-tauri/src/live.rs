@@ -57,6 +57,7 @@ pub async fn live_start(app: AppHandle, e: State<'_, Arc<Engine>>, l: State<'_, 
         return Ok(serde_json::json!({ "started": [], "running": [], "refused": [], "hidden": true }));
     }
     let cfg = e.reload_config();
+    l.retain_active(&cfg.nodes);
     let (mut nodes, mut unknown): (Vec<Node>, Vec<String>) = (Vec::new(), Vec::new());
     for id in ids {
         match cfg.node(&id) {

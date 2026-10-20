@@ -56,6 +56,19 @@ impl Out {
 /// 1台分の機能チェック。snap = 最新の分析結果 `{ at, wall_s, data }`（無ければ None）、findings = その所見、
 /// ctx = `{ now, cursors, expect, schedule, lastError }`（health.js と同じキー）
 pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: &Value) -> Vec<Check> {
+    // 運用対象でない機体（retired など）は収集していないので、分析・ログの古さや失敗を異常にしない。履歴は残る（check は1件に置き換わる）
+    let op = crate::nodes::op_state(node);
+    if !op.active {
+        let meta = [op.reason.as_str(), op.date.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join("、");
+        let detail = if op.valid {
+            format!("{}のため収集・変更の対象外{}", crate::nodes::state_label(&op.state), if meta.is_empty() { String::new() } else { format!("（{meta}）") })
+        } else {
+            op.reason.clone()
+        };
+        return vec![Check {
+            id: "ledger".into(), name: "運用状態".into(), status: if op.valid { "unknown" } else { "warn" }.into(), detail: Some(detail)
+        }];
+    }
     let c = Some(ctx);
     let now = if present(get(c, "now")) { num(get(c, "now")) } else { crate::db::now_ms() as f64 };
     let minutes = |k: &str, d: f64| {

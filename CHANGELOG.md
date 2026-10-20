@@ -3,6 +3,9 @@
 ## 未リリース
 
 - リポジトリの衛生監査（opt-in・読み取り専用）: `npm run hygiene` / `tune hygiene`。dirty・未 push・stash・ghq のパスと origin の不一致を機体横断で集め、読めない・上限超過は未観測として残す。
+- 運用対象外になった既存のライブ収集も停止する。分析失敗の日時・理由を保存して再起動後も対象台帳と状態に反映し、新しい成功結果で回復を判定する。`tune ledger` は台帳や DB の初期化・移行を行わず、WSL の取得失敗は未観測として扱う。
+- 台帳に機体の運用状態（`status`: online・retired・no-ssh・paused・out-of-scope）を追加。online 以外には接続も変更もせず、到達不能（online）と退役を区別する。対象台帳を「状態」の画面と `tune ledger` に出す。`status` を持たない従来の台帳はそのまま動く。
+- Windows の分析に WSL の中の観測を追加（読み取り専用）。動いている distro だけ内側のメモリ・PSI・上位プロセス・ディスクを読み、停止中は起動せず `stopped_unobserved`。内側の逼迫・`vmmem` との差・未観測の所見と、機体の詳細の「WSL の中」。Docker／コンテナの使用量は未対応（docs/acceptance/issue-29.md）。
 
 ## 0.6.4
 

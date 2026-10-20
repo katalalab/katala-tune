@@ -17,6 +17,8 @@ NeonMonitor（Windows のメモリ監視・自動強制終了ツール）の静�
 
 このほか:
 
+- 台帳の `status` が `online` 以外（`retired`・`no-ssh`・`paused`・`out-of-scope`、読めない値）の機体には、SSH も probe も実行せず設定も変えない。入口（probe・ログ取り込み・棚卸し・AI・接続診断・ライブ・`execOn`/`exec_on`・`plan()`）でそれぞれ断るので、呼び出し側の絞り込みが漏れても接続しない。到達できないことから `status` を自動で変えない（台帳は操作者の明示編集でのみ変わる）。`test/ledger.test.js`・`crates/tune-core/tests/ledger.rs`（JS と Rust の一致は `parity_ledger.rs`）
+- WSL distro の一覧・内部観測（`probes/win_probe.ps1` の `wsl.distros`）は台帳の Windows 機で `"wsl": true` を明示したときだけ行う。省略時・`false` は WSL コマンドを呼ばない。opt-in 時は `wsl.exe -l` で動いている distro を確認し、直前に running と確認したものだけに `wsl.exe -d <名前> --exec /bin/sh -s` で固定の読み取りスクリプト（`/proc`・`ps`・`df`）を標準入力から1回流す。停止中と一覧を読めない場合は distro に入らない。確認直後に自然停止すると `wsl -d` が distro を起動しうる競合はOS側に残るため、自動起動を避ける必要がある機体では `wsl: true` を設定しない。変更系の `wsl.exe` の操作（`--shutdown`・`--terminate`・`--unregister` など）は行わない。起動の口は `Invoke-KtWsl` の1か所で、`test/win-wsl-regression.ps1`（Windows PowerShell 5.1。偽の `Invoke-KtWsl` が呼び出しを記録）と `test/wsl.test.js`（区間の構造）が守る。
 - OS の中核・セキュリティ・AI エージェント・python/node などの実行環境は、終了を提案しない（`NO_KILL`）。台帳の `protect` で足せる。
 - `shared: true` の機体（家族との共用機など）は提案だけで、実行ボタンを出さない。`plan()` も拒否する。
 - 引数はすべて検証してからコマンドに埋める（PID は整数、名前は英数と一部記号、GUID・起動時刻は形式を固定）。PowerShell 本体にはシングルクォートを含めない（ssh 越しの Git Bash で包むため）。

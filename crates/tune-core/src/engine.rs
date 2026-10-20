@@ -224,6 +224,25 @@ impl Engine {
         Value::Object(out)
     }
 
+    /// 対象台帳（対象・除外・未観測とその理由）。読み取りだけで、台帳は書き換えない
+    pub fn ledger(&self) -> Result<Value, String> {
+        let cfg = self.reload_config();
+        let mut errors = lock(&self.last_probe_error).clone();
+        let db = lock(&self.db);
+        let mut last_ok = std::collections::HashMap::new();
+        for n in &cfg.nodes {
+            let at = db.last_snapshots(&n.id, 1).map_err(|e| e.to_string())?.first().map(|s| s.at);
+            if let Some(error) = db.probe_error(&n.id, at).map_err(|e| e.to_string())? {
+                errors.insert(n.id.clone(), error);
+            }
+            last_ok.insert(n.id.clone(), at);
+        }
+        Ok(crate::nodes::target_ledger(&cfg.nodes, |id| crate::nodes::Observation {
+            last_ok_at: last_ok.get(id).copied().flatten(),
+            last_error: errors.get(id).cloned(),
+        }))
+    }
+
     /// 前回の分析結果（画面の `last`）。機体ごとに最新の snapshot と所見
     pub fn last(&self) -> Result<Vec<Value>, String> {
         let cfg = self.config();
@@ -231,6 +250,11 @@ impl Engine {
         let mut out = Vec::new();
         for n in &cfg.nodes {
             let snaps = db.last_snapshots(&n.id, 2).map_err(|e| e.to_string())?;
+            if let Some(error) = db.probe_error(&n.id, snaps.first().map(|s| s.at)).map_err(|e| e.to_string())? {
+                let at = db.get_meta(&format!("probeFailure:{}", n.id)).map_err(|e| e.to_string())?.and_then(|v| v["at"].as_i64());
+                out.push(json!({ "node_id": n.id, "ok": false, "at": at, "error": error, "stale": true }));
+                continue;
+            }
             let Some(last) = snaps.first() else { continue };
             let data = crate::netsec::snapshot_for_node(last.data.clone(), &n.raw);
             let prev_data = snaps.get(1).map(|s| crate::netsec::snapshot_for_node(s.data.clone(), &n.raw));
@@ -288,7 +312,7 @@ impl Engine {
                     .set("cursors", Value::Array(cursors.clone()))
                     .opt("expect", n.get("expect").cloned())
                     .set("schedule", sch.clone())
-                    .opt("lastError", errors.get(&n.id).cloned().map(Value::from))
+                    .opt("lastError", db.probe_error(&n.id, last.as_ref().map(|s| s.at)).ok().flatten().or_else(|| errors.get(&n.id).cloned()).map(Value::from))
                     .build();
                 let checks = health::node_checks(&n.raw, snap.as_ref(), &findings, &ctx);
                 changed.extend(db.save_checks(&n.id, &checks, now).unwrap_or_default());
@@ -384,7 +408,9 @@ impl Engine {
         self.host.state_changed();
         let cfg = self.reload_config();
         let all = ids.as_ref().is_none_or(Vec::is_empty);
-        let targets: Vec<Node> = cfg.nodes.iter().filter(|n| all || ids.as_ref().is_some_and(|i| i.contains(&n.id))).cloned().collect();
+        let selected: Vec<Node> = cfg.nodes.iter().filter(|n| all || ids.as_ref().is_some_and(|i| i.contains(&n.id))).cloned().collect();
+        // 運用対象でない機体（retired など）には接続しない。除外は失敗ではなく理由つきで返す
+        let (targets, skipped) = crate::nodes::partition(&selected);
         let me = self.clone();
         let completed = Arc::new(Mutex::new(Vec::<Value>::new()));
         let completed2 = completed.clone();
@@ -398,7 +424,7 @@ impl Engine {
         }
         self.probing.store(false, Ordering::SeqCst);
         self.compute_checks(true, true);
-        json!({ "done": results.len(), "auto": auto, "results": lock(&completed).clone() })
+        json!({ "done": results.len(), "auto": auto, "results": lock(&completed).clone(), "skipped": skipped })
     }
 
     fn on_probe_result(&self, r: &Value) -> Value {
@@ -431,15 +457,21 @@ impl Engine {
                     }
                     Err(e) => {
                         let msg = format!("分析は終わったが保存できなかった: {e}");
-                        lock(&self.last_probe_error).insert(node_id.clone(), msg.clone());
                         if let Value::Object(m) = &mut full {
                             m.insert("ok".into(), Value::Bool(false));
                             m.insert("error".into(), Value::String(msg));
                         }
                     }
                 }
-            } else {
-                lock(&self.last_probe_error).insert(node_id, js::string(full.get("error")));
+            }
+            if !js::truthy(full.get("ok")) {
+                let mut error = js::string(full.get("error"));
+                let at = full.get("at").and_then(Value::as_i64).unwrap_or_else(now_ms);
+                if let Err(e) = db.save_probe_failure(&node_id, at, &error) {
+                    error = format!("{error}\n分析の失敗を保存できなかった: {e}");
+                    full["error"] = json!(error);
+                }
+                lock(&self.last_probe_error).insert(node_id, error);
             }
             full
         };
@@ -690,6 +722,35 @@ fn rand36(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_probe_survives_restart_until_a_newer_success() {
+        let tmp = std::env::temp_dir().join(format!("kt-probe-outcome-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config = tmp.join("nodes.json");
+        std::fs::write(&config, r#"{"nodes":[{"id":"dev","os":"windows","network":false}]}"#).unwrap();
+        let e = Engine::open(config.clone(), tmp.join("data"), Arc::new(NoHost)).unwrap();
+        e.on_probe_result(&json!({"node_id":"dev","ok":false,"at":5,"error":"initial failure"}));
+        assert_eq!(e.last().unwrap()[0]["ok"], false);
+        assert_eq!(e.last().unwrap()[0]["at"], 5);
+        e.on_probe_result(&json!({"node_id":"dev","ok":true,"at":10,"data":{"probe":"windows"}}));
+        e.on_probe_result(&json!({"node_id":"dev","ok":false,"at":20,"error":"ssh: timeout"}));
+        drop(e);
+        let e = Engine::open(config, tmp.join("data"), Arc::new(NoHost)).unwrap();
+        let last = e.last().unwrap();
+        assert_eq!(last[0]["ok"], false);
+        assert_eq!(last[0]["at"], 20);
+        let row = &e.ledger().unwrap()["rows"][0];
+        assert_eq!(row["status"], "unobserved");
+        assert!(row["reason"].as_str().unwrap().contains("ssh: timeout"));
+        e.compute_checks(false, false);
+        assert!(e.with_db(|d| d.checks()).unwrap().iter().any(|c| c["scope"] == "dev" && c["id"] == "probe" && c["status"] == "fail"));
+        e.on_probe_result(&json!({"node_id":"dev","ok":true,"at":30,"data":{"probe":"windows"}}));
+        assert_eq!(e.ledger().unwrap()["rows"][0]["status"], "target");
+        assert_eq!(e.last().unwrap()[0]["ok"], true);
+        drop(e);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
 
     #[tokio::test]
     async fn probe_completion_reports_saved_results_and_never_promotes_busy_or_failed_saves() {
