@@ -12,7 +12,7 @@ Rust 1.99.0、tauri-cli 2.12.1、Node 24.22.0、公式actionのcommit SHA、runn
 
 Macは同梱CLIを署名前に入力と比較し、`Contents/Resources/katala-source.json` を追加してアプリ全体をad-hoc再署名する。署名・Info.plist・arm64・実行権限・全ファイルのハッシュを確認し、tar.gzを作り、安全なパスと通常ファイルのみであることを検査してから一時領域へ展開し、全ハッシュと署名を再確認する。シンボリックリンクやhardlink、予期しないファイルは現在の固定bundle構成では受け付けない。
 
-Windowsは `katala-tune.exe` / `tune.exe` / `tune-agent.exe` の3点のみ。x64 PE32+実行形式、GUI/console subsystem、GUIのprocess-default RT_MANIFEST ID 1、入力sidecarとの一致を検査する。manifestは名前空間を含む実XML要素 `assembly/dependency/dependentAssembly/assemblyIdentity` とCommon Controls v6のtype/name/version/publicKeyToken/processorArchitectureを確認し、コメントを要素として扱わない。readerはこのビルドで必要なXML 1.0の範囲に限定し、DTD・外部/未知entity・CDATA・XML宣言以外のPI・不正構造・重複resourceは拒否する（64KiB/32階層/2048要素まで）。`manifest.json` に各ファイルのサイズとSHA256を記録する。既存の出力先は空でも上書きしない。未知のschema・余剰フィールドは拒否する。
+Windowsは `katala-tune.exe` / `tune.exe` / `tune-agent.exe` の3点のみ。x64 PE32+実行形式、GUI/console subsystem、GUIのprocess-default `RT_MANIFEST` resource name ID 1 (`CREATEPROCESS_MANIFEST_RESOURCE_ID`)、入力sidecarとの一致を検査する。manifestは名前空間を含む実XML要素 `assembly/dependency/dependentAssembly/assemblyIdentity` とCommon Controls v6のtype/name/version/publicKeyToken/processorArchitectureを確認し、コメントを要素として扱わない。readerはこのビルドで必要なXML 1.0の範囲に限定し、DTD・外部/未知entity・CDATA・XML宣言以外のPI・不正構造・重複resourceは拒否する（64KiB/32階層/2048要素まで）。`manifest.json` に各ファイルのサイズとSHA256を記録する。既存の出力先は空でも上書きしない。未知のschema・余剰フィールドは拒否する。
 
 ダウンロード後はmanifestのsource SHA・run ID/attemptとActions実行を照合し、ファイル・archiveのSHA256とサイズを検証する。Mac archiveは `checkArchive` で検査してから新しい空の場所へ展開し、`inspectPayload` でmanifestの `proof` に対するファイル・署名・アーキテクチャを再検査できる。Windowsも `inspectPayload` で3点を再検査する。生成された検査結果全体をmanifestと比較する。ヘルパーは同じレビュー済みsource SHAから使う。
 

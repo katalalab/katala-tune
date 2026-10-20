@@ -45,7 +45,7 @@ function fixture(t) {
 
 // A real PE resource tree (RT_MANIFEST/name/language), not a string-search mock.
 const GUI_MANIFEST = '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"><dependency><dependentAssembly><assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/></dependentAssembly></dependency></assembly>';
-function pe(gui, manifest = GUI_MANIFEST) {
+function pe(gui, manifest = GUI_MANIFEST, manifestNameId = 1) {
   const b = Buffer.alloc(2048); b.write('MZ'); b.writeUInt32LE(128, 60);
   b.write('PE\0\0', 128); b.writeUInt16LE(0x8664, 132); b.writeUInt16LE(1, 134);
   b.writeUInt16LE(240, 148); b.writeUInt16LE(2, 150);
@@ -53,7 +53,7 @@ function pe(gui, manifest = GUI_MANIFEST) {
   b.writeUInt32LE(16, opt + 108); b.writeUInt32LE(4096, opt + 128); b.writeUInt32LE(1536, opt + 132);
   const section = opt + 240; b.write('.rsrc', section); b.writeUInt32LE(4096, section + 12);
   b.writeUInt32LE(1536, section + 16); b.writeUInt32LE(512, section + 20);
-  for (const [offset, id, next] of [[0, 24, 24], [24, 1, 48], [48, 1033, 72]]) {
+  for (const [offset, id, next] of [[0, 24, 24], [24, manifestNameId, 48], [48, 1033, 72]]) {
     b.writeUInt16LE(1, 512 + offset + 14); b.writeUInt32LE(id, 512 + offset + 16);
     b.writeUInt32LE(offset === 48 ? next : (next + 0x80000000), 512 + offset + 20);
   }
@@ -124,6 +124,10 @@ test('PE parser requires executable x64 PE32+, correct subsystem and embedded GU
   ]) { const b = pe(true); mutate(b); assert.throws(() => inspectPE(b, true)); }
   for (const bytes of [0, 63, 140, 400, 550, 620]) assert.throws(() => inspectPE(pe(true).subarray(0, bytes), true));
   assert.throws(() => inspectPE(Buffer.from('MZ fake text Microsoft.Windows.Common-Controls version="6.0.0.0"'), true));
+});
+
+test('PE parser rejects a GUI manifest under resource name ID 2', () => {
+  assert.throws(() => inspectPE(pe(true, GUI_MANIFEST, 2), true), /manifest/i);
 });
 
 test('GUI manifest must use active executable resource ID 1', () => {

@@ -294,7 +294,7 @@ function inspectPE(buffer, gui) {
       need(Boolean(id & 0x80000000) === (i < named), 'invalid manifest resource name partition');
       if (i >= named) { need(id <= 0xffff && id > previousId, 'invalid/duplicate manifest resource ID'); previousId = id; }
       if (depth === 0 && id !== 24) continue;
-      if (depth === 1 && id !== 1) continue; // CREATEPROCESS_MANIFEST_RESOURCE_ID for an executable.
+      if (depth === 1) need(id === 1, 'RT_MANIFEST resource name must be ID 1');
       if (depth === 2) need(id <= 0xffff, 'invalid manifest resource language');
       if (next & 0x80000000) visit(next & 0x7fffffff, depth + 1);
       else { need(depth === 2, 'invalid manifest leaf'); const d = at(next, 16); leaves.push(buffer.subarray(rva(buffer.readUInt32LE(d), buffer.readUInt32LE(d + 4)), rva(buffer.readUInt32LE(d), buffer.readUInt32LE(d + 4)) + buffer.readUInt32LE(d + 4))); }
