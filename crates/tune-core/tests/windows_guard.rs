@@ -1,9 +1,10 @@
 #![cfg(windows)]
-//! Real Windows children exercise the product boundary. No fleet/SSH or shared process is used.
+//! Dedicated single-spawner process: every native invocation and std/Tokio control holds SERIAL.
+//! Real Windows children exercise the product backend. No fleet/SSH or shared process is used.
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use tune_core::collect::{BoundedResult, ProcessStop, run_bounded};
+use tune_core::collect::{BoundedResult, ProcessStop, run_standalone_windows_bounded};
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -52,6 +53,7 @@ fn owned_fixture() {
             drop(ready);
             std::thread::sleep(Duration::from_secs(30));
         }
+        "close-exit" => close_fixture_outputs(),
         "early-eof" => {
             close_fixture_outputs();
             std::thread::sleep(Duration::from_secs(30));
@@ -79,18 +81,13 @@ fn fixture_command(mode: &str) -> Command {
     command
 }
 
+fn deadline(timeout: Duration) -> Instant {
+    Instant::now().checked_add(timeout).expect("finite test deadline")
+}
+
 async fn fixture(mode: &str, input: &[u8], timeout: Duration, limit: usize) -> BoundedResult {
-    let executable = std::env::current_exe().unwrap().to_string_lossy().into_owned();
-    tune_core::collect::run_bounded_with_env(
-        &executable,
-        &["--exact".into(), "owned_fixture".into(), "--nocapture".into()],
-        input,
-        timeout,
-        limit,
-        limit,
-        &[(FIXTURE, mode)],
-    )
-    .await
+    let end = deadline(timeout);
+    run_standalone_windows_bounded(&fixture_command(mode), input, end, limit, limit).await
 }
 
 fn assert_ack(result: &BoundedResult, stop: ProcessStop) {
@@ -163,7 +160,7 @@ async fn root_exit_with_lingering_descendant_is_a_failure_with_ack() {
 #[tokio::test]
 async fn missing_executable_is_never_success() {
     let _serial = SERIAL.lock().await;
-    let result = run_bounded("katala-guard-missing-executable", &[], b"", Duration::from_secs(1), 1024, 1024).await;
+    let result = run_standalone_windows_bounded(&Command::new("katala-guard-missing-executable"), b"", deadline(Duration::from_secs(1)), 1024, 1024).await;
     assert!(result.spawn_failed);
     assert_eq!(result.code, None);
     assert!(!result.process_receipt.unwrap().cleanup_confirmed());
@@ -189,16 +186,9 @@ async fn argv_and_case_insensitive_environment_roundtrip() {
     let expected = ["", "space value", "quote\"value", r"trailing\", r#"slash\\\"quote"#, "日本語"];
     let mut args = vec!["--exact".into(), "owned_fixture".into(), "--nocapture".into(), "--".into()];
     args.extend(expected.iter().map(|arg| (*arg).to_owned()));
-    let result = tune_core::collect::run_bounded_with_env_clean(
-        &exe,
-        &args,
-        b"",
-        Duration::from_secs(10),
-        65536,
-        65536,
-        tune_core::collect::BoundedEnvironment { set: &[(FIXTURE, "args"), ("KATALA_GUARD_ROUNDTRIP", "removed")], remove: &["katala_guard_roundtrip"] },
-    )
-    .await;
+    let mut command = Command::new(exe);
+    command.args(args).env(FIXTURE, "args").env("KATALA_GUARD_ROUNDTRIP", "removed").env_remove("katala_guard_roundtrip");
+    let result = run_standalone_windows_bounded(&command, b"", deadline(Duration::from_secs(10)), 65536, 65536).await;
     assert_ack(&result, ProcessStop::Completed);
     assert_eq!(result.code, Some(0));
     let output = String::from_utf8(result.stdout).unwrap();
@@ -233,17 +223,9 @@ async fn cancelling_future_closes_only_its_owned_job() {
     let path = std::env::temp_dir().join(name);
     let ready_path = path.to_string_lossy().into_owned();
     let task = tokio::spawn(async move {
-        let exe = std::env::current_exe().unwrap().to_string_lossy().into_owned();
-        tune_core::collect::run_bounded_with_env(
-            &exe,
-            &["--exact".into(), "owned_fixture".into(), "--nocapture".into()],
-            b"",
-            Duration::from_secs(20),
-            65536,
-            65536,
-            &[(FIXTURE, "cancel"), ("KATALA_GUARD_READY", &ready_path)],
-        )
-        .await
+        let mut command = fixture_command("cancel");
+        command.env("KATALA_GUARD_READY", &ready_path);
+        run_standalone_windows_bounded(&command, b"", deadline(Duration::from_secs(20)), 65536, 65536).await
     });
     let deadline = Instant::now() + Duration::from_secs(10);
     let pids = loop {
@@ -302,7 +284,9 @@ async fn pipe_eof_does_not_ack_a_live_root() {
 async fn invalid_arguments_fail_before_execution() {
     let _serial = SERIAL.lock().await;
     let exe = std::env::current_exe().unwrap().to_string_lossy().into_owned();
-    let result = run_bounded(&exe, &["invalid\0argument".into()], b"", Duration::from_secs(2), 65536, 65536).await;
+    let mut command = Command::new(exe);
+    command.arg("invalid\0argument");
+    let result = run_standalone_windows_bounded(&command, b"", deadline(Duration::from_secs(2)), 65536, 65536).await;
     assert_eq!(result.code, None);
     assert!(result.stdout.is_empty());
     let receipt = result.process_receipt.unwrap();
@@ -315,10 +299,118 @@ async fn invalid_arguments_fail_before_execution() {
 async fn expired_budget_cannot_start_a_reader() {
     let _serial = SERIAL.lock().await;
     let exe = std::env::current_exe().unwrap().to_string_lossy().into_owned();
-    let result = run_bounded(&exe, &[], b"", Duration::ZERO, 1024, 1024).await;
+    let now = Instant::now();
+    for expired in [now, now.checked_sub(Duration::from_secs(1)).unwrap()] {
+        let result = run_standalone_windows_bounded(&Command::new(&exe), b"", expired, 1024, 1024).await;
+        assert!(result.timed_out);
+        assert_eq!(result.code, None);
+        let receipt = result.process_receipt.unwrap();
+        assert_eq!(receipt.stop, ProcessStop::Timeout);
+        assert!(receipt.root.is_none());
+    }
+    let command = Command::new(&exe);
+    let future = run_standalone_windows_bounded(&command, b"", deadline(Duration::from_millis(50)), 1024, 1024);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let result = future.await;
     assert!(result.timed_out);
     assert_eq!(result.code, None);
-    let receipt = result.process_receipt.unwrap();
-    assert_eq!(receipt.stop, ProcessStop::Timeout);
-    assert!(receipt.root.is_none());
+    assert!(result.process_receipt.unwrap().root.is_none(), "delayed polling must not rebase the entry deadline");
+}
+
+#[test]
+fn stdio_fixture() {
+    if std::env::var(FIXTURE).as_deref() != Ok("stdio") {
+        return;
+    }
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).unwrap();
+    std::io::stdout().write_all(&input).unwrap();
+    std::io::stderr().write_all(b"fixture-stderr").unwrap();
+    std::process::exit(0);
+}
+
+#[tokio::test]
+async fn output_pipe_observes_eof_after_its_only_client_closes() {
+    let _serial = SERIAL.lock().await;
+    let result = fixture("close-exit", b"", Duration::from_secs(3), 65536).await;
+    assert_eq!(result.code, Some(0), "guard metadata: receipt={:?}", result.process_receipt);
+    assert!(result.stderr.is_empty());
+    assert_ack(&result, ProcessStop::Completed);
+}
+
+#[tokio::test]
+async fn product_guard_runs_a_native_rust_stdio_fixture() {
+    let _serial = SERIAL.lock().await;
+    let name = "stdio_fixture";
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", name, "--nocapture"]).env(FIXTURE, "stdio");
+    let result = run_standalone_windows_bounded(&command, b"fixture-input", deadline(Duration::from_secs(5)), 65536, 65536).await;
+    assert_eq!(
+        result.code,
+        Some(0),
+        "guard metadata: timeout={} output_limit={} spawn_failed={} receipt={:?}",
+        result.timed_out,
+        result.output_limited,
+        result.spawn_failed,
+        result.process_receipt
+    );
+    assert_ack(&result, ProcessStop::Completed);
+    assert_eq!(String::from_utf8_lossy(&result.stdout).matches("running 1 test").count(), 1);
+    assert!(result.stdout.ends_with(b"fixture-input"));
+    assert_eq!(result.stderr, b"fixture-stderr");
+}
+
+async fn stdio_control(program: &std::path::Path) -> (Option<i32>, bool) {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write('guard-marker')"])
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let Ok(child) = command.spawn() else {
+        return (None, false);
+    };
+    match tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await {
+        Ok(Ok(output)) => (output.status.code(), false),
+        Ok(Err(_)) => (None, false),
+        Err(_) => (None, true),
+    }
+}
+
+#[tokio::test]
+#[allow(unsafe_code)]
+async fn product_guard_preserves_simple_windows_powershell_startup() {
+    let _serial = SERIAL.lock().await;
+    let mut buffer = [0u16; 32768];
+    // SAFETY: writable bounded buffer for the OS Windows-directory query; no environment-derived path is logged.
+    let count = unsafe { windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    assert!(count > 0 && (count as usize) < buffer.len());
+    use std::os::windows::ffi::OsStringExt;
+    let normal = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..count as usize]))
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    let canonical = normal.canonicalize().unwrap();
+    let normal_control = stdio_control(&normal).await;
+    let canonical_control = stdio_control(&canonical).await;
+    eprintln!("PowerShell startup control metadata: normal={normal_control:?} canonical={canonical_control:?}");
+    assert_eq!(normal_control, (Some(0), false));
+    assert_eq!(canonical_control, (Some(0), false));
+    let mut command = std::process::Command::new(normal);
+    command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write('guard-marker')"]);
+    let result = run_standalone_windows_bounded(&command, b"", deadline(Duration::from_secs(10)), 65536, 65536).await;
+    assert_eq!(
+        result.code,
+        Some(0),
+        "guard metadata: timeout={} output_limit={} spawn_failed={} receipt={:?}",
+        result.timed_out,
+        result.output_limited,
+        result.spawn_failed,
+        result.process_receipt
+    );
+    assert_ack(&result, ProcessStop::Completed);
+    assert_eq!(result.stdout, b"guard-marker");
 }

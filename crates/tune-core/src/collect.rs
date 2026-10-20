@@ -192,13 +192,28 @@ pub async fn run_bounded_with_env_clean(
         command.env_remove(key);
     }
     command.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-    #[cfg(windows)]
-    return windows::run(command.as_std(), input, timeout, stdout_limit, stderr_limit).await;
-    #[cfg(not(windows))]
     run_bounded_portable(command, input, timeout, stdout_limit, stderr_limit).await
 }
 
-#[cfg(not(windows))]
+/// Native Windows diagnostic backend for an isolated single-spawner helper.
+///
+/// The caller must run before GUI/background initialization in its own process,
+/// with no concurrent std/Tokio process launches. This function does not establish
+/// that isolation and returns no acceptance witness. A receipt is diagnostic data.
+/// The absolute deadline is preserved through setup and payload admission.
+/// Only program, regular arguments, environment set/remove changes and current
+/// directory are inputs; stdio and process creation options belong to the backend.
+#[cfg(windows)]
+pub async fn run_standalone_windows_bounded(
+    command: &std::process::Command,
+    input: &[u8],
+    deadline: Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> BoundedResult {
+    windows::run(command, input, deadline, stdout_limit, stderr_limit).await
+}
+
 async fn run_bounded_portable(mut command: Command, input: &[u8], timeout: Duration, stdout_limit: usize, stderr_limit: usize) -> BoundedResult {
     let Ok(mut child) = command.spawn() else {
         return BoundedResult { spawn_failed: true, ..Default::default() };
@@ -234,7 +249,6 @@ async fn run_bounded_portable(mut command: Command, input: &[u8], timeout: Durat
     answer
 }
 
-#[cfg(not(windows))]
 fn read_bounded<R: AsyncRead + Unpin + Send + 'static>(pipe: Option<R>, limit: usize, signal: tokio::sync::mpsc::Sender<()>) -> (SharedBuf, JoinHandle<()>) {
     let output = Arc::new(Mutex::new(Vec::new()));
     let buffer = Arc::clone(&output);

@@ -628,13 +628,19 @@ impl Drop for Tasks {
     }
 }
 
-pub(super) async fn run(command: &std::process::Command, input: &[u8], timeout: Duration, stdout_limit: usize, stderr_limit: usize) -> BoundedResult {
+pub(super) async fn run(
+    command: &std::process::Command,
+    input: &[u8],
+    deadline: std::time::Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> BoundedResult {
     let mut answer = BoundedResult::default();
     let mut receipt = ProcessReceipt::default();
-    let deadline = Instant::now().checked_add(timeout);
+    let deadline = Instant::from_std(deadline);
     let setup = {
         let setup = async {
-            if deadline.is_none_or(|end| Instant::now() >= end) {
+            if Instant::now() >= deadline {
                 answer.timed_out = true;
                 receipt.stop = ProcessStop::Timeout;
                 return Err(io::Error::from(io::ErrorKind::TimedOut));
@@ -654,7 +660,7 @@ pub(super) async fn run(command: &std::process::Command, input: &[u8], timeout: 
             stdout.server.connect().await?;
             stderr.server.connect().await?;
             let mut job = Job::new()?;
-            let spawn = spawn_owned(command, &job, &input_pipe, &stdout, &stderr, &mut answer.spawn_failed, deadline.expect("validated deadline"));
+            let spawn = spawn_owned(command, &job, &input_pipe, &stdout, &stderr, &mut answer.spawn_failed, deadline);
             if let Err(error) = &spawn {
                 answer.spawn_failed |= error.kind() == io::ErrorKind::NotFound;
                 if error.kind() == io::ErrorKind::TimedOut {
@@ -673,7 +679,7 @@ pub(super) async fn run(command: &std::process::Command, input: &[u8], timeout: 
             drop(client);
             let Pipe { server: stderr, client } = stderr;
             drop(client);
-            if Instant::now() >= deadline.expect("validated deadline") {
+            if Instant::now() >= deadline {
                 answer.timed_out = true;
                 receipt.stop = ProcessStop::Timeout;
                 return Err(io::Error::from(io::ErrorKind::TimedOut));
@@ -685,16 +691,13 @@ pub(super) async fn run(command: &std::process::Command, input: &[u8], timeout: 
             drop(thread);
             Ok::<_, io::Error>((job, input_pipe, stdout, stderr))
         };
-        match deadline {
-            Some(deadline) => match tokio::time::timeout_at(deadline, setup).await {
-                Ok(result) => result.ok(),
-                Err(_) => {
-                    answer.timed_out = true;
-                    receipt.stop = ProcessStop::Timeout;
-                    None
-                }
-            },
-            None => None,
+        match tokio::time::timeout_at(deadline, setup).await {
+            Ok(result) => result.ok(),
+            Err(_) => {
+                answer.timed_out = true;
+                receipt.stop = ProcessStop::Timeout;
+                None
+            }
         }
     };
     let Some((mut job, mut input_pipe, stdout, stderr)) = setup else {
@@ -773,7 +776,7 @@ pub(super) async fn run(command: &std::process::Command, input: &[u8], timeout: 
         }
         let now = Instant::now();
         // All evidence must have been observed before the fixed execution deadline, even during pipe cleanup.
-        if now >= deadline.expect("validated deadline") && receipt.stop == ProcessStop::Completed {
+        if now >= deadline && receipt.stop == ProcessStop::Completed {
             answer.timed_out = true;
             receipt.stop = ProcessStop::Timeout;
         }
@@ -796,7 +799,7 @@ pub(super) async fn run(command: &std::process::Command, input: &[u8], timeout: 
     }
     answer.code = receipt.root_exit_code;
     answer.process_receipt = Some(receipt);
-    answer.seal_windows_payload(Instant::now() >= deadline.expect("validated deadline"));
+    answer.seal_windows_payload(Instant::now() >= deadline);
     answer
 }
 
@@ -842,107 +845,5 @@ mod tests {
         let paths: Vec<_> = path_entries(OsStr::new(r";C:\trusted;;D:\tools;")).collect();
         assert_eq!(paths, vec![PathBuf::from(r"C:\trusted"), PathBuf::from(r"D:\tools")]);
         assert_eq!(path_entries(OsStr::new(";;")).count(), 0);
-    }
-}
-
-#[cfg(test)]
-mod native_regression_tests {
-    use super::*;
-    use std::io::{Read, Write};
-    const FIXTURE: &str = "KATALA_BOUNDED_LIB_FIXTURE";
-
-    #[test]
-    fn stdio_fixture() {
-        if std::env::var(FIXTURE).as_deref() != Ok("stdio") {
-            return;
-        }
-        let mut input = Vec::new();
-        std::io::stdin().read_to_end(&mut input).unwrap();
-        std::io::stdout().write_all(&input).unwrap();
-        std::io::stderr().write_all(b"fixture-stderr").unwrap();
-        std::process::exit(0);
-    }
-
-    #[tokio::test]
-    async fn output_pipe_observes_eof_after_its_only_client_closes() {
-        let session = nonce().unwrap();
-        let Pipe { mut server, client } = {
-            let security = pipe_security().unwrap();
-            pipe(&session, "eof-test", false, &security).unwrap()
-        };
-        server.connect().await.unwrap();
-        drop(client);
-        let mut byte = [0u8; 1];
-        let read = tokio::time::timeout(Duration::from_secs(3), server.read(&mut byte)).await;
-        let count = read.as_ref().ok().and_then(|r| r.as_ref().ok()).copied();
-        let error_code = read.as_ref().ok().and_then(|r| r.as_ref().err()).and_then(io::Error::raw_os_error);
-        assert_eq!(count, Some(0), "pipe metadata: timeout={} os_error={error_code:?}", read.is_err());
-    }
-
-    #[tokio::test]
-    async fn product_guard_runs_a_native_rust_stdio_fixture() {
-        let name = format!("{}::stdio_fixture", module_path!().split_once("::").unwrap().1);
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command.args(["--exact", &name, "--nocapture"]).env(FIXTURE, "stdio");
-        let result = run(&command, b"fixture-input", Duration::from_secs(5), 65536, 65536).await;
-        assert_eq!(
-            result.code,
-            Some(0),
-            "guard metadata: timeout={} output_limit={} spawn_failed={} receipt={:?}",
-            result.timed_out,
-            result.output_limited,
-            result.spawn_failed,
-            result.process_receipt
-        );
-        assert!(result.stdout.ends_with(b"fixture-input"));
-        assert_eq!(result.stderr, b"fixture-stderr");
-    }
-
-    async fn stdio_control(program: &Path) -> (Option<i32>, bool) {
-        let mut command = tokio::process::Command::new(program);
-        command
-            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write('guard-marker')"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        let Ok(child) = command.spawn() else {
-            return (None, false);
-        };
-        match tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await {
-            Ok(Ok(output)) => (output.status.code(), false),
-            Ok(Err(_)) => (None, false),
-            Err(_) => (None, true),
-        }
-    }
-
-    #[tokio::test]
-    async fn product_guard_preserves_simple_windows_powershell_startup() {
-        let mut buffer = [0u16; 32768];
-        // SAFETY: writable bounded buffer for the OS Windows-directory query; no environment-derived path is logged.
-        let count = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
-        assert!(count > 0 && (count as usize) < buffer.len());
-        use std::os::windows::ffi::OsStringExt;
-        let normal =
-            PathBuf::from(OsString::from_wide(&buffer[..count as usize])).join("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe");
-        let canonical = normal.canonicalize().unwrap();
-        let normal_control = stdio_control(&normal).await;
-        let canonical_control = stdio_control(&canonical).await;
-        eprintln!("PowerShell startup control metadata: normal={normal_control:?} canonical={canonical_control:?}");
-        assert_eq!(normal_control, (Some(0), false));
-        let mut command = std::process::Command::new(normal);
-        command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write('guard-marker')"]);
-        let result = run(&command, b"", Duration::from_secs(10), 65536, 65536).await;
-        assert_eq!(
-            result.code,
-            Some(0),
-            "guard metadata: timeout={} output_limit={} spawn_failed={} receipt={:?}",
-            result.timed_out,
-            result.output_limited,
-            result.spawn_failed,
-            result.process_receipt
-        );
-        assert_eq!(result.stdout, b"guard-marker");
     }
 }
