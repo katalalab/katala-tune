@@ -32,4 +32,6 @@ Electron は比較用。必要なときだけ `npm rebuild electron` でバイ�
 
 PR は3 OSのJS/Rustチェックを必須にし、チェック名を変えない。性能変更は `npm run benchmark:live` と `cargo run --release -p tune-core --example performance` の比較を残す。版は `npm run version:set -- <版>` で変更し、タグと一致させる。
 
+レビュー画面は `task-completion.v1` の表示専用で、共通checkerやPRの現在headを照合しない。`config/review.example.json` は入力形の例であり、画面から保存・ネットワーク・承認操作は発生しない。coverageの3配列は合計10,000件までに拒否し、欠測は表示モデルでnull、画面では「未記載」と表示する。表示変更は `node --test test/review.test.js test/review-ui.test.js` で境界、表示、非同期読込を確認する。
+
 レビューした head SHA を固定し、CI・未解決会話・main の包含を再確認してマージする。配布は署名つき下書きから始める。署名・版の不一致、キャンセル、正常更新を確認し、公開後は実際の配布 URL と SHA256 を読み返す。[リリース手順](release.md) を参照。
