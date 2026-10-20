@@ -34,6 +34,7 @@ fn remote_generation(request: &RemoteRequest) -> String {
             "alias": request.alias,
             "expected_identity_hash": request.expected_identity_hash,
             "python_program": request.python_program,
+            "windows_reader_program": request.windows_reader_program,
             "git_program": request.git_program,
         }))
         .unwrap_or_default(),
@@ -237,6 +238,7 @@ impl Engine {
                                 configs: configs.clone(),
                                 source_allowlist: env.get("source_allowlist").cloned().and_then(|value| serde_json::from_value(value).ok()),
                                 python_program,
+                                windows_reader_program: env.get("windows_reader_program").and_then(Value::as_str).map(str::to_owned),
                                 git_program,
                                 observed_at_ms: now_ms(),
                                 limits: config.topology.limits.clone(),
@@ -508,12 +510,16 @@ mod tests {
             configs: vec![json!({"path":"/selected.json","keys":[]})],
             source_allowlist: None,
             python_program: python.into(),
+            windows_reader_program: None,
             git_program: Some(git.into()),
             observed_at_ms: 1,
             limits: crate::topology::TopologyLimits::default(),
         };
         let baseline = remote_generation(&request("direct-ssh", "identity", "/usr/bin/python3", "/usr/bin/git"));
         let mut approved = request("direct-ssh", "identity", "/usr/bin/python3", "/usr/bin/git");
+        let mut changed_reader = request("direct-ssh", "identity", "/usr/bin/python3", "/usr/bin/git");
+        changed_reader.windows_reader_program = Some("C:/tools/tune.exe".into());
+        assert_ne!(baseline, remote_generation(&changed_reader));
         approved.source_allowlist = Some(vec![]);
         assert_ne!(baseline, remote_generation(&approved));
         for changed in [
