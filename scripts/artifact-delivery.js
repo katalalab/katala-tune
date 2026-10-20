@@ -171,6 +171,7 @@ function inspectPE(buffer, gui) {
     for (let i = 0; i < entries; i++) {
       const e = dir + 16 + i * 8, id = buffer.readUInt32LE(e), next = buffer.readUInt32LE(e + 4);
       if (depth === 0 && id !== 24) continue;
+      if (depth === 1) need(id === 1, 'RT_MANIFEST resource name must be ID 1');
       if (next & 0x80000000) visit(next & 0x7fffffff, depth + 1);
       else { need(depth === 2, 'invalid manifest leaf'); const d = at(next, 16); leaves.push(buffer.subarray(rva(buffer.readUInt32LE(d), buffer.readUInt32LE(d + 4)), rva(buffer.readUInt32LE(d), buffer.readUInt32LE(d + 4)) + buffer.readUInt32LE(d + 4))); }
     }
