@@ -1,6 +1,6 @@
 # 収集の保守記録
 
-Rustの通常monitorとLiveは、接続・最初の測定・終了・再試行・分集計の保存結果を、既存SQLiteの専用 `monitor_events` 表に残す。OSログ、FTS、既存所見、既存メトリクスの意味は変更しない。画面が見ていなくてもmonitor経路から記録する。Tauriの `monitor_events` は日本語summary付きで読むだけのAPIで、dashboardの `journal` は保存経路の健全性を返す。今回rendererの再設計や既存画面への新パネルは含めない。
+Rustの通常monitorとLiveは、接続・最初の測定・終了・再試行・分集計の保存結果を、既存SQLiteの専用 `monitor_events` 表に残す。OSログ、FTS、既存所見、既存メトリクスの意味は変更しない。画面が見ていなくてもmonitor経路から記録する。Tauriの `monitor_events` は日本語summary付きで読むだけのAPIで、dashboardの `journal` は保存経路の健全性を返す。ダッシュボードの既存details部品に「収集の保守記録」を設け、明示操作で最新50件・保存状況・欠落・最古時刻を読む。記録の自動pollや新しい設定操作は追加しない。
 
 ## 読み方
 
