@@ -111,16 +111,81 @@ pub struct DockerPacket {
 fn choice(value: &Value, choices: &[&str]) -> Option<String> {
     value.as_str().filter(|s| choices.contains(s)).map(str::to_owned)
 }
+/// Restricted Go numeric literal parsing, bounded by the caller's 24-byte cap.
+/// Decimal and hexadecimal literals allow underscores only at digit boundaries
+/// (or directly after 0x), never arbitrary option text.
+fn size_amount(number: &str) -> Option<f64> {
+    let unsigned = number.strip_prefix('+').unwrap_or(number);
+    let hex = unsigned.starts_with("0x") || unsigned.starts_with("0X");
+    let bytes = unsigned.as_bytes();
+    for (index, _) in bytes.iter().enumerate().filter(|(_, b)| **b == b'_') {
+        let digit = |b: &u8| if hex { b.is_ascii_hexdigit() } else { b.is_ascii_digit() };
+        let left = index.checked_sub(1).and_then(|i| bytes.get(i));
+        let right = bytes.get(index + 1);
+        if !right.is_some_and(digit) || !(left.is_some_and(digit) || (hex && index == 2)) {
+            return None;
+        }
+    }
+    let clean = unsigned.replace('_', "");
+    if !hex {
+        let clean = number.replace('_', "");
+        return clean.bytes().all(|b| b"0123456789.+-eE".contains(&b)).then(|| clean.parse::<f64>().ok()).flatten();
+    }
+    let (mantissa, exponent) = clean.get(2..)?.split_once(['p', 'P'])?;
+    let exponent = exponent.parse::<i32>().ok()?;
+    let mut amount = 0.0;
+    let mut fractional = false;
+    let mut factor = 1.0;
+    let mut digits = 0;
+    for character in mantissa.chars() {
+        if character == '.' {
+            if fractional {
+                return None;
+            }
+            fractional = true;
+        } else {
+            let digit = f64::from(character.to_digit(16)?);
+            digits += 1;
+            if fractional {
+                factor /= 16.0;
+                amount += digit * factor;
+            } else {
+                amount = amount * 16.0 + digit;
+            }
+        }
+    }
+    (digits > 0).then(|| amount * 2_f64.powi(exponent))
+}
+
 fn size(value: &Value) -> Option<String> {
     let text = value.as_str()?;
+    // Retain a previously observed/default sentinel; current Moby rejects it
+    // when explicitly configuring max-size. It is not a missing-value signal.
     if text == "-1" {
         return Some(text.into());
     }
-    if text.is_empty() || text.len() > 24 {
+    if text.is_empty() || text.len() > 24 || !text.is_ascii() {
         return None;
     }
-    let digits = if text.as_bytes().last().is_some_and(|b| b"kKmMgG".contains(b)) { &text[..text.len() - 1] } else { text };
-    (digits.bytes().all(|b| b.is_ascii_digit()) && digits.parse::<u64>().ok().is_some_and(|n| n > 0)).then(|| text.into())
+    // go-units splits at the first space, or after the final digit/dot.
+    let (number, suffix) = text.split_once(' ').or_else(|| {
+        let split = text.rfind(|c: char| c.is_ascii_digit() || c == '.')? + 1;
+        Some(text.split_at(split))
+    })?;
+    let amount = size_amount(number)?;
+    let suffix = suffix.to_ascii_lowercase();
+    let exponent = match suffix.as_str() {
+        "" | "b" => 0,
+        "k" | "kb" | "kib" => 1,
+        "m" | "mb" | "mib" => 2,
+        "g" | "gb" | "gib" => 3,
+        "t" | "tb" | "tib" => 4,
+        "p" | "pb" | "pib" => 5,
+        _ => return None,
+    };
+    // json-file uses FromHumanSize (decimal multipliers), not RAMInBytes.
+    let bytes = amount * 1000_f64.powi(exponent);
+    (bytes.is_finite() && (1.0..9_223_372_036_854_775_808.0).contains(&bytes)).then(|| text.into())
 }
 fn numeric(value: &Value) -> Option<u64> {
     value.as_u64().or_else(|| value.as_str()?.parse().ok())
@@ -153,12 +218,13 @@ pub fn parse_container(row: &Value) -> Result<Container, &'static str> {
         && (row["max_size"].is_null() || row["max_size"].as_str() == Some(""));
     let mut mounts = vec![];
     for m in array(&row["mounts"])? {
-        let kind = choice(&m["kind"], &["bind", "volume", "tmpfs", "npipe", "cluster"]).ok_or("invalid mount type")?;
+        let kind = choice(&m["kind"], &["bind", "volume", "tmpfs", "npipe", "cluster", "image"]).ok_or("invalid mount type")?;
+        let volume_hash = if kind == "volume" { m["name"].as_str().filter(|s| !s.is_empty()).map(hash) } else { None };
         mounts.push(Mount {
             kind,
             source_hash: m["source"].as_str().filter(|s| !s.is_empty()).map(hash),
             target_hash: private_hash(&m["target"])?,
-            volume_hash: m["name"].as_str().filter(|s| !s.is_empty()).map(hash),
+            volume_hash,
             writable: m["rw"].as_bool(),
         });
     }
@@ -300,7 +366,7 @@ impl DockerPacket {
                     }
                 }
                 for (i, m) in c.mounts.iter().enumerate() {
-                    if !["bind", "volume", "tmpfs", "npipe", "cluster"].contains(&m.kind.as_str())
+                    if !["bind", "volume", "tmpfs", "npipe", "cluster", "image"].contains(&m.kind.as_str())
                         || !opaque(&m.target_hash)
                         || m.source_hash.as_deref().is_some_and(|s| !opaque(s))
                         || m.volume_hash.as_deref().is_some_and(|s| !opaque(s))
@@ -310,7 +376,10 @@ impl DockerPacket {
                     let mut mount = Entity::with_key(EntityKind::DockerMount, "Docker mount", &format!("{}:{i}", entity.id));
                     mount.attributes = serde_json::to_value(m).map_err(|_| "invalid DTO")?;
                     snapshot.edges.push(Edge::new(EdgeKind::DockerMounts, &entity.id, &mount.id));
-                    if let Some(volume) = m.volume_hash.as_ref().filter(|id| engine.volumes.iter().any(|v| &v.id == *id)) {
+                    if m.kind == "volume" && !m.volume_hash.as_ref().is_some_and(|id| engine.volumes.iter().any(|v| &v.id == id)) {
+                        snapshot.failures.push(Failure::new(FailureCode::Truncated, "volume mount target not observed"));
+                    }
+                    if let Some(volume) = m.volume_hash.as_ref().filter(|id| m.kind == "volume" && engine.volumes.iter().any(|v| &v.id == *id)) {
                         let v = Entity::with_key(EntityKind::DockerVolume, "Docker volume", &format!("{}:{}", engine.id, volume));
                         snapshot.edges.push(Edge::new(EdgeKind::DockerMounts, &mount.id, &v.id));
                     }
@@ -350,7 +419,7 @@ pub fn engine_snapshots(mut coverage: TopologySnapshot) -> Vec<TopologySnapshot>
         }
         let entities = coverage.entities.iter().filter(|e| ids.contains(&e.id)).cloned().collect::<Vec<_>>();
         let edges = coverage.edges.iter().filter(|e| ids.contains(&e.from) && ids.contains(&e.to)).cloned().collect::<Vec<_>>();
-        let failures = if entities.iter().filter(|e| e.kind == EntityKind::DockerContainer).any(|c| {
+        let mut failures = if entities.iter().filter(|e| e.kind == EntityKind::DockerContainer).any(|c| {
             let count = c.attributes["networks"].as_array().map_or(0, Vec::len);
             edges.iter().filter(|e| e.kind == EdgeKind::DockerNetworkMember && e.from == c.id).count() < count
         }) {
@@ -358,6 +427,16 @@ pub fn engine_snapshots(mut coverage: TopologySnapshot) -> Vec<TopologySnapshot>
         } else {
             vec![]
         };
+        if entities.iter().filter(|e| e.kind == EntityKind::DockerMount && e.attributes["kind"] == "volume").any(|mount| {
+            !mount.attributes["volume_hash"].is_string()
+                || !edges.iter().any(|edge| {
+                    edge.kind == EdgeKind::DockerMounts
+                        && edge.from == mount.id
+                        && entities.iter().any(|target| target.id == edge.to && target.kind == EntityKind::DockerVolume)
+                })
+        }) {
+            failures.push(Failure::new(FailureCode::Truncated, "volume mount target not observed"));
+        }
         let mut snapshot = TopologySnapshot {
             scope_id: format!("{}:engine:{}", coverage.scope_id, engine.id.rsplit('.').next().unwrap_or_default()),
             status: if failures.is_empty() { ScopeStatus::Complete } else { ScopeStatus::Partial },

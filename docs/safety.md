@@ -164,3 +164,13 @@ aliases. An unknown context cannot erase another engine's successful graph;
 unobserved previous engines retain their graph with a partial receipt. Docker
 uses existing topology leases, fenced writes, retention, public anonymous export,
 and the existing refresh scheduler; it adds no background service or DB schema.
+
+A missing named-volume target or volume identity is a partial observation. The
+affected engine retains its previous complete graph, while other complete
+engines may update. Log size values accept bounded decimal/scientific numeric
+forms (including bounded hexadecimal literals and digit separators) and
+case-insensitive byte/k/m/g/t/p suffixes (including b/ib spellings),
+following go-units; a retained -1 sentinel does not claim a valid new setting.
+
+Image mounts use the existing sanitized mount DTO: source/target hashes only,
+with no volume reference inference or additional Docker operation.

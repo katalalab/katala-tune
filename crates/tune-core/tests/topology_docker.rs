@@ -288,10 +288,10 @@ async fn engine_refresh_opt_in_and_failed_collection_keep_old_engine_unobserved(
     std::fs::remove_dir_all(base).unwrap();
 }
 #[test]
-fn explicit_unlimited_log_size_is_preserved_through_packet_validation() {
+fn retained_unlimited_log_size_sentinel_survives_packet_validation() {
     use tune_core::topology::adapters::docker::{DockerEngine, DockerPacket};
     let row = json!({"id":"c","state":"running","health":null,"log_driver":"json-file","max_size":"-1","mounts":[],"networks":[],"ports":[]});
-    let c = parse_container(&row).expect("Docker accepts explicit -1 log size");
+    let c = parse_container(&row).expect("retain an observed legacy/default -1 sentinel");
     assert_eq!(c.log_max_size.as_deref(), Some("-1"));
     assert!(!c.log_unbounded_candidate, "only missing max-size is a candidate");
     let packet = DockerPacket { engines: vec![DockerEngine { id: "e".repeat(64), containers: vec![c], networks: vec![], volumes: vec![] }] };
@@ -307,4 +307,100 @@ async fn missing_socket_wording_from_new_cli_is_unreachable() {
     });
     let got = collect_docker_with(&f, &request(&["one"]), "fixture").await;
     assert_eq!(got.failures[0].code, tune_core::topology::FailureCode::Unreachable);
+}
+#[test]
+fn docker_size_grammar_keeps_valid_numeric_units_and_rejects_private_text() {
+    use tune_core::topology::adapters::docker::{DockerEngine, DockerPacket};
+    for size in ["10mb", "1.5m", "10MiB", "17MB", "10b", "1t", "1p", "1.5 m", "1e3k", "+1M", ".5m", "1.m", "0x1p2mb", "1_000k", "0X_1.8p+2m"] {
+        let row = json!({"id":"c","state":"running","health":null,"log_driver":"json-file","max_size":size,"mounts":[],"networks":[],"ports":[]});
+        let c = parse_container(&row).unwrap_or_else(|_| panic!("valid numeric log size rejected: {size}"));
+        assert_eq!(c.log_max_size.as_deref(), Some(size));
+        let packet = DockerPacket { engines: vec![DockerEngine { id: "e".repeat(64), containers: vec![c], networks: vec![], volumes: vec![] }] };
+        assert!(packet.snapshot("test".into(), 1).is_ok(), "{size}");
+    }
+    for size in ["private-token", "++1m", "1__0m", "0x1_p2m", "10\nm", "NaN m", "1e309m", "10  mb", "ggg", "0b", "1secret", "1234567890123456789012345b"] {
+        let row = json!({"id":"c","state":"running","health":null,"log_driver":"json-file","max_size":size,"mounts":[],"networks":[],"ports":[]});
+        assert!(parse_container(&row).is_err(), "unsafe or invalid size accepted: {size:?}");
+    }
+}
+#[test]
+fn unobserved_named_volume_is_partial_and_preserves_old_volume_without_blocking_other_engine() {
+    use tune_core::{
+        db::Store,
+        topology::{
+            EntityKind, FailureCode,
+            adapters::docker::{DockerEngine, DockerPacket, Volume, engine_snapshots},
+        },
+    };
+    let c=parse_container(&json!({"id":"c","state":"running","health":null,"log_driver":"local","mounts":[{"kind":"volume","source":"/fixture/volume","target":"/data","name":"volume","rw":true}],"networks":[],"ports":[]})).unwrap();
+    let volume = Volume { id: c.mounts[0].volume_hash.clone().unwrap(), driver: Some("local".into()) };
+    let old = DockerPacket {
+        engines: vec![
+            DockerEngine { id: "e".repeat(64), containers: vec![c], networks: vec![], volumes: vec![volume] },
+            DockerEngine { id: "f".repeat(64), containers: vec![], networks: vec![], volumes: vec![] },
+        ],
+    };
+    let db = Store::open_in_memory().unwrap();
+    let old_snapshots = engine_snapshots(old.snapshot("fixture:native:docker".into(), 1).unwrap());
+    for s in &old_snapshots {
+        db.record_topology("old", s, 1).unwrap();
+    }
+    let affected_scope = old_snapshots[1].scope_id.clone();
+    let other_scope = old_snapshots[2].scope_id.clone();
+    let old_volume_id = old_snapshots[1].entities.iter().find(|e| e.kind == EntityKind::DockerVolume).unwrap().id.clone();
+    let mut next = old;
+    next.engines[0].volumes.clear();
+    next.engines[1].volumes.push(Volume { id: "a".repeat(64), driver: Some("local".into()) });
+    let snapshot = next.snapshot("fixture:native:docker".into(), 2).unwrap();
+    assert_eq!(snapshot.status, ScopeStatus::Partial);
+    assert!(snapshot.failures.iter().any(|f| f.code == FailureCode::Truncated));
+    let snapshots = engine_snapshots(snapshot);
+    assert_eq!(snapshots[1].scope_id, affected_scope);
+    assert_eq!(snapshots[1].status, ScopeStatus::Partial);
+    assert_eq!(snapshots[2].scope_id, other_scope);
+    assert_eq!(snapshots[2].status, ScopeStatus::Complete);
+    assert!(snapshots[1].failures.iter().any(|f| f.code == FailureCode::Truncated));
+    for s in &snapshots {
+        db.record_topology("new", s, 2).unwrap();
+    }
+    let view = db.topology_view().unwrap();
+    let entities = view["entities"].as_array().unwrap();
+    assert!(entities.iter().any(|e| e["id"] == old_volume_id));
+    assert_eq!(
+        entities.iter().filter(|e| e["kind"] == "docker_volume").count(),
+        2,
+        "old affected volume is retained and unaffected engine's new volume is stored"
+    );
+    assert_eq!(db.topology_latest_success(&affected_scope).unwrap().unwrap()["run_id"], "old");
+    assert_eq!(db.topology_latest_success(&other_scope).unwrap().unwrap()["run_id"], "new");
+}
+#[test]
+fn volume_mount_without_observed_identity_is_unknown_in_its_engine() {
+    use tune_core::topology::{
+        FailureCode,
+        adapters::docker::{DockerEngine, DockerPacket, engine_snapshots},
+    };
+    let c=parse_container(&json!({"id":"c","state":"running","health":null,"log_driver":"local","mounts":[{"kind":"volume","source":"/fixture/volume","target":"/data","name":null,"rw":true}],"networks":[],"ports":[]})).unwrap();
+    let packet = DockerPacket { engines: vec![DockerEngine { id: "e".repeat(64), containers: vec![c], networks: vec![], volumes: vec![] }] };
+    let snapshot = packet.snapshot("fixture:native:docker".into(), 1).unwrap();
+    assert_eq!(snapshot.status, ScopeStatus::Partial);
+    assert!(snapshot.failures.iter().any(|f| f.code == FailureCode::Truncated));
+    assert_eq!(engine_snapshots(snapshot)[1].status, ScopeStatus::Partial);
+}
+#[test]
+fn image_mount_is_sanitized_without_asserting_a_volume_reference() {
+    use tune_core::topology::{
+        EntityKind,
+        adapters::docker::{DockerEngine, DockerPacket},
+    };
+    let c=parse_container(&json!({"id":"c","state":"running","health":null,"log_driver":"local","mounts":[{"kind":"image","source":"registry.invalid/private-image:tag","target":"/private/target","name":"private-image-name","rw":false}],"networks":[],"ports":[]})).expect("current Docker supports image mounts");
+    assert_eq!(c.mounts[0].kind, "image");
+    assert!(c.mounts[0].volume_hash.is_none());
+    let packet = DockerPacket { engines: vec![DockerEngine { id: "e".repeat(64), containers: vec![c], networks: vec![], volumes: vec![] }] };
+    let snapshot = packet.snapshot("fixture:native:docker".into(), 1).unwrap();
+    assert_eq!(snapshot.status, ScopeStatus::Complete);
+    assert!(snapshot.entities.iter().any(|e| e.kind == EntityKind::DockerMount));
+    let output = serde_json::to_string(&snapshot).unwrap();
+    assert!(!output.contains("private"));
+    assert!(!output.contains("registry.invalid"));
 }

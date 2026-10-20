@@ -9,3 +9,7 @@ Use the existing topology lease, fenced database storage, CLI, public export and
 Official sources checked: https://docs.docker.com/reference/cli/docker/context/inspect/ ; https://docs.docker.com/reference/cli/docker/inspect/ ; https://docs.docker.com/engine/logging/drivers/local/ . Local driver defaults are bounded; only running json-file missing max-size is an unbounded candidate. Explicit max-size=-1 is preserved as a policy fact.
 
 Additional official policy source: https://docs.docker.com/engine/logging/drivers/json-file/ .
+
+Review correction sources: https://raw.githubusercontent.com/moby/moby/master/daemon/logger/jsonfilelog/jsonfilelog.go and https://raw.githubusercontent.com/docker/go-units/master/size.go . Missing named-volume targets/identities keep only the affected engine partial.
+
+Current mount types verified against https://docs.docker.com/engine/storage/ ; image mounts remain metadata-only and never become volume references. Numeric literal syntax: https://pkg.go.dev/strconv#ParseFloat .
