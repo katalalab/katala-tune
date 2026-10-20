@@ -6,7 +6,6 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{collections::HashSet, path::Path, time::Duration};
 
 const LOG_DRIVERS: &[&str] = &["json-file", "local", "journald", "syslog", "none", "fluentd", "awslogs", "splunk", "gelf", "etwlogs", "gcplogs"];
@@ -20,7 +19,7 @@ const NETWORK_FORMAT: &str = r#"{"id":{{json .ID}},"driver":{{json .Driver}},"in
 const VOLUME_FORMAT: &str = r#"{"id":{{json .Name}},"driver":{{json .Driver}}}"#;
 
 fn hash(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    crate::db::sha256_hex(value.as_bytes())
 }
 fn bounded_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= 4096 && !value.chars().any(char::is_control)
@@ -702,5 +701,24 @@ mod process_tests {
         let out = DockerRunner.run("/usr/bin/python3", &["-c".into(), "print('x'*100000)".into()], b"", Duration::from_secs(2), 4096, 100).await;
         assert!(out.output_limited);
         assert_eq!(out.stdout.len(), 4096);
+    }
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::hash;
+
+    #[test]
+    fn docker_hash_matches_sha256_vectors_with_zero_padding() {
+        for (value, expected) in [
+            ("", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            ("abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            ("s", "043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89"),
+        ] {
+            let actual = hash(value);
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), 64);
+            assert!(actual.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        }
     }
 }

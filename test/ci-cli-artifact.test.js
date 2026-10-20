@@ -118,21 +118,25 @@ test('a symlink input binary is rejected explicitly', t => {
   assert.equal(fs.existsSync(f.dist), false);
 });
 test('Windows artifact steps append to existing checks and upload exactly the verified pair', () => {
-  const workflow = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf8');
-  const build = workflow.indexOf('      - name: Windows CLI artifact build');
-  assert.ok(build > workflow.indexOf('run: cargo build --package katala-tune --locked'));
-  const tail = workflow.slice(build);
-  assert.match(tail, /run: cargo build --locked -p tune-cli/);
-  assert.match(tail, /timeout-minutes: 20/);
-  assert.equal((tail.match(/if: runner.os == 'Windows'/g) || []).length, 3);
-  assert.match(tail, /run: node scripts\/ci-cli-artifact.js/);
-  assert.match(tail, /uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/);
-  assert.match(tail, /name: tune-cli-windows-x64-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}/);
-  assert.match(tail, /path: \|\n            dist\/ci-cli\/tune.exe\n            dist\/ci-cli\/manifest.json\n/);
-  assert.match(tail, /if-no-files-found: error/);
-  assert.match(tail, /retention-days: 7/);
-  assert.match(tail, /overwrite: false/);
-  assert.match(tail, /include-hidden-files: false/);
+  const workflowSource = fs.readFileSync(path.join(__dirname, '..', '.github', 'workflows', 'ci.yml'), 'utf8');
+  for (const eol of ['\n', '\r\n']) {
+    const raw = workflowSource.replace(/\r?\n/g, eol);
+    const workflow = raw.replace(/\r\n/g, '\n');
+    const build = workflow.indexOf('      - name: Windows CLI artifact build');
+    assert.ok(build > workflow.indexOf('run: cargo build --package katala-tune --locked'));
+    const tail = workflow.slice(build);
+    assert.match(tail, /run: cargo build --locked -p tune-cli/);
+    assert.match(tail, /timeout-minutes: 20/);
+    assert.equal((tail.match(/if: runner.os == 'Windows'/g) || []).length, 3);
+    assert.match(tail, /run: node scripts\/ci-cli-artifact.js/);
+    assert.match(tail, /uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/);
+    assert.match(tail, /name: tune-cli-windows-x64-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}/);
+    assert.match(tail, /path: \|\n            dist\/ci-cli\/tune.exe\n            dist\/ci-cli\/manifest.json\n/);
+    assert.match(tail, /if-no-files-found: error/);
+    assert.match(tail, /retention-days: 7/);
+    assert.match(tail, /overwrite: false/);
+    assert.match(tail, /include-hidden-files: false/);
+  }
 });
 
 test('Cargo lock retains distinct checkout-byte and canonical Git hashes under CRLF checkout', t => {
