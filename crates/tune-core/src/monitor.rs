@@ -435,7 +435,7 @@ fn disconnected_ready(id: &str, down: bool, now: i64, retry_at: &mut HashMap<Str
     }
 }
 
-/// 保存ACKと失敗を分ける。rolled watermarkの更新順は従来の呼出し側のまま。
+/// 保存ACKと失敗を分ける。
 fn save_minute_rows(engine: &Engine, journal: &crate::monitor_journal::Journal, rows: &[MinuteRow]) -> bool {
     let result = engine.with_db(|d| Ok(d.add_metrics(rows).map_err(|e| Category::database(&e))));
     let category = match &result {
@@ -461,6 +461,26 @@ fn save_minute_rows(engine: &Engine, journal: &crate::monitor_journal::Journal, 
         );
     }
     category.is_none()
+}
+
+fn commit_minute_rows(
+    engine: &Engine,
+    journal: &crate::monitor_journal::Journal,
+    rows: &[MinuteRow],
+    rolled: &mut HashMap<String, i64>,
+    event: impl FnOnce(Value),
+) -> bool {
+    if rows.is_empty() {
+        return false;
+    }
+    if !save_minute_rows(engine, journal, rows) {
+        return false;
+    }
+    for row in rows {
+        rolled.insert(row.node_id.clone(), row.minute);
+    }
+    event(json!({ "rows": rows.len() }));
+    true
 }
 
 /// 15 秒ごとに: 常時監視が入っていてハブの数字が新しくなければ全機体のライブに合図を送って保ち、
@@ -557,14 +577,9 @@ pub async fn run(
                     continue;
                 }
                 let got = rollup(&n.id, &live.samples(&n.id), live.procs(&n.id).as_ref(), from, until_min, &host);
-                if let Some(last) = got.last() {
-                    rolled.insert(n.id.clone(), last.minute);
-                }
                 rows.extend(got);
             }
-            if !rows.is_empty() && save_minute_rows(&engine, &journal, &rows) {
-                event(json!({ "rows": rows.len() }));
-            }
+            commit_minute_rows(&engine, &journal, &rows, &mut rolled, &*event);
         }
         if now - last_prune >= 24 * 60 * MINUTE {
             last_prune = now;
@@ -873,6 +888,63 @@ mod tests {
         assert!(journal.shutdown(Duration::from_secs(2)).await);
         drop(engine);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn rolled_minutes_advance_only_after_batch_commit_and_retry_without_duplicates() {
+        use crate::{engine::NoHost, monitor_journal::Filter};
+        let dir = std::env::temp_dir().join(format!("monitor-watermark-{}-{}", std::process::id(), now_ms()));
+        let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(NoHost)).unwrap();
+        let journal = engine.start_monitor_journal();
+        let initial: HashMap<String, i64> = ["a", "b"].map(|id| (id.into(), MINUTE)).into();
+        let mut rolled = initial.clone();
+        let before: Vec<MinuteRow> =
+            ["a", "b"].into_iter().flat_map(|id| rollup(id, &[sample(MINUTE + 1000, 1.0, 25.0, None)], None, MINUTE, 2 * MINUTE, "fixture")).collect();
+        engine.with_db(|d| d.add_metrics(&before)).unwrap();
+        engine
+            .with_db(|d| {
+                d.conn().execute_batch(
+                    "CREATE TEMP TRIGGER fail_second BEFORE INSERT ON metrics_minute WHEN NEW.node_id='b' BEGIN SELECT RAISE(ABORT,'fixture'); END",
+                )
+            })
+            .unwrap();
+        // runと同じ水位から同じ残存sampleを再集計する。失敗した分を次のtickで除外してはならない。
+        let pending = |watermark: &HashMap<String, i64>| -> Vec<MinuteRow> {
+            ["a", "b"]
+                .into_iter()
+                .flat_map(|id| {
+                    let from = watermark.get(id).map_or(-2 * MINUTE, |m| m + MINUTE);
+                    rollup(id, &[sample(2 * MINUTE + 1000, 5.0, 25.0, None)], None, from, 3 * MINUTE, "fixture")
+                })
+                .collect()
+        };
+        let rows = pending(&rolled);
+        let mut emitted = Vec::new();
+        let failed_ack = commit_minute_rows(&engine, &journal, &rows, &mut rolled, |v| emitted.push(v));
+        let failed_watermark = rolled.clone();
+        let failed_emitted = emitted.len();
+        let after_failure = engine.with_db(|d| d.metrics(None, 0, i64::MAX)).unwrap();
+        engine.with_db(|d| d.conn().execute_batch("DROP TRIGGER fail_second")).unwrap();
+        let retry = pending(&rolled);
+        let retry_ack = commit_minute_rows(&engine, &journal, &retry, &mut rolled, |v| emitted.push(v));
+        let replay_ack = commit_minute_rows(&engine, &journal, &rows, &mut rolled, |v| emitted.push(v));
+        let saved = engine.with_db(|d| d.metrics(None, 0, i64::MAX)).unwrap();
+        assert!(journal.flush(Duration::from_secs(2)).await);
+        let records = engine.with_db(|d| d.monitor_events(&Filter { kind: Some(Kind::MinuteCommit), ..Default::default() })).unwrap();
+        assert!(journal.shutdown(Duration::from_secs(2)).await);
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(!failed_ack);
+        assert_eq!(after_failure, before, "the first insert also rolls back when the second row fails");
+        assert_eq!(failed_emitted, 0, "no rows success notification on false ACK");
+        assert_eq!(failed_watermark, initial, "failed batch must leave both watermarks eligible for retry");
+        assert_eq!(retry, rows, "next tick retries the same finished minutes still in the ring");
+        assert!(retry_ack && replay_ack);
+        assert_eq!(emitted, [json!({"rows":2}), json!({"rows":2})]);
+        assert_eq!(saved.len(), 4, "replaying the same node/minute uses the existing UPSERT key");
+        assert_eq!(rolled, ["a", "b"].map(|id| (id.into(), 2 * MINUTE)).into());
+        let xs = records["events"].as_array().unwrap();
+        assert_eq!(xs.iter().filter(|x| x["data"]["committed"] == false).count(), 2);
+        assert_eq!(xs.iter().filter(|x| x["data"]["committed"] == true).count(), 4);
     }
     // 同じ変換/rollup/Store経路を通す小さいmicrobenchmark。OS/SSH/driver性能の証明ではない。
     async fn journal_microbench(enabled: bool) {

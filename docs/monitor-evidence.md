@@ -47,6 +47,6 @@ Rust/JSでCREATE TABLE IF NOT EXISTSのschemaを揃える。既存表や過去�
 
 専用表の欠如、typed filter未対応をsemantic REDで確認してから実装した。テストは一時DB/自分の短いfixture子だけでprivacy・queue overflow・DB競合・再読・TTL/row cap・max_age宣言/EOF・最初のsample/stall・保存ACKを確認する。同入力6node microbenchmarkは変換/rollup/Store/記録APIの比較であり、SSH・OS sampler・driverや通常アプリ全体の性能証明ではない。
 
-既存monitorのrolled watermarkが保存成否確認前に進む挙動は本変更で直していない。保存失敗の可視化とは別の小さい後続fix/testとする。過去の欠測原因を新記録から推定しない。
+記録機能のcommit Xとは別のcommit Yで、monitorのrolled watermarkを分集計の保存成功ACK後だけ進める。batch失敗時は成功通知を出さず、水位を保持して次のtickで残存sampleを再集計する。同じ機体・分の再保存は既存キーで置換する。ringの長さや採取間隔は変えないため、長期間のDB障害でringから失われたsampleの回復は保証しない。過去の欠測原因をこの修正から推定しない。
 
 正式反映・Windows実Rust/PS fallback・900秒自然交代・QA app再起動読出し・通常環境前後保全は、source freeze/review後の実機gate。ローカルfixtureやAPIの存在を通常運用での受入と呼ばない。

@@ -32,6 +32,6 @@
 
 ## Separate follow-up / actual gates
 
-- commit Xではmonitorのrolledが保存成功前に進む既存挙動を維持。後続commit Yで、保存成功ACK後のみ進める修正とRED→GREENを分離する。過去gapの原因とは断定しない。
+- [x] commit Xではmonitorのrolledが保存成功前に進む既存挙動を維持。後続commit Yで、保存成功ACK後のみ進める修正とRED→GREENを分離する。batch途中失敗のrollback/false ACK/成功通知0/次tick再試行/UPSERTを一時DBで確認。過去gapの原因とは断定しない。
 - Windows実Rust/PS fallback・QA再起動読出し・自然900s max_age・通常運用反映はRoot review/freeze後の実機gate。fixtureは実機受入ではない。
 - rollbackはこの専有差分を統合しない/必要なら将来journal無効。既存表/履歴を削除しない。
