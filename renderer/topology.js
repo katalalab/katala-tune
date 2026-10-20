@@ -25,8 +25,10 @@
     return `<td><code>${esc(scope.scope_id || '')}</code></td><td>${UI.chip(label, tone, { dot: true })}</td><td class="muted">${esc(observed ? new Date(observed).toLocaleString('ja-JP') : '')}</td><td class="muted">${esc(scopeFailure(scope) || '-')}</td><td class="muted">${esc(counters.entries ?? '-')} / ${esc(counters.files ?? '-')} / ${esc(counters.bytes ?? '-')}</td>`;
   }
   function rowEntity(entity) {
+    const a = entity.attributes || {};
+    const docker = entity.kind === 'docker_container' ? `state: ${a.state ?? 'unknown'}; health: ${a.health ?? 'unknown'}; memory: ${a.memory_bytes ?? 'unknown'}; nano_cpus: ${a.nano_cpus ?? 'unknown'}; ports: ${(a.ports || []).map(p => `${p.host_port} → ${p.container_port}/${p.protocol}`).join(', ') || 'none observed'}; log candidate: ${a.log_unbounded_candidate === true ? 'yes' : 'no'}` : '';
     const evidence = entity.attributes?.content_sha256 || entity.attributes?.value_hash || entity.attributes?.revision || '';
-    return `<td>${esc(entity.kind || '')}</td><td>${esc(entity.label || '')}</td><td class="muted"><code>${esc((entity.id || '').slice(-16))}</code></td><td class="muted"><code>${esc(String(evidence).slice(-16))}</code></td>`;
+    return `<td>${esc(entity.kind || '')}</td><td>${esc(entity.label || '')}</td><td class="muted"><code>${esc((entity.id || '').slice(-16))}</code></td><td class="muted"><code>${esc(docker || String(evidence).slice(-16))}</code></td>`;
   }
   function rowChange(change) {
     return `<td><code>${esc(change.scope_id || '')}</code></td><td>${esc(change.kind || '')}</td><td>${esc(change.change_kind || '')}</td><td class="muted">${esc(change.at ? new Date(change.at).toLocaleString('ja-JP') : '')}</td>`;
@@ -49,7 +51,7 @@
     const edges = graph?.edges || [];
     const views = {
       all: { label: '全体', entities: null, edges: null, hint: '収集済みの全関係' },
-      hosts: { label: '機体配置', entities: new Set(['host', 'environment', 'repository', 'checkout', 'worktree']), edges: new Set(['contains_environment', 'contains_checkout', 'checkout_of', 'worktree_of', 'contains_workspace']), hint: '機体・環境・checkout の配置' },
+      hosts: { label: '機体配置', entities: new Set(['docker_engine', 'docker_container', 'docker_network', 'docker_volume', 'docker_mount', 'host', 'environment', 'repository', 'checkout', 'worktree']), edges: new Set(['docker_contains', 'docker_network_member', 'docker_mounts', 'contains_environment', 'contains_checkout', 'checkout_of', 'worktree_of', 'contains_workspace']), hint: '機体・環境・checkout の配置' },
       dependencies: { label: '依存', entities: new Set(['repository', 'checkout', 'workspace', 'package']), edges: new Set(['contains_checkout', 'contains_workspace', 'contains_package', 'workspace_member', 'declares_dependency', 'resolves_to']), hint: '宣言と観測済み解決先の依存' },
       cicd: { label: 'CI/CD', entities: new Set(['repository', 'workflow', 'job', 'artifact', 'deployment']), edges: new Set(['has_workflow', 'has_job', 'needs_job', 'uses_action', 'uses_workflow', 'runs_on', 'deploys_to', 'stores_in']), hint: 'workflow と job の観測済み関係' },
     };
@@ -69,7 +71,7 @@
     ])}${currentness}<div class="toolbar" data-no-drag>${tabButton('all', '全体')}${tabButton('hosts', '機体配置')}${tabButton('dependencies', '依存')}${tabButton('cicd', 'CI/CD')}<button class="btn" data-topology-export="json">公開 JSON をコピー</button><button class="btn" data-topology-export="mermaid">Mermaid をコピー</button></div>
       ${filters(candidates)}
       ${UI.section(view.label, `${view.hint}。未観測の対象は推測で結びません`)}
-      ${UI.table({ cols: [{label:'型'}, {label:'名前'}, {label:'ID'}, {label:'根拠 SHA / revision'}], rows: shownEntities, row: rowEntity, empty: '条件に合う実体はありません' })}
+      ${UI.table({ cols: [{label:'型'}, {label:'名前'}, {label:'ID'}, {label:'根拠 / Docker 状態'}], rows: shownEntities, row: rowEntity, empty: '条件に合う実体はありません' })}
       ${noteLimit(shownEntities.length, filteredEntities.length)}
       ${UI.section('関係', '起点・終点は内部の opaque ID です')}
       ${UI.table({ cols: [{label:'種類'}, {label:'起点'}, {label:'終点'}], rows: shownEdges, row: rowEdge, empty: '条件に合う関係はありません' })}

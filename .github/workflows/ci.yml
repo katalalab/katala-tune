@@ -100,3 +100,27 @@ jobs:
       - name: Tauri アプリのリンクを検証
         if: runner.os != 'Linux'
         run: cargo build --package katala-tune --locked
+      - name: Windows CLI artifact build
+        if: runner.os == 'Windows'
+        timeout-minutes: 20
+        run: cargo build --locked -p tune-cli
+      - name: Windows CLI artifact manifest
+        if: runner.os == 'Windows'
+        timeout-minutes: 1
+        run: node scripts/ci-cli-artifact.js
+      - name: Windows CLI artifact upload
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tune-cli-windows-x64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/ci-cli/tune.exe
+            dist/ci-cli/manifest.json
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false
+          include-hidden-files: false
+      - name: Docker Go-template regression without a daemon
+        if: runner.os == 'Linux'
+        timeout-minutes: 1
+        run: node --test test/docker-template/docker-cli.test.js

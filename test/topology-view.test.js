@@ -176,3 +176,9 @@ test('the native command manifest and window capability both allow the topology 
     assert.ok(capability.permissions.includes('allow-'+command.replaceAll('_','-')),`${command} must be granted to the main window`);
   }
 });
+
+test('Docker evidence renders unknown health and null limits separately from zero',async()=>{
+  const g=graph();g.entities=[{...entity('docker_container','Docker container'),attributes:{state:'running',health:null,memory_bytes:0,nano_cpus:null,ports:[{container_port:80,protocol:'tcp',host_port:8080}],log_unbounded_candidate:false}}];
+  const s=await mount({graph:g});
+  assert.match(s.state.html,/health: unknown/);assert.match(s.state.html,/memory: 0/);assert.match(s.state.html,/nano_cpus: unknown/);assert.match(s.state.html,/8080/);
+});
