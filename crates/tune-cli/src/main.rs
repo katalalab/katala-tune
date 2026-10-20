@@ -46,11 +46,14 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 use tune_core::db::Store;
 use tune_core::engine::{Engine, NoHost};
-use tune_core::{collect, logs, nodes, rules};
+use tune_core::{
+    collect, logs, nodes, rules,
+    topology::export::{ExportView, public_json, public_mermaid},
+};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "使い方: tune <paths|probe|logs|ledger|last|power|network|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|update> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
+        "使い方: tune <paths|probe|logs|ledger|last|power|network|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
     );
     ExitCode::from(2)
 }
@@ -58,6 +61,30 @@ fn usage() -> ExitCode {
 /// `--name 数` の数（無い・読めなければ None）
 fn flag(rest: &[String], name: &str) -> Option<i64> {
     rest.iter().position(|a| a == name).and_then(|i| rest.get(i + 1)).and_then(|v| v.parse().ok())
+}
+
+fn topology_node_ids(rest: &[String], watch: bool) -> Result<Vec<String>, String> {
+    let mut ids = Vec::new();
+    let mut index = 0;
+    while index < rest.len() {
+        if watch && matches!(rest[index].as_str(), "--iterations" | "--interval-seconds") {
+            if rest.get(index + 1).is_none() {
+                return Err(format!("{} requires a value", rest[index]));
+            }
+            index += 2;
+            continue;
+        }
+        if rest[index].starts_with('-') {
+            return Err(format!("unknown topology option: {}", rest[index]));
+        }
+        ids.push(rest[index].clone());
+        index += 1;
+    }
+    let config = nodes::load_config(&nodes::user_config_path())?;
+    if let Some(id) = ids.iter().find(|id| config.node(id).is_none()) {
+        return Err(format!("unknown topology node id: {id}"));
+    }
+    Ok(ids)
 }
 
 fn print(v: &Value) {
@@ -219,6 +246,60 @@ async fn main() -> ExitCode {
     let Some(cmd) = args.first() else { return usage() };
     let rest = &args[1..];
     let res: Result<(), String> = match cmd.as_str() {
+        "topology-refresh" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => match topology_node_ids(rest, false) {
+                Ok(ids) => {
+                    print(&e.topology_refresh_nodes("cli", &ids).await);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
+            Err(e) => Err(e),
+        },
+        "topology-watch" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => match topology_node_ids(rest, true) {
+                Ok(ids) => {
+                    let iterations = flag(rest, "--iterations").unwrap_or(1).clamp(1, 100) as usize;
+                    let seconds = flag(rest, "--interval-seconds")
+                        .unwrap_or_else(|| e.schedule().get("topology_minutes").and_then(Value::as_i64).unwrap_or(1).saturating_mul(60))
+                        .clamp(1, 86_400) as u64;
+                    for n in 0..iterations {
+                        print(&e.topology_refresh_nodes("watch", &ids).await);
+                        if n + 1 < iterations {
+                            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+                        }
+                    }
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
+            Err(e) => Err(e),
+        },
+        "topology-export" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => {
+                let view = match e.topology_view() {
+                    Ok(view) => view,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        return ExitCode::from(1);
+                    }
+                };
+                let export_view = match rest.windows(2).find(|pair| pair[0] == "--view").map(|pair| pair[1].as_str()).unwrap_or("all") {
+                    "all" => ExportView::All,
+                    "hosts" => ExportView::Hosts,
+                    "dependencies" => ExportView::Dependencies,
+                    "cicd" => ExportView::Cicd,
+                    _ => return usage(),
+                };
+                match rest.windows(2).find(|pair| pair[0] == "--format").map(|pair| pair[1].as_str()).unwrap_or("json") {
+                    "json" => println!("{}", public_json(&view, export_view)),
+                    "mermaid" => println!("{}", public_mermaid(&view, export_view)),
+                    _ => return usage(),
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
         "network" => {
             let active = rest.iter().any(|a| a == "--probe");
             let ids: Vec<_> = rest.iter().filter(|a| a.as_str() != "--probe").cloned().collect();

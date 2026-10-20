@@ -4,17 +4,13 @@
 //! - メモリ: used = 1 - Available Bytes / 物理メモリ、commit = Committed Bytes / Commit Limit
 //! - プロセス: NtQuerySystemInformation(SystemProcessInformation) 1 回で全プロセスの CPU 時間・ワーキングセット・
 //!   名前・親。ハンドルを開かないので、保護されたプロセス（vmmemWSL など）も数えられる
-//! - GPU: nvidia-smi があるときだけ、120 回で自分から終わる `nvidia-smi dmon` を 1 つ（終わったら次の回でつなぎ直す）
+//! - GPU: nvidia-smi があるときだけ、最大5秒間隔・4秒上限の読み取り専用query（専用VRAMはadapter別）
 //!
 //! 取り出すのは数と、上位プロセスの PID・実行ファイル名だけ（コマンドライン・環境・ファイルの中身は読まない）。
 #![allow(unsafe_code)] // PDH・NtQuerySystemInformation・GlobalMemoryStatusEx・OpenProcess の呼び出しだけ。前提は各所に書く
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde_json::{Map, Value, json};
@@ -26,11 +22,10 @@ use windows_sys::Win32::System::Performance::{
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 
-use crate::sample::{Args, Dmon, GpuNow, ProcRow, display_name, gpu_json, procs_json, round, virtual_adapter};
+use crate::sample::{Args, GpuQuery as Gpus, ProcRow, display_name, procs_json, round, virtual_adapter};
 
 /// 100 を超える値をそのまま返す（コアの % は丸めない側で収める）
 const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
 const TOP: usize = 8;
 
@@ -270,95 +265,6 @@ fn nvidia_smi() -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join("nvidia-smi.exe")).find(|p| p.is_file())
 }
 
-struct Gpus {
-    smi: PathBuf,
-    names: HashMap<u32, String>,
-    totals: HashMap<u32, f64>,
-    now: Arc<Mutex<HashMap<u32, GpuNow>>>,
-    child: Option<Child>,
-    secs: u64,
-}
-
-impl Gpus {
-    fn open(smi: PathBuf, interval: f64) -> Gpus {
-        let mut g = Gpus { smi, names: HashMap::new(), totals: HashMap::new(), now: Arc::default(), child: None, secs: interval.round().max(1.0) as u64 };
-        if let Ok(o) = Command::new(&g.smi)
-            .args(["--query-gpu=index,name,memory.total", "--format=csv,noheader,nounits"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            for line in String::from_utf8_lossy(&o.stdout).lines() {
-                let f: Vec<&str> = line.split(',').map(str::trim).collect();
-                if let [i, name, total, ..] = f[..]
-                    && let Ok(i) = i.parse::<u32>()
-                {
-                    g.names.insert(i, name.to_string());
-                    if let Ok(t) = total.parse::<f64>() {
-                        g.totals.insert(i, t);
-                    }
-                }
-            }
-        }
-        g
-    }
-
-    /// dmon が動いていなければ（初回・120 回で終わった）起動する。読むのは別のスレッド
-    fn poll(&mut self) {
-        if let Some(c) = self.child.as_mut()
-            && matches!(c.try_wait(), Ok(None))
-        {
-            return;
-        }
-        self.child = None;
-        let Ok(mut c) = Command::new(&self.smi)
-            .args(["dmon", "-s", "pucm", "-d", &self.secs.to_string(), "-c", "120"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-        else {
-            return;
-        };
-        let out = c.stdout.take();
-        let now = self.now.clone();
-        std::thread::spawn(move || {
-            let Some(out) = out else { return };
-            let mut d = Dmon::default();
-            for line in BufReader::new(out).lines() {
-                let Ok(line) = line else { return };
-                if let Some((i, g)) = d.line(&line)
-                    && let Ok(mut m) = now.lock()
-                {
-                    m.insert(i, g);
-                }
-            }
-        });
-        self.child = Some(c);
-    }
-
-    fn json(&self) -> Option<Value> {
-        let m = self.now.lock().ok()?;
-        if m.is_empty() {
-            return None;
-        }
-        let mut keys: Vec<&u32> = m.keys().collect();
-        keys.sort();
-        Some(Value::Array(keys.into_iter().map(|k| gpu_json(self.names.get(k).map(String::as_str), self.totals.get(k).copied(), &m[k])).collect()))
-    }
-}
-
-impl Drop for Gpus {
-    fn drop(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // サンプラー
 // ---------------------------------------------------------------------------
@@ -439,7 +345,7 @@ impl Sampler {
             errors,
             buf: vec![0u64; 512 * 1024 / 8],
             rates: ProcRates { prev: HashMap::new(), at: None },
-            gpus: nvidia_smi().map(|p| Gpus::open(p, a.interval)),
+            gpus: nvidia_smi().map(|p| Gpus::open(p, a.procs_every)),
             session: None,
             cores: 0,
             power_seen: false,
@@ -569,6 +475,10 @@ impl Sampler {
             if let Some(v) = g.json() {
                 m.insert("gpu".into(), v);
             }
+        }
+
+        if self.gpus.is_none() {
+            m.insert("gpu".into(),json!([{"name":"GPU","source":"nvidia-smi query","memory_kind":"unknown","memory_status":"unsupported","memory_reason":"nvidia-smi-not-found; other vendors unsupported","available":false}]));
         }
 
         if procs && let Ok(raw) = processes(&mut self.buf) {

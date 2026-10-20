@@ -107,16 +107,35 @@ def app_name(path):
     return os.path.basename(path) or path
 
 
+def cpu_time_seconds(text):
+    # ps time: accumulated user + system CPU, not wall time or percent.
+    match = re.fullmatch(r"(?:(\d+)-)?(\d+):(\d+(?:\.\d+)?)(?::(\d+(?:\.\d+)?))?", text)
+    if not match:
+        return None
+    days, first, second, third = match.groups()
+    if days is not None and third is None:
+        return None
+    if third is None:
+        value = int(first) * 60 + float(second)
+        valid = float(second) < 60
+    else:
+        value = int(days or 0) * 86400 + int(first) * 3600 + float(second) * 60 + float(third)
+        valid = float(second).is_integer() and float(second) < 60 and float(third) < 60 and (days is None or int(first) < 24)
+    return round(value, 2) if valid and math.isfinite(value) else None
+
+
 def processes():
-    out = run(["ps", "-axo", "pid=,pcpu=,rss=,etime=,comm="], timeout=10)
+    out = run(["ps", "-axo", "pid=,pcpu=,rss=,etime=,time=,comm="], timeout=10)
     procs = []
     for line in out.splitlines():
-        parts = line.split(None, 4)
-        if len(parts) < 5:
+        parts = line.split(None, 5)
+        if len(parts) < 6:
             continue
-        pid, cpu, rss, etime, comm = parts
+        pid, cpu, rss, etime, cpu_time, comm = parts
+        cpu_seconds = cpu_time_seconds(cpu_time)
         procs.append({"pid": int(pid), "cpu": float(cpu), "mem_mb": round(int(rss) / 1024), "etime": etime,
-                      "name": os.path.basename(comm), "app": app_name(comm)})
+                      "name": os.path.basename(comm), "app": app_name(comm), "cpu_seconds": cpu_seconds,
+                      "private_mb": None, "handle_count": None, "thread_count": None})
     groups = {}
     for p in procs:
         g = groups.setdefault(p["app"], {"app": p["app"], "cpu": 0.0, "mem_mb": 0, "count": 0})
@@ -133,7 +152,10 @@ def processes():
             p["start"] = starts.get(p["pid"])
     agents = sum(1 for p in procs if re.match(r"^(claude|codex|opencode|cursor-agent|agy|gemini)\b", p["name"], re.I))
     return {
-        "count": len(procs),
+        "count": len(procs), "source": "ps pcpu/rss/time", "sampled_at": int(time.time() * 1000),
+        "memory_unit": "MiB", "cpu_time_unit": "seconds (cumulative)",
+        "details_reason": "private bytes, handles, threads and process I/O unavailable in low-cost ps sample",
+        "threads": None, "handles": None,
         "top_cpu": top_cpu,
         "top_mem": by(procs, "mem_mb", 15),
         "apps": by(list(groups.values()), "mem_mb", 25),
@@ -141,6 +163,16 @@ def processes():
         "agent_processes": agents,
     }
 
+
+
+def gpu_memory(gpu, apple_silicon, sampled_at):
+    """Dedicated VRAM does not exist on Apple Silicon; host RAM is not GPU allocation."""
+    return dict(gpu, adapter_index=0, memory_kind="unified" if apple_silicon else "unknown",
+                mem_total_mb=None, mem_used_mb=None, mem_free_mb=None, mem_used_pct=None,
+                memory_unit="MiB", memory_status="not-applicable" if apple_silicon else "unsupported",
+                memory_reason="unified memory shared with CPU; dedicated VRAM not applicable" if apple_silicon else "no supported dedicated VRAM provider",
+                sampled_at=sampled_at, source=gpu.get("source") or "sysctl hw.optional.arm64",
+                process_memory_reason="per-process GPU allocations unavailable")
 
 def dir_size_gb(path):
     p = os.path.expanduser(path)
@@ -583,8 +615,8 @@ def main():
         macmon = f_macmon.result()
         result["power"].update({k: v for k, v in macmon.items() if k not in ("gpu", "cpu_clusters_mhz")})
         result["cpu_clock"] = {"clusters_mhz": macmon.get("cpu_clusters_mhz"), "source": "macmon frequency residency sample" if macmon.get("available") else None}
-        if macmon.get("gpu"):
-            result["gpus"] = [macmon["gpu"]]
+        result["gpus"] = [gpu_memory(macmon.get("gpu") or {"name": "Apple GPU" if sysctl("hw.optional.arm64") == "1" else "GPU"},
+                                     sysctl("hw.optional.arm64") == "1", int(time.time() * 1000))]
         result["launchd_failing"] = f_ld.result()
         result["jobs"] = f_jobs.result()
         result["time_machine_running"] = f_tm.result()

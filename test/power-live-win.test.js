@@ -3,47 +3,54 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const {spawnSync} = require('node:child_process');
+const vramFixtures = require('./fixtures/vram-slots.json');
 
-test('PS5.1 dmon values expire and process loss/restart never reuses GPU power', {skip:process.platform !== 'win32'}, () => {
+test('PS GPU parser shares zero, N/A and driver-reserved VRAM fixtures with core and renderer', {skip:process.platform !== 'win32'}, () => {
   const source=fs.readFileSync('probes/live_win.ps1','utf8');
-  const helpers=source.slice(source.indexOf('function StartDmon'),source.indexOf('# ---- Top processes'));
+  const helpers=source.slice(source.indexOf('function ParseGpuRows'),source.indexOf('# ---- Top processes'));
   const jsonHelpers=source.slice(source.indexOf('function N('),source.indexOf('function OpenCat'));
+  const cases=vramFixtures.filter(f => ['zero-reserved','reserved','n-a'].includes(f.name));
+  const rows=cases.map(f => {
+    const g=f.gpus[0], cell=v => v == null ? 'N/A' : v;
+    return [g.adapter_index,'Fixture GPU',0,cell(g.mem_used_mb),cell(g.mem_total_mb),cell(g.mem_free_mb),'N/A','N/A','N/A','N/A',g.uuid,'P8','N/A','N/A','N/A','N/A',1,0].join(', ');
+  });
   const script=`$ErrorActionPreference="Stop"
 $inv=[Globalization.CultureInfo]::InvariantCulture
-$Interval=1;$smi="missing-sensor-executable";$gpuMaxAgeMs=3000
-$gpuName=@{0="test GPU"};$gpuTotal=@{0=100};$gpuNow=@{}
-$gpuSampleClock=[pscustomobject]@{Elapsed=[timespan]::FromMilliseconds(1000)}
 ${jsonHelpers}
 ${helpers}
-function MockProcess($lines) {
- $q=New-Object "Collections.Generic.Queue[string]"
- foreach($line in $lines){$q.Enqueue($line)}
- $reader=[pscustomobject]@{Lines=$q}
- $reader|Add-Member ScriptMethod ReadLineAsync { $t=New-Object "Threading.Tasks.TaskCompletionSource[string]";if($this.Lines.Count){$t.SetResult($this.Lines.Dequeue())};return $t.Task }
- $p=[pscustomobject]@{HasExited=$false;StandardOutput=$reader;Disposed=$false}
- $p|Add-Member ScriptMethod Dispose {$this.Disposed=$true}
- return $p
-}
-$dmon=MockProcess @("# gpu pwr sm fb gclk mclk","0 25 4 50 500 800")
-$dmonTask=$dmon.StandardOutput.ReadLineAsync();$dmonCols=$null
-PollDmon
-$fresh=GpuJson
-$gpuSampleClock.Elapsed=[timespan]::FromMilliseconds(4000);$boundary=GpuJson
-$gpuSampleClock.Elapsed=[timespan]::FromMilliseconds(4001);$expired=GpuJson
-$gpuSampleClock.Elapsed=[timespan]::FromMilliseconds(1000)
-$old=$dmon;$dmon.HasExited=$true;PollDmon;$lost=GpuJson
-$disposed=$old.Disposed;$cleared=$null -eq $dmon -and $null -eq $dmonCols
-$gpuNow[0]=@{power=25;received_ms=1000};$dmonCols=@("old");PollDmon
-$restart=GpuJson;$reset=$null -eq $dmonCols
-$dmon=MockProcess @();$dmonTask=[pscustomobject]@{IsCompleted=$true;Result=$null}
-$gpuNow[0]=@{power=25;received_ms=1000};PollDmon;$eof=GpuJson
-[ordered]@{fresh=$fresh;boundary=$boundary;expired=$expired;lost=$lost;disposed=$disposed;cleared=$cleared;restart=$restart;reset=$reset;eof=$eof}|ConvertTo-Json -Compress
+@(${rows.map(row => `ParseGpuRows ${JSON.stringify(row)} 123`).join('\n')})|ConvertTo-Json -Compress
 `;
   const r=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],{encoding:'utf8',timeout:15000,windowsHide:true});
   assert.equal(r.status,0,r.stderr);
-  const d=JSON.parse(r.stdout.trim());
-  assert.equal(JSON.parse(d.fresh)[0].power_w,25);
-  assert.equal(JSON.parse(d.boundary)[0].power_w,25);
-  for(const k of ['expired','lost','restart','eof'])assert.deepEqual(JSON.parse(d[k]),[],k);
-  for(const k of ['disposed','cleared','reset'])assert.equal(d[k],true,k);
+  const result=JSON.parse(r.stdout.trim());
+  for(let i=0;i<cases.length;i++) {
+    const actual=JSON.parse(result[i])[0], expected=cases[i].gpus[0];
+    for(const k of ['adapter_index','mem_used_mb','mem_total_mb','mem_free_mb','mem_used_pct']) assert.equal(actual[k],expected[k],`${cases[i].name}: ${k}`);
+  }
+});
+
+test('PS5.1 bounded GPU query keeps adapter identity, N/A null and expires cached values', {skip:process.platform !== 'win32'}, () => {
+  const source=fs.readFileSync('probes/live_win.ps1','utf8');
+  const helpers=source.slice(source.indexOf('function ParseGpuRows'),source.indexOf('# ---- Top processes'));
+  const jsonHelpers=source.slice(source.indexOf('function N('),source.indexOf('function OpenCat'));
+  const script=`$ErrorActionPreference="Stop"
+$inv=[Globalization.CultureInfo]::InvariantCulture
+${jsonHelpers}
+${helpers}
+$gpuRows=ParseGpuRows "0, Test GPU A, 10, 50, 100, 49, 40, 25, 500, 800, GPU-test-a, P8, 100, 80, 120, 500, 1, 0\n1, Test GPU B, N/A, N/A, 200, N/A, N/A, N/A, N/A, N/A, GPU-test-b, P8, N/A, N/A, N/A, N/A, 1, 0" 123
+$gpuMaxAgeMs=9000;$gpuReceived=1000;$gpuReason="query-timeout"
+$gpuSampleClock=[pscustomobject]@{Elapsed=[timespan]::FromMilliseconds(1000)}
+$fresh=GpuJson
+$gpuSampleClock.Elapsed=[timespan]::FromMilliseconds(10000);$boundary=GpuJson
+$gpuSampleClock.Elapsed=[timespan]::FromMilliseconds(10001);$expired=GpuJson
+[ordered]@{fresh=$fresh;boundary=$boundary;expired=$expired}|ConvertTo-Json -Compress
+`;
+  const r=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],{encoding:'utf8',timeout:15000,windowsHide:true});
+  assert.equal(r.status,0,r.stderr);
+  const d=JSON.parse(r.stdout.trim());const g=JSON.parse(d.fresh);
+  assert.equal(g[0].adapter_index,0);assert.equal(g[0].mem_free_mb,49);assert.equal(g[0].mem_used_pct,50);assert.equal(g[0].sampled_at,123);
+  assert.equal(g[1].mem_used_mb,null);assert.equal(g[1].memory_status,'partial');
+  assert.equal(JSON.parse(d.boundary)[0].mem_used_mb,50);
+  assert.equal(JSON.parse(d.expired)[0].available,false);
+  assert.equal(JSON.parse(d.expired)[0].memory_reason,'query-timeout');
 });

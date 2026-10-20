@@ -11,7 +11,7 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 regex = "1"
 encoding_rs = "0.8"
@@ -20,6 +20,8 @@ sha1_smol = "1"
 sha2 = "0.10"
 dirs = "7"
 gethostname = "1"
+toml = "0.8"
+serde-saphyr = { version = "2.0", default-features = false, features = ["deserialize"] }
 
 [lints]
 workspace = true

@@ -18,6 +18,7 @@ pub mod metrics;
 mod netsec;
 pub mod provenance;
 mod snapshots;
+mod topology;
 
 use std::path::Path;
 
@@ -34,6 +35,7 @@ pub use logs::{LogCount, LogRow, TopSignature};
 pub use netsec::NET_EVENT_DAYS;
 pub use provenance::{RunMeta, SpanIn, sha256_hex};
 pub use snapshots::Snapshot;
+pub use topology::TopologyLease;
 
 pub const DB_FILE: &str = "katala-tune.db";
 pub const LOG_RETENTION_DAYS: i64 = 30;
@@ -56,6 +58,7 @@ const SCHEMA_PARTS: &[&str] = &[
     provenance::SCHEMA,
     ai_limits::SCHEMA,
     metrics::SCHEMA,
+    topology::SCHEMA,
 ];
 const META_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT, updated_at INTEGER);\n";
 
@@ -123,6 +126,7 @@ impl Store {
             ("logs", "occurrences", "INTEGER NOT NULL DEFAULT 1"),
             ("log_cursors", "fail_streak", "INTEGER NOT NULL DEFAULT 0"),
             ("log_cursors", "note", "TEXT"),
+            ("topology_refresh_lease", "generation", "INTEGER NOT NULL DEFAULT 1"),
         ] {
             let has: i64 = self.conn.query_row(&format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name = ?"), [name], |r| r.get(0))?;
             if has == 0 {
