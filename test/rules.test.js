@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { analyze, score, compare, HIGH_PERF_GUID } = require('../lib/rules');
+const { analyze, score, compare, processDecision, HIGH_PERF_GUID } = require('../lib/rules');
 
 const mac = (over = {}) => ({
   probe: 'mac', host: { cores: 10, uptime_h: 10 }, cpu_busy: 20,
@@ -78,18 +78,140 @@ test('健全な機体は所見なしで 100 点', () => {
   assert.equal(score(analyze(win())), 100);
 });
 
-test('mac: 1コアを使い切るアプリは終了を提案し、システムは提案しない', () => {
+test('mac: CPU と名前だけでは終了を提案せず、システムは引き続き保護する', () => {
   const f = analyze(mac({ processes: { top_cpu: [
     { pid: 500, name: 'Google Drive', app: 'Google Drive', cpu: 105 },
     { pid: 414, name: 'WindowServer', app: 'WindowServer', cpu: 90 },
     { pid: 900, name: 'claude', app: 'claude', cpu: 120 },
   ], apps: [], apps_cpu: [] } }));
   const drive = f.find((x) => x.id.startsWith('runaway-Google Drive'));
-  assert.equal(drive.action.type, 'kill-process');
-  assert.deepEqual(drive.action.params, { pid: 500, name: 'Google Drive', start: null, min_cpu: 50 });
+  assert.equal(drive.action, undefined);
+  assert.equal(drive.decision.proposed_action, null);
+  assert.equal(drive.decision.remediation.class, 'manual_only');
+  assert.ok(drive.decision.needed_observation.includes('pid_name_start_owner_and_parent'));
+  assert.match(drive.advice, /CPU と名前だけでは不要/);
   assert.match(drive.advice, /Google Drive/);
   assert.equal(f.find((x) => x.id.startsWith('runaway-WindowServer')).action, undefined);
   assert.equal(f.find((x) => x.id.startsWith('runaway-claude')).action, undefined);
+});
+
+test('process decision: 確認済みの重複だけが承認必須の終了候補になる', () => {
+  const now = Date.now();
+  const p = {
+    pid: 500, ppid: 1, name: 'ExampleWorker', cpu: 105, start: 'Thu Oct  1 08:12:03 2026',
+    decision: {
+      evidence_state: 'observed', reason_status: 'confirmed', process_class: 'duplicate_candidate', collector_self: false,
+      owner_observed: true, service_match: true, scheduler_match: true, workload_match: true, protect_ledger_readable: true,
+      evidence: [{ run: 'r1', scope: 'process', source_sha256: 'a'.repeat(64), observed_at: now - 1000, rowref: 'p500' }],
+      cpu_samples: [
+        { pid: 500, start: 'Thu Oct  1 08:12:03 2026', value: 90, unit: 'percent_of_core', definition: 'cpu_time_delta', sample_window_ms: 1000, at: now - 2000 },
+        { pid: 500, start: 'Thu Oct  1 08:12:03 2026', value: 91, unit: 'percent_of_core', definition: 'cpu_time_delta', sample_window_ms: 1000, at: now - 1000 },
+      ],
+    },
+  };
+  const f = analyze(mac({ at: now, processes: { top_cpu: [p], apps: [], apps_cpu: [] } }), { hold: false, shared: false });
+  const finding = f.find((x) => x.id === 'runaway-ExampleWorker-500');
+  assert.deepEqual(finding.action.params, { pid: 500, name: 'ExampleWorker', start: 'Thu Oct  1 08:12:03 2026', min_cpu: 50 });
+  assert.equal(finding.decision.remediation.class, 'requires_approval');
+  assert.equal(finding.decision.remediation.can_auto_fix, false);
+  assert.equal(finding.decision.symptom, 'repeated_high_cpu_samples');
+  assert.notEqual(finding.decision.symptom, 'sustained_high_cpu_process');
+  assert.match(finding.advice, /重複候補を確認/);
+});
+
+test('process decision: shared、collector、identity、CPU 根拠が明示されなければ停止候補を作らない', () => {
+  const now = Date.now();
+  const base = () => ({
+    pid: 500, ppid: 1, name: 'ExampleWorker', start: 'Thu Oct  1 08:12:03 2026',
+    decision: {
+      evidence_state: 'observed', reason_status: 'confirmed', process_class: 'duplicate_candidate', owner_observed: true, collector_self: false,
+      service_match: true, scheduler_match: true, workload_match: true, protect_ledger_readable: true,
+      evidence: [{ run: 'r1', scope: 'process', source_sha256: 'a'.repeat(64), observed_at: now - 1000, rowref: 'p500' }],
+      cpu_samples: [
+        { pid: 500, start: 'Thu Oct  1 08:12:03 2026', value: 90, unit: 'percent_of_core', definition: 'cpu_time_delta', sample_window_ms: 1000, at: now - 2000 },
+        { pid: 500, start: 'Thu Oct  1 08:12:03 2026', value: 91, unit: 'percent_of_core', definition: 'cpu_time_delta', sample_window_ms: 1000, at: now - 1000 },
+      ],
+    },
+  });
+  for (const node of [{ hold: false }, { hold: false, shared: null }, { hold: false, shared: true }, { hold: false, shared: 'false' }]) {
+    const finding = processDecision(base(), node, false, now);
+    assert.equal(finding.proposed_action, null);
+    assert.ok(finding.needed_observation.includes('explicit_node_shared_clear'));
+  }
+  for (const collector_self of [undefined, null, true, 'false']) {
+    const p = base();
+    if (collector_self === undefined) delete p.decision.collector_self;
+    else p.decision.collector_self = collector_self;
+    const finding = processDecision(p, { hold: false, shared: false }, false, now);
+    assert.equal(finding.proposed_action, null);
+    assert.ok(finding.needed_observation.includes('collector_self_excluded'));
+  }
+  for (const patch of [{ ppid: null }, { ppid: 0 }, { ppid: -1 }, { name: null }, { name: 7 }, { name: 'unknown' }]) {
+    const p = { ...base(), ...patch };
+    const finding = processDecision(p, { hold: false, shared: false }, false, now);
+    assert.equal(finding.proposed_action, null);
+    assert.ok(finding.needed_observation.includes('pid_name_start_owner_and_parent'));
+  }
+  const missingName = base();
+  delete missingName.name;
+  const missingNameFinding = processDecision(missingName, { hold: false, shared: false }, false, now);
+  assert.equal(missingNameFinding.proposed_action, null);
+  assert.ok(missingNameFinding.needed_observation.includes('pid_name_start_owner_and_parent'));
+  for (const values of [[0, 0], [49.9, 91], [10001, 91]]) {
+    const p = base();
+    p.decision.cpu_samples[0].value = values[0];
+    p.decision.cpu_samples[1].value = values[1];
+    const finding = processDecision(p, { hold: false, shared: false }, false, now);
+    assert.equal(finding.proposed_action, null);
+    assert.ok(finding.needed_observation.includes('two_cpu_time_samples'));
+  }
+  const positive = processDecision(base(), { hold: false, shared: false }, false, now);
+  assert.equal(positive.proposed_action.params.min_cpu, 50);
+});
+
+test('process decision: 古い snapshot.at と同時期の observed 根拠でも入口で停止候補を作らない', () => {
+  const staleAt = Date.now() - 300001;
+  const p = {
+    pid: 500, ppid: 1, name: 'ExampleWorker', cpu: 105, start: 'Thu Oct  1 08:12:03 2026',
+    decision: {
+      evidence_state: 'observed', reason_status: 'confirmed', process_class: 'duplicate_candidate', owner_observed: true,
+      service_match: true, scheduler_match: true, workload_match: true, protect_ledger_readable: true,
+      evidence: [{ run: 'r1', scope: 'process', source_sha256: 'a'.repeat(64), observed_at: staleAt, rowref: 'p500' }],
+      cpu_samples: [
+        { pid: 500, start: 'Thu Oct  1 08:12:03 2026', value: 90, unit: 'percent_of_core', definition: 'cpu_time_delta', sample_window_ms: 1000, at: staleAt - 1000 },
+        { pid: 500, start: 'Thu Oct  1 08:12:03 2026', value: 91, unit: 'percent_of_core', definition: 'cpu_time_delta', sample_window_ms: 1000, at: staleAt },
+      ],
+    },
+  };
+  const finding = analyze(mac({ at: staleAt, processes: { top_cpu: [p], apps: [], apps_cpu: [] } }), { hold: false, shared: false }).find((x) => x.id === 'runaway-ExampleWorker-500');
+  assert.equal(finding.action, undefined);
+  assert.equal(finding.decision.proposed_action, null);
+  assert.ok(finding.decision.needed_observation.includes('fresh_timestamp_and_clock_consistency'));
+});
+
+test('process decision: observed でも stale、future、異種 CPU 標本では停止候補を作らない', () => {
+  const p = {
+    pid: 500, ppid: 1, name: 'ExampleWorker', cpu: 105, start: 'Thu Oct  1 08:12:03 2026',
+    decision: {
+      evidence_state: 'observed', reason_status: 'confirmed', process_class: 'duplicate_candidate', owner_observed: true,
+      service_match: true, scheduler_match: true, workload_match: true, protect_ledger_readable: true,
+      evidence: [{ run: 'r1', scope: 'process', source_sha256: 'a'.repeat(64), observed_at: 1760000001000, rowref: 'p500' }],
+      cpu_samples: [
+        { pid: 500, start: 'Thu Oct  1 08:12:03 2026', value: 90, unit: 'percent_of_core', definition: 'cpu_time_delta', sample_window_ms: 1000, at: 1760000000000 },
+        { pid: 500, start: 'Thu Oct  1 08:12:03 2026', value: 91, unit: 'percent_of_core', definition: 'cpu_time_delta', sample_window_ms: 2000, at: 1760000001000 },
+      ],
+    },
+  };
+  const finding = analyze(mac({ at: 1760000002000, processes: { top_cpu: [p], apps: [], apps_cpu: [] } }), { hold: false, shared: false }).find((x) => x.id === 'runaway-ExampleWorker-500');
+  assert.equal(finding.action, undefined);
+  assert.equal(finding.decision.proposed_action, null);
+  assert.ok(finding.decision.needed_observation.includes('two_cpu_time_samples'));
+});
+
+test('process decision: private process fields never enter public finding JSON', () => {
+  const p = { pid: 500, name: 'ExampleWorker', cpu: 105, argv: ['--token=secret'], owner: 'private-owner', path: '/private/path' };
+  const finding = analyze(mac({ processes: { top_cpu: [p], apps: [], apps_cpu: [] } })).find((x) => x.id === 'runaway-ExampleWorker-500');
+  assert.doesNotMatch(JSON.stringify(finding.decision), /secret|private-owner|\/private\/path/);
 });
 
 test('windows: 瞬間値だけ高いプロセスは暴走扱いしない', () => {
