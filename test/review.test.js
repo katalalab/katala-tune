@@ -79,6 +79,7 @@ test('許可したGitHubのPR・Issueだけをリンクにし、証跡とcoverag
     'javascript:alert(1)', 'data:text/html,x', 'https://github.com.evil.example/a/b/pull/1',
     ['https://user', 'github.com/a/b/pull/1'].join('@'), 'https://github.com:444/a/b/pull/1',
     'https://github.com/a/b/pull/1?x=1', 'https://github.com/a/b/pull/1#x',
+    'https://github.com/a/b/pull/1?', 'https://github.com/a/b/pull/1#',
     'https://github.com/a%2fb/pull/1', 'https://github.com/a/b/pull/0', 'https://github.com/a/b/pull/1\n',
   ]) assert.equal(model.githubUrl(url), null, url);
   assert.equal(model.githubUrl('https://github.com/a_b/re.po/issues/12'), 'https://github.com/a_b/re.po/issues/12');
@@ -154,6 +155,24 @@ test('passとacceptedの不足・受入矛盾は警告し、completion判定に�
   assert.match(task.review.warnings.join(' '), /review ref/);
   assert.match(task.review.warnings.join(' '), /acceptance gate/);
   assert.equal(model.parse({ schema: 'task-completion.v1', tasks: [{ id: 'pending', review: { status: 'pending' } }] }).tasks[0].review.acceptedLabel, '受入待ちの申告');
+});
+
+test('pass申告の証跡resultがpass以外なら警告し、passなら警告しない', () => {
+  const model = loadModel();
+  const base = { ref: 'https://github.com/a/b/pull/1', observed_at: '2026-10-19T00:00:00Z', revision: 'head', environment: 'repository' };
+  const warningsFor = (result) => model.parse({ schema: 'task-completion.v1', tasks: [{
+    id: 'result', target: 'repository', revision: 'head',
+    gates: { verification: { status: 'pass', evidence: [{ ...base, result }] } },
+  }] }, new Date('2026-10-20T00:00:00Z')).tasks[0].gates.verification.warnings.join(' ');
+  assert.match(warningsFor('fail'), /result が pass ではありません: fail/);
+  assert.doesNotMatch(warningsFor('pass'), /result が pass ではありません/);
+});
+
+test('前後空白を除いたtask idで一意性を判定し、表示にも除いた値を使う', () => {
+  const model = loadModel();
+  assert.throws(() => model.parse({ schema: 'task-completion.v1', tasks: [{ id: 'same' }, { id: ' same ' }] }));
+  assert.equal(model.parse({ schema: 'task-completion.v1', tasks: [{ id: ' trimmed ' }] }).tasks[0].id, 'trimmed');
+  assert.throws(() => model.parse({ schema: 'task-completion.v1', tasks: [{ id: ' \t ' }] }));
 });
 
 test('coverageの重なりと想定外unobservedを警告して全値を保持する', () => {

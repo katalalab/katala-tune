@@ -51,9 +51,60 @@ test('2 MiB超は読み込み前に拒否し、入力例はエスケープ済み
   assert.doesNotMatch(app.html, /<h3>implementation<\/h3>/);
   assert.match(app.html, /&lt;img src=x&gt;/);
   assert.doesNotMatch(app.html, /<img src=x>|<script>/);
+  assert.match(app.html, /結果（台帳の申告）: &lt;script&gt;x&lt;\/script&gt;/);
+  assert.match(app.html, /成功の申告の証跡の result が pass ではありません/);
   assert.match(app.html, /target="_blank" rel="noopener noreferrer"/);
   const link = app.html.match(/<a href="([^"]+)" target="_blank" rel="noopener noreferrer">([^<]+)<\/a>/);
   assert.equal(link[1], link[2]);
+});
+
+test('読み込み中はエラー文言を出さず、失敗時だけ読み込めなかったと表示する', async () => {
+  const app = loadView();
+  app.view.render();
+  let resolve;
+  const pending = app.controls.get('#reviewFile').onchange({ target: { files: [{ name: 'loading.json', size: 1, arrayBuffer: () => new Promise((done) => { resolve = done; }) }] } });
+  assert.match(app.html, /<div class="co-title">読み込み中<\/div>/);
+  assert.doesNotMatch(app.html, /読み込めませんでした/);
+  resolve(new TextEncoder().encode('{').buffer);
+  await pending;
+  assert.match(app.html, /<div class="co-title">読み込めませんでした<\/div>/);
+  assert.doesNotMatch(app.html, /<div class="co-title">読み込み中<\/div>/);
+});
+
+test('deliveryがlocal/repositoryなら配布段階を必須欠測として表示しない', async () => {
+  const app = loadView();
+  app.view.render();
+  const source = { schema: 'task-completion.v1', tasks: [
+    { id: 'repo', delivery: 'repository' },
+    { id: 'env', delivery: 'environment' },
+  ] };
+  await app.controls.get('#reviewFile').onchange({ target: { files: [file(JSON.stringify(source))] } });
+  const statuses = [...app.html.matchAll(/<h3>配布<\/h3><p>([^<]*)<\/p>/g)].map((match) => match[1]);
+  assert.match(statuses[0], /必須ではありません（依頼の終点: 正式ブランチ）/);
+  assert.doesNotMatch(statuses[0], /未記載/);
+  assert.equal(statuses[1], '未記載');
+});
+
+test('長い文字列はreview-propsの値を省略せず、折り返し可能にする', async () => {
+  const app = loadView();
+  app.view.render();
+  const long = 'x'.repeat(500);
+  await app.controls.get('#reviewFile').onchange({ target: { files: [file(JSON.stringify({ schema: 'task-completion.v1', tasks: [{ id: 'long', goal: long }] }))] } });
+  assert.ok(app.html.includes(`<div class="prop-k">目的</div><div class="prop-v">${long}</div>`));
+  assert.match(fs.readFileSync('renderer/style.css', 'utf8'), /\.review-props \.prop-v \{[^}]*overflow-wrap: anywhere;/);
+});
+
+test('証跡の警告は段階ごとに一度だけ表示する', async () => {
+  const app = loadView();
+  app.view.render();
+  const source = { schema: 'task-completion.v1', tasks: [{
+    id: 'warnings', target: 'repository', revision: 'head',
+    gates: { deployment: { status: 'pass', evidence: [{ ref: 'text', result: 'pass', observed_at: '2026-10-21T00:00:00Z', revision: 'other', environment: 'local' }] } },
+  }] };
+  await app.controls.get('#reviewFile').onchange({ target: { files: [file(JSON.stringify(source))] } });
+  assert.equal((app.html.match(/未来の日時です/g) || []).length, 1);
+  assert.equal((app.html.match(/revision が対象と異なります/g) || []).length, 1);
+  assert.equal((app.html.match(/対象環境が対象と異なります/g) || []).length, 1);
 });
 
 test('読込競合、離脱、無効JSONでは古い台帳を再表示しない', async () => {

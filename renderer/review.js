@@ -29,7 +29,7 @@
 
   function evidenceHtml(items) {
     if (!items.length) return '<p class="note-line">証跡: 未記載</p>';
-    return `<details class="review-evidence"><summary>証跡 ${items.length}件</summary>${items.map((item) => `<div class="review-evidence-row"><div>${evidenceRef(item)}</div><div class="muted">結果: ${text(item.result)} · 日時: ${text(item.observedAt)} · revision: ${text(item.revision)} · 対象: ${text(item.environment)}</div>${warnings(item.warnings)}</div>`).join('')}</details>`;
+    return `<details class="review-evidence"><summary>証跡 ${items.length}件</summary>${items.map((item) => `<div class="review-evidence-row"><div>${evidenceRef(item)}</div><div class="muted">結果（台帳の申告）: ${text(item.result)} · 日時: ${text(item.observedAt)} · revision: ${text(item.revision)} · 対象: ${text(item.environment)}</div></div>`).join('')}</details>`;
   }
 
   function coverageHtml(coverage) {
@@ -49,11 +49,15 @@
   }
 
   function taskHtml(task) {
+    const delivery = task.delivery === MODEL.missing ? task.delivery : (DELIVERY_LABEL[task.delivery] || task.delivery);
+    const deploymentOptional = task.delivery === 'local' || task.delivery === 'repository';
     const gates = MODEL.GATES.map((key) => {
       const gate = task.gates[key];
-      return `<section class="review-gate"><h3>${text(GATE_LABEL[key])}</h3><p>${text(gate.statusLabel)}</p>${evidenceHtml(gate.evidence)}${warnings(gate.warnings)}</section>`;
+      const gateStatus = key === 'deployment' && deploymentOptional && gate.statusLabel === MODEL.missing
+        ? `必須ではありません（依頼の終点: ${text(delivery)}）`
+        : text(gate.statusLabel);
+      return `<section class="review-gate"><h3>${text(GATE_LABEL[key])}</h3><p>${gateStatus}</p>${evidenceHtml(gate.evidence)}${warnings(gate.warnings)}</section>`;
     }).join('');
-    const delivery = task.delivery === MODEL.missing ? task.delivery : (DELIVERY_LABEL[task.delivery] || task.delivery);
     return `<section class="review-task"><h2>${text(task.id)}</h2><div class="props review-props"><div class="prop"><div class="prop-k">目的</div><div class="prop-v">${text(task.goal)}</div></div><div class="prop"><div class="prop-k">対象</div><div class="prop-v">${text(task.target)}</div></div><div class="prop"><div class="prop-k">対象版</div><div class="prop-v">${text(task.revision)}</div></div><div class="prop"><div class="prop-k">依頼の終点</div><div class="prop-v">${text(delivery)}</div></div><div class="prop"><div class="prop-k">レビュー</div><div class="prop-v">${text(task.review.acceptedLabel)}</div></div><div class="prop"><div class="prop-k">レビュー証跡</div><div class="prop-v">${reviewRef(task.review)} · ${text(task.review.observedAt)} · revision: ${text(task.review.revision)} · 対象: ${text(task.review.target)}</div></div></div>${warnings(task.review.warnings)}<h3 class="review-heading">5つの段階</h3><div class="review-gates">${gates}</div></section>`;
   }
 
@@ -66,14 +70,14 @@
     return `${UI.head({ title: 'レビュー', desc: 'task-completion.v1 の申告を一時表示します。ここでは検証・受入・完了を判定しません。' })}<section class="review-input"><label for="reviewFile">完了台帳 JSON</label><input id="reviewFile" type="file" accept=".json,application/json"><p class="note-line">2 MiBまで。画面を離れると読み込んだファイルと表示を破棄します。</p></section><div class="callout t-gray"><div class="co-body"><div class="co-title">未照合の表示です</div><div class="co-text">台帳の申告のみ。PRの現在のheadとは照合していません。生成元は未確認です。</div></div></div>${sourceHtml()}${body}`;
   }
 
-  function draw(message = '') {
+  function draw(message = '', loading = false) {
     const taskCount = current?.tasks.length || 0;
     const pages = Math.max(1, Math.ceil(taskCount / TASKS_PER_PAGE));
     taskPage = Math.min(taskPage, pages - 1);
     const first = taskPage * TASKS_PER_PAGE;
     const last = Math.min(first + TASKS_PER_PAGE, taskCount);
     const pager = current ? `<div class="review-pager"><span>${first + 1}–${last} / ${taskCount}件</span><button id="reviewPrev" class="btn small"${taskPage === 0 ? ' disabled' : ''}>前へ</button><button id="reviewNext" class="btn small"${taskPage + 1 === pages ? ' disabled' : ''}>次へ</button></div>` : '';
-    const body = current ? `<div class="callout t-gray"><div class="co-body"><div class="co-title">操作者の確認事項</div><div class="co-text">依頼内容への合致、結果の実演、利用者・費用・権限・データへの影響、未確認事項、戻し方、PR head SHAと台帳のrevisionの一致を確認してください。</div></div></div>${pager}${coverageHtml(current.coverage)}${current.tasks.slice(first, last).map(taskHtml).join('')}` : message ? `<div class="callout t-orange"><div class="co-body"><div class="co-title">読み込めませんでした</div><div class="co-text">${text(message)}</div></div></div>` : '<div class="empty"><p>task-completion.v1 のJSONを選択してください。</p></div>';
+    const body = current ? `<div class="callout t-gray"><div class="co-body"><div class="co-title">操作者の確認事項</div><div class="co-text">依頼内容への合致、結果の実演、利用者・費用・権限・データへの影響、未確認事項、戻し方、PR head SHAと台帳のrevisionの一致を確認してください。</div></div></div>${pager}${coverageHtml(current.coverage)}${current.tasks.slice(first, last).map(taskHtml).join('')}` : message ? `<div class="callout ${loading ? 't-gray' : 't-orange'}"><div class="co-body"><div class="co-title">${loading ? '読み込み中' : '読み込めませんでした'}</div><div class="co-text">${text(message)}</div></div></div>` : '<div class="empty"><p>task-completion.v1 のJSONを選択してください。</p></div>';
     page(baseHtml(body));
     const input = document.querySelector('#reviewFile');
     if (input) input.onchange = (event) => load(event.target?.files?.[0]);
@@ -89,7 +93,7 @@
     sourceInfo = null;
     if (!file || !Number.isFinite(file.size) || file.size < 0) return draw('ファイルサイズを確認できません。');
     if (file.size > MAX_FILE) return draw('ファイルは2 MiB以下にしてください。');
-    draw('読み込み中です。');
+    draw('読み込み中です。', true);
     try {
       const bytes = await file.arrayBuffer();
       if (token !== readToken) return;

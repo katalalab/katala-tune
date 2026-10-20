@@ -59,7 +59,7 @@
   }
 
   function githubUrl(value) {
-    if (typeof value !== 'string' || /[%\x00-\x1f\x7f]/.test(value)) return null;
+    if (typeof value !== 'string' || /[%\x00-\x1f\x7f?#]/.test(value)) return null;
     try {
       const url = new URL(value);
       if (url.href !== value || url.protocol !== 'https:' || url.hostname !== 'github.com' || url.username || url.password || url.port || url.search || url.hash) return null;
@@ -144,8 +144,8 @@
     const counts = { evidence: 0 };
     const tasks = input.tasks.map((task) => {
       if (!task || typeof task !== 'object' || Array.isArray(task)) throw Error('task は object で指定してください');
-      const id = task.id;
-      if (typeof id !== 'string' || !id.trim() || ids.has(id)) throw Error('task id は空でない一意の文字列で指定してください');
+      const id = typeof task.id === 'string' ? task.id.trim() : task.id;
+      if (typeof id !== 'string' || !id || ids.has(id)) throw Error('task id は空でない一意の文字列で指定してください');
       ids.add(id);
       const taskView = { id, goal: text(task.goal, 'goal', true), target: text(task.target, 'target', true), revision: text(task.revision, 'revision', true), delivery: text(task.delivery, 'delivery', true) };
       if (task.gates !== undefined && (!task.gates || typeof task.gates !== 'object' || Array.isArray(task.gates))) throw Error('gates は object で指定してください');
@@ -162,9 +162,10 @@
             for (const [label, field] of [['ref', item.ref], ['result', item.result], ['observed_at', item.observedAt], ['revision', item.revision], ['environment', item.environment]]) {
               if (field === missing) warnings.push(`成功の申告の証跡に ${label} がありません`);
             }
+            if (item.result !== missing && item.result !== 'pass') warnings.push(`成功の申告の証跡の result が pass ではありません: ${item.result}`);
           }
         }
-        gates[gate] = { statusLabel: statusLabel(value?.status), evidence: items, warnings };
+        gates[gate] = { statusLabel: statusLabel(value?.status), evidence: items, warnings: [...new Set(warnings)] };
       }
       const reviewView = review(task.review, taskView, now);
       if (reviewView.status === 'accepted' && ['fail', 'blocked'].includes(task.gates?.acceptance?.status)) reviewView.warnings.push(`受入の申告と acceptance gate の ${task.gates.acceptance.status} が矛盾します`);

@@ -48,9 +48,9 @@
 ### 入力の具体的な境界
 
 - `File.size` が2 MiBを超えれば `text()` / `FileReader` の前に拒否する。tasksは1〜1,000件、evidenceは1 gateあたり100件・文書全体4,000件まで、coverageの3配列合計は10,000件まで、文字列は8,192文字まで、ネストは16段までとする。配列・objectの形が不正な場合や上限超過時は文書全体を拒否し、古い表示を残さない。
-- 最上位に `schema: "task-completion.v1"`、`tasks` 配列を要求する。各taskのidは空でない一意の文字列。`goal / revision / target / delivery` が未設定なら「未記載」と表示し、設定されているのに文字列でなければ拒否する。表示用モデルの欠測はnullで保持し、文字列値の「未記載」と混同しない。deliveryの対応値は `local / repository / environment`。
+- 最上位に `schema: "task-completion.v1"`、`tasks` 配列を要求する。各taskのidは空でない一意の文字列で、前後空白を除いて一意性を判定し、その値を表示する。`goal / revision / target / delivery` が未設定なら「未記載」と表示し、設定されているのに文字列でなければ拒否する。表示用モデルの欠測はnullで保持し、文字列値の「未記載」と混同しない。deliveryの対応値は `local / repository / environment`。
 - gatesは省略可能なobjectで、対応名は `implementation / verification / integration / deployment / acceptance`。statusは `pending / in_progress / blocked / unverified / pass / fail` を表示対象とし、未知の文字列は「未対応の申告値」として文字列表示する。未設定は「未記載」、`pass` は「成功の申告（未照合）」と表示する。独自に完了判定を計算しない。
-- evidenceがある場合は配列で、各項目はobject。`ref / result / observed_at / revision / environment` は省略または文字列で、pass時に欠けた項目は警告する。日時はtimezone付きISO 8601（小数秒1〜9桁）として読み、読込時点より未来の日時・不正日時は警告する。revision・対象環境の食い違いも元の値とともに表示する。accepted時のreview情報不足とacceptance段階のfail/blockedとの矛盾も警告する。警告がないことを検証成功とは扱わない。
+- evidenceがある場合は配列で、各項目はobject。`ref / result / observed_at / revision / environment` は省略または文字列で、pass時に欠けた項目は警告する。pass時にresultが `pass` 以外なら警告し、画面では「結果（台帳の申告）」として表示する。deliveryが `local / repository` のときはdeployment未記載を必須欠測として表示しない。日時はtimezone付きISO 8601（小数秒1〜9桁）として読み、読込時点より未来の日時・不正日時は警告する。revision・対象環境の食い違いも元の値とともに表示する。accepted時のreview情報不足とacceptance段階のfail/blockedとの矛盾も警告する。警告は同じ段階で重複表示しない。警告がないことを検証成功とは扱わない。
 - coverageが文書topに未設定なら「対象範囲未記載」。設定する場合はobjectで、`expected / observed / unobserved` は省略または文字列の配列とする。空配列も受け付けるが、expected / observed が空なら不足として表示する。集合差 `expected − observed`、余分な観測、明示unobserved、observedとunobservedの重複、想定外のunobservedを表示する。件数要約と全値はnative `details` に畳み、重複は警告し、除去して完全扱いにしない。
 - 未知キーは表示・実行せず無視する。reviewの `status: "accepted"` も「受入の申告（未照合）」として扱う。evidenceの対象環境との差はdeployment / acceptance段階だけで警告する。入力検証は表示の安全性のためであり、共通の完了判定器を置き換えない。
 
@@ -64,7 +64,7 @@
 
 - 合成台帳で、欠測・不正入力・大容量・HTML/URL注入・異なるrevision・未来時刻を確認する。
 - 既存画面の登録方法を使い、Electron と Tauri の読み取り表示を確認する。
-- `npm run check`、`npm run oss-check -- --history` を実行する。今回の基準版の Node テストは294件中281成功、13 skip、失敗0。これは新機能のテスト結果ではない。
+- 実装時の `npm run check` は exit 0（Node 330件中317成功・13 skip、Rust 254成功、fmt/clippy含む）。レビュー指摘修正時は高負荷のため全体を再実行せず、`node --test test/review.test.js test/review-ui.test.js` の32件（失敗0）と `node --check`、`git diff --check` で確認した。詳細は[検証記録](../../acceptance/workflow-review.md)。
 - 差分と対象 head を固定した独立レビューの後、許可された PR / 正式反映 / 配布へ進む。macOS と Windows のファイル読込み・画面・既存機能を実機で確認するまで配布完了にしない。
 
 ## 後続の工程

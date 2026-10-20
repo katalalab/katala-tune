@@ -627,6 +627,7 @@ td .databar { margin-top: 5px; }
 
 /* ---- レビュー（renderer/review.js） ---- */
 .review-input, .review-source { margin: 18px 0; }
+.review-props .prop-v { overflow-wrap: anywhere; }
 .review-input label { display: block; margin-bottom: 7px; font-weight: 600; }
 .review-input input[type="file"] { max-width: 100%; }
 .review-task { margin: 28px 0; padding-top: 4px; border-top: 1px solid var(--line); }
