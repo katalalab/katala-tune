@@ -194,13 +194,17 @@ test('macOS real arm64 signed bundle survives archive/extraction and rejects cha
 });
 
 test('workflow is dispatch-only, permission-limited, SHA-pinned and uses real locked Tauri builds', () => {
-  const workflow = fs.readFileSync(path.join(__dirname, '../.github/workflows/artifact-delivery.yml'), 'utf8');
-  assert.match(workflow, /workflow_dispatch:/); assert.doesNotMatch(workflow, /^  (push|pull_request|schedule|workflow_run):/m);
-  assert.doesNotMatch(workflow, /\$\{\{\s*secrets\.|^\s+environment:|contents: write|gh release|tauri\.release\.conf/m);
-  const uses = [...workflow.matchAll(/uses: ([^\s]+)/g)].map(m => m[1]);
-  assert.equal(uses.length, 3); for (const use of uses) assert.match(use, /^actions\/[a-z-]+@[a-f0-9]{40}$/);
-  assert.match(workflow, /os: macos-15\n/); assert.match(workflow, /os: windows-2025\n/); assert.doesNotMatch(workflow, /-latest/);
-  assert.match(workflow, /--bundles app --config sidecars\.json -- --locked/);
-  assert.match(workflow, /--no-bundle --config sidecars\.json -- --locked/);
-  assert.match(workflow, /cmp .*tune/); assert.match(workflow, /codesign --verify --deep --strict/);
+  const source = fs.readFileSync(path.join(__dirname, '../.github/workflows/artifact-delivery.yml'), 'utf8');
+  for (const eol of ['\n', '\r\n']) {
+    const raw = source.replace(/\r?\n/g, eol);
+    const workflow = raw.replace(/\r\n/g, '\n');
+    assert.match(workflow, /workflow_dispatch:/); assert.doesNotMatch(workflow, /^  (push|pull_request|schedule|workflow_run):/m);
+    assert.doesNotMatch(workflow, /\$\{\{\s*secrets\.|^\s+environment:|contents: write|gh release|tauri\.release\.conf/m);
+    const uses = [...workflow.matchAll(/uses: ([^\s]+)/g)].map(m => m[1]);
+    assert.equal(uses.length, 3); for (const use of uses) assert.match(use, /^actions\/[a-z-]+@[a-f0-9]{40}$/);
+    assert.match(workflow, /os: macos-15\n/); assert.match(workflow, /os: windows-2025\n/); assert.doesNotMatch(workflow, /-latest/);
+    assert.match(workflow, /--bundles app --config sidecars\.json -- --locked/);
+    assert.match(workflow, /--no-bundle --config sidecars\.json -- --locked/);
+    assert.match(workflow, /cmp .*tune/); assert.match(workflow, /codesign --verify --deep --strict/);
+  }
 });
