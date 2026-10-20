@@ -51,6 +51,10 @@ cases = [
   ('node', ['bad name with spaces']),
   ('Google Chrome Helper (Renderer)', ['--type=renderer', '--secret=1']),
   ('node', []),
+  ('node', ['--token', 'ghp_' + 'A' * 36, 'app.js']),
+  ('node', ['--max-old-space-size', '4096', 'server.js']),
+  ('python3', ['-W', 'ignore', 'x.py']),
+  ('npx', ['-y', 'some-mcp-server']),
 ]
 print(json.dumps([m.proc_key(e, a) for e, a in cases]))
 `);
@@ -67,9 +71,35 @@ print(json.dumps([m.proc_key(e, a) for e, a in cases]))
     'node',
     'Google Chrome Helper (Renderer)',
     'node',
+    'node',
+    'node',
+    'python3',
+    'npx:some-mcp-server',
   ]);
   const text = JSON.stringify(k);
-  assert.doesNotMatch(text, /alice|SECRET|hunter2|secret|zzz/);
+  assert.doesNotMatch(text, /alice|SECRET|hunter2|secret|zzz|ghp_|4096|ignore/);
+});
+
+test('probe(Windows): MxKey も値付きオプションの値を鍵に入れない', { skip: process.platform !== 'win32' }, () => {
+  const fs = require('node:fs');
+  const src = fs.readFileSync(path.join(ROOT, 'probes', 'win_probe.ps1')).subarray(3).toString('ascii');
+  const start = src.indexOf('$mxInterp = ');
+  const end = src.indexOf('$mxGroups = @()');
+  assert.ok(start > 0 && end > start, 'MxKey の定義が見つからない');
+  const cases = [
+    ['node', ['--token', 'ghp_' + 'A'.repeat(36), 'app.js'], 'node'],
+    ['node', ['--max-old-space-size', '4096', 'server.js'], 'node'],
+    ['node', ['--max-old-space-size=4096', 'C:\\srv\\mcp-pdf-server\\dist\\index.js'], 'node:mcp-pdf-server'],
+    ['npx', ['-y', 'some-mcp-server'], 'npx:some-mcp-server'],
+    ['git', ['-c', 'core.fsmonitor=true', 'fsmonitor--daemon', 'run'], 'git:fsmonitor--daemon'],
+  ];
+  const q = (v) => `'${v.replace(/'/g, "''")}'`;
+  const calls = cases.map(([exe, args]) => `[Console]::WriteLine((MxKey ${q(exe)} @(${args.map(q).join(',')})))`).join('\n');
+  const script = `${src.slice(start, end)}\n${calls}`;
+  const enc = Buffer.from(script, 'utf16le').toString('base64');
+  const r = spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', enc], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(r.stdout.trim().split(/\r?\n/), cases.map((c) => c[2]));
 });
 
 test('probe: 本数・合計・孤児（PPID 1 / 親が居ない）・親・所有者を数える', () => {

@@ -114,6 +114,9 @@ INTERPRETERS = re.compile(r"^(node|nodejs|bun|deno|python3?(\.\d+)?|uv|uvx|npx|b
 LAUNCHERS = {"launchd", "login", "sshd", "sshd-session"}
 GENERIC_LABELS = {"index", "main", "cli", "server", "bin", "run", "app", "start", "dist", "build", "lib", "src", "out", "node_modules", "__main__"}
 SKIP_WORDS = {"exec", "run", "x", "dlx", "tool", "start"}
+# 値を取らないと分かっているオプション。ほかの「-」で始まる引数は次が値（トークンなど）かもしれないので、そこで読むのをやめる
+VALUELESS = {"-y", "--yes", "-q", "--quiet", "--silent", "-u", "-B", "-E", "-s", "-S", "-I", "-O", "-OO", "-i",
+             "--no-warnings", "--no-deprecation", "--trace-warnings", "--enable-source-maps", "--inspect", "--"}
 LABEL_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@+-]{0,47}$")
 GROUP_MIN_COUNT = 3
 
@@ -149,7 +152,12 @@ def proc_key(exe, tokens):
         if t in ("-c", "-C", "-r", "--require") and exe in ("git", "node"):
             i += 2
             continue
-        if t.startswith("-") or t in SKIP_WORDS:
+        if t.startswith("-"):
+            if "=" in t or t in VALUELESS:
+                i += 1
+                continue
+            break
+        if t in SKIP_WORDS:
             i += 1
             continue
         label = script_label(re.sub(r"(?<=.)@[^@/]*$", "", t))

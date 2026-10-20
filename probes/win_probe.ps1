@@ -117,6 +117,8 @@ $agents = @($list | Where-Object { $_.name -match '^(claude|codex|opencode|curso
 $mxInterp = '^(node|nodejs|bun|deno|python3?|py|uv|uvx|npx|bunx|npm|pnpm|ruby|java|javaw|git)$'
 $mxGeneric = @('index', 'main', 'cli', 'server', 'bin', 'run', 'app', 'start', 'dist', 'build', 'lib', 'src', 'out', 'node_modules', '__main__')
 $mxSkip = @('exec', 'run', 'x', 'dlx', 'tool', 'start')
+# Options known to take no value. Any other option may be followed by a value (a token etc.), so stop reading there.
+$mxValueless = @('-y', '--yes', '-q', '--quiet', '--silent', '-u', '-B', '-E', '-s', '-S', '-I', '-O', '-OO', '-i', '--no-warnings', '--no-deprecation', '--trace-warnings', '--enable-source-maps', '--inspect', '--')
 $mxLaunchers = @('explorer', 'services', 'wininit', 'winlogon', 'svchost', 'sihost', 'csrss', 'smss', 'userinit', 'System', 'Idle', 'sshd')
 function MxLabel([string]$path) {
   $parts = @($path -split '[\\/]+' | Where-Object { $_ })
@@ -143,7 +145,11 @@ function MxKey([string]$exe, [string[]]$tokens) {
     if ($t -ceq '-m' -and $i + 1 -lt $tokens.Count) { $label = MxLabel (($tokens[$i + 1] -split '\.')[0]); break }
     if ($t -ceq '-c' -and $exe -like 'python*') { break }
     if (($t -ceq '-c' -or $t -ceq '-C' -or $t -ceq '-r' -or $t -ceq '--require') -and ($exe -eq 'git' -or $exe -eq 'node')) { $i += 2; continue }
-    if ($t.StartsWith('-') -or ($mxSkip -contains $t)) { $i++; continue }
+    if ($t.StartsWith('-')) {
+      if ($t.Contains('=') -or ($mxValueless -ccontains $t)) { $i++; continue }
+      break
+    }
+    if ($mxSkip -contains $t) { $i++; continue }
     $label = MxLabel ($t -replace '(?<=.)@[^@/]*$', '')
     break
   }
