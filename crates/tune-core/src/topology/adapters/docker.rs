@@ -185,7 +185,7 @@ fn size(value: &Value) -> Option<String> {
     };
     // json-file uses FromHumanSize (decimal multipliers), not RAMInBytes.
     let bytes = amount * 1000_f64.powi(exponent);
-    (bytes.is_finite() && (1.0..9_223_372_036_854_775_808.0).contains(&bytes)).then(|| text.into())
+    (bytes.is_finite() && (0.0..9_223_372_036_854_775_808.0).contains(&bytes)).then(|| text.into())
 }
 fn numeric(value: &Value) -> Option<u64> {
     value.as_u64().or_else(|| value.as_str()?.parse().ok())

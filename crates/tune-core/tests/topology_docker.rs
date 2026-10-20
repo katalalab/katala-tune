@@ -318,7 +318,7 @@ fn docker_size_grammar_keeps_valid_numeric_units_and_rejects_private_text() {
         let packet = DockerPacket { engines: vec![DockerEngine { id: "e".repeat(64), containers: vec![c], networks: vec![], volumes: vec![] }] };
         assert!(packet.snapshot("test".into(), 1).is_ok(), "{size}");
     }
-    for size in ["private-token", "++1m", "1__0m", "0x1_p2m", "10\nm", "NaN m", "1e309m", "10  mb", "ggg", "0b", "1secret", "1234567890123456789012345b"] {
+    for size in ["private-token", "++1m", "1__0m", "0x1_p2m", "10\nm", "NaN m", "1e309m", "10  mb", "ggg", "-2b", "1secret", "1234567890123456789012345b"] {
         let row = json!({"id":"c","state":"running","health":null,"log_driver":"json-file","max_size":size,"mounts":[],"networks":[],"ports":[]});
         assert!(parse_container(&row).is_err(), "unsafe or invalid size accepted: {size:?}");
     }
@@ -403,4 +403,17 @@ fn image_mount_is_sanitized_without_asserting_a_volume_reference() {
     let output = serde_json::to_string(&snapshot).unwrap();
     assert!(!output.contains("private"));
     assert!(!output.contains("registry.invalid"));
+}
+#[test]
+fn local_zero_and_fractional_zero_log_sizes_remain_observed_policy_facts() {
+    use tune_core::topology::adapters::docker::{DockerEngine, DockerPacket};
+    for value in ["0", "0b", "0.1b", "0.0001k"] {
+        let c = parse_container(&json!({"id":"c","state":"running","health":null,"log_driver":"local","max_size":value,"mounts":[],"networks":[],"ports":[]}))
+            .expect("local logging accepts a nonnegative capacity, including a value truncated to zero");
+        assert_eq!(c.log_max_size.as_deref(), Some(value));
+        assert!(!c.log_unbounded_candidate);
+        assert_eq!(c.health, None);
+        let packet = DockerPacket { engines: vec![DockerEngine { id: "e".repeat(64), containers: vec![c], networks: vec![], volumes: vec![] }] };
+        assert_eq!(packet.snapshot("test".into(), 1).unwrap().status, ScopeStatus::Complete);
+    }
 }

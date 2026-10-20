@@ -174,3 +174,7 @@ following go-units; a retained -1 sentinel does not claim a valid new setting.
 
 Image mounts use the existing sanitized mount DTO: source/target hashes only,
 with no volume reference inference or additional Docker operation.
+
+Observed nonnegative numeric log capacities preserve zero and fractional values
+that truncate to zero. These are policy facts; health remains independently
+observed, and log candidates still require running json-file with missing size.
