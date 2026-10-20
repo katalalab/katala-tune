@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 use crate::js;
+use crate::topology::config::TopologyConfig;
 
 pub const EXAMPLE: &str = include_str!("../../../config/nodes.example.json");
 /// Electron の productName。userData（`app.getPath('userData')`）はこの名前のフォルダ
@@ -85,6 +86,11 @@ impl Node {
 
     pub fn get(&self, k: &str) -> Option<&Value> {
         self.raw.get(k)
+    }
+
+    /// Topology collector の私有 environment 設定。無ければ空で、collector は root を推測しない。
+    pub fn topology(&self) -> &Value {
+        self.raw.get("topology").unwrap_or(&Value::Null)
     }
 
     pub fn is_mac(&self) -> bool {
@@ -257,6 +263,7 @@ pub struct Config {
     pub protect: Vec<String>,
     pub fleet: Option<Fleet>,
     pub schedule: Option<Value>,
+    pub topology: TopologyConfig,
     pub file: Option<PathBuf>,
 }
 
@@ -297,6 +304,7 @@ pub fn parse_config(text: &str, file: &Path, host: &str) -> Result<Config, Strin
         protect,
         fleet,
         schedule: v.get("schedule").cloned(),
+        topology: TopologyConfig::from_value(v.get("topology")).map_err(|e| format!("{}: {e}", file.display()))?,
         file: Some(file.to_path_buf()),
     })
 }

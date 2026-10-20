@@ -16,7 +16,7 @@ function render({ cpu, probe = 'windows', fleet = false }) {
   let html = '';
   const UI = { section: () => '', head: () => '', search: () => '', select: () => '', seg: () => '', table: ({ rows, row }) => rows.map(row).join('') };
   const ctx = vm.createContext({
-    UI, esc: String, Charts: { dataBar: (n) => { assert.ok(Number.isFinite(n), 'unknown CPU must not draw a numeric bar'); return ''; } },
+    UI, esc: String, fmtTime: String, Charts: { dataBar: (n) => { assert.ok(Number.isFinite(n), 'unknown CPU must not draw a numeric bar'); return ''; } },
     state: { nodes: [{ id: 'test-node' }], results: { 'test-node': { ok: true, data } }, procFilter: { sort: 'cpu', q: '', node_id: '' } },
     ticket: () => {}, setCrumbs: () => {}, nodeOptions: () => [], page: (s) => { html = s; },
     bindSearch: () => {}, $: () => ({}), $$: () => [], data,

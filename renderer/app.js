@@ -43,6 +43,7 @@ const state = {
   jobFilter: { node_id: '', failing: false, q: '' },
   procFilter: { node_id: '', q: '', sort: 'cpu' },
   status: null,
+  overviewFilter: { q: '', os: '', status: 'all' },
 };
 
 // 非同期で描く画面が、待っている間に別の画面へ移ったら古い結果で上書きしない
@@ -73,19 +74,21 @@ function nodeDot(n) {
   return c.critical ? 'crit' : c.warn ? 'warn' : 'ok';
 }
 
-// 検索欄: 打ち終わってから描き直し、カーソルを末尾に戻す。待つ間に別の画面へ移っていたら、値だけ覚えて描き直さない
+// 検索欄: 値はすぐ覚え、打ち終わってから描き直して選択範囲を戻す。破棄済みの入力欄からは描き直さない
 function bindSearch(sel, view, apply, rerender, ms = 250) {
   let t;
   $(sel).oninput = (e) => {
     clearTimeout(t);
+    apply(e.target.value);
     t = setTimeout(async () => {
-      apply(e.target.value);
-      if (state.view !== view) return;
+      if (!e.target.isConnected || state.view !== view) return;
+      const selection = typeof e.target.selectionStart === 'number' ? [e.target.selectionStart, e.target.selectionEnd, e.target.selectionDirection] : null;
       await rerender();
       const i = $(sel);
-      if (i) { i.focus(); i.setSelectionRange(i.value.length, i.value.length); }
+      if (i) { i.focus({ preventScroll: true }); i.setSelectionRange(...(selection || [i.value.length, i.value.length])); }
     }, ms);
   };
+  return () => clearTimeout(t);
 }
 
 function page(html) { $('#page').innerHTML = `<div class="page-inner">${html}</div>`; }
@@ -174,7 +177,10 @@ function statusParts(c) {
   return [{ label: '異常', value: c.fail || 0, tone: 'crit' }, { label: '注意', value: c.warn || 0, tone: 'warn' }, { label: '正常', value: c.ok || 0, tone: 'ok' }, { label: '不明', value: c.unknown || 0, tone: 'unknown' }];
 }
 
-function cardHtml(n) {
+const COVERAGE_LABEL = { fresh: '新鮮', stale: '古い・時刻不明', failed: '取得失敗', missing: '未分析', excluded: '対象外' };
+const COVERAGE_TONE = { fresh: 'green', stale: 'orange', failed: 'red', missing: 'gray', excluded: 'gray' };
+
+function cardHtml(n, coverage) {
   const r = state.results[n.id];
   const d = r?.ok ? r.data : null;
   const fl = fleetNode(n.id);
@@ -188,7 +194,7 @@ function cardHtml(n) {
   const delta = cmp ? ` <span class="delta ${cmp.verdict}">${cmp.bench_ratio >= 1 ? '+' : ''}${((cmp.bench_ratio - 1) * 100).toFixed(0)}%</span>` : '';
   const tags = [n.local ? UI.chip('この機体', 'blue') : '', n.shared ? UI.chip('提案のみ', 'gray') : '', opChip(n)].join('');
   const sev = [c.critical ? UI.chip(`重大 ${c.critical}`, 'red') : '', c.warn ? UI.chip(`注意 ${c.warn}`, 'orange') : '', c.info ? UI.chip(`提案 ${c.info}`, 'blue') : '',
-    r?.ok && !c.critical && !c.warn ? UI.chip('良好', 'green') : ''].join('');
+    r?.ok && !c.critical && !c.warn && (!coverage || coverage === 'fresh') ? UI.chip('良好', 'green') : ''].join('');
   return `<div class="card${busy ? ' busy' : ''}" data-id="${esc(n.id)}" tabindex="0" role="button" aria-label="${esc(n.id)} の詳細を開く">
     <div class="card-top">
       <div class="card-id"><div class="card-name">${icon(osIcon(n))}<span>${esc(n.id)}</span></div>
@@ -201,34 +207,40 @@ function cardHtml(n) {
       ${Charts.meter(diskUsed, { label: 'ディスク', ...TH.disk, text: disk ? `空き ${disk.free_gb} GB` : diskUsed != null ? `${Math.round(diskUsed)}%` : '-' })}
     </div>
     <div class="card-hw">${esc(d ? `${d.host.cpu} · ${d.host.cores} スレッド · ${d.memory.total_gb} GB` : n.os === 'macos' ? 'macOS' : 'Windows')}</div>
-    <div class="card-foot">${sev}${d?.bench ? `<span title="1スレッドの固定計算。小さいほど速い">計測 ${esc(d.bench.median_ms)} ms${delta}</span>` : ''}
+    <div class="card-foot">${coverage ? UI.chip(COVERAGE_LABEL[coverage], COVERAGE_TONE[coverage]) : ''}${sev}${d?.bench ? `<span title="1スレッドの固定計算。小さいほど速い">計測 ${esc(d.bench.median_ms)} ms${delta}</span>` : ''}
       <span class="right">${busy ? '分析中…' : r ? esc(ago(r.at)) : '未分析'}</span></div>
     ${r && !r.ok ? `<div class="err"><b>分析できませんでした${r.reason_text ? `（${esc(r.reason_text)}）` : ''}</b>\n${esc(r.error)}</div>` : ''}
   </div>`;
 }
 
 function renderOverview() {
+  const focused = document.activeElement;
+  const focusAttr = $('#page').contains(focused) && ['id', 'data-coverage', 'data-overview-status', 'data-id', 'data-view-link', 'data-goto'].find(attr => focused?.hasAttribute(attr));
+  const focusValue = focusAttr ? focused.getAttribute(focusAttr) : null;
+  const selection = typeof focused?.selectionStart === 'number' ? [focused.selectionStart, focused.selectionEnd, focused.selectionDirection] : null;
   ticket();
-  const rs = state.nodes.map((n) => state.results[n.id]).filter((r) => r?.ok);
-  const all = rs.flatMap((r) => r.findings);
+  const sch = state.status?.schedule || state.cfg.schedule;
+  const coverage = Overview.summarize(state.nodes, state.results, sch);
+  const shown = Overview.select(coverage.rows, state.overviewFilter);
+  const rs = coverage.current;
+  const all = rs.flatMap((r) => r.findings || []);
   const crit = all.filter((f) => f.severity === 'critical').length;
   const warn = all.filter((f) => f.severity === 'warn').length;
-  const avg = rs.length ? Math.round(rs.reduce((s, r) => s + r.score, 0) / rs.length) : null;
+  const avg = coverage.average;
   const last = Math.max(0, ...rs.map((r) => r.at || 0));
   const fl = state.fleet?.summary;
   const sc = state.status?.counts;
-  const sch = state.status?.schedule || state.cfg.schedule;
   const worst = rs.length ? rs.reduce((a, b) => (b.score < a.score ? b : a)) : null;
   setCrumbs([{ icon: 'overview', label: '概要' }]);
   page(`
-    ${UI.head({ icon: 'overview', title: '概要', desc: `${state.nodes.length} 台の機体の状態と、優先して見るもの。${last ? `最終分析は ${fmtTime(last)}（${ago(last)}）` : 'まだ分析していません'}${sch ? `。自動スキャンは${sch.enabled ? ` ${sch.probe_minutes} 分ごと` : 'オフ'}` : ''}。` })}
+    ${UI.head({ icon: 'overview', title: '概要', desc: `${state.nodes.length} 台の機体の状態と、優先して見るもの。${last ? `最終分析は ${fmtTime(last)}（${ago(last)}）` : '新鮮な分析結果はありません'}${sch ? `。自動スキャンは${sch.enabled ? ` ${sch.probe_minutes} 分ごと` : 'オフ'}` : ''}。` })}
     ${state.cfg.example ? UI.callout({ tone: 'orange', icon: 'info', title: '機体台帳がまだ見本のままです', body: `サイドバー下の「台帳を開く」で <code>${esc(state.cfg.file)}</code> を開き、~/.ssh/config の Host 名で機体を書いてください。保存したら「全機を分析」で読み直します。` }) : ''}
     ${state.cfg.error ? UI.callout({ tone: 'red', icon: 'alert', title: '台帳を読めません', body: esc(state.cfg.error) }) : ''}
-    <div class="summary">
-      <div class="summary-gauge">${Charts.gauge(avg, { label: '平均スコア', sub: worst && worst.score < 80 ? `最低 ${worst.node_id} ${worst.score}` : '' })}</div>
+    <div class="summary overview-summary">
+      <div class="summary-gauge">${Charts.gauge(avg, { label: '新鮮な結果の平均', sub: worst && worst.score < 80 ? `最低 ${worst.node_id} ${worst.score}` : '' })}</div>
       <div>
         <div class="stats">
-          ${stat('分析済み', `${rs.length}<small>/ ${state.nodes.length} 台</small>`, { sub: rs.length < state.nodes.length ? `${state.nodes.length - rs.length} 台は結果なし` : 'すべての機体', ic: 'machine' })}
+          ${stat('新鮮な分析', `${rs.length}<small>/ 対象 ${coverage.target} 台</small>`, { sub: `台帳 ${state.nodes.length} 台・対象外 ${coverage.counts.excluded} 台`, ic: 'machine' })}
           ${stat('重大', String(crit), { cls: crit ? 'crit' : '', sub: crit ? `${new Set(rs.filter((r) => counts(r).critical).map((r) => r.node_id)).size} 台` : 'なし', ic: 'alert' })}
           ${stat('注意', String(warn), { cls: warn ? 'warn' : '', sub: warn ? `${new Set(rs.filter((r) => counts(r).warn).map((r) => r.node_id)).size} 台` : 'なし', ic: 'info' })}
           ${fl ? stat('katala-fleet 要対応', esc(fl.attention), { ic: 'fleet' }) : ''}
@@ -236,19 +248,51 @@ function renderOverview() {
         ${sc ? `<div class="breakdown"><div class="bd-head"><span>状態の内訳（全機体とアプリの機能）</span><button class="link" data-view-link="status">「状態」を開く</button></div>${Charts.stacked(statusParts(sc), { label: '状態の内訳' })}</div>` : ''}
       </div>
     </div>
-    ${UI.section('機体', 'クリックで詳細')}
-    <div class="gallery">${state.nodes.map(cardHtml).join('')}</div>
-    ${crit + warn ? `${UI.section('優先して見るもの', '重大と注意。クリックで機体の所見へ')}${topFindings()}` : ''}`);
+    <section class="overview-coverage">
+    ${UI.section('分析の取得状況', `新鮮の基準は ${coverage.freshMinutes} 分以内（分析間隔の3倍）。古い結果と対象外は平均・所見件数に含めません`)}
+    <div class="coverage" role="group" aria-label="分析の取得状況で絞り込む">
+      ${Object.entries(coverage.counts).map(([key, count]) => `<button class="coverage-item tone-${COVERAGE_TONE[key]}" data-coverage="${key}" aria-pressed="${state.overviewFilter.status === key}"><span>${esc(COVERAGE_LABEL[key])}</span><b>${count}<small> 台</small></b></button>`).join('')}
+    </div>
+    </section>
+    ${UI.section('機体', 'クリックで詳細。検索と絞り込みは平均・全体の件数を変えません')}
+    <div class="filters">
+      ${UI.search({ id: 'overviewQ', label: '機体の検索', placeholder: '機体名・役割で検索', value: state.overviewFilter.q })}
+      ${UI.select({ id: 'overviewOS', label: 'OS', options: [['', 'すべてのOS'], ['macos', 'macOS'], ['windows', 'Windows']], value: state.overviewFilter.os })}
+      ${UI.seg({ attr: 'overview-status', options: [['all', 'すべて'], ['attention', '要対応']], value: state.overviewFilter.status })}
+      <span class="count" role="status">${shown.length} / ${state.nodes.length} 台</span>
+      <button class="btn ghost" id="overviewReset">絞り込みを解除</button>
+    </div>
+    ${shown.length ? `<div class="gallery">${shown.map(({ node, status }) => cardHtml(node, status)).join('')}</div>` : UI.empty(state.nodes.length ? '条件に一致する機体はありません。絞り込みを解除すると全機体を表示します。' : '台帳に機体がありません。「台帳を開く」から設定してください。')}
+    ${crit + warn ? `${UI.section('優先して見るもの', '新鮮な対象結果の重大と注意。クリックで機体の所見へ')}${topFindings(coverage.rows.filter(r => r.status === 'fresh').map(r => r.node.id))}` : ''}`);
   $$('.card').forEach((el) => {
     el.onclick = () => go('node:' + el.dataset.id);
     el.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go('node:' + el.dataset.id); } };
   });
   $$('[data-view-link]').forEach((el) => { el.onclick = () => go(el.dataset.viewLink); });
+  const cancelSearch = bindSearch('#overviewQ', 'overview', q => { state.overviewFilter.q = q; }, renderOverview);
+  const filter = (patch, focus) => {
+    cancelSearch();
+    state.overviewFilter = { ...state.overviewFilter, q: $('#overviewQ').value, ...patch };
+    renderOverview();
+    $(focus)?.focus();
+  };
+  $('#overviewOS').onchange = e => filter({ os: e.target.value }, '#overviewOS');
+  $$('[data-coverage]').forEach(el => { el.onclick = () => filter({ status: state.overviewFilter.status === el.dataset.coverage ? 'all' : el.dataset.coverage }, `[data-coverage="${el.dataset.coverage}"]`); });
+  $$('[data-overview-status]').forEach(el => {
+    el.setAttribute('aria-pressed', String(state.overviewFilter.status === el.dataset.overviewStatus));
+    el.onclick = () => filter({ status: el.dataset.overviewStatus }, `[data-overview-status="${el.dataset.overviewStatus}"]`);
+  });
+  $('#overviewReset').onclick = () => filter({ q: '', os: '', status: 'all' }, '#overviewQ');
   bindGoto();
+  if (focusAttr) {
+    const next = $(`#page [${focusAttr}="${CSS.escape(focusValue)}"]`);
+    next?.focus({ preventScroll: true });
+    if (next && selection) next.setSelectionRange(...selection);
+  }
 }
 
-function topFindings() {
-  const items = state.nodes.flatMap((n) => (state.results[n.id]?.findings || []).filter((f) => f.severity !== 'info').map((f) => ({ n, f })));
+function topFindings(ids = state.nodes.map(n => n.id)) {
+  const items = state.nodes.filter(n => ids.includes(n.id)).flatMap((n) => (state.results[n.id]?.findings || []).filter((f) => f.severity !== 'info').map((f) => ({ n, f })));
   items.sort((a, b) => (a.f.severity === 'critical' ? 0 : 1) - (b.f.severity === 'critical' ? 0 : 1));
   return `<div class="list">${items.slice(0, 12).map(({ n, f }) => `<div class="li" data-goto="${esc(n.id)}" tabindex="0">
       ${UI.chip(SEV_LABEL[f.severity], SEV_TONE[f.severity])}
@@ -402,14 +446,33 @@ function procsHtml(d) {
     })}
     ${UI.section('CPU 上位', win ? '2点間のCPU使用率と起動からの平均' : 'ps の直近平均')}
     ${UI.table({
-      cols: [{ label: 'PID', cls: 'n' }, { label: '名前' }, { label: 'CPU', cls: 'n', width: '22%' }, win ? { label: '平均', cls: 'n' } : { label: '起動から' }, { label: 'メモリ', cls: 'n' }],
-      rows: p.top_cpu,
+      cols: [{ label: 'PID', cls: 'n' }, { label: '名前' }, { label: 'CPU', cls: 'n', width: '22%' }, win ? { label: '平均', cls: 'n' } : { label: '起動から' }, { label: 'Working set / RSS', cls: 'n' }, { label: 'CPU秒 / Private MiB', cls: 'n' }, { label: 'Handle / Thread', cls: 'n' }],
+      cls: 'scroll-x', rows: p.top_cpu,
       row: (x) => `<td class="n muted">${esc(x.pid)}</td><td>${esc(x.name)}${x.app && x.app !== x.name ? ` <span class="muted">· ${esc(x.app)}</span>` : ''}</td>`
         + `<td class="n">${cpuOf(x) == null ? '—' : cpuOf(x).toFixed(0) + '%' + Charts.dataBar(cpuOf(x), maxCpu, { tone: cpuOf(x) >= 80 ? 'warn' : 'neutral' })}</td>`
-        + `${win ? `<td class="n">${esc(x.avg_core ?? '-')}%</td>` : `<td class="muted">${esc(x.etime)}</td>`}<td class="n">${esc(x.mem_mb)} MB</td>`,
+        + `${win ? `<td class="n">${esc(x.avg_core ?? '-')}%</td>` : `<td class="muted">${esc(x.etime)}</td>`}<td class="n">${esc(x.mem_mb ?? '未取得')} MiB</td><td class="n">${esc(x.cpu_seconds ?? '未取得')} s / ${esc(x.private_mb ?? '未取得')}</td><td class="n">${esc(x.handle_count ?? '未取得')} / ${esc(x.thread_count ?? '未取得')}</td>`,
     })}
     <p class="note-line">全 ${esc(p.count ?? '-')} プロセス · AI エージェント ${esc(p.agent_processes ?? '-')}</p>
+    <p class="note-line">${esc(p.source || 'legacy snapshot')} · ${esc(fmtTime(p.sampled_at))} · CPU秒は起動からの累積です。Privateはプロセス専用のコミット量で、常駐量とは別です。一部の詳細は取得元の制約で未取得です。</p>
     ${wslHtml(d)}`;
+}
+
+function gpuHtml(g) {
+  const val = (v, unit = "") => v == null ? '未取得' : `${esc(v)}${unit}`;
+  const shared = g.memory_kind === 'unified';
+  const statuses = {available:'取得済み',partial:'一部未取得',unavailable:'取得失敗',unsupported:'未対応','not-applicable':'専用VRAM対象外'};
+  const status = statuses[g.memory_status] || '以前の分析結果';
+  const reason = g.memory_reason ? (shared ? 'CPUとGPUが統合メモリを共有しています' : /timeout/.test(g.memory_reason) ? '取得時間の上限を超えました' : /driver/.test(g.memory_reason) ? 'ドライバーから一部の値を取得できません' : /not-found|unsupported|provider/.test(g.memory_reason) ? '対応する専用VRAMの取得元がありません' : 'GPUの情報を取得できませんでした') : '';
+  const pct = g.mem_used_pct ?? (g.mem_used_mb != null && g.mem_total_mb > 0 ? g.mem_used_mb / g.mem_total_mb * 100 : null);
+  const memory = shared ? '統合メモリ共有・専用VRAM該当なし' : `${val(g.mem_used_mb)} / ${val(g.mem_total_mb)} MiB · 空き ${val(g.mem_free_mb)} MiB · ${pct == null ? '使用率未取得' : `${pct.toFixed(1)}%`}`;
+  return `<div class="gpu"><div class="gpu-name">${esc(g.name || 'GPU')}<span class="faint">${g.adapter_index != null ? `GPU ${esc(g.adapter_index)} · ` : ''}driver ${esc(g.driver ?? '未取得')}</span></div><div class="meter-list">
+    ${Charts.meter(g.util, { label: 'GPU使用率', text: val(g.util, '%') })}
+    ${Charts.meter(pct, { label: 'VRAM', warn: 90, text: memory })}
+    ${Charts.meter(g.temp_c, { label: '温度', warn: 80, crit: 85, text: val(g.temp_c, '°C') })}
+    ${Charts.meter(g.power_w != null && g.power_limit_w > 0 ? g.power_w / g.power_limit_w * 100 : null, { label: '電力', text: `${val(g.power_w)} / ${val(g.power_limit_w)} W` })}</div>
+    <p class="note-line">${esc(status)} · ${esc(fmtTime(g.sampled_at))}${reason ? ` · ${esc(reason)}` : ''}</p>
+    <details><summary>取得元・クロック・取得できない項目</summary><p class="note-line">Clock (MHz): Graphics ${val(g.clocks_graphics_mhz)} / SM ${val(g.clocks_sm_mhz)} / Memory ${val(g.clocks_memory_mhz)} · ${esc(g.pstate ?? 'P-state未取得')} · ${esc(g.source ?? '取得元不明')} · ${esc(g.memory_status ?? 'legacy snapshot')}${g.memory_reason ? ` · ${esc(g.memory_reason)}` : ''}</p>
+    <p class="note-line">GPU別のプロセスメモリは未収集です。WDDMのN/Aを0として扱わず、compute-appsはCUDAのみを表します。${esc(g.sensor_reason || '')}</p></details></div>`;
 }
 
 function machineHtml(d, r) {
@@ -436,11 +499,7 @@ function machineHtml(d, r) {
     label: x.mount, ...((x.mount === '/' || /^C:/i.test(x.mount)) ? TH.disk : { warn: 90 }),
     text: `空き ${x.free_gb} / ${x.total_gb} GB${x.raw_free_gb != null ? `（即時 ${x.raw_free_gb}）` : ''}`,
   })).join('');
-  const gpus = (d.gpus || []).map((g) => `<div class="gpu"><div class="gpu-name">${esc(g.name)}<span class="faint">driver ${esc(g.driver)}</span></div><div class="meter-list">
-      ${Charts.meter(g.util, { label: '使用率', text: `${g.util}%` })}
-      ${Charts.meter(g.mem_total_mb ? (g.mem_used_mb / g.mem_total_mb) * 100 : null, { label: 'メモリ', warn: 90, text: `${g.mem_used_mb} / ${g.mem_total_mb} MB` })}
-      ${Charts.meter(g.temp_c, { label: '温度', warn: 80, crit: 85, text: `${g.temp_c}°C` })}
-      ${Charts.meter(g.power_w != null && g.power_limit_w > 0 ? (g.power_w / g.power_limit_w) * 100 : null, { label: '電力', text: `${g.power_w ?? '未取得'} / ${g.power_limit_w ?? '未取得'} W` })}</div><p class="note-line">Clock (MHz): Graphics ${esc(g.clocks_graphics_mhz ?? '未取得')} / SM ${esc(g.clocks_sm_mhz ?? '未取得')} / Memory ${esc(g.clocks_memory_mhz ?? '未取得')} · ${esc(g.pstate || 'P-state未取得')} · ${esc(g.source || '取得元不明')}</p></div>`).join('');
+  const gpus = (d.gpus || []).map(gpuHtml).join('');
   return `${UI.props(rows.map(([k, v]) => [k, `<span class="pre">${esc(v)}</span>`]))}
     ${disks ? `${UI.section('ディスク', '使用率。macOS は実効の空き（自動で空く分を含む）')}<div class="meter-list wide">${disks}</div>` : ''}
     ${gpus ? `${UI.section('GPU', '分析した瞬間の値')}${gpus}` : ''}<button class="btn small" data-power-view>電力の計算条件と設定を開く</button>`;
@@ -455,17 +514,22 @@ async function historyHtml(id) {
   const last = h.slice(-40);
   const pts = (k) => last.map((x) => ({ t: x.at, v: x[k] }));
   const latest = last.at(-1);
+  const adapters = [...new Set(last.flatMap(x => (x.gpus || []).map((g,i) => g.uuid || `index:${g.adapter_index ?? i}`)))];
+  const gpuOf = (x,id) => (x.gpus || []).find((g,i) => (g.uuid || `index:${g.adapter_index ?? i}`) === id);
+  const gpuHistory = adapters.map(id => { const g = [...last].reverse().map(x => gpuOf(x,id)).find(Boolean); return box(`${g.name || 'GPU'} VRAM`, 'MiB・adapter別', Charts.line(last.map(x => ({t:x.at,v:gpuOf(x,id)?.mem_used_mb ?? null})), {unit:'MiB',tone:'info',min:0,label:'VRAM使用量'})); }).join('');
   return `<div class="charts">
       ${box('スコア', '100 点満点', Charts.line(pts('score'), { min: 0, max: 100, tone: Charts.scoreTone(latest.score), marks: [{ v: 80, tone: 'ok' }, { v: 55, tone: 'warn' }], better: 'high', label: 'スコア' }))}
       ${box('計測', 'ms', Charts.line(pts('bench_ms'), { unit: 'ms', tone: 'accent', better: 'low', label: '計測' }))}
       ${box('CPU 使用率', '%', Charts.line(pts('cpu'), { unit: '%', min: 0, max: 100, tone: 'info', marks: [{ v: TH.cpu.crit, tone: 'crit' }, { v: TH.cpu.warn, tone: 'warn' }], label: 'CPU 使用率' }))}
       ${box('空きメモリ', '%', Charts.line(pts('mem_avail'), { unit: '%', min: 0, max: 100, tone: 'info', marks: [{ v: 20, tone: 'warn' }, { v: 10, tone: 'crit' }], better: 'high', label: '空きメモリ' }))}
+      ${gpuHistory}
     </div>
     ${UI.section('直近の分析', `${last.length} 回・新しい順`)}
     ${UI.table({
-      cols: [{ label: '日時' }, { label: 'スコア', cls: 'n' }, { label: '計測', cls: 'n' }, { label: 'CPU', cls: 'n' }, { label: '空きメモリ', cls: 'n' }, { label: 'swap', cls: 'n' }, { label: '重大 / 注意', cls: 'n' }],
-      rows: last.slice().reverse(),
+      cols: [{ label: '日時' }, { label: 'スコア', cls: 'n' }, { label: '計測', cls: 'n' }, { label: 'CPU', cls: 'n' }, { label: '空きメモリ', cls: 'n' }, { label: 'swap', cls: 'n' }, { label: 'VRAM used / total / free (MiB)' }, { label: 'Process / Thread / Handle' }, { label: '重大 / 注意', cls: 'n' }],
+      cls: 'scroll-x', rows: last.slice().reverse(),
       row: (x) => `<td class="muted">${esc(fmtTime(x.at))}</td><td class="n"><b class="${scoreClass(x.score)}">${esc(x.score ?? '-')}</b></td><td class="n">${withUnit(x.bench_ms, ' ms')}</td><td class="n">${withUnit(x.cpu, '%')}</td><td class="n">${withUnit(x.mem_avail, '%')}</td><td class="n">${withUnit(x.swap_gb, ' GB')}</td>`
+        + `<td>${(x.gpus || []).map(g => `${esc(g.name || 'GPU')}: ${g.memory_kind === 'unified' ? '統合メモリ共有・専用VRAM該当なし' : `${esc(g.mem_used_mb ?? '未取得')} / ${esc(g.mem_total_mb ?? '未取得')} / ${esc(g.mem_free_mb ?? '未取得')} · ${esc(g.mem_used_pct ?? '未取得')}%`}`).join('<br>')}</td><td>${esc(x.process_count ?? '未取得')} / ${esc(x.thread_count ?? '未取得')} / ${esc(x.handle_count ?? '未取得')}</td>`
         + `<td class="n">${x.critical ? `<span class="sc-crit">${x.critical}</span>` : '0'} / ${x.warn ? `<span class="sc-warn">${x.warn}</span>` : '0'}</td>`,
     })}`;
 }
@@ -961,6 +1025,14 @@ window.tune.onChecksUpdated(() => {
   }, 400);
 });
 window.tune.onNavigate((v) => go(v));
+
+// 収集通知がない間も鮮度を更新する。再描画時に操作中のフォーカスと選択範囲を戻す。
+function refreshOverview() {
+  if (state.cfg && state.view === 'overview' && document.visibilityState === 'visible') renderOverview();
+}
+setInterval(refreshOverview, 60000);
+document.addEventListener('visibilitychange', refreshOverview);
+
 
 window.tune.onProbeResult((r) => {
   state.results[r.node_id] = r;

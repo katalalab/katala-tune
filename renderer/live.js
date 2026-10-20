@@ -135,10 +135,17 @@ const Live = (() => {
       row('ネット', [ser('rx', 'info'), ser('tx', 'alt')], opt({ label: 'ネットワークの送受信', floor: 1e5 }), `<span class="rd">受 ${rate(last.rx)}</span><span class="wr">送 ${rate(last.tx)}</span>`),
       row('CPU電力', [ser('power_cpu_w','info')], opt({label:'CPU package電力'}),num(last.power_cpu_w) ? `${last.power_cpu_w.toFixed(1)} W` : '未取得'),
       row('GPU電力', [ser('power_gpu_w','info')], opt({label:'GPU電力'}),num(last.power_gpu_w) ? `${last.power_gpu_w.toFixed(1)} W` : '未取得', gpu ? `Graphics ${num(gpu.clocks_graphics_mhz) ? gpu.clocks_graphics_mhz : '未取得'} MHz · Memory ${num(gpu.clocks_memory_mhz) ? gpu.clocks_memory_mhz : '未取得'} MHz` : ''),
-      gpu || pts.some((p) => num(p.gpu))
-        ? row('GPU', [ser('gpu', 'info')], opt({ min: 0, max: 100, label: 'GPU 使用率' }), pctText(pts.filter((p) => num(p.gpu)).at(-1)?.gpu),
-          gpu && num(gpu.mem_total_mb) ? `${big ? 'メモリ ' : ''}${(gpu.mem_used_mb / 1024).toFixed(1)} / ${(gpu.mem_total_mb / 1024).toFixed(1)} GB` : '')
-        : '',
+      ...(s.gpus || []).map((g) => {
+        const id = g.adapter_index ?? '?';
+        const k = g.storage_slot == null ? null : `gpu_${g.storage_slot}_vram_pct`;
+        const status = {available:'取得済み',partial:'一部未取得',unavailable:'取得失敗',unsupported:'未対応','not-applicable':'専用VRAM対象外'}[g.memory_status] || '以前の分析結果';
+        const identityReason = {'adapter-index-out-of-range':'GPU番号が保存範囲（0〜15）外', 'duplicate-adapter-index':'GPU番号が重複', 'missing-adapter-index':'GPU番号が未取得'}[g.memory_reason];
+        const reason = identityReason ? ` · ${identityReason}` : !g.memory_reason || g.memory_kind === 'unified' ? '' : /timeout/.test(g.memory_reason) ? ' · 取得時間の上限超過' : ' · 対応する取得元・ドライバー情報が未取得';
+        const memory = g.memory_kind === 'unified' ? '統合メモリ共有・専用VRAM該当なし'
+          : `${num(g.mem_used_mb) ? g.mem_used_mb : '未取得'} / ${num(g.mem_total_mb) ? g.mem_total_mb : '未取得'} MiB · 空き ${num(g.mem_free_mb) ? g.mem_free_mb : '未取得'} MiB`;
+        return row(`GPU ${id} ${g.name || ''}`, [ser(k, 'info')], opt({min:0,max:100,label:'VRAM容量使用率'}), pctText(last[k]),
+          `${esc(memory)} · GPU負荷 ${num(g.util) ? g.util + '%' : '未取得'} · ${num(g.temp_c) ? g.temp_c + '°C' : '温度未取得'} · ${esc(g.source || '取得元不明')} · ${esc(status)}${reason} · ${g.sampled_at ? esc(new Date(g.sampled_at).toLocaleTimeString('ja-JP')) : '時刻未取得'}<details><summary>取得できない項目</summary>${esc(g.memory_reason || 'なし')} · プロセス別VRAM未収集（WDDM N/A、compute-appsはCUDAのみ）</details>`);
+      }),
     ].join('');
     const lag = median(pts.slice(-30).map((p) => p.lag));
     const foot = `<div class="lv-foot">${num(s.load) ? `<span title="このサンプラー自身の CPU（1 コア換算）。macOS は ps の分を含む">サンプラー ${s.load < 1 ? s.load.toFixed(2) : s.load.toFixed(1)}%${num(s.rss_mb) ? ` · ${Math.round(s.rss_mb)} MB` : ''}</span>` : ''}`

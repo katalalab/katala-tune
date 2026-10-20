@@ -77,9 +77,12 @@ impl Store {
     /// 推移（古い順）。グラフは画面でこの点を描くだけ
     pub fn history(&self, node_id: &str, n: i64) -> Result<Vec<Value>> {
         let mut st = self.conn.prepare_cached(
-            "SELECT at, score, bench_ms, cpu, mem_avail, swap_gb, critical, warn FROM tune_snapshots WHERE node_id = ? ORDER BY at DESC LIMIT ?",
+            "SELECT at, score, bench_ms, cpu, mem_avail, swap_gb, critical, warn, json(COALESCE(json_extract(data, '$.gpus'), '[]')) AS gpus, json_extract(data, '$.processes.count') AS process_count, json_extract(data, '$.processes.threads') AS thread_count, json_extract(data, '$.processes.handles') AS handle_count FROM tune_snapshots WHERE node_id = ? ORDER BY at DESC LIMIT ?",
         )?;
         let mut rows = st.query_map(params![node_id, n], row_json)?.collect::<Result<Vec<_>>>()?;
+        for row in &mut rows {
+            row["gpus"] = row["gpus"].as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or_else(|| serde_json::json!([]));
+        }
         rows.reverse();
         Ok(rows)
     }

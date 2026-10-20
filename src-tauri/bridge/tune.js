@@ -77,6 +77,10 @@
     monitorSettings: (patch) => invoke('monitor_settings', { patch: patch ?? null }),
     hubPull: () => invoke('hub_pull'),
     onMonitor: (fn) => { listen('monitor', (p) => fn(p)); },
+    topologyView: () => invoke('topology_view'),
+    topologyRefresh: () => invoke('topology_refresh'),
+    topologyExport: (view, format) => invoke('topology_export', { view: String(view || 'all'), format: String(format || 'json') }),
+    onTopologyUpdated: (fn) => { listen('topology-updated', (p) => fn(p)); },
     // 「接続」（Tauri 版だけ）: tune-agent とのペアリングと、ペア済みの機体の一覧。コードは引数で渡すだけで、どこにも残さない
     agentPeers: () => invoke('agent_peers'),
     agentPair: (addr, code) => invoke('agent_pair', { addr: String(addr || ''), code: String(code || '') }),

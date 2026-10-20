@@ -17,6 +17,7 @@ mod agent;
 mod commands;
 mod commands_netsec;
 mod commands_tools;
+mod commands_topology;
 mod confirm;
 mod live;
 mod monitor;
@@ -71,6 +72,9 @@ impl Host for TauriHost {
     }
     fn ai_synced(&self, r: &Value) {
         let _ = self.app.emit("ai-synced", r);
+    }
+    fn topology_updated(&self, receipt: &Value) {
+        let _ = self.app.emit("topology-updated", receipt);
     }
 }
 
@@ -132,6 +136,9 @@ pub fn run() {
             commands::set_schedule,
             commands::set_login,
             commands::dev_report,
+            commands_topology::topology_view,
+            commands_topology::topology_refresh,
+            commands_topology::topology_export,
             commands_tools::inventory,
             commands_tools::inventory_run,
             commands_tools::dogu_refresh,

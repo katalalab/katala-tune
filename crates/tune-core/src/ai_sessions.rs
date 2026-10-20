@@ -115,7 +115,7 @@ pub enum Fetched {
     Error(String),
 }
 
-fn missing_python(r: &RunResult) -> bool {
+pub(crate) fn missing_python(r: &RunResult) -> bool {
     let e = format!("{}\n{}", r.err, r.out);
     r.out.contains(NO_PYTHON)
         || (r.code.is_none() && e.contains("Error: spawn"))

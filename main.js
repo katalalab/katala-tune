@@ -242,6 +242,8 @@ ipcMain.handle('ledger', () => {
 
 ipcMain.handle('last', () => cfg.nodes.map((n) => {
   const [last, prev] = db.lastSnapshots(n.id, 2);
+  const error = db.probeError(n.id, last?.at ?? null);
+  if (error) return { node_id: n.id, ok: false, at: db.getMeta(`probeFailure:${n.id}`).at, error, stale: true };
   if (!last) return null;
   return { ...enrich({ node_id: n.id, ok: true, data: last.data, at: last.at, wall_s: last.wall_s }, prev?.data), stale: true };
 }).filter(Boolean));

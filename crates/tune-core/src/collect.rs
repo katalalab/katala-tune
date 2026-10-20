@@ -148,6 +148,118 @@ pub async fn run(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Dura
     RunResult { code: status.and_then(|s| s.code()), out: decode(&out), err: decode(&err) + &extra }
 }
 
+/// Bounded binary transport used by topology collection. It never formats raw
+/// output because manifests and command errors may contain private material.
+#[derive(Default)]
+pub struct BoundedResult {
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub timed_out: bool,
+    pub output_limited: bool,
+    pub spawn_failed: bool,
+}
+
+/// Explicit process environment for a bounded transport invocation.
+pub struct BoundedEnvironment<'a> {
+    pub set: &'a [(&'a str, &'a str)],
+    pub remove: &'a [&'a str],
+}
+
+pub async fn run_bounded(cmd: &str, args: &[String], input: &[u8], timeout: Duration, stdout_limit: usize, stderr_limit: usize) -> BoundedResult {
+    run_bounded_with_env(cmd, args, input, timeout, stdout_limit, stderr_limit, &[]).await
+}
+
+pub async fn run_bounded_with_env(
+    cmd: &str,
+    args: &[String],
+    input: &[u8],
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    env: &[(&str, &str)],
+) -> BoundedResult {
+    run_bounded_with_env_clean(cmd, args, input, timeout, stdout_limit, stderr_limit, BoundedEnvironment { set: env, remove: &[] }).await
+}
+
+/// Run with explicit values while removing inherited variables that could alter
+/// the target selected by a read-only collector.
+pub async fn run_bounded_with_env_clean(
+    cmd: &str,
+    args: &[String],
+    input: &[u8],
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    environment: BoundedEnvironment<'_>,
+) -> BoundedResult {
+    let mut command = command(cmd);
+    command.envs(environment.set.iter().copied());
+    for key in environment.remove {
+        command.env_remove(key);
+    }
+    command.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let Ok(mut child) = command.spawn() else {
+        return BoundedResult { spawn_failed: true, ..Default::default() };
+    };
+    let input = input.to_vec();
+    let mut stdin = child.stdin.take();
+    let writer = tokio::spawn(async move {
+        if let Some(pipe) = stdin.as_mut() {
+            let _ = pipe.write_all(&input).await;
+            let _ = pipe.shutdown().await;
+        }
+    });
+    let (signal, mut exceeded) = tokio::sync::mpsc::channel(2);
+    let (stdout, read_out) = read_bounded(child.stdout.take(), stdout_limit, signal.clone());
+    let (stderr, read_err) = read_bounded(child.stderr.take(), stderr_limit, signal);
+    let mut answer = BoundedResult::default();
+    let status = tokio::select! {
+        status = child.wait() => status.ok(),
+        _ = tokio::time::sleep(timeout) => { answer.timed_out = true; let _ = child.start_kill(); child.wait().await.ok() },
+        Some(()) = exceeded.recv() => { answer.output_limited = true; let _ = child.start_kill(); child.wait().await.ok() },
+    };
+    let deadline = tokio::time::Instant::now() + PIPE_GRACE;
+    for mut task in [writer, read_out, read_err] {
+        if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    answer.output_limited |= exceeded.try_recv().is_ok();
+    answer.code = status.and_then(|status| status.code());
+    answer.stdout = std::mem::take(&mut *lock_buf(&stdout));
+    answer.stderr = std::mem::take(&mut *lock_buf(&stderr));
+    answer
+}
+
+fn read_bounded<R: AsyncRead + Unpin + Send + 'static>(pipe: Option<R>, limit: usize, signal: tokio::sync::mpsc::Sender<()>) -> (SharedBuf, JoinHandle<()>) {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let buffer = Arc::clone(&output);
+    let task = tokio::spawn(async move {
+        let Some(mut pipe) = pipe else {
+            return;
+        };
+        let mut chunk = [0u8; 8192];
+        while let Ok(count) = pipe.read(&mut chunk).await {
+            if count == 0 {
+                break;
+            }
+            let overflow = {
+                let mut bytes = lock_buf(&buffer);
+                let room = limit.saturating_sub(bytes.len());
+                bytes.extend_from_slice(&chunk[..count.min(room)]);
+                count > room
+            };
+            if overflow {
+                let _ = signal.try_send(());
+                break;
+            }
+        }
+    });
+    (output, task)
+}
+
 pub type RunFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = RunResult> + Send + 'a>>;
 
 /// 子プロセスの実行口。本物は [`System`]、テストは偽の ssh に差し替える（呼び出しを数え、台本どおりの結果を返す）
@@ -628,6 +740,31 @@ mod tests {
         assert!(SSH_OPTS.contains(&"-T"));
         assert!(SSH_OPTS.contains(&"ControlMaster=no"));
         assert!(SSH_OPTS.contains(&"ControlPath=none"));
+    }
+
+    #[tokio::test]
+    async fn bounded_clean_environment_removes_git_checkout_overrides() {
+        if cfg!(windows) {
+            return;
+        }
+        let result = run_bounded_with_env_clean(
+            "/usr/bin/env",
+            &[],
+            b"",
+            Duration::from_secs(2),
+            16 * 1024,
+            1024,
+            BoundedEnvironment {
+                set: &[("GIT_DIR", "poisoned-directory"), ("GIT_CONFIG_COUNT", "1"), ("SAFE_BOUNDARY", "kept")],
+                remove: &["GIT_DIR", "GIT_CONFIG_COUNT"],
+            },
+        )
+        .await;
+        assert_eq!(result.code, Some(0));
+        let output = String::from_utf8(result.stdout).unwrap();
+        assert!(!output.contains("GIT_DIR="));
+        assert!(!output.contains("GIT_CONFIG_COUNT="));
+        assert!(output.contains("SAFE_BOUNDARY=kept"));
     }
 
     #[tokio::test]

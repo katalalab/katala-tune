@@ -38,6 +38,8 @@ pub trait Host: Send + Sync + 'static {
     fn inventory_result(&self, _r: &Value) {}
     /// 1台の AI エージェントのセッションの取り込みが終わった（画面の `onAiSynced`）
     fn ai_synced(&self, _r: &Value) {}
+    /// Topology の定期更新が終わった。UI は receipt を読んで再表示する。
+    fn topology_updated(&self, _receipt: &Value) {}
 }
 
 /// 何もしない Host（CLI・テスト用）
@@ -60,6 +62,7 @@ pub struct Engine {
     data_dir: PathBuf,
     probing: AtomicBool,
     syncing: AtomicBool,
+    pub(crate) topology_refreshing: AtomicBool,
     last_probe_error: Mutex<HashMap<String, String>>,
     fleet: Mutex<(Option<Value>, Option<i64>)>,
     action_targets: Mutex<HashSet<String>>,
@@ -128,6 +131,7 @@ impl Engine {
             data_dir,
             probing: AtomicBool::new(false),
             syncing: AtomicBool::new(false),
+            topology_refreshing: AtomicBool::new(false),
             last_probe_error: Mutex::new(HashMap::new()),
             fleet: Mutex::new((None, None)),
             action_targets: Mutex::new(HashSet::new()),
@@ -250,6 +254,11 @@ impl Engine {
         let mut out = Vec::new();
         for n in &cfg.nodes {
             let snaps = db.last_snapshots(&n.id, 2).map_err(|e| e.to_string())?;
+            if let Some(error) = db.probe_error(&n.id, snaps.first().map(|s| s.at)).map_err(|e| e.to_string())? {
+                let at = db.get_meta(&format!("probeFailure:{}", n.id)).map_err(|e| e.to_string())?.and_then(|v| v["at"].as_i64());
+                out.push(json!({ "node_id": n.id, "ok": false, "at": at, "error": error, "stale": true }));
+                continue;
+            }
             let Some(last) = snaps.first() else { continue };
             let data = crate::netsec::snapshot_for_node(last.data.clone(), &n.raw);
             let prev_data = snaps.get(1).map(|s| crate::netsec::snapshot_for_node(s.data.clone(), &n.raw));
@@ -495,7 +504,23 @@ impl Engine {
     /// 1分ごとに呼ぶ。期限が来たものだけ動かす（スリープ明けでも溜まった分を1回で済ませる）
     pub async fn tick(self: &Arc<Self>) {
         let s = self.schedule();
-        if !js::truthy(s.get("enabled")) || self.is_probing() || self.is_syncing() {
+        let schedule_enabled = js::truthy(s.get("enabled"));
+        let topology_due = schedule_enabled
+            && self.config().topology.enabled
+            && self.with_db(|d| d.get_meta("lastTopologyAt")).ok().flatten().and_then(|v| v.as_i64()).is_none_or(|at| {
+                now_ms().saturating_sub(at) >= s.get("topology_minutes").and_then(Value::as_i64).unwrap_or(60).clamp(1, 1_440).saturating_mul(60_000)
+            });
+        if topology_due {
+            let receipt = self.topology_refresh("schedule").await;
+            self.host.topology_updated(&receipt);
+            if receipt.get("run_id").and_then(Value::as_str).is_some()
+                && matches!(receipt.get("status").and_then(Value::as_str), Some("complete" | "partial" | "failed"))
+            {
+                let ended_at = receipt.get("ended_at").and_then(Value::as_i64).unwrap_or_else(now_ms);
+                let _ = self.with_db(|d| d.set_meta("lastTopologyAt", &Value::from(ended_at)));
+            }
+        }
+        if !schedule_enabled || self.is_probing() || self.is_syncing() {
             return;
         }
         let now = now_ms() as f64;
@@ -718,6 +743,72 @@ fn rand36(n: usize) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn topology_schedule_consumes_cadence_after_partial_runs_but_not_busy_or_held_leases() {
+        struct TopologyHost(Mutex<Vec<Value>>);
+        impl Host for TopologyHost {
+            fn topology_updated(&self, receipt: &Value) {
+                lock(&self.0).push(receipt.clone());
+            }
+        }
+        let tmp = std::env::temp_dir().join(format!("kt-topology-cadence-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let config = tmp.join("nodes.json");
+        let missing_root = serde_json::to_string(&tmp.join("missing-root").to_string_lossy()).unwrap();
+        let hostname = crate::nodes::local_host();
+        std::fs::write(
+            &config,
+            format!(
+                r#"{{"topology":{{"enabled":true,"owners":[],"github":{{"enabled":false}}}},"schedule":{{"enabled":true,"topology_minutes":60}},"nodes":[{{"id":"fixture","alias":"fixture","os":"macos","local_hostname":"{hostname}","topology":{{"environments":[{{"id":"native","transport":"node","roots":[{missing_root}]}}]}}}}]}}"#
+            ),
+        )
+        .unwrap();
+        let host = Arc::new(TopologyHost(Mutex::new(vec![])));
+        let engine = Arc::new(Engine::open(config, tmp.join("data"), host.clone()).unwrap());
+        // Keep unrelated scheduled work out of this cadence-only test. Topology
+        // scheduling intentionally happens before this existing guard.
+        engine.probing.store(true, Ordering::SeqCst);
+        engine.with_db(|db| db.set_meta("lastTopologyAt", &Value::from(0))).unwrap();
+
+        engine.tick().await;
+        let first_at = engine.with_db(|db| db.get_meta("lastTopologyAt")).unwrap().and_then(|value| value.as_i64()).unwrap();
+        let first_history = engine.topology_view().unwrap()["history"].as_array().unwrap().len();
+        let first_receipt = lock(&host.0).last().cloned().unwrap();
+        assert!(first_at > 0);
+        assert_eq!(first_receipt["status"], "partial");
+        assert_eq!(first_receipt["ended_at"].as_i64(), Some(first_at));
+        assert!(first_history > 0, "the missing root must finish as a retained partial receipt");
+
+        // A completed (even partial) refresh is awaited before tick returns, so a
+        // subsequent minute tick cannot immediately launch the same bounded scan.
+        engine.tick().await;
+        assert_eq!(engine.with_db(|db| db.get_meta("lastTopologyAt")).unwrap().and_then(|value| value.as_i64()), Some(first_at));
+        assert_eq!(engine.topology_view().unwrap()["history"].as_array().unwrap().len(), first_history);
+
+        // An elapsed cadence permits exactly one new partial attempt.
+        engine.with_db(|db| db.set_meta("lastTopologyAt", &Value::from(0))).unwrap();
+        engine.tick().await;
+        assert!(engine.topology_view().unwrap()["history"].as_array().unwrap().len() > first_history);
+
+        // An in-process busy result and a lease held by another process have no
+        // run_id, therefore they do not consume the cadence.
+        engine.with_db(|db| db.set_meta("lastTopologyAt", &Value::from(0))).unwrap();
+        let before_busy = engine.topology_view().unwrap()["history"].as_array().unwrap().len();
+        engine.topology_refreshing.store(true, Ordering::SeqCst);
+        engine.tick().await;
+        engine.topology_refreshing.store(false, Ordering::SeqCst);
+        assert_eq!(engine.with_db(|db| db.get_meta("lastTopologyAt")).unwrap().and_then(|value| value.as_i64()), Some(0));
+        assert_eq!(engine.topology_view().unwrap()["history"].as_array().unwrap().len(), before_busy);
+
+        let held = engine.with_db(|db| db.acquire_topology_lease_fenced("cadence-holder", now_ms(), 60_000)).unwrap().unwrap();
+        engine.tick().await;
+        assert_eq!(engine.with_db(|db| db.get_meta("lastTopologyAt")).unwrap().and_then(|value| value.as_i64()), Some(0));
+        assert_eq!(engine.topology_view().unwrap()["history"].as_array().unwrap().len(), before_busy);
+        engine.with_db(|db| db.release_topology_lease_fenced(&held)).unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
     #[test]
     fn failed_probe_survives_restart_until_a_newer_success() {
         let tmp = std::env::temp_dir().join(format!("kt-probe-outcome-{}-{}", std::process::id(), now_ms()));
@@ -725,10 +816,16 @@ mod tests {
         let config = tmp.join("nodes.json");
         std::fs::write(&config, r#"{"nodes":[{"id":"dev","os":"windows","network":false}]}"#).unwrap();
         let e = Engine::open(config.clone(), tmp.join("data"), Arc::new(NoHost)).unwrap();
+        e.on_probe_result(&json!({"node_id":"dev","ok":false,"at":5,"error":"initial failure"}));
+        assert_eq!(e.last().unwrap()[0]["ok"], false);
+        assert_eq!(e.last().unwrap()[0]["at"], 5);
         e.on_probe_result(&json!({"node_id":"dev","ok":true,"at":10,"data":{"probe":"windows"}}));
         e.on_probe_result(&json!({"node_id":"dev","ok":false,"at":20,"error":"ssh: timeout"}));
         drop(e);
         let e = Engine::open(config, tmp.join("data"), Arc::new(NoHost)).unwrap();
+        let last = e.last().unwrap();
+        assert_eq!(last[0]["ok"], false);
+        assert_eq!(last[0]["at"], 20);
         let row = &e.ledger().unwrap()["rows"][0];
         assert_eq!(row["status"], "unobserved");
         assert!(row["reason"].as_str().unwrap().contains("ssh: timeout"));
@@ -736,6 +833,7 @@ mod tests {
         assert!(e.with_db(|d| d.checks()).unwrap().iter().any(|c| c["scope"] == "dev" && c["id"] == "probe" && c["status"] == "fail"));
         e.on_probe_result(&json!({"node_id":"dev","ok":true,"at":30,"data":{"probe":"windows"}}));
         assert_eq!(e.ledger().unwrap()["rows"][0]["status"], "target");
+        assert_eq!(e.last().unwrap()[0]["ok"], true);
         drop(e);
         std::fs::remove_dir_all(tmp).unwrap();
     }

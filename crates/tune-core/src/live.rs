@@ -40,7 +40,7 @@ pub const WIN_LIVE: &[u8] = include_bytes!("../../../probes/live_win.ps1");
 const MAX_LINE: usize = 256 * 1024;
 const MAX_CORES: usize = 1024;
 const MAX_TOP: usize = 20;
-const MAX_GPUS: usize = 16;
+pub(crate) const MAX_GPUS: usize = 16;
 const MAX_NAME: usize = 120;
 
 /// 設定。既定は 1 秒ごと・上位プロセスは 5 秒ごと・直近 300 点・同時に 6 台まで・合図が 2 分途切れたら止める
@@ -154,6 +154,17 @@ pub struct Gpu {
     pub util: Option<f64>,
     pub mem_used_mb: Option<f64>,
     pub mem_total_mb: Option<f64>,
+    pub mem_free_mb: Option<f64>,
+    pub mem_used_pct: Option<f64>,
+    /// Physical provider index, preserved independently of the bounded metric slot.
+    pub adapter_index: Option<u32>,
+    /// Validated storage key (0..MAX_GPUS). Never trust a slot supplied by a sampler.
+    #[serde(skip_deserializing)]
+    pub storage_slot: Option<u8>,
+    pub sampled_at: Option<i64>,
+    pub memory_kind: Option<String>,
+    pub memory_status: Option<String>,
+    pub memory_reason: Option<String>,
     pub power_w: Option<f64>,
     pub power_limit_w: Option<f64>,
     pub power_min_w: Option<f64>,
@@ -272,6 +283,18 @@ fn short(s: &str) -> String {
     s.chars().take(MAX_NAME).collect()
 }
 
+fn gpu_slot(gpus: &[Gpu], i: usize) -> Result<u8, &'static str> {
+    match gpus[i].adapter_index {
+        Some(id) if id >= MAX_GPUS as u32 => Err("adapter-index-out-of-range"),
+        Some(id) if gpus.iter().filter(|g| g.adapter_index == Some(id)).count() > 1 => Err("duplicate-adapter-index"),
+        Some(id) => Ok(id as u8),
+        // Older single-GPU samplers have no index. Multiple unindexed rows cannot
+        // be mapped by array order without mixing their history after a reorder.
+        None if gpus.len() == 1 => Ok(0),
+        None => Err("missing-adapter-index"),
+    }
+}
+
 fn clean_procs(p: Procs) -> Procs {
     let fix = |xs: Vec<Proc>| -> Vec<Proc> {
         xs.into_iter()
@@ -315,7 +338,8 @@ impl Sample {
             pressure: m.pressure.map(|p| short(&p)),
         });
         let gpu = r.gpu.map(|g| {
-            g.into_iter()
+            let mut gpus: Vec<Gpu> = g
+                .into_iter()
                 .take(MAX_GPUS)
                 .map(|x| Gpu {
                     uuid: x.uuid.map(|s| short(&s)),
@@ -323,6 +347,14 @@ impl Sample {
                     util: pct(x.util),
                     mem_used_mb: nonneg(x.mem_used_mb),
                     mem_total_mb: nonneg(x.mem_total_mb),
+                    mem_free_mb: nonneg(x.mem_free_mb),
+                    mem_used_pct: pct(x.mem_used_pct),
+                    adapter_index: x.adapter_index,
+                    storage_slot: None,
+                    sampled_at: x.sampled_at,
+                    memory_kind: x.memory_kind.map(|s| short(&s)),
+                    memory_status: x.memory_status.map(|s| short(&s)),
+                    memory_reason: x.memory_reason.map(|s| short(&s)),
                     power_w: nonneg(x.power_w),
                     power_limit_w: nonneg(x.power_limit_w),
                     power_min_w: nonneg(x.power_min_w),
@@ -335,7 +367,23 @@ impl Sample {
                     source: x.source.map(|s| short(&s)),
                     available: x.available,
                 })
-                .collect()
+                .collect();
+            for i in 0..gpus.len() {
+                let slot = gpu_slot(&gpus, i);
+                let g = &mut gpus[i];
+                match slot {
+                    Ok(slot) => g.storage_slot = Some(slot),
+                    Err(reason) => {
+                        g.mem_used_mb = None;
+                        g.mem_total_mb = None;
+                        g.mem_free_mb = None;
+                        g.mem_used_pct = None;
+                        g.memory_status = Some("unavailable".into());
+                        g.memory_reason = Some(reason.into());
+                    }
+                }
+            }
+            gpus
         });
         let power = r.power.map(|x| Power {
             package_w: nonneg(x.package_w),
@@ -393,8 +441,15 @@ impl Sample {
         let power_source = self.power.as_ref().and_then(|p| p.package_source.as_ref());
         if let Some(g) = &self.gpu {
             put("gpu", g.iter().filter_map(|x| x.util).reduce(f64::max), 1);
-            let (used, total) = g.iter().fold((0.0, 0.0), |(u, t), x| (u + x.mem_used_mb.unwrap_or(0.0), t + x.mem_total_mb.unwrap_or(0.0)));
-            put("gmem", (total > 0.0).then(|| used / total * 100.0), 1);
+            let memory_pct = |x: &Gpu| x.mem_used_mb.zip(x.mem_total_mb).filter(|(u, t)| *t > 0.0 && *u <= *t).map(|(u, t)| u / t * 100.0);
+            put("gmem", g.iter().enumerate().filter(|(i, _)| gpu_slot(g, *i).is_ok()).filter_map(|(_, x)| memory_pct(x)).reduce(f64::max), 1);
+            for (i, x) in g.iter().enumerate() {
+                let Ok(id) = gpu_slot(g, i) else { continue };
+                put(&format!("gpu_{id}_vram_used_mib"), x.mem_used_mb, 0);
+                put(&format!("gpu_{id}_vram_total_mib"), x.mem_total_mb, 0);
+                put(&format!("gpu_{id}_vram_free_mib"), x.mem_free_mb, 0);
+                put(&format!("gpu_{id}_vram_pct"), memory_pct(x), 1);
+            }
             put("gtemp", g.iter().filter_map(|x| x.temp_c).reduce(f64::max), 0);
             if !g.is_empty() && g.iter().all(|x| x.power_w.is_some()) {
                 put("power_gpu_w", Some(g.iter().map(|x| x.power_w.unwrap_or_default()).sum()), 1);
@@ -614,11 +669,12 @@ fn native_args(o: &Opts) -> Vec<String> {
     .to_vec()
 }
 
-/// この機体のネイティブのサンプラー: アプリ（tune・katala-tune）の隣、無ければ ~/.katala-tune/bin
+/// この機体のネイティブのサンプラー: アプリの隣、無ければ helpers の namespace。
+/// `KATALA_TUNE_DATA_DIR` を明示した QA では `data/bin` に閉じ、通常は従来の HOME を使う。
 fn local_native() -> Option<PathBuf> {
     let beside = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("tune-agent.exe")));
-    let home = dirs::home_dir().map(|h| h.join(".katala-tune").join("bin").join("tune-agent.exe"));
-    [beside, home].into_iter().flatten().find(|p| p.is_file())
+    let managed = crate::helpers::bin_dir().join("tune-agent.exe");
+    [beside, Some(managed)].into_iter().flatten().find(|p| p.is_file())
 }
 
 /// 機体ごとの起動方法。macOS / Windows とも標準入力でスクリプトを渡す。
@@ -1373,6 +1429,23 @@ mod tests {
     const SAMPLE: &str = r#"{"type":"s","t":1700000000000,"seq":3,"cpu":12.5,"cores":[10,20,null,150],"mem":{"used_pct":41.2,"swap_used_gb":1.5,"swap_total_gb":2,"pressure":"normal"},"disk":{"read_bps":1000,"write_bps":-5},"net":{"rx_bps":10,"tx_bps":20},"power":{"package_w":200.8,"package_source":"Energy Meter RAPL package average","available":true},"gpu":[{"uuid":"GPU-a","name":"G","util":30,"mem_used_mb":1024,"mem_total_mb":4096,"power_w":220,"power_limit_w":320,"power_min_w":100,"power_max_w":350,"temp_c":65,"clocks_graphics_mhz":1800,"clocks_sm_mhz":1815,"clocks_memory_mhz":9500,"pstate":"P0","source":"nvidia-smi dmon","available":true}],"procs":{"count":3,"top_cpu":[{"pid":7,"name":"a","cpu":150.5,"mem_mb":10}],"top_mem":[]},"self":{"cpu_s":0.5,"rss_mb":20}}"#;
 
     #[test]
+    fn vram_keeps_adapter_fields_and_missing_memory_is_not_zero() {
+        let Some(Msg::Sample(raw)) = parse_line(
+            r#"{"type":"s","t":123,"gpu":[{"adapter_index":0,"name":"A","mem_used_mb":1024,"mem_total_mb":4096,"mem_free_mb":3000,"memory_status":"available","memory_kind":"dedicated","sampled_at":123},{"adapter_index":1,"name":"B","mem_total_mb":8192,"mem_used_mb":null,"mem_free_mb":null,"memory_status":"partial"}]}"#,
+        ) else {
+            panic!("sample")
+        };
+        let (s, _, _) = Sample::from_raw(*raw, 123);
+        let point = s.point();
+        assert_eq!(point["gpu_0_vram_used_mib"], json!(1024.0));
+        assert_eq!(point["gpu_0_vram_free_mib"], json!(3000.0));
+        assert_eq!(point["gpu_0_vram_pct"], json!(25.0));
+        assert_eq!(point["gpu_1_vram_used_mib"], Value::Null);
+        assert_eq!(point["gmem"], json!(25.0), "available adapter percent, never dilute with unknown adapter");
+        assert_eq!(serde_json::to_value(&s.gpu).unwrap()[0]["memory_status"], "available");
+    }
+
+    #[test]
     fn parses_lines_and_ignores_noise() {
         let Some(Msg::Hello(h)) = parse_line("\u{FEFF}{\"type\":\"hello\",\"v\":1,\"os\":\"windows\",\"cores\":8,\"errors\":\"x\",\"has\":{\"gpu\":true}}\r")
         else {
@@ -1465,40 +1538,52 @@ mod tests {
         assert!(launch(&node("x", "linux"), &o).is_err());
     }
 
-    /// 実 PowerShell で scope・短い stdin chunk・末尾 byte・EOF 前後を検証する。
+    /// 本番の spawn 経路で stderr flood 後の初回出力・scope・stdin 保持と回収を検証する。
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_boot_preserves_script_scope_and_stdin_lifetime() {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        let script = b"$value=42;function Scope {$script:value};[Console]::WriteLine((Scope));$io=[Console]::OpenStandardInput();[Console]::WriteLine($io.ReadByte());[Console]::WriteLine($io.ReadByte())";
+        let script = b"[Console]::Error.Write(('E' * 131072));$value=42;function Scope {$script:value};[Console]::WriteLine((Scope));$io=[Console]::OpenStandardInput();[Console]::WriteLine($io.ReadByte());[Console]::WriteLine($io.ReadByte())";
         let boot = windows_boot(script.len(), "");
         let utf16: Vec<u8> = boot.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        let mut child = collect::command("powershell.exe")
-            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &crate::logs::base64(&utf16)])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let mut input = child.stdin.take().unwrap();
-        for chunk in script.chunks(7) {
-            input.write_all(chunk).await.unwrap();
-            input.flush().await.unwrap();
-        }
-        input.write_all(b"Q").await.unwrap();
-        input.flush().await.unwrap();
-        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
-        let scope = tokio::time::timeout(Duration::from_secs(15), output.next_line()).await.unwrap().unwrap();
-        assert_eq!(scope.as_deref(), Some("42"), "dot-source must preserve $script scope");
-        let tail = tokio::time::timeout(Duration::from_secs(5), output.next_line()).await.unwrap().unwrap();
-        assert_eq!(tail.as_deref(), Some("81"), "bootstrap must consume exactly script.len() bytes");
-        assert!(child.try_wait().unwrap().is_none(), "must remain alive before stdin EOF");
-        drop(input);
-        let eof = tokio::time::timeout(Duration::from_secs(5), output.next_line()).await.unwrap().unwrap();
-        assert_eq!(eof.as_deref(), Some("-1"));
-        let status = tokio::time::timeout(Duration::from_secs(5), child.wait()).await.unwrap().unwrap();
-        assert!(status.success());
+        let mut stdin = script.to_vec();
+        stdin.push(b'Q');
+        let mut source = spawn(Launch {
+            program: "powershell.exe".into(),
+            args: vec!["-NoLogo".into(), "-NoProfile".into(), "-NonInteractive".into(), "-EncodedCommand".into(), crate::logs::base64(&utf16)],
+            stdin,
+            keep_stdin: true,
+            cleanup: None,
+        })
+        .unwrap();
+        let first_line_timeout = Duration::from_secs(15);
+        let scope = match tokio::time::timeout(first_line_timeout, source.lines.recv()).await {
+            Ok(Some(scope)) => scope,
+            Ok(None) => panic!("PowerShell stdout closed before the first line"),
+            Err(_) => {
+                let ended = tokio::time::timeout(Duration::from_secs(5), source.close()).await;
+                panic!("PowerShell produced no first stdout line within {first_line_timeout:?}; shutdown: {ended:?}");
+            }
+        };
+        assert_eq!(scope.trim_end(), "42", "dot-source must preserve $script scope");
+        let first_byte = tokio::time::timeout(Duration::from_secs(5), source.lines.recv())
+            .await
+            .expect("PowerShell should read the first byte")
+            .expect("PowerShell stdout closed before the first byte");
+        assert_eq!(first_byte.trim_end(), "81", "bootstrap must consume exactly script.len() bytes");
+        assert!(tokio::time::timeout(Duration::from_millis(100), source.lines.recv()).await.is_err(), "must remain alive while stdin stays open");
+        let ended = tokio::time::timeout(Duration::from_secs(5), source.close()).await.unwrap();
+        assert_eq!(ended.code, Some(0), "closing the source should close stdin and let PowerShell exit: {ended:?}");
+        assert!(ended.err.contains("EEEE"), "spawn must drain the PowerShell stderr flood: {ended:?}");
+        assert!(ended.err.len() <= 4096, "spawn must retain only the bounded stderr tail: {} bytes", ended.err.len());
+    }
+
+    /// Bootstrap must retain its remaining-byte loop so short pipe reads cannot truncate the script.
+    #[test]
+    fn windows_boot_accumulates_partial_reads_until_script_length() {
+        let script_len = 7;
+        let boot = windows_boot(script_len, "");
+        let read_loop = format!(";while($p -lt {script_len}){{$r=$i.Read($b,$p,({script_len}-$p));if($r -eq 0){{exit 2}};$p+=$r}};");
+        assert!(boot.contains(&read_loop), "bootstrap must read remaining bytes after each partial read: {boot}");
     }
 
     // ---- 偽のサンプラー（一定間隔で行を出すローカルのスクリプト）で、開始・停止・自動停止・上限・つなぎ直しを確かめる ----
@@ -1782,7 +1867,10 @@ for _ in range(400):
             } else {
                 for sample in &samples {
                     assert_eq!(sample.power, Some(Power { available: Some(false), ..Power::default() }));
-                    assert_eq!(sample.gpu, Some(vec![]), "欠測をGPUの0Wとして作らない");
+                    let gpu = &sample.gpu.as_ref().unwrap()[0];
+                    assert_eq!(gpu.power_w, None, "欠測をGPUの0Wとして作らない");
+                    assert_eq!(gpu.mem_used_mb, None, "統合メモリのGPU割当は未取得");
+                    assert!(matches!(gpu.memory_status.as_deref(), Some("not-applicable") | Some("unsupported")));
                 }
             }
             std::fs::remove_dir_all(dir).unwrap();
