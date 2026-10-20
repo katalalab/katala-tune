@@ -315,21 +315,81 @@ fn current_uid() -> Option<u32> {
     })
 }
 
-/// Windows: 継承した権限を外し、いまのユーザーだけに許可する（icacls。引数はパスとユーザー名だけ）
+/// OS が確認したプロセストークンの本人 SID。環境変数のユーザー名は本人確認に使わない。
+#[cfg(windows)]
+#[allow(unsafe_code)] // token query と OS 所有 SID 文字列の解放だけ。handle は OwnedHandle が閉じる。
+fn process_user_sid() -> Result<String> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{Authorization::ConvertSidToStringSidW, GetTokenInformation, SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let unavailable = || Error::Store("Windows のプロセストークンの本人 SID を確かめられないので、ファイルの権限を絞れない".into());
+    let mut raw_token = std::ptr::null_mut();
+    // SAFETY: GetCurrentProcess は借用 pseudo-handle。TOKEN_QUERY だけで取得した token の所有権を受け取る。
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) } == 0 {
+        return Err(unavailable());
+    }
+    // SAFETY: OpenProcessToken 成功時だけ、返された owned handle をちょうど一度 OwnedHandle に渡す。
+    let token = unsafe { OwnedHandle::from_raw_handle(raw_token) };
+    #[repr(C)]
+    struct UserBuffer {
+        user: TOKEN_USER,
+        sid: [u8; SECURITY_MAX_SID_SIZE as usize],
+    }
+    let mut buffer = UserBuffer { user: TOKEN_USER::default(), sid: [0; SECURITY_MAX_SID_SIZE as usize] };
+    let mut returned = 0;
+    // SAFETY: TOKEN_USER に整列した writable buffer。SID は Windows の最大長分を追加し、全長を渡す。
+    if unsafe { GetTokenInformation(token.as_raw_handle(), TokenUser, std::ptr::from_mut(&mut buffer).cast(), size_of::<UserBuffer>() as u32, &mut returned) }
+        == 0
+        || returned < size_of::<TOKEN_USER>() as u32
+        || returned > size_of::<UserBuffer>() as u32
+        || buffer.user.User.Sid.is_null()
+    {
+        return Err(unavailable());
+    }
+    let mut text = std::ptr::null_mut();
+    // SAFETY: TokenUser 成功時の SID は buffer 内で有効。buffer は変換が終わるまで生存する。
+    if unsafe { ConvertSidToStringSidW(buffer.user.User.Sid, &mut text) } == 0 || text.is_null() {
+        return Err(unavailable());
+    }
+    struct SidText(windows_sys::core::PWSTR);
+    impl Drop for SidText {
+        fn drop(&mut self) {
+            // SAFETY: ConvertSidToStringSidW が返した allocation をちょうど一度 LocalFree する。
+            unsafe { LocalFree(self.0.cast()) };
+        }
+    }
+    let text = SidText(text);
+    let mut sid = String::new();
+    // SID の最大 15 sub-authorities を含む表現より大きい固定上限。OS の NUL まで一文字ずつ読む。
+    for offset in 0..256 {
+        // SAFETY: API は NUL 終端の SID 文字列を返す。終端以降のメモリを slice に含めない。
+        let unit = unsafe { *text.0.add(offset) };
+        if unit == 0 {
+            return if sid.starts_with("S-") { Ok(sid) } else { Err(unavailable()) };
+        }
+        if unit != u16::from(b'S') && unit != u16::from(b'-') && !(u16::from(b'0')..=u16::from(b'9')).contains(&unit) {
+            return Err(unavailable());
+        }
+        sid.push(char::from(unit as u8));
+    }
+    Err(unavailable())
+}
+
+/// Windows: 継承した権限を外し、プロセストークンの本人 SID だけに許可する。
 #[cfg(windows)]
 fn restrict_acl(path: &Path) -> Result<()> {
     use std::os::windows::process::CommandExt;
-    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
-        (Ok(d), Ok(u)) if !d.is_empty() && !u.is_empty() => format!("{d}\\{u}"),
-        (_, Ok(u)) if !u.is_empty() => u,
-        _ => return Err(Error::Store("Windows のユーザー名が分からないので、ファイルの権限を絞れない".into())),
-    };
+    let sid = process_user_sid()?;
     let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\Windows"));
     let st = std::process::Command::new(root.join("System32").join("icacls.exe"))
         .arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")
-        .arg(format!("{user}:F"))
+        .arg(format!("*{sid}:F"))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
@@ -406,6 +466,65 @@ mod tests {
         let left: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
         assert_eq!(left, vec![std::ffi::OsString::from(KEY_FILE)]);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_acl_ignores_account_environment_in_fresh_process() {
+        use std::{
+            os::windows::process::CommandExt,
+            process::Command,
+            time::{Duration, Instant},
+        };
+        const CHILD: &str = "TUNE_LINK_ACL_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let dir = std::env::temp_dir().join(format!("tune-link-token-acl-{}-{}", std::process::id(), crate::now_ms()));
+            fs::create_dir(&dir).expect("fresh ACL fixture directory");
+            struct Fixture(PathBuf);
+            impl Drop for Fixture {
+                fn drop(&mut self) {
+                    let _ = fs::remove_file(self.0.join(KEY_FILE));
+                    let _ = fs::remove_dir(&self.0);
+                }
+            }
+            let fixture = Fixture(dir);
+            let (first, created) = DeviceKeys::load_or_create(&fixture.0).expect("token ACL must allow creating the private key");
+            assert!(created);
+            let (second, created_again) = DeviceKeys::load_or_create(&fixture.0).expect("token ACL must allow reopening the same private key");
+            assert!(!created_again);
+            assert_eq!(first.identity(), second.identity());
+            fs::remove_file(fixture.0.join(KEY_FILE)).expect("remove only the fixture key");
+            fs::remove_dir(&fixture.0).expect("fixture directory must contain no other files");
+            return;
+        }
+        for spoofed in [true, false] {
+            let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+            command
+                .args(["--exact", "keys::tests::windows_acl_ignores_account_environment_in_fresh_process", "--test-threads=1"])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(0x0800_0000);
+            if spoofed {
+                command.env("USERDOMAIN", "missing-test-domain").env("USERNAME", "missing-test-account");
+            } else {
+                command.env_remove("USERDOMAIN").env_remove("USERNAME");
+            }
+            let mut child = command.spawn().expect("start isolated ACL regression child");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("wait for ACL regression child") {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated ACL regression child exceeded its time limit");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert!(status.success(), "private key ACL must use the process token, regardless of account environment");
+        }
     }
 
     #[cfg(unix)]

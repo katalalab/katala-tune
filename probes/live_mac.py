@@ -532,6 +532,14 @@ def main():
         if "gpu" not in s:
             s["gpu"] = []
             s["power"] = {"available": False}
+        arm = sysctl("hw.optional.arm64", C.c_int)
+        apple = arm is not None and arm.value == 1
+        if not s["gpu"]:
+            s["gpu"] = [{"name": "Apple GPU" if apple else "GPU", "source": "sysctl hw.optional.arm64"}]
+        for gpu in s["gpu"]:
+            gpu.update(adapter_index=0, memory_kind="unified" if apple else "unknown", memory_status="not-applicable" if apple else "unsupported",
+                       memory_reason="unified memory shared with CPU; dedicated VRAM not applicable" if apple else "no supported dedicated VRAM provider",
+                       mem_used_mb=None, mem_total_mb=None, mem_free_mb=None, mem_used_pct=None, sampled_at=s["t"])
         cur = cpu_ticks() if has["cpu"] else None
         s["cpu"], s["cores"] = cpu_pct(cpu_prev, cur)
         cpu_prev = cur or cpu_prev

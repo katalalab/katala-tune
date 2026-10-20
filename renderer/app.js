@@ -446,14 +446,33 @@ function procsHtml(d) {
     })}
     ${UI.section('CPU 上位', win ? '2点間のCPU使用率と起動からの平均' : 'ps の直近平均')}
     ${UI.table({
-      cols: [{ label: 'PID', cls: 'n' }, { label: '名前' }, { label: 'CPU', cls: 'n', width: '22%' }, win ? { label: '平均', cls: 'n' } : { label: '起動から' }, { label: 'メモリ', cls: 'n' }],
-      rows: p.top_cpu,
+      cols: [{ label: 'PID', cls: 'n' }, { label: '名前' }, { label: 'CPU', cls: 'n', width: '22%' }, win ? { label: '平均', cls: 'n' } : { label: '起動から' }, { label: 'Working set / RSS', cls: 'n' }, { label: 'CPU秒 / Private MiB', cls: 'n' }, { label: 'Handle / Thread', cls: 'n' }],
+      cls: 'scroll-x', rows: p.top_cpu,
       row: (x) => `<td class="n muted">${esc(x.pid)}</td><td>${esc(x.name)}${x.app && x.app !== x.name ? ` <span class="muted">· ${esc(x.app)}</span>` : ''}</td>`
         + `<td class="n">${cpuOf(x) == null ? '—' : cpuOf(x).toFixed(0) + '%' + Charts.dataBar(cpuOf(x), maxCpu, { tone: cpuOf(x) >= 80 ? 'warn' : 'neutral' })}</td>`
-        + `${win ? `<td class="n">${esc(x.avg_core ?? '-')}%</td>` : `<td class="muted">${esc(x.etime)}</td>`}<td class="n">${esc(x.mem_mb)} MB</td>`,
+        + `${win ? `<td class="n">${esc(x.avg_core ?? '-')}%</td>` : `<td class="muted">${esc(x.etime)}</td>`}<td class="n">${esc(x.mem_mb ?? '未取得')} MiB</td><td class="n">${esc(x.cpu_seconds ?? '未取得')} s / ${esc(x.private_mb ?? '未取得')}</td><td class="n">${esc(x.handle_count ?? '未取得')} / ${esc(x.thread_count ?? '未取得')}</td>`,
     })}
     <p class="note-line">全 ${esc(p.count ?? '-')} プロセス · AI エージェント ${esc(p.agent_processes ?? '-')}</p>
+    <p class="note-line">${esc(p.source || 'legacy snapshot')} · ${esc(fmtTime(p.sampled_at))} · CPU秒は起動からの累積です。Privateはプロセス専用のコミット量で、常駐量とは別です。一部の詳細は取得元の制約で未取得です。</p>
     ${wslHtml(d)}`;
+}
+
+function gpuHtml(g) {
+  const val = (v, unit = "") => v == null ? '未取得' : `${esc(v)}${unit}`;
+  const shared = g.memory_kind === 'unified';
+  const statuses = {available:'取得済み',partial:'一部未取得',unavailable:'取得失敗',unsupported:'未対応','not-applicable':'専用VRAM対象外'};
+  const status = statuses[g.memory_status] || '以前の分析結果';
+  const reason = g.memory_reason ? (shared ? 'CPUとGPUが統合メモリを共有しています' : /timeout/.test(g.memory_reason) ? '取得時間の上限を超えました' : /driver/.test(g.memory_reason) ? 'ドライバーから一部の値を取得できません' : /not-found|unsupported|provider/.test(g.memory_reason) ? '対応する専用VRAMの取得元がありません' : 'GPUの情報を取得できませんでした') : '';
+  const pct = g.mem_used_pct ?? (g.mem_used_mb != null && g.mem_total_mb > 0 ? g.mem_used_mb / g.mem_total_mb * 100 : null);
+  const memory = shared ? '統合メモリ共有・専用VRAM該当なし' : `${val(g.mem_used_mb)} / ${val(g.mem_total_mb)} MiB · 空き ${val(g.mem_free_mb)} MiB · ${pct == null ? '使用率未取得' : `${pct.toFixed(1)}%`}`;
+  return `<div class="gpu"><div class="gpu-name">${esc(g.name || 'GPU')}<span class="faint">${g.adapter_index != null ? `GPU ${esc(g.adapter_index)} · ` : ''}driver ${esc(g.driver ?? '未取得')}</span></div><div class="meter-list">
+    ${Charts.meter(g.util, { label: 'GPU使用率', text: val(g.util, '%') })}
+    ${Charts.meter(pct, { label: 'VRAM', warn: 90, text: memory })}
+    ${Charts.meter(g.temp_c, { label: '温度', warn: 80, crit: 85, text: val(g.temp_c, '°C') })}
+    ${Charts.meter(g.power_w != null && g.power_limit_w > 0 ? g.power_w / g.power_limit_w * 100 : null, { label: '電力', text: `${val(g.power_w)} / ${val(g.power_limit_w)} W` })}</div>
+    <p class="note-line">${esc(status)} · ${esc(fmtTime(g.sampled_at))}${reason ? ` · ${esc(reason)}` : ''}</p>
+    <details><summary>取得元・クロック・取得できない項目</summary><p class="note-line">Clock (MHz): Graphics ${val(g.clocks_graphics_mhz)} / SM ${val(g.clocks_sm_mhz)} / Memory ${val(g.clocks_memory_mhz)} · ${esc(g.pstate ?? 'P-state未取得')} · ${esc(g.source ?? '取得元不明')} · ${esc(g.memory_status ?? 'legacy snapshot')}${g.memory_reason ? ` · ${esc(g.memory_reason)}` : ''}</p>
+    <p class="note-line">GPU別のプロセスメモリは未収集です。WDDMのN/Aを0として扱わず、compute-appsはCUDAのみを表します。${esc(g.sensor_reason || '')}</p></details></div>`;
 }
 
 function machineHtml(d, r) {
@@ -480,11 +499,7 @@ function machineHtml(d, r) {
     label: x.mount, ...((x.mount === '/' || /^C:/i.test(x.mount)) ? TH.disk : { warn: 90 }),
     text: `空き ${x.free_gb} / ${x.total_gb} GB${x.raw_free_gb != null ? `（即時 ${x.raw_free_gb}）` : ''}`,
   })).join('');
-  const gpus = (d.gpus || []).map((g) => `<div class="gpu"><div class="gpu-name">${esc(g.name)}<span class="faint">driver ${esc(g.driver)}</span></div><div class="meter-list">
-      ${Charts.meter(g.util, { label: '使用率', text: `${g.util}%` })}
-      ${Charts.meter(g.mem_total_mb ? (g.mem_used_mb / g.mem_total_mb) * 100 : null, { label: 'メモリ', warn: 90, text: `${g.mem_used_mb} / ${g.mem_total_mb} MB` })}
-      ${Charts.meter(g.temp_c, { label: '温度', warn: 80, crit: 85, text: `${g.temp_c}°C` })}
-      ${Charts.meter(g.power_w != null && g.power_limit_w > 0 ? (g.power_w / g.power_limit_w) * 100 : null, { label: '電力', text: `${g.power_w ?? '未取得'} / ${g.power_limit_w ?? '未取得'} W` })}</div><p class="note-line">Clock (MHz): Graphics ${esc(g.clocks_graphics_mhz ?? '未取得')} / SM ${esc(g.clocks_sm_mhz ?? '未取得')} / Memory ${esc(g.clocks_memory_mhz ?? '未取得')} · ${esc(g.pstate || 'P-state未取得')} · ${esc(g.source || '取得元不明')}</p></div>`).join('');
+  const gpus = (d.gpus || []).map(gpuHtml).join('');
   return `${UI.props(rows.map(([k, v]) => [k, `<span class="pre">${esc(v)}</span>`]))}
     ${disks ? `${UI.section('ディスク', '使用率。macOS は実効の空き（自動で空く分を含む）')}<div class="meter-list wide">${disks}</div>` : ''}
     ${gpus ? `${UI.section('GPU', '分析した瞬間の値')}${gpus}` : ''}<button class="btn small" data-power-view>電力の計算条件と設定を開く</button>`;
@@ -499,17 +514,22 @@ async function historyHtml(id) {
   const last = h.slice(-40);
   const pts = (k) => last.map((x) => ({ t: x.at, v: x[k] }));
   const latest = last.at(-1);
+  const adapters = [...new Set(last.flatMap(x => (x.gpus || []).map((g,i) => g.uuid || `index:${g.adapter_index ?? i}`)))];
+  const gpuOf = (x,id) => (x.gpus || []).find((g,i) => (g.uuid || `index:${g.adapter_index ?? i}`) === id);
+  const gpuHistory = adapters.map(id => { const g = [...last].reverse().map(x => gpuOf(x,id)).find(Boolean); return box(`${g.name || 'GPU'} VRAM`, 'MiB・adapter別', Charts.line(last.map(x => ({t:x.at,v:gpuOf(x,id)?.mem_used_mb ?? null})), {unit:'MiB',tone:'info',min:0,label:'VRAM使用量'})); }).join('');
   return `<div class="charts">
       ${box('スコア', '100 点満点', Charts.line(pts('score'), { min: 0, max: 100, tone: Charts.scoreTone(latest.score), marks: [{ v: 80, tone: 'ok' }, { v: 55, tone: 'warn' }], better: 'high', label: 'スコア' }))}
       ${box('計測', 'ms', Charts.line(pts('bench_ms'), { unit: 'ms', tone: 'accent', better: 'low', label: '計測' }))}
       ${box('CPU 使用率', '%', Charts.line(pts('cpu'), { unit: '%', min: 0, max: 100, tone: 'info', marks: [{ v: TH.cpu.crit, tone: 'crit' }, { v: TH.cpu.warn, tone: 'warn' }], label: 'CPU 使用率' }))}
       ${box('空きメモリ', '%', Charts.line(pts('mem_avail'), { unit: '%', min: 0, max: 100, tone: 'info', marks: [{ v: 20, tone: 'warn' }, { v: 10, tone: 'crit' }], better: 'high', label: '空きメモリ' }))}
+      ${gpuHistory}
     </div>
     ${UI.section('直近の分析', `${last.length} 回・新しい順`)}
     ${UI.table({
-      cols: [{ label: '日時' }, { label: 'スコア', cls: 'n' }, { label: '計測', cls: 'n' }, { label: 'CPU', cls: 'n' }, { label: '空きメモリ', cls: 'n' }, { label: 'swap', cls: 'n' }, { label: '重大 / 注意', cls: 'n' }],
-      rows: last.slice().reverse(),
+      cols: [{ label: '日時' }, { label: 'スコア', cls: 'n' }, { label: '計測', cls: 'n' }, { label: 'CPU', cls: 'n' }, { label: '空きメモリ', cls: 'n' }, { label: 'swap', cls: 'n' }, { label: 'VRAM used / total / free (MiB)' }, { label: 'Process / Thread / Handle' }, { label: '重大 / 注意', cls: 'n' }],
+      cls: 'scroll-x', rows: last.slice().reverse(),
       row: (x) => `<td class="muted">${esc(fmtTime(x.at))}</td><td class="n"><b class="${scoreClass(x.score)}">${esc(x.score ?? '-')}</b></td><td class="n">${withUnit(x.bench_ms, ' ms')}</td><td class="n">${withUnit(x.cpu, '%')}</td><td class="n">${withUnit(x.mem_avail, '%')}</td><td class="n">${withUnit(x.swap_gb, ' GB')}</td>`
+        + `<td>${(x.gpus || []).map(g => `${esc(g.name || 'GPU')}: ${g.memory_kind === 'unified' ? '統合メモリ共有・専用VRAM該当なし' : `${esc(g.mem_used_mb ?? '未取得')} / ${esc(g.mem_total_mb ?? '未取得')} / ${esc(g.mem_free_mb ?? '未取得')} · ${esc(g.mem_used_pct ?? '未取得')}%`}`).join('<br>')}</td><td>${esc(x.process_count ?? '未取得')} / ${esc(x.thread_count ?? '未取得')} / ${esc(x.handle_count ?? '未取得')}</td>`
         + `<td class="n">${x.critical ? `<span class="sc-crit">${x.critical}</span>` : '0'} / ${x.warn ? `<span class="sc-warn">${x.warn}</span>` : '0'}</td>`,
     })}`;
 }

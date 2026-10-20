@@ -103,7 +103,7 @@ $list = foreach ($p in $procs) {
   if ($null -ne $sample -and $null -ne $sample.cpu -and $sample.life -gt 60) { $avg = $sample.cpu / $sample.life * 100 }
   # start: UTC start time, used to confirm the same process right before a kill (PID reuse guard)
   $st = $null; if ($null -ne $sample) { $st = $sample.start_time.ToUniversalTime().ToString("yyyyMMddHHmmssfff") }
-  [pscustomobject]@{ pid = $p.Id; name = $p.ProcessName; cpu = (R1 $c); avg_core = (R1 $avg); mem_mb = [int]($p.WorkingSet64 / 1MB); start = $st }
+  [pscustomobject]@{ pid = $p.Id; name = $p.ProcessName; cpu = (R1 $c); avg_core = (R1 $avg); mem_mb = $(if ($null -ne $p.WorkingSet64) { RNum ($p.WorkingSet64 / 1MB) } else { $null }); start = $st; cpu_seconds = $(if ($null -ne $sample) { RNum $sample.cpu 3 } else { $null }); private_mb = $(if ($null -ne $p.PrivateMemorySize64) { RNum ($p.PrivateMemorySize64 / 1MB) } else { $null }); handle_count = $(if ($null -ne $p.HandleCount) { [int]$p.HandleCount } else { $null }); thread_count = $(if ($null -ne $p.Threads) { [int]$p.Threads.Count } else { $null }) }
 }
 $groups = $list | Group-Object name | ForEach-Object {
   $groupCpu = $null
@@ -242,22 +242,69 @@ $excl = $null
 $pref = Get-MpPreference
 if ($pref -and $pref.ExclusionPath -and ($pref.ExclusionPath -notmatch 'N/A')) { $excl = @($pref.ExclusionPath).Count }
 
-# GPU
+# GPU: a single bounded query per analysis; no daemon, setters or process-name query.
+# BEGIN GPU TELEMETRY
+function InvokeGpuQuery($exe, $fields) {
+  $p = New-Object Diagnostics.Process
+  $p.StartInfo = New-Object Diagnostics.ProcessStartInfo
+  $p.StartInfo.FileName = $exe
+  $p.StartInfo.Arguments = "--query-gpu=$fields --format=csv,noheader,nounits"
+  $p.StartInfo.UseShellExecute = $false
+  $p.StartInfo.CreateNoWindow = $true
+  $p.StartInfo.RedirectStandardOutput = $true
+  $p.StartInfo.RedirectStandardError = $true
+  try {
+    [void]$p.Start()
+    $out = $p.StandardOutput.ReadToEndAsync()
+    $err = $p.StandardError.ReadToEndAsync()
+    if (-not $p.WaitForExit(4000)) { $p.Kill(); return @{ rows = @(); reason = "query-timeout" } }
+    if (-not $out.Wait(200)) { return @{ rows = @(); reason = "output-timeout" } }
+    $text = $out.Result
+    if ($p.ExitCode -ne 0) { return @{ rows = @(); reason = "query-failed" } }
+    if ($text.Length -gt 65536) { return @{ rows = @(); reason = "output-limit" } }
+    return @{ rows = @($text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 16); reason = $null }
+  } catch { return @{ rows = @(); reason = "query-unavailable" } } finally { $p.Dispose() }
+}
+function GpuMemory($g, $at) {
+  foreach ($key in @("mem_used_mb", "mem_total_mb", "mem_free_mb", "util", "temp_c", "power_w")) { if ($null -ne $g[$key] -and $g[$key] -lt 0) { $g[$key] = $null } }
+  if ($null -ne $g.mem_total_mb -and $g.mem_total_mb -le 0) { $g.mem_total_mb = $null }
+  if ($null -ne $g.util -and $g.util -gt 100) { $g.util = $null }
+  if ($null -ne $g.mem_total_mb -and $null -ne $g.mem_used_mb -and $g.mem_used_mb -gt $g.mem_total_mb) { $g.mem_used_mb = $null }
+  if ($null -ne $g.mem_total_mb -and $null -ne $g.mem_free_mb -and $g.mem_free_mb -gt $g.mem_total_mb) { $g.mem_free_mb = $null }
+  $g.sensor_reason = "null sensor values mean unavailable/unsupported driver fields, never zero"
+  $g.memory_kind = "dedicated"; $g.memory_unit = "MiB"; $g.sampled_at = $at
+  $valid = $null -ne $g.mem_used_mb -and $null -ne $g.mem_total_mb -and $g.mem_total_mb -gt 0 -and $g.mem_used_mb -ge 0 -and $g.mem_used_mb -le $g.mem_total_mb
+  $g.mem_used_pct = $(if ($valid) { RNum ($g.mem_used_mb / $g.mem_total_mb * 100) } else { $null })
+  $freeValid = $null -ne $g.mem_free_mb -and $g.mem_free_mb -ge 0 -and $g.mem_free_mb -le $g.mem_total_mb
+  $g.memory_status = $(if ($valid -and $freeValid) { "available" } else { "partial" })
+  $g.memory_reason = $(if ($valid -and $freeValid) { $null } else { "driver returned unavailable or invalid memory fields" })
+  $g.process_memory_reason = "not collected; WDDM per-process memory may be N/A; compute-apps covers CUDA only"
+  return [pscustomobject]$g
+}
 $gpus = @()
+$gpuAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+$gpuReason = "nvidia-smi-not-found; other GPU vendors unsupported (AdapterRAM is not a reliable VRAM capacity)"
 if ($smi) {
-  $q = @(& nvidia-smi --query-gpu=uuid,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,power.min_limit,power.max_limit,clocks.current.graphics,clocks.current.sm,clocks.current.memory,pstate,clocks_throttle_reasons.active,driver_version --format=csv,noheader,nounits 2>$null)
-  $full = $q.Count -gt 0
-  if (-not $full) { $q = @(& nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,clocks_throttle_reasons.active,driver_version --format=csv,noheader,nounits 2>$null) }
-  foreach ($line in $q) {
-    $f = $line -split ',\s*'
-    if ($full -and $f.Count -ge 16) {
-      $gpus += [pscustomobject]@{ uuid = $f[0]; name = $f[1]; util = (RNum $f[2]); mem_used_mb = (RNum $f[3] 0); mem_total_mb = (RNum $f[4] 0); temp_c = (RNum $f[5] 0); power_w = (RNum $f[6]); power_limit_w = (RNum $f[7]); power_min_w = (RNum $f[8]); power_max_w = (RNum $f[9]); clocks_graphics_mhz = (RNum $f[10] 0); clocks_sm_mhz = (RNum $f[11] 0); clocks_memory_mhz = (RNum $f[12] 0); pstate = $(if ($f[13] -match "^(N/A|Not Supported|\[N/A\])$") { $null } else { $f[13] }); throttle = $f[14]; driver = $f[15]; source = "nvidia-smi"; available = $true }
-    } elseif (-not $full -and $f.Count -ge 9) {
-      $gpus += [pscustomobject]@{ uuid = $null; name = $f[0]; util = (RNum $f[1]); mem_used_mb = (RNum $f[2] 0); mem_total_mb = (RNum $f[3] 0); temp_c = (RNum $f[4] 0); power_w = (RNum $f[5]); power_limit_w = (RNum $f[6]); power_min_w = $null; power_max_w = $null; clocks_graphics_mhz = $null; clocks_sm_mhz = $null; clocks_memory_mhz = $null; pstate = $null; throttle = $f[7]; driver = $f[8]; source = "nvidia-smi-legacy-query"; available = $true }
-    }
+  $query = InvokeGpuQuery $smi.Source "index,name,utilization.gpu,memory.used,memory.total,memory.free,temperature.gpu,power.draw,power.limit,power.min_limit,power.max_limit,clocks.current.graphics,clocks.current.sm,clocks.current.memory,pstate,driver_version,uuid,clocks_throttle_reasons.active"
+  $gpuReason = $query.reason
+  $memoryOnly = $false
+  if ($query.reason -eq "query-failed") {
+    $query = InvokeGpuQuery $smi.Source "index,name,memory.used,memory.total,memory.free"
+    $gpuReason = $query.reason; $memoryOnly = $true
+  }
+  foreach ($line in $query.rows) {
+    $f = $line -split ",\s*"
+    if ($memoryOnly -and $f.Count -eq 5) { $f = @($f[0], $f[1], $null, $f[2], $f[3], $f[4], $null, $null, $null, $null, $null, $null, $null, $null, $null, $null, $null, $null) }
+    if ($f.Count -ne 18) { $gpuReason = "invalid-query-row"; continue }
+    $g = @{ uuid = $f[16]; throttle = $f[17]; adapter_index = (RNum $f[0] 0); name = $f[1]; util = (RNum $f[2]); mem_used_mb = (RNum $f[3] 0); mem_total_mb = (RNum $f[4] 0); mem_free_mb = (RNum $f[5] 0); temp_c = (RNum $f[6]); power_w = (RNum $f[7]); power_limit_w = (RNum $f[8]); power_min_w = (RNum $f[9]); power_max_w = (RNum $f[10]); clocks_graphics_mhz = (RNum $f[11]); clocks_sm_mhz = (RNum $f[12]); clocks_memory_mhz = (RNum $f[13]); pstate = $(if ($f[14] -match "^(N/A|Not Supported|\[N/A\])$") { $null } else { $f[14] }); driver = $f[15]; source = $(if ($memoryOnly) { "nvidia-smi memory-only fallback" } else { "nvidia-smi" }); available = $true }
+    $gpus += GpuMemory $g $gpuAt
   }
 }
+if ($gpus.Count -eq 0) {
+  $gpus = @([pscustomobject]@{ adapter_index = $null; name = "GPU"; source = "nvidia-smi"; available = $false; memory_kind = "unknown"; memory_unit = "MiB"; memory_status = $(if ($smi) { "unavailable" } else { "unsupported" }); memory_reason = $gpuReason; sampled_at = $gpuAt; mem_total_mb = $null; mem_used_mb = $null; mem_free_mb = $null; mem_used_pct = $null; util = $null; temp_c = $null; power_w = $null; power_limit_w = $null; process_memory_reason = "not collected" })
+}
+# END GPU TELEMETRY
 
 $cpuPowerW = $null; $cpuPowerSource = $null; $cpuPowerReason = "LibreHardwareMonitor CPU Package unavailable"
 try {
@@ -761,6 +808,12 @@ $result = [ordered]@{
   memory = [ordered]@{ total_gb = (R1 ($totalMb / 1024)); free_gb = (R1 ($os.FreePhysicalMemory / 1MB)); available_pct = (R1 ($os.FreePhysicalMemory / $os.TotalVisibleMemorySize * 100)); commit_pct = $commitPct; pagefile_alloc_mb = $pfa['AllocatedBaseSize']; pagefile_used_mb = $pfa['CurrentUsage']; pagefile_peak_mb = $pfa['PeakUsage'] }
   processes = [ordered]@{
     count = @($list).Count
+    threads = $(if (@($list | Where-Object { $null -eq $_.thread_count }).Count -eq 0) { ($list | Measure-Object thread_count -Sum).Sum } else { $null })
+    handles = $(if (@($list | Where-Object { $null -eq $_.handle_count }).Count -eq 0) { ($list | Measure-Object handle_count -Sum).Sum } else { $null })
+    source = "Get-Process (existing two-point CPU sample)"
+    sampled_at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    memory_unit = "MiB"; cpu_time_unit = "seconds (cumulative)"
+    details_reason = "I/O rates unavailable in this provider; private bytes are committed private memory, not private working set"
     top_cpu = @($list | Sort-Object cpu -Descending | Select-Object -First 15)
     top_mem = @($list | Sort-Object mem_mb -Descending | Select-Object -First 15)
     apps = @($groups | Sort-Object mem_mb -Descending | Select-Object -First 25)

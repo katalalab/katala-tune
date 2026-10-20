@@ -7,6 +7,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::js::{self, Jv, Obj, arr, get, num, or, present, string, to_fixed, truthy};
+use crate::{db, decision};
 
 pub const HIGH_PERF_GUID: &str = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
 pub const BALANCED_GUID: &str = "381b4222-f694-41f0-9685-ff5bb260df2e";
@@ -324,7 +325,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 "cpu",
                 format!("CPU が飽和している（{}%）", string(cpu_busy)),
                 format!("上位: {top}"),
-                "下の「暴走の疑い」から順に止める。止められない処理なら、その間ほかの重い作業を別の機体へ回す。",
+                "根拠がそろった停止候補だけを確認する。根拠が不足する間は、ほかの重い作業を別の機体へ回す。",
             );
         } else if busy >= 60.0 {
             out.simple(
@@ -352,7 +353,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
     for p in hogs {
         let name = p.get("name");
         let app = p.get("app");
-        let killable = !no_kill(&string(name)) && !no_kill(&if truthy(app) { string(app) } else { String::new() });
+        let protected = no_kill(&string(name)) || no_kill(&if truthy(app) { string(app) } else { String::new() });
         let prefix = if truthy(app) && !js::strict_eq(app, name) { format!("{} / ", string(app)) } else { String::new() };
         let etime = p.get("etime");
         let detail = format!(
@@ -362,22 +363,21 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
             if is_win { format!("（瞬間値。起動からの平均は {}%）", string(p.get("avg_core"))) } else { "（直近の平均）".into() }
         );
         let advice = advice_for(&[app, name]).map(str::to_string).unwrap_or_else(|| {
-            if killable {
-                "想定外ならアプリを終了して様子を見る。".into()
+            if !protected {
+                "所有者・起動時刻・二点の CPU 時間差分・サービス／スケジューラ／作業負荷を再観測する。".into()
             } else {
                 "OS・セキュリティ、または誰かの作業（AI エージェント・python・node など）の可能性があるため、終了は提案しない。何の処理かを確かめ、原因側（同期・インデックス・ビルド・学習）を止める。".into()
             }
         });
-        // min_cpu: 終了の直前に測り直して、これを下回っていたら（回復していたら）中止する
-        let action = killable.then(|| {
-            let params = Obj::new()
-                .opt("pid", p.get("pid").cloned())
-                .opt("name", name.cloned())
-                .set("start", js::nullish(p.get("start"), None).cloned().unwrap_or(Value::Null))
-                .set("min_cpu", 50)
-                .build();
-            json!({ "type": "kill-process", "label": "このプロセスを終了", "params": params })
-        });
+        let decision = decision::process_stop_finding_at(p, node, protected, db::now_ms());
+        let decision_value = serde_json::to_value(&decision).unwrap_or(Value::Null);
+        let action = decision.proposed_action;
+        let decision_reason = decision.reason.get("summary").and_then(Value::as_str).unwrap_or("停止候補の根拠を確認できない。");
+        let advice = if action.is_some() {
+            format!("{decision_reason} 停止には承認が必要。実行時にも保護台帳・PID・名前・起動時刻・CPU を読み直して一致しなければ中止する。")
+        } else {
+            format!("{decision_reason} {advice}")
+        };
         out.add(
             format!("runaway-{}-{}", string(name), string(p.get("pid"))),
             "warn",
@@ -388,6 +388,9 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
             None,
             action,
         );
+        if let Some(finding) = out.0.last_mut().and_then(Value::as_object_mut) {
+            finding.insert("decision".into(), decision_value);
+        }
     }
 
     // メモリ
