@@ -157,9 +157,9 @@ fn docker_graph_survives_store_and_public_export_without_private_attributes() {
 }
 #[test]
 fn trusted_distribution_paths_allow_homebrew_but_not_escape() {
-    use tune_core::topology::adapters::docker::trusted_path;
     #[cfg(not(windows))]
     {
+        use tune_core::topology::adapters::docker::trusted_path;
         assert!(trusted_path("/opt/homebrew/Cellar/docker/29.9.1/bin/docker"));
         for path in ["/tmp/docker", "/opt/homebrew/Cellar/docker/../../bin/docker", "/opt/homebrew/Cellar/docker/1/bin/other"] {
             assert!(!trusted_path(path));
