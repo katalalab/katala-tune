@@ -2,7 +2,8 @@
 # PowerShell 5.1. Keep this file ASCII only (PS 5.1 reads BOM-less UTF-8 as the ANSI code page).
 # Collects no secrets, environment variables, command lines or file contents
 # (except the memory/processors keys of ~/.wslconfig, and the opt-in WSL observation below:
-# /proc memory figures, process names and disk usage inside distros reported as running).
+# /proc memory figures, process names and disk usage inside distros reported as running;
+# command lines of interpreters are read only to build a short key and are never output).
 # -NoNetwork skips the network and security section (nodes.json "network": false).
 # -ObserveWsl enables WSL distro enumeration and inside observation (nodes.json "wsl": true).
 param([switch]$NoNetwork, [switch]$ObserveWsl)
@@ -102,7 +103,7 @@ $list = foreach ($p in $procs) {
   if ($null -ne $sample -and $null -ne $sample.cpu -and $sample.life -gt 60) { $avg = $sample.cpu / $sample.life * 100 }
   # start: UTC start time, used to confirm the same process right before a kill (PID reuse guard)
   $st = $null; if ($null -ne $sample) { $st = $sample.start_time.ToUniversalTime().ToString("yyyyMMddHHmmssfff") }
-  [pscustomobject]@{ pid = $p.Id; name = $p.ProcessName; cpu = (R1 $c); avg_core = (R1 $avg); mem_mb = [int]($p.WorkingSet64 / 1MB); start = $st }
+  [pscustomobject]@{ pid = $p.Id; name = $p.ProcessName; cpu = (R1 $c); avg_core = (R1 $avg); mem_mb = $(if ($null -ne $p.WorkingSet64) { RNum ($p.WorkingSet64 / 1MB) } else { $null }); start = $st; cpu_seconds = $(if ($null -ne $sample) { RNum $sample.cpu 3 } else { $null }); private_mb = $(if ($null -ne $p.PrivateMemorySize64) { RNum ($p.PrivateMemorySize64 / 1MB) } else { $null }); handle_count = $(if ($null -ne $p.HandleCount) { [int]$p.HandleCount } else { $null }); thread_count = $(if ($null -ne $p.Threads) { [int]$p.Threads.Count } else { $null }) }
 }
 $groups = $list | Group-Object name | ForEach-Object {
   $groupCpu = $null
@@ -110,6 +111,116 @@ $groups = $list | Group-Object name | ForEach-Object {
   [pscustomobject]@{ app = $_.Name; cpu = (R1 $groupCpu); mem_mb = [int](($_.Group | Measure-Object mem_mb -Sum).Sum); count = $_.Count }
 }
 $agents = @($list | Where-Object { $_.name -match '^(claude|codex|opencode|cursor-agent|agy|gemini)' }).Count
+
+# Process multiplication and trees (issues 38 and 30). Read-only. Command lines are read only for interpreters (node, python, git ...)
+# to build a short key (exe:script name); the command line itself is never output. Owner: session 0 (services and SSH logons) = system, otherwise user.
+$mxInterp = '^(node|nodejs|bun|deno|python3?|py|uv|uvx|npx|bunx|npm|pnpm|ruby|java|javaw|git)$'
+$mxGeneric = @('index', 'main', 'cli', 'server', 'bin', 'run', 'app', 'start', 'dist', 'build', 'lib', 'src', 'out', 'node_modules', '__main__')
+$mxSkip = @('exec', 'run', 'x', 'dlx', 'tool', 'start')
+# Options known to take no value. Any other option may be followed by a value (a token etc.), so stop reading there.
+$mxValueless = @('-y', '--yes', '-q', '--quiet', '--silent', '-u', '-B', '-E', '-s', '-S', '-I', '-O', '-OO', '-i', '--no-warnings', '--no-deprecation', '--trace-warnings', '--enable-source-maps', '--inspect', '--')
+$mxLaunchers = @('explorer', 'services', 'wininit', 'winlogon', 'svchost', 'sihost', 'csrss', 'smss', 'userinit', 'System', 'Idle', 'sshd')
+# Label = the script file name; for a generic name (index.js ...) only the package directly under node_modules.
+# Arbitrary parent directories (project or customer names) are never used.
+function MxLabel([string]$path) {
+  $parts = @($path -split '[\\/]+' | Where-Object { $_ })
+  if ($parts.Count -eq 0) { return $null }
+  $ok = '^[A-Za-z0-9][A-Za-z0-9_.@+-]{0,47}$'
+  $n = $parts[$parts.Count - 1] -replace '\.([cm]?[jt]s|py|jar)$', ''
+  if (-not ($mxGeneric -contains $n) -and ($n -cmatch $ok)) { return $n }
+  for ($j = $parts.Count - 2; $j -ge 0; $j--) {
+    if ($parts[$j] -ieq 'node_modules' -and $j + 1 -lt $parts.Count - 1) {
+      $pkg = $parts[$j + 1]
+      if ($pkg.StartsWith('@') -and $j + 2 -lt $parts.Count - 1) { $pkg = $parts[$j + 2] }
+      if (-not ($mxGeneric -contains $pkg) -and ($pkg -cmatch $ok)) { return $pkg }
+      return $null
+    }
+  }
+  return $null
+}
+function MxKey([string]$exe, [string[]]$tokens) {
+  if ($exe -notmatch $mxInterp) { return $exe.Substring(0, [Math]::Min(48, $exe.Length)) }
+  $label = $null
+  $i = 0
+  while ($i -lt $tokens.Count) {
+    $t = [string]$tokens[$i]
+    if ($t -ceq '-m' -and $i + 1 -lt $tokens.Count) { $label = MxLabel (($tokens[$i + 1] -split '\.')[0]); break }
+    if ($t -ceq '-c' -and $exe -like 'python*') { break }
+    if (($t -ceq '-c' -or $t -ceq '-C' -or $t -ceq '-r' -or $t -ceq '--require') -and ($exe -eq 'git' -or $exe -eq 'node')) { $i += 2; continue }
+    if ($t.StartsWith('-')) {
+      if ($t.Contains('=') -or ($mxValueless -ccontains $t)) { $i++; continue }
+      break
+    }
+    if ($mxSkip -contains $t) { $i++; continue }
+    $label = MxLabel ($t -replace '(?<=.)@[^@/\\]*$', '')
+    break
+  }
+  if ($label) { return ($exe + ':' + $label) }
+  return $exe
+}
+$mxGroups = @(); $mxTrees = @(); $mxAvail = 'unavailable'; $mxReason = $null
+try {
+  $mx = @{}
+  $mxCim = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, WorkingSetSize, SessionId, CreationDate -ErrorAction Stop)
+  if ($mxCim.Count -eq 0) { throw 'no-data' }
+  # Command lines are queried only for interpreter executables (other processes' arguments are never read)
+  $mxCmd = @{}
+  $mxNames = @($mxCim | ForEach-Object { [string]$_.Name } | Where-Object { ($_ -replace '\.exe$', '') -match $mxInterp -and $_ -match '^[A-Za-z0-9._-]+$' } | Sort-Object -Unique)
+  if ($mxNames.Count -gt 0) {
+    $flt = ($mxNames | ForEach-Object { "Name = '$_'" }) -join ' OR '
+    foreach ($c in @(Get-CimInstance Win32_Process -Filter $flt -Property ProcessId, CommandLine)) { if ($c.CommandLine) { $mxCmd[[int]$c.ProcessId] = [string]$c.CommandLine } }
+  }
+  foreach ($w in $mxCim) {
+    $nm = ([string]$w.Name) -replace '\.exe$', ''
+    $tok = @()
+    if ($nm -match $mxInterp -and $mxCmd.ContainsKey([int]$w.ProcessId)) {
+      $tok = @([regex]::Matches($mxCmd[[int]$w.ProcessId], '"([^"]*)"|(\S+)') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value } } | Select-Object -Skip 1)
+    }
+    $mx[[int]$w.ProcessId] = @{ pid = [int]$w.ProcessId; ppid = [int]$w.ParentProcessId; name = $nm; kb = ([double]$w.WorkingSetSize / 1KB); sys = ([int]$w.SessionId -eq 0); born = $w.CreationDate; key = (MxKey $nm $tok) }
+  }
+  $kids = @{}
+  foreach ($r in $mx.Values) {
+    $p = $mx[$r.ppid]
+    if ($p -and $r.born -and $p.born -and $p.born -gt $r.born) { $p = $null }
+    $r.parent = $p
+    $r.orphan = (($r.ppid -le 0) -or (-not $p))
+    if ($p) { $kids[$p.pid] = 1 + [int]$kids[$p.pid] }
+  }
+  $gh = @{}
+  $th = @{}
+  foreach ($r in $mx.Values) {
+    $g = $gh[$r.key]
+    if (-not $g) { $g = @{ key = $r.key; count = 0; kb = 0.0; orphans = 0; orphan_kb = 0.0; sys = 0; usr = 0; parents = @{} }; $gh[$r.key] = $g }
+    $g.count++; $g.kb += $r.kb
+    if ($r.sys) { $g.sys++ } else { $g.usr++ }
+    if ($r.orphan) { $g.orphans++; $g.orphan_kb += $r.kb }
+    if ($r.parent) { $pn = ([string]$r.parent.name); $g.parents[$pn] = 1 + [int]$g.parents[$pn] }
+    $x = $r; $seen = @{}
+    while (-not $seen.ContainsKey($x.pid)) {
+      $seen[$x.pid] = 1
+      $p = $x.parent
+      if ((-not $p) -or $p.pid -le 4 -or ($mxLaunchers -contains $p.name)) { break }
+      $x = $p
+    }
+    $t = $th[$x.pid]
+    if (-not $t) { $t = @{ root = $x.name; pid = $x.pid; sys = $x.sys; count = 0; kb = 0.0; children = [int]$kids[$x.pid] }; $th[$x.pid] = $t }
+    $t.count++; $t.kb += $r.kb
+  }
+  $mxGroups = @($gh.Values | Where-Object { $_.count -ge 3 } | ForEach-Object {
+    $top = $null
+    if ($_.parents.Count -gt 0) { $top = ($_.parents.GetEnumerator() | Sort-Object @{ e = 'Value'; Descending = $true }, @{ e = 'Name'; Descending = $false } | Select-Object -First 1).Key }
+    $own = 'mixed'; if ($_.sys -eq 0) { $own = 'user' } elseif ($_.usr -eq 0) { $own = 'system' }
+    [pscustomobject]@{ key = $_.key; count = $_.count; mem_mb = [int][Math]::Round($_.kb / 1024); orphans = $_.orphans; orphan_mb = [int][Math]::Round($_.orphan_kb / 1024); parent = $top; owner = $own }
+  } | Sort-Object @{ e = 'mem_mb'; Descending = $true }, @{ e = 'count'; Descending = $true }, key | Select-Object -First 20)
+  $mxTrees = @($th.Values | Where-Object { $_.count -ge 2 } | ForEach-Object {
+    $own = 'user'; if ($_.sys) { $own = 'system' }
+    [pscustomobject]@{ root = $_.root; pid = $_.pid; owner = $own; count = $_.count; children = $_.children; mem_mb = [int][Math]::Round($_.kb / 1024) }
+  } | Sort-Object @{ e = 'mem_mb'; Descending = $true }, pid | Select-Object -First 10)
+  $mxAvail = 'available'
+} catch {
+  $mxReason = NsErr $_
+}
+$mx = $null; $mxCim = $null; $mxCmd = $null; $gh = $null; $th = $null; $kids = $null
 
 # Memory
 $commitPct = $null
@@ -131,22 +242,69 @@ $excl = $null
 $pref = Get-MpPreference
 if ($pref -and $pref.ExclusionPath -and ($pref.ExclusionPath -notmatch 'N/A')) { $excl = @($pref.ExclusionPath).Count }
 
-# GPU
+# GPU: a single bounded query per analysis; no daemon, setters or process-name query.
+# BEGIN GPU TELEMETRY
+function InvokeGpuQuery($exe, $fields) {
+  $p = New-Object Diagnostics.Process
+  $p.StartInfo = New-Object Diagnostics.ProcessStartInfo
+  $p.StartInfo.FileName = $exe
+  $p.StartInfo.Arguments = "--query-gpu=$fields --format=csv,noheader,nounits"
+  $p.StartInfo.UseShellExecute = $false
+  $p.StartInfo.CreateNoWindow = $true
+  $p.StartInfo.RedirectStandardOutput = $true
+  $p.StartInfo.RedirectStandardError = $true
+  try {
+    [void]$p.Start()
+    $out = $p.StandardOutput.ReadToEndAsync()
+    $err = $p.StandardError.ReadToEndAsync()
+    if (-not $p.WaitForExit(4000)) { $p.Kill(); return @{ rows = @(); reason = "query-timeout" } }
+    if (-not $out.Wait(200)) { return @{ rows = @(); reason = "output-timeout" } }
+    $text = $out.Result
+    if ($p.ExitCode -ne 0) { return @{ rows = @(); reason = "query-failed" } }
+    if ($text.Length -gt 65536) { return @{ rows = @(); reason = "output-limit" } }
+    return @{ rows = @($text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 16); reason = $null }
+  } catch { return @{ rows = @(); reason = "query-unavailable" } } finally { $p.Dispose() }
+}
+function GpuMemory($g, $at) {
+  foreach ($key in @("mem_used_mb", "mem_total_mb", "mem_free_mb", "util", "temp_c", "power_w")) { if ($null -ne $g[$key] -and $g[$key] -lt 0) { $g[$key] = $null } }
+  if ($null -ne $g.mem_total_mb -and $g.mem_total_mb -le 0) { $g.mem_total_mb = $null }
+  if ($null -ne $g.util -and $g.util -gt 100) { $g.util = $null }
+  if ($null -ne $g.mem_total_mb -and $null -ne $g.mem_used_mb -and $g.mem_used_mb -gt $g.mem_total_mb) { $g.mem_used_mb = $null }
+  if ($null -ne $g.mem_total_mb -and $null -ne $g.mem_free_mb -and $g.mem_free_mb -gt $g.mem_total_mb) { $g.mem_free_mb = $null }
+  $g.sensor_reason = "null sensor values mean unavailable/unsupported driver fields, never zero"
+  $g.memory_kind = "dedicated"; $g.memory_unit = "MiB"; $g.sampled_at = $at
+  $valid = $null -ne $g.mem_used_mb -and $null -ne $g.mem_total_mb -and $g.mem_total_mb -gt 0 -and $g.mem_used_mb -ge 0 -and $g.mem_used_mb -le $g.mem_total_mb
+  $g.mem_used_pct = $(if ($valid) { RNum ($g.mem_used_mb / $g.mem_total_mb * 100) } else { $null })
+  $freeValid = $null -ne $g.mem_free_mb -and $g.mem_free_mb -ge 0 -and $g.mem_free_mb -le $g.mem_total_mb
+  $g.memory_status = $(if ($valid -and $freeValid) { "available" } else { "partial" })
+  $g.memory_reason = $(if ($valid -and $freeValid) { $null } else { "driver returned unavailable or invalid memory fields" })
+  $g.process_memory_reason = "not collected; WDDM per-process memory may be N/A; compute-apps covers CUDA only"
+  return [pscustomobject]$g
+}
 $gpus = @()
+$gpuAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+$gpuReason = "nvidia-smi-not-found; other GPU vendors unsupported (AdapterRAM is not a reliable VRAM capacity)"
 if ($smi) {
-  $q = @(& nvidia-smi --query-gpu=uuid,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,power.min_limit,power.max_limit,clocks.current.graphics,clocks.current.sm,clocks.current.memory,pstate,clocks_throttle_reasons.active,driver_version --format=csv,noheader,nounits 2>$null)
-  $full = $q.Count -gt 0
-  if (-not $full) { $q = @(& nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,clocks_throttle_reasons.active,driver_version --format=csv,noheader,nounits 2>$null) }
-  foreach ($line in $q) {
-    $f = $line -split ',\s*'
-    if ($full -and $f.Count -ge 16) {
-      $gpus += [pscustomobject]@{ uuid = $f[0]; name = $f[1]; util = (RNum $f[2]); mem_used_mb = (RNum $f[3] 0); mem_total_mb = (RNum $f[4] 0); temp_c = (RNum $f[5] 0); power_w = (RNum $f[6]); power_limit_w = (RNum $f[7]); power_min_w = (RNum $f[8]); power_max_w = (RNum $f[9]); clocks_graphics_mhz = (RNum $f[10] 0); clocks_sm_mhz = (RNum $f[11] 0); clocks_memory_mhz = (RNum $f[12] 0); pstate = $(if ($f[13] -match "^(N/A|Not Supported|\[N/A\])$") { $null } else { $f[13] }); throttle = $f[14]; driver = $f[15]; source = "nvidia-smi"; available = $true }
-    } elseif (-not $full -and $f.Count -ge 9) {
-      $gpus += [pscustomobject]@{ uuid = $null; name = $f[0]; util = (RNum $f[1]); mem_used_mb = (RNum $f[2] 0); mem_total_mb = (RNum $f[3] 0); temp_c = (RNum $f[4] 0); power_w = (RNum $f[5]); power_limit_w = (RNum $f[6]); power_min_w = $null; power_max_w = $null; clocks_graphics_mhz = $null; clocks_sm_mhz = $null; clocks_memory_mhz = $null; pstate = $null; throttle = $f[7]; driver = $f[8]; source = "nvidia-smi-legacy-query"; available = $true }
-    }
+  $query = InvokeGpuQuery $smi.Source "index,name,utilization.gpu,memory.used,memory.total,memory.free,temperature.gpu,power.draw,power.limit,power.min_limit,power.max_limit,clocks.current.graphics,clocks.current.sm,clocks.current.memory,pstate,driver_version,uuid,clocks_throttle_reasons.active"
+  $gpuReason = $query.reason
+  $memoryOnly = $false
+  if ($query.reason -eq "query-failed") {
+    $query = InvokeGpuQuery $smi.Source "index,name,memory.used,memory.total,memory.free"
+    $gpuReason = $query.reason; $memoryOnly = $true
+  }
+  foreach ($line in $query.rows) {
+    $f = $line -split ",\s*"
+    if ($memoryOnly -and $f.Count -eq 5) { $f = @($f[0], $f[1], $null, $f[2], $f[3], $f[4], $null, $null, $null, $null, $null, $null, $null, $null, $null, $null, $null, $null) }
+    if ($f.Count -ne 18) { $gpuReason = "invalid-query-row"; continue }
+    $g = @{ uuid = $f[16]; throttle = $f[17]; adapter_index = (RNum $f[0] 0); name = $f[1]; util = (RNum $f[2]); mem_used_mb = (RNum $f[3] 0); mem_total_mb = (RNum $f[4] 0); mem_free_mb = (RNum $f[5] 0); temp_c = (RNum $f[6]); power_w = (RNum $f[7]); power_limit_w = (RNum $f[8]); power_min_w = (RNum $f[9]); power_max_w = (RNum $f[10]); clocks_graphics_mhz = (RNum $f[11]); clocks_sm_mhz = (RNum $f[12]); clocks_memory_mhz = (RNum $f[13]); pstate = $(if ($f[14] -match "^(N/A|Not Supported|\[N/A\])$") { $null } else { $f[14] }); driver = $f[15]; source = $(if ($memoryOnly) { "nvidia-smi memory-only fallback" } else { "nvidia-smi" }); available = $true }
+    $gpus += GpuMemory $g $gpuAt
   }
 }
+if ($gpus.Count -eq 0) {
+  $gpus = @([pscustomobject]@{ adapter_index = $null; name = "GPU"; source = "nvidia-smi"; available = $false; memory_kind = "unknown"; memory_unit = "MiB"; memory_status = $(if ($smi) { "unavailable" } else { "unsupported" }); memory_reason = $gpuReason; sampled_at = $gpuAt; mem_total_mb = $null; mem_used_mb = $null; mem_free_mb = $null; mem_used_pct = $null; util = $null; temp_c = $null; power_w = $null; power_limit_w = $null; process_memory_reason = "not collected" })
+}
+# END GPU TELEMETRY
 
 $cpuPowerW = $null; $cpuPowerSource = $null; $cpuPowerReason = "LibreHardwareMonitor CPU Package unavailable"
 try {
@@ -650,11 +808,21 @@ $result = [ordered]@{
   memory = [ordered]@{ total_gb = (R1 ($totalMb / 1024)); free_gb = (R1 ($os.FreePhysicalMemory / 1MB)); available_pct = (R1 ($os.FreePhysicalMemory / $os.TotalVisibleMemorySize * 100)); commit_pct = $commitPct; pagefile_alloc_mb = $pfa['AllocatedBaseSize']; pagefile_used_mb = $pfa['CurrentUsage']; pagefile_peak_mb = $pfa['PeakUsage'] }
   processes = [ordered]@{
     count = @($list).Count
+    threads = $(if (@($list | Where-Object { $null -eq $_.thread_count }).Count -eq 0) { ($list | Measure-Object thread_count -Sum).Sum } else { $null })
+    handles = $(if (@($list | Where-Object { $null -eq $_.handle_count }).Count -eq 0) { ($list | Measure-Object handle_count -Sum).Sum } else { $null })
+    source = "Get-Process (existing two-point CPU sample)"
+    sampled_at = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    memory_unit = "MiB"; cpu_time_unit = "seconds (cumulative)"
+    details_reason = "I/O rates unavailable in this provider; private bytes are committed private memory, not private working set"
     top_cpu = @($list | Sort-Object cpu -Descending | Select-Object -First 15)
     top_mem = @($list | Sort-Object mem_mb -Descending | Select-Object -First 15)
     apps = @($groups | Sort-Object mem_mb -Descending | Select-Object -First 25)
     apps_cpu = @($groups | Sort-Object cpu -Descending | Select-Object -First 10)
     agent_processes = $agents
+    groups = @($mxGroups)
+    trees = @($mxTrees)
+    groups_availability = $mxAvail
+    groups_reason = $mxReason
   }
   power = [ordered]@{ plan_guid = $guid; plan_name = $planName; plans = @($plans); package_w = $cpuPowerW; package_source = $cpuPowerSource; package_availability = $(if ($null -ne $cpuPowerW) { "available" } else { "unavailable" }); package_reason = $cpuPowerReason; soc_w = $null; soc_source = $null; low_power_mode = $null; on_battery = $null }
   defender = [ordered]@{ realtime = $mp.RealTimeProtectionEnabled; exclusions = $excl }

@@ -35,6 +35,16 @@ pub const HUB_ANALYSIS_STALE_MS: i64 = 2 * 60 * MINUTE;
 const KEYS: [&str; 15] =
     ["cpu", "mem", "swap", "commit", "dr", "dw", "rx", "tx", "power_cpu_w", "power_soc_w", "power_platform_w", "power_gpu_w", "gpu", "gmem", "gtemp"];
 
+fn metric_keys() -> Vec<String> {
+    let mut keys: Vec<String> = KEYS.iter().map(|s| (*s).to_string()).collect();
+    for id in 0..crate::live::MAX_GPUS {
+        for suffix in ["used_mib", "total_mib", "free_mib", "pct"] {
+            keys.push(format!("gpu_{id}_vram_{suffix}"));
+        }
+    }
+    keys
+}
+
 // ---------------------------------------------------------------------------
 // 設定（meta の monitor）
 // ---------------------------------------------------------------------------
@@ -110,16 +120,17 @@ pub fn rollup(node_id: &str, samples: &[Sample], procs: Option<&Value>, from: i6
         }
     }
     let last = by_minute.keys().next_back().copied();
+    let keys = metric_keys();
     by_minute
         .into_iter()
         .map(|(minute, pts)| {
             let mut v = Map::new();
-            for k in KEYS {
+            for k in &keys {
                 let xs: Vec<f64> = pts.iter().filter_map(|p| p.get(k).and_then(Value::as_f64)).collect();
                 if !xs.is_empty() {
                     let avg = xs.iter().sum::<f64>() / xs.len() as f64;
                     let max = xs.iter().copied().fold(f64::MIN, f64::max);
-                    v.insert(k.into(), json!([round(avg, 2), round(max, 2)]));
+                    v.insert(k.clone(), json!([round(avg, 2), round(max, 2)]));
                 }
             }
             if Some(minute) == last
@@ -148,11 +159,12 @@ pub fn series(rows: &[MinuteRow], since: i64, until: i64, max: usize) -> Value {
     let span = (until - since).max(MINUTE);
     let buckets = max.max(1) as i64;
     let width = (span / buckets).max(MINUTE);
+    let keys = metric_keys();
     let mut acc: BTreeMap<i64, HashMap<&str, (f64, usize, f64)>> = BTreeMap::new();
     for r in rows {
         let b = since + (r.minute - since).div_euclid(width) * width;
         let e = acc.entry(b).or_default();
-        for k in KEYS {
+        for k in keys.iter().map(String::as_str) {
             if let Some([a, m]) = r.v.get(k).and_then(Value::as_array).and_then(|x| x.iter().map(Value::as_f64).collect::<Option<Vec<_>>>()).as_deref() {
                 let x = e.entry(k).or_insert((0.0, 0, f64::MIN));
                 x.0 += a;
@@ -163,7 +175,7 @@ pub fn series(rows: &[MinuteRow], since: i64, until: i64, max: usize) -> Value {
     }
     let mut out = Map::new();
     out.insert("t".into(), json!(acc.keys().collect::<Vec<_>>()));
-    for k in KEYS {
+    for k in keys.iter().map(String::as_str) {
         if acc.values().any(|e| e.contains_key(k)) {
             out.insert(k.into(), json!(acc.values().map(|e| e.get(k).map(|(s, n, _)| round(s / *n as f64, 2))).collect::<Vec<_>>()));
             out.insert(format!("{k}_max"), json!(acc.values().map(|e| e.get(k).map(|x| round(x.2, 2))).collect::<Vec<_>>()));
@@ -565,6 +577,27 @@ mod tests {
             gpu: gtemp.map(|g| vec![Gpu { util: Some(10.0), temp_c: Some(g), ..Default::default() }]),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn vram_adapter_values_survive_minute_rollup_series_and_sqlite() {
+        let s = Sample {
+            t: 1000,
+            gpu: Some(vec![
+                Gpu { adapter_index: Some(0), mem_used_mb: Some(1024.0), mem_total_mb: Some(4096.0), mem_free_mb: Some(3000.0), ..Default::default() },
+                Gpu { adapter_index: Some(1), mem_total_mb: Some(8192.0), ..Default::default() },
+            ]),
+            ..Default::default()
+        };
+        let rows = rollup("a", &[s], None, 0, MINUTE, "test");
+        assert_eq!(rows[0].v["gpu_0_vram_free_mib"], json!([3000.0, 3000.0]));
+        assert!(rows[0].v.get("gpu_1_vram_used_mib").is_none());
+        let db = Store::open_in_memory().unwrap();
+        db.add_metrics(&rows).unwrap();
+        let saved = db.metrics(Some("a"), 0, MINUTE).unwrap();
+        let values = series(&saved, 0, MINUTE, 60);
+        assert_eq!(values["gpu_0_vram_pct"], json!([25.0]));
+        assert!(values.get("gpu_1_vram_pct").is_none());
     }
 
     #[test]

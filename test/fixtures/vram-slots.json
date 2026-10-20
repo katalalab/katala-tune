@@ -1,0 +1,386 @@
+[
+  {
+    "name": "zero-reserved",
+    "gpus": [
+      {
+        "adapter_index": 0,
+        "uuid": "GPU-fixture",
+        "name": "Fixture GPU",
+        "mem_used_mb": 0,
+        "mem_total_mb": 100,
+        "mem_free_mb": 99,
+        "mem_used_pct": 0.0,
+        "memory_status": "available",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123
+      }
+    ],
+    "slots": [
+      0
+    ],
+    "reasons": [
+      null
+    ],
+    "metrics": {
+      "gpu_0_vram_used_mib": 0.0,
+      "gpu_0_vram_total_mib": 100.0,
+      "gpu_0_vram_free_mib": 99.0,
+      "gpu_0_vram_pct": 0.0
+    }
+  },
+  {
+    "name": "reserved",
+    "gpus": [
+      {
+        "adapter_index": 0,
+        "uuid": "GPU-fixture",
+        "name": "Fixture GPU",
+        "mem_used_mb": 50,
+        "mem_total_mb": 100,
+        "mem_free_mb": 49,
+        "mem_used_pct": 50.0,
+        "memory_status": "available",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123
+      }
+    ],
+    "slots": [
+      0
+    ],
+    "reasons": [
+      null
+    ],
+    "metrics": {
+      "gpu_0_vram_used_mib": 50.0,
+      "gpu_0_vram_total_mib": 100.0,
+      "gpu_0_vram_free_mib": 49.0,
+      "gpu_0_vram_pct": 50.0
+    }
+  },
+  {
+    "name": "n-a",
+    "gpus": [
+      {
+        "adapter_index": 1,
+        "uuid": "GPU-fixture",
+        "name": "Fixture GPU",
+        "mem_used_mb": null,
+        "mem_total_mb": null,
+        "mem_free_mb": null,
+        "mem_used_pct": null,
+        "memory_status": "partial",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123
+      }
+    ],
+    "slots": [
+      1
+    ],
+    "reasons": [
+      null
+    ],
+    "metrics": {}
+  },
+  {
+    "name": "legacy-null-index",
+    "gpus": [
+      {
+        "adapter_index": null,
+        "uuid": "GPU-fixture",
+        "name": "Fixture GPU",
+        "mem_used_mb": null,
+        "mem_total_mb": null,
+        "mem_free_mb": null,
+        "mem_used_pct": null,
+        "memory_status": "partial",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123
+      }
+    ],
+    "slots": [
+      0
+    ],
+    "reasons": [
+      null
+    ],
+    "metrics": {}
+  },
+  {
+    "name": "index-16",
+    "gpus": [
+      {
+        "adapter_index": 16,
+        "uuid": "GPU-fixture",
+        "name": "Fixture GPU",
+        "mem_used_mb": 50,
+        "mem_total_mb": 100,
+        "mem_free_mb": 49,
+        "mem_used_pct": 50.0,
+        "memory_status": "available",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123,
+        "storage_slot": 0
+      }
+    ],
+    "slots": [
+      null
+    ],
+    "reasons": [
+      "adapter-index-out-of-range"
+    ],
+    "metrics": {}
+  },
+  {
+    "name": "index-u32-max",
+    "gpus": [
+      {
+        "adapter_index": 4294967295,
+        "uuid": "GPU-fixture",
+        "name": "Fixture GPU",
+        "mem_used_mb": 50,
+        "mem_total_mb": 100,
+        "mem_free_mb": 49,
+        "mem_used_pct": 50.0,
+        "memory_status": "available",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123
+      }
+    ],
+    "slots": [
+      null
+    ],
+    "reasons": [
+      "adapter-index-out-of-range"
+    ],
+    "metrics": {}
+  },
+  {
+    "name": "duplicate-index",
+    "gpus": [
+      {
+        "adapter_index": 0,
+        "uuid": "GPU-a",
+        "name": "Fixture GPU",
+        "mem_used_mb": 50,
+        "mem_total_mb": 100,
+        "mem_free_mb": 49,
+        "mem_used_pct": 50.0,
+        "memory_status": "available",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123
+      },
+      {
+        "adapter_index": 0,
+        "uuid": "GPU-b",
+        "name": "Fixture GPU",
+        "mem_used_mb": 75,
+        "mem_total_mb": 100,
+        "mem_free_mb": 24,
+        "mem_used_pct": 75.0,
+        "memory_status": "available",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123
+      }
+    ],
+    "slots": [
+      null,
+      null
+    ],
+    "reasons": [
+      "duplicate-adapter-index",
+      "duplicate-adapter-index"
+    ],
+    "metrics": {}
+  },
+  {
+    "name": "multi-null-index",
+    "gpus": [
+      {
+        "adapter_index": 0,
+        "uuid": "GPU-a",
+        "name": "Fixture GPU",
+        "mem_used_mb": 50,
+        "mem_total_mb": 100,
+        "mem_free_mb": 49,
+        "mem_used_pct": 50.0,
+        "memory_status": "available",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123
+      },
+      {
+        "adapter_index": null,
+        "uuid": "GPU-b",
+        "name": "Fixture GPU",
+        "mem_used_mb": 75,
+        "mem_total_mb": 100,
+        "mem_free_mb": 24,
+        "mem_used_pct": 75.0,
+        "memory_status": "available",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123
+      }
+    ],
+    "slots": [
+      0,
+      null
+    ],
+    "reasons": [
+      null,
+      "missing-adapter-index"
+    ],
+    "metrics": {
+      "gpu_0_vram_used_mib": 50.0,
+      "gpu_0_vram_total_mib": 100.0,
+      "gpu_0_vram_free_mib": 49.0,
+      "gpu_0_vram_pct": 50.0
+    }
+  },
+  {
+    "name": "sparse-reordered",
+    "gpus": [
+      {
+        "adapter_index": 15,
+        "uuid": "GPU-b",
+        "name": "Fixture GPU",
+        "mem_used_mb": 75,
+        "mem_total_mb": 100,
+        "mem_free_mb": 24,
+        "mem_used_pct": 75.0,
+        "memory_status": "available",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123
+      },
+      {
+        "adapter_index": 2,
+        "uuid": "GPU-a",
+        "name": "Fixture GPU",
+        "mem_used_mb": 25,
+        "mem_total_mb": 100,
+        "mem_free_mb": 74,
+        "mem_used_pct": 25.0,
+        "memory_status": "available",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123
+      }
+    ],
+    "slots": [
+      15,
+      2
+    ],
+    "reasons": [
+      null,
+      null
+    ],
+    "metrics": {
+      "gpu_15_vram_used_mib": 75.0,
+      "gpu_15_vram_total_mib": 100.0,
+      "gpu_15_vram_free_mib": 24.0,
+      "gpu_15_vram_pct": 75.0,
+      "gpu_2_vram_used_mib": 25.0,
+      "gpu_2_vram_total_mib": 100.0,
+      "gpu_2_vram_free_mib": 74.0,
+      "gpu_2_vram_pct": 25.0
+    }
+  },
+  {
+    "name": "sparse-ordered",
+    "gpus": [
+      {
+        "adapter_index": 2,
+        "uuid": "GPU-a",
+        "name": "Fixture GPU",
+        "mem_used_mb": 25,
+        "mem_total_mb": 100,
+        "mem_free_mb": 74,
+        "mem_used_pct": 25.0,
+        "memory_status": "available",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123
+      },
+      {
+        "adapter_index": 15,
+        "uuid": "GPU-b",
+        "name": "Fixture GPU",
+        "mem_used_mb": 75,
+        "mem_total_mb": 100,
+        "mem_free_mb": 24,
+        "mem_used_pct": 75.0,
+        "memory_status": "available",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123
+      }
+    ],
+    "slots": [
+      2,
+      15
+    ],
+    "reasons": [
+      null,
+      null
+    ],
+    "metrics": {
+      "gpu_2_vram_used_mib": 25.0,
+      "gpu_2_vram_total_mib": 100.0,
+      "gpu_2_vram_free_mib": 74.0,
+      "gpu_2_vram_pct": 25.0,
+      "gpu_15_vram_used_mib": 75.0,
+      "gpu_15_vram_total_mib": 100.0,
+      "gpu_15_vram_free_mib": 24.0,
+      "gpu_15_vram_pct": 75.0
+    }
+  },
+  {
+    "name": "duplicate-index-reversed",
+    "gpus": [
+      {
+        "adapter_index": 0,
+        "uuid": "GPU-b",
+        "name": "Fixture GPU",
+        "mem_used_mb": 75,
+        "mem_total_mb": 100,
+        "mem_free_mb": 24,
+        "mem_used_pct": 75.0,
+        "memory_status": "available",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123
+      },
+      {
+        "adapter_index": 0,
+        "uuid": "GPU-a",
+        "name": "Fixture GPU",
+        "mem_used_mb": 50,
+        "mem_total_mb": 100,
+        "mem_free_mb": 49,
+        "mem_used_pct": 50.0,
+        "memory_status": "available",
+        "memory_kind": "dedicated",
+        "source": "fixture",
+        "sampled_at": 123
+      }
+    ],
+    "slots": [
+      null,
+      null
+    ],
+    "reasons": [
+      "duplicate-adapter-index",
+      "duplicate-adapter-index"
+    ],
+    "metrics": {}
+  }
+]

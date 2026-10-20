@@ -23,9 +23,15 @@ pub fn exe(name: &str) -> String {
     if cfg!(windows) { format!("{name}.exe") } else { name.to_string() }
 }
 
-/// ~/.katala-tune/bin
+/// 同梱道具の保存先。検証用に `KATALA_TUNE_DATA_DIR` を明示したときは
+/// その隔離 data directory 配下へ置き、通常運用は従来の `~/.katala-tune/bin` を使う。
+fn bin_dir_for(data_dir: Option<&Path>) -> PathBuf {
+    data_dir.map(|path| path.join("bin")).unwrap_or_else(|| crate::nodes::home().join(".katala-tune").join("bin"))
+}
+
 pub fn bin_dir() -> PathBuf {
-    crate::nodes::home().join(".katala-tune").join("bin")
+    let isolated = std::env::var_os("KATALA_TUNE_DATA_DIR").filter(|value| !value.is_empty()).map(PathBuf::from);
+    bin_dir_for(isolated.as_deref())
 }
 
 /// from（アプリの隣）にある道具のうち、to と中身が違うものを写す。戻り値は道具ごとの結果
@@ -136,6 +142,12 @@ pub async fn push_agent(node: &Node, bytes: &[u8]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bin_dir_uses_isolated_data_namespace_only_when_requested() {
+        assert_eq!(bin_dir_for(Some(Path::new("/private/qa/data"))), PathBuf::from("/private/qa/data/bin"));
+        assert_eq!(bin_dir_for(None), crate::nodes::home().join(".katala-tune").join("bin"));
+    }
 
     #[test]
     fn versions_compare_like_semver() {
