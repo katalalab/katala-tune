@@ -271,6 +271,10 @@ mod windows_script_tests {
     #[tokio::test]
     async fn native_script_classifies_privileges_and_partial_cim_without_localized_messages() {
         let mock_cim = r#"
+class CimDenied : System.Exception {
+    [int]$NativeErrorCode = 5
+    CimDenied() : base("localized") { $this.HResult = -2147217405 }
+}
 function Get-CimInstance {
     param($ClassName,$Property,$OperationTimeoutSec)
     if ($ClassName -eq "Win32_ComputerSystem") { return @{ Manufacturer = "Example"; Model = "Model" } }
@@ -282,6 +286,7 @@ function Get-CimInstance {
             ("return $true", "enabled"),
             ("return $false", "disabled"),
             ("throw [System.UnauthorizedAccessException]::new(\"localized\")", "permission_denied"),
+            ("throw [CimDenied]::new()", "permission_denied"),
             ("throw [System.ComponentModel.Win32Exception]::new(1314)", "permission_denied"),
             ("throw [System.ComponentModel.Win32Exception]::new(5)", "permission_denied"),
             ("throw [System.PlatformNotSupportedException]::new(\"localized\")", "unsupported"),
@@ -300,7 +305,7 @@ function Get-CimInstance {
             assert!(!String::from_utf8_lossy(&result.stdout).contains("localized"));
         }
         let script = format!(
-            "{mock_cim}\nfunction Get-CimInstance {{ param($ClassName,$Property,$OperationTimeoutSec) if ($ClassName -eq \"Win32_BaseBoard\") {{ throw [System.UnauthorizedAccessException]::new() }} return @{{ Manufacturer=\"Example\";Model=\"Model\";SMBIOSBIOSVersion=\"1\" }} }}\nfunction Confirm-SecureBootUEFI {{ return $false }}\n{}",
+            "{mock_cim}\nfunction Get-CimInstance {{ param($ClassName,$Property,$OperationTimeoutSec) if ($ClassName -eq \"Win32_BaseBoard\") {{ throw [CimDenied]::new() }} return @{{ Manufacturer=\"Example\";Model=\"Model\";SMBIOSBIOSVersion=\"1\" }} }}\nfunction Confirm-SecureBootUEFI {{ return $false }}\n{}",
             WIN.trim_start_matches('\u{feff}')
         );
         let input = format!("{}\n", crate::logs::base64(script.as_bytes()));
