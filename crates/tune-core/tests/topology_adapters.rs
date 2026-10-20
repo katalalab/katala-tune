@@ -13,7 +13,10 @@ use tune_core::{
         adapters::{
             CommandFuture, CommandRunner,
             github::{GithubCache, GithubCacheEntry, GithubRequest, collect_github_with, repository_scope},
-            remote::{POSIX_PROBE, RemotePlatform, RemoteRequest, RemoteRuntimeKind, WINDOWS_PROBE, collect_remote_with, identity_hash},
+            remote::{
+                POSIX_PROBE, RemotePlatform, RemoteRequest, RemoteRuntimeKind, RemoteSourceCheckout, RemoteSourceManifest, WINDOWS_PROBE, collect_remote_with,
+                identity_hash, source_root_fingerprint,
+            },
         },
     },
 };
@@ -55,6 +58,16 @@ fn remote() -> RemoteRequest {
         cursor: None,
         roots: vec!["/private/example-root".into()],
         configs: vec![],
+        source_allowlist: Some(vec![RemoteSourceCheckout {
+            root_index: 0,
+            relative_path: ".".into(),
+            expected_head: "a".repeat(40),
+            manifests: vec![RemoteSourceManifest {
+                relative_path: "package.json".into(),
+                bytes: 26,
+                sha256: tune_core::db::sha256_hex(b"{\"name\":\"example-package\"}"),
+            }],
+        }]),
         python_program: "/usr/bin/python3".into(),
         git_program: None,
         observed_at_ms: 1000,
@@ -74,7 +87,7 @@ fn capture(request: &RemoteRequest) -> RawCapture {
         counters: CaptureCounters { repositories: 1, manifests: 1, files: 1, bytes: text.len(), ..Default::default() },
         repositories: vec![RawRepository {
             relative_path: ".".into(),
-            root_fingerprint: "a".repeat(64),
+            root_fingerprint: source_root_fingerprint(&request.roots[0], request.platform),
             git: RawGitMetadata {
                 origin: Some("https://credential@example.org/example/repo.git?secret=value#fragment".into()),
                 head: Some("a".repeat(40)),
@@ -129,6 +142,175 @@ fn snapshot(scope: &str) -> TopologySnapshot {
         failures: vec![],
         counters: CaptureCounters::default(),
         observed_at_ms: 123,
+    }
+}
+
+#[tokio::test]
+async fn remote_rejects_unpinned_sources_before_transport() {
+    let mut request = remote();
+    request.source_allowlist = None;
+    let fake = Fake::new(vec![remote_capture(&request)]);
+    let capture = collect_remote_with(&fake, &request).await;
+    assert!(fake.calls.lock().unwrap().is_empty(), "a metadata-only request must not open SSH");
+    assert!(capture.repositories.is_empty() && capture.progress.is_none());
+    assert_eq!(capture.failures[0].code, FailureCode::PermissionDenied);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn posix_unpinned_source_does_not_return_manifest_content() {
+    use std::{fs, process::Command};
+    let base = std::env::temp_dir().join(format!("topology-unpinned-fixture-{}", std::process::id()));
+    fs::create_dir_all(&base).unwrap();
+    assert!(Command::new("/usr/bin/git").args(["init", "--quiet"]).arg(&base).status().unwrap().success());
+    let secret = "unapproved-manifest-sentinel";
+    fs::write(base.join("package.json"), format!(r#"{{"name":"{secret}"}}"#)).unwrap();
+    let config = json!({"scope_id":"test:unpinned","observed_at_ms":1000,"roots":[base],"configs":[],"limits":limits()});
+    let result = run_posix_probe(&config).await;
+    assert!(!serde_json::to_string(&result).unwrap().contains(secret));
+    assert!(result["repositories"].as_array().unwrap().is_empty());
+    assert_eq!(result["failures"][0]["code"], "permission_denied");
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn remote_invalid_source_permissions_never_open_transport() {
+    for mode in 0..13 {
+        let mut request = remote();
+        match mode {
+            0 => request.source_allowlist = Some(vec![]),
+            1 => {
+                let policy = request.source_allowlist.as_mut().unwrap();
+                policy.push(policy[0].clone());
+            }
+            2 => request.source_allowlist.as_mut().unwrap()[0].root_index = 1,
+            3 => request.source_allowlist.as_mut().unwrap()[0].relative_path = "a/../b".into(),
+            4 => request.source_allowlist.as_mut().unwrap()[0].expected_head = "unknown".into(),
+            5 => {
+                let files = &mut request.source_allowlist.as_mut().unwrap()[0].manifests;
+                files.push(files[0].clone());
+            }
+            6 => request.source_allowlist.as_mut().unwrap()[0].manifests[0].relative_path = "../package.json".into(),
+            7 => request.source_allowlist.as_mut().unwrap()[0].manifests[0].bytes = request.limits.file_bytes + 1,
+            8 => request.source_allowlist.as_mut().unwrap()[0].manifests[0].sha256 = "invalid".into(),
+            9 => request.configs = vec![json!({"path":"/not-opened.json","keys":[]})],
+            10 => request.roots = vec!["/allowed/../other".into()],
+            11 => request.roots = vec!["/allowed//other".into()],
+            _ => request.limits.total_bytes_per_environment = 1,
+        }
+        let fake = Fake::new(vec![]);
+        let capture = collect_remote_with(&fake, &request).await;
+        assert!(fake.calls.lock().unwrap().is_empty(), "invalid source permission mode {mode}");
+        assert!(capture.repositories.is_empty() && capture.progress.is_none());
+        assert_eq!(capture.failures[0].code, FailureCode::PermissionDenied, "mode {mode}");
+    }
+}
+
+#[tokio::test]
+async fn remote_rejects_self_consistent_but_unapproved_sources_without_retaining_content() {
+    for mode in 0..9 {
+        let request = remote();
+        let mut raw = remote_capture(&request);
+        match mode {
+            0 => raw["repositories"][0]["git"]["head"] = json!("b".repeat(40)),
+            1 => raw["repositories"][0]["manifests"][0]["revision"] = json!("b".repeat(40)),
+            2 => raw["repositories"][0]["manifests"][0]["relative_path"] = json!("nested/package.json"),
+            3 => {
+                let text = "unapproved-manifest-sentinel";
+                raw["repositories"][0]["manifests"][0]["content"] = json!(text);
+                raw["repositories"][0]["manifests"][0]["content_sha256"] = json!(tune_core::db::sha256_hex(text.as_bytes()));
+                raw["counters"]["bytes"] = json!(text.len());
+            }
+            4 => raw["repositories"][0]["manifests"][0]["kind"] = json!("cargo"),
+            5 => raw["repositories"][0]["root_fingerprint"] = json!("0".repeat(64)),
+            6 => raw["repositories"][0]["relative_path"] = json!("other-checkout"),
+            7 => {
+                let repo = raw["repositories"][0].clone();
+                raw["repositories"].as_array_mut().unwrap().push(repo);
+                raw["counters"]["repositories"] = json!(2);
+                raw["counters"]["manifests"] = json!(2);
+            }
+            _ => {
+                let file = raw["repositories"][0]["manifests"][0].clone();
+                raw["repositories"][0]["manifests"].as_array_mut().unwrap().push(file);
+                raw["counters"]["manifests"] = json!(2);
+            }
+        }
+        let capture = collect_remote_with(&Fake::new(vec![raw]), &request).await;
+        assert!(capture.repositories.is_empty() && capture.progress.is_none(), "mode {mode}");
+        assert_eq!(capture.failures[0].code, FailureCode::PermissionDenied, "mode {mode}");
+        assert!(!serde_json::to_string(&capture).unwrap().contains("unapproved-manifest-sentinel"));
+    }
+}
+
+#[tokio::test]
+async fn remote_missing_sources_and_empty_captures_never_become_complete() {
+    for empty in [false, true] {
+        let request = remote();
+        let mut raw = remote_capture(&request);
+        raw["repositories"][0]["manifests"] = json!([]);
+        raw["counters"]["manifests"] = json!(0);
+        raw["counters"]["bytes"] = json!(0);
+        if empty {
+            raw["repositories"] = json!([]);
+            raw["counters"]["repositories"] = json!(0);
+        }
+        let capture = collect_remote_with(&Fake::new(vec![raw]), &request).await;
+        assert!(capture.failures.iter().any(|failure| failure.message == "source allowlist incomplete"));
+        let snapshots = tune_core::topology::adapters::assemble_capture(&capture);
+        assert!(snapshots.iter().all(|snapshot| snapshot.status != ScopeStatus::Complete));
+    }
+}
+
+#[tokio::test]
+async fn remote_partial_manifest_set_preserves_the_previous_complete_checkout_graph() {
+    let mut request = remote();
+    let content = r#"{"name":"second-package"}"#;
+    let sha = tune_core::db::sha256_hex(content.as_bytes());
+    request.source_allowlist.as_mut().unwrap()[0].manifests.push(RemoteSourceManifest {
+        relative_path: "nested/package.json".into(),
+        bytes: content.len(),
+        sha256: sha.clone(),
+    });
+    let mut complete = remote_capture(&request);
+    let mut second = complete["repositories"][0]["manifests"][0].clone();
+    second["relative_path"] = json!("nested/package.json");
+    second["content"] = json!(content);
+    second["content_sha256"] = json!(sha);
+    complete["repositories"][0]["manifests"].as_array_mut().unwrap().push(second);
+    complete["counters"]["manifests"] = json!(2);
+    complete["counters"]["files"] = json!(2);
+    complete["counters"]["bytes"] = json!(26 + content.len());
+    let capture = collect_remote_with(&Fake::new(vec![complete]), &request).await;
+    assert!(capture.failures.is_empty());
+    let snapshots = tune_core::topology::adapters::assemble_capture(&capture);
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].status, ScopeStatus::Complete);
+    let scope = snapshots[0].scope_id.clone();
+    let db = tune_core::db::Store::open_in_memory().unwrap();
+    db.record_topology("complete", &snapshots[0], 1).unwrap();
+    let previous = db.topology_entities(&scope).unwrap();
+    assert!(previous.iter().any(|entity| entity["label"] == "second-package"));
+
+    let partial = collect_remote_with(&Fake::new(vec![remote_capture(&request)]), &request).await;
+    assert_eq!(partial.repositories[0].manifests.len(), 1);
+    assert!(partial.repositories[0].failures.iter().any(|failure| failure.message == "source allowlist incomplete"));
+    for snapshot in tune_core::topology::adapters::assemble_capture(&partial) {
+        assert_ne!(snapshot.status, ScopeStatus::Complete);
+        db.record_topology("partial", &snapshot, 2).unwrap();
+    }
+    assert_eq!(db.topology_entities(&scope).unwrap(), previous);
+    assert_eq!(db.topology_latest_success(&scope).unwrap().unwrap()["run_id"], "complete");
+    assert_eq!(db.topology_latest_failure(&scope).unwrap().unwrap()["run_id"], "partial");
+}
+
+#[test]
+fn source_roots_match_platform_fingerprints_and_invalid_input_cannot_panic() {
+    assert_eq!(source_root_fingerprint("/allowed/root", RemotePlatform::Posix), tune_core::db::sha256_hex(b"/allowed/root"));
+    assert_eq!(source_root_fingerprint("C:\\Allowed\\Root", RemotePlatform::Windows), tune_core::db::sha256_hex(b"c:/allowed/root"));
+    assert_eq!(source_root_fingerprint("C:\\", RemotePlatform::Windows), tune_core::db::sha256_hex(b"c:/"));
+    for root in ["", "x", "日"] {
+        let _ = source_root_fingerprint(root, RemotePlatform::Windows);
     }
 }
 
@@ -368,7 +550,8 @@ async fn posix_probe_reads_two_roots_and_worktree_without_mutation_or_symlink_de
     fs::create_dir_all(first.join(".branch-recovery/objects")).unwrap();
     fs::write(first.join(".branch-recovery/objects/package.json"), "{invalid").unwrap();
     let roots = vec![first.to_string_lossy().into_owned(), second.to_string_lossy().into_owned()];
-    let config = json!({"scope_id":"test:posix","observed_at_ms":1000,"roots":roots,"configs":[],"limits":limits()});
+    let mut config = json!({"scope_id":"test:posix","observed_at_ms":1000,"roots":roots,"configs":[],"limits":limits()});
+    approve_fixture_sources(&mut config);
     let prefix = format!("import json\nCONFIG=json.loads({})\n", serde_json::to_string(&config.to_string()).unwrap());
     let text = format!("{prefix}{POSIX_PROBE}");
     let before = std::fs::read(first.join(".git/config")).unwrap();
@@ -378,6 +561,7 @@ async fn posix_probe_reads_two_roots_and_worktree_without_mutation_or_symlink_de
     assert!(capture.failures.is_empty());
     assert_eq!(capture.repositories.len(), 3);
     assert_eq!(capture.counters.manifests, 3);
+    assert_eq!(capture.counters.children, 15);
     assert!(capture.repositories.iter().any(|repo| repo.git.is_worktree));
     assert!(capture.repositories.iter().flat_map(|repo| &repo.manifests).all(|manifest| !manifest.relative_path.contains(".branch-recovery")));
     let roots = capture.repositories.iter().map(|repo| &repo.root_fingerprint).collect::<std::collections::BTreeSet<_>>();
@@ -528,6 +712,7 @@ async fn approved_remote_smoke_receipts() {
             cursor: None,
             roots: item["roots"].as_array().unwrap().iter().map(|value| value.as_str().unwrap().to_owned()).collect(),
             configs: vec![],
+            source_allowlist: item.get("source_allowlist").cloned().and_then(|value| serde_json::from_value(value).ok()),
             python_program: "/usr/bin/python3".into(),
             git_program: None,
             observed_at_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64,
@@ -581,10 +766,88 @@ async fn process_failures_are_static_and_do_not_expose_stderr_secrets() {
     }
 }
 
+/// Construct explicit permissions only for temporary test-owned fixtures.
+#[cfg(unix)]
+fn approve_fixture_sources(config: &mut Value) {
+    use std::{fs, path::Path, process::Command};
+    fn visit(path: &Path, root: usize, relative: &str, inherited: Option<usize>, policy: &mut Vec<Value>) {
+        let mut checkout = inherited;
+        if path.join(".git").exists() {
+            let git = |args: &[&str]| Command::new("/usr/bin/git").env_clear().env("PATH", "/usr/bin:/bin").args(["-C"]).arg(path).args(args).output().unwrap();
+            if !git(&["rev-parse", "--verify", "HEAD"]).status.success() {
+                assert!(
+                    git(&[
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.com",
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "-c",
+                        "commit.gpgsign=false",
+                        "commit",
+                        "--allow-empty",
+                        "--no-gpg-sign",
+                        "--quiet",
+                        "-m",
+                        "fixture"
+                    ])
+                    .status
+                    .success()
+                );
+            }
+            let head = String::from_utf8(git(&["rev-parse", "--verify", "HEAD"]).stdout).unwrap().trim().to_owned();
+            checkout = Some(policy.len());
+            policy.push(json!({"root_index":root,"relative_path":relative,"expected_head":head,"manifests":[]}));
+        }
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let kind = entry.file_type().unwrap();
+            if kind.is_symlink()
+                || [".git", ".branch-recovery", "target", "node_modules", ".cache", "cache", "__pycache__", ".venv", "venv", "vendor", "dist", "build"]
+                    .contains(&name.as_str())
+            {
+                continue;
+            }
+            let child = if relative == "." { name.clone() } else { format!("{relative}/{name}") };
+            if kind.is_dir() {
+                visit(&entry.path(), root, &child, checkout, policy);
+            } else if let Some(index) = checkout {
+                let base = policy[index]["relative_path"].as_str().unwrap();
+                let file = if base == "." { child } else { child.strip_prefix(&format!("{base}/")).unwrap().to_owned() };
+                if ["Cargo.toml", "package.json", "pyproject.toml", "go.mod"].contains(&name.as_str())
+                    || (file.starts_with(".github/workflows/") && file.matches('/').count() == 2 && (file.ends_with(".yml") || file.ends_with(".yaml")))
+                {
+                    let bytes = fs::read(entry.path()).unwrap();
+                    policy[index]["manifests"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"relative_path":file,"bytes":bytes.len(),"sha256":tune_core::db::sha256_hex(&bytes)}));
+                }
+            }
+        }
+    }
+    // System temporary-directory aliases are resolved only when building fixture permissions.
+    for root in config["roots"].as_array_mut().unwrap() {
+        *root = json!(std::fs::canonicalize(root.as_str().unwrap()).unwrap());
+    }
+    let mut policy = vec![];
+    for (index, root) in config["roots"].as_array().unwrap().iter().enumerate() {
+        visit(Path::new(root.as_str().unwrap()), index, ".", None, &mut policy);
+    }
+    config["source_allowlist"] = json!(policy);
+}
+
 #[cfg(unix)]
 async fn run_posix_probe(config: &Value) -> Value {
+    run_posix_probe_text(config, POSIX_PROBE).await.0
+}
+
+#[cfg(unix)]
+async fn run_posix_probe_text(config: &Value, probe: &str) -> (Value, Vec<u8>) {
     let prefix = format!("import json\nCONFIG=json.loads({})\n", serde_json::to_string(&config.to_string()).unwrap());
-    let source = format!("{prefix}{POSIX_PROBE}");
+    let source = format!("{prefix}{probe}");
     let output = run_bounded(
         "/usr/bin/python3",
         &["-B".into(), "-".into()],
@@ -595,7 +858,134 @@ async fn run_posix_probe(config: &Value) -> Value {
     )
     .await;
     assert_eq!(output.code, Some(0), "bounded probe exited without a valid receipt");
-    serde_json::from_slice(&output.stdout).expect("bounded probe must return valid JSON")
+    (serde_json::from_slice(&output.stdout).expect("bounded probe must return valid JSON"), output.stdout)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn posix_source_gate_scrubs_raw_stdout_on_changed_or_unapproved_sources() {
+    use std::{fs, os::unix::fs::symlink, process::Command};
+    let base = std::env::temp_dir().join(format!("topology-source-gate-fixture-{}", std::process::id()));
+    fs::create_dir_all(&base).unwrap();
+    assert!(Command::new("/usr/bin/git").args(["init", "--quiet"]).arg(&base).status().unwrap().success());
+    let approved = r#"{"name":"approved-fixture"}"#;
+    let rejected = r#"{"name":"unapproved-manifest-sentinel"}"#;
+    fs::write(base.join("package.json"), approved).unwrap();
+    let mut config = json!({"scope_id":"test:source-gate","observed_at_ms":1000,"roots":[base],"configs":[],"limits":limits()});
+    approve_fixture_sources(&mut config);
+    let accepted = run_posix_probe(&config).await;
+    assert!(accepted["failures"].as_array().unwrap().is_empty());
+    assert_eq!(accepted["repositories"][0]["manifests"][0]["content"], approved);
+    assert_eq!(accepted["counters"]["children"], 5);
+    for mode in 0..10 {
+        let mut request = config.clone();
+        match mode {
+            0 => fs::write(base.join("package.json"), rejected).unwrap(),
+            1 => request["source_allowlist"][0]["manifests"][0]["sha256"] = json!("0".repeat(64)),
+            2 => request["source_allowlist"][0]["manifests"][0]["bytes"] = json!(approved.len() + 1),
+            3 => request["source_allowlist"][0]["manifests"][0]["relative_path"] = json!("nested/package.json"),
+            4 => request["source_allowlist"][0]["expected_head"] = json!("0".repeat(40)),
+            5 => fs::write(base.join("Cargo.toml"), rejected).unwrap(),
+            6 => {
+                let entry = request["source_allowlist"][0].clone();
+                request["source_allowlist"].as_array_mut().unwrap().push(entry);
+            }
+            7 => fs::remove_file(base.join("package.json")).unwrap(),
+            8 => fs::rename(base.join(".git"), base.join("hidden-git")).unwrap(),
+            _ => {
+                fs::write(base.join("unapproved.txt"), rejected).unwrap();
+                fs::remove_file(base.join("package.json")).unwrap();
+                symlink(base.join("unapproved.txt"), base.join("package.json")).unwrap();
+            }
+        }
+        let (capture, stdout) = run_posix_probe_text(&request, POSIX_PROBE).await;
+        assert!(!String::from_utf8_lossy(&stdout).contains("unapproved-manifest-sentinel"), "mode {mode}");
+        assert!(!capture["failures"].as_array().unwrap().is_empty(), "mode {mode}");
+        if mode <= 6 {
+            assert!(capture["repositories"].as_array().unwrap().is_empty(), "mode {mode}");
+            assert!(capture["progress"].is_null());
+        } else {
+            let raw: RawCapture = serde_json::from_value(capture).unwrap();
+            assert!(tune_core::topology::adapters::assemble_capture(&raw).iter().all(|snapshot| snapshot.status != ScopeStatus::Complete));
+        }
+        if mode == 8 {
+            fs::rename(base.join("hidden-git"), base.join(".git")).unwrap();
+        }
+        if mode == 9 {
+            fs::remove_file(base.join("package.json")).unwrap();
+        }
+        fs::write(base.join("package.json"), approved).unwrap();
+        if mode == 5 {
+            fs::remove_file(base.join("Cargo.toml")).unwrap();
+        }
+    }
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn posix_source_gate_rejects_a_symlink_in_a_selected_roots_ancestor() {
+    use std::{fs, os::unix::fs::symlink, process::Command};
+    let base = std::env::temp_dir().join(format!("topology-source-root-link-{}", std::process::id()));
+    let checkout = base.join("real/checkout");
+    fs::create_dir_all(&checkout).unwrap();
+    assert!(Command::new("/usr/bin/git").args(["init", "--quiet"]).arg(&checkout).status().unwrap().success());
+    fs::write(checkout.join("package.json"), r#"{"name":"unapproved-manifest-sentinel"}"#).unwrap();
+    let mut config = json!({"scope_id":"test:ancestor-link","observed_at_ms":1000,"roots":[checkout],"configs":[],"limits":limits()});
+    approve_fixture_sources(&mut config);
+    let base = fs::canonicalize(base).unwrap();
+    symlink(base.join("real"), base.join("linked")).unwrap();
+    config["roots"][0] = json!(base.join("linked/checkout"));
+    let (capture, stdout) = run_posix_probe_text(&config, POSIX_PROBE).await;
+    assert!(!String::from_utf8_lossy(&stdout).contains("unapproved-manifest-sentinel"));
+    assert!(capture["repositories"].as_array().unwrap().is_empty());
+    assert_eq!(capture["counters"]["files"], 0);
+    assert!(capture["failures"].as_array().unwrap().iter().any(|failure| failure["code"] == "permission_denied"));
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn posix_source_gate_rechecks_head_after_read_before_returning_content() {
+    use std::{fs, process::Command};
+    let base = std::env::temp_dir().join(format!("topology-source-head-fixture-{}", std::process::id()));
+    fs::create_dir_all(&base).unwrap();
+    assert!(Command::new("/usr/bin/git").args(["init", "--quiet"]).arg(&base).status().unwrap().success());
+    fs::write(base.join("package.json"), r#"{"name":"approved-fixture"}"#).unwrap();
+    let mut config = json!({"scope_id":"test:head-race","observed_at_ms":1000,"roots":[base],"configs":[],"limits":limits()});
+    approve_fixture_sources(&mut config);
+    let original = config["source_allowlist"][0]["expected_head"].as_str().unwrap().to_owned();
+    let git = |args: &[&str]| Command::new("/usr/bin/git").env_clear().env("PATH", "/usr/bin:/bin").arg("-C").arg(&base).args(args).output().unwrap();
+    assert!(
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "--quiet",
+            "-m",
+            "changed fixture"
+        ])
+        .status
+        .success()
+    );
+    config["test_changed_head"] = json!(String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap().trim());
+    assert!(git(&["update-ref", "HEAD", &original]).status.success());
+    // Deterministic fixture-only interleaving immediately before the production recheck.
+    let probe = POSIX_PROBE.replace("    # Recheck HEAD after all reads.", "    subprocess.run([config.get(\"git_program\") or \"/usr/bin/git\", \"-C\", roots[0], \"update-ref\", \"HEAD\", config[\"test_changed_head\"]], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n    # Recheck HEAD after all reads.");
+    assert_ne!(probe, POSIX_PROBE);
+    let (capture, stdout) = run_posix_probe_text(&config, &probe).await;
+    assert!(!String::from_utf8_lossy(&stdout).contains("approved-fixture"));
+    assert!(capture["repositories"].as_array().unwrap().is_empty());
+    assert_eq!(capture["failures"][0]["code"], "permission_denied");
+    fs::remove_dir_all(base).unwrap();
 }
 
 #[cfg(unix)]
@@ -614,9 +1004,11 @@ async fn posix_cursor_reaches_late_repository_in_three_small_budget_runs() {
     budget.repositories_per_environment = 1;
     budget.entries_per_environment = 8;
     let mut config = json!({"scope_id":"test:progress","observed_at_ms":1000,"roots":[base],"configs":[],"limits":budget});
+    approve_fixture_sources(&mut config);
     let mut observed = std::collections::BTreeSet::new();
     for index in 0..3 {
         let capture = run_posix_probe(&config).await;
+        assert!(capture["failures"].as_array().unwrap().iter().any(|failure| failure["message"] == "source allowlist incomplete"));
         for repo in capture["repositories"].as_array().unwrap() {
             if repo["failures"].as_array().unwrap().is_empty() {
                 observed.insert(repo["relative_path"].as_str().unwrap().to_owned());
@@ -648,6 +1040,7 @@ async fn posix_skip_policy_change_invalidates_legacy_cursor_and_discovers_normal
     let mut budget = limits();
     budget.repositories_per_environment = 1;
     let mut config = json!({"scope_id":"test:legacy-skip","observed_at_ms":1000,"roots":[base],"configs":[],"limits":budget});
+    approve_fixture_sources(&mut config);
     let legacy_probe = POSIX_PROBE.replacen("\".branch-recovery\", ", "", 1);
     let prefix = format!("import json\nCONFIG=json.loads({})\n", serde_json::to_string(&config.to_string()).unwrap());
     let legacy =
@@ -746,7 +1139,8 @@ async fn posix_listing_cache_counts_160_directories_once_and_completes_checkout(
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("package.json"), &content).unwrap();
     }
-    let config = json!({"scope_id":"test:scaling","observed_at_ms":1000,"roots":[root],"configs":[],"limits":limits()});
+    let mut config = json!({"scope_id":"test:scaling","observed_at_ms":1000,"roots":[root],"configs":[],"limits":limits()});
+    approve_fixture_sources(&mut config);
     let result = run_posix_probe(&config).await;
     assert!(result["progress"].is_null(), "321 unique entries must fit the default 20000 entry budget");
     assert_eq!(result["counters"]["entries"], json!(321));
@@ -760,8 +1154,10 @@ async fn windows_transport_sends_bounded_raw_stdin_and_rejects_oversized_before_
     let mut request = remote();
     request.platform = RemotePlatform::Windows;
     request.roots = vec!["C:\\fixture".into()];
-    request.configs = vec![json!({"fixture_padding":"x".repeat(70000)})];
-    let fake = Fake::new(vec![remote_capture(&request)]);
+    request.source_allowlist.as_mut().unwrap()[0].relative_path = "x".repeat(70000);
+    let mut reported = remote_capture(&request);
+    reported["repositories"][0]["relative_path"] = json!("x".repeat(70000));
+    let fake = Fake::new(vec![reported]);
     assert!(collect_remote_with(&fake, &request).await.failures.is_empty());
     {
         let calls = fake.calls.lock().unwrap();
@@ -771,7 +1167,7 @@ async fn windows_transport_sends_bounded_raw_stdin_and_rejects_oversized_before_
         assert!(String::from_utf8(calls[0].2.clone()).unwrap().ends_with(WINDOWS_PROBE.trim_start_matches('\u{feff}')));
     }
     request.limits.file_bytes = 4 * 1024 * 1024;
-    request.configs = vec![json!({"fixture_padding":"x".repeat(2*1024*1024)})];
+    request.source_allowlist.as_mut().unwrap()[0].relative_path = "x".repeat(2 * 1024 * 1024);
     let fake = Fake::new(vec![]);
     let result = collect_remote_with(&fake, &request).await;
     assert!(fake.calls.lock().unwrap().is_empty());
@@ -780,7 +1176,7 @@ async fn windows_transport_sends_bounded_raw_stdin_and_rejects_oversized_before_
 
 #[cfg(unix)]
 #[tokio::test]
-async fn posix_probe_configuration_caps_are_partial_and_counted() {
+async fn posix_probe_configuration_file_budget_does_not_authorize_reads() {
     use std::fs;
     let base = std::env::temp_dir().join(format!("topology-config-cap-{}", std::process::id()));
     fs::create_dir_all(&base).unwrap();
@@ -801,19 +1197,16 @@ async fn posix_probe_configuration_caps_are_partial_and_counted() {
     let output = run_bounded("/usr/bin/python3", &["-".into()], format!("{prefix}{POSIX_PROBE}").as_bytes(), Duration::from_secs(10), 1_000_000, 1000).await;
     assert_eq!(output.code, Some(0));
     let capture: RawCapture = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(capture.counters.config_files, 1);
-    assert_eq!(capture.counters.config_keys, 1);
-    assert!(capture.failures.iter().any(|failure| failure.code == FailureCode::LimitReached && failure.message == "configuration file budget exceeded"));
-    assert!(
-        capture.repositories.iter().all(|repo| repo.failures.iter().all(|failure| failure.code != FailureCode::LimitReached)),
-        "the unstarted second config must not be represented as complete"
-    );
+    assert!(capture.repositories.is_empty());
+    assert_eq!(capture.counters.config_files, 0);
+    assert_eq!(capture.counters.config_keys, 0);
+    assert_eq!(capture.failures[0].code, FailureCode::PermissionDenied);
     fs::remove_dir_all(base).unwrap();
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn posix_probe_configuration_key_cap_is_environment_wide() {
+async fn posix_probe_configuration_key_budget_does_not_authorize_reads() {
     use std::fs;
     let base = std::env::temp_dir().join(format!("topology-config-key-cap-{}", std::process::id()));
     fs::create_dir_all(&base).unwrap();
@@ -831,16 +1224,16 @@ async fn posix_probe_configuration_key_cap_is_environment_wide() {
     let output = run_bounded("/usr/bin/python3", &["-".into()], format!("{prefix}{POSIX_PROBE}").as_bytes(), Duration::from_secs(10), 1_000_000, 1000).await;
     assert_eq!(output.code, Some(0));
     let capture: RawCapture = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(capture.counters.config_files, 2);
-    assert_eq!(capture.counters.config_keys, 2);
-    assert!(capture.failures.iter().any(|failure| failure.code == FailureCode::LimitReached && failure.message == "configuration key budget exceeded"));
-    assert!(capture.repositories.last().unwrap().failures.iter().any(|failure| failure.code == FailureCode::LimitReached));
+    assert!(capture.repositories.is_empty());
+    assert_eq!(capture.counters.config_files, 0);
+    assert_eq!(capture.counters.config_keys, 0);
+    assert_eq!(capture.failures[0].code, FailureCode::PermissionDenied);
     fs::remove_dir_all(base).unwrap();
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn posix_probe_missing_configuration_key_keeps_a_partial_receipt() {
+async fn posix_probe_unapproved_configuration_is_rejected_before_json_parse() {
     use std::fs;
     let base = std::env::temp_dir().join(format!("topology-config-missing-key-{}", std::process::id()));
     fs::create_dir_all(&base).unwrap();
@@ -857,10 +1250,10 @@ async fn posix_probe_missing_configuration_key_keeps_a_partial_receipt() {
     reported["target_identity"] = json!(request.expected_identity_hash.clone());
     reported["runtime"] = json!({"kind":"native","platform":"posix","kernel_wsl":false,"distro":null});
     let capture = collect_remote_with(&Fake::new(vec![reported]), &request).await;
-    assert!(capture.failures.is_empty(), "the scoped failure is a valid partial capture");
-    assert_eq!(capture.counters.config_files, 1);
+    assert!(capture.repositories.is_empty());
+    assert_eq!(capture.counters.config_files, 0);
     assert_eq!(capture.counters.config_keys, 0);
-    assert!(capture.repositories.iter().any(|repo| repo.config_file_read && repo.failures.iter().any(|failure| failure.code == FailureCode::ParseError)));
+    assert_eq!(capture.failures[0].code, FailureCode::PermissionDenied);
     fs::remove_dir_all(base).unwrap();
 }
 
@@ -874,7 +1267,7 @@ async fn remote_rejects_inconsistent_configuration_counters() {
 }
 
 #[tokio::test]
-async fn remote_keeps_failed_configuration_receipts_without_claiming_a_read() {
+async fn remote_rejects_unapproved_configuration_receipts_even_without_content() {
     let request = remote();
     let mut reported = remote_capture(&request);
     reported["counters"]["repositories"] = json!(2);
@@ -888,10 +1281,8 @@ async fn remote_keeps_failed_configuration_receipts_without_claiming_a_read() {
         "failures": [{"code":"parse_error","message":"selected configuration unavailable"}]
     }));
     let capture = collect_remote_with(&Fake::new(vec![reported]), &request).await;
-    assert!(capture.failures.is_empty());
-    assert_eq!(capture.counters.config_files, 0);
-    assert_eq!(capture.counters.config_keys, 0);
-    assert!(capture.repositories.iter().any(|repo| repo.relative_path.starts_with("configuration-") && !repo.failures.is_empty()));
+    assert!(capture.repositories.is_empty());
+    assert_eq!(capture.failures[0].code, FailureCode::PermissionDenied);
 }
 
 #[tokio::test]

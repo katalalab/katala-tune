@@ -66,6 +66,68 @@ function Test-TopologyRelative([string]$Value,[bool]$Entry=$false) {
     if ($Value -eq ".") {return $true}
     return ($Value -ne "" -and -not @($Value -split "/" | Where-Object {$_ -eq "" -or $_ -eq "." -or $_ -eq ".."}).Count)
 }
+# Source permission is per request, never inferred from an earlier capture.
+$script:TopologySourceDenied=$false
+$script:TopologySources=New-Object "System.Collections.Generic.Dictionary[string,object]" ([StringComparer]::Ordinal)
+function Test-TopologySourcePolicy {
+    if ($null -eq $TopologyRequest.source_allowlist -or $TopologyRequest.source_allowlist -isnot [array] -or $TopologyRequest.source_allowlist.Count -eq 0 -or @($TopologyRequest.configs).Count -gt 0) {return $false}
+    try {
+        $TopologyTotalFiles=0;$TopologyTotalBytes=[long]0
+        if ($TopologyRequest.source_allowlist.Count -gt $TopologyLimits.entries_per_environment) {return $false}
+        foreach ($TopologyRawRoot in $TopologyRequest.roots) {
+            $TopologyCanonical=$TopologyRawRoot.Replace("\","/")
+            if ($TopologyCanonical -notmatch "^[a-zA-Z]:/" -or ($TopologyCanonical.Length -gt 3 -and @($TopologyCanonical.Substring(3).Split("/") | Where-Object {$_ -eq "" -or $_ -eq "." -or $_ -eq ".."}).Count -gt 0)) {return $false}
+        }
+        foreach ($TopologyAllowed in $TopologyRequest.source_allowlist) {
+            if (@($TopologyAllowed.PSObject.Properties).Count -ne 4 -or $TopologyAllowed.root_index -isnot [int] -and $TopologyAllowed.root_index -isnot [long]) {return $false}
+            if ($TopologyAllowed.root_index -lt 0 -or $TopologyAllowed.root_index -ge $TopologyRootPaths.Count -or -not (Test-TopologyRelative $TopologyAllowed.relative_path) -or $TopologyAllowed.expected_head -cnotmatch "^([a-f0-9]{40}|[a-f0-9]{64})$" -or $TopologyAllowed.manifests -isnot [array]) {return $false}
+            $TopologyRootHash=Get-TopologyHash $TopologyRootPaths[$TopologyAllowed.root_index].ToLowerInvariant().Replace("\","/")
+            $TopologyKey=$TopologyRootHash+"|"+$TopologyAllowed.relative_path
+            if ($TopologySources.ContainsKey($TopologyKey)) {return $false}
+            $TopologyFiles=New-Object "System.Collections.Generic.Dictionary[string,object]" ([StringComparer]::Ordinal)
+            foreach ($TopologyFile in $TopologyAllowed.manifests) {
+                if (@($TopologyFile.PSObject.Properties).Count -ne 3 -or -not (Test-TopologyRelative $TopologyFile.relative_path) -or $TopologyFile.relative_path -eq "." -or $TopologyFiles.ContainsKey($TopologyFile.relative_path) -or $TopologyFile.sha256 -cnotmatch "^[a-f0-9]{64}$" -or $TopologyFile.bytes -isnot [int] -and $TopologyFile.bytes -isnot [long]) {return $false}
+                if ($TopologyFile.bytes -lt 0 -or $TopologyFile.bytes -gt $TopologyLimits.file_bytes) {return $false}
+                $TopologyTotalFiles++;$TopologyTotalBytes+=$TopologyFile.bytes
+                $TopologyWorkflow=$TopologyFile.relative_path -cmatch "^\.github/workflows/[^/]+\.ya?ml$"
+                if (-not $TopologyWorkflow -and $TopologyFile.relative_path -cnotmatch "(^|/)(Cargo\.toml|package\.json|pyproject\.toml|go\.mod)$" -or $TopologyWorkflow -and $TopologyFile.bytes -gt $TopologyLimits.workflow_bytes -or $TopologyTotalFiles -gt $TopologyLimits.manifests_per_environment -or $TopologyTotalBytes -gt $TopologyLimits.total_bytes_per_environment) {return $false}
+                $TopologyFiles.Add($TopologyFile.relative_path,$TopologyFile)
+            }
+            $TopologySources.Add($TopologyKey,@{checkout=$TopologyAllowed;files=$TopologyFiles})
+        }
+    } catch {return $false}
+    return $true
+}
+function Test-TopologySourceBytes($Repo,[string]$Path,[byte[]]$Data) {
+    $TopologyKey=$Repo.root_fingerprint+"|"+$Repo.relative_path
+    if (-not $TopologySources.ContainsKey($TopologyKey)) {return $false}
+    $TopologyAllowed=$TopologySources[$TopologyKey]
+    if (-not $TopologyAllowed.files.ContainsKey($Path) -or $Repo.git.head -cne $TopologyAllowed.checkout.expected_head) {return $false}
+    $TopologyFile=$TopologyAllowed.files[$Path]
+    $TopologyHasher=[Security.Cryptography.SHA256]::Create()
+    try {$TopologyHash=([BitConverter]::ToString($TopologyHasher.ComputeHash($Data))).Replace("-","").ToLowerInvariant()} finally {$TopologyHasher.Dispose()}
+    return ($Data.Length -eq $TopologyFile.bytes -and $TopologyHash -ceq $TopologyFile.sha256)
+}
+function Confirm-TopologySources {
+    $TopologySeen=New-Object "System.Collections.Generic.HashSet[string]" ([StringComparer]::Ordinal)
+    $TopologyComplete=$true
+    foreach ($TopologyRepo in $TopologyRepositories) {
+        $TopologyKey=$TopologyRepo.root_fingerprint+"|"+$TopologyRepo.relative_path
+        if (-not $TopologySources.ContainsKey($TopologyKey) -or -not $TopologySeen.Add($TopologyKey) -or $TopologyRepo.config_file_read -or @($TopologyRepo.configs).Count -gt 0) {$script:TopologySourceDenied=$true;break}
+        $TopologyAllowed=$TopologySources[$TopologyKey]
+        $TopologyPath=Get-TopologyUnderRoot $TopologyRootPaths[$TopologyAllowed.checkout.root_index] $TopologyRepo.relative_path
+        if (-not $TopologyPath -or $TopologyRepo.git.head -cne $TopologyAllowed.checkout.expected_head -or (Invoke-TopologyGit $TopologyPath "rev-parse --verify HEAD") -cne $TopologyAllowed.checkout.expected_head) {$script:TopologySourceDenied=$true;break}
+        $TopologyFiles=New-Object "System.Collections.Generic.HashSet[string]" ([StringComparer]::Ordinal)
+        foreach ($TopologyFile in $TopologyRepo.manifests) {
+            if (-not $TopologyFiles.Add($TopologyFile.relative_path) -or $TopologyFile.revision -cne $TopologyAllowed.checkout.expected_head -or -not (Test-TopologySourceBytes $TopologyRepo $TopologyFile.relative_path ([Text.Encoding]::UTF8.GetBytes($TopologyFile.content)))) {$script:TopologySourceDenied=$true;break}
+        }
+        if ($TopologyFiles.Count -ne $TopologyAllowed.files.Count) {$TopologyComplete=$false;Add-TopologyFailure "permission_denied" "source allowlist incomplete" $TopologyRepo}
+    }
+    if ($TopologySourceDenied -or -not $TopologySourcePolicyOk) {
+        $TopologyRepositories.Clear();$TopologyCounters.repositories=0;$TopologyCounters.manifests=0;$TopologyCounters.config_files=0;$TopologyCounters.config_keys=0;$TopologyResult.progress=$null;$TopologyFailures.Clear()
+        Add-TopologyFailure "permission_denied" "remote source allowlist mismatch"
+    } elseif (-not $TopologyComplete -or $TopologySeen.Count -ne $TopologySources.Count) {Add-TopologyFailure "permission_denied" "source allowlist incomplete"}
+}
 function Test-TopologyCursor($Value,[int]$Roots) {
     if ($null -eq $Value) {return $true}
     if ($Value.version -isnot [int] -and $Value.version -isnot [long]) {return $false}
@@ -93,6 +155,12 @@ function Test-TopologyFits {
     return ([Text.Encoding]::UTF8.GetByteCount((ConvertTo-Json -InputObject $TopologyResult -Depth 64 -Compress))+192 -le $TopologyLimits.stdout_bytes)
 }
 function Get-TopologyUnderRoot([string]$Root,[string]$Relative) {
+    # Reject a reparse point in any root ancestor, not only at the selected root.
+    $TopologyAncestor=[IO.Path]::GetPathRoot($Root)
+    foreach ($TopologyPart in @(".")+@($Root.Substring($TopologyAncestor.Length) -split "[\\/]" | Where-Object {$_ -ne ""})) {
+        if ($TopologyPart -ne ".") {$TopologyAncestor=Join-Path $TopologyAncestor $TopologyPart}
+        try {$TopologyAncestorItem=Get-Item -LiteralPath $TopologyAncestor -Force;if (($TopologyAncestorItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {return $null}} catch {return $null}
+    }
     $TopologyPath=$Root
     foreach ($TopologyComponent in @(".")+@($Relative -split "/" | Where-Object {$_ -ne "."})) {
         if ($TopologyComponent -ne ".") {$TopologyPath=Join-Path $TopologyPath $TopologyComponent}
@@ -165,15 +233,18 @@ $TopologyRuntimeOk=($TopologyRequest.expected_runtime -ne "wsl")
 if ($TopologyRequest.expected_identity_hash -and $TopologyRequest.expected_identity_hash -ne $TopologyResult.target_identity) {$TopologyRuntimeOk=$false}
 $script:TopologyRootPaths=New-Object System.Collections.ArrayList;$TopologyRootStamps=New-Object System.Collections.ArrayList
 foreach ($TopologyRawRoot in $TopologyRequest.roots) {
-    $TopologyRoot=[IO.Path]::GetFullPath($TopologyRawRoot).TrimEnd("\")
+    $TopologyRoot=[IO.Path]::GetFullPath($TopologyRawRoot)
+    if ($TopologyRoot.Length -gt 3) {$TopologyRoot=$TopologyRoot.TrimEnd("\")}
     [void]$TopologyRootPaths.Add($TopologyRoot)
     try {$TopologyItem=Get-Item -LiteralPath $TopologyRoot -Force;[void]$TopologyRootStamps.Add(@($TopologyRoot.ToLowerInvariant().Replace("\","/"),$TopologyItem.CreationTimeUtc.Ticks,$TopologyItem.LastWriteTimeUtc.Ticks))} catch {[void]$TopologyRootStamps.Add(@($TopologyRoot,$null))}
 }
-$TopologyFingerprintMaterial=[ordered]@{version=1;roots=@($TopologyRootStamps);skip=@($TopologySkip | Sort-Object);parser="katala-topology-parser.v1";limits=$TopologyLimits;configs=@($TopologyRequest.configs);hash_mode="hash_json_typed_v1"}
+$TopologyFingerprintMaterial=[ordered]@{version=1;roots=@($TopologyRootStamps);skip=@($TopologySkip | Sort-Object);parser="katala-topology-parser.v1";limits=$TopologyLimits;configs=@($TopologyRequest.configs);source_allowlist=@($TopologyRequest.source_allowlist);hash_mode="hash_json_typed_v1"}
 $script:TopologyFingerprint=Get-TopologyHash (ConvertTo-Json -InputObject $TopologyFingerprintMaterial -Depth 64 -Compress)
+$TopologySourcePolicyOk=Test-TopologySourcePolicy
 $TopologyCursor=$TopologyRequest.cursor
 $TopologyCursorOk=Test-TopologyCursor $TopologyCursor $TopologyRootPaths.Count
-if (-not $TopologyRuntimeOk) {Add-TopologyFailure "permission_denied" "runtime identity mismatch"}
+if (-not $TopologySourcePolicyOk) {Add-TopologyFailure "permission_denied" "explicit source allowlist required"}
+elseif (-not $TopologyRuntimeOk) {Add-TopologyFailure "permission_denied" "runtime identity mismatch"}
 elseif (-not $TopologyCursorOk) {Add-TopologyFailure "permission_denied" "invalid continuation cursor"}
 elseif ($TopologyRootPaths.Count -eq 0 -or $TopologyRootPaths.Count -gt $TopologyLimits.roots_per_environment) {Add-TopologyFailure "unsupported" "invalid configured root count"}
 else {
@@ -228,6 +299,7 @@ else {
                         $TopologyData=Read-TopologyFile $TopologyPath $TopologyMaximum $TopologyRepo
                         if ($TopologyStop) {break}
                         if ($null -ne $TopologyData) {
+                            if (-not (Test-TopologySourceBytes $TopologyRepo $TopologyRepoRelative $TopologyData)) {$script:TopologySourceDenied=$true;$TopologyCurrent.after=$TopologyName;continue}
                             try {$TopologyUtf8=New-Object Text.UTF8Encoding($false,$true);$TopologyContent=$TopologyUtf8.GetString($TopologyData)} catch {Add-TopologyFailure "parse_error" "manifest is not utf-8" $TopologyRepo;$TopologyCurrent.after=$TopologyName;continue}
                             [void]$TopologyRepo.manifests.Add(@{relative_path=$TopologyRepoRelative;kind=$TopologyKind;content=$TopologyContent;content_sha256=(Get-TopologyHash $TopologyContent);revision=$TopologyRepo.git.head});$TopologyCounters.manifests++
                             if (-not (Test-TopologyFits)) {$TopologyRepo.manifests.RemoveAt($TopologyRepo.manifests.Count-1);$TopologyCounters.manifests--;if ($TopologyCounters.manifests -gt 0) {Add-TopologyFailure "limit_reached" "stdout byte budget exceeded";$script:TopologyStop=$true;break};Add-TopologyFailure "limit_reached" "stalled_directory: manifest stdout budget; narrow root or raise limit" $TopologyRepo}
@@ -275,6 +347,7 @@ else {
         if (-not (Test-TopologyFits)) {$TopologyRemoved=$TopologyRepositories[$TopologyRepositories.Count-1];$TopologyRepositories.RemoveAt($TopologyRepositories.Count-1);$TopologyCounters.repositories--;if ($TopologyRemoved.config_file_read) {$TopologyCounters.config_files--};$TopologyCounters.config_keys-=$TopologyRemoved.configs.Count;Add-TopologyFailure "limit_reached" "configuration stdout budget exceeded";break}
     }
 }
+Confirm-TopologySources
 $TopologyCounters.duration_ms=$TopologyClock.ElapsedMilliseconds
 $TopologyEncoded=ConvertTo-Json -InputObject $TopologyResult -Depth 64 -Compress
 if ([Text.Encoding]::UTF8.GetByteCount($TopologyEncoded) -gt $TopologyLimits.stdout_bytes) {$TopologyRepositories.Clear();$TopologyCounters.repositories=0;$TopologyCounters.manifests=0;$TopologyCounters.config_files=0;$TopologyCounters.config_keys=0;$TopologyResult.progress=$null;$TopologyFailures.Clear();Add-TopologyFailure "limit_reached" "stalled_directory: stdout metadata budget; raise limit";$TopologyEncoded=ConvertTo-Json -InputObject $TopologyResult -Depth 64 -Compress}

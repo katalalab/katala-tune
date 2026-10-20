@@ -3,7 +3,10 @@ use super::super::model::{CaptureCounters, RawCapture};
 use super::super::{Failure, FailureCode, TopologyLimits, normalize_git_origin};
 use super::{CommandRunner, SystemRunner, failure_from_process};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 pub const POSIX_PROBE: &str = include_str!("../../../../../probes/topology_posix.py");
 pub const WINDOWS_PROBE: &str = include_str!("../../../../../probes/topology_win.ps1");
@@ -30,6 +33,23 @@ pub enum RemoteRuntimeKind {
     Wsl,
 }
 
+/// Private, explicit permission for one checkout and the exact manifest bytes.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSourceCheckout {
+    pub root_index: usize,
+    pub relative_path: String,
+    pub expected_head: String,
+    pub manifests: Vec<RemoteSourceManifest>,
+}
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSourceManifest {
+    pub relative_path: String,
+    pub bytes: usize,
+    pub sha256: String,
+}
+
 /// Private request: roots, aliases and selected configuration paths are never logged.
 pub struct RemoteRequest {
     pub scope_id: String,
@@ -42,6 +62,7 @@ pub struct RemoteRequest {
     /// WSL surfaces must already have a direct SSH alias. No distro launcher exists here.
     pub roots: Vec<String>,
     pub configs: Vec<Value>,
+    pub source_allowlist: Option<Vec<RemoteSourceCheckout>>,
     pub python_program: String,
     pub git_program: Option<String>,
     pub observed_at_ms: i64,
@@ -50,6 +71,129 @@ pub struct RemoteRequest {
 
 pub fn identity_hash(hostname: &str) -> String {
     crate::db::sha256_hex(hostname.trim().to_ascii_lowercase().trim_end_matches(".local").as_bytes())
+}
+
+fn canonical_relative(value: &str, checkout: bool) -> bool {
+    (checkout && value == ".") || (safe_relative(value) && !value.split('/').any(|part| part == "."))
+}
+
+/// Match the probe platform's lexical absolute-root normalization, without IO.
+pub fn source_root_fingerprint(root: &str, platform: RemotePlatform) -> String {
+    let path = if platform == RemotePlatform::Windows { root.replace('\\', "/").to_lowercase() } else { root.to_owned() };
+    let (prefix, rest) = if platform == RemotePlatform::Windows { (path.get(..2).unwrap_or(""), path.get(2..).unwrap_or("")) } else { ("", path.as_str()) };
+    let mut parts = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let normalized = format!("{prefix}/{}", parts.join("/"));
+    crate::db::sha256_hex(normalized.as_bytes())
+}
+fn source_kind(path: &str) -> Option<&'static str> {
+    if path.starts_with(".github/workflows/") && path.matches('/').count() == 2 && (path.ends_with(".yml") || path.ends_with(".yaml")) {
+        return Some("workflow");
+    }
+    match path.rsplit('/').next()? {
+        "Cargo.toml" => Some("cargo"),
+        "package.json" => Some("node"),
+        "pyproject.toml" => Some("python"),
+        "go.mod" => Some("go"),
+        _ => None,
+    }
+}
+fn canonical_root(root: &str, platform: RemotePlatform) -> bool {
+    let path = if platform == RemotePlatform::Windows { root.replace('\\', "/") } else { root.to_owned() };
+    let rest = if platform == RemotePlatform::Windows { path.get(3..).unwrap_or("") } else { path.get(1..).unwrap_or("") };
+    (rest.is_empty() || !rest.split('/').any(|part| matches!(part, "" | "." | ".."))) && (platform == RemotePlatform::Windows || !path.contains('\\'))
+}
+fn valid_source_allowlist(request: &RemoteRequest) -> bool {
+    let Some(policy) = &request.source_allowlist else { return false };
+    if policy.is_empty()
+        || policy.len() > request.limits.entries_per_environment
+        || !request.configs.is_empty()
+        || request.roots.iter().any(|root| !canonical_root(root, request.platform))
+    {
+        return false;
+    }
+    let mut total_files = 0usize;
+    let mut total_bytes = 0usize;
+    let mut checkouts = HashSet::new();
+    for checkout in policy {
+        if checkout.root_index >= request.roots.len()
+            || !canonical_relative(&checkout.relative_path, true)
+            || !oid(&checkout.expected_head)
+            || checkout.expected_head != checkout.expected_head.to_ascii_lowercase()
+            || !checkouts.insert((source_root_fingerprint(&request.roots[checkout.root_index], request.platform), checkout.relative_path.as_str()))
+        {
+            return false;
+        }
+        let mut files = HashSet::new();
+        for file in &checkout.manifests {
+            total_files = total_files.saturating_add(1);
+            total_bytes = total_bytes.saturating_add(file.bytes);
+            if total_files > request.limits.manifests_per_environment
+                || total_bytes > request.limits.total_bytes_per_environment
+                || !canonical_relative(&file.relative_path, false)
+                || source_kind(&file.relative_path).is_none()
+                || !files.insert(file.relative_path.as_str())
+                || !hash(&file.sha256)
+                || file.sha256 != file.sha256.to_ascii_lowercase()
+                || file.bytes > request.limits.file_bytes
+                || (source_kind(&file.relative_path) == Some("workflow") && file.bytes > request.limits.workflow_bytes)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// A subset may be returned for continuation, but cannot become a Complete scan.
+fn validate_sources(request: &RemoteRequest, capture: &mut RawCapture) -> Result<bool, ()> {
+    let policy = request.source_allowlist.as_ref().ok_or(())?;
+    let approved_checkouts = policy
+        .iter()
+        .enumerate()
+        .map(|(index, approved)| {
+            ((source_root_fingerprint(&request.roots[approved.root_index], request.platform), approved.relative_path.as_str()), (index, approved))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    let mut complete = true;
+    for repo in &mut capture.repositories {
+        let Some((index, approved)) = approved_checkouts.get(&(repo.root_fingerprint.clone(), repo.relative_path.as_str())) else {
+            return Err(());
+        };
+        if !seen.insert(*index) || repo.git.head.as_deref() != Some(approved.expected_head.as_str()) || repo.config_file_read || !repo.configs.is_empty() {
+            return Err(());
+        }
+        let allowed_files = approved.manifests.iter().map(|allowed| (allowed.relative_path.as_str(), allowed)).collect::<HashMap<_, _>>();
+        let mut files = HashSet::new();
+        for file in &repo.manifests {
+            let Some(allowed) = allowed_files.get(file.relative_path.as_str()) else { return Err(()) };
+            if !files.insert(file.relative_path.as_str())
+                || file.revision.as_deref() != Some(approved.expected_head.as_str())
+                || file.content.len() != allowed.bytes
+                || file.content_sha256 != allowed.sha256
+                || crate::db::sha256_hex(file.content.as_bytes()) != allowed.sha256
+                || source_kind(&file.relative_path) != Some(file.kind.as_str())
+            {
+                return Err(());
+            }
+        }
+        if files.len() != approved.manifests.len() {
+            complete = false;
+            if repo.failures.len() < 64 {
+                repo.failures.push(Failure::new(FailureCode::PermissionDenied, "source allowlist incomplete"));
+            }
+        }
+    }
+    Ok(complete && seen.len() == policy.len())
 }
 
 pub async fn collect_remote(request: &RemoteRequest) -> RawCapture {
@@ -84,6 +228,10 @@ pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteReq
         failed.failures.push(Failure::new(FailureCode::Unsupported, "invalid existing SSH surface or roots"));
         return failed;
     }
+    if !valid_source_allowlist(request) {
+        failed.failures.push(Failure::new(FailureCode::PermissionDenied, "explicit source allowlist required"));
+        return failed;
+    }
     if request.roots.len() > request.limits.roots_per_environment {
         failed.failures.push(Failure::new(FailureCode::LimitReached, "root budget exceeded"));
         return failed;
@@ -92,7 +240,7 @@ pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteReq
         failed.failures.push(Failure::new(FailureCode::PermissionDenied, "invalid continuation cursor"));
         return failed;
     }
-    let config = json!({"scope_id":request.scope_id,"observed_at_ms":request.observed_at_ms,"roots":request.roots,"configs":request.configs,"git_program":request.git_program,"limits":request.limits,"work_timeout_ms":remote_work_timeout_ms(request.limits.remote_timeout_seconds),"cursor":request.cursor,"expected_runtime":request.expected_runtime,"expected_distro":request.expected_distro,"expected_identity_hash":request.expected_identity_hash});
+    let config = json!({"source_allowlist":request.source_allowlist,"scope_id":request.scope_id,"observed_at_ms":request.observed_at_ms,"roots":request.roots,"configs":request.configs,"git_program":request.git_program,"limits":request.limits,"work_timeout_ms":remote_work_timeout_ms(request.limits.remote_timeout_seconds),"cursor":request.cursor,"expected_runtime":request.expected_runtime,"expected_distro":request.expected_distro,"expected_identity_hash":request.expected_identity_hash});
     let serialized = serde_json::to_vec(&config).unwrap_or_default();
     if serialized.len() > request.limits.file_bytes {
         failed.failures.push(Failure::new(FailureCode::LimitReached, "remote request byte budget exceeded"));
@@ -179,6 +327,15 @@ pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteReq
     if !valid_capture(&capture) || capture.progress.as_ref().is_some_and(|cursor| !valid_cursor(cursor, request.roots.len(), request.limits.depth)) {
         failed.failures.push(Failure::new(FailureCode::ParseError, "remote report violates bounded schema"));
         return failed;
+    }
+    match validate_sources(request, &mut capture) {
+        Err(()) => {
+            failed.failures.push(Failure::new(FailureCode::PermissionDenied, "remote source allowlist mismatch"));
+            return failed;
+        }
+        Ok(false) if capture.failures.len() < 64 => capture.failures.push(Failure::new(FailureCode::PermissionDenied, "source allowlist incomplete")),
+        Ok(false) => {}
+        Ok(true) => {}
     }
     for failure in &mut capture.failures {
         failure.message = safe_failure_message(&failure.message, false);
@@ -304,6 +461,8 @@ fn empty_capture(request: &RemoteRequest) -> RawCapture {
 fn safe_failure_message(message: &str, repository: bool) -> String {
     if message.starts_with("stalled_directory:") {
         "stalled_directory: narrow root or raise limit".into()
+    } else if message == "source allowlist incomplete" {
+        message.into()
     } else if message == "continued-fragment" {
         "continued-fragment".into()
     } else if message == "continuation cursor invalidated" {
