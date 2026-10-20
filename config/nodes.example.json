@@ -1,6 +1,12 @@
 {
   "_comment": "~/.config/katala-tune/nodes.json にコピーして編集する。alias は ~/.ssh/config の Host 名。local_hostname がこの機体の hostname と一致するとローカルで実行する。status は運用状態（online・retired・no-ssh・paused・out-of-scope。省略は online）で、online 以外の機体には接続も変更もしない。到達できないだけでは変わらないので、退役などは操作者がここを編集して決める（status_reason に理由、status_date に判断日）。WSL 内の観測は wsl: true を指定した Windows 機だけで行う（既定は無効）",
   "fleet": null,
+  "topology": {
+    "enabled": false,
+    "owners": [],
+    "github": { "enabled": false, "cache_minutes": 15 },
+    "limits": {}
+  },
   "protect": [
     "python.exe",
     "Code",
@@ -48,7 +54,8 @@
       "role": "共用 PC",
       "shared": true,
       "network": false,
-      "note": "shared: true の機体は提案だけで、変更を実行しない。network: false でネットワークとセキュリティ（待ち受け・防御・常駐の増減・接続先・ログイン）を集めない"
+      "repo_hygiene": false,
+      "note": "shared: true の機体は提案だけで、変更を実行しない。network: false でネットワークとセキュリティ（待ち受け・防御・常駐の増減・接続先・ログイン）を、repo_hygiene: false でリポジトリの衛生監査（パス・dirty の件数）を集めない（共用機は repo_hygiene: true と書かない限り対象外。repo_roots（配列）で ghq root のほかの置き場を足せる）"
     },
     {
       "id": "old-pc",
@@ -63,6 +70,7 @@
   "schedule": {
     "enabled": true,
     "probe_minutes": 60,
-    "logs_minutes": 15
+    "logs_minutes": 15,
+    "topology_minutes": 60
   }
 }

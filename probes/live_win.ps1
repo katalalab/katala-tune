@@ -1,9 +1,8 @@
 ﻿# katala-tune live sampler (Windows). Read-only: prints one JSON line per interval to stdout until the reader goes away.
 # PowerShell 5.1. Keep this file ASCII only (PS 5.1 reads BOM-less UTF-8 as the ANSI code page).
 # Reads performance counters in-process (.NET PerformanceCounterCategory with English names, which also works on
-# localized Windows): no WMI polling. GPU (only when nvidia-smi exists) comes from one `nvidia-smi dmon` child that
-# ends by itself after 120 samples (so it cannot outlive this sampler for long even if this process is killed) and is
-# restarted while we run. Collects numbers and, for top processes, PID and executable name only
+# localized Windows): no WMI polling. GPU uses one read-only nvidia-smi query at most every five seconds,
+# bounded to four seconds and tied to this sampler. Collects numbers and, for top processes, PID and executable name only
 # (no command lines, environment or file contents).
 # Stops with -WatchStdin when stdin closes (local run: the app keeps our stdin open) or when the ssh session we run
 # under ends (remote run), when stdout breaks, after -MaxSeconds ({"type":"end","reason":"max_age"}),
@@ -80,78 +79,71 @@ try {
 } catch { $energyCounters.Clear() }
 $energyWarm = $energyCounters.Count -gt 0
 
-# ---- GPU (nvidia-smi dmon: sm = utilization.gpu, fb = memory used MB) ----
+# ---- GPU: one bounded read-only query at most every 5 seconds, no resident dmon ----
 $smi = $null
 $sc = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 if ($sc) { $smi = $sc.Source }
-$gpuName = @{}; $gpuTotal = @{}; $gpuNow = @{}
 $gpuSampleClock = [Diagnostics.Stopwatch]::StartNew()
-$gpuMaxAgeMs = [math]::Max(2500, 3 * [math]::Max(1, [math]::Round($Interval)) * 1000)
-$dmon = $null; $dmonTask = $null; $dmonCols = $null
-if ($smi) {
-  foreach ($line in @(& $smi --query-gpu=index,name,memory.total --format=csv,noheader,nounits 2>$null)) {
-    $f = ([string]$line) -split ',\s*'
-    if ($f.Count -ge 3) { $gpuName[[int]$f[0]] = $f[1]; $gpuTotal[[int]$f[0]] = $f[2] }
-  }
-}
-function StartDmon {
-  $script:gpuNow.Clear(); $script:dmonCols = $null
-  $psi = New-Object Diagnostics.ProcessStartInfo($smi, ('dmon -s pucm -d ' + [int][math]::Max(1, [math]::Round($Interval)) + ' -c 120'))
-  $psi.UseShellExecute = $false
-  $psi.RedirectStandardOutput = $true
-  $psi.CreateNoWindow = $true
-  try { $script:dmon = [Diagnostics.Process]::Start($psi); $script:dmonTask = $script:dmon.StandardOutput.ReadLineAsync() }
-  catch { $script:dmon = $null; $script:dmonTask = $null }
-}
-# Read the lines dmon has written so far, without waiting.
-function PollDmon {
-  if ($null -eq $script:dmon) { StartDmon; return }
-  try {
-    if ($script:dmon.HasExited) {
-      $script:gpuNow.Clear(); $script:dmonCols = $null
-      $script:dmon.Dispose(); $script:dmon = $null; $script:dmonTask = $null
-      return
-    }
-  } catch { $script:gpuNow.Clear(); $script:dmonCols = $null; $script:dmon = $null; $script:dmonTask = $null; return }
-  while ($null -ne $script:dmonTask -and $script:dmonTask.IsCompleted) {
-    $line = $null
-    try { $line = $script:dmonTask.Result } catch { }
-    if ($null -eq $line) {
-      # dmon ended (sample count reached): start a new one on the next poll
-      try { $script:dmon.Dispose() } catch { }
-      $script:dmon = $null; $script:dmonTask = $null
-      $script:gpuNow.Clear(); $script:dmonCols = $null
-      return
-    }
-    if ($line -match '^#\s*gpu') { $script:dmonCols = @($line.TrimStart('#').Trim() -split '\s+') }
-    elseif ($line -notmatch '^#' -and $script:dmonCols) {
-      $f = @($line.Trim() -split '\s+')
-      $gi = [array]::IndexOf($script:dmonCols, 'gpu'); $si = [array]::IndexOf($script:dmonCols, 'sm'); $fi = [array]::IndexOf($script:dmonCols, 'fb')
-      if ($gi -ge 0 -and $f.Count -eq $script:dmonCols.Count) {
-        $u = $null; if ($si -ge 0) { $u = $f[$si] }
-        $m = $null; if ($fi -ge 0) { $m = $f[$fi] }
-        $pi = [array]::IndexOf($script:dmonCols, 'pwr'); $ti = [array]::IndexOf($script:dmonCols, 'gtemp')
-        $gci = [array]::IndexOf($script:dmonCols, 'gclk'); if ($gci -lt 0) { $gci = [array]::IndexOf($script:dmonCols, 'pclk') }; $sci = [array]::IndexOf($script:dmonCols, 'smclk'); $mci = [array]::IndexOf($script:dmonCols, 'mclk')
-        $script:gpuNow[[int]$f[$gi]] = [ordered]@{
-          received_ms = $script:gpuSampleClock.Elapsed.TotalMilliseconds
-          util = $u; mem = $m
-          power = $(if ($pi -ge 0) { $f[$pi] } else { $null }); temp = $(if ($ti -ge 0) { $f[$ti] } else { $null })
-          graphics = $(if ($gci -ge 0) { $f[$gci] } else { $null }); sm_clock = $(if ($sci -ge 0) { $f[$sci] } else { $null }); memory_clock = $(if ($mci -ge 0) { $f[$mci] } else { $null })
-        }
-      }
-    }
-    $script:dmonTask = $script:dmon.StandardOutput.ReadLineAsync()
-  }
-}
-function StopDmon { if ($script:dmon) { try { if (-not $script:dmon.HasExited) { $script:dmon.Kill() } } catch { } } }
-function GpuJson {
+$gpuEveryMs = [math]::Max(5000, $ProcEvery * 1000)
+$gpuMaxAgeMs = $gpuEveryMs + 4500
+$gpuQuery = $null; $gpuTask = $null; $gpuErrorTask = $null
+$gpuFallback = $false; $gpuStarted = -$gpuEveryMs; $gpuReceived = $null; $gpuRows = "[]"; $gpuReason = "nvidia-smi-not-found; other vendors unsupported"
+function ParseGpuRows($text, $at) {
   $rows = New-Object System.Collections.Generic.List[string]
-  foreach ($k in $gpuNow.Keys) {
-    $v = $gpuNow[$k]
-    if ($null -eq $v.received_ms -or $script:gpuSampleClock.Elapsed.TotalMilliseconds - $v.received_ms -gt $script:gpuMaxAgeMs) { continue }
-    $rows.Add('{"name":' + (J $gpuName[$k]) + ',"util":' + (N $v.util 0) + ',"mem_used_mb":' + (N $v.mem 0) + ',"mem_total_mb":' + (N $gpuTotal[$k] 0) + ',"power_w":' + (N $v.power) + ',"temp_c":' + (N $v.temp 0) + ',"clocks_graphics_mhz":' + (N $v.graphics 0) + ',"clocks_sm_mhz":' + (N $v.sm_clock 0) + ',"clocks_memory_mhz":' + (N $v.memory_clock 0) + ',"source":"nvidia-smi dmon","available":true}')
+  foreach ($line in @($text -split "`r?`n" | Select-Object -First 16)) {
+    $f = $line -split ",\s*"
+    $memoryOnly = $f.Count -eq 5
+    if ($memoryOnly) { $f = @($f[0], $f[1], $null, $f[2], $f[3], $f[4], $null, $null, $null, $null, $null, $null, $null, $null, $null, $null, $null, $null) }
+    if ($f.Count -ne 18) { continue }
+    $used = N $f[3] 0; $total = N $f[4] 0; $free = N $f[5] 0
+    $pct = "null"; $status = "partial"; $reason = "driver returned unavailable or invalid memory fields"
+    $validTotal = $total -ne "null" -and [double]$total -gt 0
+    $validUsed = $validTotal -and $used -ne "null" -and [double]$used -ge 0 -and [double]$used -le [double]$total
+    $validFree = $validTotal -and $free -ne "null" -and [double]$free -ge 0 -and [double]$free -le [double]$total
+    if (-not $validTotal) { $total = "null" }
+    if (-not $validUsed) { $used = "null" }
+    if (-not $validFree) { $free = "null" }
+    if ($validUsed) { $pct = N ([double]$used / [double]$total * 100) }
+    if ($pct -ne "null" -and $validFree) { $status = "available"; $reason = $null }
+    $rows.Add('{"adapter_index":' + (N $f[0] 0) + ',"name":' + (J $f[1]) + ',"util":' + (N $f[2]) + ',"mem_used_mb":' + $used + ',"mem_total_mb":' + $total + ',"mem_free_mb":' + $free + ',"mem_used_pct":' + $pct + ',"temp_c":' + (N $f[6]) + ',"power_w":' + (N $f[7]) + ',"clocks_graphics_mhz":' + (N $f[8]) + ',"clocks_memory_mhz":' + (N $f[9]) + ',"uuid":' + (J $f[10]) + ',"pstate":' + (J $f[11]) + ',"power_limit_w":' + (N $f[12]) + ',"power_min_w":' + (N $f[13]) + ',"power_max_w":' + (N $f[14]) + ',"clocks_sm_mhz":' + (N $f[15]) + ',"driver":' + (J $f[16]) + ',"memory_kind":"dedicated","memory_status":' + (J $status) + ',"memory_reason":' + (J $reason) + ',"sampled_at":' + $at + ',"source":"nvidia-smi query (MiB)","available":true}')
   }
-  return ('[' + ($rows -join ',') + ']')
+  return "[" + ($rows -join ",") + "]"
+}
+function StopGpuQuery {
+  if ($script:gpuQuery) { try { if (-not $script:gpuQuery.HasExited) { $script:gpuQuery.Kill() }; $script:gpuQuery.Dispose() } catch { } }
+  $script:gpuQuery = $null; $script:gpuTask = $null; $script:gpuErrorTask = $null
+}
+function StartGpuQuery($memoryOnly) {
+  $script:gpuStarted = $script:gpuSampleClock.Elapsed.TotalMilliseconds
+  $psi = New-Object Diagnostics.ProcessStartInfo($smi, "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,memory.free,temperature.gpu,power.draw,clocks.current.graphics,clocks.current.memory,uuid,pstate,power.limit,power.min_limit,power.max_limit,clocks.current.sm,driver_version,clocks_throttle_reasons.active --format=csv,noheader,nounits")
+  if ($memoryOnly) { $psi.Arguments = "--query-gpu=index,name,memory.used,memory.total,memory.free --format=csv,noheader,nounits" }
+  $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+  try {
+    $script:gpuQuery = [Diagnostics.Process]::Start($psi)
+    $script:gpuTask = $script:gpuQuery.StandardOutput.ReadToEndAsync(); $script:gpuErrorTask = $script:gpuQuery.StandardError.ReadToEndAsync()
+  } catch { StopGpuQuery; $script:gpuRows = "[]"; $script:gpuReason = "query-unavailable" }
+}
+function PollGpuQuery {
+  $ms = $script:gpuSampleClock.Elapsed.TotalMilliseconds
+  if ($script:gpuQuery) {
+    if ($script:gpuQuery.HasExited) {
+      if (-not $script:gpuTask.IsCompleted -and $ms - $script:gpuStarted -lt 4000) { return }
+      if ($script:gpuQuery.ExitCode -eq 0 -and $script:gpuTask.IsCompleted -and $script:gpuTask.Result.Length -le 65536) {
+        $script:gpuRows = ParseGpuRows $script:gpuTask.Result ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+        $script:gpuReceived = $ms; $script:gpuReason = "invalid-query-row"
+      } elseif (-not $script:gpuFallback -and $script:gpuQuery.ExitCode -ne 0) {
+        StopGpuQuery; $script:gpuFallback = $true; StartGpuQuery $true; return
+      } else { $script:gpuRows = "[]"; $script:gpuReason = "query-failed" }
+      StopGpuQuery
+    } elseif ($ms - $script:gpuStarted -ge 4000) { StopGpuQuery; $script:gpuRows = "[]"; $script:gpuReason = "query-timeout" }
+    return
+  }
+  if (-not $smi -or $ms - $script:gpuStarted -lt $gpuEveryMs) { return }
+  $script:gpuFallback = $false; StartGpuQuery $false
+}
+function GpuJson {
+  if ($null -ne $gpuReceived -and $gpuSampleClock.Elapsed.TotalMilliseconds - $gpuReceived -le $gpuMaxAgeMs -and $gpuRows -ne "[]") { return $gpuRows }
+  return '[{"name":"GPU","memory_kind":"unknown","memory_status":' + (J $(if ($smi) { "unavailable" } else { "unsupported" })) + ',"memory_reason":' + (J $gpuReason) + ',"source":"nvidia-smi query","available":false}]'
 }
 
 # ---- Top processes from the Process counters: CPU of every process (also protected ones) without opening handles ----
@@ -214,7 +206,7 @@ $nPrev = ReadCat $netCat
 $rxPrev = Samples $nPrev 'Bytes Received/sec'; $txPrev = Samples $nPrev 'Bytes Sent/sec'
 $netKeys = @($rxPrev.Keys | Where-Object { $_ -notmatch $NET_SKIP })
 [void](Procs)
-if ($smi) { PollDmon }
+PollGpuQuery
 # -WatchStdin: an async read on stdin completes with 0 bytes when the app goes away (local run).
 # Over ssh that is not enough: when the session ends, Git Bash keeps copies of our stdin/stdout pipes, so neither EOF
 # nor a write error arrives (seen on a real machine). So we also watch the ssh session process (sshd-session / sshd)
@@ -341,10 +333,8 @@ try {
       $line += ',"net":{"rx_bps":' + ([math]::Round($sumRx)).ToString($inv) + ',"tx_bps":' + ([math]::Round($sumTx)).ToString($inv) + '}'
     }
 
-    if ($smi) {
-      PollDmon
-      if ($gpuNow.Count -gt 0) { $line += ',"gpu":' + (GpuJson) }
-    }
+    PollGpuQuery
+    $line += ',"gpu":' + (GpuJson)
     if ($procCat -and $now -ge $nextProcs) {
       $nextProcs = $now + $ProcEvery * 1000
       $p = Procs
@@ -364,4 +354,4 @@ try {
     if ($Count -gt 0 -and $seq -ge $Count) { [void](Emit '{"type":"end","reason":"count"}'); break }
   }
 }
-finally { StopDmon }
+finally { StopGpuQuery }

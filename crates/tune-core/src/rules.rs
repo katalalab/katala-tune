@@ -7,6 +7,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::js::{self, Jv, Obj, arr, get, num, or, present, string, to_fixed, truthy};
+use crate::{db, decision};
 
 pub const HIGH_PERF_GUID: &str = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
 pub const BALANCED_GUID: &str = "381b4222-f694-41f0-9685-ff5bb260df2e";
@@ -173,6 +174,55 @@ fn advice_for(names: &[Jv<'_>]) -> Option<&'static str> {
     None
 }
 
+/// JS の `+v || 0`
+fn num0(v: Jv<'_>) -> f64 {
+    let x = num(v);
+    if x.is_nan() { 0.0 } else { x }
+}
+
+fn fmt_mb(mb: f64) -> String {
+    if mb >= 1024.0 { format!("{} GB", to_fixed(mb / 1024.0, 1)) } else { format!("{} MB", js::num_str(mb)) }
+}
+
+/// 多重起動の種類。key（実行ファイル[:スクリプト名]）から決める（lib/rules.js の multiKind）
+#[derive(PartialEq, Clone, Copy)]
+enum MultiKind {
+    Fsmonitor,
+    Mcp,
+    Other,
+}
+
+fn multi_kind(key: &str) -> MultiKind {
+    if key == "git:fsmonitor--daemon" {
+        MultiKind::Fsmonitor
+    } else if key.to_ascii_lowercase().contains("mcp") {
+        MultiKind::Mcp
+    } else {
+        MultiKind::Other
+    }
+}
+
+/// （本数, 合計 MB）の両方を超えたら所見にする
+fn multi_threshold(k: MultiKind) -> (f64, f64) {
+    match k {
+        MultiKind::Fsmonitor => (10.0, 100.0),
+        MultiKind::Mcp => (4.0, 256.0),
+        MultiKind::Other => (30.0, 2048.0),
+    }
+}
+
+fn multi_advice(k: MultiKind) -> &'static str {
+    match k {
+        MultiKind::Fsmonitor => {
+            "git の fsmonitor デーモンがリポジトリごとに常駐している。`git config --global core.fsmonitor false` で新しく増えなくなる（提案であり、自動では変更しない）。すでに常駐しているものは各リポジトリで `git fsmonitor--daemon stop` するまで残るので、設定の保存と、実際の本数・空きメモリが減ったことを分けて確かめる。大きなリポジトリだけで使うなら、そこだけローカル設定で有効にする。"
+        }
+        MultiKind::Mcp => {
+            "MCP サーバが AI セッションごとに複製されている。使っていないセッション・エディタを閉じると、親が終了したものから消える。親が終了済みで残っているものは持ち主を確かめてから止める（自動では終了しない）。共有できるサーバは 1 つに寄せる設定を検討する。"
+        }
+        MultiKind::Other => "同じ実行ファイルが多数起動している。親（セッション・アプリ）を確かめ、不要な親を閉じる。個々のプロセスを RSS だけで止めない。",
+    }
+}
+
 fn gb(mb: Jv<'_>) -> String {
     to_fixed(num(mb) / 1024.0, 1)
 }
@@ -275,7 +325,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 "cpu",
                 format!("CPU が飽和している（{}%）", string(cpu_busy)),
                 format!("上位: {top}"),
-                "下の「暴走の疑い」から順に止める。止められない処理なら、その間ほかの重い作業を別の機体へ回す。",
+                "根拠がそろった停止候補だけを確認する。根拠が不足する間は、ほかの重い作業を別の機体へ回す。",
             );
         } else if busy >= 60.0 {
             out.simple(
@@ -303,7 +353,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
     for p in hogs {
         let name = p.get("name");
         let app = p.get("app");
-        let killable = !no_kill(&string(name)) && !no_kill(&if truthy(app) { string(app) } else { String::new() });
+        let protected = no_kill(&string(name)) || no_kill(&if truthy(app) { string(app) } else { String::new() });
         let prefix = if truthy(app) && !js::strict_eq(app, name) { format!("{} / ", string(app)) } else { String::new() };
         let etime = p.get("etime");
         let detail = format!(
@@ -313,22 +363,21 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
             if is_win { format!("（瞬間値。起動からの平均は {}%）", string(p.get("avg_core"))) } else { "（直近の平均）".into() }
         );
         let advice = advice_for(&[app, name]).map(str::to_string).unwrap_or_else(|| {
-            if killable {
-                "想定外ならアプリを終了して様子を見る。".into()
+            if !protected {
+                "所有者・起動時刻・二点の CPU 時間差分・サービス／スケジューラ／作業負荷を再観測する。".into()
             } else {
                 "OS・セキュリティ、または誰かの作業（AI エージェント・python・node など）の可能性があるため、終了は提案しない。何の処理かを確かめ、原因側（同期・インデックス・ビルド・学習）を止める。".into()
             }
         });
-        // min_cpu: 終了の直前に測り直して、これを下回っていたら（回復していたら）中止する
-        let action = killable.then(|| {
-            let params = Obj::new()
-                .opt("pid", p.get("pid").cloned())
-                .opt("name", name.cloned())
-                .set("start", js::nullish(p.get("start"), None).cloned().unwrap_or(Value::Null))
-                .set("min_cpu", 50)
-                .build();
-            json!({ "type": "kill-process", "label": "このプロセスを終了", "params": params })
-        });
+        let decision = decision::process_stop_finding_at(p, node, protected, db::now_ms());
+        let decision_value = serde_json::to_value(&decision).unwrap_or(Value::Null);
+        let action = decision.proposed_action;
+        let decision_reason = decision.reason.get("summary").and_then(Value::as_str).unwrap_or("停止候補の根拠を確認できない。");
+        let advice = if action.is_some() {
+            format!("{decision_reason} 停止には承認が必要。実行時にも保護台帳・PID・名前・起動時刻・CPU を読み直して一致しなければ中止する。")
+        } else {
+            format!("{decision_reason} {advice}")
+        };
         out.add(
             format!("runaway-{}-{}", string(name), string(p.get("pid"))),
             "warn",
@@ -339,6 +388,9 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
             None,
             action,
         );
+        if let Some(finding) = out.0.last_mut().and_then(Value::as_object_mut) {
+            finding.insert("decision".into(), decision_value);
+        }
     }
 
     // メモリ
@@ -417,6 +469,107 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 if is_win { "（ワーキングセット）" } else { "（RSS。共有分を重ねて数えるため実際より大きめ）" }
             ),
             advice_for(&[a.get("app")]).unwrap_or("このアプリの使い方を見直す。"),
+        );
+    }
+
+    // 同一コマンドの多重起動・孤児（processes.groups）と、プロセス木の根ごとの合計（processes.trees）
+    let ws_note = if is_win { "（ワーキングセット）" } else { "（RSS。共有分を重ねて数えるため実際より大きめ）" };
+    for g in arr(get(procs, "groups")) {
+        if !truthy(Some(g)) {
+            continue;
+        }
+        let key = string(g.get("key"));
+        let kind = multi_kind(&key);
+        // OS・実行環境の定常的な多重（svchost・launchd 系など）と、システム所有で種類の分からないものは数えない
+        if no_kill(&key) || (js::is_str(g.get("owner"), "system") && kind == MultiKind::Other) {
+            continue;
+        }
+        let (min, mb) = multi_threshold(kind);
+        let count = num0(g.get("count"));
+        let mem = num0(g.get("mem_mb"));
+        let orphans = num0(g.get("orphans"));
+        let orphan_mb = num0(g.get("orphan_mb"));
+        let multi = count >= min && mem >= mb;
+        let orphan_only = !multi && kind == MultiKind::Mcp && orphans >= 2.0 && orphan_mb >= 100.0;
+        if !multi && !orphan_only {
+            continue;
+        }
+        let parent = string(js::nullish(g.get("parent"), Some(&Value::from("不明"))));
+        let mostly_orphan = orphans >= 2.0 && orphans * 2.0 >= count;
+        let severity = if orphan_only || (total_mb_truthy && mem >= total_mb * 0.1) || count >= 100.0 { "warn" } else { "info" };
+        out.add(
+            format!("{}-{key}", if multi { "proc-multi" } else { "proc-orphan" }),
+            severity,
+            "memory",
+            if multi {
+                format!("{key} が {} 本同時に動いている（合計 {}）", js::num_str(count), fmt_mb(mem))
+            } else {
+                format!("{key} の孤児が {} 本残っている（{}）", js::num_str(orphans), fmt_mb(orphan_mb))
+            },
+            format!(
+                "親の多数派: {parent}、親が終了済み（PPID 1 など）{} 本、所有者 {}、合計{ws_note}",
+                js::num_str(orphans),
+                if js::is_str(g.get("owner"), "mixed") {
+                    "ユーザーとシステム"
+                } else if js::is_str(g.get("owner"), "system") {
+                    "システム（Windows はセッション 0・SSH を含む）"
+                } else {
+                    "ユーザー"
+                }
+            ),
+            format!(
+                "{}{}",
+                if kind == MultiKind::Mcp && (mostly_orphan || orphan_only) {
+                    "半数前後以上が親を失って残っている。セッション終了後の取り残しの可能性が高い。"
+                } else {
+                    ""
+                },
+                multi_advice(kind)
+            ),
+            None,
+            None,
+        );
+    }
+    let tree_dup = |t: &Value| {
+        arr(get(procs, "apps")).iter().any(|a| {
+            matches!((a.get("app"), t.get("root")), (Some(Value::String(x)), Some(Value::String(y))) if x == y)
+                && total_mb_truthy
+                && num(a.get("mem_mb")) >= total_mb * 0.2
+        })
+    };
+    for t in arr(get(procs, "trees"))
+        .iter()
+        .filter(|t| {
+            truthy(Some(t))
+                && !js::is_str(t.get("owner"), "system")
+                && total_mb_truthy
+                && num0(t.get("count")) >= 3.0
+                && num0(t.get("mem_mb")) >= total_mb * 0.2
+                && !tree_dup(t)
+        })
+        .take(2)
+    {
+        out.add(
+            format!("mem-tree-{}", string(t.get("root"))),
+            "info",
+            "memory",
+            format!(
+                "{} を根とするプロセス群が {} GB（実メモリの {}%、{} プロセス）",
+                string(t.get("root")),
+                gb(t.get("mem_mb")),
+                to_fixed(num(t.get("mem_mb")) / total_mb * 100.0, 0),
+                string(t.get("count"))
+            ),
+            format!(
+                "根: {}（PID {}）、直下の子 {} 本、所有者 {}、群の合計{ws_note}",
+                string(t.get("root")),
+                string(t.get("pid")),
+                string(js::nullish(t.get("children"), Some(&Value::from(0)))),
+                if js::is_str(t.get("owner"), "user") { "ユーザー".to_string() } else { string(t.get("owner")) }
+            ),
+            "単一プロセスの RSS だけで止める判断はしない。根のアプリを作業中でないか確かめてから通常終了する。サービス・コンテナ・待ち受け中のものは、依存先を確かめるまで止めない。".into(),
+            None,
+            None,
         );
     }
 

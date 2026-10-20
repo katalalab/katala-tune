@@ -18,6 +18,7 @@
 //! | [`netsec`] | ネットワークとセキュリティ（待ち受け・防御・常駐の増減・ログイン・初めての接続先。正規化・判定・状態と、DB を使う取り込み・画面） | lib/netsec.js（DB を使う部分は tune-core だけ） |
 //! | [`live`] | ライブ表示（画面が見ているあいだだけ 1〜2 秒ごとに取る。経路・解析・保持・管理） | なし（Tauri 版だけ） |
 //! | [`prices`] | 費用の推定（API 単価換算）。同梱の単価表 data/prices.json（取得日・出典・版つき） | （tune-core だけ） |
+//! | [`hygiene`] | リポジトリの衛生監査（dirty・未 push・stash・ghq のパスと origin の不一致。opt-in・読み取り専用） | lib/hygiene.js |
 //! | [`codex_limits`] | Codex の残り枠（codex app-server の account/rateLimits/read。窓の長さ・使用率・リセット時刻だけ） | （tune-core だけ） |
 //!
 //! 表の定義は `db/` に機能ごとに置く（inventory は Electron 版と同じ表、ai_sessions は tune-core だけの表）。
@@ -25,16 +26,20 @@
 
 pub mod actions;
 pub mod ai_sessions;
+pub mod capabilities;
 pub mod codex_limits;
 pub mod collate;
 pub mod collect;
 pub mod db;
+pub mod decision;
 pub mod dogu;
 pub mod engine;
 pub mod engine_power;
 pub mod engine_tools;
+pub mod engine_topology;
 pub mod health;
 pub mod helpers;
+pub mod hygiene;
 pub mod inventory;
 pub mod js;
 pub mod live;
@@ -47,4 +52,5 @@ pub mod power;
 pub mod power_observation;
 pub mod prices;
 pub mod rules;
+pub mod topology;
 pub mod wsl;

@@ -7,6 +7,8 @@
 //!                                    読み取りだけで、台帳も DB も書き換えず、機体へ接続もしない
 //!   tune last                        DB の前回の分析結果（所見・スコアつき）を JSON で
 //!   tune power                       電力・Clockと計算条件を JSON で（読み取り専用）
+//!   tune capabilities [機体 ...] firmware 読取（省略はこの機体、保存なし）
+//!   tune maintenance-plan [機体 ...] 読取更新と実行不可の保守計画
 //!   tune network [--probe] [機体 ...] 軽量な接続診断（省略はこの機体。--probeだけHTTPS到達性・時間も測る）
 //!   tune status [--recompute]        DB の状態（機能チェック）を JSON で。--recompute で計算し直して保存する
 //!   tune analyze <snapshot.json>     snapshot（probe の data）から所見を作る
@@ -19,6 +21,9 @@
 //!   tune ai-limits [機体 ...]        Codex の残り枠だけを問い合わせる（codex app-server。間隔の下限を見ない。共用機は呼ばない）
 //!   tune netsec [--probe] [機体 ...]  ネットワークとセキュリティ（「セキュリティ」の画面と同じ JSON）。--probe で先に分析して保存する
 //!                                    （DB は KATALA_TUNE_DATA_DIR で写しを指す）
+//!   tune hygiene [--ghq-root D] [--root D]... [--max-repos N] [--budget 秒] [--repos] [機体 ...]
+//!                                    リポジトリの衛生監査（dirty・未 push・stash・ghq のパスと origin の不一致。opt-in・読み取り専用・保存しない。
+//!                                    --repos でリポジトリごとの行も出す。台帳の repo_hygiene: false の機体と共用機は対象外）
 //!   tune export [--since ms]         常時監視の集計と最新の分析結果を写しの形で（ハブとして写される側。読み取り専用）
 //!   tune hub-pull                    ハブから 1 回写す（台帳の機体へ SSH して tune export を呼ぶ）
 //!   tune monitor ['{"enabled":true,"hub":"id"}']  常時監視とハブの設定を見る・変える
@@ -46,11 +51,14 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 use tune_core::db::Store;
 use tune_core::engine::{Engine, NoHost};
-use tune_core::{collect, logs, nodes, rules};
+use tune_core::{
+    collect, logs, nodes, rules,
+    topology::export::{ExportView, public_json, public_mermaid},
+};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "使い方: tune <paths|probe|logs|ledger|last|power|network|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|update> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
+        "使い方: tune <paths|probe|hygiene|logs|ledger|last|power|network|capabilities|maintenance-plan|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
     );
     ExitCode::from(2)
 }
@@ -58,6 +66,30 @@ fn usage() -> ExitCode {
 /// `--name 数` の数（無い・読めなければ None）
 fn flag(rest: &[String], name: &str) -> Option<i64> {
     rest.iter().position(|a| a == name).and_then(|i| rest.get(i + 1)).and_then(|v| v.parse().ok())
+}
+
+fn topology_node_ids(rest: &[String], watch: bool) -> Result<Vec<String>, String> {
+    let mut ids = Vec::new();
+    let mut index = 0;
+    while index < rest.len() {
+        if watch && matches!(rest[index].as_str(), "--iterations" | "--interval-seconds") {
+            if rest.get(index + 1).is_none() {
+                return Err(format!("{} requires a value", rest[index]));
+            }
+            index += 2;
+            continue;
+        }
+        if rest[index].starts_with('-') {
+            return Err(format!("unknown topology option: {}", rest[index]));
+        }
+        ids.push(rest[index].clone());
+        index += 1;
+    }
+    let config = nodes::load_config(&nodes::user_config_path())?;
+    if let Some(id) = ids.iter().find(|id| config.node(id).is_none()) {
+        return Err(format!("unknown topology node id: {id}"));
+    }
+    Ok(ids)
 }
 
 fn print(v: &Value) {
@@ -140,6 +172,58 @@ fn spread(mut xs: Vec<f64>) -> Value {
     json!({ "median": at(0.5).round(), "p95": at(0.95).round(), "max": at(1.0).round() })
 }
 
+/// リポジトリの衛生監査（scripts/repo-hygiene.js と同じ）。保存しない
+async fn hygiene(rest: &[String]) -> Result<(), String> {
+    use tune_core::hygiene;
+    let mut opts = json!({ "roots": [] });
+    let (mut ids, mut with_repos) = (Vec::new(), false);
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        let mut val = |name: &str| it.next().cloned().ok_or(format!("{name} の値が無い"));
+        match a.as_str() {
+            "--ghq-root" => opts["ghq_root"] = json!(val(a)?),
+            "--root" => {
+                let v = val(a)?;
+                if let Some(r) = opts["roots"].as_array_mut() {
+                    r.push(json!(v));
+                }
+            }
+            "--max-repos" => opts["max_repos"] = json!(val(a)?.parse::<i64>().map_err(|e| e.to_string())?),
+            "--budget" => opts["budget_s"] = json!(val(a)?.parse::<i64>().map_err(|e| e.to_string())?),
+            "--repos" => with_repos = true,
+            x if x.starts_with("--") => return Err(format!("知らない引数: {x}")),
+            x => ids.push(x.to_string()),
+        }
+    }
+    let want = targets(&ids)?;
+    let (run, skipped): (Vec<_>, Vec<_>) = want.into_iter().partition(hygiene::enabled);
+    let results = hygiene::audit_all(&run, &opts).await;
+    let mut nodes_out = Vec::new();
+    for r in &results {
+        let id = r["node_id"].as_str().unwrap_or("?");
+        if r["ok"] != true {
+            eprintln!("{id}: NG {}", r["error"].as_str().unwrap_or(""));
+            nodes_out.push(json!({ "node_id": id, "ok": false, "error": r["error"] }));
+            continue;
+        }
+        let findings = hygiene::analyze(r);
+        let repos = r["repos"].as_array().map_or(&[][..], Vec::as_slice);
+        let observed = repos.iter().filter(|x| x["state"] == "ok").count();
+        let unobserved = repos.len() - observed + r["skipped"].as_u64().unwrap_or(0) as usize;
+        eprintln!("{id}: 見つけた {} 件・未観測 {unobserved} 件・{:.1}s・所見 {}", r["enumerated"], r["wall_s"].as_f64().unwrap_or(0.0), findings.len());
+        let mut o = r.clone();
+        if !with_repos {
+            o.as_object_mut().map(|m| m.remove("repos"));
+        }
+        o["observed"] = json!(observed);
+        o["findings"] = json!(findings);
+        nodes_out.push(o);
+    }
+    let ok: Vec<Value> = results.into_iter().filter(|r| r["ok"] == true).collect();
+    print(&json!({ "nodes": nodes_out, "skipped_nodes": skipped.iter().map(|n| &n.id).collect::<Vec<_>>(), "matrix": hygiene::matrix(&ok) }));
+    Ok(())
+}
+
 /// ライブ表示のサンプラーを流して、届き方を測る（画面なし）
 async fn live(rest: &[String]) -> Result<(), String> {
     use tune_core::live::{Live, Opts, ProcessRoute};
@@ -219,6 +303,73 @@ async fn main() -> ExitCode {
     let Some(cmd) = args.first() else { return usage() };
     let rest = &args[1..];
     let res: Result<(), String> = match cmd.as_str() {
+        "topology-refresh" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => match topology_node_ids(rest, false) {
+                Ok(ids) => {
+                    print(&e.topology_refresh_nodes("cli", &ids).await);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
+            Err(e) => Err(e),
+        },
+        "topology-watch" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => match topology_node_ids(rest, true) {
+                Ok(ids) => {
+                    let iterations = flag(rest, "--iterations").unwrap_or(1).clamp(1, 100) as usize;
+                    let seconds = flag(rest, "--interval-seconds")
+                        .unwrap_or_else(|| e.schedule().get("topology_minutes").and_then(Value::as_i64).unwrap_or(1).saturating_mul(60))
+                        .clamp(1, 86_400) as u64;
+                    for n in 0..iterations {
+                        print(&e.topology_refresh_nodes("watch", &ids).await);
+                        if n + 1 < iterations {
+                            tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+                        }
+                    }
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
+            Err(e) => Err(e),
+        },
+        "topology-export" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => {
+                let view = match e.topology_view() {
+                    Ok(view) => view,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        return ExitCode::from(1);
+                    }
+                };
+                let export_view = match rest.windows(2).find(|pair| pair[0] == "--view").map(|pair| pair[1].as_str()).unwrap_or("all") {
+                    "all" => ExportView::All,
+                    "hosts" => ExportView::Hosts,
+                    "dependencies" => ExportView::Dependencies,
+                    "cicd" => ExportView::Cicd,
+                    _ => return usage(),
+                };
+                match rest.windows(2).find(|pair| pair[0] == "--format").map(|pair| pair[1].as_str()).unwrap_or("json") {
+                    "json" => println!("{}", public_json(&view, export_view)),
+                    "mermaid" => println!("{}", public_mermaid(&view, export_view)),
+                    _ => return usage(),
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
+        "capabilities" | "maintenance-plan" => {
+            if rest.iter().any(|id| id.starts_with('-')) {
+                Err("未対応のオプション".into())
+            } else {
+                match nodes::load_config(&nodes::user_config_path()).and_then(|cfg| tune_core::capabilities::select(&cfg.nodes, rest)) {
+                    Ok(selected) => tune_core::capabilities::check(&selected).await.map(|evidence| {
+                        let output = if cmd == "maintenance-plan" { tune_core::capabilities::maintenance_plan(&evidence) } else { evidence };
+                        print(&output);
+                    }),
+                    Err(error) => Err(error),
+                }
+            }
+        }
         "network" => {
             let active = rest.iter().any(|a| a == "--probe");
             let ids: Vec<_> = rest.iter().filter(|a| a.as_str() != "--probe").cloned().collect();
@@ -233,6 +384,7 @@ async fn main() -> ExitCode {
             );
             Ok(())
         }
+        "hygiene" => hygiene(rest).await,
         "probe" => match targets(rest) {
             Ok(t) => {
                 let rs = collect::probe_all(&t, |r| {

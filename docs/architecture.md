@@ -32,6 +32,18 @@
 - 続きの位置（ログ・AI エージェントのセッション）は分析エンジンが覚えて毎回渡す。機体側には状態を書かない
 - `tune-agent` の配布: アプリが SSH で `~/.katala-tune/` に置き、ハッシュを確かめてから実行する。読めるスクリプト（`probes/`）は予備として残す
 
+## 構成トポロジー（読み取り専用、opt-in）
+
+`tune-core::topology` は、機体・環境・論理リポジトリ・checkout / worktree・workspace・package・設定・workflow / job を SQLite の履歴へ記録する。ローカル、既存の直接 SSH、GitHub の読み取りは別 adapter だが、manifest の解析と graph 組立は共通にする。collector は fetch、install、agent 配布、設定変更、外部書き込みを行わない。
+
+- `TopologyConfig` は既定で無効。許可した root、owner、環境、時間・件数・byte・request 上限だけを読む。symlink と `.git`、build / cache、仮想環境、dependency vendor は walk しない。
+- 各 checkout scope は Complete / Partial / Failed と理由・coverage・source hash・観測時刻を持つ。Partial / Failed は以前の成功 graph を削除しない。画面は保持済み graph を現時点の全件観測と表示しない。
+- source cache は raw manifest を保存せず、content hash・parser version と型付き facts だけを保存する。credential file / env は収集しない。選択 manifest 全文は bounded に読み parser 処理するが、raw 全文を DB、cache、出力へ永続保存しない。型付き宣言文字列に秘密を直書きした場合の自動識別・除去は保証しない。選択 workflow の job id / needs / uses / if / environment / trigger filter を含む宣言値は private DB、cache、internal view に残るため、秘密を直書きした manifest は入力から除外する。GitHub の blob 再利用は actual fetch 時刻を保ち、catalog の新しい HEAD / revision と混同しない。
+- run lease は SQLite の generation fence と heartbeat を使う。network / scan 中に lease が失効した収集者は保存できない。DB transaction 内で network を待たない。
+- JSON / Mermaid の public export は既知の graph kind と出力内参照用の決定的な `entity-N` / `edge-N` 連番だけを出す。同一 graph では byte stable だが、graph 変更、view 間、別時点の永続 identity は保証しない。属性・宣言値・内部 canonical ID は出さず、graph 構造や観測時刻からの推定も防御保証しない。root / config を後日除外しても既存 graph、source cache、history は自動 purge されず、粒度別 purge UI / API は現時点にない。
+
+画面の topology は四つの表示（全体、機体、依存、CI/CD）を 200 件までに絞り、表示件数と未表示件数を分ける。全件の export は画面の上限とは別で、public export を明示して実行する。AWS / Cloudflare の既存認証を使う read audit と Figma の設計確認は topology collector の入力ではない。どちらも別の read-only audit として証跡を保持し、collector からクラウド設定・Figma を変更しない。
+
 ## ライブ表示（画面が見ているあいだだけ 1 秒ごと）
 
 60 分ごとの分析とは別に、「リソース」と「機体」の画面で「ライブ」を入れると、CPU（全体・コアごと）・メモリ（使用率・swap / コミット）・ディスクとネットワークの速度・GPU（nvidia-smi があるとき）を 1 秒ごとに、上位プロセスを 5 秒ごとに流す（Tauri 版だけ）。
@@ -91,5 +103,5 @@
 ## 変えないこと
 
 - 調査は読み取り専用。変更する操作は許可リスト・確認ダイアログ・実行直前の台帳の読み直しを通す（docs/safety.md）
-- 外へ送るのは操作者が承認したときだけ。秘密・会話の本文・ツールの入出力・コマンドライン引数は取り出さない・保存しない
+- 外へ送るのは操作者が承認したときだけ。秘密・会話の本文・ツールの入出力・コマンドライン引数は取り出さない・保存しない。ただし topology の型付き宣言値は上記の private DB、cache、internal view の境界に従う
 - 個人・環境の情報をリポジトリに書かない（`npm run oss-check`）

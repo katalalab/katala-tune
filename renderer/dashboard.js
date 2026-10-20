@@ -30,6 +30,7 @@
     const a = (k, i = 0) => (Array.isArray(v[k]) ? v[k][i] : null);
     return {
       src: 'minute', t: n.latest?.minute, cpu: a('cpu'), mem: a('mem'), gpu: a('gpu'), gtemp: a('gtemp', 1), commit: a('commit'), swap: a('swap'),
+      ...Object.fromEntries(Object.keys(v).filter(k => /^gpu_\d+_vram_(used_mib|total_mib|free_mib|pct)$/.test(k)).map(k => [k,a(k)])),
       power_cpu_w: a('power_cpu_w'), power_gpu_w: a('power_gpu_w'), power_soc_w: a('power_soc_w'), power_platform_w: a('power_platform_w'),
     };
   }
@@ -79,6 +80,16 @@
       return x && x.name ? `<span title="${esc(k === 'top_cpu' ? 'CPU（1 コア比）' : 'メモリ')}">${esc(x.name)} <b>${esc(num(x[unit]) ? r0(x[unit]) : '–')}</b>${k === 'top_cpu' ? '%' : 'MB'}</span>` : '';
     };
     const al = (n.alerts || []).map((a) => UI.chip(a.title || a.id, SEV[a.severity]?.[1] || 'orange', { title: a.detail || '' })).join('');
+    const adapterIds = [...new Set(Object.keys(v).map(k => /^gpu_(\d+)_vram_/.exec(k)?.[1]).filter(Boolean))];
+    const gpus = (typeof Live !== 'undefined' && Live.store[n.id]?.gpus) || [];
+    const adapters = gpus.map(g => ({slot:g.storage_slot, label:g.adapter_index ?? '?', meta:g}));
+    for (const id of adapterIds) if (!adapters.some(g => g.slot != null && String(g.slot) === id)) adapters.push({slot:id,label:id});
+    const vram = adapters.map(({slot, label, meta}) => {
+      const value = suffix => slot != null && num(v[`gpu_${slot}_vram_${suffix}`]) ? r0(v[`gpu_${slot}_vram_${suffix}`]) : '未取得';
+      if (meta?.memory_kind === 'unified') return '<div class="note-line">統合メモリ共有・専用VRAM該当なし</div>';
+      const reason = {'adapter-index-out-of-range':'GPU番号が保存範囲（0〜15）外', 'duplicate-adapter-index':'GPU番号が重複', 'missing-adapter-index':'GPU番号が未取得'}[meta?.memory_reason];
+      return `<div class="note-line">GPU ${esc(label)} VRAM ${esc(value('used_mib'))} / ${esc(value('total_mib'))} MiB · 空き ${esc(value('free_mib'))} MiB · ${esc(value('pct'))}%${reason ? ` · ${esc(reason)}` : ''}</div>`;
+    }).join('');
     const last = n.last || {};
     return `<div class="dtile st-${st}" data-dash="${esc(n.id)}">
       <div class="dt-top"><span class="dt-name" data-goto="${esc(n.id)}" tabindex="0">${UI.icon(n.os === 'windows' ? 'win' : 'mac')}<b>${esc(n.id)}</b></span>
@@ -89,6 +100,7 @@
         ${num(v.gpu) || num(v.gtemp) ? metric('GPU', v.gpu, '%', { warn: 85, crit: 97 }) + metric('GPU 温度', v.gtemp, '℃', { warn: 75, crit: 85 }) : num(v.commit) ? metric('コミット', v.commit, '%', { warn: 80, crit: 90 }) : metric('swap', v.swap, 'GB', { warn: 4, crit: 8, digits: 1 })}
         ${pw ? `<div class="dm" title="${esc(pw.label)}"><div class="dm-k">電力</div><div class="dm-v">${esc(r0(pw.w))}<small>W</small></div></div>` : ''}
       </div>
+      <div class="dt-vram">${vram}</div>
       <div class="dt-spark">${spark}</div>
       <div class="dt-top2">${top('top_cpu', 'cpu')}${top('top_mem', 'mem_mb')}</div>
       ${al ? `<div class="dt-alerts">${al}</div>` : ''}
@@ -199,7 +211,7 @@
       fresh.innerHTML = tile(n);
       const nt = fresh.firstElementChild;
       el.className = nt.className;
-      for (const sel of ['.dt-metrics', '.dt-state', '.dt-top2', '.dt-spark']) {
+      for (const sel of ['.dt-metrics', '.dt-state', '.dt-top2', '.dt-spark', '.dt-vram']) {
         const a = el.querySelector(sel), b = nt.querySelector(sel);
         if (a && b && a.innerHTML !== b.innerHTML) a.innerHTML = b.innerHTML;
       }

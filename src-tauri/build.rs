@@ -43,6 +43,9 @@ const COMMANDS: &[&str] = &[
     "dashboard",
     "monitor_settings",
     "hub_pull",
+    "topology_view",
+    "topology_refresh",
+    "topology_export",
 ];
 
 fn main() {

@@ -235,70 +235,184 @@ pub fn procs_json(rows: &[ProcRow], n: usize) -> Value {
     })
 }
 
-/// nvidia-smi dmon の 1 行（見出しで列を覚えてから読む）
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct GpuNow {
-    pub util: Option<f64>,
-    pub mem_mb: Option<f64>,
-    pub power_w: Option<f64>,
-    pub temp_c: Option<f64>,
-    pub graphics_mhz: Option<f64>,
-    pub sm_mhz: Option<f64>,
-    pub memory_mhz: Option<f64>,
+/// NVIDIA query parser shared by the native sampler and cross-platform tests.
+pub fn parse_gpu_query(text: &str, sampled_at: i64) -> Vec<Value> {
+    text.lines().take(16).filter_map(|line| {
+        let mut f: Vec<&str> = line.split(',').map(str::trim).collect();
+        if f.len() == 5 { f = vec![f[0],f[1],"N/A",f[2],f[3],f[4],"N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A","N/A"]; }
+        if f.len() != 18 { return None; }
+        let index = f[0].parse::<u32>().ok()?;
+        let num = |i: usize| f[i].parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0);
+        let total = num(4).filter(|v| *v > 0.0);
+        let used = num(3).filter(|v| total.is_none_or(|t| *v <= t));
+        let free = num(5).filter(|v| total.is_none_or(|t| *v <= t));
+        let pct = used.zip(total).map(|(u,t)| u/t*100.0);
+        let available = pct.is_some() && free.is_some();
+        let n = |v: Option<f64>, d| v.map_or(Value::Null, |x| round(x,d));
+        let string = |i: usize| (!matches!(f[i],"N/A"|"[N/A]"|"Not Supported"|"")).then(|| f[i].chars().take(120).collect::<String>());
+        Some(json!({"adapter_index":index,"name":string(1),"util":n(num(2).filter(|v|*v<=100.0),1),
+            "mem_used_mb":n(used,0),"mem_total_mb":n(total,0),"mem_free_mb":n(free,0),"mem_used_pct":n(pct,1),
+            "temp_c":n(num(6),1),"power_w":n(num(7),1),"clocks_graphics_mhz":n(num(8),0),"clocks_memory_mhz":n(num(9),0),
+            "uuid":string(10),"pstate":string(11),"power_limit_w":n(num(12),1),"power_min_w":n(num(13),1),"power_max_w":n(num(14),1),"clocks_sm_mhz":n(num(15),0),"driver":string(16),
+            "source":"nvidia-smi query (MiB)","sampled_at":sampled_at,"memory_kind":"dedicated","memory_status":if available {"available"}else{"partial"},
+            "memory_reason":if available {None}else{Some("driver returned unavailable or invalid memory fields")},"available":true}))
+    }).collect()
 }
 
-/// dmon の出力を 1 行ずつ。`# gpu …` の見出しで列を覚え、数の行を (gpu 番号, 値) にする
-#[derive(Default)]
-pub struct Dmon {
-    cols: Vec<String>,
-}
+type GpuRead = std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, &'static str>> + Send>>;
 
-impl Dmon {
-    pub fn line(&mut self, line: &str) -> Option<(u32, GpuNow)> {
-        let t = line.trim();
-        if let Some(h) = t.strip_prefix('#') {
-            let h = h.trim();
-            if h.starts_with("gpu") {
-                self.cols = h.split_whitespace().map(str::to_string).collect();
+/// One owned child, at most every five seconds; no detached readers or resident dmon.
+pub struct GpuQuery {
+    smi: std::path::PathBuf,
+    every: Duration,
+    runtime: Option<tokio::runtime::Runtime>,
+    child: Option<tokio::process::Child>,
+    output: Option<GpuRead>,
+    read: Option<Result<String, &'static str>>,
+    started: Option<Instant>,
+    sampled: Option<Instant>,
+    fallback: bool,
+    rows: Vec<Value>,
+    reason: &'static str,
+}
+impl GpuQuery {
+    pub fn open(smi: std::path::PathBuf, every: f64) -> Self {
+        Self {
+            smi,
+            every: Duration::from_secs_f64(every.max(5.0)),
+            runtime: tokio::runtime::Builder::new_current_thread().enable_all().build().ok(),
+            child: None,
+            output: None,
+            read: None,
+            started: None,
+            sampled: None,
+            fallback: false,
+            rows: vec![],
+            reason: "query-pending",
+        }
+    }
+    fn stop(&mut self) {
+        // Dropping the async read closes its pipe, including when a grandchild holds the other end.
+        self.output = None;
+        self.read = None;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            if let Some(rt) = &self.runtime {
+                let _ = rt.block_on(async { tokio::time::timeout(Duration::from_millis(200), child.wait()).await });
             }
-            return None;
         }
-        let f: Vec<&str> = t.split_whitespace().collect();
-        if self.cols.is_empty() || f.len() != self.cols.len() {
-            return None;
+    }
+    fn start(&mut self, memory_only: bool) {
+        let Some(rt) = &self.runtime else {
+            self.reason = "query-runtime-unavailable";
+            return;
+        };
+        let fields = if memory_only {
+            "index,name,memory.used,memory.total,memory.free"
+        } else {
+            "index,name,utilization.gpu,memory.used,memory.total,memory.free,temperature.gpu,power.draw,clocks.current.graphics,clocks.current.memory,uuid,pstate,power.limit,power.min_limit,power.max_limit,clocks.current.sm,driver_version,clocks_throttle_reasons.active"
+        };
+        let mut command = tokio::process::Command::new(&self.smi);
+        command
+            .args([format!("--query-gpu={fields}"), "--format=csv,noheader,nounits".into()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            command.creation_flags(0x0800_0000);
         }
-        let at = |k: &str| self.cols.iter().position(|c| c == k).and_then(|i| f[i].parse::<f64>().ok()).filter(|x| x.is_finite());
-        let gpu = self.cols.iter().position(|c| c == "gpu").and_then(|i| f[i].parse::<u32>().ok())?;
-        Some((
-            gpu,
-            GpuNow {
-                util: at("sm"),
-                mem_mb: at("fb"),
-                power_w: at("pwr"),
-                temp_c: at("gtemp"),
-                graphics_mhz: at("gclk").or_else(|| at("pclk")),
-                sm_mhz: at("smclk"),
-                memory_mhz: at("mclk"),
-            },
-        ))
+        self.started = Some(Instant::now());
+        self.fallback = memory_only;
+        let _guard = rt.enter();
+        match command.spawn() {
+            Ok(mut child) => {
+                let out = child.stdout.take();
+                self.output = Some(Box::pin(async move {
+                    use tokio::io::AsyncReadExt;
+                    let out = out.ok_or("output-unavailable")?;
+                    let mut buf = Vec::new();
+                    out.take(65537).read_to_end(&mut buf).await.map_err(|_| "output-unavailable")?;
+                    if buf.len() > 65536 {
+                        return Err("output-limit");
+                    };
+                    Ok(String::from_utf8_lossy(&buf).into_owned())
+                }));
+                self.read = None;
+                self.child = Some(child);
+            }
+            Err(_) => {
+                self.rows.clear();
+                self.reason = "query-unavailable";
+            }
+        }
+    }
+    pub fn poll(&mut self) {
+        if self.child.is_some() {
+            if let (Some(rt), Some(output)) = (&self.runtime, self.output.as_mut())
+                && let Ok(result) = rt.block_on(async { tokio::time::timeout(Duration::from_millis(1), output).await })
+            {
+                self.read = Some(result);
+                self.output = None;
+            }
+            if let Some(Err(reason)) = &self.read {
+                self.reason = reason;
+                self.rows.clear();
+                self.stop();
+                return;
+            }
+            match self.child.as_mut().unwrap().try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        self.stop();
+                        self.rows.clear();
+                        self.reason = "query-failed";
+                        if !self.fallback {
+                            self.start(true)
+                        };
+                        return;
+                    }
+                    if let Some(Ok(text)) = self.read.take() {
+                        self.rows = parse_gpu_query(&text, tune_link::now_ms());
+                        self.sampled = Some(Instant::now());
+                        self.reason = "invalid-query-row";
+                        self.stop();
+                        return;
+                    }
+                }
+                Err(_) => {
+                    self.stop();
+                    self.rows.clear();
+                    self.reason = "query-failed";
+                    return;
+                }
+                Ok(None) => {}
+            }
+            if self.started.is_some_and(|t| t.elapsed() >= Duration::from_secs(4)) {
+                self.stop();
+                self.rows.clear();
+                self.reason = "query-timeout";
+            }
+            return;
+        }
+        if self.started.is_none_or(|t| t.elapsed() >= self.every) {
+            self.start(false);
+        }
+    }
+    pub fn json(&self) -> Option<Value> {
+        if !self.rows.is_empty() && self.sampled.is_some_and(|t| t.elapsed() <= self.every + Duration::from_millis(4500)) {
+            return Some(json!(self.rows));
+        }
+        Some(
+            json!([{"name":"GPU","source":"nvidia-smi query","memory_kind":"unknown","memory_status":"unavailable","memory_reason":self.reason,"available":false}]),
+        )
     }
 }
-
-pub fn gpu_json(name: Option<&str>, total_mb: Option<f64>, g: &GpuNow) -> Value {
-    let n = |x: Option<f64>, d| x.map_or(Value::Null, |v| round(v, d));
-    json!({
-        "name": name,
-        "util": n(g.util, 0),
-        "mem_used_mb": n(g.mem_mb, 0),
-        "mem_total_mb": n(total_mb, 0),
-        "power_w": n(g.power_w, 1),
-        "temp_c": n(g.temp_c, 0),
-        "clocks_graphics_mhz": n(g.graphics_mhz, 0),
-        "clocks_sm_mhz": n(g.sm_mhz, 0),
-        "clocks_memory_mhz": n(g.memory_mhz, 0),
-        "source": "nvidia-smi dmon",
-        "available": true,
-    })
+impl Drop for GpuQuery {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 #[cfg(test)]
@@ -362,32 +476,56 @@ mod tests {
     }
 
     #[test]
-    fn dmon_reads_columns_from_the_header() {
-        let mut d = Dmon::default();
-        assert_eq!(
-            d.line("    0     26     31      -     29      3      0      0      0      0  10501   2520   9001    11      0"),
-            None,
-            "見出しの前は読まない"
+    fn query_rows_keep_free_memory_and_na_per_adapter() {
+        let rows = parse_gpu_query(
+            "0, Test GPU A, 10, 50, 100, 49, 40, 25, 500, 800, GPU-test-a, P8, 100, 80, 120, 500, 1, 0\n1, Test GPU B, N/A, N/A, 200, N/A, N/A, N/A, N/A, N/A, GPU-test-b, P8, N/A, N/A, N/A, N/A, 1, 0",
+            123,
         );
-        assert_eq!(d.line("# gpu    pwr  gtemp  mtemp     sm    mem    enc    dec    jpg    ofa   mclk   pclk     fb   bar1   ccpm"), None);
-        assert_eq!(d.line("# Idx      W      C      C      %      %      %      %      %      %    MHz    MHz     MB     MB     MB"), None);
-        let (i, g) = d.line("    0     26     31      -     29      3      0      0      0      0  10501   2520   9001    11      0").unwrap();
-        assert_eq!(i, 0);
-        assert_eq!(
-            g,
-            GpuNow {
-                util: Some(29.0),
-                mem_mb: Some(9001.0),
-                power_w: Some(26.0),
-                temp_c: Some(31.0),
-                graphics_mhz: Some(2520.0),
-                sm_mhz: None,
-                memory_mhz: Some(10501.0)
-            }
-        );
-        assert_eq!(d.line("    0     26"), None, "列の数が合わない行は捨てる");
-        let v = gpu_json(Some("RTX"), Some(24564.0), &g);
-        assert_eq!((v["util"].clone(), v["power_w"].clone(), v["clocks_sm_mhz"].clone()), (json!(29.0), json!(26.0), Value::Null));
+        assert_eq!(rows[0]["mem_free_mb"], json!(49.0));
+        assert_eq!(rows[0]["mem_used_pct"], json!(50.0));
+        assert_eq!(rows[1]["mem_used_mb"], Value::Null);
+        assert_eq!(rows[1]["memory_status"], "partial");
+        assert_eq!(rows[0]["sampled_at"], 123);
+        let fallback = parse_gpu_query("0, Test GPU, 50, 100, 49", 123);
+        assert_eq!(fallback[0]["mem_used_mb"], json!(50.0));
+        assert_eq!(fallback[0]["util"], Value::Null);
+    }
+
+    #[test]
+    fn query_cache_expires_without_converting_missing_memory_to_zero() {
+        let mut q = GpuQuery::open("missing-sensor".into(), 5.0);
+        q.rows = parse_gpu_query("0, Test GPU, 0, 100, 99", 123);
+        q.sampled = Some(Instant::now());
+        assert_eq!(q.json().unwrap()[0]["mem_used_mb"], json!(0.0));
+        q.sampled = Some(Instant::now() - Duration::from_secs(10));
+        let expired = q.json().unwrap();
+        assert_eq!(expired[0]["available"], false);
+        assert_eq!(expired[0]["mem_used_mb"], Value::Null);
+        assert_eq!(expired[0]["memory_status"], "unavailable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_pipe_read_is_cancelled_on_repeated_timeout_and_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tune-gpu-pipe-{}-{}", std::process::id(), tune_link::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("fake-sensor");
+        std::fs::write(&exe, "#!/bin/sh\n(sleep 0.2) &\nprintf '0, Test GPU, 0, 100, 99\\n'\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for _ in 0..5 {
+            let mut q = GpuQuery::open(exe.clone(), 5.0);
+            q.start(false);
+            std::thread::sleep(Duration::from_millis(20));
+            q.poll();
+            q.started = Some(Instant::now() - Duration::from_secs(5));
+            q.poll();
+            assert_eq!(q.reason, "query-timeout");
+            assert!(q.child.is_none() && q.output.is_none() && q.read.is_none());
+            assert_eq!(q.runtime.as_ref().unwrap().metrics().num_alive_tasks(), 0, "no detached reader tasks");
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
