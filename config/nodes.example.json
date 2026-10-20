@@ -19,6 +19,9 @@
       "os": "macos",
       "local_hostname": "My-MacBook-Pro",
       "role": "この Mac",
+      "topology": {
+        "environments": [{"id":"native","transport":"node","enabled":false,"roots":[],"docker":{"enabled":false,"contexts":["default"]}}]
+      },
       "expect": {
         "jobs": [
           "com.example.backup"

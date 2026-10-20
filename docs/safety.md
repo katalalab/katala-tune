@@ -126,3 +126,41 @@ CPU 使用率・実行ファイル名・同名プロセス数だけでは、不�
 - 共用機は、外向きの接続先（宛先）を既定で残さない。調査の結果を受け取った直後に宛先の一覧を落とし（`dropPeers`・`drop_peers`）、DB にも画面にも入れず、初めての接続先も覚えない。台帳の `"network_peers": true` で明示したときだけ残し、所見は提案だけにする
 - 共用機は、ログインのアカウント名と送り元も既定で集めない。台帳の `"network_logins": true` で明示したときだけ集める。既定値へ戻した後は、以前の接続先とログインの送り元を最新結果・状態・ログ検索・署名・セキュリティ画面へ返さない
 - 外向きの接続は分析のときの1回の標本。最初の 7 日は覚えるだけで、知らせない（学習の途中で全部が「初めて」になるのを避ける）。自分の待ち受けの番号で受けた接続（外から来た接続）は外向きに数えない（相手の番号が毎回変わり、誤検知になる）。
+
+### Docker topology
+
+Docker collection is opt-in per explicit local native topology environment. It
+uses no action API and exposes no mutating Docker verbs. Context endpoint
+inspection precedes daemon access; only local `unix:///...` and
+`npipe:////./pipe/...` are accepted. Subsequent reads pin that validated endpoint
+with `--host`, removing Docker host/context/TLS/API/header environment overrides.
+Remote SSH/TCP/cloud endpoints are excluded with unknown coverage. Nothing starts
+Docker Desktop, a daemon, WSL, containers, or another service.
+
+The adapter resolves an absolute Docker binary from known installation paths,
+checks its canonical destination (including the Homebrew Docker formula), and
+uses fixed argv without a shell. Each owned child has at most 5 seconds, bounded
+stdout/stderr, and kill/wait cleanup through the existing bounded collector.
+The cumulative collection deadline is at most 60 seconds, with at most 8
+explicit contexts, 512 objects per catalog, 128 mount/network/port entries per
+container, 1 MiB stdout per command and 8 MiB cumulative output. Configured
+smaller topology budgets apply. Output overflow and timeouts are failures, never
+empty-success inventories.
+
+Only projected fields are requested: IDs, state/optional health, resource limits,
+restart policy, log driver and only max-size/max-file, mount identities,
+network membership and published port numbers. IDs and paths become hashes.
+No raw inspect, Env, command, complete labels, log messages, authentication,
+TLS material or daemon configuration is persisted or printed. The public typed
+import boundary rejects unknown fields and validates sanitized policies/hashes.
+Network membership has its own edge and never asserts a dependency. Unavailable
+health stays unknown; stopped unhealthy containers are not current incidents.
+Only running json-file containers with missing max-size become log candidates;
+local driver defaults are bounded. Limits of zero remain zero, distinct from
+missing values, and do not themselves assert a problem.
+
+Coverage receipts are separate from engine snapshots. Engine IDs deduplicate
+aliases. An unknown context cannot erase another engine's successful graph;
+unobserved previous engines retain their graph with a partial receipt. Docker
+uses existing topology leases, fenced writes, retention, public anonymous export,
+and the existing refresh scheduler; it adds no background service or DB schema.
