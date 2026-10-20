@@ -407,24 +407,32 @@ fn compare_names(left: &OsStr, right: &OsStr) -> Ordering {
         _ => Ordering::Greater,
     }
 }
-fn environment(command: &std::process::Command) -> io::Result<Vec<u16>> {
-    let mut vars: Vec<_> = std::env::vars_os().collect();
-    for (name, value) in command.get_envs() {
+fn environment(command: &std::process::Command, entries: &[(OsString, OsString)]) -> io::Result<Vec<u16>> {
+    // Command does not expose its env_clear state. A separate complete map is the
+    // sole authority; reject edits rather than silently ignoring/merging them.
+    if command.get_envs().next().is_some() {
+        return Err(invalid());
+    }
+    let mut vars: Vec<_> = entries.iter().collect();
+    for (name, value) in &vars {
+        if name.len() > 1024 * 1024 || value.len() > 1024 * 1024 {
+            return Err(invalid());
+        }
         let units = wide(name)?;
         if units.len() == 1 || units.contains(&u16::from(b'=')) {
             return Err(invalid());
         }
-        vars.retain(|(key, _)| compare_names(key, name) != Ordering::Equal);
-        if let Some(value) = value {
-            vars.push((name.to_owned(), value.to_owned()));
-        }
+        wide(value)?;
     }
     vars.sort_by(|(a, _), (b, _)| compare_names(a, b));
+    if vars.windows(2).any(|pair| compare_names(&pair[0].0, &pair[1].0) == Ordering::Equal) {
+        return Err(invalid());
+    }
     let mut output = Vec::new();
     for (key, value) in vars {
-        let mut key = wide(&key)?;
+        let mut key = wide(key)?;
         key.pop();
-        let value = wide(&value)?;
+        let value = wide(value)?;
         output.extend(key);
         output.push(u16::from(b'='));
         output.extend(value);
@@ -443,7 +451,7 @@ fn path_entries(path: &OsStr) -> impl Iterator<Item = PathBuf> + '_ {
     std::env::split_paths(path).filter(|entry| !entry.as_os_str().is_empty())
 }
 
-fn executable(command: &std::process::Command) -> io::Result<PathBuf> {
+fn executable(command: &std::process::Command, environment: &[(OsString, OsString)]) -> io::Result<PathBuf> {
     let program = Path::new(command.get_program());
     let extension = program.extension().unwrap_or_default().to_string_lossy();
     if extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat") {
@@ -459,7 +467,7 @@ fn executable(command: &std::process::Command) -> io::Result<PathBuf> {
     if name.components().count() > 1 || name.is_absolute() {
         return name.canonicalize().and_then(|p| if p.is_file() { Ok(p) } else { Err(invalid()) });
     }
-    let child_path = command.get_envs().find(|(k, _)| compare_names(k, OsStr::new("PATH")) == Ordering::Equal).and_then(|(_, v)| v);
+    let child_path = environment.iter().find(|(k, _)| compare_names(k, OsStr::new("PATH")) == Ordering::Equal).map(|(_, v)| v);
     let mut paths = Vec::new();
     if let Some(path) = child_path {
         paths.extend(path_entries(path));
@@ -478,9 +486,6 @@ fn executable(command: &std::process::Command) -> io::Result<PathBuf> {
         }
         use std::os::windows::ffi::OsStringExt;
         paths.push(PathBuf::from(OsString::from_wide(&buffer[..count as usize])));
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        paths.extend(path_entries(&path));
     }
     paths.into_iter().map(|p| p.join(&name)).find(|p| p.is_file()).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?.canonicalize()
 }
@@ -522,19 +527,18 @@ fn user_executable_path(path: PathBuf) -> io::Result<PathBuf> {
     }
 }
 
-fn spawn_owned(
-    command: &std::process::Command,
-    job: &Job,
-    input: &Pipe,
-    out: &Pipe,
-    err: &Pipe,
-    spawn_failed: &mut bool,
+struct SpawnContext<'a> {
+    command: &'a std::process::Command,
+    environment: &'a [(OsString, OsString)],
     deadline: Instant,
-) -> io::Result<(Process, OwnedHandle)> {
-    let executable = user_executable_path(executable(command)?)?;
+}
+
+fn spawn_owned(context: SpawnContext<'_>, job: &Job, input: &Pipe, out: &Pipe, err: &Pipe, spawn_failed: &mut bool) -> io::Result<(Process, OwnedHandle)> {
+    let SpawnContext { command, environment: values, deadline } = context;
+    let env = environment(command, values)?;
+    let executable = user_executable_path(executable(command, values)?)?;
     let application = wide(executable.as_os_str())?;
     let mut argv = command_line(&executable, command)?;
-    let env = environment(command)?;
     let cwd = command.get_current_dir().map(|p| wide(p.as_os_str())).transpose()?;
     // Value arrays are declared before Attributes and remain alive until its destructor.
     let jobs = [job.handle.as_raw_handle()];
@@ -630,6 +634,7 @@ impl Drop for Tasks {
 
 pub(super) async fn run(
     command: &std::process::Command,
+    environment: &[(OsString, OsString)],
     input: &[u8],
     deadline: std::time::Instant,
     stdout_limit: usize,
@@ -660,7 +665,7 @@ pub(super) async fn run(
             stdout.server.connect().await?;
             stderr.server.connect().await?;
             let mut job = Job::new()?;
-            let spawn = spawn_owned(command, &job, &input_pipe, &stdout, &stderr, &mut answer.spawn_failed, deadline);
+            let spawn = spawn_owned(SpawnContext { command, environment, deadline }, &job, &input_pipe, &stdout, &stderr, &mut answer.spawn_failed);
             if let Err(error) = &spawn {
                 answer.spawn_failed |= error.kind() == io::ErrorKind::NotFound;
                 if error.kind() == io::ErrorKind::TimedOut {
@@ -838,6 +843,16 @@ mod tests {
         assert_eq!(user_executable_path(at_limit).unwrap(), PathBuf::from(format!("C:\\{}", "x".repeat(252))));
         let over_limit = PathBuf::from(format!("{prefix}{}", "x".repeat(253)));
         assert_eq!(user_executable_path(over_limit.clone()).unwrap(), over_limit);
+    }
+
+    #[test]
+    fn complete_environment_is_explicit_sorted_and_double_terminated() {
+        let mut command = std::process::Command::new("example.exe");
+        command.env_clear();
+        assert_eq!(environment(&command, &[]).unwrap(), vec![0, 0]);
+        let entries = [(OsString::from("b"), OsString::from("second")), (OsString::from("A"), OsString::from("first"))];
+        let expected: Vec<_> = "A=first\0b=second\0\0".encode_utf16().collect();
+        assert_eq!(environment(&command, &entries).unwrap(), expected);
     }
 
     #[test]

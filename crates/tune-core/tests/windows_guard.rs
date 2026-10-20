@@ -1,10 +1,11 @@
 #![cfg(windows)]
 //! Dedicated single-spawner process: every native invocation and std/Tokio control holds SERIAL.
 //! Real Windows children exercise the product backend. No fleet/SSH or shared process is used.
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use tune_core::collect::{BoundedResult, ProcessStop, run_standalone_windows_bounded};
+use tune_core::collect::{BoundedResult, ProcessStop, StandaloneWindowsEnvironment, run_standalone_windows_bounded};
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -64,6 +65,9 @@ fn owned_fixture() {
                     println!("env:{value}");
                 }
             }
+            if let Ok(value) = std::env::var("KATALA_GUARD_SET") {
+                println!("set:{value}");
+            }
             let args = std::env::args().skip_while(|arg| arg != "--").skip(1).collect::<Vec<_>>();
             for arg in args {
                 println!("arg:{}:{arg}", arg.len());
@@ -75,10 +79,27 @@ fn owned_fixture() {
     std::process::exit(0);
 }
 
-fn fixture_command(mode: &str) -> Command {
+fn fixture_invocation() -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
-    command.args(["--exact", "owned_fixture", "--nocapture"]).env(FIXTURE, mode);
+    command.args(["--exact", "owned_fixture", "--nocapture"]);
     command
+}
+
+fn fixture_command(mode: &str) -> Command {
+    let mut command = fixture_invocation();
+    command.env_clear().envs(minimal_environment()).env(FIXTURE, mode);
+    command
+}
+
+// Explicit non-secret OS locations only; do not collect the parent's complete environment.
+fn minimal_environment() -> Vec<(OsString, OsString)> {
+    ["SystemRoot", "WINDIR", "TEMP", "TMP", "COMSPEC"].into_iter().filter_map(|key| std::env::var_os(key).map(|value| (key.into(), value))).collect()
+}
+
+fn fixture_environment(mode: &str) -> Vec<(OsString, OsString)> {
+    let mut entries = minimal_environment();
+    entries.push((FIXTURE.into(), mode.into()));
+    entries
 }
 
 fn deadline(timeout: Duration) -> Instant {
@@ -87,7 +108,8 @@ fn deadline(timeout: Duration) -> Instant {
 
 async fn fixture(mode: &str, input: &[u8], timeout: Duration, limit: usize) -> BoundedResult {
     let end = deadline(timeout);
-    run_standalone_windows_bounded(&fixture_command(mode), input, end, limit, limit).await
+    let environment = fixture_environment(mode);
+    run_standalone_windows_bounded(&fixture_invocation(), StandaloneWindowsEnvironment::new(&environment), input, end, limit, limit).await
 }
 
 fn assert_ack(result: &BoundedResult, stop: ProcessStop) {
@@ -160,7 +182,15 @@ async fn root_exit_with_lingering_descendant_is_a_failure_with_ack() {
 #[tokio::test]
 async fn missing_executable_is_never_success() {
     let _serial = SERIAL.lock().await;
-    let result = run_standalone_windows_bounded(&Command::new("katala-guard-missing-executable"), b"", deadline(Duration::from_secs(1)), 1024, 1024).await;
+    let result = run_standalone_windows_bounded(
+        &Command::new("katala-guard-missing-executable"),
+        StandaloneWindowsEnvironment::new(&[]),
+        b"",
+        deadline(Duration::from_secs(1)),
+        1024,
+        1024,
+    )
+    .await;
     assert!(result.spawn_failed);
     assert_eq!(result.code, None);
     assert!(!result.process_receipt.unwrap().cleanup_confirmed());
@@ -187,12 +217,17 @@ async fn argv_and_case_insensitive_environment_roundtrip() {
     let mut args = vec!["--exact".into(), "owned_fixture".into(), "--nocapture".into(), "--".into()];
     args.extend(expected.iter().map(|arg| (*arg).to_owned()));
     let mut command = Command::new(exe);
-    command.args(args).env(FIXTURE, "args").env("KATALA_GUARD_ROUNDTRIP", "removed").env_remove("katala_guard_roundtrip");
-    let result = run_standalone_windows_bounded(&command, b"", deadline(Duration::from_secs(10)), 65536, 65536).await;
+    command.args(args);
+    let mut environment = fixture_environment("args");
+    // Omission deletes ROUNDTRIP; a differently-cased complete-map key still sets SET.
+    environment.push(("katala_guard_set".into(), "present".into()));
+    let result =
+        run_standalone_windows_bounded(&command, StandaloneWindowsEnvironment::new(&environment), b"", deadline(Duration::from_secs(10)), 65536, 65536).await;
     assert_ack(&result, ProcessStop::Completed);
     assert_eq!(result.code, Some(0));
     let output = String::from_utf8(result.stdout).unwrap();
     assert!(!output.contains("env:"));
+    assert!(output.contains("set:present"));
     assert_eq!(output.matches("running 1 test").count(), 1, "only the selected fixture must run");
     for arg in expected {
         assert!(output.contains(&format!("arg:{}:{arg}", arg.len())), "argv roundtrip missing");
@@ -223,9 +258,10 @@ async fn cancelling_future_closes_only_its_owned_job() {
     let path = std::env::temp_dir().join(name);
     let ready_path = path.to_string_lossy().into_owned();
     let task = tokio::spawn(async move {
-        let mut command = fixture_command("cancel");
-        command.env("KATALA_GUARD_READY", &ready_path);
-        run_standalone_windows_bounded(&command, b"", deadline(Duration::from_secs(20)), 65536, 65536).await
+        let command = fixture_invocation();
+        let mut environment = fixture_environment("cancel");
+        environment.push(("KATALA_GUARD_READY".into(), ready_path.into()));
+        run_standalone_windows_bounded(&command, StandaloneWindowsEnvironment::new(&environment), b"", deadline(Duration::from_secs(20)), 65536, 65536).await
     });
     let deadline = Instant::now() + Duration::from_secs(10);
     let pids = loop {
@@ -286,7 +322,7 @@ async fn invalid_arguments_fail_before_execution() {
     let exe = std::env::current_exe().unwrap().to_string_lossy().into_owned();
     let mut command = Command::new(exe);
     command.arg("invalid\0argument");
-    let result = run_standalone_windows_bounded(&command, b"", deadline(Duration::from_secs(2)), 65536, 65536).await;
+    let result = run_standalone_windows_bounded(&command, StandaloneWindowsEnvironment::new(&[]), b"", deadline(Duration::from_secs(2)), 65536, 65536).await;
     assert_eq!(result.code, None);
     assert!(result.stdout.is_empty());
     let receipt = result.process_receipt.unwrap();
@@ -301,7 +337,7 @@ async fn expired_budget_cannot_start_a_reader() {
     let exe = std::env::current_exe().unwrap().to_string_lossy().into_owned();
     let now = Instant::now();
     for expired in [now, now.checked_sub(Duration::from_secs(1)).unwrap()] {
-        let result = run_standalone_windows_bounded(&Command::new(&exe), b"", expired, 1024, 1024).await;
+        let result = run_standalone_windows_bounded(&Command::new(&exe), StandaloneWindowsEnvironment::new(&[]), b"", expired, 1024, 1024).await;
         assert!(result.timed_out);
         assert_eq!(result.code, None);
         let receipt = result.process_receipt.unwrap();
@@ -309,7 +345,7 @@ async fn expired_budget_cannot_start_a_reader() {
         assert!(receipt.root.is_none());
     }
     let command = Command::new(&exe);
-    let future = run_standalone_windows_bounded(&command, b"", deadline(Duration::from_millis(50)), 1024, 1024);
+    let future = run_standalone_windows_bounded(&command, StandaloneWindowsEnvironment::new(&[]), b"", deadline(Duration::from_millis(50)), 1024, 1024);
     tokio::time::sleep(Duration::from_millis(100)).await;
     let result = future.await;
     assert!(result.timed_out);
@@ -343,8 +379,17 @@ async fn product_guard_runs_a_native_rust_stdio_fixture() {
     let _serial = SERIAL.lock().await;
     let name = "stdio_fixture";
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    command.args(["--exact", name, "--nocapture"]).env(FIXTURE, "stdio");
-    let result = run_standalone_windows_bounded(&command, b"fixture-input", deadline(Duration::from_secs(5)), 65536, 65536).await;
+    command.args(["--exact", name, "--nocapture"]);
+    let environment = fixture_environment("stdio");
+    let result = run_standalone_windows_bounded(
+        &command,
+        StandaloneWindowsEnvironment::new(&environment),
+        b"fixture-input",
+        deadline(Duration::from_secs(5)),
+        65536,
+        65536,
+    )
+    .await;
     assert_eq!(
         result.code,
         Some(0),
@@ -362,6 +407,7 @@ async fn product_guard_runs_a_native_rust_stdio_fixture() {
 
 async fn stdio_control(program: &std::path::Path) -> (Option<i32>, bool) {
     let mut command = tokio::process::Command::new(program);
+    command.env_clear().envs(minimal_environment());
     command
         .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write('guard-marker')"])
         .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
@@ -401,7 +447,9 @@ async fn product_guard_preserves_simple_windows_powershell_startup() {
     assert_eq!(canonical_control, (Some(0), false));
     let mut command = std::process::Command::new(normal);
     command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write('guard-marker')"]);
-    let result = run_standalone_windows_bounded(&command, b"", deadline(Duration::from_secs(10)), 65536, 65536).await;
+    let environment = minimal_environment();
+    let result =
+        run_standalone_windows_bounded(&command, StandaloneWindowsEnvironment::new(&environment), b"", deadline(Duration::from_secs(10)), 65536, 65536).await;
     assert_eq!(
         result.code,
         Some(0),
@@ -413,4 +461,94 @@ async fn product_guard_preserves_simple_windows_powershell_startup() {
     );
     assert_ack(&result, ProcessStop::Completed);
     assert_eq!(result.stdout, b"guard-marker");
+}
+
+const CANARY: &str = "KATALA_GUARD_ENV_CANARY";
+const SYNTHETIC_CANARY: &str = "synthetic-canary-not-a-credential";
+
+fn environment_command(mode: &str) -> Command {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", "environment_fixture", "--nocapture", "--", mode]);
+    command
+}
+
+#[test]
+fn environment_fixture() {
+    let arguments: Vec<_> = std::env::args().collect();
+    if arguments.iter().any(|value| value == "--guard-env-child") {
+        assert!(std::env::vars_os().next().is_none(), "child must receive exactly the empty map");
+        println!("empty-environment-child-ran");
+        std::process::exit(0);
+    }
+    if !arguments.iter().any(|value| value == "--guard-env-parent") {
+        return;
+    }
+    assert!(std::env::var(CANARY).as_deref() == Ok(SYNTHETIC_CANARY), "synthetic parent canary must be present");
+    let mut command = environment_command("--guard-env-child");
+    command.env_clear();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let result =
+        runtime.block_on(run_standalone_windows_bounded(&command, StandaloneWindowsEnvironment::new(&[]), b"", deadline(Duration::from_secs(5)), 65536, 65536));
+    assert_ack(&result, ProcessStop::Completed);
+    assert_eq!(result.code, Some(0));
+    assert!(String::from_utf8_lossy(&result.stdout).contains("empty-environment-child-ran"), "actual child execution required");
+    assert!(!result.stdout.windows(SYNTHETIC_CANARY.len()).any(|part| part == SYNTHETIC_CANARY.as_bytes()));
+    assert!(!result.stderr.windows(SYNTHETIC_CANARY.len()).any(|part| part == SYNTHETIC_CANARY.as_bytes()));
+    println!("empty-environment-parent-confirmed");
+    std::process::exit(0);
+}
+
+#[tokio::test]
+async fn complete_empty_environment_does_not_reintroduce_parent_values() {
+    let _serial = SERIAL.lock().await;
+    // A separate parent gets only a public synthetic value. No global set_var or secret read is needed.
+    let mut command = tokio::process::Command::from(environment_command("--guard-env-parent"));
+    command.env_clear().env(CANARY, SYNTHETIC_CANARY).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let child = command.spawn().unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await.unwrap().unwrap();
+    assert!(output.status.success(), "isolated environment parent failed: code={:?}", output.status.code());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("empty-environment-parent-confirmed"), "actual parent verification required");
+    assert!(!output.stdout.windows(SYNTHETIC_CANARY.len()).any(|part| part == SYNTHETIC_CANARY.as_bytes()));
+    assert!(!output.stderr.windows(SYNTHETIC_CANARY.len()).any(|part| part == SYNTHETIC_CANARY.as_bytes()));
+}
+
+#[tokio::test]
+async fn complete_environment_rejects_ambiguous_and_invalid_inputs() {
+    let _serial = SERIAL.lock().await;
+    for entries in [
+        vec![("Name".into(), "first".into()), ("name".into(), "second".into())],
+        vec![("NAME".into(), "first".into()), ("NAME".into(), "second".into())],
+        vec![("".into(), "value".into())],
+        vec![("NAME=OTHER".into(), "value".into())],
+        vec![("NAME\0".into(), "value".into())],
+        vec![("NAME".into(), "value\0".into())],
+    ] {
+        let result = run_standalone_windows_bounded(
+            &environment_command("--guard-env-child"),
+            StandaloneWindowsEnvironment::new(&entries),
+            b"",
+            deadline(Duration::from_secs(2)),
+            65536,
+            65536,
+        )
+        .await;
+        assert_eq!(result.code, None);
+        let receipt = result.process_receipt.unwrap();
+        assert_eq!(receipt.stop, ProcessStop::SetupFailed);
+        assert!(receipt.root.is_none(), "invalid complete map must fail before spawn");
+    }
+    for remove in [false, true] {
+        let mut command = environment_command("--guard-env-child");
+        if remove {
+            command.env_remove("NAME");
+        } else {
+            command.env("NAME", "value");
+        }
+        let result =
+            run_standalone_windows_bounded(&command, StandaloneWindowsEnvironment::new(&[]), b"", deadline(Duration::from_secs(2)), 65536, 65536).await;
+        assert_eq!(result.code, None);
+        let receipt = result.process_receipt.unwrap();
+        assert_eq!(receipt.stop, ProcessStop::SetupFailed);
+        assert!(receipt.root.is_none(), "Command edits must not be silently ignored");
+    }
 }

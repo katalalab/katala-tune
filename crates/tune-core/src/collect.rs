@@ -195,23 +195,40 @@ pub async fn run_bounded_with_env_clean(
     run_bounded_portable(command, input, timeout, stdout_limit, stderr_limit).await
 }
 
+/// Complete child environment for the standalone Windows backend. Nothing is
+/// inherited implicitly; omit a key to remove it. Validation occurs before spawn.
+#[cfg(windows)]
+pub struct StandaloneWindowsEnvironment<'a> {
+    entries: &'a [(std::ffi::OsString, std::ffi::OsString)],
+}
+
+#[cfg(windows)]
+impl<'a> StandaloneWindowsEnvironment<'a> {
+    pub fn new(entries: &'a [(std::ffi::OsString, std::ffi::OsString)]) -> Self {
+        Self { entries }
+    }
+}
+
 /// Native Windows diagnostic backend for an isolated single-spawner helper.
 ///
 /// The caller must run before GUI/background initialization in its own process,
 /// with no concurrent std/Tokio process launches. This function does not establish
 /// that isolation and returns no acceptance witness. A receipt is diagnostic data.
 /// The absolute deadline is preserved through setup and payload admission.
-/// Only program, regular arguments, environment set/remove changes and current
-/// directory are inputs; stdio and process creation options belong to the backend.
+/// Command supplies only program, regular arguments and current directory. Any
+/// Command environment set/remove entry is rejected; env_clear alone is allowed.
+/// The mandatory complete environment is authoritative even with env_clear.
+/// Stdio and process creation options belong to the backend.
 #[cfg(windows)]
 pub async fn run_standalone_windows_bounded(
     command: &std::process::Command,
+    environment: StandaloneWindowsEnvironment<'_>,
     input: &[u8],
     deadline: Instant,
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> BoundedResult {
-    windows::run(command, input, deadline, stdout_limit, stderr_limit).await
+    windows::run(command, environment.entries, input, deadline, stdout_limit, stderr_limit).await
 }
 
 async fn run_bounded_portable(mut command: Command, input: &[u8], timeout: Duration, stdout_limit: usize, stderr_limit: usize) -> BoundedResult {

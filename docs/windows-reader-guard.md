@@ -70,17 +70,26 @@ that cannot be confirmed is recorded as incomplete. Dropping/cancelling the
 invocation aborts its tasks and drops the sole owned Job handle, whose
 kill-on-close policy applies to the invocation's process tree.
 
-Executable resolution preserves the explicit child PATH precedence, application
-and system directories, then parent PATH used by Rust's Windows `Command`.
-Empty PATH entries are excluded so they cannot introduce a current-directory
-search. Short canonical drive and UNC executable paths use the ordinary path
-form only when `GetFullPathNameW` leaves that form exactly unchanged. Long paths,
+The mandatory `StandaloneWindowsEnvironment` is a complete map and the sole
+child-environment authority. The backend never reads or merges the ambient
+process environment. An empty map supplies an actual empty double-NUL block;
+omission removes a key. `Command` supplies program, regular argv and current
+directory only. Any remaining `Command` environment set/remove entry is rejected
+before spawn. `env_clear()` alone is accepted, but does not override the explicit
+map. Empty/equal-sign/NUL keys, NUL values and ordinal case-insensitive duplicate
+keys fail closed; duplicate values are not merged or given an implicit winner.
+The validated block is sorted with Windows ordinal case-insensitive comparison.
+
+Executable resolution searches the complete map's explicit PATH, application
+and system directories. It does not fall back to ambient parent PATH. Empty PATH
+entries are excluded so they cannot introduce a current-directory search. Short
+canonical drive and UNC executable paths use the ordinary path form only when
+`GetFullPathNameW` leaves that form exactly unchanged. Long paths,
 normalization-sensitive names, and other namespaces retain their verbatim form;
 removing a prefix must not select a different file. This follows Rust Command's
 short-path compatibility rule for both the application name and argv[0].
 Arguments use UTF-16 Windows argv quoting; shell batch files are rejected rather
-than reinterpreted. The bounded API's explicit environment values and removals
-are preserved with Windows ordinal case-insensitive name comparison.
+than reinterpreted.
 
 ## Boundary and verification
 
@@ -119,13 +128,18 @@ actual target acceptance.
 
 `tests/windows_guard.rs` is a dedicated process whose native invocations and
 standard-spawn controls share one serial lock. It exercises the explicit product
-backend with all twelve lifecycle cases and three startup/EOF smoke cases,
+backend with all twelve lifecycle cases, three startup/EOF smoke cases, and
+complete-environment admission and isolation regressions,
 including real PowerShell, native Rust stdio, and explicit child output-handle
 closure. Standard-spawn controls finish before native invocation. Cases cover
 input/EOF, timeout, both output limits, unread stdin,
 lingering descendants, missing executable, unrelated child survival, cancellation
 and argv/environment roundtrips. Windows native execution is required; a cross
-compilation type check does not establish runtime acceptance.
+compilation type check does not establish runtime acceptance. The environment
+negative uses a separate fixture parent with only a public synthetic canary;
+that parent invokes the real backend with `env_clear()` and an explicit empty
+map. An argv-selected real child must execute and observe exactly an empty
+environment. No process-global environment mutation or actual credential is used.
 
 API references: [Rust temporary handle inheritance lock](https://github.com/rust-lang/rust/blob/1.99.0/library/std/src/sys/process/windows.rs#L314-L399),
 [Job assignment at creation](https://devblogs.microsoft.com/oldnewthing/20230209-00/?p=107812%2F),
