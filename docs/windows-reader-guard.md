@@ -50,6 +50,8 @@ A cleanup acknowledgement requires all of the following:
 The Job's `total_processes` and the list of observed identities are separate
 measurements. Polling can miss short-lived descendants; the list is not an
 exhaustive process history. Zero Job membership is the descendant-exit evidence.
+After observing the retained root exit, accounting is refreshed before deciding
+that descendants linger; an earlier active snapshot cannot establish that.
 Exit code `259` alone is never used as a liveness test.
 
 A completed input writer is not a delivery acknowledgement. Tokio/mio may have

@@ -373,6 +373,9 @@ impl Job {
             // SAFETY: retained root has signaled; 259 is a valid exit value, never a liveness test.
             check(unsafe { GetExitCodeProcess(root.handle.as_raw_handle(), &mut code) })?;
             receipt.root_exit_code = Some(code as i32);
+            // The initial accounting may predate root exit. Only a subsequent
+            // sample can establish that descendants remain after that exit.
+            self.accounting(receipt)?;
         }
         Ok(())
     }
