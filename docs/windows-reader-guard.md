@@ -65,7 +65,12 @@ kill-on-close policy applies to the invocation's process tree.
 Executable resolution preserves the explicit child PATH precedence, application
 and system directories, then parent PATH used by Rust's Windows `Command`.
 Empty PATH entries are excluded so they cannot introduce a current-directory
-search. Arguments use UTF-16 Windows argv quoting; shell batch files are rejected rather
+search. Short canonical drive and UNC executable paths use the ordinary path
+form only when `GetFullPathNameW` leaves that form exactly unchanged. Long paths,
+normalization-sensitive names, and other namespaces retain their verbatim form;
+removing a prefix must not select a different file. This follows Rust Command's
+short-path compatibility rule for both the application name and argv[0].
+Arguments use UTF-16 Windows argv quoting; shell batch files are rejected rather
 than reinterpreted. The bounded API's explicit environment values and removals
 are preserved with Windows ordinal case-insensitive name comparison.
 
@@ -92,4 +97,5 @@ compilation type check does not establish runtime acceptance.
 API references: [Job assignment at creation](https://devblogs.microsoft.com/oldnewthing/20230209-00/?p=107812%2F),
 [process attributes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute),
 [pipe security](https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights),
+[Rust executable path compatibility](https://github.com/rust-lang/rust/blob/1.99.0/library/std/src/sys/args/windows.rs#L328-L387),
 [Tokio named pipes](https://docs.rs/tokio/1.54.0/tokio/net/windows/named_pipe/struct.ServerOptions.html).

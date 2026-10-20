@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::mem::size_of;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
@@ -24,7 +24,7 @@ use windows_sys::Win32::{
         Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
         GetTokenInformation, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
-    Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING},
+    Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, GetFullPathNameW, OPEN_EXISTING},
     System::{
         JobObjects::{
             CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -485,6 +485,43 @@ fn executable(command: &std::process::Command) -> io::Result<PathBuf> {
     paths.into_iter().map(|p| p.join(&name)).find(|p| p.is_file()).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?.canonicalize()
 }
 
+// Match the short-path compatibility rule used by Rust Command. A verbatim path
+// cannot simply lose its prefix: Win32 normalization could select a different file.
+fn user_executable_path(path: PathBuf) -> io::Result<PathBuf> {
+    let original = wide(path.as_os_str())?;
+    if original.len() > 260 {
+        return Ok(path);
+    }
+    let prefix: Vec<_> = r"\\?\".encode_utf16().collect();
+    let unc_prefix: Vec<_> = r"\\?\UNC\".encode_utf16().collect();
+    let candidate = if original.starts_with(&unc_prefix) {
+        let mut units = vec![u16::from(b'\\'); 2];
+        units.extend_from_slice(&original[unc_prefix.len()..]);
+        units
+    } else if original.starts_with(&prefix)
+        && original.len() >= 8
+        && ((u16::from(b'A')..=u16::from(b'Z')).contains(&original[4]) || (u16::from(b'a')..=u16::from(b'z')).contains(&original[4]))
+        && original[5] == u16::from(b':')
+        && original[6] == u16::from(b'\\')
+    {
+        original[prefix.len()..].to_vec()
+    } else {
+        return Ok(path);
+    };
+    let mut normalized = [0u16; 261];
+    // SAFETY: candidate is an absolute, NUL-terminated UTF-16 drive/UNC path;
+    // the output is writable and bounded. This lexical query does not open the path.
+    let count = unsafe { GetFullPathNameW(candidate.as_ptr(), normalized.len() as u32, normalized.as_mut_ptr(), null_mut()) } as usize;
+    if count == 0 {
+        return Err(os_error());
+    }
+    if count < normalized.len() && normalized[..count] == candidate[..candidate.len() - 1] {
+        Ok(PathBuf::from(OsString::from_wide(&candidate[..candidate.len() - 1])))
+    } else {
+        Ok(path)
+    }
+}
+
 fn spawn_owned(
     command: &std::process::Command,
     job: &Job,
@@ -494,7 +531,7 @@ fn spawn_owned(
     spawn_failed: &mut bool,
     deadline: Instant,
 ) -> io::Result<(Process, OwnedHandle)> {
-    let executable = executable(command)?;
+    let executable = user_executable_path(executable(command)?)?;
     let application = wide(executable.as_os_str())?;
     let mut argv = command_line(&executable, command)?;
     let env = environment(command)?;
@@ -767,9 +804,145 @@ pub(super) async fn run(command: &std::process::Command, input: &[u8], timeout: 
 mod tests {
     use super::*;
     #[test]
+    fn compatible_short_executable_paths_drop_only_a_safe_verbatim_prefix() {
+        for (original, expected) in [
+            (r"\\?\C:\fixtures\tool.exe", r"C:\fixtures\tool.exe"),
+            (r"\\?\UNC\example.invalid\share\tool.exe", r"\\example.invalid\share\tool.exe"),
+            (r"C:\fixtures\tool.exe", r"C:\fixtures\tool.exe"),
+        ] {
+            assert_eq!(user_executable_path(PathBuf::from(original)).unwrap(), PathBuf::from(expected));
+        }
+    }
+
+    #[test]
+    fn executable_path_normalization_preserves_distinct_names_and_namespaces() {
+        for original in [
+            r"\\?\C:\fixtures\tool.exe.",
+            r"\\?\C:\fixtures\tool.exe ",
+            r"\\?\C:\fixtures\..\tool.exe",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\tool.exe",
+        ] {
+            let path = PathBuf::from(original);
+            assert_eq!(user_executable_path(path.clone()).unwrap(), path);
+        }
+    }
+
+    #[test]
+    fn executable_path_prefix_conversion_respects_the_utf16_length_boundary() {
+        let prefix = r"\\?\C:\";
+        let at_limit = PathBuf::from(format!("{prefix}{}", "x".repeat(252)));
+        assert_eq!(wide(at_limit.as_os_str()).unwrap().len(), 260);
+        assert_eq!(user_executable_path(at_limit).unwrap(), PathBuf::from(format!("C:\\{}", "x".repeat(252))));
+        let over_limit = PathBuf::from(format!("{prefix}{}", "x".repeat(253)));
+        assert_eq!(user_executable_path(over_limit.clone()).unwrap(), over_limit);
+    }
+
+    #[test]
     fn empty_path_entries_never_add_the_working_directory() {
         let paths: Vec<_> = path_entries(OsStr::new(r";C:\trusted;;D:\tools;")).collect();
         assert_eq!(paths, vec![PathBuf::from(r"C:\trusted"), PathBuf::from(r"D:\tools")]);
         assert_eq!(path_entries(OsStr::new(";;")).count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod native_regression_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    const FIXTURE: &str = "KATALA_BOUNDED_LIB_FIXTURE";
+
+    #[test]
+    fn stdio_fixture() {
+        if std::env::var(FIXTURE).as_deref() != Ok("stdio") {
+            return;
+        }
+        let mut input = Vec::new();
+        std::io::stdin().read_to_end(&mut input).unwrap();
+        std::io::stdout().write_all(&input).unwrap();
+        std::io::stderr().write_all(b"fixture-stderr").unwrap();
+        std::process::exit(0);
+    }
+
+    #[tokio::test]
+    async fn output_pipe_observes_eof_after_its_only_client_closes() {
+        let session = nonce().unwrap();
+        let Pipe { mut server, client } = {
+            let security = pipe_security().unwrap();
+            pipe(&session, "eof-test", false, &security).unwrap()
+        };
+        server.connect().await.unwrap();
+        drop(client);
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(3), server.read(&mut byte)).await;
+        let count = read.as_ref().ok().and_then(|r| r.as_ref().ok()).copied();
+        let error_code = read.as_ref().ok().and_then(|r| r.as_ref().err()).and_then(io::Error::raw_os_error);
+        assert_eq!(count, Some(0), "pipe metadata: timeout={} os_error={error_code:?}", read.is_err());
+    }
+
+    #[tokio::test]
+    async fn product_guard_runs_a_native_rust_stdio_fixture() {
+        let name = format!("{}::stdio_fixture", module_path!().split_once("::").unwrap().1);
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", &name, "--nocapture"]).env(FIXTURE, "stdio");
+        let result = run(&command, b"fixture-input", Duration::from_secs(5), 65536, 65536).await;
+        assert_eq!(
+            result.code,
+            Some(0),
+            "guard metadata: timeout={} output_limit={} spawn_failed={} receipt={:?}",
+            result.timed_out,
+            result.output_limited,
+            result.spawn_failed,
+            result.process_receipt
+        );
+        assert!(result.stdout.ends_with(b"fixture-input"));
+        assert_eq!(result.stderr, b"fixture-stderr");
+    }
+
+    async fn stdio_control(program: &Path) -> (Option<i32>, bool) {
+        let mut command = tokio::process::Command::new(program);
+        command
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write('guard-marker')"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let Ok(child) = command.spawn() else {
+            return (None, false);
+        };
+        match tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await {
+            Ok(Ok(output)) => (output.status.code(), false),
+            Ok(Err(_)) => (None, false),
+            Err(_) => (None, true),
+        }
+    }
+
+    #[tokio::test]
+    async fn product_guard_preserves_simple_windows_powershell_startup() {
+        let mut buffer = [0u16; 32768];
+        // SAFETY: writable bounded buffer for the OS Windows-directory query; no environment-derived path is logged.
+        let count = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+        assert!(count > 0 && (count as usize) < buffer.len());
+        use std::os::windows::ffi::OsStringExt;
+        let normal =
+            PathBuf::from(OsString::from_wide(&buffer[..count as usize])).join("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe");
+        let canonical = normal.canonicalize().unwrap();
+        let normal_control = stdio_control(&normal).await;
+        let canonical_control = stdio_control(&canonical).await;
+        eprintln!("PowerShell startup control metadata: normal={normal_control:?} canonical={canonical_control:?}");
+        assert_eq!(normal_control, (Some(0), false));
+        let mut command = std::process::Command::new(normal);
+        command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write('guard-marker')"]);
+        let result = run(&command, b"", Duration::from_secs(10), 65536, 65536).await;
+        assert_eq!(
+            result.code,
+            Some(0),
+            "guard metadata: timeout={} output_limit={} spawn_failed={} receipt={:?}",
+            result.timed_out,
+            result.output_limited,
+            result.spawn_failed,
+            result.process_receipt
+        );
+        assert_eq!(result.stdout, b"guard-marker");
     }
 }
