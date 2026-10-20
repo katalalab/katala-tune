@@ -7,6 +7,8 @@
 //!                                    読み取りだけで、台帳も DB も書き換えず、機体へ接続もしない
 //!   tune last                        DB の前回の分析結果（所見・スコアつき）を JSON で
 //!   tune power                       電力・Clockと計算条件を JSON で（読み取り専用）
+//!   tune capabilities [機体 ...] firmware 読取（省略はこの機体、保存なし）
+//!   tune maintenance-plan [機体 ...] 読取更新と実行不可の保守計画
 //!   tune network [--probe] [機体 ...] 軽量な接続診断（省略はこの機体。--probeだけHTTPS到達性・時間も測る）
 //!   tune status [--recompute]        DB の状態（機能チェック）を JSON で。--recompute で計算し直して保存する
 //!   tune analyze <snapshot.json>     snapshot（probe の data）から所見を作る
@@ -56,7 +58,7 @@ use tune_core::{
 
 fn usage() -> ExitCode {
     eprintln!(
-        "使い方: tune <paths|probe|hygiene|logs|ledger|last|power|network|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
+        "使い方: tune <paths|probe|hygiene|logs|ledger|last|power|network|capabilities|maintenance-plan|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
     );
     ExitCode::from(2)
 }
@@ -355,6 +357,19 @@ async fn main() -> ExitCode {
             }
             Err(e) => Err(e),
         },
+        "capabilities" | "maintenance-plan" => {
+            if rest.iter().any(|id| id.starts_with('-')) {
+                Err("未対応のオプション".into())
+            } else {
+                match nodes::load_config(&nodes::user_config_path()).and_then(|cfg| tune_core::capabilities::select(&cfg.nodes, rest)) {
+                    Ok(selected) => tune_core::capabilities::check(&selected).await.map(|evidence| {
+                        let output = if cmd == "maintenance-plan" { tune_core::capabilities::maintenance_plan(&evidence) } else { evidence };
+                        print(&output);
+                    }),
+                    Err(error) => Err(error),
+                }
+            }
+        }
         "network" => {
             let active = rest.iter().any(|a| a == "--probe");
             let ids: Vec<_> = rest.iter().filter(|a| a.as_str() != "--probe").cloned().collect();

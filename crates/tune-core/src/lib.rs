@@ -26,6 +26,7 @@
 
 pub mod actions;
 pub mod ai_sessions;
+pub mod capabilities;
 pub mod codex_limits;
 pub mod collate;
 pub mod collect;
