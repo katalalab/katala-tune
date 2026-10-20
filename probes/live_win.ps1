@@ -97,8 +97,14 @@ function ParseGpuRows($text, $at) {
     if ($f.Count -ne 18) { continue }
     $used = N $f[3] 0; $total = N $f[4] 0; $free = N $f[5] 0
     $pct = "null"; $status = "partial"; $reason = "driver returned unavailable or invalid memory fields"
-    if ($used -ne "null" -and $total -ne "null" -and [double]$total -gt 0 -and [double]$used -ge 0 -and [double]$used -le [double]$total) { $pct = N ([double]$used / [double]$total * 100) }
-    if ($pct -ne "null" -and $free -ne "null" -and [double]$free -ge 0 -and [double]$free -le [double]$total) { $status = "available"; $reason = $null }
+    $validTotal = $total -ne "null" -and [double]$total -gt 0
+    $validUsed = $validTotal -and $used -ne "null" -and [double]$used -ge 0 -and [double]$used -le [double]$total
+    $validFree = $validTotal -and $free -ne "null" -and [double]$free -ge 0 -and [double]$free -le [double]$total
+    if (-not $validTotal) { $total = "null" }
+    if (-not $validUsed) { $used = "null" }
+    if (-not $validFree) { $free = "null" }
+    if ($validUsed) { $pct = N ([double]$used / [double]$total * 100) }
+    if ($pct -ne "null" -and $validFree) { $status = "available"; $reason = $null }
     $rows.Add('{"adapter_index":' + (N $f[0] 0) + ',"name":' + (J $f[1]) + ',"util":' + (N $f[2]) + ',"mem_used_mb":' + $used + ',"mem_total_mb":' + $total + ',"mem_free_mb":' + $free + ',"mem_used_pct":' + $pct + ',"temp_c":' + (N $f[6]) + ',"power_w":' + (N $f[7]) + ',"clocks_graphics_mhz":' + (N $f[8]) + ',"clocks_memory_mhz":' + (N $f[9]) + ',"uuid":' + (J $f[10]) + ',"pstate":' + (J $f[11]) + ',"power_limit_w":' + (N $f[12]) + ',"power_min_w":' + (N $f[13]) + ',"power_max_w":' + (N $f[14]) + ',"clocks_sm_mhz":' + (N $f[15]) + ',"driver":' + (J $f[16]) + ',"memory_kind":"dedicated","memory_status":' + (J $status) + ',"memory_reason":' + (J $reason) + ',"sampled_at":' + $at + ',"source":"nvidia-smi query (MiB)","available":true}')
   }
   return "[" + ($rows -join ",") + "]"

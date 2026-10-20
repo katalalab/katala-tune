@@ -120,12 +120,13 @@ fn parser_keeps_workspace_extra_go_replace_and_sanitized_remote_reference() {
     assert_eq!(extra.source, DependencySource::Git);
     assert_eq!(extra.origin.as_deref(), Some("example.com/tool.whl"));
     let go = parse_go(
-        "module example.com/p\nrequire example.com/lib v1.0.0\nreplace (\n example.com/lib v1.0.0 => ../lib v1.2.0\n example.com/unused => ../unused\n)\n",
+        "module example.com/p\nrequire example.com/lib v1.0.0\nreplace (\n example.com/lib => ../fallback\n example.com/lib v1.0.0 => ../exact\n example.com/lib v1.1.0 => ../other\n example.com/unused v1.0.0 => ../unused\n)\n",
     )
     .unwrap();
     let lib = go.dependencies.iter().find(|d| d.name == "example.com/lib").unwrap();
     assert_eq!(lib.source, DependencySource::Path);
-    assert_eq!(lib.resolved.as_deref(), Some("path:../lib"));
+    assert_eq!(lib.resolved.as_deref(), Some("path:../exact"), "an exact left-hand version wins over an unversioned replacement");
+    assert_eq!(lib.spec.as_deref(), Some("path:../exact"), "the resolver needs the sanitized local replacement path, not the required module version");
     assert_eq!(go.dependencies.len(), 1, "replace only must not create a dependency");
 }
 
@@ -352,6 +353,35 @@ fn local_capture_is_bounded_and_assembles_repository_scoped_graphs() {
     assert!(assemble_capture(&limited_capture).iter().any(|snapshot| snapshot.scope_id.ends_with(":coverage") && snapshot.status == ScopeStatus::Partial));
     let no_root = capture_local("fixture-node:native", &Vec::<PathBuf>::new(), &[], &TopologyLimits::default());
     assert_eq!(assemble_capture(&no_root)[0].status, ScopeStatus::Partial);
+
+    // A repository walk that could not finish must be Partial, so the store
+    // keeps the previously observed graph instead of deleting the missing part.
+    let walk_base = std::env::temp_dir().join(format!("topology-walk-failure-{}", tune_core::db::now_ms()));
+    let first = walk_base.join("first");
+    let second = walk_base.join("second");
+    fixture_repo(&first, "https://example.com/group/first.git");
+    fixture_repo(&second, "https://example.com/group/second.git");
+    std::fs::write(first.join("package.json"), r#"{"name":"first"}"#).unwrap();
+    std::fs::create_dir_all(first.join("sub")).unwrap();
+    std::fs::write(first.join("sub/package.json"), [0xff, 0xfe]).unwrap();
+    std::fs::write(second.join("package.json"), r#"{"name":"second"}"#).unwrap();
+    let walk_capture = capture_local("fixture-node:native", std::slice::from_ref(&walk_base), &[], &TopologyLimits::default());
+    assert!(walk_capture.failures.iter().any(|failure| failure.code == FailureCode::ParseError));
+    assert!(walk_capture.repositories.iter().any(|repository| repository.failures.iter().any(|failure| failure.code == FailureCode::ParseError)));
+    let walk_snapshots = assemble_capture(&walk_capture);
+    let checkout_for = |label: &str| {
+        walk_snapshots
+            .iter()
+            .find(|snapshot| {
+                snapshot.scope_id.contains(":checkout:") && snapshot.entities.iter().any(|entity| entity.kind == EntityKind::Package && entity.label == label)
+            })
+            .unwrap()
+    };
+    let incomplete = checkout_for("first");
+    assert_eq!(incomplete.status, ScopeStatus::Partial);
+    assert!(incomplete.failures.iter().any(|failure| failure.code == FailureCode::ParseError));
+    assert_eq!(checkout_for("second").status, ScopeStatus::Complete);
+    let _ = std::fs::remove_dir_all(walk_base);
     let _ = std::fs::remove_dir_all(base);
 }
 
@@ -551,6 +581,8 @@ fn resolver_only_links_observed_git_workspace_path_and_reusable_workflow_targets
     fixture_repo(&flow, "https://github.com/acme/flow.git");
     std::fs::create_dir_all(app.join("member")).unwrap();
     std::fs::create_dir_all(app.join("shared")).unwrap();
+    std::fs::create_dir_all(app.join("go-app")).unwrap();
+    std::fs::create_dir_all(app.join("go-shared")).unwrap();
     std::fs::create_dir_all(app.join(".github/workflows")).unwrap();
     std::fs::create_dir_all(flow.join(".github/workflows")).unwrap();
     std::fs::write(
@@ -564,6 +596,12 @@ fn resolver_only_links_observed_git_workspace_path_and_reusable_workflow_targets
     )
     .unwrap();
     std::fs::write(app.join("shared/Cargo.toml"), "[package]\nname='shared'\nversion='0.1.0'\n").unwrap();
+    std::fs::write(
+        app.join("go-app/go.mod"),
+        "module example.com/go-app\nrequire example.com/go-shared v1.0.0\nreplace example.com/go-shared => ../go-shared\n",
+    )
+    .unwrap();
+    std::fs::write(app.join("go-shared/go.mod"), "module example.com/go-shared\n").unwrap();
     std::fs::write(app.join(".github/workflows/call.yml"), "on: push\njobs:\n  call:\n    uses: acme/flow/.github/workflows/reuse.yml@v1\n").unwrap();
     std::fs::write(flow.join("Cargo.toml"), "[package]\nname='flow'\nversion='0.1.0'\n").unwrap();
     std::fs::write(flow.join(".github/workflows/reuse.yml"), "on: workflow_call\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps: []\n").unwrap();
@@ -589,6 +627,19 @@ fn resolver_only_links_observed_git_workspace_path_and_reusable_workflow_targets
     let unresolved = app.entities.iter().find(|entity| entity.kind == EntityKind::Package && entity.label == "missing").unwrap();
     assert_eq!(unresolved.attributes["resolution"], "unresolved", "labels alone never bind a target");
     assert_eq!(unresolved.attributes["unresolved_reason"], "target was not observed");
+    let go_local = app
+        .entities
+        .iter()
+        .find(|entity| {
+            entity.kind == EntityKind::Package
+                && entity.label == "example.com/go-shared"
+                && entity.attributes["declared"] == true
+                && entity.attributes["source"] == "path"
+        })
+        .unwrap();
+    assert_eq!(go_local.attributes["spec"], "path:../go-shared");
+    assert_eq!(go_local.attributes["resolution"], "resolved", "the Go replacement path resolves against the go.mod directory");
+    assert!(app.edges.iter().any(|edge| edge.kind == EdgeKind::ResolvesTo && edge.from == go_local.id));
     let _ = std::fs::remove_dir_all(base);
 }
 

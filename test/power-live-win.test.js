@@ -54,3 +54,30 @@ $gpuSampleClock.Elapsed=[timespan]::FromMilliseconds(10001);$expired=GpuJson
   assert.equal(JSON.parse(d.expired)[0].available,false);
   assert.equal(JSON.parse(d.expired)[0].memory_reason,'query-timeout');
 });
+
+test('PS GPU parser nulls invalid VRAM capacity values before serializing partial rows', {skip:process.platform !== 'win32'}, () => {
+  const source=fs.readFileSync('probes/live_win.ps1','utf8');
+  const helpers=source.slice(source.indexOf('function ParseGpuRows'),source.indexOf('# ---- Top processes'));
+  const jsonHelpers=source.slice(source.indexOf('function N('),source.indexOf('function OpenCat'));
+  const rows=[
+    '0, Invalid Total, 0, 50, 0, 0, N/A, N/A, N/A, N/A, GPU-invalid-total, P8, N/A, N/A, N/A, N/A, 1, 0',
+    '1, Invalid Used, 0, 101, 100, 0, N/A, N/A, N/A, N/A, GPU-invalid-used, P8, N/A, N/A, N/A, N/A, 1, 0',
+    '2, Invalid Free, 0, 50, 100, -1, N/A, N/A, N/A, N/A, GPU-invalid-free, P8, N/A, N/A, N/A, N/A, 1, 0',
+  ];
+  const script=`$ErrorActionPreference="Stop"
+$inv=[Globalization.CultureInfo]::InvariantCulture
+${jsonHelpers}
+${helpers}
+@(${rows.map(row => `ParseGpuRows ${JSON.stringify(row)} 123`).join('\n')})|ConvertTo-Json -Compress
+`;
+  const r=spawnSync('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],{encoding:'utf8',timeout:15000,windowsHide:true});
+  assert.equal(r.status,0,r.stderr);
+  const actual=JSON.parse(r.stdout.trim()).map(row=>JSON.parse(row)[0]);
+  for(const gpu of actual) {
+    assert.equal(gpu.memory_status,'partial');
+    assert.equal(gpu.memory_reason,'driver returned unavailable or invalid memory fields');
+  }
+  assert.deepEqual([actual[0].mem_used_mb,actual[0].mem_total_mb,actual[0].mem_free_mb],[null,null,null]);
+  assert.deepEqual([actual[1].mem_used_mb,actual[1].mem_total_mb,actual[1].mem_free_mb],[null,null,0]);
+  assert.deepEqual([actual[2].mem_used_mb,actual[2].mem_total_mb,actual[2].mem_free_mb],[50,100,null]);
+});

@@ -302,6 +302,15 @@ fn capture_root(
 ) -> Option<Vec<CursorFrame>> {
     let deadline = started + Duration::from_secs(limits.local_timeout_seconds);
     let mut fallback = None;
+    let mut walk_failures = Vec::<(PathBuf, Failure)>::new();
+    let mut pending = None;
+    macro_rules! scan_failure {
+        ($directory:expr, $code:expr, $message:expr) => {{
+            let item = failure($code, $message);
+            capture.failures.push(item.clone());
+            walk_failures.push(($directory, item));
+        }};
+    }
     // A parent frame is resumed after each child. Keep completed directory listings for
     // this capture so a wide root is not re-enumerated once per child. The cache never
     // crosses runs; opaque cursor state continues to contain only positions.
@@ -309,15 +318,16 @@ fn capture_root(
     let mut cached_names = 0usize;
     let listing_cache_limit = limits.entries_per_environment;
     let mut stack = if initial_frames.is_empty() { vec![CursorFrame { directory: root.to_path_buf(), depth: 0, after: None }] } else { initial_frames };
-    while let Some(mut frame) = stack.pop() {
+    'walk: while let Some(mut frame) = stack.pop() {
         let listed_directory = frame.directory.clone();
         if Instant::now() >= deadline {
-            capture.failures.push(failure(FailureCode::Timeout, "local scan timed out"));
+            scan_failure!(frame.directory.clone(), FailureCode::Timeout, "local scan timed out");
             stack.push(frame);
-            return Some(stack);
+            pending = Some(stack);
+            break 'walk;
         }
         if frame.depth > limits.depth {
-            capture.failures.push(failure(FailureCode::LimitReached, "directory depth budget exceeded"));
+            scan_failure!(frame.directory.clone(), FailureCode::LimitReached, "directory depth budget exceeded");
             continue;
         }
         let entries = if let Some(entries) = listing_cache.get(&frame.directory) {
@@ -326,12 +336,12 @@ fn capture_root(
             let entries = match fs::read_dir(&frame.directory) {
                 Ok(read) => read.map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned())).collect::<Result<Vec<_>, _>>(),
                 Err(_) => {
-                    capture.failures.push(failure(FailureCode::PermissionDenied, "directory cannot be read"));
+                    scan_failure!(frame.directory.clone(), FailureCode::PermissionDenied, "directory cannot be read");
                     continue;
                 }
             };
             let Ok(mut entries) = entries else {
-                capture.failures.push(failure(FailureCode::Internal, "directory entry cannot be read"));
+                scan_failure!(frame.directory.clone(), FailureCode::Internal, "directory entry cannot be read");
                 continue;
             };
             entries.sort();
@@ -346,12 +356,13 @@ fn capture_root(
                 continue;
             }
             if capture.counters.entries >= limits.entries_per_environment {
-                capture.failures.push(failure(FailureCode::LimitReached, "directory entry budget exceeded"));
+                scan_failure!(frame.directory.clone(), FailureCode::LimitReached, "directory entry budget exceeded");
                 stack.push(frame);
-                return Some(stack);
+                pending = Some(stack);
+                break 'walk;
             }
             if !safe_cursor_entry(&name) {
-                capture.failures.push(failure(FailureCode::Unsupported, "directory entry cannot be cursorized"));
+                scan_failure!(frame.directory.clone(), FailureCode::Unsupported, "directory entry cannot be cursorized");
                 frame.after = Some(name);
                 continue;
             }
@@ -359,7 +370,7 @@ fn capture_root(
             let kind = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata.file_type(),
                 Err(_) => {
-                    capture.failures.push(failure(FailureCode::Internal, "directory entry type is unavailable"));
+                    scan_failure!(frame.directory.clone(), FailureCode::Internal, "directory entry type is unavailable");
                     frame.after = Some(name);
                     continue;
                 }
@@ -386,42 +397,43 @@ fn capture_root(
             };
             capture.counters.files += 1;
             if capture.counters.manifests >= limits.manifests_per_environment {
-                capture.failures.push(failure(FailureCode::LimitReached, "manifest budget exceeded"));
+                scan_failure!(frame.directory.clone(), FailureCode::LimitReached, "manifest budget exceeded");
                 stack.push(frame);
-                return Some(stack);
+                pending = Some(stack);
+                break 'walk;
             }
             let metadata = match fs::metadata(&path) {
                 Ok(metadata) => metadata,
                 Err(_) => {
-                    capture.failures.push(failure(FailureCode::Internal, "manifest metadata is unavailable"));
+                    scan_failure!(frame.directory.clone(), FailureCode::Internal, "manifest metadata is unavailable");
                     continue;
                 }
             };
             let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
             if size > limits.file_bytes || capture.counters.bytes.saturating_add(size) > limits.total_bytes_per_environment {
-                capture.failures.push(failure(FailureCode::LimitReached, "manifest byte budget exceeded"));
+                scan_failure!(frame.directory.clone(), FailureCode::LimitReached, "manifest byte budget exceeded");
                 continue;
             }
             let mut bytes = Vec::with_capacity(size.min(limits.file_bytes));
             let mut file = match File::open(&path) {
                 Ok(file) => file,
                 Err(_) => {
-                    capture.failures.push(failure(FailureCode::PermissionDenied, "manifest cannot be read"));
+                    scan_failure!(frame.directory.clone(), FailureCode::PermissionDenied, "manifest cannot be read");
                     continue;
                 }
             };
             if file.by_ref().take((limits.file_bytes as u64).saturating_add(1)).read_to_end(&mut bytes).is_err() {
-                capture.failures.push(failure(FailureCode::Internal, "manifest read failed"));
+                scan_failure!(frame.directory.clone(), FailureCode::Internal, "manifest read failed");
                 continue;
             }
             if bytes.len() > limits.file_bytes {
-                capture.failures.push(failure(FailureCode::LimitReached, "manifest byte budget exceeded"));
+                scan_failure!(frame.directory.clone(), FailureCode::LimitReached, "manifest byte budget exceeded");
                 continue;
             }
             let content = match String::from_utf8(bytes) {
                 Ok(content) => content,
                 Err(_) => {
-                    capture.failures.push(failure(FailureCode::ParseError, "manifest is not utf-8"));
+                    scan_failure!(frame.directory.clone(), FailureCode::ParseError, "manifest is not utf-8");
                     continue;
                 }
             };
@@ -445,7 +457,30 @@ fn capture_root(
             cached_names = cached_names.saturating_sub(entries.len());
         }
     }
-    None
+    apply_walk_failures(capture, root, &walk_failures);
+    pending
+}
+
+/// A repository is only complete when every directory below it was enumerated.
+/// Directory failures stay in the coverage scope, so attach them to the deepest
+/// containing repository as well; otherwise `assemble_capture` would report a
+/// truncated walk as `Complete` and the store would remove the missing graph.
+fn apply_walk_failures(capture: &mut RawCapture, root: &Path, failures: &[(PathBuf, Failure)]) {
+    for (directory, item) in failures {
+        let mut best: Option<(usize, usize)> = None;
+        for (index, repository) in capture.repositories.iter().enumerate() {
+            let repository_root = if repository.relative_path == "." { root.to_path_buf() } else { root.join(&repository.relative_path) };
+            if directory.starts_with(&repository_root) {
+                let depth = repository_root.components().count();
+                if best.map_or(true, |(_, current)| depth > current) {
+                    best = Some((index, depth));
+                }
+            }
+        }
+        if let Some((index, _)) = best {
+            capture.repositories[index].failures.push(item.clone());
+        }
+    }
 }
 
 fn safe_config_key(pointer: &str, mode: &str) -> bool {

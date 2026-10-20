@@ -42,8 +42,8 @@ async function mount(options = {}) {
   const tune = options.unavailable ? {} : {
     topologyView:async()=>{state.loads++;return options.load ? options.load(state.loads) : state.graph;},
     topologyRefresh:options.refresh || (async()=>({status:'partial',changes:0,scopes:[]})),
-    topologyExport:async(view,format)=>{state.exports.push({view,format});if(options.exportFailure) throw Error(options.exportFailure);return 'public-only-'+view+'-'+format;},
-    copy:async(text)=>state.copies.push(text),
+    topologyExport:options.export || (async(view,format)=>{state.exports.push({view,format});if(options.exportFailure) throw Error(options.exportFailure);return 'public-only-'+view+'-'+format;}),
+    copy:options.copy || (async(text)=>state.copies.push(text)),
     onTopologyUpdated:fn=>{state.event=fn;},
   };
   const context={UI,window:{tune},document,page,setCrumbs(){}};
@@ -86,11 +86,31 @@ test('public copy requests the selected backend export and never copies internal
   const failure=await mount({exportFailure:'<unsafe export>'});await failure.click('topologyExport','json');assert.deepEqual(failure.state.copies,[]);assert.match(failure.state.html,/&lt;unsafe export&gt;/);assert.doesNotMatch(failure.state.html,/<unsafe export>/);
 });
 
+test('finishing an export or copy after navigation does not replace the other view',async()=>{
+  for(const stage of ['export','copy']) {
+    let complete;
+    const pending=new Promise(resolve=>{complete=resolve;});
+    const d=await mount(stage === 'export' ? {export:()=>pending} : {copy:()=>pending});
+    const control=d.state.controls.find(c=>c.dataset.topologyExport === 'json');
+    const exporting=control.listeners.click();await flush();
+    d.state.view='dashboard';d.view.leave();const pages=d.state.pages;
+    complete('public-only-all-json');await exporting;await flush();
+    assert.equal(d.state.pages,pages,`${stage} completion must not render after navigation`);
+  }
+});
+
 test('filter and kind selection limit results and retain safe escaped labels',async()=>{
   const source=graph();source.entities.push(entity('package','<img src=x onerror=alert(1)>',99));
   const d=await mount({graph:source});assert.match(d.state.html,/&lt;img src=x onerror=alert\(1\)&gt;/);assert.doesNotMatch(d.state.html,/<img src=x/);
   await d.change('topologyKind','package');assert.match(d.state.html,/fixture-package/);assert.doesNotMatch(d.state.html,/fixture-host/);
   await d.change('topologyFilter','not-found','input');assert.match(d.state.html,/条件に合う実体はありません/);assert.doesNotMatch(d.state.html,/fixture-package/);
+});
+
+test('changing topology tabs resets the kind filter to all',async()=>{
+  const d=await mount();await d.change('topologyKind','package');
+  await d.click('topologyTab','cicd');
+  assert.match(d.state.html,/fixture-workflow/);
+  assert.match(d.state.html,/fixture-job/);
 });
 
 test('continuous search retains focus and caret after filtering rerenders controls',async()=>{

@@ -106,12 +106,12 @@
       await T.copy(await T.topologyExport(state.tab, format));
       state.exportStatus = `${format === 'json' ? '公開 JSON' : 'Mermaid'} をクリップボードへコピーしました`;
     } catch (error) { state.exportStatus = `export に失敗しました: ${String(error?.message || error)}`; }
-    render();
+    if (active()) render();
   }
   function bindControls() {
     document.querySelector('#topologyRefresh')?.addEventListener('click', refresh);
     document.querySelectorAll('[data-topology-export]').forEach((button) => button.addEventListener('click', () => exportTopology(button.dataset.topologyExport)));
-    document.querySelectorAll('[data-topology-tab]').forEach((button) => button.addEventListener('click', () => { state.tab = button.dataset.topologyTab; render(); }));
+    document.querySelectorAll('[data-topology-tab]').forEach((button) => button.addEventListener('click', () => { state.tab = button.dataset.topologyTab; state.kind = 'all'; render(); }));
     document.querySelector('#topologyFilter')?.addEventListener('input', (event) => { state.filter = event.target.value; render(); });
     document.querySelector('#topologyKind')?.addEventListener('change', (event) => { state.kind = event.target.value; render(); });
   }

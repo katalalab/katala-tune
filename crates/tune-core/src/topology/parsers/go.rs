@@ -21,13 +21,13 @@ fn parse_requirement(value: &str) -> Option<(String, Option<String>)> {
     safe_module(fields.first()?).then(|| (fields[0].to_owned(), fields.get(1).map(|value| (*value).to_owned())))
 }
 
-fn parse_replacement(value: &str) -> Option<(String, Replacement)> {
+fn parse_replacement(value: &str) -> Option<((String, Option<String>), Replacement)> {
     let (left, right) = value.split_once("=>")?;
-    let (name, _) = parse_requirement(left.trim())?;
+    let (name, lhs_version) = parse_requirement(left.trim())?;
     let right = right.trim();
     let (target, version) = parse_requirement(right)?;
     let local = target.starts_with('.') || is_absolute_path_any_platform(&target);
-    Some((name, Replacement { target, version, local }))
+    Some(((name, lhs_version), Replacement { target, version, local }))
 }
 
 pub fn parse_go(text: &str) -> Result<ParsedPackage, Failure> {
@@ -85,7 +85,7 @@ pub fn parse_go(text: &str) -> Result<ParsedPackage, Failure> {
         .into_iter()
         .filter(|(dependency, _)| dependency != &name)
         .map(|(name, version)| {
-            let replacement = replacements.get(&name);
+            let replacement = replacements.get(&(name.clone(), version.clone())).or_else(|| replacements.get(&(name.clone(), None)));
             let local = replacement.is_some_and(|replacement| replacement.local);
             let resolved = replacement.map(|replacement| {
                 if replacement.local {
@@ -101,7 +101,7 @@ pub fn parse_go(text: &str) -> Result<ParsedPackage, Failure> {
                 name,
                 alias: None,
                 kind: DependencyKind::Normal,
-                spec: version,
+                spec: if local { replacement.map(|replacement| sanitized_path_spec(&replacement.target)) } else { version },
                 extra: None,
                 origin: None,
                 target: None,
