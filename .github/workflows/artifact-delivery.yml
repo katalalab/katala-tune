@@ -1,0 +1,117 @@
+# Manual artifacts only. No release/tag/feed/environment/signing secrets.
+name: artifact-delivery
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: 'Reviewed current main commit (40 lowercase hex)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: artifact-delivery-${{ inputs.source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: artifact (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+          - platform: windows-x64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      TARGET: ${{ matrix.target }}
+      PLATFORM: ${{ matrix.platform }}
+      RUST_TOOLCHAIN: '1.99.0'
+      TAURI_CLI_VERSION: '2.12.1'
+      RUSTFLAGS: ''
+      CARGO_ENCODED_RUSTFLAGS: ''
+      CARGO_BUILD_RUSTFLAGS: ''
+      CARGO_INCREMENTAL: '0'
+    steps:
+      # Checkout the dispatch ref, never an untrusted input ref/helper.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.22.0'
+      - name: Bind dispatch to reviewed main source
+        run: |
+          set -euo pipefail
+          node -e 'const e=process.env; if (!/^[a-f0-9]{40}$/.test(e.SOURCE_SHA) || e.GITHUB_REF !== "refs/heads/main" || e.GITHUB_SHA !== e.SOURCE_SHA || e.GITHUB_WORKFLOW_SHA !== e.SOURCE_SHA) process.exit(1)'
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git merge-base --is-ancestor HEAD origin/main
+          test -z "$(git status --porcelain)"
+          node --test test/artifact-delivery.test.js
+      - name: Install fixed Rust and Tauri CLI
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustup target add "$TARGET"
+          cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
+      - name: Build release sidecars
+        run: |
+          set -euo pipefail
+          mkdir src-tauri/binaries
+          if [ "$PLATFORM" = macos-arm64 ]; then
+            cargo build --release --locked -p tune-cli --target "$TARGET"
+            cp "target/$TARGET/release/tune" "src-tauri/binaries/tune-$TARGET"
+            printf '%s\n' '{"bundle":{"externalBin":["binaries/tune"]}}' > sidecars.json
+          else
+            cargo build --release --locked -p tune-cli -p tune-agent --target "$TARGET"
+            cp "target/$TARGET/release/tune.exe" "src-tauri/binaries/tune-$TARGET.exe"
+            cp "target/$TARGET/release/tune-agent.exe" "src-tauri/binaries/tune-agent-$TARGET.exe"
+            printf '%s\n' '{"bundle":{"externalBin":["binaries/tune","binaries/tune-agent"]}}' > sidecars.json
+          fi
+          node scripts/artifact-delivery.js source "$PLATFORM" "$RUNNER_TEMP/katala-source.json"
+      - name: Build embedded frontend application
+        run: |
+          set -euo pipefail
+          if [ "$PLATFORM" = macos-arm64 ]; then
+            cargo tauri build --ci --target "$TARGET" --bundles app --config sidecars.json -- --locked
+          else
+            cargo tauri build --ci --target "$TARGET" --no-bundle --config sidecars.json -- --locked
+          fi
+      - name: Stage and verify complete payload
+        run: |
+          set -euo pipefail
+          payload="$RUNNER_TEMP/katala-payload"
+          mkdir "$payload"
+          if [ "$PLATFORM" = macos-arm64 ]; then
+            app="target/$TARGET/release/bundle/macos/Katala Tune.app"
+            cmp "target/$TARGET/release/tune" "$app/Contents/MacOS/tune"
+            ditto "$app" "$payload/Katala Tune.app"
+            cp -n "$RUNNER_TEMP/katala-source.json" "$payload/Katala Tune.app/Contents/Resources/katala-source.json"
+            codesign --force --deep --sign - "$payload/Katala Tune.app"
+            codesign --verify --deep --strict "$payload/Katala Tune.app"
+          else
+            for bin in katala-tune.exe tune.exe tune-agent.exe; do
+              cp "target/$TARGET/release/$bin" "$payload/$bin"
+            done
+          fi
+          node scripts/artifact-delivery.js package "$PLATFORM" "$RUNNER_TEMP/katala-source.json" "$payload" "$RUNNER_TEMP/katala-delivery"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: katala-delivery-${{ matrix.platform }}-${{ inputs.source_sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/katala-delivery/*
+          if-no-files-found: error
+          retention-days: 7
