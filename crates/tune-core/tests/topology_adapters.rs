@@ -1,5 +1,4 @@
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::Mutex,
@@ -66,7 +65,7 @@ fn remote() -> RemoteRequest {
             manifests: vec![RemoteSourceManifest {
                 relative_path: "package.json".into(),
                 bytes: 26,
-                sha256: format!("{:x}", Sha256::digest(b"{\"name\":\"example-package\"}")),
+                sha256: tune_core::db::sha256_hex(b"{\"name\":\"example-package\"}"),
             }],
         }]),
         python_program: "/usr/bin/python3".into(),
@@ -100,7 +99,7 @@ fn capture(request: &RemoteRequest) -> RawCapture {
                 relative_path: "package.json".into(),
                 kind: "node".into(),
                 content: text.into(),
-                content_sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
+                content_sha256: tune_core::db::sha256_hex(text.as_bytes()),
                 revision: Some("a".repeat(40)),
             }],
             configs: vec![],
@@ -219,7 +218,7 @@ async fn remote_rejects_self_consistent_but_unapproved_sources_without_retaining
             3 => {
                 let text = "unapproved-manifest-sentinel";
                 raw["repositories"][0]["manifests"][0]["content"] = json!(text);
-                raw["repositories"][0]["manifests"][0]["content_sha256"] = json!(format!("{:x}", Sha256::digest(text.as_bytes())));
+                raw["repositories"][0]["manifests"][0]["content_sha256"] = json!(tune_core::db::sha256_hex(text.as_bytes()));
                 raw["counters"]["bytes"] = json!(text.len());
             }
             4 => raw["repositories"][0]["manifests"][0]["kind"] = json!("cargo"),
@@ -267,7 +266,7 @@ async fn remote_missing_sources_and_empty_captures_never_become_complete() {
 async fn remote_partial_manifest_set_preserves_the_previous_complete_checkout_graph() {
     let mut request = remote();
     let content = r#"{"name":"second-package"}"#;
-    let sha = format!("{:x}", Sha256::digest(content.as_bytes()));
+    let sha = tune_core::db::sha256_hex(content.as_bytes());
     request.source_allowlist.as_mut().unwrap()[0].manifests.push(RemoteSourceManifest {
         relative_path: "nested/package.json".into(),
         bytes: content.len(),
@@ -307,9 +306,9 @@ async fn remote_partial_manifest_set_preserves_the_previous_complete_checkout_gr
 
 #[test]
 fn source_roots_match_platform_fingerprints_and_invalid_input_cannot_panic() {
-    assert_eq!(source_root_fingerprint("/allowed/root", RemotePlatform::Posix), format!("{:x}", Sha256::digest(b"/allowed/root")));
-    assert_eq!(source_root_fingerprint("C:\\Allowed\\Root", RemotePlatform::Windows), format!("{:x}", Sha256::digest(b"c:/allowed/root")));
-    assert_eq!(source_root_fingerprint("C:\\", RemotePlatform::Windows), format!("{:x}", Sha256::digest(b"c:/")));
+    assert_eq!(source_root_fingerprint("/allowed/root", RemotePlatform::Posix), tune_core::db::sha256_hex(b"/allowed/root"));
+    assert_eq!(source_root_fingerprint("C:\\Allowed\\Root", RemotePlatform::Windows), tune_core::db::sha256_hex(b"c:/allowed/root"));
+    assert_eq!(source_root_fingerprint("C:\\", RemotePlatform::Windows), tune_core::db::sha256_hex(b"c:/"));
     for root in ["", "x", "日"] {
         let _ = source_root_fingerprint(root, RemotePlatform::Windows);
     }
@@ -721,7 +720,7 @@ async fn approved_remote_smoke_receipts() {
         };
         let started = std::time::Instant::now();
         let capture = collect_remote(&request).await;
-        receipts.push(json!({"schema":"topology_adapter_live_receipt.v1","scope_id":request.scope_id,"observed_at_ms":request.observed_at_ms,"duration_ms":started.elapsed().as_millis(),"identity_matches":capture.target_identity==request.expected_identity_hash,"target_identity":capture.target_identity,"limits":capture.limits,"repositories":capture.repositories.len(),"manifests":capture.repositories.iter().map(|repo|repo.manifests.len()).sum::<usize>(),"counters":capture.counters,"failures":capture.failures,"probe_sha256":format!("{:x}",Sha256::digest(if request.platform==RemotePlatform::Windows { WINDOWS_PROBE.as_bytes() } else { POSIX_PROBE.as_bytes() })),"raw_content_persisted":false,"transport":"existing_strict_ssh_stdin"}));
+        receipts.push(json!({"schema":"topology_adapter_live_receipt.v1","scope_id":request.scope_id,"observed_at_ms":request.observed_at_ms,"duration_ms":started.elapsed().as_millis(),"identity_matches":capture.target_identity==request.expected_identity_hash,"target_identity":capture.target_identity,"limits":capture.limits,"repositories":capture.repositories.len(),"manifests":capture.repositories.iter().map(|repo|repo.manifests.len()).sum::<usize>(),"counters":capture.counters,"failures":capture.failures,"probe_sha256":tune_core::db::sha256_hex(if request.platform==RemotePlatform::Windows { WINDOWS_PROBE.as_bytes() } else { POSIX_PROBE.as_bytes() }),"raw_content_persisted":false,"transport":"existing_strict_ssh_stdin"}));
     }
     std::fs::write(output, serde_json::to_vec_pretty(&receipts).unwrap()).unwrap();
     assert!(
@@ -824,7 +823,7 @@ fn approve_fixture_sources(config: &mut Value) {
                     policy[index]["manifests"]
                         .as_array_mut()
                         .unwrap()
-                        .push(json!({"relative_path":file,"bytes":bytes.len(),"sha256":format!("{:x}",Sha256::digest(&bytes))}));
+                        .push(json!({"relative_path":file,"bytes":bytes.len(),"sha256":tune_core::db::sha256_hex(&bytes)}));
                 }
             }
         }

@@ -267,7 +267,7 @@ pub fn is_absolute_path_any_platform(path: &str) -> bool {
 pub fn sanitized_path_spec(path: &str) -> String {
     let windows = path.contains('\\') || (path.as_bytes().get(1) == Some(&b':'));
     let normalized = normalize_path(path, if windows { "windows" } else { "posix" });
-    if is_absolute_path_any_platform(path) { format!("path-sha256:{:x}", Sha256::digest(normalized.as_bytes())) } else { format!("path:{normalized}") }
+    if is_absolute_path_any_platform(path) { format!("path-sha256:{}", crate::db::sha256_hex(normalized.as_bytes())) } else { format!("path:{normalized}") }
 }
 
 pub fn normalize_path(path: &str, platform: &str) -> String {

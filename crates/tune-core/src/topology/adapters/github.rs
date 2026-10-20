@@ -5,7 +5,6 @@ use super::remote::{oid, safe_relative};
 use super::{CommandRunner, SystemRunner, failure_from_process};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     time::{Duration, Instant},
@@ -71,7 +70,7 @@ pub struct GithubCollection {
 }
 
 pub fn repository_scope(base: &str, owner: &str, name: &str) -> String {
-    format!("{base}:repo:{:x}", Sha256::digest(format!("{}/{}", owner.to_ascii_lowercase(), name.to_ascii_lowercase()).as_bytes()))
+    format!("{base}:repo:{}", crate::db::sha256_hex(format!("{}/{}", owner.to_ascii_lowercase(), name.to_ascii_lowercase()).as_bytes()))
 }
 fn owner_valid(owner: &str) -> bool {
     !owner.is_empty() && owner.len() <= 39 && !owner.starts_with('-') && !owner.ends_with('-') && owner.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -340,7 +339,7 @@ pub async fn collect_github_with(runner: &dyn CommandRunner, request: &GithubReq
         let mut capture = blank(request, scope);
         capture.repositories.push(RawRepository {
             relative_path: ".".into(),
-            root_fingerprint: format!("{:x}", Sha256::digest(format!("github/{}/{}", repository.owner, repository.name).as_bytes())),
+            root_fingerprint: crate::db::sha256_hex(format!("github/{}/{}", repository.owner, repository.name).as_bytes()),
             git: RawGitMetadata {
                 origin: Some(format!("github.com/{}/{}", repository.owner, repository.name)),
                 head: repository.head.clone(),
@@ -583,7 +582,7 @@ pub async fn collect_github_with(runner: &dyn CommandRunner, request: &GithubReq
                     relative_path: blob.path.clone(),
                     kind: blob.kind.clone(),
                     content: content.into(),
-                    content_sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
+                    content_sha256: crate::db::sha256_hex(content.as_bytes()),
                     revision: metas[blob.index].head.clone(),
                 });
             }

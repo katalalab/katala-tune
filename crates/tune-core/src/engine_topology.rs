@@ -4,7 +4,6 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::db::now_ms;
 use crate::engine::Engine;
@@ -20,27 +19,24 @@ use crate::topology::{
 static NEXT_TOPOLOGY_RUN: AtomicU64 = AtomicU64::new(1);
 
 fn remote_generation(request: &RemoteRequest) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(
-            serde_json::to_vec(&json!({
-                "roots": request.roots,
-                "configs": request.configs,
-                "source_allowlist": request.source_allowlist,
-                "limits": request.limits,
-                "platform": match request.platform {
-                    RemotePlatform::Posix => "posix",
-                    RemotePlatform::Windows => "windows",
-                },
-                "runtime": request.expected_runtime,
-                "expected_distro": request.expected_distro,
-                "alias": request.alias,
-                "expected_identity_hash": request.expected_identity_hash,
-                "python_program": request.python_program,
-                "git_program": request.git_program,
-            }))
-            .unwrap_or_default(),
-        )
+    crate::db::sha256_hex(
+        &serde_json::to_vec(&json!({
+            "roots": request.roots,
+            "configs": request.configs,
+            "source_allowlist": request.source_allowlist,
+            "limits": request.limits,
+            "platform": match request.platform {
+                RemotePlatform::Posix => "posix",
+                RemotePlatform::Windows => "windows",
+            },
+            "runtime": request.expected_runtime,
+            "expected_distro": request.expected_distro,
+            "alias": request.alias,
+            "expected_identity_hash": request.expected_identity_hash,
+            "python_program": request.python_program,
+            "git_program": request.git_program,
+        }))
+        .unwrap_or_default(),
     )
 }
 
@@ -83,7 +79,7 @@ impl Engine {
             return json!({"schema":"katala_topology.v1","status":"already_running","trigger":trigger,"started_at":started_at,"ended_at":now_ms(),"scopes":[]});
         }
         let sequence = NEXT_TOPOLOGY_RUN.fetch_add(1, Ordering::Relaxed);
-        let run_id = format!("topology-{:x}", Sha256::digest(format!("{trigger}:{started_at}:{}:{sequence}", std::process::id()).as_bytes()));
+        let run_id = format!("topology-{}", crate::db::sha256_hex(format!("{trigger}:{started_at}:{}:{sequence}", std::process::id()).as_bytes()));
         let lease_ttl_ms = i64::try_from(config.topology.limits.local_timeout_seconds.max(config.topology.limits.remote_timeout_seconds))
             .unwrap_or(3_600)
             .saturating_mul(2_000);
@@ -366,7 +362,7 @@ impl Engine {
             let mut owner_key = config.topology.owners.iter().map(|owner| owner.to_ascii_lowercase()).collect::<Vec<_>>();
             owner_key.sort();
             owner_key.dedup();
-            let cache_key = format!("github.v1.{:x}", Sha256::digest(owner_key.join("\n").as_bytes()));
+            let cache_key = format!("github.v1.{}", crate::db::sha256_hex(owner_key.join("\n").as_bytes()));
             let cache = self.with_db(|db| db.github_cache(&cache_key)).ok().flatten().unwrap_or_default();
             let request = GithubRequest {
                 scope_id: "github".into(),

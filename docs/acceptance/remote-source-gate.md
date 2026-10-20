@@ -1,6 +1,6 @@
 # Remote topology source gate
 
-この変更は remote topology の gate 1（返送する manifest の同一性）だけを実装する。通常 remote topology の有効設定は変更しない。base は `d013572`。並行変更の取り込み後の再検証、正式反映、Windows native、通常 app の実機受入は別工程であり、この fixture 検証で代用しない。
+この変更は remote topology の gate 1（返送する manifest の同一性）だけを実装する。通常 remote topology の有効設定は変更しない。original base は `d013572`、最新 main `02b62e89423de13cd8e2c8ef5460fa3aaf4f13f1` を通常 merge で取り込んだ。並行変更の取り込み後の再検証、正式反映、Windows native、通常 app の実機受入は別工程であり、この fixture 検証で代用しない。
 
 ## Private request の契約
 

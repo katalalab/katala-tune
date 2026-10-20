@@ -3,7 +3,6 @@ use super::super::model::{CaptureCounters, RawCapture};
 use super::super::{Failure, FailureCode, TopologyLimits, normalize_git_origin};
 use super::{CommandRunner, SystemRunner, failure_from_process};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     time::Duration,
@@ -71,7 +70,7 @@ pub struct RemoteRequest {
 }
 
 pub fn identity_hash(hostname: &str) -> String {
-    format!("{:x}", Sha256::digest(hostname.trim().to_ascii_lowercase().trim_end_matches(".local").as_bytes()))
+    crate::db::sha256_hex(hostname.trim().to_ascii_lowercase().trim_end_matches(".local").as_bytes())
 }
 
 fn canonical_relative(value: &str, checkout: bool) -> bool {
@@ -93,7 +92,7 @@ pub fn source_root_fingerprint(root: &str, platform: RemotePlatform) -> String {
         }
     }
     let normalized = format!("{prefix}/{}", parts.join("/"));
-    format!("{:x}", Sha256::digest(normalized.as_bytes()))
+    crate::db::sha256_hex(normalized.as_bytes())
 }
 fn source_kind(path: &str) -> Option<&'static str> {
     if path.starts_with(".github/workflows/") && path.matches('/').count() == 2 && (path.ends_with(".yml") || path.ends_with(".yaml")) {
@@ -181,7 +180,7 @@ fn validate_sources(request: &RemoteRequest, capture: &mut RawCapture) -> Result
                 || file.revision.as_deref() != Some(approved.expected_head.as_str())
                 || file.content.len() != allowed.bytes
                 || file.content_sha256 != allowed.sha256
-                || format!("{:x}", Sha256::digest(file.content.as_bytes())) != allowed.sha256
+                || crate::db::sha256_hex(file.content.as_bytes()) != allowed.sha256
                 || source_kind(&file.relative_path) != Some(file.kind.as_str())
             {
                 return Err(());
@@ -412,7 +411,7 @@ fn valid_capture(capture: &RawCapture) -> bool {
                 || !matches!(manifest.kind.as_str(), "cargo" | "node" | "python" | "go" | "workflow")
                 || manifest.content.len() > limit.file_bytes
                 || (manifest.kind == "workflow" && manifest.content.len() > limit.workflow_bytes)
-                || format!("{:x}", Sha256::digest(manifest.content.as_bytes())) != manifest.content_sha256
+                || crate::db::sha256_hex(manifest.content.as_bytes()) != manifest.content_sha256
             {
                 return false;
             }
@@ -576,7 +575,7 @@ pub fn hash_json_typed_v1(value: &Value) -> Result<String, Failure> {
     }
     let mut bytes = Vec::new();
     encode(value, &mut bytes, 0)?;
-    Ok(format!("{:x}", Sha256::digest(&bytes)))
+    Ok(crate::db::sha256_hex(&bytes))
 }
 
 #[cfg(test)]
