@@ -5,6 +5,8 @@ use std::{
     sync::Mutex,
     time::Duration,
 };
+#[cfg(unix)]
+use tune_core::collect::run_bounded;
 use tune_core::{
     collect::BoundedResult,
     topology::{
@@ -16,9 +18,6 @@ use tune_core::{
         },
     },
 };
-#[cfg(unix)]
-use tune_core::collect::run_bounded;
-
 type TransportCall = (String, Vec<String>, Vec<u8>);
 
 struct Fake {
