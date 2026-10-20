@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 use tune_core::{
-    collect::{BoundedResult, run_bounded},
+    collect::BoundedResult,
     topology::{
         CaptureCounters, FailureCode, RawCapture, RawGitMetadata, RawManifest, RawRepository, ScopeStatus, TopologyLimits, TopologySnapshot,
         adapters::{
@@ -16,6 +16,8 @@ use tune_core::{
         },
     },
 };
+#[cfg(unix)]
+use tune_core::collect::run_bounded;
 
 type TransportCall = (String, Vec<String>, Vec<u8>);
 
