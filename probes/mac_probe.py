@@ -163,7 +163,7 @@ def proc_key(exe, tokens):
         if t in SKIP_WORDS:
             i += 1
             continue
-        label = script_label(re.sub(r"(?<=.)@[^@/]*$", "", t))
+        label = script_label(re.sub(r"(?<=.)@[^@/\\]*$", "", t))
         break
     return "%s:%s" % (exe, label) if label else exe
 

@@ -152,7 +152,7 @@ function MxKey([string]$exe, [string[]]$tokens) {
       break
     }
     if ($mxSkip -contains $t) { $i++; continue }
-    $label = MxLabel ($t -replace '(?<=.)@[^@/]*$', '')
+    $label = MxLabel ($t -replace '(?<=.)@[^@/\\]*$', '')
     break
   }
   if ($label) { return ($exe + ':' + $label) }
