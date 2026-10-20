@@ -28,7 +28,85 @@ def canonical_json_typed_v1(value):
     raise ValueError("unsupported json type")
 
 
+def source_policy(config):
+    policy = config.get("source_allowlist")
+    if not isinstance(policy, list) or not policy or config.get("configs"):
+        return None
+    approved = {}
+    total_files, total_bytes = 0, 0
+    roots = config.get("roots", [])
+    def relative(path, checkout=False):
+        return isinstance(path, str) and ((checkout and path == ".") or (path and not path.startswith("/") and not any(c in path for c in "\\:") and not any(unicodedata.category(c) == "Cc" for c in path) and all(part not in ("", ".", "..") for part in path.split("/"))))
+    def hexadecimal(value, lengths):
+        return isinstance(value, str) and len(value) in lengths and all(c in "0123456789abcdef" for c in value)
+    try:
+        if len(policy) > config["limits"]["entries_per_environment"]:
+            return None
+        for root in roots:
+            if not isinstance(root, str) or not root.startswith("/") or "\\" in root or (root != "/" and any(part in ("", ".", "..") for part in root[1:].split("/"))):
+                return None
+        for checkout in policy:
+            if set(checkout) != {"root_index", "relative_path", "expected_head", "manifests"} or type(checkout["root_index"]) is not int or not 0 <= checkout["root_index"] < len(roots) or not relative(checkout["relative_path"], True) or not hexadecimal(checkout["expected_head"], (40, 64)) or not isinstance(checkout["manifests"], list):
+                return None
+            root = "/" + os.path.abspath(roots[checkout["root_index"]]).lstrip("/")
+            key = (hashlib.sha256(root.encode()).hexdigest(), checkout["relative_path"])
+            if key in approved:
+                return None
+            files = {}
+            for item in checkout["manifests"]:
+                if set(item) != {"relative_path", "bytes", "sha256"} or not relative(item["relative_path"]) or item["relative_path"] in files or type(item["bytes"]) is not int or not 0 <= item["bytes"] <= config["limits"]["file_bytes"] or not hexadecimal(item["sha256"], (64,)):
+                    return None
+                total_files += 1
+                total_bytes += item["bytes"]
+                path = item["relative_path"]
+                workflow = path.startswith(".github/workflows/") and path.count("/") == 2 and path.endswith((".yml", ".yaml"))
+                if (not workflow and path.split("/")[-1] not in ("Cargo.toml", "package.json", "pyproject.toml", "go.mod")) or (workflow and item["bytes"] > config["limits"]["workflow_bytes"]) or total_files > config["limits"]["manifests_per_environment"] or total_bytes > config["limits"]["total_bytes_per_environment"]:
+                    return None
+                files[path] = item
+            approved[key] = (checkout, files)
+    except (KeyError, TypeError, ValueError):
+        return None
+    return approved
+
+
+def admitted_source(policy, root_hash, repo, path, data):
+    approved = policy.get((root_hash, repo["relative_path"])) if policy is not None else None
+    item = approved[1].get(path) if approved else None
+    return bool(item is not None and repo["git"]["head"] == approved[0]["expected_head"] and len(data) == item["bytes"] and hashlib.sha256(data).hexdigest() == item["sha256"])
+
+
+def enforce_sources(result, policy, denied):
+    seen, complete = set(), True
+    for repo in result["repositories"]:
+        key = (repo["root_fingerprint"], repo["relative_path"])
+        approved = policy.get(key) if policy is not None else None
+        if not approved or key in seen or repo["git"]["head"] != approved[0]["expected_head"] or repo.get("config_file_read") or repo["configs"]:
+            denied = True
+            break
+        seen.add(key)
+        files = set()
+        for manifest in repo["manifests"]:
+            if manifest["relative_path"] in files or manifest["revision"] != approved[0]["expected_head"] or not admitted_source(policy, key[0], repo, manifest["relative_path"], manifest["content"].encode("utf-8")):
+                denied = True
+                break
+            files.add(manifest["relative_path"])
+        if len(files) != len(approved[1]):
+            complete = False
+            if len(repo["failures"]) < 64:
+                repo["failures"].append({"code": "permission_denied", "message": "source allowlist incomplete"})
+    if denied or policy is None:
+        result["repositories"].clear()
+        for counter in ("repositories", "manifests", "config_files", "config_keys"):
+            result["counters"][counter] = 0
+        result["progress"] = None
+        result["failures"][:] = [{"code": "permission_denied", "message": "remote source allowlist mismatch"}]
+    elif (not complete or len(seen) != len(policy)) and len(result["failures"]) < 64:
+        result["failures"].append({"code": "permission_denied", "message": "source allowlist incomplete"})
+
+
 def collect_topology(config):
+    policy = source_policy(config)
+    source_denied = False
     limits = config["limits"]
     started = time.monotonic()
     deadline = started + max(0.1, config.get("work_timeout_ms", max(100, int(limits["remote_timeout_seconds"] * 800))) / 1000)
@@ -66,8 +144,12 @@ def collect_topology(config):
         return True
 
     def finish():
+        enforce_sources(result, policy, source_denied)
         counters["duration_ms"] = int((time.monotonic() - started) * 1000)
         return result
+
+    if policy is None:
+        return finish()
 
     expected = config.get("expected_runtime", "native")
     if (config.get("expected_identity_hash") and config["expected_identity_hash"] != result["target_identity"]) or expected != runtime["kind"] or (expected == "wsl" and (not distro or distro != config.get("expected_distro"))):
@@ -155,7 +237,7 @@ def collect_topology(config):
                 return False
         return True
 
-    roots = [os.path.abspath(os.path.expanduser(root)) for root in config.get("roots", [])]
+    roots = ["/" + os.path.abspath(root).lstrip("/") for root in config.get("roots", [])]
     if not roots or len(roots) > limits["roots_per_environment"]:
         failure("unsupported", "invalid configured root count"); return finish()
     root_stamps = []
@@ -166,7 +248,7 @@ def collect_topology(config):
         except OSError:
             root_stamps.append([root, None])
     fingerprint = opaque(json.dumps({"version": 1, "roots": root_stamps, "skip": sorted(SKIP), "parser": PARSER_VERSION,
-                                    "limits": limits, "configs": config.get("configs", []), "hash_mode": "hash_json_typed_v1"}, sort_keys=True, separators=(",", ":")))
+                                    "limits": limits, "configs": config.get("configs", []), "source_allowlist": config.get("source_allowlist"), "hash_mode": "hash_json_typed_v1"}, sort_keys=True, separators=(",", ":")))
     cursor = config.get("cursor")
     if cursor is not None and not cursor_valid(cursor, len(roots)):
         failure("permission_denied", "invalid continuation cursor"); return finish()
@@ -190,7 +272,7 @@ def collect_topology(config):
 
     def under_root(root, relative):
         path = root
-        if os.path.islink(root):
+        if os.path.islink(root) or os.path.realpath(root) != root:
             return None
         for part in ([] if relative == "." else relative.split("/")):
             path = os.path.join(path, part)
@@ -265,7 +347,7 @@ def collect_topology(config):
 
     while root_index < len(roots) and not stop:
         root = roots[root_index]
-        if not os.path.isdir(root) or os.path.islink(root):
+        if not os.path.isdir(root) or os.path.islink(root) or os.path.realpath(root) != root:
             failure("permission_denied", "root missing unreadable or symlink"); root_index += 1; frames = []; continue
         if not frames:
             frames = [{"dir": ".", "after": ""}]
@@ -335,6 +417,8 @@ def collect_topology(config):
                         if stop:
                             break
                         if data is not None:
+                            if not admitted_source(policy, repo["root_fingerprint"], repo, repo_relative, data):
+                                source_denied = True; current["after"] = name; continue
                             try:
                                 content = data.decode("utf-8", "strict")
                             except UnicodeError:
@@ -413,6 +497,16 @@ def collect_topology(config):
             counters["config_files"] -= int(removed["config_file_read"])
             counters["config_keys"] -= len(removed["configs"])
             failure("limit_reached", "configuration stdout budget exceeded"); break
+    # Recheck HEAD after all reads. Exact approved byte buffers are the only text admitted.
+    for repo in repositories:
+        approved = policy.get((repo["root_fingerprint"], repo["relative_path"]))
+        if approved is None:
+            source_denied = True
+            break
+        path = under_root(roots[approved[0]["root_index"]], repo["relative_path"])
+        if path is None or git(path, ["rev-parse", "--verify", "HEAD"]) != approved[0]["expected_head"]:
+            source_denied = True
+            break
     finish()
     # Empty metadata itself must fit; requests below this envelope are rejected by Rust.
     if len(json.dumps(result, separators=(",", ":"), ensure_ascii=True).encode()) > limits["stdout_bytes"]:
