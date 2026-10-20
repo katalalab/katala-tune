@@ -472,7 +472,7 @@ fn apply_walk_failures(capture: &mut RawCapture, root: &Path, failures: &[(PathB
             let repository_root = if repository.relative_path == "." { root.to_path_buf() } else { root.join(&repository.relative_path) };
             if directory.starts_with(&repository_root) {
                 let depth = repository_root.components().count();
-                if best.map_or(true, |(_, current)| depth > current) {
+                if best.is_none_or(|(_, current)| depth > current) {
                     best = Some((index, depth));
                 }
             }

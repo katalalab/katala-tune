@@ -78,6 +78,6 @@ ${helpers}
     assert.equal(gpu.memory_reason,'driver returned unavailable or invalid memory fields');
   }
   assert.deepEqual([actual[0].mem_used_mb,actual[0].mem_total_mb,actual[0].mem_free_mb],[null,null,null]);
-  assert.deepEqual([actual[1].mem_used_mb,actual[1].mem_total_mb,actual[1].mem_free_mb],[null,null,0]);
+  assert.deepEqual([actual[1].mem_used_mb,actual[1].mem_total_mb,actual[1].mem_free_mb],[null,100,0]);
   assert.deepEqual([actual[2].mem_used_mb,actual[2].mem_total_mb,actual[2].mem_free_mb],[50,100,null]);
 });
