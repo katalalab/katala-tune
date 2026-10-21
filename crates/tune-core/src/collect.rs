@@ -465,11 +465,18 @@ async fn probe_exchange_command(command: Command, _args: &[String]) -> RunResult
 /// stdout and stderr have all completed before one monotonic deadline.
 async fn probe_exchange_command_until(mut command: Command, deadline: tokio::time::Instant) -> RunResult {
     command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    // Leave a bounded cleanup interval inside the one absolute deadline.  A
+    // failed root must be killed and reaped; expiry may never add grace after
+    // the 135-second contract.
+    let now = tokio::time::Instant::now();
+    let remaining = deadline.saturating_duration_since(now);
+    let cleanup = (remaining / 4).min(Duration::from_secs(1));
+    let work_deadline = deadline.checked_sub(cleanup).unwrap_or(deadline);
     let Ok(mut child) = command.spawn() else {
         return RunResult { code: Some(9), out: String::new(), err: "Windows probe transport outcome unverified".into() };
     };
     let stdin = child.stdin.take();
-    let stdin_ok = tokio::time::timeout_at(deadline, async move {
+    let stdin_ok = tokio::time::timeout_at(work_deadline, async move {
         if let Some(mut pipe) = stdin {
             pipe.shutdown().await.map_err(|_| ())?;
         }
@@ -481,9 +488,9 @@ async fn probe_exchange_command_until(mut command: Command, deadline: tokio::tim
     .is_some();
     let mut stdout_task = tokio::spawn(read_probe_pipe(child.stdout.take(), 1_048_576));
     let mut stderr_task = tokio::spawn(read_probe_pipe(child.stderr.take(), 65_536));
-    let status = tokio::time::timeout_at(deadline, child.wait()).await.ok().and_then(Result::ok);
-    let stdout = tokio::time::timeout_at(deadline, &mut stdout_task).await.ok().and_then(Result::ok).and_then(Result::ok);
-    let stderr = tokio::time::timeout_at(deadline, &mut stderr_task).await.ok().and_then(Result::ok).and_then(Result::ok);
+    let status = tokio::time::timeout_at(work_deadline, child.wait()).await.ok().and_then(Result::ok);
+    let stdout = tokio::time::timeout_at(work_deadline, &mut stdout_task).await.ok().and_then(Result::ok).and_then(Result::ok);
+    let stderr = tokio::time::timeout_at(work_deadline, &mut stderr_task).await.ok().and_then(Result::ok).and_then(Result::ok);
     if !stdin_ok || status.as_ref().and_then(|value| value.code()) != Some(0) || stdout.is_none() || stderr.is_none() {
         stdout_task.abort();
         stderr_task.abort();
@@ -1339,14 +1346,41 @@ sys.stderr.write('z');sys.stderr.flush();time.sleep(3)"#,
     }
 
     #[tokio::test]
-    #[ignore = "the controlled deadline fixture deliberately terminates its owned child"]
-    async fn fixed_windows_probe_transport_rejects_a_root_timeout() {
+    async fn fixed_windows_probe_transport_kills_and_reaps_its_ready_root_on_timeout() {
         if cfg!(windows) {
             return;
         }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
         let mut command = Command::new("/usr/bin/env");
-        command.args(["python3", "-c", "import time;time.sleep(2)"]);
-        let result = probe_exchange_command_until(command, tokio::time::Instant::now() + Duration::from_millis(50)).await;
+        command.args([
+            "python3",
+            "-c",
+            &format!("import os,socket,time\ns=socket.create_connection(('127.0.0.1',{port}));s.sendall(str(os.getpid()).encode());s.close()\ntime.sleep(5)"),
+        ]);
+        let exchange = tokio::spawn(async move { probe_exchange_command_until(command, tokio::time::Instant::now() + Duration::from_secs(1)).await });
+        let (mut ready, _) = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await.unwrap().unwrap();
+        let mut pid = Vec::new();
+        tokio::time::timeout(Duration::from_millis(100), ready.read_to_end(&mut pid)).await.unwrap().unwrap();
+        let pid = String::from_utf8(pid).unwrap().parse::<i32>().unwrap();
+        assert!(pid > 0);
+        let result = exchange.await.unwrap();
         assert_eq!((result.code, result.out.as_str()), (Some(9), ""));
+        let reaped = tokio::time::timeout(Duration::from_millis(150), async {
+            loop {
+                let gone = !std::process::Command::new("/bin/kill")
+                    .args(["-0", &pid.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if gone {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(reaped.is_ok(), "owned timeout fixture root {pid} was not reaped");
     }
 }
