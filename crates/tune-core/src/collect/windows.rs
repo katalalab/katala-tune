@@ -362,10 +362,6 @@ impl Job {
             receipt.observed.push(identity.clone());
             self.processes.push(Process { handle, identity });
         }
-        receipt.observed_exited = !self.processes.is_empty();
-        for process in &self.processes {
-            receipt.observed_exited &= exited(&process.handle)?;
-        }
         let root = self.processes.first().ok_or_else(invalid)?;
         receipt.root_exited = exited(&root.handle)?;
         if receipt.root_exited {
@@ -376,6 +372,12 @@ impl Job {
             // The initial accounting may predate root exit. Only a subsequent
             // sample can establish that descendants remain after that exit.
             self.accounting(receipt)?;
+        }
+        // Sample retained members after root exit; an earlier nonsignaled root
+        // must not be mistaken for a descendant that remains after root exit.
+        receipt.observed_exited = !self.processes.is_empty();
+        for process in &self.processes {
+            receipt.observed_exited &= exited(&process.handle)?;
         }
         Ok(())
     }
@@ -654,7 +656,7 @@ impl Drop for Tasks {
 }
 
 fn lingering_descendants(receipt: &ProcessReceipt) -> bool {
-    receipt.root_exited && !receipt.job_empty
+    receipt.root_exited && !receipt.job_empty && !receipt.observed_exited
 }
 
 #[derive(Default)]
@@ -670,17 +672,18 @@ struct CleanupStep {
 
 impl CleanupState {
     fn advance(&mut self, receipt: &mut ProcessReceipt, now: Instant) -> CleanupStep {
-        let mut terminate = false;
         if self.deadline.is_none() && (receipt.stop != ProcessStop::Completed || receipt.root_exited) {
             self.deadline = Some(now + CLEANUP);
-            if receipt.stop != ProcessStop::Completed && !self.termination_requested {
-                self.termination_requested = true;
-                terminate = true;
-            }
         }
         let expired = self.deadline.is_some_and(|end| now >= end);
         if expired && receipt.stop == ProcessStop::Completed {
             receipt.stop = ProcessStop::CleanupUnconfirmed;
+        }
+        // Decide after every stop mutation, including expiry. Record the one-shot
+        // request before the caller attempts termination; Drop remains a fallback.
+        let terminate = receipt.stop != ProcessStop::Completed && !self.termination_requested;
+        if terminate {
+            self.termination_requested = true;
         }
         CleanupStep { terminate, expired }
     }
@@ -844,12 +847,12 @@ pub(super) async fn run(
             answer.timed_out = true;
             receipt.stop = ProcessStop::Timeout;
         }
-        if receipt.cleanup_confirmed() {
-            break;
-        }
         let step = cleanup.advance(&mut receipt, now);
         if step.terminate {
             let _ = job.terminate();
+        }
+        if receipt.cleanup_confirmed() {
+            break;
         }
         if step.expired {
             break;

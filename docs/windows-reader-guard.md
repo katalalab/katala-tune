@@ -50,8 +50,14 @@ A cleanup acknowledgement requires all of the following:
 The Job's `total_processes` and the list of observed identities are separate
 measurements. Polling can miss short-lived descendants; the list is not an
 exhaustive process history. Zero Job membership is the descendant-exit evidence.
-After observing the retained root exit, accounting is refreshed before deciding
-that descendants linger; an earlier active snapshot cannot establish that.
+After observing retained root exit and its exit code, accounting is refreshed
+and retained member signals are sampled afterwards. Lingering descendants
+require a nonsignaled observed member after root exit as well as nonzero Job
+accounting. If all retained members have exited but accounting is still nonzero,
+the backend continues actual observation within the unchanged execution deadline
+and existing cleanup window. It never synthesizes Job zero or assumes unknown
+active membership is harmless lag; errors, limits and missing cleanup remain
+failures, and actual zero membership is mandatory for ACK.
 Exit code `259` alone is never used as a liveness test.
 
 A completed input writer is not a delivery acknowledgement. Tokio/mio may have
@@ -68,7 +74,12 @@ timeout even if subsequent cleanup is fully confirmed. After
 timeout/overflow/lingering, only the newly owned Job is terminated, and a
 separate three-second cleanup window gathers exit and pipe evidence. Output
 readers continue draining without increasing their saved byte budget. Cleanup
-that cannot be confirmed is recorded as incomplete. Dropping/cancelling the
+that cannot be confirmed is recorded as incomplete. The cleanup deadline starts
+once and is never extended. All stop changes, including observation failure and
+cleanup expiry after pending accounting, pass through one loop termination
+request before ACK or expiry can break the loop. The request is marked before
+attempting owned-Job termination and is not repeated by the loop.
+Dropping/cancelling the
 invocation aborts its tasks and drops the sole owned Job handle, whose
 kill-on-close policy applies to the invocation's process tree.
 
