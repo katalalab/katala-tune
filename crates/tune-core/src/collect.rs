@@ -1069,11 +1069,12 @@ mod tests {
         let nonce = "d".repeat(64);
         let body = b"action body";
         let hash = crate::db::sha256_hex(body);
-        let fixture = |result_hash: &str, exit: i32, hold_eof: bool| {
+        let fixture = |result_hash: &str, exit: i32, hold_eof: bool, reject_early_stdin: bool| {
             format!(
                 r#"import hashlib,select,sys,time
-r,_,_=select.select([sys.stdin.buffer],[],[],.15)
-if r: sys.exit(91)
+if {reject_early_stdin}:
+ r,_,_=select.select([sys.stdin.buffer],[],[],.15)
+ if r: sys.exit(91)
 sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush()
 line=sys.stdin.buffer.readline().decode('ascii').strip().split(' ')
 body=sys.stdin.buffer.read()
@@ -1081,7 +1082,8 @@ if len(line)!=5 or line[:3]!=['KT2','REQUEST','{nonce}'] or int(line[3])!=len(bo
 sys.stdout.write('KT2 RESULT {nonce} {result_hash} 0 2 0\nok');sys.stdout.flush()
 if {hold_eof}: time.sleep(2)
 sys.exit({exit})"#,
-                hold_eof = if hold_eof { "True" } else { "False" }
+                hold_eof = if hold_eof { "True" } else { "False" },
+                reject_early_stdin = if reject_early_stdin { "True" } else { "False" },
             )
         };
         let run_fixture = |script: String, timeout: Duration| async move {
@@ -1090,13 +1092,15 @@ sys.exit({exit})"#,
             action_exchange_command(command, body, timeout).await
         };
 
-        let valid = run_fixture(fixture(&hash, 0, false), Duration::from_secs(2)).await;
+        let valid = run_fixture(fixture(&hash, 0, false, true), Duration::from_secs(2)).await;
         assert_eq!((valid.code, valid.out.as_str(), valid.err.as_str()), (Some(0), "ok", ""));
-        let wrong_hash = run_fixture(fixture(&"0".repeat(64), 0, false), Duration::from_secs(2)).await;
+        let wrong_hash = run_fixture(fixture(&"0".repeat(64), 0, false, true), Duration::from_secs(2)).await;
         assert_eq!(wrong_hash.code, Some(7));
-        let ssh_nonzero = run_fixture(fixture(&hash, 255, false), Duration::from_secs(2)).await;
+        let ssh_nonzero = run_fixture(fixture(&hash, 255, false, true), Duration::from_secs(2)).await;
         assert_eq!(ssh_nonzero.code, Some(7));
-        let held_eof = run_fixture(fixture(&hash, 0, true), Duration::from_millis(250)).await;
+        // This fixture has already parsed the complete REQUEST before holding
+        // stdout open, so the expiry is causally after the write attempt.
+        let held_eof = run_fixture(fixture(&hash, 0, true, false), Duration::from_secs(1)).await;
         assert_eq!(held_eof.code, Some(7));
     }
 
@@ -1128,11 +1132,11 @@ sys.exit({exit})"#,
             )
         };
 
-        // Closing the receiver read end after READY makes write_all/shutdown return
-        // Ok(Err(_)); that is still after-commit uncertainty, never a successful 0.
+        // Close the receiver read end before READY reaches the controller. This
+        // makes the following write_all/shutdown a post-commit transport error.
         let closed_stdin = format!(
             r#"import os,sys,time
-sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush();os.close(0);time.sleep(.05)
+os.close(0);sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush();time.sleep(.05)
 sys.stdout.write('KT2 RESULT {nonce} {hash} 0 0 0\n');sys.stdout.flush()"#,
         );
         assert_eq!(run_fixture(closed_stdin, Duration::from_secs(2)).await.code, Some(7));
