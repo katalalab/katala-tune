@@ -42,6 +42,7 @@ const COMMANDS: &[&str] = &[
     "netsec",
     "dashboard",
     "monitor_settings",
+    "monitor_events",
     "hub_pull",
     "topology_view",
     "topology_refresh",
