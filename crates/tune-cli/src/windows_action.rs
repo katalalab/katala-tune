@@ -111,7 +111,7 @@ enum Event {
 
 #[cfg(windows)]
 #[derive(Debug)]
-struct ReceiverError;
+pub(crate) struct ReceiverError;
 
 #[cfg(windows)]
 fn parse_arguments(args: &[String]) -> Option<(String, u64)> {
@@ -368,7 +368,7 @@ fn nonce() -> Result<String, ReceiverError> {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn powershell_path() -> Result<std::path::PathBuf, ReceiverError> {
+pub(crate) fn powershell_path() -> Result<std::path::PathBuf, ReceiverError> {
     use std::{ffi::OsString, os::windows::ffi::OsStringExt};
     use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 

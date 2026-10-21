@@ -22,7 +22,7 @@ fn tmp(tag: &str) -> PathBuf {
 }
 
 fn node_json(id: &str) -> Value {
-    json!({ "id": id, "alias": format!("mock-{id}"), "os": "windows" })
+    json!({ "id": id, "alias": format!("mock-{id}"), "os": "windows", "action_helper": { "schema": "katala-tune/action-helper/v2", "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "tune_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "run_id": 1, "attempt": 1 } })
 }
 
 fn node(id: &str) -> Node {
@@ -46,6 +46,13 @@ impl Runner for MockSsh {
             self.calls.lock().unwrap().push(args.to_vec());
             let alias = args.iter().find(|a| a.starts_with("mock-")).cloned().unwrap_or_default();
             self.script.get(&alias).cloned().unwrap_or_else(|| res(None, "", &format!("台本に無い host: {alias}")))
+        })
+    }
+    fn probe_exchange<'a>(&'a self, node: &'a Node, _helper: &'a str, _benchmark: bool, _network: bool, _observe_wsl: bool) -> RunFuture<'a> {
+        Box::pin(async move {
+            let args = vec!["-T".into(), "-o".into(), "BatchMode=yes".into(), "-o".into(), "ConnectTimeout=10".into(), node.alias.clone()];
+            self.calls.lock().unwrap().push(args);
+            self.script.get(&node.alias).cloned().unwrap_or_else(|| res(None, "", &format!("台本に無い host: {}", node.alias)))
         })
     }
 }
@@ -274,12 +281,12 @@ async fn ledger_change_during_confirmation_stops_execution_and_records_reason() 
         (
             "action-helper",
             vec![
-                json!({ "id": "w", "alias": "mock-w", "os": "windows", "action_helper": { "schema": "katala-tune/action-helper/v1", "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "tune_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "run_id": 1, "attempt": 1 } }),
+                json!({ "id": "w", "alias": "mock-w", "os": "windows", "action_helper": { "schema": "katala-tune/action-helper/v2", "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "tune_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "manifest_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "run_id": 1, "attempt": 1 } }),
             ],
             "接続先",
         ),
         ("removed", vec![], "台帳に無い"),
-        ("shared", vec![json!({ "id": "w", "alias": "mock-w", "os": "windows", "shared": true })], "共用機"),
+        ("shared", vec![json!({ "id": "w", "alias": "mock-w", "os": "windows", "shared": true })], "接続先"),
     ];
     for (name, changed, expected) in cases {
         let s = setup(&[node_json("w")], &[]);
@@ -331,7 +338,8 @@ async fn protect_list_or_broken_ledger_after_approval_stops_execution() {
 async fn unchanged_identity_still_runs() {
     let s = setup(&[node_json("w")], &[]);
     let ledger = s.ledger.clone();
-    let rewritten = json!({ "id": "w", "alias": "mock-w", "os": "windows", "note": "説明を足しただけ" });
+    let mut rewritten = node_json("w");
+    rewritten["note"] = json!("説明を足しただけ");
     let r = s
         .engine
         .confirm_and_run_with(s.host.as_ref(), "w", &disable(), "t", None, approve(true, move || write_ledger(&ledger, &[rewritten], &[])))
@@ -492,10 +500,18 @@ impl Runner for CountLocal {
             res(Some(0), "{\"probe\":\"windows\"}\n", "")
         })
     }
+    fn probe_exchange<'a>(&'a self, _node: &'a Node, _helper: &'a str, _benchmark: bool, _network: bool, _observe_wsl: bool) -> RunFuture<'a> {
+        Box::pin(async move {
+            self.0.lock().unwrap().push("probe".into());
+            res(Some(0), "{\"probe\":\"windows\"}\n", "")
+        })
+    }
 }
 
 fn local_node() -> Node {
-    Node::from_value(&json!({ "id": "here", "alias": "mock-here", "os": "windows", "local_hostname": "this-host" }), "this-host")
+    let mut value = node_json("here");
+    value["local_hostname"] = json!("this-host");
+    Node::from_value(&value, "this-host")
 }
 
 #[tokio::test]
@@ -508,7 +524,7 @@ async fn local_node_execution_and_probe_go_through_the_given_runner() {
     assert_eq!(r.0.lock().unwrap().len(), 1, "ローカルの変更も渡された実行器を通る");
     let p = tune_core::collect::probe_node_with(&r, &n).await;
     assert_eq!(p["ok"], json!(true), "{p}");
-    assert!(r.0.lock().unwrap().len() >= 3, "ローカルの調査（調査・ベンチ）も渡された実行器を通る");
+    assert_eq!(r.0.lock().unwrap().len(), 2, "ローカル Windows 調査も named transport を通る");
 }
 
 // ---- レビュー指摘: 結果の書き込みが「未更新」を返したら成功扱いにしない ----

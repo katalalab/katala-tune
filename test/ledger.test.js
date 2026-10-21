@@ -26,7 +26,8 @@ function mockSsh(script = {}) {
     const alias = args.find((a) => typeof a === 'string' && Object.hasOwn(script, a));
     return script[alias] || { code: 0, out: '{"probe":"windows","cpu_busy":1}\n', err: '' };
   };
-  return { run, calls };
+  const probeExchange = async (node) => run('ssh', ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', node.alias]);
+  return { run, probeExchange, calls };
 }
 const noLocal = new Proxy({}, { get: (_t, k) => () => { throw new Error(`ローカル実行を呼んだ: ${String(k)}`); } });
 
@@ -63,7 +64,11 @@ test('status の読み方: 大文字小文字・アンダースコアを許し�
 test('retired / no-ssh / paused / out-of-scope / 不明な status には ssh も probe も実行しない', async () => {
   const ssh = mockSsh();
   const seen = [];
-  const results = await probeAll(cfg().nodes, (r) => seen.push(r.node_id), { run: ssh.run, localShell: noLocal });
+  const nodes = cfg().nodes.map((node) => node.os === 'windows' && ledger.opState(node).active ? {
+    ...node,
+    action_helper: { schema: 'katala-tune/action-helper/v2', source_sha: 'a'.repeat(40), tune_sha256: 'b'.repeat(64), manifest_sha256: 'c'.repeat(64), run_id: 1, attempt: 1 },
+  } : node);
+  const results = await probeAll(nodes, (r) => seen.push(r.node_id), { run: ssh.run, probeExchange: ssh.probeExchange, localShell: noLocal });
   assert.deepEqual(results.map((r) => r.node_id).sort(), ['active-mac', 'explicit-online']);
   assert.deepEqual(seen.sort(), ['active-mac', 'explicit-online']);
   assert.equal(ssh.calls.length, 2);

@@ -260,7 +260,7 @@ test('GPU 電力の outcome-unverified は local/remote とも undo を出さず
 test('remote Windows GPU action は named KT2 exchange に本文だけを渡す', async () => {
   const action = { type: 'set-gpu-power-limit', params: { uuid: 'GPU-01234567-89ab-cdef-0123-456789abcdef', watts: 180, min: 100, max: 250, prev_w: 200 } };
   let call;
-  const action_helper = { schema: 'katala-tune/action-helper/v1', source_sha: 'a'.repeat(40), tune_sha256: 'b'.repeat(64), manifest_sha256: 'c'.repeat(64), run_id: 1, attempt: 1 };
+  const action_helper = { schema: 'katala-tune/action-helper/v2', source_sha: 'a'.repeat(40), tune_sha256: 'b'.repeat(64), manifest_sha256: 'c'.repeat(64), run_id: 1, attempt: 1 };
   const result = await execute({ ...node, local: false, action_helper }, action, { protect: [] }, async () => { throw new Error('generic transport must stay unused'); }, async (...args) => {
     call = args;
     return { code: 9, out: '', err: '' };
@@ -273,7 +273,7 @@ test('remote Windows GPU action は named KT2 exchange に本文だけを渡す'
 
 test('remote Windows action は approved helper record が無いか閉じた形式でなければ transport 前に拒否する', async () => {
   const action = { type: 'kill-process', params: { pid: 4242, name: 'Worker', start: '20261021010101000', min_cpu: 1 } };
-  for (const action_helper of [undefined, { schema: 'katala-tune/action-helper/v1', source_sha: 'a'.repeat(40), tune_sha256: 'b'.repeat(64), manifest_sha256: 'c'.repeat(64), run_id: 1, attempt: 1, extra: true }]) {
+  for (const action_helper of [undefined, { schema: 'katala-tune/action-helper/v1', source_sha: 'a'.repeat(40), tune_sha256: 'b'.repeat(64), manifest_sha256: 'c'.repeat(64), run_id: 1, attempt: 1 }, { schema: 'katala-tune/action-helper/v2', source_sha: 'a'.repeat(40), tune_sha256: 'b'.repeat(64), manifest_sha256: 'c'.repeat(64), run_id: 1, attempt: 1, extra: true }]) {
     let calls = 0;
     const result = await execute({ ...node, local: false, action_helper }, action, { protect: [] }, async () => { throw new Error('generic transport must stay unused'); }, async () => { calls += 1; return { code: 0, out: '', err: '' }; });
     assert.equal(result.code, 9);
