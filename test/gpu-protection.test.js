@@ -12,7 +12,9 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 const { EventEmitter } = require('node:events');
+const { createRequire } = require('node:module');
 const { PassThrough } = require('node:stream');
+const vm = require('node:vm');
 const probe = fs.readFileSync(path.join(__dirname, '..', 'probes', 'win_probe.ps1'), 'utf8');
 const windowsPowerShell = process.env.KT_GPU_POWERSHELL || 'powershell.exe';
 
@@ -337,6 +339,29 @@ test('KT2 controller は単調期限、厳密な結果枠、stdin/stdio 境界�
     return child;
   };
   assert.equal((await actionExchange(node2, helper, body, { spawnChild: closedStdin, timeoutMs: 1000 })).code, 7, 'a failed post-READY write is outcome-unverified');
+  const collectModule = require.resolve('../lib/collect');
+  const source = fs.readFileSync(collectModule, 'utf8').replace(
+    'const monotonicNow = () => performance.now();',
+    'const monotonicNow = (() => { const ticks = [0, 0, 0, 101, 101]; return () => ticks.shift() ?? 101; })();',
+  );
+  const sandbox = { module: { exports: {} }, Buffer, TextDecoder, process, setTimeout, clearTimeout, require: createRequire(collectModule), __dirname: path.dirname(collectModule) };
+  vm.runInNewContext(source, sandbox, { filename: collectModule });
+  let preWriteSpawns = 0, preWriteEnds = 0;
+  const expiresBeforeWrite = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = new EventEmitter();
+    child.stdin.destroy = () => {};
+    child.stdin.end = () => { preWriteEnds += 1; };
+    child.kill = () => {};
+    queueMicrotask(() => child.stdout.write(`KT2 READY ${nonce}\n`));
+    return child;
+  };
+  const preWrite = await sandbox.module.exports.actionExchange(node2, helper, body, { timeoutMs: 100, spawnChild: (...args) => { preWriteSpawns += 1; return expiresBeforeWrite(...args); } });
+  assert.equal(preWrite.code, 9, 'READY without a write attempt remains pre-commit');
+  assert.equal(preWriteEnds, 0, 'the expired deadline never calls stdin.end');
+  assert.equal(preWriteSpawns, 1, 'the pre-write deadline never retries');
   const zeroUnhandled = [];
   const onUnhandled = (reason) => { zeroUnhandled.push(String(reason)); };
   process.on('unhandledRejection', onUnhandled);
