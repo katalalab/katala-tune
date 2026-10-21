@@ -118,7 +118,7 @@ fn receive_once(
     let _lease = PinnedWindowsExecutable::open(&image, expected_sha256, input_end).map_err(|_| ReceiverError)?;
     let nonce = nonce()?;
     let mut output = std::io::stdout().lock();
-    write!(output, "KT2 READY {nonce}\n").map_err(|_| ReceiverError)?;
+    writeln!(output, "KT2 READY {nonce}").map_err(|_| ReceiverError)?;
     output.flush().map_err(|_| ReceiverError)?;
 
     let request = read_request(&mut std::io::stdin().lock(), &nonce, input_end)?;
@@ -160,7 +160,7 @@ fn receive_once(
     {
         return Err(ReceiverError);
     }
-    write!(output, "KT2 RESULT {} {} {} {} {}\n", nonce, request.sha256, code, result.stdout.len(), result.stderr.len()).map_err(|_| ReceiverError)?;
+    writeln!(output, "KT2 RESULT {} {} {} {} {}", nonce, request.sha256, code, result.stdout.len(), result.stderr.len()).map_err(|_| ReceiverError)?;
     output.write_all(&result.stdout).map_err(|_| ReceiverError)?;
     output.write_all(&result.stderr).map_err(|_| ReceiverError)?;
     output.flush().map_err(|_| ReceiverError)
@@ -174,8 +174,6 @@ struct Request {
 
 #[cfg(windows)]
 fn read_request(input: &mut impl std::io::Read, nonce: &str, deadline: Instant) -> Result<Request, ReceiverError> {
-    use std::io::Read;
-
     let header = read_header(input, deadline)?;
     let fields: Vec<_> = header.split(' ').collect();
     let [prefix, kind, request_nonce, count, sha256] = fields.as_slice() else {
@@ -196,8 +194,6 @@ fn read_request(input: &mut impl std::io::Read, nonce: &str, deadline: Instant) 
 
 #[cfg(windows)]
 fn read_header(input: &mut impl std::io::Read, deadline: Instant) -> Result<String, ReceiverError> {
-    use std::io::Read;
-
     let mut header = Vec::with_capacity(MAX_HEADER_BYTES);
     while header.len() < MAX_HEADER_BYTES {
         if Instant::now() >= deadline {
