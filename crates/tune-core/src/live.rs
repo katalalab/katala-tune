@@ -18,19 +18,23 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::collect;
 use crate::db::now_ms;
-use crate::monitor_journal::{Category, Data, InputEnd, Journal, Kind, PipeEnd, Policy, Reason, StatePhase, elapsed_ms};
+use crate::monitor_journal::{
+    Category, CloseTrigger, Data, InputEnd, Journal, Kind, PipeEnd, Policy, Reason, StatePhase, StreamBoundary, StreamIo, WaitOrigin, elapsed_ms,
+};
 use crate::nodes::Node;
 
 pub const MAC_LIVE: &str = include_str!("../../../probes/live_mac.py");
@@ -565,6 +569,9 @@ pub struct Ended {
     pub stdout: PipeEnd,
     pub stderr: PipeEnd,
     pub stdin: InputEnd,
+    pub wait_origin: Option<WaitOrigin>,
+    pub kill_attempted: Option<bool>,
+    pub io: Option<StreamBoundary>,
 }
 
 impl Ended {
@@ -586,22 +593,43 @@ pub struct Source {
     stop: Option<oneshot::Sender<()>>,
     done: Option<oneshot::Receiver<Ended>>,
     pub transport_pid: Option<u32>,
+    boundary: Option<Arc<Mutex<ReadBoundary>>>,
 }
 
 impl Source {
     pub fn new(lines: mpsc::Receiver<String>, stop: oneshot::Sender<()>, done: oneshot::Receiver<Ended>) -> Source {
-        Source { lines, stop: Some(stop), done: Some(done), transport_pid: None }
+        Source { lines, stop: Some(stop), done: Some(done), transport_pid: None, boundary: None }
     }
 
     /// 止めて、終わるのを待つ
-    pub async fn close(mut self) -> Ended {
+    pub async fn close(self) -> Ended {
+        self.close_with(CloseTrigger::Stop, None).await
+    }
+
+    async fn close_with(mut self, trigger: CloseTrigger, sample_age: Option<Duration>) -> Ended {
+        // Snapshot before sending stop: EOF caused by closing stdin must not become pre-close EOF.
+        let mut io = self.boundary.as_ref().and_then(|b| b.lock().ok().map(|s| s.snapshot()));
+        if let Some(d) = io.as_mut() {
+            d.close_trigger = Some(trigger);
+            d.sample_age_ms = sample_age.and_then(|age| u32::try_from(age.as_millis()).ok());
+            d.overflow |= sample_age.is_some() && d.sample_age_ms.is_none();
+        }
+        let began = Instant::now();
         if let Some(s) = self.stop.take() {
             let _ = s.send(());
         }
-        match self.done.take() {
+        let mut ended = match self.done.take() {
             Some(d) => d.await.unwrap_or_default(),
             None => Ended::default(),
+        };
+        if let Some(d) = io.as_mut() {
+            d.close_ms = u32::try_from(began.elapsed().as_millis()).ok();
+            d.overflow |= d.close_ms.is_none();
+            d.wait_origin = ended.wait_origin;
+            d.kill_attempted = ended.kill_attempted;
         }
+        ended.io = io;
+        ended
     }
 }
 
@@ -762,30 +790,39 @@ pub fn spawn(l: Launch) -> Result<Source, String> {
         outcome
     });
     let (tx, rx) = mpsc::channel(256);
-    let out_task = tokio::spawn(read_lines(child.stdout.take(), tx));
+    let boundary = Arc::new(Mutex::new(ReadBoundary::new()));
+    let out_task = tokio::spawn(read_lines(child.stdout.take(), tx, boundary.clone()));
     let err_task = tokio::spawn(read_tail(child.stderr.take(), 4096));
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let (done_tx, done_rx) = oneshot::channel();
     let cleanup = l.cleanup;
+    let wait_boundary = boundary.clone();
     tokio::spawn(async move {
         let mut closed_tx = Some(closed_tx);
         // stop_rx は止める指示か、Source が捨てられた（送り手が無くなった）ときに終わる
-        let status = tokio::select! {
-            st = child.wait() => st.ok(),
+        let mut kill_attempted = false;
+        let (status, wait_origin) = tokio::select! {
+            st = child.wait() => (st.ok(), WaitOrigin::Natural),
             _ = stop_rx => {
                 // まず標準入力を閉じる。サンプラーは自分で後始末して終わる（Windows は nvidia-smi も止める）。
                 // 終わらなければ（応答の無い機体など）強制的に止める
                 drop(closed_tx.take());
                 let grace = if keep { Duration::from_millis(2500) } else { Duration::ZERO };
-                match tokio::time::timeout(grace, child.wait()).await {
+                let status = match tokio::time::timeout(grace, child.wait()).await {
                     Ok(st) => st.ok(),
                     Err(_) => {
+                        // API attempt only; an error/already-exited race does not prove a kill.
+                        kill_attempted = true;
                         let _ = child.start_kill();
                         child.wait().await.ok()
                     }
-                }
+                };
+                (status, WaitOrigin::Close)
             }
         };
+        if let Ok(mut b) = wait_boundary.lock() {
+            b.wait_observed = status.as_ref().map(|_| true);
+        }
         drop(closed_tx);
         // 孫プロセスがパイプを持ち続けても止まらないよう、読み終わりを待つのは少しだけ
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -801,10 +838,14 @@ pub fn spawn(l: Launch) -> Result<Source, String> {
             stdout: stdout.unwrap_or(PipeEnd::Cancelled),
             stderr,
             stdin: stdin.unwrap_or(InputEnd::Cancelled),
+            wait_origin: Some(wait_origin),
+            kill_attempted: Some(kill_attempted),
+            io: None,
         });
     });
     let mut source = Source::new(rx, stop_tx, done_rx);
     source.transport_pid = transport_pid;
+    source.boundary = Some(boundary);
     Ok(source)
 }
 
@@ -819,9 +860,69 @@ async fn reader_result<T: Send + 'static>(mut task: JoinHandle<T>, deadline: tok
     }
 }
 
-async fn read_lines(out: Option<tokio::process::ChildStdout>, tx: mpsc::Sender<String>) -> PipeEnd {
-    let Some(out) = out else { return PipeEnd::Unknown };
-    let mut r = BufReader::new(out);
+struct ReadBoundary {
+    began: Instant,
+    data: StreamBoundary,
+    wait_observed: Option<bool>,
+}
+impl ReadBoundary {
+    fn new() -> Self {
+        Self { began: Instant::now(), data: StreamBoundary::default(), wait_observed: Some(false) }
+    }
+    fn at_ms(&mut self) -> Option<u32> {
+        let ms = u32::try_from(self.began.elapsed().as_millis()).ok();
+        self.data.overflow |= ms.is_none();
+        ms
+    }
+    fn add(&mut self, bytes: usize) {
+        let n = u32::try_from(bytes).ok().and_then(|n| self.data.bytes.checked_add(n));
+        self.data.overflow |= n.is_none();
+        self.data.bytes = n.unwrap_or(u32::MAX);
+        self.data.last_byte_ms = self.at_ms();
+    }
+    fn snapshot(&self) -> StreamBoundary {
+        let mut data = self.data.clone();
+        data.snapshot_ms = u32::try_from(self.began.elapsed().as_millis()).ok();
+        data.overflow |= data.snapshot_ms.is_none();
+        data.wait_before_close = self.wait_observed;
+        data
+    }
+}
+
+// Observe actual pipe reads, including a partial line still held by read_until/BufReader.
+struct ObservedRead<R> {
+    inner: R,
+    boundary: Arc<Mutex<ReadBoundary>>,
+}
+impl<R: AsyncRead + Unpin> AsyncRead for ObservedRead<R> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Ok(mut b) = this.boundary.lock() {
+            match &result {
+                Poll::Ready(Ok(())) if buf.filled().len() > before => b.add(buf.filled().len() - before),
+                Poll::Ready(Ok(())) => b.data.pre_stdout = Some(PipeEnd::Eof),
+                Poll::Ready(Err(_)) => b.data.pre_stdout = Some(PipeEnd::ReadError),
+                Poll::Pending => {}
+            }
+        }
+        result
+    }
+}
+
+async fn read_lines(out: Option<tokio::process::ChildStdout>, tx: mpsc::Sender<String>, boundary: Arc<Mutex<ReadBoundary>>) -> PipeEnd {
+    let Some(out) = out else {
+        if let Ok(mut b) = boundary.lock() {
+            b.data.pre_stdout = Some(PipeEnd::Unknown);
+        }
+        return PipeEnd::Unknown;
+    };
+    read_lines_from(out, tx, boundary).await
+}
+
+async fn read_lines_from<R: AsyncRead + Unpin>(out: R, tx: mpsc::Sender<String>, boundary: Arc<Mutex<ReadBoundary>>) -> PipeEnd {
+    let mut r = BufReader::new(ObservedRead { inner: out, boundary: boundary.clone() });
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -833,6 +934,10 @@ async fn read_lines(out: Option<tokio::process::ChildStdout>, tx: mpsc::Sender<S
             return PipeEnd::Eof;
         }
         if buf.last() != Some(&b'\n') && n >= MAX_LINE {
+            if let Ok(mut b) = boundary.lock() {
+                b.data.overflow |= b.data.discarded == u32::MAX;
+                b.data.discarded = b.data.discarded.saturating_add(1);
+            }
             loop {
                 let mut skip = Vec::new();
                 match (&mut r).take(MAX_LINE as u64).read_until(b'\n', &mut skip).await {
@@ -844,8 +949,27 @@ async fn read_lines(out: Option<tokio::process::ChildStdout>, tx: mpsc::Sender<S
             }
             continue;
         }
-        if tx.send(collect::decode(&buf)).await.is_err() {
+        let frame = collect::decode(&buf);
+        let Ok(permit) = tx.reserve().await else {
+            if let Ok(mut b) = boundary.lock() {
+                b.data.pre_stdout = Some(PipeEnd::Cancelled);
+            }
             return PipeEnd::Cancelled;
+        };
+        // Commit metadata before publishing: the consumer may immediately snapshot and close.
+        match boundary.lock() {
+            Ok(mut b) => {
+                b.data.overflow |= b.data.forwarded == u32::MAX;
+                b.data.forwarded = b.data.forwarded.saturating_add(1);
+                if buf.last() == Some(&b'\n') {
+                    b.data.last_line_ms = b.at_ms();
+                }
+                // No await: snapshot and publication share the same linearization boundary.
+                permit.send(frame);
+            }
+            Err(_) => {
+                permit.send(frame);
+            } // Keep delivery; poisoned diagnostics stay unknown.
         }
     }
 }
@@ -1389,6 +1513,20 @@ fn stop_requested(rx: &watch::Receiver<Option<Stop>>) -> Option<Stop> {
     rx.borrow().clone()
 }
 
+fn end_category(timed_out: bool, samples: u64, ended: &Ended) -> Option<Category> {
+    if timed_out {
+        Some(if samples == 0 { Category::FirstSampleTimeout } else { Category::StallTimeout })
+    } else if ended.code.is_some_and(|c| c != 0) {
+        Some(Category::ExitNonzero)
+    } else if ended.wait_observed != Some(true) {
+        Some(Category::WaitUnknown)
+    } else if ended.code.is_none() {
+        Some(Category::StatusWithoutCode)
+    } else {
+        None
+    }
+}
+
 /// 1 台の流れ: 開く → 読む → 切れたらつなぎ直す（続けての失敗が max_retries を超えたら止める）
 async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Receiver<Option<Stop>>) {
     let o = live.opts.clone();
@@ -1422,6 +1560,8 @@ async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Re
                 let mut last_at = None;
                 let mut rejected = 0u64;
                 let mut timed_out = false;
+                let mut last_sample = None;
+                let mut timeout_sample_age = None;
                 let mut checkpoint = Instant::now();
                 let transport_pid = src.transport_pid;
                 let stopped: Option<Stop> = loop {
@@ -1441,6 +1581,7 @@ async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Re
                                 }
                                 Some(Msg::Sample(s)) => {
                                     got += 1;
+                                    last_sample = Some(Instant::now());
                                     last_seq = s.seq; last_at = Some(now_ms());
                                     live.on_sample(&node.id, epoch, *s);
                                     if got == 1 { live.record(&node.id, epoch, attempt, Kind::FirstSample, Data { seq: last_seq, last_sample_at: last_at, transport_pid, duration_ms: Some(elapsed_ms(opened_at)), ..Data::default() }); }
@@ -1455,24 +1596,22 @@ async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Re
                             Ok(None) => break None,
                             Err(_) => {
                                 timed_out = true;
+                                timeout_sample_age = last_sample.map(|at: Instant| at.elapsed());
                                 err = format!("{} 秒間データが来ない", secs(wait));
                                 break None;
                             }
                         }
                     }
                 };
-                let ended = src.close().await;
-                let category = if timed_out {
-                    Some(if got == 0 { Category::FirstSampleTimeout } else { Category::StallTimeout })
-                } else if ended.code.is_some_and(|c| c != 0) {
-                    Some(Category::ExitNonzero)
-                } else if ended.wait_observed != Some(true) {
-                    Some(Category::WaitUnknown)
-                } else if ended.code.is_none() {
-                    Some(Category::StatusWithoutCode)
+                let trigger = if timed_out {
+                    CloseTrigger::Timeout
+                } else if stopped.is_some() {
+                    CloseTrigger::Stop
                 } else {
-                    None
+                    CloseTrigger::ChannelEnd
                 };
+                let ended = src.close_with(trigger, timeout_sample_age).await;
+                let category = end_category(timed_out, got, &ended);
                 live.record(
                     &node.id,
                     epoch,
@@ -1492,6 +1631,7 @@ async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Re
                         rejected: Some(rejected),
                         seq: last_seq,
                         last_sample_at: last_at,
+                        io: ended.io.clone().map(StreamIo::Observed),
                         ..Data::default()
                     },
                 );
@@ -2105,5 +2245,143 @@ for _ in range(400):
             assert!(journal.shutdown(Duration::from_secs(2)).await);
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    // No remote sampler: the owned local child exits zero only after Source closes stdin.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn journal_separates_timeout_cleanup_from_natural_zero_exit() {
+        struct StdinRoute(bool);
+        impl Route for StdinRoute {
+            fn open(&self, _: &Node, _: &Opts) -> Result<Source, String> {
+                let tail = if self.0 { "cat >/dev/null" } else { "exit 0" };
+                spawn(Launch {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), format!("echo '{{\"type\":\"s\",\"seq\":1}}'; {tail}")],
+                    keep_stdin: true,
+                    ..Launch::default()
+                })
+            }
+        }
+        for silent in [true, false] {
+            let db = Arc::new(Mutex::new(crate::db::Store::open_in_memory().unwrap()));
+            let journal = Journal::start(db.clone());
+            let live = Live::new(Arc::new(StdinRoute(silent)), Opts { stall_timeout: Duration::from_millis(150), max_retries: 0, ..quick() }, Box::new(|_| {}));
+            live.bind_journal(journal.clone());
+            live.start(&[node("fixture", "macos")], &[]);
+            until("disconnected", || state(&live, "fixture").1 == "disconnected").await;
+            assert!(journal.flush(Duration::from_secs(2)).await);
+            let rows = db.lock().unwrap().monitor_events(&crate::monitor_journal::Filter::default()).unwrap();
+            let end = rows["events"].as_array().unwrap().iter().find(|e| e["kind"] == "end").unwrap();
+            let d = &end["data"];
+            assert_eq!(d["exit_code"], 0);
+            assert_eq!(d["wait_observed"], true);
+            assert_eq!(d["category"], if silent { json!("stall_timeout") } else { Value::Null });
+            assert_eq!(d["io"]["close_trigger"], if silent { "timeout" } else { "channel_end" });
+            assert_eq!(d["io"]["kill_attempted"], false);
+            assert_eq!(d["io"]["forwarded"], 1);
+            if silent {
+                assert_eq!(d["io"]["wait_origin"], "close");
+                assert_eq!(d["io"]["wait_before_close"], false);
+                assert!(d["io"]["sample_age_ms"].as_u64().unwrap() >= 150);
+                assert_eq!(d["io"]["pre_stdout"], Value::Null);
+            } else {
+                assert_eq!(d["io"]["pre_stdout"], "eof");
+                assert_eq!(d["io"]["sample_age_ms"], Value::Null);
+            }
+            assert_eq!(d["producer_pid"], Value::Null);
+            assert_eq!(d["actual_source_sha256"], Value::Null);
+            live.shutdown(Duration::from_secs(2)).await;
+            assert!(journal.shutdown(Duration::from_secs(2)).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_boundary_retains_partial_discard_and_error_without_payload() {
+        let boundary = Arc::new(Mutex::new(ReadBoundary::new()));
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::channel(2);
+        let task = tokio::spawn(read_lines_from(reader, tx, boundary.clone()));
+        writer.write_all(b"partial-secret-canary").await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(30), rx.recv()).await.is_err());
+        let pre = boundary.lock().unwrap().snapshot();
+        assert_eq!(pre.bytes, 21);
+        assert_eq!(pre.forwarded, 0);
+        assert!(pre.last_byte_ms.is_some() && pre.last_line_ms.is_none());
+        assert!(pre.snapshot_ms >= pre.last_byte_ms);
+        assert_eq!(pre.pre_stdout, None);
+        writer.write_all(&vec![b'x'; MAX_LINE]).await.unwrap();
+        writer.write_all(b"\n{\"type\":\"s\",\"seq\":1}\n").await.unwrap();
+        assert!(rx.recv().await.unwrap().contains("\"seq\":1"));
+        drop(writer);
+        assert_eq!(task.await.unwrap(), PipeEnd::Eof);
+        let post = boundary.lock().unwrap().snapshot();
+        assert_eq!(post.discarded, 1);
+        assert_eq!(post.forwarded, 1);
+        assert_eq!(post.pre_stdout, Some(PipeEnd::Eof));
+        assert!(!serde_json::to_string(&post).unwrap().contains("secret-canary"));
+
+        struct Broken;
+        impl tokio::io::AsyncRead for Broken {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("secret-canary")))
+            }
+        }
+        let boundary = Arc::new(Mutex::new(ReadBoundary::new()));
+        let (tx, _) = mpsc::channel(1);
+        assert_eq!(read_lines_from(Broken, tx, boundary.clone()).await, PipeEnd::ReadError);
+        let d = boundary.lock().unwrap().snapshot();
+        assert_eq!(d.pre_stdout, Some(PipeEnd::ReadError));
+        assert_eq!(d.bytes, 0);
+        assert!(!serde_json::to_string(&d).unwrap().contains("secret-canary"));
+
+        // Keep the existing final unterminated-frame behavior, but do not call it a newline.
+        let boundary = Arc::new(Mutex::new(ReadBoundary::new()));
+        let (tx, mut rx) = mpsc::channel(1);
+        assert_eq!(read_lines_from(&b"{\"type\":\"s\",\"seq\":1}"[..], tx, boundary.clone()).await, PipeEnd::Eof);
+        assert!(matches!(parse_line(&rx.recv().await.unwrap()), Some(Msg::Sample(_))));
+        let partial = boundary.lock().unwrap().snapshot();
+        assert_eq!(partial.forwarded, 1);
+        assert_eq!(partial.last_line_ms, None);
+        assert_eq!(partial.pre_stdout, Some(PipeEnd::Eof));
+    }
+
+    #[tokio::test]
+    async fn missing_cleanup_report_retains_unknown_diagnostics() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+        let (stop, _stopped) = oneshot::channel();
+        let (done, report) = oneshot::channel();
+        drop(done);
+        let ended = Source::new(rx, stop, report).close().await;
+        assert_eq!(ended.wait_observed, None);
+        assert_eq!(ended.code, None);
+        assert_eq!(ended.wait_origin, None);
+        assert_eq!(ended.kill_attempted, None);
+        assert_eq!(ended.io, None);
+        assert_eq!(end_category(false, 1, &ended), Some(Category::WaitUnknown));
+        assert_eq!(end_category(true, 1, &ended), Some(Category::StallTimeout));
+        let ended =
+            Ended { code: Some(0), wait_observed: Some(true), io: Some(StreamBoundary { overflow: true, ..StreamBoundary::default() }), ..Ended::default() };
+        assert_eq!(end_category(false, 1, &ended), None);
+        assert!(ended.io.as_ref().unwrap().overflow);
+        // Read errors remain explicit; diagnostics do not rewrite the pre-existing exit category.
+        let ended = Ended { code: Some(0), wait_observed: Some(true), stdout: PipeEnd::ReadError, ..Ended::default() };
+        assert_eq!(end_category(false, 1, &ended), None);
+        assert_eq!(ended.stdout, PipeEnd::ReadError);
+        assert!(ended.io.is_none());
+    }
+
+    #[test]
+    fn read_boundary_saturation_is_explicit_unknown() {
+        let mut b = ReadBoundary::new();
+        b.add(u32::MAX as usize);
+        b.add(1);
+        assert_eq!(b.snapshot().bytes, u32::MAX);
+        assert!(b.snapshot().overflow);
     }
 }
