@@ -97,7 +97,13 @@ fn current_scopes_are_unbounded_while_history_stays_bounded_and_exports_keep_rec
     let public: Value = serde_json::from_str(&public_json(&view, ExportView::All)).unwrap();
     assert!(view["entities"].as_array().unwrap().iter().any(|entity| entity["id"] == oldest_id));
     assert!(public["entities"].as_array().unwrap().iter().any(|entity| entity["currentness"] == "complete" && entity["observed_at_ms"] == 4_242));
-    assert!(public["entities"].as_array().unwrap().iter().any(|entity| entity["currentness"] == "partial" && entity["observed_at_ms"] == 1_001));
+    assert!(
+        public["entities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entity| entity["currentness"] == "partial" && entity["observed_at_ms"] == 1_000 && entity["last_receipt_observed_at_ms"] == 1_001)
+    );
     assert!(public_mermaid(&view, ExportView::All).contains("(partial)"));
     drop(reopened);
     let _ = std::fs::remove_dir_all(directory);
@@ -272,4 +278,305 @@ fn view_projects_shared_entities_and_edges_once_with_scope_provenance() {
     let mermaid = public_mermaid(&view, ExportView::All);
     assert_eq!(mermaid.matches("host-1").count(), 1);
     let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
+fn accepted_facts_bind_to_applied_scope_and_survive_later_partial_history() {
+    let db = Store::open_in_memory().unwrap();
+    let mut complete = snapshot("scope-a", ScopeStatus::Complete, "shared");
+    complete.observed_at_ms = 100;
+    db.record_topology("complete", &complete, 900).unwrap();
+    for i in 0..=200 {
+        let mut partial = complete.clone();
+        partial.status = ScopeStatus::Partial;
+        partial.observed_at_ms = 1000 + i;
+        db.record_topology(&format!("partial-{i}"), &partial, 1000 + i).unwrap();
+    }
+    let view = db.topology_view().unwrap();
+    assert_eq!(view["entities"][0]["facts_observed_at_ms"], 100);
+    assert_eq!(view["edges"][0]["facts_observed_at_ms"], 100);
+    let public: Value = serde_json::from_str(&public_json(&view, ExportView::All)).unwrap();
+    assert_eq!(public["entities"][0]["observed_at_ms"], 100);
+    assert!(public["entities"][0]["last_attempt_at_ms"].is_null());
+    assert_eq!(public["entities"][0]["last_receipt_observed_at_ms"], 1200);
+    db.conn().execute("DELETE FROM topology_runs WHERE run_id='complete'", []).unwrap();
+    assert_eq!(db.topology_view().unwrap()["entities"][0]["facts_observed_at_ms"], 100, "accepted binding does not cascade from run cleanup");
+    // Applying older facts later must bind to the newly adopted row, not max receipt time.
+    complete.observed_at_ms = 50;
+    complete.entities[0].attributes = json!({"revision":"older-facts-applied-later"});
+    db.record_topology("later-applied", &complete, 2000).unwrap();
+    let view = db.topology_view().unwrap();
+    assert_eq!(view["entities"][0]["facts_observed_at_ms"], 50);
+    assert_eq!(view["entities"][0]["accepted_run_id"], "later-applied");
+    assert_eq!(view["entities"][0]["attributes"]["revision"], "older-facts-applied-later");
+    let lease = db.acquire_topology_lease_fenced("fixture", 0, 10000).unwrap().unwrap();
+    db.save_source_cache_fenced(&lease, &cache_entry("fixture", "digest", 7), 3000).unwrap();
+    let mut cached = complete;
+    cached.observed_at_ms = 50;
+    db.record_topology("cached", &cached, 3000).unwrap();
+    assert_eq!(db.topology_view().unwrap()["entities"][0]["facts_observed_at_ms"], 50);
+    assert_eq!(db.source_cache(&cache_entry("fixture", "digest", 7).key).unwrap().unwrap().fetched_at_ms, 7);
+}
+
+#[test]
+fn shared_projection_facts_follow_attribute_owner_not_another_scope_or_receipt_maximum() {
+    let db = Store::open_in_memory().unwrap();
+    let mut a = snapshot("a-scope", ScopeStatus::Complete, "shared");
+    a.observed_at_ms = 10;
+    a.entities[0].attributes = json!({"revision":"owner-a"});
+    let mut b = a.clone();
+    b.scope_id = "b-scope".into();
+    b.observed_at_ms = 900;
+    b.entities[0].attributes = json!({"revision":"owner-b"});
+    db.record_topology("b", &b, 1).unwrap();
+    db.record_topology("a", &a, 2).unwrap();
+    let view = db.topology_view().unwrap();
+    assert_eq!(view["entities"][0]["attributes"]["revision"], "owner-a");
+    assert_eq!(view["entities"][0]["facts_observed_at_ms"], 10);
+    assert_eq!(view["entities"][0]["accepted_run_id"], "a");
+    assert_eq!(view["entities"][0]["scope_ids"].as_array().unwrap().len(), 2);
+    assert_eq!(view["edges"][0]["facts_observed_at_ms"], 10);
+    db.conn().execute("DELETE FROM topology_accepted_facts WHERE scope_id='a-scope'", []).unwrap();
+    let unknown = db.topology_view().unwrap();
+    assert!(unknown["entities"][0]["facts_observed_at_ms"].is_null());
+    assert_eq!(unknown["entities"][0]["attributes"]["revision"], "owner-a");
+}
+
+#[test]
+fn accepted_graph_and_fact_binding_rollback_together() {
+    let db = Store::open_in_memory().unwrap();
+    let mut old = snapshot("scope", ScopeStatus::Complete, "stable");
+    old.observed_at_ms = 10;
+    db.record_topology("old", &old, 100).unwrap();
+    let before = db.topology_view().unwrap();
+    db.conn()
+        .execute_batch("CREATE TRIGGER reject_fact_update BEFORE UPDATE ON topology_accepted_facts BEGIN SELECT RAISE(ABORT,'fixture atomic rollback'); END;")
+        .unwrap();
+    let mut next = old;
+    next.entities[0].attributes = json!({"revision":"new"});
+    next.observed_at_ms = 20;
+    assert!(db.record_topology("new", &next, 200).is_err());
+    assert_eq!(db.topology_view().unwrap(), before);
+    db.conn().execute_batch("DROP TRIGGER reject_fact_update;CREATE TRIGGER reject_change_insert BEFORE INSERT ON topology_changes WHEN NEW.run_id='new' BEGIN SELECT RAISE(ABORT,'fixture rollback after facts'); END;").unwrap();
+    assert!(db.record_topology("new", &next, 200).is_err());
+    assert_eq!(db.topology_view().unwrap(), before);
+}
+
+#[test]
+fn unknown_or_corrupt_fact_metadata_does_not_hide_accepted_or_write_on_view() {
+    for update in
+        ["version=2", "version='unknown'", "facts_observed_at_ms=-1", "facts_observed_at_ms='unknown'", "facts_observed_at_ms=x'00'", "accepted_run_id=x'00'"]
+    {
+        let db = Store::open_in_memory().unwrap();
+        db.record_topology("accepted", &snapshot("scope", ScopeStatus::Complete, "stable"), 100).unwrap();
+        db.conn().execute(&format!("UPDATE topology_accepted_facts SET {update}"), []).unwrap();
+        let changes = db.conn().total_changes();
+        let view = db.topology_view().unwrap();
+        assert_eq!(view["entities"][0]["label"], "stable");
+        assert!(view["entities"][0]["facts_observed_at_ms"].is_null(), "{update}");
+        assert!(view["edges"][0]["facts_observed_at_ms"].is_null());
+        assert_eq!(db.conn().total_changes(), changes);
+    }
+    let db = Store::open_in_memory().unwrap();
+    db.record_topology("accepted", &snapshot("scope", ScopeStatus::Complete, "stable"), 100).unwrap();
+    db.conn().execute_batch("ALTER TABLE topology_accepted_facts RENAME COLUMN version TO unknown_version;").unwrap();
+    assert!(db.topology_view().unwrap()["entities"][0]["facts_observed_at_ms"].is_null());
+}
+
+#[test]
+fn legacy_fact_metadata_is_not_bootstrapped_from_receipts_on_read_only_or_reopen() {
+    let path = std::env::temp_dir().join(format!(
+        "tune-facts-legacy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir(&path).unwrap();
+    let db = Store::open(&path).unwrap();
+    let mut s = snapshot("scope", ScopeStatus::Complete, "stable");
+    s.observed_at_ms = 999;
+    db.record_topology("old-complete", &s, 100).unwrap();
+    db.conn().execute_batch("DROP TABLE topology_accepted_facts;PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    drop(db);
+    let bytes = std::fs::read(path.join(tune_core::db::DB_FILE)).unwrap();
+    let db = Store::open_read_only(&path).unwrap();
+    let changes = db.conn().total_changes();
+    let view = db.topology_view().unwrap();
+    assert_eq!(view["entities"][0]["label"], "stable");
+    assert!(view["entities"][0]["facts_observed_at_ms"].is_null());
+    assert_eq!(db.conn().total_changes(), changes);
+    drop(db);
+    assert_eq!(std::fs::read(path.join(tune_core::db::DB_FILE)).unwrap(), bytes);
+    let db = Store::open(&path).unwrap();
+    assert!(db.topology_view().unwrap()["entities"][0]["facts_observed_at_ms"].is_null());
+    s.observed_at_ms = 10;
+    db.record_topology("new-complete", &s, 200).unwrap();
+    assert_eq!(db.topology_view().unwrap()["entities"][0]["facts_observed_at_ms"], 10);
+    drop(db);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn public_facts_and_attempt_times_never_export_candidates_or_metadata_identities() {
+    let id = Entity::new(EntityKind::Host, "private-canary").id;
+    for facts in [Value::Null, json!(-1), json!("private-canary"), json!(0), json!(42)] {
+        let graph = json!({"entities":[{"id":id,"kind":"host","label":"private-canary","scope_ids":["private-scope"],"facts_observed_at_ms":facts,"accepted_run_id":"private-run"}],"edges":[],"scopes":[{"scope_id":"private-scope","status":"partial","observed_at":99}],"candidates":[{"scope_id":"private-candidate-scope","attempt_id":"private-attempt","source_generation":"private-source","digest":"private-digest","entities":[{"kind":"docker_container","label":"private-candidate"}],"edges":[]}]});
+        let exported = public_json(&graph, ExportView::All);
+        let public: Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(public["entities"][0]["observed_at_ms"], facts.as_i64().filter(|at| *at >= 0).map_or(Value::Null, |at| json!(at)));
+        assert!(public["entities"][0]["last_attempt_at_ms"].is_null());
+        assert_eq!(public["entities"][0]["last_receipt_observed_at_ms"], 99);
+        for text in [exported, public_mermaid(&graph, ExportView::All)] {
+            for private in ["private-", "accepted_run_id", "candidates", "source_generation", "digest"] {
+                assert!(!text.contains(private));
+            }
+        }
+    }
+}
+
+#[test]
+fn concurrent_complete_writes_never_mix_accepted_attributes_and_facts() {
+    let path = std::env::temp_dir().join(format!(
+        "tune-facts-concurrent-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir(&path).unwrap();
+    let reader = Store::open(&path).unwrap();
+    let writer = Store::open(&path).unwrap();
+    let mut initial = snapshot("scope", ScopeStatus::Complete, "shared");
+    initial.observed_at_ms = 0;
+    initial.entities[0].attributes = json!({"fact_version":0,"memory_bytes":0});
+    writer.record_topology("initial", &initial, 0).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let started = barrier.clone();
+    let thread = std::thread::spawn(move || {
+        started.wait();
+        for i in 1..=50 {
+            let mut s = initial.clone();
+            s.observed_at_ms = i;
+            s.entities[0].attributes = json!({"fact_version":i,"memory_bytes":i});
+            writer.record_topology(&format!("write-{i}"), &s, i).unwrap();
+        }
+    });
+    barrier.wait();
+    for index in 0..100 {
+        let view = match index % 3 {
+            0 => reader.topology_view(),
+            1 => reader.topology_accepted_view(),
+            _ => reader.topology_ui_view(&Default::default()),
+        }
+        .unwrap();
+        assert_eq!(view["entities"][0]["attributes"]["memory_bytes"], view["entities"][0]["facts_observed_at_ms"]);
+    }
+    thread.join().unwrap();
+    drop(reader);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn accepted_only_view_never_reads_candidate_schema_or_payload_and_preserves_export() {
+    let db = Store::open_in_memory().unwrap();
+    let mut s = snapshot("scope", ScopeStatus::Complete, "stable");
+    s.observed_at_ms = 42;
+    db.record_topology("accepted", &s, 100).unwrap();
+    let full = db.topology_view().unwrap();
+    // Inspecting this optional candidate view, even via PRAGMA, raises a real
+    // SQL error. Accepted-only reads must not reach it or mask full API errors.
+    db.conn().execute_batch("DROP TABLE docker_candidates;CREATE VIEW docker_candidates AS SELECT candidate_probe_must_not_run() AS scope_id;DROP TABLE docker_ui_rows;CREATE VIEW docker_ui_rows AS SELECT projection_probe_must_not_run() AS scope_id;").unwrap();
+    assert!(db.topology_view().is_err());
+    let changes = db.conn().total_changes();
+    let accepted = db.topology_accepted_view().unwrap();
+    let mut expected = full.clone();
+    expected.as_object_mut().unwrap().remove("candidates");
+    assert_eq!(accepted, expected);
+    assert_eq!(accepted["entities"][0]["facts_observed_at_ms"], 42);
+    assert!(accepted.get("candidates").is_none());
+    assert_eq!(public_json(&accepted, ExportView::All), public_json(&full, ExportView::All));
+    assert_eq!(public_mermaid(&accepted, ExportView::All), public_mermaid(&full, ExportView::All));
+    assert_eq!(db.conn().total_changes(), changes);
+}
+
+fn reopen_unknown_ui_schema(ddl: &str) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "tune-optional-ui-{}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir(&path).unwrap();
+    let db = Store::open(&path).unwrap();
+    let mut s = snapshot("accepted-scope", ScopeStatus::Complete, "stable");
+    s.observed_at_ms = 42;
+    db.record_topology("accepted", &s, 100).unwrap();
+    let before = db.topology_accepted_view().unwrap();
+    db.conn().execute_batch(&format!("DROP TABLE docker_ui_rows;{ddl}")).unwrap();
+    let schema: String = db.conn().query_row("SELECT sql FROM sqlite_schema WHERE name='docker_ui_rows'", [], |r| r.get(0)).unwrap();
+    drop(db);
+    let reopened = Store::open(&path);
+    assert!(reopened.is_ok(), "unknown optional UI schema must not block accepted startup: {:?}", reopened.as_ref().err());
+    let db = reopened.unwrap();
+    assert_eq!(db.topology_accepted_view().unwrap(), before);
+    assert_eq!(db.conn().query_row("SELECT sql FROM sqlite_schema WHERE name='docker_ui_rows'", [], |r| r.get::<_, String>(0)).unwrap(), schema);
+    assert_eq!(db.conn().query_row("SELECT old FROM docker_ui_rows", [], |r| r.get::<_, String>(0)).unwrap(), "preserved");
+    assert_eq!(db.conn().query_row("SELECT count(*) FROM sqlite_schema WHERE name='docker_ui_rows_selection'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    let writes = db.conn().total_changes();
+    let ui = db.topology_ui_view(&Default::default()).unwrap();
+    assert!(ui["candidates"].as_array().unwrap().is_empty());
+    assert!(!ui["entities"].as_array().unwrap().is_empty());
+    assert_eq!(ui["window"]["candidate_unavailable_reasons"], json!(["unknown_projection_schema"]));
+    assert_eq!(db.conn().total_changes(), writes);
+    drop(db);
+    let readonly = Store::open_read_only(&path).unwrap();
+    let writes = readonly.conn().total_changes();
+    assert!(readonly.topology_ui_view(&Default::default()).unwrap()["candidates"].as_array().unwrap().is_empty());
+    assert_eq!(readonly.topology_accepted_view().unwrap(), before);
+    assert_eq!(readonly.conn().total_changes(), writes);
+    drop(readonly);
+    std::fs::remove_dir_all(path).unwrap();
+}
+#[test]
+fn optional_ui_unknown_table_does_not_block_accepted_reopen() {
+    reopen_unknown_ui_schema("CREATE TABLE docker_ui_rows(old TEXT);INSERT INTO docker_ui_rows VALUES ('preserved');");
+}
+#[test]
+fn optional_ui_future_table_does_not_block_accepted_reopen() {
+    reopen_unknown_ui_schema("CREATE TABLE docker_ui_rows(old TEXT,future_version INTEGER);INSERT INTO docker_ui_rows VALUES ('preserved',2);");
+}
+#[test]
+fn optional_ui_unknown_view_does_not_block_accepted_reopen() {
+    reopen_unknown_ui_schema("CREATE VIEW docker_ui_rows AS SELECT 'preserved' AS old;");
+}
+#[test]
+fn optional_ui_known_index_is_initialized_only_on_writable_open() {
+    let path = std::env::temp_dir().join(format!(
+        "tune-optional-index-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir(&path).unwrap();
+    let columns = |db: &Store| -> Vec<String> {
+        let mut s = db.conn().prepare("PRAGMA index_info(docker_ui_rows_selection)").unwrap();
+        s.query_map([], |r| r.get(2)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    };
+    let db = Store::open(&path).unwrap();
+    assert_eq!(columns(&db), vec!["row_type", "kind", "scope_id", "id"]);
+    db.conn().execute_batch("DROP INDEX docker_ui_rows_selection").unwrap();
+    drop(db);
+    let readonly = Store::open_read_only(&path).unwrap();
+    let writes = readonly.conn().total_changes();
+    readonly.topology_ui_view(&Default::default()).unwrap();
+    assert!(columns(&readonly).is_empty());
+    assert_eq!(readonly.conn().total_changes(), writes);
+    drop(readonly);
+    let db = Store::open(&path).unwrap();
+    assert_eq!(columns(&db), vec!["row_type", "kind", "scope_id", "id"]);
+    let writes = db.conn().total_changes();
+    db.topology_ui_view(&Default::default()).unwrap();
+    assert_eq!(db.conn().total_changes(), writes);
+    drop(db);
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(columns(&reopened), vec!["row_type", "kind", "scope_id", "id"]);
+    drop(reopened);
+    std::fs::remove_dir_all(path).unwrap();
 }

@@ -77,7 +77,7 @@
     monitorSettings: (patch) => invoke('monitor_settings', { patch: patch ?? null }),
     hubPull: () => invoke('hub_pull'),
     onMonitor: (fn) => { listen('monitor', (p) => fn(p)); },
-    topologyView: () => invoke('topology_view'),
+    topologyView: (request) => invoke('topology_view', request ? { request } : {}),
     topologyRefresh: () => invoke('topology_refresh'),
     topologyExport: (view, format) => invoke('topology_export', { view: String(view || 'all'), format: String(format || 'json') }),
     onTopologyUpdated: (fn) => { listen('topology-updated', (p) => fn(p)); },

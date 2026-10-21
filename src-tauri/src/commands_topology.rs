@@ -8,8 +8,8 @@ use tune_core::{
 };
 
 #[tauri::command]
-pub async fn topology_view(e: State<'_, Arc<Engine>>) -> Result<Value, String> {
-    e.topology_view()
+pub async fn topology_view(e: State<'_, Arc<Engine>>, request: Option<tune_core::db::TopologyUiRequest>) -> Result<Value, String> {
+    e.topology_ui_view(&request.unwrap_or_default())
 }
 
 #[tauri::command]
@@ -28,7 +28,7 @@ pub async fn topology_export(e: State<'_, Arc<Engine>>, view: String, format: St
         "cicd" => ExportView::Cicd,
         _ => return Err("unknown topology export view".into()),
     };
-    let graph = e.topology_view()?;
+    let graph = e.topology_accepted_view()?;
     match format.as_str() {
         "json" => Ok(public_json(&graph, view)),
         "mermaid" => Ok(public_mermaid(&graph, view)),
