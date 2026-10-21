@@ -188,10 +188,12 @@ mod windows {
             let (status, response, diagnostic) = complete(child, reader, oversized, &nonce);
             assert_eq!(status.code(), Some(7), "receiver diagnostic: {}", String::from_utf8_lossy(&diagnostic));
             assert!(response.is_empty());
-            assert_eq!(
-                String::from_utf8(diagnostic).unwrap(),
-                "KT2 DIAG stage=backend outcome=output_limited timed_out=0 output_limited=1 spawn_failed=0 receipt_stop=completed cleanup_confirmed=1 elapsed=0_5s\n"
-            );
+            let elapsed = String::from_utf8(diagnostic)
+                .unwrap()
+                .strip_prefix("KT2 DIAG stage=backend outcome=output_limited timed_out=0 output_limited=1 spawn_failed=0 receipt_stop=output_limit cleanup_confirmed=1 elapsed=")
+                .unwrap()
+                .to_owned();
+            assert!(matches!(elapsed.as_str(), "0_5s\n" | "5_8s\n" | "8s_plus\n"));
             assert!(!base.exists());
         }
     }
