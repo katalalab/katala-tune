@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tune_core::collect::{BoundedResult, run_bounded_with_env};
@@ -15,6 +15,7 @@ impl Drop for WriteLock {
 
 struct Observation {
     result: BoundedResult,
+    elapsed: Duration,
     started: bool,
     locked: bool,
     stopped: bool,
@@ -36,6 +37,7 @@ async fn finite_monitor(hold_write_lock: bool) -> Observation {
     drop(Store::open(&data).unwrap());
     let child_cfg = cfg.to_string_lossy().into_owned();
     let child_data = data.to_string_lossy().into_owned();
+    let began = Instant::now();
     let child = tokio::spawn(async move {
         run_bounded_with_env(
             env!("CARGO_BIN_EXE_tune"),
@@ -75,6 +77,7 @@ async fn finite_monitor(hold_write_lock: bool) -> Observation {
     let locked = lock.is_some();
     // No assertions while the retained, 30s-bounded child is active. The lock is RAII.
     let result = child.await.unwrap();
+    let elapsed = began.elapsed();
     drop(lock);
     let persisted = Store::open_read_only(&data).ok().and_then(|d| {
         d.conn()
@@ -89,11 +92,19 @@ async fn finite_monitor(hold_write_lock: bool) -> Observation {
     let persisted_events = persisted.map(|p| p.1);
     let config_held = std::fs::read_to_string(&cfg).is_ok_and(|s| s == text);
     let removed = std::fs::remove_dir_all(&root).is_ok();
-    Observation { result, started, locked, stopped, persisted_events, config_held, removed }
+    Observation { result, elapsed, started, locked, stopped, persisted_events, config_held, removed }
 }
 
 fn bounded_and_clean(o: &Observation) {
-    assert!(!o.result.timed_out && !o.result.output_limited && !o.result.spawn_failed);
+    assert!(
+        !o.result.timed_out && !o.result.output_limited && !o.result.spawn_failed,
+        "bounded monitor: timed_out={} output_limited={} spawn_failed={} code={:?} elapsed_ms={}",
+        o.result.timed_out,
+        o.result.output_limited,
+        o.result.spawn_failed,
+        o.result.code,
+        o.elapsed.as_millis()
+    );
     assert!(o.started, "the private journal must reach the persistent start barrier");
     assert!(o.config_held && o.removed, "private config is unchanged and all DB handles close before cleanup");
 }
