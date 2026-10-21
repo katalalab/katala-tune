@@ -532,8 +532,13 @@ mod tests {
         assert_eq!(j.health()["dropped_total"], 2);
         assert_eq!(j.health()["rejected_total"], 2);
         assert!(j.flush(Duration::from_secs(2)).await);
+        // 合法なhex識別子にも"bad"は含まれ得る。nonceへの偶然の一致を決定的に再現する。
+        db.lock().unwrap().conn().execute("UPDATE monitor_events SET collector_id='bad-1-0',payload=json_set(payload,'$.collector_id','bad-1-0')", []).unwrap();
         let out = db.lock().unwrap().monitor_events(&Filter::default()).unwrap();
-        assert!(!out.to_string().contains("bad"));
+        let events = out["events"].as_array().unwrap();
+        assert!(events.iter().any(|e| e["kind"] == "collector_started"));
+        assert!(events.iter().all(|e| e["collector_id"] == "bad-1-0"));
+        assert!(events.iter().all(|e| e["node_id"].is_null()), "neither oversized nor control-bearing node IDs may be stored");
         assert!(j.shutdown(Duration::from_secs(2)).await);
     }
     #[test]
