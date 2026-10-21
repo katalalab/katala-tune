@@ -17,10 +17,10 @@ impl Store {
     pub(crate) fn insert_monitor_events(&self, events: &[Event], now: i64) -> Result<usize> {
         // journalのblocking仕事をSQLiteの既定busy待機でshutdown期限の外へ残さない。
         // 呼出元はStore mutexを保持する。他のStore書き込みの待機設定は成功/失敗とも復元する。
-        let busy_ms: u64 = self.conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
+        let busy_ms: u32 = self.conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
         self.conn.busy_timeout(Duration::ZERO)?;
         let result = self.insert_monitor_events_nowait(events, now);
-        self.conn.busy_timeout(Duration::from_millis(busy_ms))?;
+        self.conn.busy_timeout(Duration::from_millis(u64::from(busy_ms)))?;
         result
     }
 
@@ -162,7 +162,7 @@ mod tests {
         let blocker = Store::open(&dir).unwrap();
         let timeout = std::time::Duration::from_millis(2500);
         db.conn().busy_timeout(timeout).unwrap();
-        let configured = || db.conn().query_row("PRAGMA busy_timeout", [], |r| r.get::<_, u64>(0)).unwrap();
+        let configured = || db.conn().query_row("PRAGMA busy_timeout", [], |r| r.get::<_, u32>(0)).unwrap();
         db.insert_monitor_events(&[event(1, crate::db::now_ms())], crate::db::now_ms()).unwrap();
         assert_eq!(configured(), 2500, "successful journal writes restore the existing timeout");
         blocker.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
