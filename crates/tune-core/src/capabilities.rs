@@ -418,7 +418,8 @@ function Get-CimInstance {
             "pipes_completed": value.as_ref().and_then(|v| v["pipes_completed"].as_bool()),
             "stderr_clixml": error.trim_start().starts_with("#< CLIXML"),
             "stderr_parser_error": error.contains("ParserError"), "stderr_method_exception": error.contains("MethodInvocationException"),
-            "outer_reader_eof": "unobserved"
+            "outer_reader_eof": result.process_receipt.as_ref().map(|r| r.stdout_eof && r.stderr_eof),
+            "process_receipt": result.process_receipt
         });
         eprintln!("worker transport evidence: {evidence}");
         assert_eq!(result.code, Some(0), "worker transport evidence: {evidence}");
