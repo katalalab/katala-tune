@@ -19,6 +19,25 @@ const vm = require('node:vm');
 const probe = fs.readFileSync(path.join(__dirname, '..', 'probes', 'win_probe.ps1'), 'utf8');
 const windowsPowerShell = process.env.KT_GPU_POWERSHELL || 'powershell.exe';
 
+async function exchangeAfterRequest(exchange, script, options = {}) {
+  const server = net.createServer();
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  let timeout;
+  const barrier = new Promise((resolve, reject) => {
+    timeout = setTimeout(() => reject(new Error('request barrier unavailable')), 1000);
+    server.once('connection', (socket) => {
+      socket.once('error', reject);
+      socket.once('data', (data) => { clearTimeout(timeout); resolve(data.toString('ascii')); });
+    });
+  });
+  const pending = exchange(script(port), options);
+  try {
+    const marker = await barrier;
+    return { marker, result: await pending };
+  } finally { server.close(); }
+}
+
 const node = { id: 'gpu-node', alias: 'mock-gpu', os: 'windows', hold: false, shared: false };
 const now = Date.now();
 const worker = () => ({
@@ -281,9 +300,14 @@ test('KT2 exchange waits for READY before its only request and classifies termin
   assert.equal(nonzero.code, 7);
 
   const bodyHash = require('node:crypto').createHash('sha256').update(body).digest('hex');
-  const heldEof = String.raw`const crypto=require('node:crypto');let chunks=[];process.stdout.write('KT2 READY ${nonce}\n');process.stdin.on('data',d=>chunks.push(d));process.stdin.on('end',()=>{const all=Buffer.concat(chunks),at=all.indexOf(10),line=all.subarray(0,at).toString('ascii').split(' '),bytes=all.subarray(at+1);if(at<0||line.length!==5||line[0]!=='KT2'||line[1]!=='REQUEST'||line[2]!=='${nonce}'||Number(line[3])!==bytes.length||line[4]!==crypto.createHash('sha256').update(bytes).digest('hex')){process.exit(92);return}process.stdout.write('KT2 RESULT ${nonce} ${bodyHash} 0 0 0\n');setTimeout(()=>{},2000)});`;
-  const held = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', heldEof] }, timeoutMs: 1000 });
-  assert.equal(held.code, 7);
+  const heldEof = (port) => String.raw`const crypto=require('node:crypto'),net=require('node:net');let chunks=[];process.stdout.write('KT2 READY ${nonce}\n');process.stdin.on('data',d=>chunks.push(d));process.stdin.on('end',()=>{const all=Buffer.concat(chunks),at=all.indexOf(10),line=all.subarray(0,at).toString('ascii').split(' '),bytes=all.subarray(at+1);if(at<0||line.length!==5||line[0]!=='KT2'||line[1]!=='REQUEST'||line[2]!=='${nonce}'||Number(line[3])!==bytes.length||line[4]!==crypto.createHash('sha256').update(bytes).digest('hex')){process.exit(92);return}const socket=net.connect(${port},'127.0.0.1',()=>{socket.end('write-complete');process.stdout.write('KT2 RESULT ${nonce} ${bodyHash} 0 0 0\n');setTimeout(()=>{},2000)})});`;
+  const held = await exchangeAfterRequest(
+    (script, options = {}) => actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', script] }, timeoutMs: 1000, ...options }),
+    heldEof,
+    { timeoutMs: 1000 },
+  );
+  assert.equal(held.marker, 'write-complete', 'the held EOF case starts after the completed request write');
+  assert.equal(held.result.code, 7);
 
   const noReady = 'setTimeout(()=>{},2000)';
   const beforeCommit = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', noReady] }, timeoutMs: 150 });
@@ -301,24 +325,6 @@ test('KT2 controller は単調期限、厳密な結果枠、stdin/stdio 境界�
   const hash = require('node:crypto').createHash('sha256').update(body).digest('hex');
   const node2 = { ...node, local: false };
   const exchange = (script, options = {}) => actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', script] }, timeoutMs: 1000, ...options });
-  const exchangeAfterRequest = async (script, options = {}) => {
-    const server = net.createServer();
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const port = server.address().port;
-    let timeout;
-    const barrier = new Promise((resolve, reject) => {
-      timeout = setTimeout(() => reject(new Error('request barrier unavailable')), 1000);
-      server.once('connection', (socket) => {
-        socket.once('error', reject);
-        socket.once('data', (data) => { clearTimeout(timeout); resolve(data.toString('ascii')); });
-      });
-    });
-    const pending = exchange(script(port), options);
-    try {
-      const marker = await barrier;
-      return { marker, result: await pending };
-    } finally { server.close(); }
-  };
   const result = (fields, payload = '', stderr = '') => `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('KT2 RESULT '+${JSON.stringify(fields)}+'\\n'+${JSON.stringify(payload)});process.stderr.write(${JSON.stringify(stderr)})});`;
 
   let spawns = 0;
@@ -401,12 +407,12 @@ test('KT2 controller は単調期限、厳密な結果枠、stdin/stdio 境界�
   } finally { process.removeListener('unhandledRejection', onUnhandled); }
   const afterReadyDeadline = (port) => `const net=require('node:net');process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{const socket=net.connect(${port},'127.0.0.1',()=>{socket.end('write-complete');setTimeout(()=>process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 0 0\\n'),2000)})});`;
   let postWriteSpawns = 0;
-  const afterReady = await exchangeAfterRequest(afterReadyDeadline, { timeoutMs: 1000, spawnChild: (...args) => { postWriteSpawns += 1; return spawn(...args); } });
+  const afterReady = await exchangeAfterRequest(exchange, afterReadyDeadline, { timeoutMs: 1000, spawnChild: (...args) => { postWriteSpawns += 1; return spawn(...args); } });
   assert.equal(afterReady.marker, 'write-complete', 'the child parsed the completed request before the deadline path');
   assert.equal(afterReady.result.code, 7, 'an expired result deadline follows the one completed request write');
   assert.equal(postWriteSpawns, 1, 'the post-write deadline never retries');
   const heldStderr = (port) => `const cp=require('node:child_process'),net=require('node:net');process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{const socket=net.connect(${port},'127.0.0.1',()=>{socket.end('write-complete');process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 0 0\\n');cp.spawn(process.execPath,['-e','setTimeout(()=>{},2000)'],{stdio:['ignore','ignore',process.stderr]})})});`;
-  const held = await exchangeAfterRequest(heldStderr, { timeoutMs: 1000 });
+  const held = await exchangeAfterRequest(exchange, heldStderr, { timeoutMs: 1000 });
   assert.equal(held.marker, 'write-complete', 'the held stderr case starts after the completed request write');
   assert.equal(held.result.code, 7);
 
