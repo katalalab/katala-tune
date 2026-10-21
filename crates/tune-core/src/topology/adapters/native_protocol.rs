@@ -51,6 +51,7 @@ impl Write for SizeLimit {
 pub(crate) fn validate_native(request: &ReaderRequest) -> Result<(), ReaderError> {
     if request.schema != REQUEST_SCHEMA
         || request.probe_sha256 != source_backend_sha256()
+        || !request.git_artifact_sha256.as_deref().is_some_and(|digest| hex(digest, 64))
         || request.cursor.is_some()
         || !request.configs.is_empty()
         || request.source_allowlist.len().checked_mul(5).is_none_or(|n| n > super::native_reader::MAX_GIT_CHILDREN)

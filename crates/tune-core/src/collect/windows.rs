@@ -9,6 +9,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -44,7 +45,7 @@ use windows_sys::Win32::{
 };
 
 use super::windows_pin::PinnedWindowsExecutable;
-use super::{BoundedResult, ProcessIdentity, ProcessReceipt, ProcessStop};
+use super::{BoundedResult, ProcessIdentity, ProcessReceipt, ProcessStop, WindowsMetadataExitPolicy};
 
 const CLEANUP: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(10);
@@ -724,7 +725,7 @@ pub(super) async fn run(
 // releases the empty Job, every observed process handle, and the pinned image.
 struct WindowsOsExitWitness {
     _job: Job,
-    pin: PinnedWindowsExecutable,
+    pin: Arc<PinnedWindowsExecutable>,
     input_sha256: String,
     stdout_sha256: String,
     artifact_sha256: String,
@@ -794,13 +795,32 @@ pub(super) async fn run_owned(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> Result<OwnedWindowsCompletion, BoundedResult> {
+    run_owned_shared(Arc::new(pin), command, environment, input, deadline, stdout_limit, stderr_limit, WindowsMetadataExitPolicy::ZeroOnly).await
+}
+
+fn metadata_exit_allowed(answer: &BoundedResult, policy: WindowsMetadataExitPolicy) -> bool {
+    answer.code == Some(0)
+        || (matches!(policy, WindowsMetadataExitPolicy::MissingOrigin) && answer.code == Some(1) && answer.stdout.is_empty() && answer.stderr.is_empty())
+}
+
+#[allow(clippy::too_many_arguments, clippy::result_large_err)] // One shared lease and a narrow metadata policy added to the unchanged bounded transport contract.
+pub(super) async fn run_owned_shared(
+    pin: Arc<PinnedWindowsExecutable>,
+    command: &std::process::Command,
+    environment: &[(OsString, OsString)],
+    input: &[u8],
+    deadline: std::time::Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    exit_policy: WindowsMetadataExitPolicy,
+) -> Result<OwnedWindowsCompletion, BoundedResult> {
     if deadline > pin.deadline() {
         // A caller may shorten the lease's original budget, never restart or
         // extend it between pinning and actual process creation.
         return Err(BoundedResult { process_receipt: Some(ProcessReceipt::default()), ..Default::default() });
     }
     let (answer, job) = run_inner(command, environment, input, deadline, stdout_limit, stderr_limit, Some(&pin)).await;
-    if answer.code != Some(0)
+    if !metadata_exit_allowed(&answer, exit_policy)
         || answer.timed_out
         || answer.output_limited
         || answer.spawn_failed
@@ -1002,6 +1022,122 @@ async fn run_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metadata_exit_one_is_only_the_empty_missing_origin_case() {
+        // Policy truth table only: these diagnostics cannot create a witness.
+        for (code, stdout, stderr, zero_only, missing_origin) in [
+            (Some(0), b"value".as_slice(), b"".as_slice(), true, true),
+            (Some(1), b"", b"", false, true),
+            (Some(1), b"value", b"", false, false),
+            (Some(1), b"", b"error", false, false),
+            (Some(2), b"", b"", false, false),
+            (None, b"", b"", false, false),
+        ] {
+            let result = BoundedResult { code, stdout: stdout.to_vec(), stderr: stderr.to_vec(), ..Default::default() };
+            assert_eq!(metadata_exit_allowed(&result, WindowsMetadataExitPolicy::ZeroOnly), zero_only);
+            assert_eq!(metadata_exit_allowed(&result, WindowsMetadataExitPolicy::MissingOrigin), missing_origin);
+        }
+    }
+
+    #[test]
+    fn shared_metadata_keeps_one_lease_and_rejects_another_same_bytes_program() {
+        // Only the isolated exact-filter child creates native inheritable pipe
+        // clients. The parallel libtest parent uses ordinary std spawn only.
+        let fixture = format!("{}::shared_metadata_standalone_fixture", module_path!().split_once("::").unwrap().1);
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", &fixture, "--nocapture", "--", "--shared-pinned-metadata"]);
+        command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::inherit());
+        let mut child = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(35);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("isolated shared metadata fixture exceeded its finite deadline");
+            }
+            std::thread::sleep(POLL);
+        }
+        assert!(child.wait().unwrap().success(), "isolated shared metadata fixture must succeed");
+    }
+
+    #[test]
+    fn shared_metadata_standalone_fixture() {
+        if !std::env::args().any(|arg| arg == "--shared-pinned-metadata") {
+            return;
+        }
+        let mut buffer = [0u16; 32768];
+        // SAFETY: fixed writable UTF-16 buffer for read-only OS location queries.
+        let count = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+        assert!(count > 0 && count < buffer.len());
+        let root = OsString::from_wide(&buffer[..count]);
+        // SAFETY: the same fixed output buffer remains valid for the second query.
+        let count = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+        assert!(count > 0 && count < buffer.len());
+        let program = PathBuf::from(OsString::from_wide(&buffer[..count])).join("cmd.exe").canonicalize().unwrap();
+        let image = std::fs::read(&program).unwrap();
+        let artifact = sha256(&image);
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        let pin = Arc::new(PinnedWindowsExecutable::open(&program, &artifact, end).unwrap());
+        let environment = [(OsString::from("SystemRoot"), root.clone()), (OsString::from("WINDIR"), root)];
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        for (code, policy) in
+            [("0", WindowsMetadataExitPolicy::ZeroOnly), ("0", WindowsMetadataExitPolicy::ZeroOnly), ("1", WindowsMetadataExitPolicy::MissingOrigin)]
+        {
+            let mut command = std::process::Command::new(pin.executable());
+            command.args(["/D", "/C", "exit", code]);
+            let completion = match runtime.block_on(run_owned_shared(Arc::clone(&pin), &command, &environment, b"", end, 8192, 8192, policy)) {
+                Ok(completion) => completion,
+                Err(result) => panic!(
+                    "shared metadata failure: code={:?} timeout={} limit={} spawn={} stop={:?} cleanup={}",
+                    result.code,
+                    result.timed_out,
+                    result.output_limited,
+                    result.spawn_failed,
+                    result.process_receipt.as_ref().map(|receipt| receipt.stop),
+                    result.process_receipt.as_ref().is_some_and(ProcessReceipt::cleanup_confirmed)
+                ),
+            };
+            assert!(Arc::ptr_eq(&completion.witness.pin, &pin));
+            assert_eq!(Arc::strong_count(&pin), 2, "one caller lease and one completion lease");
+            assert!(completion.diagnostic().process_receipt.as_ref().unwrap().cleanup_confirmed());
+            assert!(completion.into_verified_output(b"", &artifact).ok().expect("actual shared completion binding").is_empty());
+            assert_eq!(Arc::strong_count(&pin), 1, "consumption releases only this invocation's lease");
+        }
+        let mut missing = std::process::Command::new(pin.executable());
+        missing.args(["/D", "/C", "exit", "1"]);
+        let failed = runtime
+            .block_on(run_owned_shared(Arc::clone(&pin), &missing, &environment, b"", end, 8192, 8192, WindowsMetadataExitPolicy::ZeroOnly))
+            .err()
+            .expect("zero-only policy cannot issue an exit-one completion");
+        assert_eq!(failed.code, None);
+        assert!(failed.stdout.is_empty() && failed.stderr.is_empty());
+        assert!(failed.process_receipt.as_ref().unwrap().cleanup_confirmed());
+
+        let directory = std::env::temp_dir().join(format!("shared-pin-fixture-{}-{}", std::process::id(), crate::db::now_ms()));
+        std::fs::create_dir(&directory).unwrap();
+        let alternate = directory.join("same-bytes.exe");
+        std::fs::write(&alternate, &image).unwrap();
+        let other = PinnedWindowsExecutable::open(&alternate, &artifact, end).unwrap();
+        assert_eq!(pin.sha256(), other.sha256());
+        assert_ne!(pin.executable(), other.executable());
+        let command = std::process::Command::new(other.executable());
+        let failed = runtime
+            .block_on(run_owned_shared(Arc::clone(&pin), &command, &environment, b"", end, 8192, 8192, WindowsMetadataExitPolicy::ZeroOnly))
+            .err()
+            .expect("same image bytes at another executable path cannot replace the retained artifact");
+        assert_eq!(failed.code, None);
+        assert!(failed.stdout.is_empty() && failed.stderr.is_empty());
+        let receipt = failed.process_receipt.unwrap();
+        assert_eq!(receipt.stop, ProcessStop::SetupFailed);
+        assert!(receipt.root.is_none() && receipt.observed.is_empty(), "reject the different program before process creation");
+        assert_eq!(Arc::strong_count(&pin), 1);
+        drop(other);
+        std::fs::remove_dir_all(directory).unwrap();
+        drop(runtime);
+        drop(pin);
+        std::process::exit(0);
+    }
+
     // Synthetic decision-table state only: these tests issue no OS/ownership witness.
     fn policy_receipt() -> ProcessReceipt {
         let owner = ProcessIdentity { pid: 1, created_filetime: "1".into(), os_session: 1 };

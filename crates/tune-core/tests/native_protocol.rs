@@ -13,11 +13,12 @@ use tune_core::{
 
 const INNER_NONCE: &str = "22222222222222222222222222222222";
 const ARTIFACT: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const GIT_ARTIFACT: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 fn request() -> ReaderRequest {
     serde_json::from_value(json!({"schema":native::REQUEST_SCHEMA,"nonce":"11111111111111111111111111111111","scope_id":"fixture:native","observed_at_ms":1000,
         "expected_identity_hash":"a".repeat(64),"expected_runtime":"native","expected_distro":null,"roots":["C:/fixture"],"configs":[],"cursor":null,
         "source_allowlist":[{"root_index":0,"relative_path":".","expected_head":"b".repeat(40),"manifests":[]}],"git_program":"C:/tools/git.exe",
-        "limits":TopologyLimits::default(),"budget_ms":10000,"probe_sha256":native::source_backend_sha256()}))
+        "limits":TopologyLimits::default(),"budget_ms":10000,"probe_sha256":native::source_backend_sha256(),"git_artifact_sha256":GIT_ARTIFACT}))
     .unwrap()
 }
 fn identity(pid: u32) -> ProcessIdentity {
@@ -75,6 +76,8 @@ fn native_schema_roundtrips_and_legacy_paths_do_not_accept_it() {
     mixed.probe_sha256 = reader::probe_sha256();
     assert!(mixed.validate().is_err());
     mixed.schema = reader::REQUEST_SCHEMA.into();
+    assert!(mixed.validate().is_err());
+    mixed.git_artifact_sha256 = None;
     assert!(mixed.validate().is_ok());
     mixed.probe_sha256 = native::source_backend_sha256();
     assert!(mixed.validate().is_err());
@@ -102,8 +105,12 @@ fn native_constructor_and_request_caps_preserve_strict_pre_io_admission() {
         observed_at_ms: original.observed_at_ms,
         limits: original.limits.clone(),
     };
-    let built = ReaderRequest::from_remote_native(&remote, original.nonce.clone(), original.budget_ms).unwrap();
+    let built = ReaderRequest::from_remote_native(&remote, original.nonce.clone(), original.budget_ms, GIT_ARTIFACT.into()).unwrap();
     assert_eq!(body(&built), body(&original));
+    assert!(ReaderRequest::from_remote_native(&remote, original.nonce.clone(), original.budget_ms, "E".repeat(64)).is_err());
+    let legacy = ReaderRequest::from_remote(&remote, original.nonce.clone(), original.budget_ms).unwrap();
+    assert!(legacy.git_artifact_sha256.is_none());
+    assert!(serde_json::from_slice::<Value>(&body(&legacy)).unwrap().get("git_artifact_sha256").is_none());
     let mut many = original.clone();
     many.limits.repositories_per_environment = 1000;
     many.source_allowlist = (0..820)
@@ -129,6 +136,7 @@ fn derived_frame_is_canonical_and_changes_only_nonce_and_budget() {
     expected.nonce = INNER_NONCE.into();
     expected.budget_ms = 5000;
     assert_eq!(body(&derived), body(&expected));
+    assert_eq!(derived.git_artifact_sha256.as_deref(), Some(GIT_ARTIFACT));
     assert_eq!(bytes, reader::encode_request(&expected).unwrap());
     assert_eq!(&bytes[..8], b"KTRDR001");
     assert_eq!(&bytes[12..16], &[0; 4]);
@@ -151,15 +159,81 @@ fn derived_body_golden_locks_dto_field_order_and_limit_projection() {
             "{{\"schema\":\"katala_native_reader_request.v2\",\"nonce\":\"{}\",\"scope_id\":\"fixture:native\",\"observed_at_ms\":1000,",
             "\"expected_identity_hash\":\"{}\",\"expected_runtime\":\"native\",\"expected_distro\":null,\"roots\":[\"C:/fixture\"],\"configs\":[],\"cursor\":null,",
             "\"source_allowlist\":[{{\"root_index\":0,\"relative_path\":\".\",\"expected_head\":\"{}\",\"manifests\":[]}}],\"git_program\":\"C:/tools/git.exe\",",
-            "\"limits\":{},\"budget_ms\":5000,\"probe_sha256\":\"{}\"}}"
+            "\"limits\":{},\"budget_ms\":5000,\"probe_sha256\":\"{}\",\"git_artifact_sha256\":\"{}\"}}"
         ),
         INNER_NONCE,
         "a".repeat(64),
         "b".repeat(40),
         limits,
-        native::source_backend_sha256()
+        native::source_backend_sha256(),
+        GIT_ARTIFACT
     );
     assert_eq!(bytes, frame(b"KTRDR001", expected.as_bytes(), &[]));
+}
+
+#[test]
+fn native_git_artifact_is_required_lowercase_and_legacy_some_is_rejected() {
+    let original = request();
+    for value in [
+        None,
+        Some(json!(null)),
+        Some(json!("")),
+        Some(json!("E".repeat(64))),
+        Some(json!("g".repeat(64))),
+        Some(json!("e".repeat(63))),
+        Some(json!("e".repeat(65))),
+    ] {
+        let mut fields: Value = serde_json::from_slice(&body(&original)).unwrap();
+        if let Some(value) = value {
+            fields["git_artifact_sha256"] = value;
+        } else {
+            fields.as_object_mut().unwrap().remove("git_artifact_sha256");
+        }
+        assert!(reader::read_request(&mut std::io::Cursor::new(frame(b"KTRDR001", &serde_json::to_vec(&fields).unwrap(), &[]))).is_err());
+    }
+    let mut legacy = original.clone();
+    legacy.schema = reader::REQUEST_SCHEMA.into();
+    legacy.probe_sha256 = reader::probe_sha256();
+    for sha in [GIT_ARTIFACT.to_owned(), String::new(), "E".repeat(64)] {
+        legacy.git_artifact_sha256 = Some(sha);
+        assert!(legacy.validate().is_err());
+    }
+    legacy.git_artifact_sha256 = None;
+    let mut explicit_null = serde_json::to_value(&legacy).unwrap();
+    explicit_null["git_artifact_sha256"] = Value::Null;
+    assert!(reader::read_request(&mut std::io::Cursor::new(frame(b"KTRDR001", &serde_json::to_vec(&explicit_null).unwrap(), &[]))).is_err());
+    let expected = format!(
+        concat!(
+            "{{\"schema\":\"katala_windows_reader_request.v1\",\"nonce\":\"11111111111111111111111111111111\",\"scope_id\":\"fixture:native\",\"observed_at_ms\":1000,",
+            "\"expected_identity_hash\":\"{}\",\"expected_runtime\":\"native\",\"expected_distro\":null,\"roots\":[\"C:/fixture\"],\"configs\":[],\"cursor\":null,",
+            "\"source_allowlist\":[{{\"root_index\":0,\"relative_path\":\".\",\"expected_head\":\"{}\",\"manifests\":[]}}],\"git_program\":\"C:/tools/git.exe\",",
+            "\"limits\":{},\"budget_ms\":10000,\"probe_sha256\":\"{}\"}}"
+        ),
+        "a".repeat(64),
+        "b".repeat(40),
+        serde_json::to_string(&TopologyLimits::default()).unwrap(),
+        reader::probe_sha256()
+    );
+    assert_eq!(reader::encode_request(&legacy).unwrap(), frame(b"KTRDR001", expected.as_bytes(), &[]));
+}
+
+#[test]
+fn approved_git_sha_changes_invalidate_processing_original_and_derived_bindings() {
+    let original = request();
+    let raw = body(&original);
+    let (inner, derived) = native::derive_inner(&original, INNER_NONCE.into(), 5000).unwrap();
+    let payload = capture(&inner);
+    let response = native::encode_processing_response(&inner, &derived[16..], &identity(2), &payload).unwrap();
+    let outer = native::encode_outer_response(&original, &raw, &derived, &response, &receipt(), ARTIFACT).unwrap();
+    let mut changed_original = original.clone();
+    changed_original.git_artifact_sha256 = Some("f".repeat(64));
+    assert!(native::decode_outer_response(&outer, &changed_original, &body(&changed_original), ARTIFACT, &identity(1)).is_err());
+    let mut changed_inner = inner.clone();
+    changed_inner.git_artifact_sha256 = Some("f".repeat(64));
+    let changed_frame = reader::encode_request(&changed_inner).unwrap();
+    assert!(native::decode_processing_response(&response, &changed_inner, &changed_frame[16..]).is_err());
+    let changed_response = native::encode_processing_response(&changed_inner, &changed_frame[16..], &identity(2), &payload).unwrap();
+    assert!(native::encode_outer_response(&original, &raw, &changed_frame, &changed_response, &receipt(), ARTIFACT).is_err());
 }
 #[test]
 fn processing_completion_binds_exact_body_capture_and_identity_without_exit_claims() {

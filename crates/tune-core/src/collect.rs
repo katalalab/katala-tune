@@ -268,6 +268,30 @@ pub async fn run_owned_standalone_windows_bounded(
     windows::run_owned(pin, command, environment.entries, input, deadline, stdout_limit, stderr_limit).await
 }
 
+/// Metadata status policy, selected by the fixed Git operation rather than input.
+#[cfg(windows)]
+pub(crate) enum WindowsMetadataExitPolicy {
+    ZeroOnly,
+    MissingOrigin,
+}
+
+/// Reuse one retained artifact lease for all queries in an isolated native reader.
+/// Each invocation still verifies its actual suspended image and owns its Job.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments, clippy::result_large_err)] // Existing bounded arguments plus the narrow metadata exit policy; preserve full diagnostics.
+pub(crate) async fn run_shared_pinned_windows_metadata_bounded(
+    pin: std::sync::Arc<PinnedWindowsExecutable>,
+    command: &std::process::Command,
+    environment: StandaloneWindowsEnvironment<'_>,
+    input: &[u8],
+    deadline: Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    exit_policy: WindowsMetadataExitPolicy,
+) -> Result<OwnedWindowsCompletion, BoundedResult> {
+    windows::run_owned_shared(pin, command, environment.entries, input, deadline, stdout_limit, stderr_limit, exit_policy).await
+}
+
 async fn run_bounded_portable(mut command: Command, input: &[u8], timeout: Duration, stdout_limit: usize, stderr_limit: usize) -> BoundedResult {
     let Ok(mut child) = command.spawn() else {
         return BoundedResult { spawn_failed: true, ..Default::default() };

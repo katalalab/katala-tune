@@ -7,12 +7,13 @@ use super::{
     windows_reader::{MAX_RESPONSE_HEADER_BYTES, ReaderError, ReaderRequest},
 };
 use crate::collect::{
-    PinnedWindowsExecutable, ProcessStop, StandaloneWindowsEnvironment, current_windows_process_identity, run_owned_standalone_windows_bounded,
-    run_standalone_windows_bounded,
+    PinnedWindowsExecutable, StandaloneWindowsEnvironment, WindowsMetadataExitPolicy, current_windows_process_identity, run_owned_standalone_windows_bounded,
+    run_shared_pinned_windows_metadata_bounded,
 };
 use std::{
     path::Path,
     process::Command,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -35,45 +36,54 @@ fn validate_body(request: &ReaderRequest, exact_body: &[u8], deadline: Instant) 
 
 struct FixedGitRunner {
     runtime: tokio::runtime::Runtime,
+    pin: Arc<PinnedWindowsExecutable>,
+    approved_program: String,
 }
 impl GitRunner for FixedGitRunner {
     fn run(&self, request: &GitCommand) -> Result<Vec<u8>, NativeReaderError> {
-        let mut command = Command::new(request.program());
+        if request.program() != self.approved_program {
+            return Err(NativeReaderError::Git);
+        }
+        // The same lease survives every metadata query and all final HEAD
+        // checks. Never reopen an approved path between queries, even for bytes
+        // with the same hash: the retained NTFS identity is execution authority.
+        let mut command = Command::new(self.pin.executable());
         command.current_dir(request.directory()).args(request.arguments());
-        let result = self.runtime.block_on(run_standalone_windows_bounded(
-            &command,
-            StandaloneWindowsEnvironment::new(request.environment()),
-            b"",
-            request.deadline(),
-            request.stdout_limit(),
-            request.stderr_limit(),
-        ));
-        if result.timed_out {
-            return Err(NativeReaderError::Timeout);
-        }
-        if result.output_limited {
-            return Err(NativeReaderError::Limit);
-        }
-        if result.spawn_failed || !result.process_receipt.as_ref().is_some_and(|receipt| receipt.stop == ProcessStop::Completed && receipt.cleanup_confirmed())
-        {
-            return Err(NativeReaderError::Git);
-        }
-        // A missing local origin is the sole nonzero metadata result admitted.
-        if request.operation() == GitOperation::Origin && result.code == Some(1) && result.stdout.is_empty() && result.stderr.is_empty() {
-            return Ok(vec![]);
-        }
-        if result.code != Some(0) {
-            return Err(NativeReaderError::Git);
-        }
-        Ok(result.stdout)
+        let policy = if request.operation() == GitOperation::Origin { WindowsMetadataExitPolicy::MissingOrigin } else { WindowsMetadataExitPolicy::ZeroOnly };
+        let completion = self
+            .runtime
+            .block_on(run_shared_pinned_windows_metadata_bounded(
+                Arc::clone(&self.pin),
+                &command,
+                StandaloneWindowsEnvironment::new(request.environment()),
+                b"",
+                request.deadline(),
+                request.stdout_limit(),
+                request.stderr_limit(),
+                policy,
+            ))
+            .map_err(|result| {
+                if result.timed_out {
+                    NativeReaderError::Timeout
+                } else if result.output_limited {
+                    NativeReaderError::Limit
+                } else {
+                    NativeReaderError::Git
+                }
+            })?;
+        // The actual OS witness is consumed here. Public receipt fields never
+        // authorize source admission, including the empty missing-origin case.
+        completion.into_verified_output(b"", self.pin.sha256()).map_err(|_| NativeReaderError::Git)
     }
 }
 
 pub fn execute_reader(request: &ReaderRequest, exact_body: &[u8], deadline: Instant) -> Result<Vec<u8>, ReaderError> {
     validate_body(request, exact_body, deadline)?;
+    let pin = PinnedWindowsExecutable::open(Path::new(&request.git_program), request.git_artifact_sha256.as_deref().ok_or(ReaderError)?, deadline)
+        .map_err(|_| ReaderError)?;
     let source = native::windows::WindowsSourceIo::default();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ReaderError)?;
-    let git = FixedGitRunner { runtime };
+    let git = FixedGitRunner { runtime, pin: Arc::new(pin), approved_program: request.git_program.clone() };
     let capture = native::collect_with(&request.remote_request(), deadline, &source, &git).map_err(|_| ReaderError)?;
     let mut capture = serde_json::to_value(capture).map_err(|_| ReaderError)?;
     capture.as_object_mut().ok_or(ReaderError)?.insert("runtime".into(), serde_json::json!({"kind":"native","platform":"windows","kernel_wsl":false}));

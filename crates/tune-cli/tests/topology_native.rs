@@ -213,7 +213,10 @@ mod native_windows {
                 observed_at_ms: tune_core::db::now_ms(),
                 limits: TopologyLimits { file_bytes: 4 * 1024 * 1024, stdout_bytes: 16 * 1024 * 1024, ..Default::default() },
             };
-            ReaderRequest::from_remote_native(&remote, reader::fresh_nonce().unwrap(), budget_ms).expect("native v2 request")
+            // Fixture setup is the approving operator: capture the installed
+            // Git artifact before constructing the exact native request body.
+            let approved_git = tune_core::db::sha256_hex(&std::fs::read(&self.git).unwrap());
+            ReaderRequest::from_remote_native(&remote, reader::fresh_nonce().unwrap(), budget_ms, approved_git).expect("native v2 request")
         }
 
         fn snapshot(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
@@ -403,6 +406,149 @@ mod native_windows {
             assert!(invalid.snapshot() == before);
             invalid.assert_private_state_absent();
         }
+    }
+
+    #[test]
+    fn native_entries_reject_unapproved_git_artifacts_before_source_capture() {
+        let _serial = SERIAL.lock().unwrap();
+        let fixture = Fixture::new(MANIFEST.to_vec());
+        let before = fixture.snapshot();
+        let (_, digest) = artifact();
+        for entry in ENTRIES {
+            let mut request = fixture.request(30_000);
+            assert_ne!(request.git_artifact_sha256.as_deref(), Some("0".repeat(64).as_str()));
+            request.git_artifact_sha256 = Some("0".repeat(64));
+            let (output, _, _) = run(&fixture, entry, &request, false, &digest);
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty() && output.stderr.is_empty());
+            assert!(fixture.snapshot() == before);
+            fixture.assert_private_state_absent();
+        }
+    }
+
+    #[test]
+    fn native_verify_preserves_real_unicode_linked_worktree_and_git_metadata() {
+        use std::collections::BTreeMap;
+
+        fn query(fixture: &Fixture, directory: &Path, operation: &[&str]) -> Vec<u8> {
+            let directory = normal(directory);
+            let mut arguments = vec!["-C", directory.as_str()];
+            arguments.extend_from_slice(operation);
+            fixture.git(&arguments)
+        }
+        fn utf8_trim(bytes: Vec<u8>) -> String {
+            String::from_utf8(bytes).unwrap_or_else(|_| panic!("real Git metadata must be lossless UTF-8")).trim().to_owned()
+        }
+        fn metadata_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+            fn visit(root: &Path, directory: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+                for entry in std::fs::read_dir(directory).unwrap() {
+                    let path = entry.unwrap().path();
+                    let metadata = std::fs::symlink_metadata(&path).unwrap();
+                    assert!(!metadata.file_type().is_symlink(), "synthetic Git metadata must not contain links");
+                    if metadata.is_dir() {
+                        visit(root, &path, files);
+                    } else {
+                        assert!(metadata.is_file());
+                        files.insert(path.strip_prefix(root).unwrap().to_path_buf(), std::fs::read(path).unwrap());
+                    }
+                }
+            }
+            let mut files = BTreeMap::new();
+            visit(root, root, &mut files);
+            files
+        }
+
+        let _serial = SERIAL.lock().unwrap();
+        let fixture = Fixture::new(MANIFEST.to_vec());
+        let unicode_root = fixture.base.join("登録ルート");
+        let checkout_relative = "階層/作業-🚀-e\u{301}";
+        let linked = unicode_root.join(checkout_relative);
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        let linked_argument = linked.to_str().unwrap().replace('\\', "/");
+        fixture.git(&["worktree", "add", "--detach", &linked_argument, &fixture.head]);
+        std::fs::write(linked.join("README.md"), b"unapproved dirty linked worktree fixture\n").unwrap();
+        // An unapproved, invalid manifest exists within the registered roots.
+        // It cannot be decoded or returned by this allowlist-only collection.
+        let unapproved = unicode_root.join("not-approved/package.json");
+        std::fs::create_dir(unapproved.parent().unwrap()).unwrap();
+        std::fs::write(&unapproved, [0xff, 0xfe, 0x00]).unwrap();
+
+        let mut request = fixture.request(30_000);
+        request.roots.push(normal(&unicode_root));
+        let mut linked_approval = request.source_allowlist[0].clone();
+        linked_approval.root_index = 1;
+        linked_approval.relative_path = checkout_relative.into();
+        request.source_allowlist.push(linked_approval);
+        request.validate().unwrap();
+
+        let normal_before = fixture.snapshot();
+        let linked_head = query(&fixture, &linked, &["rev-parse", "--verify", "HEAD"]);
+        let linked_status = query(&fixture, &linked, &["status", "--porcelain", "--untracked-files=all"]);
+        let linked_package = std::fs::read(linked.join("package.json")).unwrap();
+        let linked_readme = std::fs::read(linked.join("README.md")).unwrap();
+        let linked_pointer = std::fs::read(linked.join(".git")).unwrap();
+        assert!(!normal_before.3.is_empty() && !linked_status.is_empty());
+        assert!(linked.join(".git").is_file());
+        assert_eq!(linked_package, fixture.approved);
+        let expected_metadata = [&fixture.repo, &linked].map(|directory| {
+            (
+                utf8_trim(query(&fixture, directory, &["rev-parse", "--absolute-git-dir"])),
+                utf8_trim(query(&fixture, directory, &["rev-parse", "--path-format=absolute", "--git-common-dir"])),
+            )
+        });
+        assert!(expected_metadata[0].0 == expected_metadata[0].1, "normal checkout private and common Git directories must match");
+        assert!(expected_metadata[1].0 != expected_metadata[1].1, "linked worktree private and common Git directories must differ");
+        // Includes config, index, refs, logs, and every worktree registration
+        // file. Enumeration here is fixture verification, never reader code.
+        let git_metadata_before = metadata_files(&fixture.repo.join(".git"));
+        assert!(git_metadata_before.contains_key(Path::new("config")));
+        assert!(git_metadata_before.keys().any(|path| path.starts_with("worktrees")));
+
+        let (_, digest) = artifact();
+        // Exercise the independent verifier once, without repeating all roles.
+        let (output, _retained, _) = run(&fixture, "topology-verify", &request, true, &digest);
+        assert!(output.status.success(), "native Unicode/worktree verification must exit zero: code={:?}", output.status.code());
+        assert!(output.stderr.is_empty());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("native Unicode/worktree capture JSON");
+        assert_eq!(value["runtime"]["kind"], "native");
+        assert_eq!(value["runtime"]["platform"], "windows");
+        assert_eq!(value["runtime"]["kernel_wsl"], false);
+        let capture: RawCapture = serde_json::from_value(value).unwrap();
+        assert_eq!(capture.scope_id, request.scope_id);
+        assert_eq!(capture.target_identity.as_deref(), Some(request.expected_identity_hash.as_str()));
+        assert_eq!(capture.observed_at_ms, request.observed_at_ms);
+        assert!(capture.limits == request.limits);
+        assert!(capture.failures.is_empty() && capture.progress.is_none());
+        assert_eq!(capture.repositories.len(), 2, "no unapproved checkout is enumerated into capture");
+        assert_eq!(capture.counters.repositories, 2);
+        assert_eq!(capture.counters.manifests, 2);
+        assert_eq!(capture.counters.files, 2);
+        assert_eq!(capture.counters.bytes, fixture.approved.len() * 2);
+        assert_eq!(capture.counters.children, 10, "four metadata operations per checkout, then both final HEAD checks");
+        for (index, relative) in ["repo", checkout_relative].into_iter().enumerate() {
+            let root = remote::source_root_fingerprint(&request.roots[index], RemotePlatform::Windows);
+            let repository = capture.repositories.iter().find(|repo| repo.root_fingerprint == root && repo.relative_path == relative).unwrap();
+            assert_eq!(repository.git.head.as_deref(), Some(fixture.head.as_str()));
+            assert_eq!(repository.git.is_worktree, index == 1);
+            assert_eq!(repository.git.git_dir, Some(tune_core::db::sha256_hex(expected_metadata[index].0.as_bytes())));
+            assert_eq!(repository.git.common_dir, Some(tune_core::db::sha256_hex(expected_metadata[index].1.as_bytes())));
+            assert_eq!(repository.manifests.len(), 1);
+            assert_eq!(repository.manifests[0].relative_path, "package.json");
+            assert_eq!(repository.manifests[0].content.as_bytes(), fixture.approved);
+            assert_eq!(repository.manifests[0].content_sha256, tune_core::db::sha256_hex(&fixture.approved));
+            assert_eq!(repository.manifests[0].revision.as_deref(), Some(fixture.head.as_str()));
+            assert!(repository.failures.is_empty() && repository.configs.is_empty() && !repository.config_file_read);
+        }
+        assert!(!output.stdout.windows(b"unapproved dirty".len()).any(|bytes| bytes == b"unapproved dirty"));
+        assert!(fixture.snapshot() == normal_before, "normal checkout HEAD, bytes and dirty status must stay unchanged");
+        assert!(query(&fixture, &linked, &["rev-parse", "--verify", "HEAD"]) == linked_head);
+        assert!(query(&fixture, &linked, &["status", "--porcelain", "--untracked-files=all"]) == linked_status);
+        assert!(std::fs::read(linked.join("package.json")).unwrap() == linked_package);
+        assert!(std::fs::read(linked.join("README.md")).unwrap() == linked_readme);
+        assert!(std::fs::read(linked.join(".git")).unwrap() == linked_pointer);
+        assert!(metadata_files(&fixture.repo.join(".git")) == git_metadata_before, "Git config and worktree registration metadata must stay byte-identical");
+        assert_eq!(std::fs::read(unapproved).unwrap(), [0xff, 0xfe, 0x00]);
+        fixture.assert_private_state_absent();
     }
 
     #[allow(unsafe_code)]

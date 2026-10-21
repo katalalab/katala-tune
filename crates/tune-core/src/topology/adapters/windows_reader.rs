@@ -47,6 +47,16 @@ pub struct ReaderRequest {
     /// Legacy wire key: v1 hashes embedded PS; native v2 hashes the source backend.
     /// Neither digest establishes executable artifact identity or permission.
     pub probe_sha256: String,
+    /// Explicit operator-approved Git executable digest for native v2. Never
+    /// discovered from PATH or accepted from an executable's self-report.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "git_artifact")]
+    pub git_artifact_sha256: Option<String>,
+}
+
+fn git_artifact<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    // Missing is the unchanged legacy wire shape. Explicit null must not turn
+    // an added native-only field into an accepted legacy request extension.
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -85,10 +95,11 @@ pub fn valid_program_path(value: &str) -> bool {
 }
 
 impl ReaderRequest {
-    pub fn from_remote_native(request: &RemoteRequest, nonce: String, budget_ms: u64) -> Result<Self, ReaderError> {
+    pub fn from_remote_native(request: &RemoteRequest, nonce: String, budget_ms: u64, git_artifact_sha256: String) -> Result<Self, ReaderError> {
         let mut value = Self::from_remote(request, nonce, budget_ms)?;
         value.schema = super::native_protocol::REQUEST_SCHEMA.into();
         value.probe_sha256 = super::native_protocol::source_backend_sha256();
+        value.git_artifact_sha256 = Some(git_artifact_sha256);
         value.validate()?;
         Ok(value)
     }
@@ -109,6 +120,7 @@ impl ReaderRequest {
             limits: request.limits.clone(),
             budget_ms,
             probe_sha256: probe_sha256(),
+            git_artifact_sha256: None,
         };
         value.validate()?;
         Ok(value)
@@ -144,6 +156,7 @@ impl ReaderRequest {
             || self.expected_runtime != RemoteRuntimeKind::Native
             || self.expected_distro.is_some()
             || (!native && self.probe_sha256 != probe_sha256())
+            || (!native && self.git_artifact_sha256.is_some())
             || self.budget_ms == 0
             || self.budget_ms > MAX_BUDGET_MS
             || self.budget_ms > self.limits.remote_timeout_seconds.saturating_mul(1000)
@@ -361,6 +374,28 @@ pub async fn execute(request: &ReaderRequest, request_bytes: &[u8], deadline: st
     // The guard may spend up to three seconds observing termination. Keep that
     // and output overhead inside the standalone CLI's absolute deadline.
     let work_deadline = deadline.checked_sub(std::time::Duration::from_millis(3500)).ok_or(ReaderError)?;
+    let output = run_probe(request, work_deadline).await?;
+    if output.code != Some(0)
+        || output.spawn_failed
+        || output.timed_out
+        || output.output_limited
+        || !output.process_receipt.as_ref().is_some_and(|receipt| receipt_ok(receipt, &request.nonce))
+    {
+        return Err(ReaderError);
+    }
+    // Gate1 remains enforced before returning source bytes, in addition to the
+    // embedded probe's pre-return byte checks and the controller's own check.
+    remote::validate_capture_bytes(&request.remote_request(), &output.stdout).map_err(|_| ReaderError)?;
+    if std::time::Instant::now() >= deadline {
+        return Err(ReaderError);
+    }
+    encode_response(request, request_bytes, output)
+}
+
+// Keep the exact product launch available to Windows unit diagnostics. This
+// returns existing bounded data without adding a log or an admission boundary.
+#[cfg(windows)]
+async fn run_probe(request: &ReaderRequest, work_deadline: std::time::Instant) -> Result<BoundedResult, ReaderError> {
     let work = work_deadline.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero()).ok_or(ReaderError)?;
     let config = serde_json::json!({"source_allowlist":request.source_allowlist,"scope_id":request.scope_id,"observed_at_ms":request.observed_at_ms,
         "roots":request.roots,"configs":request.configs,"git_program":request.git_program,"limits":request.limits,"cursor":request.cursor,
@@ -395,21 +430,7 @@ pub async fn execute(request: &ReaderRequest, request_bytes: &[u8], deadline: st
         request.limits.stderr_bytes,
     )
     .await;
-    if output.code != Some(0)
-        || output.spawn_failed
-        || output.timed_out
-        || output.output_limited
-        || !output.process_receipt.as_ref().is_some_and(|receipt| receipt_ok(receipt, &request.nonce))
-    {
-        return Err(ReaderError);
-    }
-    // Gate1 remains enforced before returning source bytes, in addition to the
-    // embedded probe's pre-return byte checks and the controller's own check.
-    remote::validate_capture_bytes(&request.remote_request(), &output.stdout).map_err(|_| ReaderError)?;
-    if std::time::Instant::now() >= deadline {
-        return Err(ReaderError);
-    }
-    encode_response(request, request_bytes, output)
+    Ok(output)
 }
 #[cfg(windows)]
 #[allow(unsafe_code)]
@@ -422,4 +443,247 @@ fn powershell_program() -> Result<String, ReaderError> {
     }
     let root = String::from_utf16(&buffer[..count]).map_err(|_| ReaderError)?;
     Ok(format!("{root}\\WindowsPowerShell\\v1.0\\powershell.exe"))
+}
+
+#[cfg(all(test, windows))]
+mod native_diagnostics {
+    use super::*;
+    use std::{
+        path::{Path, PathBuf},
+        process::{Child, Command, Stdio},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    const CHILD: &str = "--legacy-probe-diagnostic-child";
+    const RECORD: &str = "KATALA_LEGACY_PROBE_DIAGNOSTIC=";
+    const TEST: &str = "topology::adapters::windows_reader::native_diagnostics::actual_legacy_probe_reports_sanitized_failure_metadata";
+    const MANIFEST: &[u8] = b"{\"name\":\"legacy-probe-diagnostic-fixture\"}";
+
+    fn require<T>(result: Result<T, impl std::fmt::Debug>, stage: &str) -> T {
+        result.unwrap_or_else(|_| panic!("synthetic legacy diagnostic setup failed: {stage}"))
+    }
+
+    fn finite(child: &mut Child, deadline: Instant) -> std::process::ExitStatus {
+        loop {
+            if let Some(status) = require(child.try_wait(), "wait") {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("synthetic legacy diagnostic exceeded its finite window");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn git(program: &Path, root: &Path, arguments: &[&str]) -> Vec<u8> {
+        let mut command = Command::new(program);
+        command.current_dir(root).args(arguments).env_clear();
+        for key in ["SystemRoot", "WINDIR", "TEMP", "TMP", "COMSPEC"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "NUL")
+            .env("GIT_CONFIG_SYSTEM", "NUL")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = require(command.spawn(), "Git spawn");
+        let stdout = child.stdout.take().unwrap_or_else(|| panic!("synthetic Git stdout missing"));
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            require(stdout.take(8193).read_to_end(&mut bytes), "Git stdout");
+            bytes
+        });
+        let status = finite(&mut child, Instant::now() + Duration::from_secs(10));
+        assert!(status.success(), "synthetic Git setup/query failed: code={:?}", status.code());
+        let bytes = reader.join().unwrap_or_else(|_| panic!("synthetic Git reader failed"));
+        assert!(bytes.len() <= 8192, "synthetic Git output exceeded its bound");
+        bytes
+    }
+
+    struct Fixture {
+        root: PathBuf,
+        program: PathBuf,
+        request: ReaderRequest,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let program = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_else(|| panic!("synthetic Git discovery PATH missing")))
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| path.join("git.exe"))
+                .find(|path| path.is_file())
+                .unwrap_or_else(|| panic!("real fixture Git is required"));
+            let program = require(program.canonicalize(), "Git absolute path");
+            let stamp = require(SystemTime::now().duration_since(UNIX_EPOCH), "fixture clock").as_nanos();
+            let root = std::env::temp_dir().join(format!("legacy-probe-diagnostic-{}-{stamp}", std::process::id()));
+            require(std::fs::create_dir(&root), "exclusive fixture directory");
+            require(std::fs::write(root.join("package.json"), MANIFEST), "approved manifest");
+            git(&program, &root, &["init", "--quiet"]);
+            git(&program, &root, &["add", "--", "package.json"]);
+            git(
+                &program,
+                &root,
+                &[
+                    "-c",
+                    "user.name=Legacy Fixture",
+                    "-c",
+                    "user.email=legacy-fixture@example.org",
+                    "-c",
+                    "core.hooksPath=NUL",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "synthetic fixture",
+                ],
+            );
+            let head = require(String::from_utf8(git(&program, &root, &["rev-parse", "--verify", "HEAD"])), "fixture HEAD UTF-8").trim().to_owned();
+            let program_text = program.to_str().unwrap_or_else(|| panic!("fixture Git path requires UTF-8")).trim_start_matches(r"\\?\").replace('\\', "/");
+            let root_text = root.to_str().unwrap_or_else(|| panic!("fixture root requires UTF-8")).replace('\\', "/");
+            let request = require(
+                serde_json::from_value(serde_json::json!({
+                    "schema":REQUEST_SCHEMA,"nonce":"0123456789abcdef0123456789abcdef","scope_id":"fixture:legacy-diagnostic","observed_at_ms":1000,
+                    "expected_identity_hash":remote::identity_hash(&gethostname::gethostname().to_string_lossy()),"expected_runtime":"native","expected_distro":null,
+                    "roots":[root_text],"configs":[],"cursor":null,"source_allowlist":[{"root_index":0,"relative_path":".","expected_head":head,
+                    "manifests":[{"relative_path":"package.json","bytes":MANIFEST.len(),"sha256":crate::db::sha256_hex(MANIFEST)}]}],
+                    "git_program":program_text,"limits":TopologyLimits::default(),"budget_ms":30000,"probe_sha256":probe_sha256()
+                })),
+                "request DTO",
+            );
+            Self { root, program, request }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // Only this exclusively created synthetic fixture belongs to this test.
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[derive(Serialize)]
+    struct Diagnostic {
+        stage: &'static str,
+        code: Option<i32>,
+        spawn_failed: bool,
+        timed_out: bool,
+        output_limited: bool,
+        stop: Option<ProcessStop>,
+        root_exit_code: Option<i32>,
+        ack: [bool; 6],
+        total_processes: Option<u32>,
+        observed_count: usize,
+        stderr_bytes: usize,
+        stderr_sha256: String,
+        known_error_categories: Vec<&'static str>,
+        capture_valid: bool,
+    }
+    fn diagnostic(output: &BoundedResult, capture_valid: bool) -> Diagnostic {
+        let receipt = output.process_receipt.as_ref();
+        let categories: &[&str] = &[
+            "CommandNotFoundException",
+            "Modules_ModuleNotFound",
+            "ModuleCannotBeLoaded",
+            "ImportModuleException",
+            "InvalidOperation",
+            "ArgumentNullException",
+            "UnauthorizedAccess",
+            "ProviderNotFound",
+            "TypeNotFound",
+            "ParserError",
+            "FileNotFoundException",
+            "TypeInitializationException",
+        ];
+        Diagnostic {
+            stage: if output.code == Some(0) && receipt.is_some_and(ProcessReceipt::cleanup_confirmed) { "capture_validation" } else { "guard_result" },
+            code: output.code,
+            spawn_failed: output.spawn_failed,
+            timed_out: output.timed_out,
+            output_limited: output.output_limited,
+            stop: receipt.map(|value| value.stop),
+            root_exit_code: receipt.and_then(|value| value.root_exit_code),
+            ack: receipt.map_or([false; 6], |value| {
+                [value.root_exited, value.job_empty, value.observed_exited, value.stdout_eof, value.stderr_eof, value.writer_finished]
+            }),
+            total_processes: receipt.map(|value| value.total_processes),
+            observed_count: receipt.map_or(0, |value| value.observed.len()),
+            stderr_bytes: output.stderr.len(),
+            stderr_sha256: crate::db::sha256_hex(&output.stderr),
+            known_error_categories: categories
+                .iter()
+                .copied()
+                .filter(|category| output.stderr.windows(category.len()).any(|bytes| bytes == category.as_bytes()))
+                .collect(),
+            capture_valid,
+        }
+    }
+
+    #[test]
+    fn actual_legacy_probe_reports_sanitized_failure_metadata() {
+        if !std::env::args().any(|argument| argument == CHILD) {
+            // Exactly one libtest runs in the child. All fixture std launches
+            // finish before the strict backend exposes inheritable endpoints.
+            let mut child = require(
+                Command::new(require(std::env::current_exe(), "unit artifact"))
+                    .args(["--exact", TEST, "--nocapture", "--", CHILD])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn(),
+                "isolated diagnostic spawn",
+            );
+            let stdout = child.stdout.take().unwrap_or_else(|| panic!("isolated diagnostic stdout missing"));
+            let reader = std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                require(stdout.take(65537).read_to_end(&mut bytes), "isolated diagnostic output");
+                bytes
+            });
+            let status = finite(&mut child, Instant::now() + Duration::from_secs(60));
+            let bytes = reader.join().unwrap_or_else(|_| panic!("isolated diagnostic output reader failed"));
+            assert!(bytes.len() <= 65536, "isolated diagnostic output exceeded its bound");
+            let text = require(String::from_utf8(bytes), "isolated diagnostic output encoding");
+            let records = text.lines().filter_map(|line| line.strip_prefix(RECORD)).collect::<Vec<_>>();
+            assert_eq!(records.len(), 1, "the exact isolated test must emit its structural record");
+            // Only our fixed-shape structural record is forwarded, never raw
+            // libtest/Git/PowerShell output, paths, process identities or source.
+            let record: serde_json::Value = require(serde_json::from_str(records[0]), "structural record JSON");
+            eprintln!("{RECORD}{record}");
+            assert!(status.success(), "actual legacy probe failed: code={:?}", status.code());
+            return;
+        }
+        let fixture = Fixture::new();
+        assert!(fixture.request.validate().is_ok(), "synthetic request must pass admission before IO");
+        let runtime = require(tokio::runtime::Builder::new_current_thread().enable_all().build(), "isolated runtime");
+        let output = runtime.block_on(run_probe(&fixture.request, Instant::now() + Duration::from_millis(26500)));
+        drop(runtime);
+        let output = match output {
+            Ok(output) => output,
+            Err(_) => {
+                let record = diagnostic(&BoundedResult::default(), false);
+                let mut record = require(serde_json::to_value(record), "launch-error diagnostic");
+                record["stage"] = Value::String("launch_preparation".into());
+                println!("\n{RECORD}{record}");
+                panic!("actual legacy probe launch preparation failed");
+            }
+        };
+        let capture = remote::validate_capture_bytes(&fixture.request.remote_request(), &output.stdout);
+        let record = require(serde_json::to_string(&diagnostic(&output, capture.is_ok())), "structural diagnostic");
+        println!("\n{RECORD}{record}");
+        assert!(
+            output.code == Some(0) && !output.spawn_failed && !output.timed_out && !output.output_limited,
+            "actual legacy probe must exit zero within limits"
+        );
+        assert!(output.process_receipt.as_ref().is_some_and(ProcessReceipt::cleanup_confirmed), "actual legacy probe requires every OS ACK");
+        let capture = require(capture, "actual legacy capture validation");
+        assert!(capture.failures.is_empty(), "actual legacy capture must have no failures");
+        assert!(capture.repositories.len() == 1 && capture.repositories[0].manifests.len() == 1, "actual approved manifest required");
+        assert!(capture.repositories[0].manifests[0].content.as_bytes() == MANIFEST, "actual approved bytes required");
+        assert!(require(std::fs::read(fixture.root.join("package.json")), "post-read manifest") == MANIFEST, "approved fixture must remain unchanged");
+        let head = require(String::from_utf8(git(&fixture.program, &fixture.root, &["rev-parse", "--verify", "HEAD"])), "post-read HEAD");
+        assert!(head.trim() == fixture.request.source_allowlist[0].expected_head, "fixture HEAD must remain unchanged");
+    }
 }
