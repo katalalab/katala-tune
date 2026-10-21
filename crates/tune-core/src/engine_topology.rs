@@ -326,29 +326,50 @@ impl Engine {
                 } else {
                     vec![excluded("transport is unsupported")]
                 };
+                let mut docker_batch_id = None;
+                let mut docker_admissions = HashMap::new();
                 let docker = env.get("docker").unwrap_or(&Value::Null);
                 if enabled && docker.get("enabled").and_then(Value::as_bool) == Some(true) {
                     let docker_scope = format!("{scope_id}:docker");
-                    let snapshot = if node.local && transport == "node" {
-                        let contexts = docker
-                            .get("contexts")
-                            .and_then(Value::as_array)
-                            .and_then(|rows| rows.iter().map(|v| v.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>())
-                            .unwrap_or_default();
-                        let request = DockerRequest {
-                            scope_id: docker_scope.clone(),
-                            contexts,
-                            program: docker.get("program").map(|value| value.as_str().unwrap_or("").to_owned()),
-                            observed_at_ms: now_ms(),
-                            limits: config.topology.limits.clone(),
-                        };
-                        collect_docker(&request).await
+                    let mut docker_snapshots = if let Some(api) = docker.get("direct_api") {
+                        use crate::topology::adapters::docker_api;
+                        let batch_id = docker_api::batch_id();
+                        let attempt = self.with_db(|db| db.reserve_docker_attempt_fenced(&lease, &batch_id, now_ms()));
+                        docker_batch_id = Some(batch_id);
+                        if !node.local || transport != "node" || env.get("kind").is_some_and(|kind| kind.as_str() != Some("native")) {
+                            let mut snapshot = excluded("Docker direct API requires an explicit local native environment");
+                            snapshot.scope_id = docker_scope.clone();
+                            vec![snapshot]
+                        } else {
+                            let batch = match attempt {
+                                Ok(attempt) => docker_api::collect(api, &docker_scope, &config.topology.limits, attempt).await,
+                                Err(_) => docker_api::failed(&docker_scope, FailureCode::Internal),
+                            };
+                            docker_admissions = batch.admissions;
+                            batch.snapshots
+                        }
                     } else {
-                        let mut snapshot = excluded("Docker collection requires an explicit local native environment");
-                        snapshot.scope_id = docker_scope;
-                        snapshot
+                        let snapshot = if node.local && transport == "node" {
+                            let contexts = docker
+                                .get("contexts")
+                                .and_then(Value::as_array)
+                                .and_then(|rows| rows.iter().map(|v| v.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>())
+                                .unwrap_or_default();
+                            let request = DockerRequest {
+                                scope_id: docker_scope.clone(),
+                                contexts,
+                                program: docker.get("program").map(|value| value.as_str().unwrap_or("").to_owned()),
+                                observed_at_ms: now_ms(),
+                                limits: config.topology.limits.clone(),
+                            };
+                            collect_docker(&request).await
+                        } else {
+                            let mut snapshot = excluded("Docker collection requires an explicit local native environment");
+                            snapshot.scope_id = docker_scope;
+                            snapshot
+                        };
+                        engine_snapshots(snapshot)
                     };
-                    let mut docker_snapshots = engine_snapshots(snapshot);
                     let prefix = format!("{scope_id}:docker:engine:");
                     let observed = docker_snapshots.iter().map(|s| s.scope_id.clone()).collect::<HashSet<_>>();
                     let previous = self.with_db(|db| db.topology_scope_ids_with_prefix(&prefix)).unwrap_or_default();
@@ -380,12 +401,24 @@ impl Engine {
                         scopes.push(json!({"scope_id":snapshot.scope_id,"status":"failed","failure":"lease_lost"}));
                         continue;
                     }
-                    match self.with_db(|db| db.record_topology_fenced(&lease, &run_id, &snapshot, now_ms())) {
+                    let collection_id = docker_batch_id
+                        .as_deref()
+                        .filter(|_| snapshot.scope_id == format!("{scope_id}:docker") || snapshot.scope_id.starts_with(&format!("{scope_id}:docker:engine:")))
+                        .unwrap_or(&run_id);
+                    match self.with_db(|db| db.record_topology_fenced(&lease, collection_id, &snapshot, now_ms())) {
                         Ok(cs) => {
+                            // A source capability is saved only after this exact engine receipt commits.
+                            if let Some(admitted) = docker_admissions.remove(&snapshot.scope_id)
+                                && self.with_db(|db| db.record_docker_candidate_fenced(&lease, admitted, now_ms())).is_err()
+                            {
+                                snapshots_saved = false;
+                                scopes.push(json!({"scope_id":snapshot.scope_id,"status":"failed","failure":"docker_candidate_save_failed"}));
+                            }
                             changes += cs.len();
                             scopes.push(json!({"scope_id":snapshot.scope_id,"status":status,"changes":cs.len(),"counters":snapshot.counters,"failures":snapshot.failures.iter().map(|failure| failure.code).collect::<Vec<_>>() }));
                         }
                         Err(_) => {
+                            docker_admissions.remove(&snapshot.scope_id);
                             snapshots_saved = false;
                             scopes.push(json!({"scope_id":snapshot.scope_id,"status":"failed","failure":"internal"}));
                         }

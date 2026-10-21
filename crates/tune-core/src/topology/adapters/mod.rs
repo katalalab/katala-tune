@@ -1,4 +1,5 @@
 pub mod docker;
+pub(crate) mod docker_api;
 
 pub mod github;
 pub mod local;
