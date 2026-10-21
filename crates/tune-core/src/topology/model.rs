@@ -422,6 +422,7 @@ pub struct Workflow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TopologyLimits {
     pub roots_per_environment: usize,
     pub depth: usize,

@@ -26,7 +26,7 @@ pub enum RemotePlatform {
     Posix,
     Windows,
 }
-#[derive(Clone, Copy, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteRuntimeKind {
     Native,
@@ -64,6 +64,7 @@ pub struct RemoteRequest {
     pub configs: Vec<Value>,
     pub source_allowlist: Option<Vec<RemoteSourceCheckout>>,
     pub python_program: String,
+    pub windows_reader_program: Option<String>,
     pub git_program: Option<String>,
     pub observed_at_ms: i64,
     pub limits: TopologyLimits,
@@ -196,15 +197,7 @@ fn validate_sources(request: &RemoteRequest, capture: &mut RawCapture) -> Result
     Ok(complete && seen.len() == policy.len())
 }
 
-pub async fn collect_remote(request: &RemoteRequest) -> RawCapture {
-    collect_remote_with(&SystemRunner, request).await
-}
-
-pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteRequest) -> RawCapture {
-    let mut failed = empty_capture(request);
-    let alias_ok =
-        !request.alias.is_empty() && !request.alias.starts_with('-') && request.alias.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
-    let python_ok = request.python_program.starts_with('/') && request.python_program.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b));
+pub(super) fn validate_collection(request: &RemoteRequest) -> Result<(), Failure> {
     let distro_ok = request.expected_distro.as_deref().is_none_or(|value| {
         !value.is_empty() && value.len() <= 64 && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
     });
@@ -217,52 +210,72 @@ pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteReq
                 root.len() > 2 && root.as_bytes()[0].is_ascii_alphabetic() && root.as_bytes()[1] == b':' && matches!(root.as_bytes()[2], b'/' | b'\\')
             }
     });
-    if !distro_ok
-        || !runtime_ok
-        || !roots_ok
-        || request.limits.stdout_bytes < 2048
-        || !alias_ok
-        || (request.platform == RemotePlatform::Posix && !python_ok)
-        || request.roots.is_empty()
-    {
+    if !distro_ok || !runtime_ok || !roots_ok || request.limits.stdout_bytes < 2048 || request.roots.is_empty() {
+        return Err(Failure::new(FailureCode::Unsupported, "invalid existing SSH surface or roots"));
+    }
+    if !valid_source_allowlist(request) {
+        return Err(Failure::new(FailureCode::PermissionDenied, "explicit source allowlist required"));
+    }
+    if request.roots.len() > request.limits.roots_per_environment {
+        return Err(Failure::new(FailureCode::LimitReached, "root budget exceeded"));
+    }
+    if request.cursor.as_ref().is_some_and(|cursor| !valid_cursor(cursor, request.roots.len(), request.limits.depth)) {
+        return Err(Failure::new(FailureCode::PermissionDenied, "invalid continuation cursor"));
+    }
+    Ok(())
+}
+
+pub async fn collect_remote(request: &RemoteRequest) -> RawCapture {
+    collect_remote_with(&SystemRunner, request).await
+}
+
+pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteRequest) -> RawCapture {
+    let mut failed = empty_capture(request);
+    let alias_ok =
+        !request.alias.is_empty() && !request.alias.starts_with('-') && request.alias.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    let python_ok = request.python_program.starts_with('/') && request.python_program.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b));
+    if !alias_ok || (request.platform == RemotePlatform::Posix && !python_ok) {
         failed.failures.push(Failure::new(FailureCode::Unsupported, "invalid existing SSH surface or roots"));
         return failed;
     }
-    if !valid_source_allowlist(request) {
-        failed.failures.push(Failure::new(FailureCode::PermissionDenied, "explicit source allowlist required"));
-        return failed;
-    }
-    if request.roots.len() > request.limits.roots_per_environment {
-        failed.failures.push(Failure::new(FailureCode::LimitReached, "root budget exceeded"));
-        return failed;
-    }
-    if request.cursor.as_ref().is_some_and(|cursor| !valid_cursor(cursor, request.roots.len(), request.limits.depth)) {
-        failed.failures.push(Failure::new(FailureCode::PermissionDenied, "invalid continuation cursor"));
+    if let Err(failure) = validate_collection(request) {
+        failed.failures.push(failure);
         return failed;
     }
     let config = json!({"source_allowlist":request.source_allowlist,"scope_id":request.scope_id,"observed_at_ms":request.observed_at_ms,"roots":request.roots,"configs":request.configs,"git_program":request.git_program,"limits":request.limits,"work_timeout_ms":remote_work_timeout_ms(request.limits.remote_timeout_seconds),"cursor":request.cursor,"expected_runtime":request.expected_runtime,"expected_distro":request.expected_distro,"expected_identity_hash":request.expected_identity_hash});
     let serialized = serde_json::to_vec(&config).unwrap_or_default();
-    if serialized.len() > request.limits.file_bytes {
+    if serialized.len() > request.limits.file_bytes || serialized.len() > MAX_REMOTE_INPUT {
         failed.failures.push(Failure::new(FailureCode::LimitReached, "remote request byte budget exceeded"));
         return failed;
     }
-    let encoded_config = crate::logs::base64(&serialized);
+    let mut reader_binding = None;
     let (command, stdin) = if request.platform == RemotePlatform::Posix {
+        let encoded_config = crate::logs::base64(&serialized);
         (
             format!("exec {} -B -", request.python_program),
             format!("import base64,json\nCONFIG=json.loads(base64.b64decode(\"{encoded_config}\"))\n{POSIX_PROBE}").into_bytes(),
         )
     } else {
-        let script = format!(
-            "$TopologyRequest = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(\"{encoded_config}\")) | ConvertFrom-Json\n{}",
-            WINDOWS_PROBE.trim_start_matches('\u{feff}')
-        );
-        let stdin = script.into_bytes();
-        let loader = WINDOWS_STDIN_LOADER.replace("__BYTES__", &stdin.len().to_string());
-        let utf16: Vec<u8> = loader.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        (format!("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {}", crate::logs::base64(&utf16)), stdin)
+        use super::windows_reader::{ReaderRequest, encode_request, fresh_nonce, valid_program_path};
+        let Some(program) = request.windows_reader_program.as_deref().filter(|p| valid_program_path(p)) else {
+            failed.failures.push(Failure::new(FailureCode::Unsupported, "explicit Windows reader executable required"));
+            return failed;
+        };
+        let prepared = fresh_nonce()
+            .and_then(|nonce| ReaderRequest::from_remote(request, nonce, remote_work_timeout_ms(request.limits.remote_timeout_seconds)))
+            .and_then(|reader| encode_request(&reader).map(|frame| (reader, frame)));
+        let Ok((reader, frame)) = prepared else {
+            failed.failures.push(Failure::new(FailureCode::PermissionDenied, "remote reader request invalid"));
+            return failed;
+        };
+        let command = format!("exec '{program}' topology-reader --budget-ms {}", reader.budget_ms);
+        // The frame prefix is fixed at sixteen bytes; preserve the exact body
+        // sent to the remote helper, never a reserialized approximation.
+        reader_binding = Some((reader, frame[16..].to_vec()));
+        (command, frame)
     };
-    if stdin.len() > MAX_REMOTE_INPUT {
+    let stdin_limit = MAX_REMOTE_INPUT + if reader_binding.is_some() { 16 } else { 0 };
+    if stdin.len() > stdin_limit {
         failed.failures.push(Failure::new(FailureCode::LimitReached, "remote stdin byte budget exceeded"));
         return failed;
     }
@@ -283,21 +296,43 @@ pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteReq
         request.alias.clone(),
         command,
     ]);
-    let output = runner
-        .run("ssh", &args, &stdin, Duration::from_secs(request.limits.remote_timeout_seconds), request.limits.stdout_bytes, request.limits.stderr_bytes)
-        .await;
+    let stdout_limit = if reader_binding.is_some() {
+        request.limits.stdout_bytes.saturating_add(super::windows_reader::MAX_RESPONSE_HEADER_BYTES + 16)
+    } else {
+        request.limits.stdout_bytes
+    };
+    let output = runner.run("ssh", &args, &stdin, Duration::from_secs(request.limits.remote_timeout_seconds), stdout_limit, request.limits.stderr_bytes).await;
     if let Some(failure) = failure_from_process(&output) {
         failed.failures.push(failure);
         return failed;
     }
-    if output.stdout.contains(&0) {
-        failed.failures.push(Failure::new(FailureCode::ParseError, "transport contains invalid NUL"));
-        return failed;
+    let bytes = if let Some((reader, body)) = &reader_binding {
+        match super::windows_reader::decode_response(&output.stdout, reader, body) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                failed.failures.push(Failure::new(FailureCode::PermissionDenied, "remote reader acknowledgement invalid"));
+                return failed;
+            }
+        }
+    } else {
+        output.stdout.as_slice()
+    };
+    match validate_capture_bytes(request, bytes) {
+        Ok(capture) => capture,
+        Err(failure) => {
+            failed.failures.push(failure);
+            failed
+        }
     }
-    let raw = serde_json::from_slice::<Value>(&output.stdout);
+}
+
+pub(super) fn validate_capture_bytes(request: &RemoteRequest, bytes: &[u8]) -> Result<RawCapture, Failure> {
+    if bytes.contains(&0) {
+        return Err(Failure::new(FailureCode::ParseError, "transport contains invalid NUL"));
+    }
+    let raw = super::windows_reader::strict_json::<Value>(bytes);
     let Ok(raw) = raw else {
-        failed.failures.push(Failure::new(FailureCode::ParseError, "remote report invalid"));
-        return failed;
+        return Err(Failure::new(FailureCode::ParseError, "remote report invalid"));
     };
     let runtime = &raw["runtime"];
     let expected_kind = if request.expected_runtime == RemoteRuntimeKind::Wsl { "wsl" } else { "native" };
@@ -307,13 +342,11 @@ pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteReq
         || runtime["kernel_wsl"].as_bool() != Some(request.expected_runtime == RemoteRuntimeKind::Wsl)
         || (request.expected_runtime == RemoteRuntimeKind::Wsl && runtime["distro"].as_str() != request.expected_distro.as_deref())
     {
-        failed.failures.push(Failure::new(FailureCode::PermissionDenied, "remote runtime identity mismatch"));
-        return failed;
+        return Err(Failure::new(FailureCode::PermissionDenied, "remote runtime identity mismatch"));
     }
     let capture = serde_json::from_value::<RawCapture>(raw);
     let Ok(mut capture) = capture else {
-        failed.failures.push(Failure::new(FailureCode::ParseError, "remote report invalid"));
-        return failed;
+        return Err(Failure::new(FailureCode::ParseError, "remote report invalid"));
     };
     if capture.scope_id != request.scope_id
         || capture.adapter != "remote"
@@ -321,17 +354,14 @@ pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteReq
         || capture.limits != request.limits
         || request.expected_identity_hash.as_ref().is_some_and(|expected| capture.target_identity.as_ref() != Some(expected))
     {
-        failed.failures.push(Failure::new(FailureCode::PermissionDenied, "remote identity or request mismatch"));
-        return failed;
+        return Err(Failure::new(FailureCode::PermissionDenied, "remote identity or request mismatch"));
     }
     if !valid_capture(&capture) || capture.progress.as_ref().is_some_and(|cursor| !valid_cursor(cursor, request.roots.len(), request.limits.depth)) {
-        failed.failures.push(Failure::new(FailureCode::ParseError, "remote report violates bounded schema"));
-        return failed;
+        return Err(Failure::new(FailureCode::ParseError, "remote report violates bounded schema"));
     }
     match validate_sources(request, &mut capture) {
         Err(()) => {
-            failed.failures.push(Failure::new(FailureCode::PermissionDenied, "remote source allowlist mismatch"));
-            return failed;
+            return Err(Failure::new(FailureCode::PermissionDenied, "remote source allowlist mismatch"));
         }
         Ok(false) if capture.failures.len() < 64 => capture.failures.push(Failure::new(FailureCode::PermissionDenied, "source allowlist incomplete")),
         Ok(false) => {}
@@ -346,7 +376,7 @@ pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteReq
             failure.message = safe_failure_message(&failure.message, true);
         }
     }
-    capture
+    Ok(capture)
 }
 
 fn valid_capture(capture: &RawCapture) -> bool {

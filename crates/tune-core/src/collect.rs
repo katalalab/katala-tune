@@ -152,6 +152,18 @@ mod bounded;
 pub use bounded::{BoundedResult, ProcessIdentity, ProcessReceipt, ProcessStop};
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+mod windows_pin;
+#[cfg(windows)]
+pub use windows::OwnedWindowsCompletion;
+#[cfg(windows)]
+pub use windows_pin::PinnedWindowsExecutable;
+
+/// Read-only facts for this process; these diagnostics cannot issue an OS witness.
+#[cfg(windows)]
+pub fn current_windows_process_identity() -> std::io::Result<ProcessIdentity> {
+    windows::current_process_identity()
+}
 
 /// Explicit process environment for a bounded transport invocation.
 pub struct BoundedEnvironment<'a> {
@@ -229,6 +241,55 @@ pub async fn run_standalone_windows_bounded(
     stderr_limit: usize,
 ) -> BoundedResult {
     windows::run(command, environment.entries, input, deadline, stdout_limit, stderr_limit).await
+}
+
+/// Observe one pinned child tree from a dedicated single-spawner supervisor.
+///
+/// Command's program must exactly equal `pin.executable()`; the pin is the only
+/// executable authority. Success retains the lease and actual Job/process handles
+/// until its bound output is consumed. A serialized receipt cannot construct it.
+/// The absolute deadline may shorten the pin's original deadline, never extend it.
+/// This API does not establish caller isolation: use only before background/GUI
+/// initialization in an independent supervisor observing the reader as its root.
+/// Failure or cancellation requests owned-Job termination but cannot retain this
+/// lease beyond the future if exit is unconfirmed. The independent outer owner
+/// must retain its own lease through actual helper exit and its fixed deadline.
+#[cfg(windows)]
+#[allow(clippy::result_large_err)] // Preserve the complete diagnostic result on failure without an extra boxed transport type.
+pub async fn run_owned_standalone_windows_bounded(
+    pin: PinnedWindowsExecutable,
+    command: &std::process::Command,
+    environment: StandaloneWindowsEnvironment<'_>,
+    input: &[u8],
+    deadline: Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<OwnedWindowsCompletion, BoundedResult> {
+    windows::run_owned(pin, command, environment.entries, input, deadline, stdout_limit, stderr_limit).await
+}
+
+/// Metadata status policy, selected by the fixed Git operation rather than input.
+#[cfg(windows)]
+pub(crate) enum WindowsMetadataExitPolicy {
+    ZeroOnly,
+    MissingOrigin,
+}
+
+/// Reuse one retained artifact lease for all queries in an isolated native reader.
+/// Each invocation still verifies its actual suspended image and owns its Job.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments, clippy::result_large_err)] // Existing bounded arguments plus the narrow metadata exit policy; preserve full diagnostics.
+pub(crate) async fn run_shared_pinned_windows_metadata_bounded(
+    pin: std::sync::Arc<PinnedWindowsExecutable>,
+    command: &std::process::Command,
+    environment: StandaloneWindowsEnvironment<'_>,
+    input: &[u8],
+    deadline: Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    exit_policy: WindowsMetadataExitPolicy,
+) -> Result<OwnedWindowsCompletion, BoundedResult> {
+    windows::run_owned_shared(pin, command, environment.entries, input, deadline, stdout_limit, stderr_limit, exit_policy).await
 }
 
 async fn run_bounded_portable(mut command: Command, input: &[u8], timeout: Duration, stdout_limit: usize, stderr_limit: usize) -> BoundedResult {

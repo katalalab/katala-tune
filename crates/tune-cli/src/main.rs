@@ -44,6 +44,8 @@
 //! 変更操作（actions）はここからは実行しない（確認ダイアログを通すため、アプリからだけ）。
 
 mod agent;
+mod topology_native;
+mod topology_reader;
 
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -297,9 +299,22 @@ async fn live(rest: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let started = std::time::Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|cmd| cmd == "topology-reader") {
+        return topology_reader::main(&args[1..], started);
+    }
+    if let Some(entry) = args.first().filter(|entry| matches!(entry.as_str(), "topology-native-reader" | "topology-supervise" | "topology-verify")) {
+        return topology_native::main(entry, &args[1..], started);
+    }
+    match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(runtime) => runtime.block_on(async_main(args)),
+        Err(_) => ExitCode::from(1),
+    }
+}
+
+async fn async_main(args: Vec<String>) -> ExitCode {
     let Some(cmd) = args.first() else { return usage() };
     let rest = &args[1..];
     let res: Result<(), String> = match cmd.as_str() {
