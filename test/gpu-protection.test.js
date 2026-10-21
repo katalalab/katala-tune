@@ -280,8 +280,8 @@ test('KT2 exchange waits for READY before its only request and classifies termin
   assert.equal(nonzero.code, 7);
 
   const bodyHash = require('node:crypto').createHash('sha256').update(body).digest('hex');
-  const heldEof = `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('KT2 RESULT ${nonce} ${bodyHash} 0 0 0\\n');setTimeout(()=>{},2000)});`;
-  const held = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', heldEof] }, timeoutMs: 150 });
+  const heldEof = String.raw`const crypto=require('node:crypto');let chunks=[];process.stdout.write('KT2 READY ${nonce}\n');process.stdin.on('data',d=>chunks.push(d));process.stdin.on('end',()=>{const all=Buffer.concat(chunks),at=all.indexOf(10),line=all.subarray(0,at).toString('ascii').split(' '),bytes=all.subarray(at+1);if(at<0||line.length!==5||line[0]!=='KT2'||line[1]!=='REQUEST'||line[2]!=='${nonce}'||Number(line[3])!==bytes.length||line[4]!==crypto.createHash('sha256').update(bytes).digest('hex')){process.exit(92);return}process.stdout.write('KT2 RESULT ${nonce} ${bodyHash} 0 0 0\n');setTimeout(()=>{},2000)});`;
+  const held = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', heldEof] }, timeoutMs: 1000 });
   assert.equal(held.code, 7);
 
   const noReady = 'setTimeout(()=>{},2000)';
