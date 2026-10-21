@@ -127,7 +127,7 @@ mod windows {
         let request:ReaderRequest=serde_json::from_value(json!({
             "schema":reader::REQUEST_SCHEMA,"nonce":"0123456789abcdef0123456789abcdef","scope_id":"fixture:environment","observed_at_ms":1000,
             "expected_identity_hash":identity_hash(&tune_core::nodes::local_host()),"expected_runtime":"native","expected_distro":null,
-            "roots":[root.to_string_lossy().replace('\\',"/")],"configs":[],"cursor":null,
+            "roots":[root.canonicalize().unwrap().to_str().unwrap().trim_start_matches(r"\\?\").replace('\\',"/")],"configs":[],"cursor":null,
             "source_allowlist":[{"root_index":0,"relative_path":".","expected_head":head,"manifests":[{"relative_path":"package.json","bytes":content.len(),"sha256":tune_core::db::sha256_hex(&content)}]}],
             "git_program":program,"limits":TopologyLimits::default(),"budget_ms":30000,"probe_sha256":tune_core::db::sha256_hex(WINDOWS_PROBE.as_bytes())
         })).unwrap();

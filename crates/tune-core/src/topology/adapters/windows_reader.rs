@@ -511,6 +511,9 @@ mod native_diagnostics {
         root: PathBuf,
         program: PathBuf,
         request: ReaderRequest,
+        original_root: String,
+        original_has_tilde: bool,
+        original_lexical_differs: bool,
     }
     impl Fixture {
         fn new() -> Self {
@@ -544,7 +547,18 @@ mod native_diagnostics {
             );
             let head = require(String::from_utf8(git(&program, &root, &["rev-parse", "--verify", "HEAD"])), "fixture HEAD UTF-8").trim().to_owned();
             let program_text = program.to_str().unwrap_or_else(|| panic!("fixture Git path requires UTF-8")).trim_start_matches(r"\\?\").replace('\\', "/");
-            let root_text = root.to_str().unwrap_or_else(|| panic!("fixture root requires UTF-8")).replace('\\', "/");
+            let original_root = root.to_str().unwrap_or_else(|| panic!("fixture root requires UTF-8")).replace('\\', "/");
+            // Approve the independently resolved fixture path before building
+            // the request. Never turn the probe's reported hash into policy.
+            let approved_root = require(root.canonicalize(), "approved fixture root");
+            let root_text =
+                approved_root.to_str().unwrap_or_else(|| panic!("approved fixture root requires UTF-8")).trim_start_matches(r"\\?\").replace('\\', "/");
+            let recanonical = require(Path::new(&root_text).canonicalize(), "approved root canonical check");
+            let recanonical = recanonical.to_str().unwrap_or_else(|| panic!("canonical check requires UTF-8")).trim_start_matches(r"\\?\").replace('\\', "/");
+            assert!(root_text == recanonical, "approved fixture root must be lexically canonical");
+            let original_has_tilde = original_root.contains('~');
+            let original_lexical_differs = remote::source_root_fingerprint(&original_root, RemotePlatform::Windows)
+                != remote::source_root_fingerprint(&root_text, RemotePlatform::Windows);
             let request = require(
                 serde_json::from_value(serde_json::json!({
                     "schema":REQUEST_SCHEMA,"nonce":"0123456789abcdef0123456789abcdef","scope_id":"fixture:legacy-diagnostic","observed_at_ms":1000,
@@ -555,7 +569,7 @@ mod native_diagnostics {
                 })),
                 "request DTO",
             );
-            Self { root, program, request }
+            Self { root, program, request, original_root, original_has_tilde, original_lexical_differs }
         }
     }
     impl Drop for Fixture {
@@ -774,6 +788,11 @@ mod native_diagnostics {
         let fixture = Fixture::new();
         assert!(fixture.request.validate().is_ok(), "synthetic request must pass admission before IO");
         let runtime = require(tokio::runtime::Builder::new_current_thread().enable_all().build(), "isolated runtime");
+        let mut original = fixture.request.clone();
+        original.roots[0] = fixture.original_root.clone();
+        // When the actual temp spelling differs, retain the old approval as a
+        // negative control. The canonical positive remains mandatory everywhere.
+        let original_output = fixture.original_lexical_differs.then(|| runtime.block_on(run_probe(&original, Instant::now() + Duration::from_millis(26500))));
         let output = runtime.block_on(run_probe(&fixture.request, Instant::now() + Duration::from_millis(26500)));
         drop(runtime);
         let output = match output {
@@ -789,6 +808,22 @@ mod native_diagnostics {
         let capture = remote::validate_capture_bytes(&fixture.request.remote_request(), &output.stdout);
         let mut record = require(serde_json::to_value(diagnostic(&output, capture.is_ok())), "structural diagnostic");
         record["validation"] = capture_structure(&fixture.request, &output.stdout);
+        record["original_has_tilde"] = Value::Bool(fixture.original_has_tilde);
+        record["original_lexical_differs"] = Value::Bool(fixture.original_lexical_differs);
+        record["original_alias_attempt"] = original_output.as_ref().map_or(Value::Null, |attempt| match attempt {
+            Err(_) => serde_json::json!({"preparation_ok":false}),
+            Ok(previous) => {
+                let mut value = require(
+                    serde_json::to_value(diagnostic(previous, remote::validate_capture_bytes(&original.remote_request(), &previous.stdout).is_ok())),
+                    "original-alias diagnostic",
+                );
+                value["preparation_ok"] = Value::Bool(true);
+                value["validation"] = capture_structure(&original, &previous.stdout);
+                value["reported_capture_matches_canonical_approval"] =
+                    Value::Bool(remote::validate_capture_bytes(&fixture.request.remote_request(), &previous.stdout).is_ok());
+                value
+            }
+        });
         println!("\n{RECORD}{record}");
         assert!(
             output.code == Some(0) && !output.spawn_failed && !output.timed_out && !output.output_limited,
@@ -799,6 +834,25 @@ mod native_diagnostics {
         assert!(capture.failures.is_empty(), "actual legacy capture must have no failures");
         assert!(capture.repositories.len() == 1 && capture.repositories[0].manifests.len() == 1, "actual approved manifest required");
         assert!(capture.repositories[0].manifests[0].content.as_bytes() == MANIFEST, "actual approved bytes required");
+        if let Some(attempt) = original_output {
+            let previous = require(attempt, "original-alias actual probe");
+            assert!(
+                previous.code == Some(0) && !previous.spawn_failed && !previous.timed_out && !previous.output_limited,
+                "original-alias probe must finish within limits"
+            );
+            assert!(previous.process_receipt.as_ref().is_some_and(ProcessReceipt::cleanup_confirmed), "original-alias probe requires every OS ACK");
+            let denied = remote::validate_capture_bytes(&original.remote_request(), &previous.stdout);
+            assert!(
+                denied.as_ref().err().is_some_and(
+                    |failure| failure.code == crate::topology::FailureCode::PermissionDenied && failure.message == "remote source allowlist mismatch"
+                ),
+                "different original lexical root must remain denied"
+            );
+            assert!(
+                remote::validate_capture_bytes(&fixture.request.remote_request(), &previous.stdout).is_ok(),
+                "old probe must report exactly the independently approved canonical root"
+            );
+        }
         assert!(require(std::fs::read(fixture.root.join("package.json")), "post-read manifest") == MANIFEST, "approved fixture must remain unchanged");
         let head = require(String::from_utf8(git(&fixture.program, &fixture.root, &["rev-parse", "--verify", "HEAD"])), "post-read HEAD");
         assert!(head.trim() == fixture.request.source_allowlist[0].expected_head, "fixture HEAD must remain unchanged");

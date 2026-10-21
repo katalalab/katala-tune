@@ -1052,7 +1052,7 @@ mod tests {
         command.args(["--exact", &fixture, "--nocapture", "--", "--shared-pinned-metadata"]);
         command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::inherit());
         let mut child = command.spawn().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(35);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while child.try_wait().unwrap().is_none() {
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
@@ -1069,21 +1069,176 @@ mod tests {
         if !std::env::args().any(|arg| arg == "--shared-pinned-metadata") {
             return;
         }
+        // Diagnostic only. Both variants remain suspended, verify the held
+        // image, and terminate their actual retained handle. No witness is issued.
+        async fn suspended_probes(
+            pin: &PinnedWindowsExecutable,
+            command: &std::process::Command,
+            values: &[(OsString, OsString)],
+            deadline: std::time::Instant,
+            dos_application: &Path,
+            cases: [&'static str; 2],
+        ) -> io::Result<()> {
+            let session = nonce()?;
+            let security = pipe_security()?;
+            let input = pipe(&session, "stdin", true, &security)?;
+            let stdout = pipe(&session, "stdout", false, &security)?;
+            let stderr = pipe(&session, "stderr", false, &security)?;
+            input.server.connect().await?;
+            stdout.server.connect().await?;
+            stderr.server.connect().await?;
+            let job = Job::new()?;
+            let jobs = [job.handle.as_raw_handle()];
+            let handles = [input.client.as_raw_handle(), stdout.client.as_raw_handle(), stderr.client.as_raw_handle()];
+            let mut attributes = Attributes::new(&jobs, &handles)?;
+            let mut startup = STARTUPINFOEXW::default();
+            startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+            startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+            startup.StartupInfo.hStdInput = handles[0];
+            startup.StartupInfo.hStdOutput = handles[1];
+            startup.StartupInfo.hStdError = handles[2];
+            startup.lpAttributeList = attributes.raw();
+            let original_argv = command_line(pin.executable(), command)?;
+            let env = environment(command, values)?;
+            let cwd = command.get_current_dir().map(|path| wide(path.as_os_str())).transpose()?;
+            // Reuse these exact Job, stdio handles, attribute list and environment
+            // for the two one-parameter variants of each pinned image.
+            for (case, application, null_line) in [(cases[0], pin.executable(), true), (cases[1], dos_application, false)] {
+                let application = wide(application.as_os_str())?;
+                let mut argv = original_argv.clone();
+                let mut created = PROCESS_INFORMATION::default();
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::from(io::ErrorKind::TimedOut));
+                }
+                // SAFETY: all buffers, attribute arrays and handles remain live.
+                // JOB_LIST is unchanged; the primary thread is NEVER resumed.
+                let ok = unsafe {
+                    CreateProcessW(
+                        application.as_ptr(),
+                        if null_line { null_mut() } else { argv.as_mut_ptr() },
+                        null(),
+                        null(),
+                        1,
+                        CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                        env.as_ptr().cast(),
+                        cwd.as_ref().map_or(null(), |path| path.as_ptr()),
+                        &startup.StartupInfo,
+                        &mut created,
+                    )
+                };
+                if ok == 0 {
+                    let error = os_error();
+                    eprintln!("shared_suspended_case={case} error={} verified=false termination_ack=false job_empty=false", error.raw_os_error().unwrap_or(-1));
+                    continue;
+                }
+                let root = owned(created.hProcess)?;
+                let thread = owned(created.hThread)?;
+                let verified = pin.verify_process(root.as_raw_handle()).is_ok();
+                // SAFETY: terminate only this freshly created retained suspended
+                // root, regardless of image verification. Never resume either case.
+                let requested = unsafe { windows_sys::Win32::System::Threading::TerminateProcess(root.as_raw_handle(), 0) } != 0;
+                let cleanup_end = deadline.min(std::time::Instant::now() + CLEANUP);
+                let mut receipt = ProcessReceipt::default();
+                let (mut root_ack, mut empty) = (false, false);
+                while std::time::Instant::now() < cleanup_end {
+                    if exited(&root).unwrap_or(false) {
+                        let mut code = 0;
+                        // SAFETY: query the retained root only after actual signal.
+                        root_ack = requested && unsafe { GetExitCodeProcess(root.as_raw_handle(), &mut code) } != 0 && code == 0;
+                    }
+                    empty = job.accounting(&mut receipt).is_ok() && receipt.job_empty;
+                    if root_ack && empty {
+                        break;
+                    }
+                    tokio::time::sleep(POLL).await;
+                }
+                eprintln!("shared_suspended_case={case} error=0 verified={verified} termination_ack={root_ack} job_empty={empty}");
+                // Keep both handles through finite observation. If cleanup is
+                // unknown, stop and let the owned Job destructor request cleanup.
+                drop(thread);
+                drop(root);
+                if !root_ack || !empty {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        let end = std::time::Instant::now() + Duration::from_secs(45);
         let mut buffer = [0u16; 32768];
-        // SAFETY: fixed writable UTF-16 buffer for read-only OS location queries.
-        let count = unsafe { GetWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
-        assert!(count > 0 && count < buffer.len());
-        let root = OsString::from_wide(&buffer[..count]);
-        // SAFETY: the same fixed output buffer remains valid for the second query.
+        // SAFETY: fixed writable UTF-16 buffer for a read-only OS location query.
         let count = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
         assert!(count > 0 && count < buffer.len());
         let program = PathBuf::from(OsString::from_wide(&buffer[..count])).join("cmd.exe").canonicalize().unwrap();
         let image = std::fs::read(&program).unwrap();
         let artifact = sha256(&image);
-        let end = std::time::Instant::now() + Duration::from_secs(20);
         let pin = Arc::new(PinnedWindowsExecutable::open(&program, &artifact, end).unwrap());
-        let environment = [(OsString::from("SystemRoot"), root.clone()), (OsString::from("WINDIR"), root)];
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let source = crate::topology::adapters::native_reader::windows::WindowsSourceIo::default();
+        let git_environment = crate::topology::adapters::native_reader::environment(&source).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let report = |case: &'static str, volume_match: bool, result: &Result<OwnedWindowsCompletion, BoundedResult>| {
+            let diagnostic = match result {
+                Ok(completion) => completion.diagnostic(),
+                Err(result) => result,
+            };
+            eprintln!(
+                "shared_pinned_case={case} system_volume_match={volume_match} code={:?} root_exit_code={:?} root_present={} timeout={} limit={} spawn={} stop={:?} cleanup={}",
+                diagnostic.code,
+                diagnostic.process_receipt.as_ref().and_then(|receipt| receipt.root_exit_code),
+                diagnostic.process_receipt.as_ref().is_some_and(|receipt| receipt.root.is_some()),
+                diagnostic.timed_out,
+                diagnostic.output_limited,
+                diagnostic.spawn_failed,
+                diagnostic.process_receipt.as_ref().map(|receipt| receipt.stop),
+                diagnostic.process_receipt.as_ref().is_some_and(ProcessReceipt::cleanup_confirmed)
+            );
+        };
+        let same_volume = |candidate: &PinnedWindowsExecutable| candidate.executable().components().next() == pin.executable().components().next();
+        struct TemporaryDirectory(PathBuf);
+        impl Drop for TemporaryDirectory {
+            fn drop(&mut self) {
+                // Exclusively created below. Every later-declared lease is
+                // dropped before this cleanup, including during unwinding.
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = std::env::temp_dir().join(format!("shared-pin-fixture-{}-{}", std::process::id(), crate::db::now_ms()));
+        std::fs::create_dir(&directory).unwrap();
+        let temporary = TemporaryDirectory(directory);
+        let own_program = std::env::current_exe().unwrap();
+        let own_image = std::fs::read(&own_program).unwrap();
+        let own_artifact = sha256(&own_image);
+        let own_pin = Arc::new(PinnedWindowsExecutable::open(&own_program, &own_artifact, end).unwrap());
+        let exit_fixture = format!("{}::accounting_exit_fixture", module_path!().split_once("::").unwrap().1);
+        let exit_args = ["--exact", &exit_fixture, "--nocapture", "--", "--owned-accounting-exit"];
+        let mut own_command = std::process::Command::new(own_pin.executable());
+        own_command.current_dir(&cwd).args(exit_args);
+        let own_result =
+            runtime.block_on(run_owned_shared(Arc::clone(&own_pin), &own_command, &git_environment, b"", end, 8192, 8192, WindowsMetadataExitPolicy::ZeroOnly));
+        report("own_rust", same_volume(&own_pin), &own_result);
+        let own_passed = own_result.is_ok_and(|completion| completion.into_verified_output(b"", &own_artifact).is_ok());
+        let copied_program = temporary.0.join("rust-control.exe");
+        let copy_pin = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&copied_program)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, &own_image))
+            .and_then(|()| PinnedWindowsExecutable::open(&copied_program, &own_artifact, end))
+            .ok()
+            .map(Arc::new);
+        let copy_passed = if let Some(copied) = &copy_pin {
+            let mut command = std::process::Command::new(copied.executable());
+            command.current_dir(&cwd).args(exit_args);
+            let result =
+                runtime.block_on(run_owned_shared(Arc::clone(copied), &command, &git_environment, b"", end, 8192, 8192, WindowsMetadataExitPolicy::ZeroOnly));
+            let volume_match = same_volume(copied);
+            report("copied_rust", volume_match, &result);
+            let consumed = result.is_ok_and(|completion| completion.into_verified_output(b"", &own_artifact).is_ok());
+            volume_match && consumed
+        } else {
+            eprintln!("shared_pinned_case=copied_rust_setup_failed");
+            false
+        };
         // Fixture-only PATH discovery. Product execution still receives one
         // explicit pinned program and the native collector's exact nine-key map.
         let git_program = std::env::split_paths(&std::env::var_os("PATH").expect("fixture Git PATH"))
@@ -1096,7 +1251,7 @@ mod tests {
         let git_artifact = sha256(&std::fs::read(&git_program).unwrap());
         let git_pin = Arc::new(PinnedWindowsExecutable::open(&git_program, &git_artifact, end).unwrap());
         let mut git_command = std::process::Command::new(git_pin.executable());
-        git_command.current_dir(std::env::current_dir().unwrap()).args([
+        git_command.current_dir(&cwd).args([
             "--no-optional-locks",
             "-c",
             "core.fsmonitor=false",
@@ -1105,68 +1260,61 @@ mod tests {
             "rev-parse",
             "--absolute-git-dir",
         ]);
-        let source = crate::topology::adapters::native_reader::windows::WindowsSourceIo::default();
-        let git_environment = crate::topology::adapters::native_reader::environment(&source).unwrap();
         let git_result =
             runtime.block_on(run_owned_shared(Arc::clone(&git_pin), &git_command, &git_environment, b"", end, 8192, 8192, WindowsMetadataExitPolicy::ZeroOnly));
-        let git_diagnostic = match &git_result {
-            Ok(completion) => completion.diagnostic(),
-            Err(result) => result,
-        };
-        eprintln!(
-            "shared_actual_git_metadata: code={:?} root_exit_code={:?} timeout={} limit={} spawn={} stop={:?} cleanup={}",
-            git_diagnostic.code,
-            git_diagnostic.process_receipt.as_ref().and_then(|receipt| receipt.root_exit_code),
-            git_diagnostic.timed_out,
-            git_diagnostic.output_limited,
-            git_diagnostic.spawn_failed,
-            git_diagnostic.process_receipt.as_ref().map(|receipt| receipt.stop),
-            git_diagnostic.process_receipt.as_ref().is_some_and(ProcessReceipt::cleanup_confirmed)
-        );
+        report("actual_git", same_volume(&git_pin), &git_result);
         let git_passed = git_result.is_ok_and(|completion| completion.into_verified_output(b"", &git_artifact).is_ok_and(|bytes| !bytes.is_empty()));
+        let git_dos = user_executable_path(git_program.clone()).unwrap();
+        let cmd_dos = user_executable_path(program.clone()).unwrap();
+        let mut probe_cmd = std::process::Command::new(pin.executable());
+        probe_cmd.current_dir(&cwd).args(["/D", "/C", "exit", "0"]);
+        for (held, command, values, dos, cases) in [
+            (git_pin.as_ref(), &git_command, git_environment.as_slice(), git_dos.as_path(), ["git_guid_null", "git_dos_application"]),
+            (pin.as_ref(), &probe_cmd, git_environment.as_slice(), cmd_dos.as_path(), ["cmd_guid_null", "cmd_dos_application"]),
+        ] {
+            if let Err(error) = runtime.block_on(suspended_probes(held, command, values, end, dos, cases)) {
+                for case in cases {
+                    eprintln!("shared_suspended_case={case} error={} verified=false termination_ack=false job_empty=false", error.raw_os_error().unwrap_or(-1));
+                }
+            }
+        }
+        let mut cmd_passed = true;
         for (code, policy) in
             [("0", WindowsMetadataExitPolicy::ZeroOnly), ("0", WindowsMetadataExitPolicy::ZeroOnly), ("1", WindowsMetadataExitPolicy::MissingOrigin)]
         {
             let mut command = std::process::Command::new(pin.executable());
-            command.args(["/D", "/C", "exit", code]);
-            let completion = match runtime.block_on(run_owned_shared(Arc::clone(&pin), &command, &environment, b"", end, 8192, 8192, policy)) {
-                Ok(completion) => completion,
-                Err(result) => panic!(
-                    "shared metadata failure: code={:?} timeout={} limit={} spawn={} stop={:?} cleanup={}",
-                    result.code,
-                    result.timed_out,
-                    result.output_limited,
-                    result.spawn_failed,
-                    result.process_receipt.as_ref().map(|receipt| receipt.stop),
-                    result.process_receipt.as_ref().is_some_and(ProcessReceipt::cleanup_confirmed)
-                ),
-            };
-            assert!(Arc::ptr_eq(&completion.witness.pin, &pin));
-            assert_eq!(Arc::strong_count(&pin), 2, "one caller lease and one completion lease");
-            assert!(completion.diagnostic().process_receipt.as_ref().unwrap().cleanup_confirmed());
-            assert!(completion.into_verified_output(b"", &artifact).ok().expect("actual shared completion binding").is_empty());
-            assert_eq!(Arc::strong_count(&pin), 1, "consumption releases only this invocation's lease");
+            command.current_dir(&cwd).args(["/D", "/C", "exit", code]);
+            let result = runtime.block_on(run_owned_shared(Arc::clone(&pin), &command, &git_environment, b"", end, 8192, 8192, policy));
+            report(if code == "0" { "system_cmd_zero" } else { "system_cmd_origin_one" }, true, &result);
+            let passed = result.is_ok_and(|completion| {
+                let retained = Arc::ptr_eq(&completion.witness.pin, &pin) && Arc::strong_count(&pin) == 2;
+                let cleanup = completion.diagnostic().process_receipt.as_ref().is_some_and(ProcessReceipt::cleanup_confirmed);
+                let consumed = completion.into_verified_output(b"", &artifact).is_ok_and(|bytes| bytes.is_empty());
+                retained && cleanup && consumed
+            });
+            cmd_passed &= passed && Arc::strong_count(&pin) == 1;
         }
         let mut missing = std::process::Command::new(pin.executable());
-        missing.args(["/D", "/C", "exit", "1"]);
-        let failed = runtime
-            .block_on(run_owned_shared(Arc::clone(&pin), &missing, &environment, b"", end, 8192, 8192, WindowsMetadataExitPolicy::ZeroOnly))
-            .err()
-            .expect("zero-only policy cannot issue an exit-one completion");
-        assert_eq!(failed.code, None);
-        assert!(failed.stdout.is_empty() && failed.stderr.is_empty());
-        assert!(failed.process_receipt.as_ref().unwrap().cleanup_confirmed());
+        missing.current_dir(&cwd).args(["/D", "/C", "exit", "1"]);
+        let missing_result =
+            runtime.block_on(run_owned_shared(Arc::clone(&pin), &missing, &git_environment, b"", end, 8192, 8192, WindowsMetadataExitPolicy::ZeroOnly));
+        report("system_cmd_one_zero_only", true, &missing_result);
+        let missing_rejected = missing_result.is_err_and(|failed| {
+            failed.code.is_none()
+                && failed.stdout.is_empty()
+                && failed.stderr.is_empty()
+                && failed.process_receipt.as_ref().is_some_and(ProcessReceipt::cleanup_confirmed)
+        });
 
-        let directory = std::env::temp_dir().join(format!("shared-pin-fixture-{}-{}", std::process::id(), crate::db::now_ms()));
-        std::fs::create_dir(&directory).unwrap();
-        let alternate = directory.join("same-bytes.exe");
+        let alternate = temporary.0.join("same-bytes.exe");
         std::fs::write(&alternate, &image).unwrap();
         let other = PinnedWindowsExecutable::open(&alternate, &artifact, end).unwrap();
         assert_eq!(pin.sha256(), other.sha256());
         assert_ne!(pin.executable(), other.executable());
-        let command = std::process::Command::new(other.executable());
+        let mut command = std::process::Command::new(other.executable());
+        command.current_dir(&cwd);
         let failed = runtime
-            .block_on(run_owned_shared(Arc::clone(&pin), &command, &environment, b"", end, 8192, 8192, WindowsMetadataExitPolicy::ZeroOnly))
+            .block_on(run_owned_shared(Arc::clone(&pin), &command, &git_environment, b"", end, 8192, 8192, WindowsMetadataExitPolicy::ZeroOnly))
             .err()
             .expect("same image bytes at another executable path cannot replace the retained artifact");
         assert_eq!(failed.code, None);
@@ -1175,11 +1323,18 @@ mod tests {
         assert_eq!(receipt.stop, ProcessStop::SetupFailed);
         assert!(receipt.root.is_none() && receipt.observed.is_empty(), "reject the different program before process creation");
         assert_eq!(Arc::strong_count(&pin), 1);
+        assert!(own_passed, "same-parent pinned original Rust control must complete and consume");
+        assert!(copy_passed, "same-bytes Rust control must complete on the system volume and consume");
+        assert!(cmd_passed, "all shared system-command completion and lease assertions remain required");
+        assert!(missing_rejected, "zero-only policy still requires a real completed exit-one rejection");
         assert!(git_passed, "actual pinned Git metadata must succeed as well as the system command fixture");
         drop(other);
-        std::fs::remove_dir_all(directory).unwrap();
+        drop(copy_pin);
+        drop(own_pin);
+        drop(git_pin);
         drop(runtime);
         drop(pin);
+        drop(temporary);
         std::process::exit(0);
     }
 
