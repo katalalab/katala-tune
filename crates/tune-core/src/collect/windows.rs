@@ -892,19 +892,24 @@ mod tests {
         job.after_first_accounting = Some(Box::new(move |job, first| {
             assert!(!first.job_empty, "suspended real root must be active at the first sample");
             assert_eq!(first.total_processes, 1);
-            // SAFETY: this is the retained primary thread returned for our suspended Job-owned root.
-            if unsafe { ResumeThread(thread.as_raw_handle()) } != 1 {
-                return Err(os_error());
-            }
+            let primary_thread = thread; // Keep the suspended primary-thread handle until root exit is confirmed.
             let root = &job.processes[0];
-            // SAFETY: finite wait on our retained real root; no PID selection or unrelated termination.
-            let wait = unsafe { WaitForSingleObject(root.handle.as_raw_handle(), 5000) };
+            if Instant::now() >= spawn_deadline {
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            // SAFETY: terminate only the retained process created suspended in this test's fresh Job.
+            // Its primary thread is never resumed; this isolates accounting order from executed fixture code.
+            check(unsafe { windows_sys::Win32::System::Threading::TerminateProcess(root.handle.as_raw_handle(), 0) })?;
+            let wait_ms = spawn_deadline.saturating_duration_since(Instant::now()).as_millis().min(u128::from(u32::MAX)) as u32;
+            // SAFETY: finite wait on our retained root, bounded by the original absolute spawn deadline.
+            let wait = unsafe { WaitForSingleObject(root.handle.as_raw_handle(), wait_ms) };
             observed_hook_wait.store(wait, Ordering::SeqCst);
-            if wait != WAIT_OBJECT_0 {
+            if wait != WAIT_OBJECT_0 || Instant::now() >= spawn_deadline {
                 return Err(io::Error::from(io::ErrorKind::TimedOut));
             }
             // The old decision combines this actual root-exit query with the earlier active sample.
             observed_old_order.store(exited(&root.handle)? && !first.job_empty, Ordering::SeqCst);
+            drop(primary_thread);
             Ok(())
         }));
         job.observe(&mut receipt).unwrap();
