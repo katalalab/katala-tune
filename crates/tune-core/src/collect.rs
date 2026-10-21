@@ -1326,6 +1326,8 @@ sys.stderr.write('z');sys.stderr.flush();time.sleep(3)"#,
         assert_eq!((stdout_plus.code, stdout_plus.out.as_str()), (Some(9), ""));
         let stderr_exact = run("import sys;sys.stderr.write('x'*65536)", Duration::from_secs(3)).await;
         assert_eq!((stderr_exact.code, stderr_exact.err.len()), (Some(0), 65_536));
+        let stderr_plus = run("import sys;print('{\\\"probe\\\":true}');sys.stderr.write('x'*65537)", Duration::from_secs(3)).await;
+        assert_eq!((stderr_plus.code, stderr_plus.out.as_str()), (Some(9), ""));
         let dual_plus = run("import sys;sys.stdout.write('x'*1048577);sys.stderr.write('z'*65537)", Duration::from_secs(3)).await;
         assert_eq!((dual_plus.code, dual_plus.out.as_str()), (Some(9), ""));
         let nonzero_json = run("import sys;print('{\\\"probe\\\":true}');sys.exit(3)", Duration::from_secs(3)).await;
