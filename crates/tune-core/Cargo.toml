@@ -23,7 +23,7 @@ sha1_smol = "1"
 sha2 = "0.11"
 dirs = "7"
 gethostname = "1"
-toml = "0.8"
+toml = "1.1"
 serde-saphyr = { version = "2.0", default-features = false, features = ["deserialize"] }
 
 [target.'cfg(windows)'.dependencies]
