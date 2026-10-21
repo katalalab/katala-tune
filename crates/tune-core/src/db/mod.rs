@@ -15,6 +15,7 @@ mod checks;
 mod inventory;
 mod logs;
 pub mod metrics;
+mod monitor_events;
 mod netsec;
 pub mod provenance;
 mod snapshots;
@@ -35,7 +36,7 @@ pub use logs::{LogCount, LogRow, TopSignature};
 pub use netsec::NET_EVENT_DAYS;
 pub use provenance::{RunMeta, SpanIn, sha256_hex};
 pub use snapshots::Snapshot;
-pub use topology::TopologyLease;
+pub use topology::{TopologyLease, TopologyUiRequest};
 
 pub const DB_FILE: &str = "katala-tune.db";
 pub const LOG_RETENTION_DAYS: i64 = 30;
@@ -58,6 +59,7 @@ const SCHEMA_PARTS: &[&str] = &[
     provenance::SCHEMA,
     ai_limits::SCHEMA,
     metrics::SCHEMA,
+    monitor_events::SCHEMA,
     topology::SCHEMA,
 ];
 const META_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT, updated_at INTEGER);\n";
@@ -98,6 +100,7 @@ impl Store {
         s.add_columns()?;
         s.migrate()?;
         s.tx(|c| ai_sessions::migrate(c, old_ai))?;
+        s.tx(topology::initialize_optional_indexes)?;
         Ok(s)
     }
 

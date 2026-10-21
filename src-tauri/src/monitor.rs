@@ -67,3 +67,10 @@ pub async fn monitor_settings(e: State<'_, Arc<Engine>>, patch: Option<Value>) -
 pub async fn hub_pull(e: State<'_, Arc<Engine>>) -> Result<Value, String> {
     monitor::pull(&e).await
 }
+
+/// 接続・収集の保守記録。照会による書込み/通知はしない。
+#[tauri::command]
+pub async fn monitor_events(e: State<'_, Arc<Engine>>, filter: Option<Value>) -> Result<Value, String> {
+    let filter = serde_json::from_value(filter.unwrap_or_else(|| json!({}))).map_err(|_| "収集記録の絞り込みが不正です".to_string())?;
+    e.monitor_events(&filter)
+}

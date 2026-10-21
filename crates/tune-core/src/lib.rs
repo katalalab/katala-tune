@@ -45,6 +45,7 @@ pub mod js;
 pub mod live;
 pub mod logs;
 pub mod monitor;
+pub mod monitor_journal;
 pub mod netsec;
 pub mod network;
 pub mod nodes;

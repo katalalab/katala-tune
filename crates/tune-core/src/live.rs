@@ -19,7 +19,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 
 use crate::collect;
 use crate::db::now_ms;
+use crate::monitor_journal::{Category, Data, InputEnd, Journal, Kind, PipeEnd, Policy, Reason, StatePhase, elapsed_ms};
 use crate::nodes::Node;
 
 pub const MAC_LIVE: &str = include_str!("../../../probes/live_mac.py");
@@ -560,6 +561,10 @@ pub fn downsample(points: &[Value], max: usize) -> Vec<Value> {
 pub struct Ended {
     pub code: Option<i32>,
     pub err: String,
+    pub wait_observed: Option<bool>,
+    pub stdout: PipeEnd,
+    pub stderr: PipeEnd,
+    pub stdin: InputEnd,
 }
 
 impl Ended {
@@ -580,11 +585,12 @@ pub struct Source {
     pub lines: mpsc::Receiver<String>,
     stop: Option<oneshot::Sender<()>>,
     done: Option<oneshot::Receiver<Ended>>,
+    pub transport_pid: Option<u32>,
 }
 
 impl Source {
     pub fn new(lines: mpsc::Receiver<String>, stop: oneshot::Sender<()>, done: oneshot::Receiver<Ended>) -> Source {
-        Source { lines, stop: Some(stop), done: Some(done) }
+        Source { lines, stop: Some(stop), done: Some(done), transport_pid: None }
     }
 
     /// 止めて、終わるのを待つ
@@ -735,26 +741,28 @@ pub fn spawn(l: Launch) -> Result<Source, String> {
             return Err(format!("{} を起動できない: {e}", l.program));
         }
     };
+    let transport_pid = child.id();
     let mut stdin = child.stdin.take();
     let input = l.stdin;
     let keep = l.keep_stdin;
     // keep のとき、標準入力は止めるとき（closed の送り手が無くなったとき）まで開いておく
     let (closed_tx, closed_rx) = oneshot::channel::<()>();
-    tokio::spawn(async move {
+    let stdin_task = tokio::spawn(async move {
+        let mut outcome = InputEnd::Unknown;
         if let Some(si) = stdin.as_mut() {
-            let _ = si.write_all(&input).await;
-            let _ = si.flush().await;
-            if !keep {
-                let _ = si.shutdown().await;
+            outcome = if si.write_all(&input).await.is_ok() && si.flush().await.is_ok() { InputEnd::Written } else { InputEnd::WriteError };
+            if !keep && si.shutdown().await.is_err() {
+                outcome = InputEnd::WriteError;
             }
         }
         if keep {
             let _ = closed_rx.await;
         }
         drop(stdin);
+        outcome
     });
     let (tx, rx) = mpsc::channel(256);
-    tokio::spawn(read_lines(child.stdout.take(), tx));
+    let out_task = tokio::spawn(read_lines(child.stdout.take(), tx));
     let err_task = tokio::spawn(read_tail(child.stderr.take(), 4096));
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let (done_tx, done_rx) = oneshot::channel();
@@ -780,34 +788,56 @@ pub fn spawn(l: Launch) -> Result<Source, String> {
         };
         drop(closed_tx);
         // 孫プロセスがパイプを持ち続けても止まらないよう、読み終わりを待つのは少しだけ
-        let err = tokio::time::timeout(Duration::from_secs(2), err_task).await.ok().and_then(Result::ok).unwrap_or_default();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let (stdout, tail, stdin) = tokio::join!(reader_result(out_task, deadline), reader_result(err_task, deadline), reader_result(stdin_task, deadline));
+        let (err, stderr) = tail.unwrap_or_else(|| (String::new(), PipeEnd::Cancelled));
         if let Some(f) = cleanup {
             let _ = std::fs::remove_file(f);
         }
-        let _ = done_tx.send(Ended { code: status.and_then(|s| s.code()), err });
+        let _ = done_tx.send(Ended {
+            code: status.as_ref().and_then(|s| s.code()),
+            wait_observed: Some(status.is_some()),
+            err,
+            stdout: stdout.unwrap_or(PipeEnd::Cancelled),
+            stderr,
+            stdin: stdin.unwrap_or(InputEnd::Cancelled),
+        });
     });
-    Ok(Source::new(rx, stop_tx, done_rx))
+    let mut source = Source::new(rx, stop_tx, done_rx);
+    source.transport_pid = transport_pid;
+    Ok(source)
 }
 
-async fn read_lines(out: Option<tokio::process::ChildStdout>, tx: mpsc::Sender<String>) {
-    let Some(out) = out else { return };
+async fn reader_result<T: Send + 'static>(mut task: JoinHandle<T>, deadline: tokio::time::Instant) -> Option<T> {
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(r) => r.ok(),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            None
+        }
+    }
+}
+
+async fn read_lines(out: Option<tokio::process::ChildStdout>, tx: mpsc::Sender<String>) -> PipeEnd {
+    let Some(out) = out else { return PipeEnd::Unknown };
     let mut r = BufReader::new(out);
     let mut buf = Vec::new();
     loop {
         buf.clear();
         let n = match (&mut r).take(MAX_LINE as u64).read_until(b'\n', &mut buf).await {
             Ok(n) => n,
-            Err(_) => return,
+            Err(_) => return PipeEnd::ReadError,
         };
         if n == 0 {
-            return;
+            return PipeEnd::Eof;
         }
         if buf.last() != Some(&b'\n') && n >= MAX_LINE {
-            // 長すぎる行は改行まで読み捨てる
             loop {
                 let mut skip = Vec::new();
                 match (&mut r).take(MAX_LINE as u64).read_until(b'\n', &mut skip).await {
-                    Ok(0) | Err(_) => return,
+                    Ok(0) => return PipeEnd::Eof,
+                    Err(_) => return PipeEnd::ReadError,
                     Ok(_) if skip.last() == Some(&b'\n') => break,
                     Ok(_) => {}
                 }
@@ -815,25 +845,28 @@ async fn read_lines(out: Option<tokio::process::ChildStdout>, tx: mpsc::Sender<S
             continue;
         }
         if tx.send(collect::decode(&buf)).await.is_err() {
-            return;
+            return PipeEnd::Cancelled;
         }
     }
 }
 
-async fn read_tail(err: Option<tokio::process::ChildStderr>, keep: usize) -> String {
-    let Some(mut err) = err else { return String::new() };
-    let mut tail: Vec<u8> = Vec::new();
+async fn read_tail(err: Option<tokio::process::ChildStderr>, keep: usize) -> (String, PipeEnd) {
+    let Some(mut err) = err else { return (String::new(), PipeEnd::Unknown) };
+    let mut tail = Vec::new();
     let mut chunk = [0u8; 4096];
-    while let Ok(n) = err.read(&mut chunk).await {
-        if n == 0 {
-            break;
+    let end = loop {
+        match err.read(&mut chunk).await {
+            Ok(0) => break PipeEnd::Eof,
+            Err(_) => break PipeEnd::ReadError,
+            Ok(n) => {
+                tail.extend_from_slice(&chunk[..n]);
+                if tail.len() > keep {
+                    tail.drain(..tail.len() - keep);
+                }
+            }
         }
-        tail.extend_from_slice(&chunk[..n]);
-        if tail.len() > keep {
-            tail.drain(..tail.len() - keep);
-        }
-    }
-    collect::decode(&tail)
+    };
+    (collect::decode(&tail), end)
 }
 
 /// 今の経路: この機体はローカル実行、ほかは SSH（`launch`）
@@ -1039,11 +1072,39 @@ pub struct Live {
     opts: Opts,
     sink: Sink,
     st: Mutex<Shared>,
+    journal: OnceLock<Journal>,
 }
 
 impl Live {
     pub fn new(route: Arc<dyn Route>, opts: Opts, sink: Sink) -> Arc<Live> {
-        Arc::new(Live { route, opts, sink, st: Mutex::new(Shared::default()) })
+        Arc::new(Live { route, opts, sink, st: Mutex::new(Shared::default()), journal: OnceLock::new() })
+    }
+
+    pub fn bind_journal(&self, journal: Journal) {
+        let _ = self.journal.set(journal);
+    }
+
+    fn record(&self, id: &str, epoch: u64, attempt: u32, kind: Kind, mut data: Data) {
+        if self.journal.get().is_none() {
+            return;
+        }
+        {
+            let st = self.lock();
+            if Self::current(&st, id, epoch) {
+                data.phase = st.nodes.get(id).map(|n| match n.phase {
+                    Phase::Connecting => StatePhase::Connecting,
+                    Phase::Running => StatePhase::Running,
+                    Phase::Retrying => StatePhase::Retrying,
+                    Phase::Stopped => StatePhase::Stopped,
+                });
+            }
+        }
+        if kind == Kind::Stopped {
+            data.phase = Some(StatePhase::Stopped);
+        }
+        if let Some(j) = self.journal.get() {
+            j.record(Some(id), epoch, attempt, kind, data);
+        }
     }
 
     pub fn opts(&self) -> &Opts {
@@ -1332,17 +1393,37 @@ fn stop_requested(rx: &watch::Receiver<Option<Stop>>) -> Option<Stop> {
 async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Receiver<Option<Stop>>) {
     let o = live.opts.clone();
     let mut failures = 0u32;
+    let mut attempt = 0u32;
     let why: Stop = 'outer: loop {
         if let Some(r) = stop_requested(&stop) {
             break r;
         }
+        attempt = attempt.saturating_add(1);
+        let opened_at = Instant::now();
+        live.record(&node.id, epoch, attempt, Kind::Open, Data { configured_local: Some(node.local), ..Data::default() });
         let mut err = String::new();
         match live.route.open(&node, &o) {
-            Err(e) => err = e,
+            Err(e) => {
+                err = e;
+                live.record(
+                    &node.id,
+                    epoch,
+                    attempt,
+                    Kind::End,
+                    Data { category: Some(Category::OpenFailed), duration_ms: Some(elapsed_ms(opened_at)), ..Data::default() },
+                );
+            }
             Ok(mut src) => {
                 let started = Instant::now();
                 let mut got = 0u64;
                 let mut planned = false;
+                let mut declared = None;
+                let mut last_seq = None;
+                let mut last_at = None;
+                let mut rejected = 0u64;
+                let mut timed_out = false;
+                let mut checkpoint = Instant::now();
+                let transport_pid = src.transport_pid;
                 let stopped: Option<Stop> = loop {
                     let wait = if got == 0 { o.first_line_timeout } else { o.stall_timeout };
                     tokio::select! {
@@ -1354,16 +1435,26 @@ async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Re
                         }
                         r = tokio::time::timeout(wait, src.lines.recv()) => match r {
                             Ok(Some(line)) => match parse_line(&line) {
-                                Some(Msg::Hello(h)) => live.on_hello(&node.id, epoch, h),
+                                Some(Msg::Hello(h)) => {
+                                    live.record(&node.id, epoch, attempt, Kind::Hello, Data { native_rust: match h.implementation.as_deref() { Some("rust") => Some(true), _ => None }, reported_version: crate::monitor_journal::reported_version(h.agent.as_deref()), ..Data::default() });
+                                    live.on_hello(&node.id, epoch, h);
+                                }
                                 Some(Msg::Sample(s)) => {
                                     got += 1;
+                                    last_seq = s.seq; last_at = Some(now_ms());
                                     live.on_sample(&node.id, epoch, *s);
+                                    if got == 1 { live.record(&node.id, epoch, attempt, Kind::FirstSample, Data { seq: last_seq, last_sample_at: last_at, transport_pid, duration_ms: Some(elapsed_ms(opened_at)), ..Data::default() }); }
+                                    if checkpoint.elapsed() >= Duration::from_secs(60) {
+                                        live.record(&node.id, epoch, attempt, Kind::Checkpoint, Data { samples: Some(got), rejected: Some(rejected), seq: last_seq, last_sample_at: last_at, duration_ms: Some(elapsed_ms(opened_at)), ..Data::default() });
+                                        checkpoint = Instant::now();
+                                    }
                                 }
-                                Some(Msg::End(reason)) => planned = reason == "max_age",
-                                None => {}
+                                Some(Msg::End(reason)) => { planned = reason == "max_age"; declared = Some(Reason::end(&reason)); },
+                                None => { rejected += 1; }
                             },
                             Ok(None) => break None,
                             Err(_) => {
+                                timed_out = true;
                                 err = format!("{} 秒間データが来ない", secs(wait));
                                 break None;
                             }
@@ -1371,12 +1462,57 @@ async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Re
                     }
                 };
                 let ended = src.close().await;
+                let category = if timed_out {
+                    Some(if got == 0 { Category::FirstSampleTimeout } else { Category::StallTimeout })
+                } else if ended.code.is_some_and(|c| c != 0) {
+                    Some(Category::ExitNonzero)
+                } else if ended.wait_observed != Some(true) {
+                    Some(Category::WaitUnknown)
+                } else if ended.code.is_none() {
+                    Some(Category::StatusWithoutCode)
+                } else {
+                    None
+                };
+                live.record(
+                    &node.id,
+                    epoch,
+                    attempt,
+                    Kind::End,
+                    Data {
+                        reason: declared,
+                        category,
+                        exit_code: ended.code,
+                        wait_observed: ended.wait_observed,
+                        stdout: Some(ended.stdout),
+                        stderr: Some(ended.stderr),
+                        stdin: Some(ended.stdin),
+                        transport_pid,
+                        duration_ms: Some(elapsed_ms(opened_at)),
+                        samples: Some(got),
+                        rejected: Some(rejected),
+                        seq: last_seq,
+                        last_sample_at: last_at,
+                        ..Data::default()
+                    },
+                );
                 if let Some(s) = stopped {
                     break 'outer s;
                 }
                 if planned {
                     // サンプラーが区切りで終わった。数えずに、少しだけ置いてつなぎ直す
                     failures = 0;
+                    live.record(
+                        &node.id,
+                        epoch,
+                        attempt,
+                        Kind::Retry,
+                        Data {
+                            reason: Some(Reason::MaxAge),
+                            policy: Some(Policy::PlannedRecycle),
+                            delay_ms: Some(o.backoff_for(1).min(Duration::from_millis(500)).as_millis() as u64),
+                            ..Data::default()
+                        },
+                    );
                     tokio::select! {
                         _ = tokio::time::sleep(o.backoff_for(1).min(Duration::from_millis(500))) => {}
                         r = stop.changed() => {
@@ -1403,6 +1539,13 @@ async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Re
         }
         live.set_phase(&node.id, epoch, Phase::Retrying, Some(err), failures);
         let wait = o.backoff_for(failures);
+        live.record(
+            &node.id,
+            epoch,
+            attempt,
+            Kind::Retry,
+            Data { policy: Some(Policy::StreamBackoff), delay_ms: Some(wait.as_millis() as u64), ..Data::default() },
+        );
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
             r = stop.changed() => {
@@ -1414,6 +1557,17 @@ async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Re
         }
         live.set_phase(&node.id, epoch, Phase::Connecting, None, failures);
     };
+    let reason = match &why {
+        Stop::User => Reason::User,
+        Stop::Idle => Reason::Idle,
+        Stop::Hidden => Reason::Hidden,
+        Stop::Disconnected(_) => Reason::Disconnected,
+        Stop::Limit => Reason::Limit,
+        Stop::AppExit => Reason::AppExit,
+        Stop::Restart => Reason::Restart,
+        Stop::Excluded => Reason::Excluded,
+    };
+    live.record(&node.id, epoch, attempt, Kind::Stopped, Data { reason: Some(reason), ..Data::default() });
     live.finish(&node.id, epoch, why);
 }
 
@@ -1897,5 +2051,59 @@ for _ in range(400):
         // 強制終了ならシグナルで終わり code は None。0 は標準入力が閉じたのを見て自分で終わったということ
         assert_eq!(ended.code, Some(0), "{}", ended.err);
         assert!(t0.elapsed() < Duration::from_millis(2500));
+    }
+    #[tokio::test]
+    async fn journal_planned_recycle_eof_and_privacy() {
+        if cfg!(windows) {
+            return;
+        }
+        let (route, dir) = fake(
+            r#"echo $$ >> "$KT_DIR/pids-$1"; echo '{"type":"hello","impl":"rust","agent":"0.6.4","errors":"dummy-private-canary"}'; echo '{"type":"s","seq":1}'; echo '{"type":"end","reason":"max_age"}'; echo dummy-private-canary >&2"#,
+        );
+        let db = Arc::new(Mutex::new(crate::db::Store::open_in_memory().unwrap()));
+        let journal = Journal::start(db.clone());
+        let live = Live::new(route.clone(), quick(), Box::new(|_| {}));
+        live.bind_journal(journal.clone());
+        live.start(&[node("fixture", "macos")], &[]);
+        until("3 open", || route.opened.load(Ordering::SeqCst) >= 3).await;
+        live.shutdown(Duration::from_secs(3)).await;
+        assert!(journal.flush(Duration::from_secs(2)).await);
+        let v = db.lock().unwrap().monitor_events(&crate::monitor_journal::Filter { limit: Some(500), ..Default::default() }).unwrap();
+        assert!(!v.to_string().contains("dummy-private-canary"));
+        let xs = v["events"].as_array().unwrap();
+        assert!(xs.iter().any(|e| e["kind"] == "first_sample" && e["data"]["transport_pid"].is_number()));
+        assert!(xs.iter().any(|e| e["kind"] == "retry" && e["data"]["policy"] == "planned_recycle"));
+        assert!(xs.iter().any(|e| e["kind"] == "end" && e["data"]["stdout"] == "eof" && e["data"]["exit_code"] == 0));
+        assert!(!xs.iter().any(|e| e["kind"] == "stopped" && e["data"]["reason"] == "disconnected"));
+        assert!(journal.shutdown(Duration::from_secs(2)).await);
+        assert!(pids(&dir, "fixture").iter().all(|p| !alive(*p)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn journal_distinguishes_first_sample_and_stall_timeout() {
+        if cfg!(windows) {
+            return;
+        }
+        for (line, category) in [("", "first_sample_timeout"), ("echo '{\"type\":\"s\",\"seq\":1}';", "stall_timeout")] {
+            let script = format!("echo '{{\"type\":\"hello\"}}'; {line} while true; do sleep 0.05; done");
+            let (route, dir) = fake(&script);
+            let db = Arc::new(Mutex::new(crate::db::Store::open_in_memory().unwrap()));
+            let journal = Journal::start(db.clone());
+            let live = Live::new(
+                route,
+                Opts { first_line_timeout: Duration::from_millis(150), stall_timeout: Duration::from_millis(150), max_retries: 0, ..quick() },
+                Box::new(|_| {}),
+            );
+            live.bind_journal(journal.clone());
+            live.start(&[node("fixture", "macos")], &[]);
+            until("disconnected", || state(&live, "fixture").1 == "disconnected").await;
+            assert!(journal.flush(Duration::from_secs(2)).await);
+            let v = db.lock().unwrap().monitor_events(&crate::monitor_journal::Filter::default()).unwrap();
+            assert!(v["events"].as_array().unwrap().iter().any(|e| e["kind"] == "end" && e["data"]["category"] == category));
+            live.shutdown(Duration::from_secs(3)).await;
+            assert!(journal.shutdown(Duration::from_secs(2)).await);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

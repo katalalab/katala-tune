@@ -349,7 +349,7 @@ async fn async_main(args: Vec<String>) -> ExitCode {
         },
         "topology-export" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
             Ok(e) => {
-                let view = match e.topology_view() {
+                let view = match e.topology_accepted_view() {
                     Ok(view) => view,
                     Err(error) => {
                         eprintln!("{error}");
@@ -625,8 +625,16 @@ async fn async_main(args: Vec<String>) -> ExitCode {
                     .map(Arc::new);
                 tune_core::monitor::run(e.clone(), live.clone(), |ev| eprintln!("monitor: {ev}"), Some(until), agent).await;
                 let v = tune_core::monitor::dashboard(&e, Some(&live), 60);
-                live.shutdown(std::time::Duration::from_secs(3)).await;
-                v.map(|v| print(&v))
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                live.shutdown(deadline.saturating_duration_since(std::time::Instant::now())).await;
+                if !e.finish_monitor_journal(deadline.saturating_duration_since(std::time::Instant::now())).await {
+                    Err("収集記録の終了時保存を確認できません".into())
+                } else {
+                    v.map(|mut v| {
+                        v["journal"] = e.monitor_journal_health();
+                        print(&v)
+                    })
+                }
             }
             Err(e) => Err(e),
         },

@@ -532,6 +532,16 @@ impl Engine {
     }
 }
 
+// Read-only graph surfaces are separate from collection and admission.
+impl Engine {
+    pub fn topology_accepted_view(&self) -> Result<Value, String> {
+        self.with_db(|db| db.topology_accepted_view())
+    }
+    pub fn topology_ui_view(&self, request: &crate::db::TopologyUiRequest) -> Result<Value, String> {
+        self.with_db(|db| db.topology_ui_view(request))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
