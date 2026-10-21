@@ -827,6 +827,8 @@ pub(super) async fn run_owned_shared(
         return Err(BoundedResult { process_receipt: Some(ProcessReceipt::default()), ..Default::default() });
     }
     let (answer, job) = run_inner(command, environment, input, deadline, stdout_limit, stderr_limit, Some(&pin)).await;
+    #[cfg(test)]
+    let missing_origin_policy = matches!(&exit_policy, WindowsMetadataExitPolicy::MissingOrigin);
     if !metadata_exit_allowed(&answer, exit_policy)
         || answer.timed_out
         || answer.output_limited
@@ -836,7 +838,7 @@ pub(super) async fn run_owned_shared(
         #[cfg(test)]
         eprintln!(
             "owned_admission_rejected missing_origin={} code={:?} timeout={} limited={} spawn={} stdout_len={} stderr_len={} stop={:?} cleanup={}",
-            matches!(exit_policy, WindowsMetadataExitPolicy::MissingOrigin),
+            missing_origin_policy,
             answer.code,
             answer.timed_out,
             answer.output_limited,
