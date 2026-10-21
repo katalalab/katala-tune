@@ -653,6 +653,39 @@ impl Drop for Tasks {
     }
 }
 
+fn lingering_descendants(receipt: &ProcessReceipt) -> bool {
+    receipt.root_exited && !receipt.job_empty
+}
+
+#[derive(Default)]
+struct CleanupState {
+    deadline: Option<Instant>,
+    termination_requested: bool,
+}
+
+struct CleanupStep {
+    terminate: bool,
+    expired: bool,
+}
+
+impl CleanupState {
+    fn advance(&mut self, receipt: &mut ProcessReceipt, now: Instant) -> CleanupStep {
+        let mut terminate = false;
+        if self.deadline.is_none() && (receipt.stop != ProcessStop::Completed || receipt.root_exited) {
+            self.deadline = Some(now + CLEANUP);
+            if receipt.stop != ProcessStop::Completed && !self.termination_requested {
+                self.termination_requested = true;
+                terminate = true;
+            }
+        }
+        let expired = self.deadline.is_some_and(|end| now >= end);
+        if expired && receipt.stop == ProcessStop::Completed {
+            receipt.stop = ProcessStop::CleanupUnconfirmed;
+        }
+        CleanupStep { terminate, expired }
+    }
+}
+
 pub(super) async fn run(
     command: &std::process::Command,
     environment: &[(OsString, OsString)],
@@ -752,7 +785,7 @@ pub(super) async fn run(
         stdout: Some(tokio::spawn(drain(stdout, stdout_limit, signal.clone()))),
         stderr: Some(tokio::spawn(drain(stderr, stderr_limit, signal))),
     };
-    let mut cleanup_deadline = None;
+    let mut cleanup = CleanupState::default();
     loop {
         if overflow.try_recv().is_ok() {
             answer.output_limited = true;
@@ -802,7 +835,7 @@ pub(super) async fn run(
                 receipt.stop = ProcessStop::IoFailure;
             }
         }
-        if receipt.root_exited && !receipt.job_empty && receipt.stop == ProcessStop::Completed {
+        if lingering_descendants(&receipt) && receipt.stop == ProcessStop::Completed {
             receipt.stop = ProcessStop::LingeringDescendants;
         }
         let now = Instant::now();
@@ -814,16 +847,11 @@ pub(super) async fn run(
         if receipt.cleanup_confirmed() {
             break;
         }
-        if cleanup_deadline.is_none() && (receipt.stop != ProcessStop::Completed || receipt.root_exited) {
-            cleanup_deadline = Some(now + CLEANUP);
-            if receipt.stop != ProcessStop::Completed {
-                let _ = job.terminate();
-            }
+        let step = cleanup.advance(&mut receipt, now);
+        if step.terminate {
+            let _ = job.terminate();
         }
-        if cleanup_deadline.is_some_and(|end| now >= end) {
-            if receipt.stop == ProcessStop::Completed {
-                receipt.stop = ProcessStop::CleanupUnconfirmed;
-            }
+        if step.expired {
             break;
         }
         tokio::time::sleep(POLL).await;
@@ -837,6 +865,90 @@ pub(super) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Synthetic decision-table state only: these tests issue no OS/ownership witness.
+    fn policy_receipt() -> ProcessReceipt {
+        let owner = ProcessIdentity { pid: 1, created_filetime: "1".into(), os_session: 1 };
+        let root = ProcessIdentity { pid: 2, created_filetime: "2".into(), os_session: 1 };
+        ProcessReceipt {
+            owner_session: "a".repeat(32),
+            owner: Some(owner),
+            root: Some(root.clone()),
+            observed: vec![root],
+            total_processes: 1,
+            stop: ProcessStop::Completed,
+            root_exited: true,
+            root_exit_code: Some(0),
+            job_empty: false,
+            observed_exited: true,
+            stdout_eof: true,
+            stderr_eof: true,
+            writer_finished: true,
+        }
+    }
+
+    fn assert_unknown_payload_is_sealed(receipt: &ProcessReceipt) {
+        assert!(!receipt.cleanup_confirmed());
+        let mut result = BoundedResult {
+            code: Some(0),
+            stdout: b"parser".to_vec(),
+            stderr: b"diagnostic".to_vec(),
+            process_receipt: Some(receipt.clone()),
+            ..Default::default()
+        };
+        result.seal_windows_payload(false);
+        assert_eq!(result.code, None);
+        assert!(result.stdout.is_empty() && result.stderr.is_empty());
+    }
+
+    #[test]
+    fn classifier_requires_a_nonsignaled_member_after_root_exit() {
+        for (root_exited, job_empty, observed_exited, expected) in
+            [(true, false, true, false), (true, false, false, true), (false, false, false, false), (true, true, false, false)]
+        {
+            let mut receipt = policy_receipt();
+            receipt.root_exited = root_exited;
+            receipt.job_empty = job_empty;
+            receipt.observed_exited = observed_exited;
+            assert_eq!(lingering_descendants(&receipt), expected, "root={root_exited} empty={job_empty} observed={observed_exited}");
+        }
+    }
+
+    #[test]
+    fn pending_cleanup_then_observe_failure_requests_termination_once() {
+        let start = Instant::now();
+        let mut state = CleanupState::default();
+        let mut receipt = policy_receipt();
+        assert!(!state.advance(&mut receipt, start).terminate);
+        let fixed = state.deadline;
+        receipt.stop = ProcessStop::IoFailure;
+        let first = state.advance(&mut receipt, start + POLL);
+        let repeated = state.advance(&mut receipt, start + POLL + POLL);
+        assert_eq!(state.deadline, fixed);
+        assert_eq!(fixed, Some(start + CLEANUP));
+        assert!(!first.expired && !repeated.expired);
+        assert_unknown_payload_is_sealed(&receipt);
+        assert_eq!(usize::from(first.terminate) + usize::from(repeated.terminate), 1, "failure after pending cleanup must request once");
+        assert!(state.termination_requested);
+    }
+
+    #[test]
+    fn pending_cleanup_expiry_requests_termination_once_before_break() {
+        let start = Instant::now();
+        let mut state = CleanupState::default();
+        let mut receipt = policy_receipt();
+        assert!(!state.advance(&mut receipt, start).terminate);
+        let fixed = state.deadline;
+        let first = state.advance(&mut receipt, start + CLEANUP);
+        let repeated = state.advance(&mut receipt, start + CLEANUP + POLL);
+        assert_eq!(state.deadline, fixed);
+        assert_eq!(fixed, Some(start + CLEANUP));
+        assert!(first.expired && repeated.expired);
+        assert_eq!(receipt.stop, ProcessStop::CleanupUnconfirmed);
+        assert_unknown_payload_is_sealed(&receipt);
+        assert_eq!(usize::from(first.terminate) + usize::from(repeated.terminate), 1, "expiry must request termination before returning break");
+        assert!(state.termination_requested);
+    }
+
     #[test]
     fn accounting_exit_fixture() {
         if std::env::args().any(|arg| arg == "--owned-accounting-exit") {
@@ -914,6 +1026,8 @@ mod tests {
         }));
         job.observe(&mut receipt).unwrap();
         let diagnostic_started = Instant::now();
+        let final_observation_deadline = spawn_deadline.min(diagnostic_started + CLEANUP);
+        assert!(!lingering_descendants(&receipt), "an exited observed root alone is not a live descendant: {receipt:?}");
         let diagnostic_deadline = spawn_deadline.min(diagnostic_started + Duration::from_millis(1000));
         // Diagnostics are separate later observations; never overwrite the receipt under test.
         let retained: Vec<_> = job
@@ -1053,10 +1167,21 @@ mod tests {
         }
         eprintln!("accounting bounded observation_elapsed_ms={}", diagnostic_started.elapsed().as_millis());
         assert!(old_order_would_report_lingering.load(Ordering::SeqCst), "the real interleaving must reproduce the old false-positive predicate");
-        assert!(receipt.root_exited && receipt.observed_exited);
-        assert_eq!(receipt.root_exit_code, Some(0));
-        assert_eq!(receipt.total_processes, 1);
-        assert!(receipt.job_empty, "post-root-exit accounting must replace the stale active sample");
+        let mut final_receipt = receipt.clone();
+        while Instant::now() < final_observation_deadline {
+            job.observe(&mut final_receipt).unwrap();
+            assert!(!lingering_descendants(&final_receipt), "no actual observed live descendant is expected");
+            if final_receipt.root_exited && final_receipt.observed_exited && final_receipt.job_empty {
+                break;
+            }
+            let remaining = final_observation_deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(remaining.min(POLL));
+        }
+        assert!(Instant::now() < final_observation_deadline, "final OS evidence must be observed within the original fixed deadlines");
+        assert!(final_receipt.root_exited && final_receipt.observed_exited);
+        assert_eq!(final_receipt.root_exit_code, Some(0));
+        assert_eq!(final_receipt.total_processes, 1);
+        assert!(final_receipt.job_empty, "post-root-exit accounting must eventually report actual zero within the fixed deadlines");
         assert!(!spawn_failed);
     }
 

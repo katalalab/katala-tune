@@ -154,6 +154,11 @@ additional Job member, including a nonsignaled member after root exit. Its origi
 and teardown remain unresolved; live descendants and unconfirmed cleanup stay
 failures, with no production grace period or member exclusion.
 
+Private decision-table tests use synthetic diagnostic state to check classification
+and cleanup-request policy, including one-shot requests after pending observation
+fails or expires. These policy values are not OS observations and do not mint an
+ownership witness or replace the actual Job, retained-handle and EOF tests.
+
 API references: [Rust temporary handle inheritance lock](https://github.com/rust-lang/rust/blob/1.99.0/library/std/src/sys/process/windows.rs#L314-L399),
 [Job assignment at creation](https://devblogs.microsoft.com/oldnewthing/20230209-00/?p=107812%2F),
 [process attributes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute),
