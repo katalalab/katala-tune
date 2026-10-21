@@ -3,6 +3,7 @@ use super::{Result, Store, now_ms};
 use crate::monitor_journal::{EVENT_BYTES, Event, Filter, KEEP_DAYS, KEEP_ROWS};
 use rusqlite::params;
 use serde_json::{Value, json};
+use std::time::Duration;
 
 pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS monitor_events (
@@ -14,6 +15,16 @@ CREATE INDEX IF NOT EXISTS monitor_events_node_time ON monitor_events(node_id,ts
 ";
 impl Store {
     pub(crate) fn insert_monitor_events(&self, events: &[Event], now: i64) -> Result<usize> {
+        // journalのblocking仕事をSQLiteの既定busy待機でshutdown期限の外へ残さない。
+        // 呼出元はStore mutexを保持する。他のStore書き込みの待機設定は成功/失敗とも復元する。
+        let busy_ms: u32 = self.conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
+        self.conn.busy_timeout(Duration::ZERO)?;
+        let result = self.insert_monitor_events_nowait(events, now);
+        self.conn.busy_timeout(Duration::from_millis(u64::from(busy_ms)))?;
+        result
+    }
+
+    fn insert_monitor_events_nowait(&self, events: &[Event], now: i64) -> Result<usize> {
         // TransactionのDropでCOMMIT失敗時もrollbackする。別featureのtransactionには触れない。
         let tx = self.conn.unchecked_transaction()?;
         let pruned = {
@@ -142,6 +153,39 @@ mod tests {
         assert_eq!(db.monitor_events(&Filter::default()).unwrap()["events"][0]["app_version"], "test");
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn journal_busy_is_immediate_and_restores_the_store_timeout() {
+        let dir = std::env::temp_dir().join(format!("monitor-journal-busy-{}-{}", std::process::id(), crate::db::now_ms()));
+        let db = Store::open(&dir).unwrap();
+        let blocker = Store::open(&dir).unwrap();
+        let timeout = std::time::Duration::from_millis(2500);
+        db.conn().busy_timeout(timeout).unwrap();
+        let configured = || db.conn().query_row("PRAGMA busy_timeout", [], |r| r.get::<_, u32>(0)).unwrap();
+        db.insert_monitor_events(&[event(1, crate::db::now_ms())], crate::db::now_ms()).unwrap();
+        assert_eq!(configured(), 2500, "successful journal writes restore the existing timeout");
+        blocker.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let began = std::time::Instant::now();
+        let err = db.insert_monitor_events(&[event(2, crate::db::now_ms())], crate::db::now_ms()).unwrap_err();
+        let journal_elapsed = began.elapsed();
+        let restored = configured();
+        let began = std::time::Instant::now();
+        let other = db.set_meta("blocked", &json!(true));
+        let other_elapsed = began.elapsed();
+        blocker.conn().execute_batch("ROLLBACK").unwrap();
+        db.set_meta("recovered", &json!(true)).unwrap();
+        db.insert_monitor_events(&[event(2, crate::db::now_ms())], crate::db::now_ms()).unwrap();
+        let final_timeout = configured();
+        drop(blocker);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(err.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy));
+        assert!(journal_elapsed < std::time::Duration::from_secs(1), "journal waited {}ms", journal_elapsed.as_millis());
+        assert_eq!(restored, 2500, "failed journal writes restore the existing timeout");
+        assert!(other.is_err());
+        assert!(other_elapsed >= std::time::Duration::from_secs(1), "other Store writes retain their busy wait");
+        assert_eq!(final_timeout, 2500);
     }
     #[test]
     fn correlation_filters_and_cursor_return_only_the_requested_attempt() {
