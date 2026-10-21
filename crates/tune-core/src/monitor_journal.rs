@@ -144,6 +144,57 @@ impl Kind {
     }
 }
 
+/// Collector-local boundaries only; None is unobserved, never remote proof.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseTrigger {
+    Timeout,
+    ChannelEnd,
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitOrigin {
+    Natural,
+    Close,
+}
+
+/// Snapshot immediately before close; byte/newline/snapshot times are relative to reader creation.
+/// forwarded counts delivered frames (including the existing final unterminated EOF frame).
+/// Counters saturate at u32::MAX and overflow remains explicit. No stream contents.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StreamBoundary {
+    pub bytes: u32,
+    pub forwarded: u32,
+    pub discarded: u32,
+    pub snapshot_ms: Option<u32>,
+    pub last_byte_ms: Option<u32>,
+    pub last_line_ms: Option<u32>,
+    pub pre_stdout: Option<PipeEnd>,
+    pub sample_age_ms: Option<u32>,
+    pub close_trigger: Option<CloseTrigger>,
+    pub close_ms: Option<u32>,
+    pub wait_origin: Option<WaitOrigin>,
+    pub wait_before_close: Option<bool>,
+    pub forced_kill: Option<bool>,
+    pub overflow: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IoOmission {
+    SizeLimit,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum StreamIo {
+    Observed(StreamBoundary),
+    Omitted(IoOmission),
+}
+
 /// Option は未確認。PID は役割を分け、producer は現protocolでは未確認のまま。
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -200,6 +251,8 @@ pub struct Data {
     pub dropped: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub db_failures: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io: Option<StreamIo>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -257,7 +310,7 @@ impl State {
         if node.is_some_and(|s| s.is_empty() || s.len() > 128 || s.chars().any(char::is_control)) {
             return None;
         }
-        let e = Event {
+        let mut e = Event {
             v: 1,
             collector_id: self.collector_id.clone(),
             app_version: env!("CARGO_PKG_VERSION").into(),
@@ -269,7 +322,15 @@ impl State {
             kind,
             data,
         };
-        (serde_json::to_vec(&e).ok()?.len() <= EVENT_BYTES).then_some(e)
+        if serde_json::to_vec(&e).ok()?.len() <= EVENT_BYTES {
+            return Some(e);
+        }
+        // One bounded metadata-only fallback, no persistence retry. Preserve the essential End.
+        if kind == Kind::End && matches!(e.data.io, Some(StreamIo::Observed(_))) {
+            e.data.io = Some(StreamIo::Omitted(IoOmission::SizeLimit));
+            return (serde_json::to_vec(&e).ok()?.len() <= EVENT_BYTES).then_some(e);
+        }
+        None
     }
 }
 
@@ -847,5 +908,89 @@ mod tests {
         for s in ["token/path", "0.6.4-private-canary", "1.2", "1.2.3.4", "1.2.-3", ""] {
             assert_eq!(reported_version(Some(s)), None);
         }
+    }
+
+    #[tokio::test]
+    async fn end_boundary_budget_preserves_essential_row_and_old_history() {
+        let old: Data = serde_json::from_value(json!({"producer_pid":null,"actual_source_sha256":null,"samples":1})).unwrap();
+        assert!(old.io.is_none());
+        let db = store();
+        let j = Journal::start(db);
+        let io = StreamIo::Observed(StreamBoundary {
+            snapshot_ms: Some(u32::MAX),
+            bytes: u32::MAX,
+            forwarded: u32::MAX,
+            discarded: u32::MAX,
+            last_byte_ms: Some(u32::MAX),
+            last_line_ms: Some(u32::MAX),
+            pre_stdout: Some(PipeEnd::ReadError),
+            sample_age_ms: Some(u32::MAX),
+            close_trigger: Some(CloseTrigger::ChannelEnd),
+            close_ms: Some(u32::MAX),
+            wait_origin: Some(WaitOrigin::Natural),
+            wait_before_close: Some(false),
+            forced_kill: Some(false),
+            overflow: true,
+        });
+        let typical = Data {
+            phase: Some(StatePhase::Running),
+            category: Some(Category::StallTimeout),
+            transport_pid: Some(1234),
+            duration_ms: Some(470812),
+            seq: Some(460),
+            samples: Some(460),
+            rejected: Some(0),
+            last_sample_at: Some(1792550319698),
+            exit_code: Some(0),
+            wait_observed: Some(true),
+            stdout: Some(PipeEnd::Eof),
+            stderr: Some(PipeEnd::Eof),
+            stdin: Some(InputEnd::Written),
+            io: Some(io.clone()),
+            ..Data::default()
+        };
+        let e = j.state.row(Some("fixture"), 1, 1, Kind::End, typical).unwrap();
+        assert!(matches!(e.data.io, Some(StreamIo::Observed(_))));
+        assert!(serde_json::to_vec(&e).unwrap().len() <= EVENT_BYTES);
+
+        // Maximum runtime End fields and the worst JSON escaping of a legal 128-byte node.
+        let max = Data {
+            phase: Some(StatePhase::Connecting),
+            reason: Some(Reason::MaxAge),
+            category: Some(Category::FirstSampleTimeout),
+            transport_pid: Some(u32::MAX),
+            duration_ms: Some(u64::MAX),
+            seq: Some(u64::MAX),
+            samples: Some(u64::MAX),
+            rejected: Some(u64::MAX),
+            last_sample_at: Some(i64::MIN),
+            exit_code: Some(i32::MIN),
+            wait_observed: Some(false),
+            stdout: Some(PipeEnd::Cancelled),
+            stderr: Some(PipeEnd::Cancelled),
+            stdin: Some(InputEnd::WriteError),
+            ..Data::default()
+        };
+        let node = "\"".repeat(128);
+        let baseline = j.state.row(Some(&node), u64::MAX, u32::MAX, Kind::End, max.clone()).unwrap();
+        let baseline_bytes = serde_json::to_vec(&baseline).unwrap().len();
+        let expanded = Data { io: Some(io), ..max };
+        let mut raw = baseline.clone();
+        raw.data = expanded.clone();
+        assert!(serde_json::to_vec(&raw).unwrap().len() > EVENT_BYTES);
+        let bounded = j.state.row(Some(&node), u64::MAX, u32::MAX, Kind::End, expanded).unwrap();
+        assert_eq!(bounded.data.io, Some(StreamIo::Omitted(IoOmission::SizeLimit)));
+        assert_eq!(bounded.data.category, baseline.data.category);
+        assert_eq!(bounded.data.samples, baseline.data.samples);
+        assert_eq!(bounded.data.exit_code, baseline.data.exit_code);
+        assert_eq!(bounded.data.wait_observed, baseline.data.wait_observed);
+        assert!(serde_json::to_vec(&bounded).unwrap().len() <= EVENT_BYTES);
+        assert!(baseline_bytes < EVENT_BYTES);
+        // Omission describes metadata quality, without changing a category-free End.
+        raw.data.category = None;
+        let bounded = j.state.row(Some(&node), u64::MAX, u32::MAX, Kind::End, raw.data).unwrap();
+        assert_eq!(bounded.data.category, None);
+        assert_eq!(bounded.data.io, Some(StreamIo::Omitted(IoOmission::SizeLimit)));
+        assert!(j.shutdown(Duration::from_secs(2)).await);
     }
 }
