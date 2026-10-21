@@ -408,6 +408,7 @@ impl Runner for System {
     }
 }
 
+#[cfg(any(windows, test))]
 fn windows_probe_args(helper_sha256: &str, benchmark: bool, network: bool, observe_wsl: bool) -> Vec<String> {
     vec![
         "windows-probe-v1".into(),
@@ -428,10 +429,10 @@ async fn probe_exchange_system(node: &Node, helper_sha256: &str, benchmark: bool
     if node.refusal().is_some() || !lower_hex(helper_sha256, 64) {
         return RunResult { code: Some(9), out: String::new(), err: "Windows probe request is invalid; collection refused".into() };
     }
-    let args = windows_probe_args(helper_sha256, benchmark, network, observe_wsl);
     if node.local {
         #[cfg(windows)]
         {
+            let args = windows_probe_args(helper_sha256, benchmark, network, observe_wsl);
             let home = crate::nodes::home();
             let helper = home.join(".katala-tune").join("bin").join("tune.exe");
             if !home.is_absolute()
@@ -440,7 +441,10 @@ async fn probe_exchange_system(node: &Node, helper_sha256: &str, benchmark: bool
             {
                 return RunResult { code: Some(9), out: String::new(), err: "Windows probe helper path is invalid; collection refused".into() };
             }
-            return probe_exchange_command(command(&helper), &args).await;
+            let Some(helper) = helper.to_str() else {
+                return RunResult { code: Some(9), out: String::new(), err: "Windows probe helper path is invalid; collection refused".into() };
+            };
+            return probe_exchange_command(command(helper), &args).await;
         }
         #[cfg(not(windows))]
         return RunResult { code: Some(9), out: String::new(), err: "Windows probe is unavailable on this platform".into() };
@@ -453,10 +457,11 @@ async fn probe_exchange_system(node: &Node, helper_sha256: &str, benchmark: bool
     );
     let mut command = command("ssh");
     command.args(ssh_args(&node.alias, &remote));
-    probe_exchange_command(command, &args).await
+    probe_exchange_command(command, &[]).await
 }
 
-async fn probe_exchange_command(command: Command, _args: &[String]) -> RunResult {
+async fn probe_exchange_command(mut command: Command, args: &[String]) -> RunResult {
+    command.args(args);
     probe_exchange_command_until(command, tokio::time::Instant::now() + Duration::from_secs(135)).await
 }
 
@@ -1311,6 +1316,55 @@ sys.stderr.write('z');sys.stderr.flush();time.sleep(3)"#,
         confirmed.read_exact(&mut signal).await.unwrap();
         assert_eq!(&signal, b"write-complete");
         assert_eq!(exchange.await.unwrap().code, Some(7));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fixed_windows_probe_launches_exact_arguments_with_empty_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = std::env::temp_dir().join(format!("kt-probe-argv-{}-{} 日本語", std::process::id(), crate::db::now_ms()));
+        std::fs::create_dir(&root).unwrap();
+        let fixture = Fixture(root.clone());
+        let helper = root.join("tune.exe");
+        std::fs::write(&helper, b"#!/bin/sh\nif IFS= read -r unexpected; then exit 8; fi\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let hash = "b".repeat(64);
+        for benchmark in [false, true] {
+            for network in [false, true] {
+                for observe_wsl in [false, true] {
+                    let args = windows_probe_args(&hash, benchmark, network, observe_wsl);
+                    let result = probe_exchange_command(command(helper.to_str().unwrap()), &args).await;
+                    assert_eq!(result.code, Some(0), "owned argv fixture must exit with stdin EOF");
+                    assert_eq!(
+                        result.out.lines().collect::<Vec<_>>(),
+                        [
+                            "windows-probe-v1",
+                            "--helper-sha256",
+                            hash.as_str(),
+                            "--benchmark",
+                            if benchmark { "1" } else { "0" },
+                            "--network",
+                            if network { "1" } else { "0" },
+                            "--observe-wsl",
+                            if observe_wsl { "1" } else { "0" },
+                            "--budget-ms",
+                            "120000",
+                        ],
+                        "the actual helper child must receive every closed argument in order"
+                    );
+                    assert!(result.err.is_empty());
+                }
+            }
+        }
+        drop(fixture);
+        assert!(!root.exists());
     }
 
     #[tokio::test]
