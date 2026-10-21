@@ -178,7 +178,11 @@ fn public_view(source: &Value, view: ExportView) -> Value {
         .filter_map(|entity| {
             let kind = entity["kind"].as_str()?;
             let id = entity["id"].as_str()?;
-            (known_entity(kind) && opaque_id(id, kind) && view.entity(kind)).then_some((id, kind))
+            (known_entity(kind) && opaque_id(id, kind) && view.entity(kind)).then_some((
+                id,
+                kind,
+                entity["facts_observed_at_ms"].as_i64().filter(|at| *at >= 0),
+            ))
         })
         .collect::<Vec<_>>();
     entities.sort_unstable();
@@ -187,14 +191,14 @@ fn public_view(source: &Value, view: ExportView) -> Value {
     let entities = entities
         .into_iter()
         .enumerate()
-        .map(|(index, (id, kind))| {
+        .map(|(index, (id, kind, facts_observed_at_ms))| {
             let next = ordinal.entry(kind).or_insert(0usize);
             *next += 1;
             let scopes = entity_scopes.get(id).cloned().unwrap_or_default();
-            let (currentness, observed_at_ms) = currentness(&receipts, &scopes);
+            let (currentness, last_receipt_observed_at_ms) = currentness(&receipts, &scopes);
             let public_id = format!("entity-{}", index + 1);
             public_ids.insert(id, public_id.clone());
-            json!({"id":public_id,"kind":kind,"label":format!("{kind}-{next}"),"currentness":currentness,"observed_at_ms":observed_at_ms})
+            json!({"id":public_id,"kind":kind,"label":format!("{kind}-{next}"),"currentness":currentness,"observed_at_ms":facts_observed_at_ms,"last_attempt_at_ms":null,"last_receipt_observed_at_ms":last_receipt_observed_at_ms})
         })
         .collect::<Vec<_>>();
     let mut edges = source["edges"]
@@ -210,8 +214,9 @@ fn public_view(source: &Value, view: ExportView) -> Value {
                 let from = public_ids.get(from)?;
                 let to = public_ids.get(to)?;
                 let scopes = edge_scopes.get(id).cloned().unwrap_or_default();
-                let (currentness, observed_at_ms) = currentness(&receipts, &scopes);
-                Some((id, json!({"kind":kind,"from":from,"to":to,"currentness":currentness,"observed_at_ms":observed_at_ms})))
+                let (currentness, last_receipt_observed_at_ms) = currentness(&receipts, &scopes);
+                let facts_observed_at_ms=edge["facts_observed_at_ms"].as_i64().filter(|at| *at>=0);
+                Some((id, json!({"kind":kind,"from":from,"to":to,"currentness":currentness,"observed_at_ms":facts_observed_at_ms,"last_attempt_at_ms":null,"last_receipt_observed_at_ms":last_receipt_observed_at_ms})))
             })
         })
         .flatten()
@@ -290,7 +295,9 @@ mod tests {
         let graph = json!({"entities":[{"id":id,"kind":"host","scope_ids":["private-a"]}],"edges":[],"scopes":[{"scope_id":"private-a","status":"partial","observed_at":1}]});
         let exported: serde_json::Value = serde_json::from_str(&public_json(&graph, ExportView::All)).unwrap();
         assert_eq!(exported["entities"][0]["currentness"], "partial");
-        assert_eq!(exported["entities"][0]["observed_at_ms"], 1);
+        assert!(exported["entities"][0]["observed_at_ms"].is_null());
+        assert!(exported["entities"][0]["last_attempt_at_ms"].is_null());
+        assert_eq!(exported["entities"][0]["last_receipt_observed_at_ms"], 1);
         assert!(!public_json(&graph, ExportView::All).contains("private-a"));
         assert!(public_mermaid(&graph, ExportView::All).contains("(partial)"));
         let absent = json!({"entities":[{"id":id,"kind":"host","scope_ids":["scope-201"]}],"edges":[],"scopes":[]});
