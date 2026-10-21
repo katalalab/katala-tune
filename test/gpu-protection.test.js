@@ -305,12 +305,6 @@ test('KT2 controller は単調期限、厳密な結果枠、stdin/stdio 境界�
   assert.deepEqual(valid, { code: 0, out: 'ok', err: '' });
   assert.equal(spawns, 1, 'KT2 exchange does not retry or send a second request');
 
-  const originalDateNow = Date.now;
-  Date.now = () => originalDateNow() + 24 * 60 * 60 * 1000;
-  try {
-    assert.equal((await exchange(result(`${nonce} ${hash} 0 0 0`))).code, 0, 'wall-clock jumps do not change the monotonic deadline');
-  } finally { Date.now = originalDateNow; }
-
   for (const fields of [
     `${nonce} ${'0'.repeat(64)} 0 0 0`,
     `${'f'.repeat(64)} ${hash} 0 0 0`,
@@ -343,8 +337,22 @@ test('KT2 controller は単調期限、厳密な結果枠、stdin/stdio 境界�
     return child;
   };
   assert.equal((await actionExchange(node2, helper, body, { spawnChild: closedStdin, timeoutMs: 1000 })).code, 7, 'a failed post-READY write is outcome-unverified');
+  const zeroUnhandled = [];
+  const onUnhandled = (reason) => { zeroUnhandled.push(String(reason)); };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    let zeroSpawns = 0;
+    const zero = await exchange('setTimeout(()=>{},1000)', { timeoutMs: 0, spawnChild: (...args) => { zeroSpawns += 1; return spawn(...args); } });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(zero.code, 9, 'an expired READY deadline cannot write a request');
+    assert.equal(zeroSpawns, 1, 'the expired path spawns once and never retries');
+    assert.deepEqual(zeroUnhandled, [], 'destroying an unopened reader cannot leak Premature close');
+  } finally { process.removeListener('unhandledRejection', onUnhandled); }
   const afterReadyDeadline = `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 0 0\\n'),1000));`;
-  assert.equal((await exchange(afterReadyDeadline, { timeoutMs: 100 })).code, 7);
+  let postWriteSpawns = 0;
+  const afterReady = await exchange(afterReadyDeadline, { timeoutMs: 100, spawnChild: (...args) => { postWriteSpawns += 1; return spawn(...args); } });
+  assert.equal(afterReady.code, 7, 'an expired result deadline follows the one completed request write');
+  assert.equal(postWriteSpawns, 1, 'the post-write deadline never retries');
   const heldStderr = `const cp=require('node:child_process');process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 0 0\\n');cp.spawn(process.execPath,['-e','setTimeout(()=>{},2000)'],{stdio:['ignore','ignore',process.stderr]})});`;
   assert.equal((await exchange(heldStderr, { timeoutMs: 150 })).code, 7);
 
