@@ -100,7 +100,7 @@ const MAX_BUDGET_MS: u64 = 25_000;
 const MIN_BUDGET_MS: u64 = 9_000;
 #[cfg(windows)]
 const DEFAULT_BUDGET_MS: u64 = 25_000;
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub(crate) const POWERSHELL_BOOTSTRAP: &str = "$ErrorActionPreference='Stop';try{$r=New-Object System.IO.StreamReader([Console]::OpenStandardInput(),[System.Text.Encoding]::ASCII,$false,1024,$true);$b=[Convert]::FromBase64String($r.ReadToEnd());$s=(New-Object System.Text.UTF8Encoding($false,$true)).GetString($b);$sb=[ScriptBlock]::Create($s)}catch{exit 9};try{&$sb;if($null -eq $LASTEXITCODE){exit 0};exit [int]$LASTEXITCODE}catch{exit 7}";
 
 #[cfg(windows)]

@@ -7,6 +7,11 @@ const BUDGET_MS: u64 = 120_000;
 const MAX_PROBE_PAYLOAD_BYTES: usize = 128 * 1024;
 #[cfg(any(windows, test))]
 const WINDOWS_COMMAND_LINE_LIMIT: usize = 32_767;
+/// The probe accepts partial snapshots from its permissive observations.  Do
+/// not use the action bootstrap here: it turns a tolerated native observation
+/// failure left in `$LASTEXITCODE` into a failure of the whole probe.
+#[cfg(any(windows, test))]
+const PROBE_POWERSHELL_BOOTSTRAP: &str = "$ErrorActionPreference='Stop';try{$r=New-Object System.IO.StreamReader([Console]::OpenStandardInput(),[System.Text.Encoding]::ASCII,$false,1024,$true);$b=[Convert]::FromBase64String($r.ReadToEnd());$s=(New-Object System.Text.UTF8Encoding($false,$true)).GetString($b);$sb=[ScriptBlock]::Create($s)}catch{exit 9};try{&$sb;exit 0}catch{exit 7}";
 
 fn arguments(args: &[String]) -> Option<(String, bool, bool, bool)> {
     let [hash_flag, hash, benchmark_flag, benchmark, network_flag, network, wsl_flag, wsl, budget_flag, budget] = args else { return None };
@@ -57,7 +62,7 @@ fn powershell_payload(benchmark: bool, network: bool, observe_wsl: bool) -> Opti
 
 #[cfg(any(windows, test))]
 fn powershell_arguments() -> [&'static str; 5] {
-    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", super::windows_action::POWERSHELL_BOOTSTRAP]
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", PROBE_POWERSHELL_BOOTSTRAP]
 }
 
 /// Build the only helper-to-PowerShell transport: a small fixed argv and an
@@ -226,13 +231,83 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn run_bootstrap(bootstrap: &str, input: &[u8]) -> std::process::Output {
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+
+        let shell = crate::windows_action::powershell_path().expect("fixed System32 PowerShell resolver");
+        let mut child = Command::new(shell)
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", bootstrap])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start fixed PowerShell fixture");
+        let mut stdin = child.stdin.take().expect("fixture stdin");
+        stdin.write_all(input).expect("write fixture payload");
+        drop(stdin);
+        child.wait_with_output().expect("wait for fixed PowerShell fixture")
+    }
+
+    #[cfg(windows)]
+    fn run_probe_payload(payload: &str) -> std::process::Output {
+        let input = powershell_stdin(payload).expect("bounded fixture payload");
+        run_bootstrap(PROBE_POWERSHELL_BOOTSTRAP, &input)
+    }
+
+    #[cfg(windows)]
+    const SYSTEM32_CMD_NONZERO: &str = "& (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System) 'cmd.exe') /c exit 23";
+
+    #[cfg(windows)]
     #[test]
-    #[ignore = "requires the separately approved PS5/7 native helper stage"]
-    fn payload_parses_and_emits_the_fixed_benchmark_marker() {
-        // Native execution belongs to the Windows canary stage.  Keep this
-        // positive parser/output contract beside the source constructor.
-        let payload = powershell_payload(true, false, true).unwrap();
-        assert!(payload.contains("$NoNetwork = $true"));
-        assert!(payload.contains(tune_core::collect::BENCH_MARK));
+    fn probe_bootstrap_ignores_tolerated_native_exit_after_snapshot() {
+        let payload = format!("Write-Output '{{\"probe\":\"windows\"}}'\n{SYSTEM32_CMD_NONZERO}\n");
+        let input = powershell_stdin(&payload).unwrap();
+        let action = run_bootstrap(crate::windows_action::POWERSHELL_BOOTSTRAP, &input);
+        assert!(!action.status.success(), "the action bootstrap demonstrates the stale LASTEXITCODE counterfactual");
+
+        let probe = run_probe_payload(&payload);
+        assert!(probe.status.success(), "probe completion, not a tolerated observation, sets its exit status: {:?}", probe.status);
+        assert_eq!(probe.stdout, b"{\"probe\":\"windows\"}\r\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_bootstrap_does_not_follow_the_action_bootstrap_error_path() {
+        let payload = "Write-Output '{\"probe\":\"windows\"}'\n$global:LASTEXITCODE = 'not-an-exit-code'\n";
+        let input = powershell_stdin(payload).unwrap();
+        let action = run_bootstrap(crate::windows_action::POWERSHELL_BOOTSTRAP, &input);
+        assert_eq!(action.status.code(), Some(7), "the action bootstrap error path remains observable with base64 stdin");
+
+        let probe = run_probe_payload(payload);
+        assert!(probe.status.success());
+        assert_eq!(probe.stdout, b"{\"probe\":\"windows\"}\r\n");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_bootstrap_retains_snapshot_when_benchmark_exit_is_nonzero() {
+        let payload = format!("Write-Output '{{\"probe\":\"windows\"}}'\nWrite-Output '{}'\n{SYSTEM32_CMD_NONZERO}\n", tune_core::collect::BENCH_MARK,);
+        let probe = run_probe_payload(&payload);
+        assert!(probe.status.success(), "a benchmark native exit must not discard an already emitted snapshot: {:?}", probe.status);
+        assert_eq!(probe.stdout, format!("{{\"probe\":\"windows\"}}\r\n{}\r\n", tune_core::collect::BENCH_MARK).as_bytes(),);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_bootstrap_rejects_decode_parse_and_terminating_payload_failures() {
+        let decode = run_bootstrap(PROBE_POWERSHELL_BOOTSTRAP, b"%%%not-base64%%%");
+        assert!(!decode.status.success());
+        assert!(decode.stdout.is_empty());
+
+        let parse = run_bootstrap(PROBE_POWERSHELL_BOOTSTRAP, &powershell_stdin("if (").unwrap());
+        assert!(!parse.status.success());
+        assert!(parse.stdout.is_empty());
+
+        let terminating = run_probe_payload("throw 'fixture terminating failure'");
+        assert!(!terminating.status.success());
+        assert!(terminating.stdout.is_empty());
     }
 }
