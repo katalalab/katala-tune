@@ -375,6 +375,9 @@ pub trait Runner: Send + Sync {
     fn local_python<'a>(&'a self, code: &'a str, timeout: Duration) -> RunFuture<'a> {
         Box::pin(async move { self.run("local:python", &[code.to_string()], None, timeout).await })
     }
+    fn action_exchange<'a>(&'a self, _node: &'a Node, _helper_sha256: &'a str, _body: &'a [u8], _timeout: Duration) -> RunFuture<'a> {
+        Box::pin(async { RunResult { code: Some(9), out: String::new(), err: "KT2 action exchange is unavailable; operation refused".into() } })
+    }
 }
 
 /// 本物の子プロセスを起こす
@@ -393,6 +396,162 @@ impl Runner for System {
     fn local_python<'a>(&'a self, code: &'a str, timeout: Duration) -> RunFuture<'a> {
         Box::pin(local::python(code, timeout))
     }
+    fn action_exchange<'a>(&'a self, node: &'a Node, helper_sha256: &'a str, body: &'a [u8], timeout: Duration) -> RunFuture<'a> {
+        Box::pin(action_exchange_system(node, helper_sha256, body, timeout))
+    }
+}
+
+async fn action_exchange_system(node: &Node, helper_sha256: &str, body: &[u8], timeout: Duration) -> RunResult {
+    if let Some(err) = node.refusal() {
+        return RunResult { code: Some(9), out: String::new(), err };
+    }
+    if node.local
+        || body.is_empty()
+        || body.len() > 65_536
+        || helper_sha256.len() != 64
+        || !helper_sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return RunResult { code: Some(9), out: String::new(), err: "KT2 action request is invalid; operation refused".into() };
+    }
+    let remote_command = format!(r#"exec "$HOME/.katala-tune/bin/tune.exe" windows-action-receiver-v2 --helper-sha256 {helper_sha256} --budget-ms 25000"#);
+    let mut c = command("ssh");
+    c.args(ssh_args(&node.alias, &remote_command));
+    action_exchange_command(c, body, timeout).await
+}
+
+fn lower_hex(value: &str, size: usize) -> bool {
+    value.len() == size && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn canonical_usize(value: &str) -> Option<usize> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let parsed = value.parse::<usize>().ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
+
+async fn action_exchange_failure(child: &mut tokio::process::Child, read_err: &mut JoinHandle<()>, committed: bool, message: &str) -> RunResult {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(PIPE_GRACE, child.wait()).await;
+    if !read_err.is_finished() {
+        read_err.abort();
+    }
+    let _ = read_err.await;
+    RunResult { code: Some(if committed { 7 } else { 9 }), out: String::new(), err: message.into() }
+}
+
+/// Finite KT2 controller exchange. This is intentionally separate from `run`:
+/// generic commands can write stdin eagerly, while this transport must wait for READY.
+async fn action_exchange_command(mut c: Command, body: &[u8], timeout: Duration) -> RunResult {
+    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let mut child = match c.spawn() {
+        Ok(v) => v,
+        Err(e) => return RunResult { code: Some(9), out: String::new(), err: format!("KT2 spawn failed: {e}") },
+    };
+    let start = tokio::time::Instant::now();
+    let end = start + timeout.min(Duration::from_secs(40));
+    let ready_end = (start + Duration::from_secs(15)).min(end);
+    let Some(mut stdin) = child.stdin.take() else {
+        return RunResult { code: Some(9), out: String::new(), err: "KT2 stdin unavailable; operation refused".into() };
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        return RunResult { code: Some(9), out: String::new(), err: "KT2 stdout unavailable; operation refused".into() };
+    };
+    let (signal, mut exceeded) = tokio::sync::mpsc::channel(1);
+    let (_stderr, mut read_err) = read_bounded(child.stderr.take(), 65_536, signal);
+    let mut header = Vec::new();
+    let mut one = [0u8; 1];
+    let ready = async {
+        while header.len() < 256 {
+            if stdout.read_exact(&mut one).await.is_err() {
+                return None;
+            }
+            if one[0] == b'\n' {
+                return std::str::from_utf8(&header).ok().map(str::to_owned);
+            }
+            if !one[0].is_ascii() || one[0] == b'\r' {
+                return None;
+            }
+            header.push(one[0]);
+        }
+        None
+    };
+    let ready = match tokio::time::timeout_at(ready_end, ready).await.ok().flatten() {
+        Some(v) => v,
+        None => {
+            return action_exchange_failure(&mut child, &mut read_err, false, "KT2 READY unavailable; operation refused").await;
+        }
+    };
+    let Some(nonce) = ready.strip_prefix("KT2 READY ").filter(|v| lower_hex(v, 64)) else {
+        return action_exchange_failure(&mut child, &mut read_err, false, "KT2 READY invalid; operation refused").await;
+    };
+    if exceeded.try_recv().is_ok() {
+        return action_exchange_failure(&mut child, &mut read_err, false, "KT2 stderr exceeded limit; operation refused").await;
+    }
+    let hash = crate::db::sha256_hex(body);
+    let request = format!("KT2 REQUEST {nonce} {} {hash}\n", body.len());
+    // The remote receiver can observe any part of this frame. From this point on,
+    // a local transport failure cannot prove that the action did not run.
+    let committed = true;
+    if tokio::time::timeout_at(end, async {
+        stdin.write_all(request.as_bytes()).await?;
+        stdin.write_all(body).await?;
+        stdin.shutdown().await
+    })
+    .await
+    .is_err()
+    {
+        return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 request outcome unverified").await;
+    }
+    drop(stdin);
+    let mut result_header = Vec::new();
+    let read_result_header = async {
+        while result_header.len() < 256 {
+            stdout.read_exact(&mut one).await?;
+            if one[0] == b'\n' {
+                return Ok::<(), std::io::Error>(());
+            }
+            if !one[0].is_ascii() || one[0] == b'\r' {
+                return Err(std::io::Error::other("bad header"));
+            }
+            result_header.push(one[0]);
+        }
+        Err(std::io::Error::other("long header"))
+    };
+    if tokio::time::timeout_at(end, read_result_header).await.ok().and_then(Result::ok).is_none() {
+        return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 result outcome unverified").await;
+    }
+    let Ok(result_header) = std::str::from_utf8(&result_header) else {
+        return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 result invalid").await;
+    };
+    let fields: Vec<_> = result_header.split(' ').collect();
+    if fields.len() != 7 || fields[0] != "KT2" || fields[1] != "RESULT" || fields[2] != nonce || fields[3] != hash {
+        return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 result invalid").await;
+    }
+    let code = fields[4].parse::<i32>().ok().filter(|v| fields[4] == v.to_string() && matches!(*v, 0 | 3 | 4 | 5 | 6 | 7 | 8 | 9));
+    let a = canonical_usize(fields[5]);
+    let b = canonical_usize(fields[6]);
+    let (Some(code), Some(a), Some(b)) = (code, a, b) else { return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 result invalid").await };
+    if a > 65536 || b > 65536 {
+        return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 result invalid").await;
+    }
+    let mut payload = vec![0; a + b];
+    let mut trailing = [0u8; 1];
+    let complete = async {
+        stdout.read_exact(&mut payload).await?;
+        let n = stdout.read(&mut trailing).await?;
+        if n == 0 { Ok(()) } else { Err(std::io::Error::other("surplus")) }
+    };
+    if tokio::time::timeout_at(end, complete).await.ok().and_then(Result::ok).is_none() {
+        return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 result outcome unverified").await;
+    }
+    let status = tokio::time::timeout_at(end, child.wait()).await.ok().and_then(Result::ok);
+    let stderr_complete = tokio::time::timeout_at(end, &mut read_err).await.is_ok() && exceeded.try_recv().is_err();
+    if !status.is_some_and(|s| s.code() == Some(0)) || !stderr_complete {
+        return RunResult { code: Some(7), out: String::new(), err: "KT2 ssh closure unverified".into() };
+    }
+    RunResult { code: Some(code), out: decode(&payload[..a]), err: decode(&payload[a..]) }
 }
 
 /// 失敗の理由を、画面と判定が使える種類に分ける（lib/collect.js の classifyFailure と同じ）。
@@ -899,5 +1058,44 @@ mod tests {
         // Windows の cmd は改行が CRLF なので、前後の空白を除いて比べる
         assert_eq!((r.code, r.out.trim(), r.err.trim()), (Some(0), "first", "oops"), "それまでに読んだ分は捨てない");
         assert!(started.elapsed() < Duration::from_secs(4), "孫の終わりを待たない: {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn kt2_exchange_waits_for_ready_and_rejects_unverified_terminal_states() {
+        if cfg!(windows) {
+            return;
+        }
+        let nonce = "d".repeat(64);
+        let body = b"action body";
+        let hash = crate::db::sha256_hex(body);
+        let fixture = |result_hash: &str, exit: i32, hold_eof: bool| {
+            format!(
+                r#"import hashlib,select,sys,time
+r,_,_=select.select([sys.stdin.buffer],[],[],.15)
+if r: sys.exit(91)
+sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush()
+line=sys.stdin.buffer.readline().decode('ascii').strip().split(' ')
+body=sys.stdin.buffer.read()
+if len(line)!=5 or line[:3]!=['KT2','REQUEST','{nonce}'] or int(line[3])!=len(body) or line[4]!=hashlib.sha256(body).hexdigest(): sys.exit(92)
+sys.stdout.write('KT2 RESULT {nonce} {result_hash} 0 2 0\nok');sys.stdout.flush()
+if {hold_eof}: time.sleep(2)
+sys.exit({exit})"#,
+                hold_eof = if hold_eof { "True" } else { "False" }
+            )
+        };
+        let run_fixture = |script: String, timeout: Duration| async move {
+            let mut command = Command::new("/usr/bin/env");
+            command.args(["python3", "-c", &script]);
+            action_exchange_command(command, body, timeout).await
+        };
+
+        let valid = run_fixture(fixture(&hash, 0, false), Duration::from_secs(2)).await;
+        assert_eq!((valid.code, valid.out.as_str(), valid.err.as_str()), (Some(0), "ok", ""));
+        let wrong_hash = run_fixture(fixture(&"0".repeat(64), 0, false), Duration::from_secs(2)).await;
+        assert_eq!(wrong_hash.code, Some(7));
+        let ssh_nonzero = run_fixture(fixture(&hash, 255, false), Duration::from_secs(2)).await;
+        assert_eq!(ssh_nonzero.code, Some(7));
+        let held_eof = run_fixture(fixture(&hash, 0, true), Duration::from_millis(250)).await;
+        assert_eq!(held_eof.code, Some(7));
     }
 }

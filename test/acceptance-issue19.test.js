@@ -187,6 +187,7 @@ test('条件3: 承認のあいだに台帳の接続先・OS・機体が変わっ
     ['alias', (n) => [{ ...n, alias: 'mock-other' }], /接続先/],
     ['os', (n) => [{ ...n, os: 'macos' }], /接続先|Windows だけ/],
     ['local', (n) => [{ ...n, local_hostname: os.hostname().replace(/\.local$/, '') }], /接続先/],
+    ['action-helper', (n) => [{ ...n, action_helper: { schema: 'katala-tune/action-helper/v1', source_sha: 'a'.repeat(40), tune_sha256: 'b'.repeat(64), manifest_sha256: 'c'.repeat(64), run_id: 1, attempt: 1 } }], /接続先/],
     ['removed', () => [], /台帳に無い/],
   ];
   for (const [name, change, expected] of cases) {

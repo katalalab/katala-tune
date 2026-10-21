@@ -3,7 +3,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { analyze } = require('../lib/rules');
-const { plan, execute, ACTION_RECEIVER, ACTION_RECEIVER_COMMAND } = require('../lib/actions');
+const { plan, execute } = require('../lib/actions');
+const { actionExchange } = require('../lib/collect');
 const { makeRunner } = require('../lib/runner');
 const { loadConfig } = require('../lib/nodes');
 const fs = require('node:fs');
@@ -232,47 +233,60 @@ test('GPU 電力の outcome-unverified は local/remote とも undo を出さず
   assert.ok((await execute(node, power, { protect: [] }, async () => ({ code: 7, out: '', err: '' }))).undo);
 });
 
-test('remote Windows GPU action は固定 receiver と完全 stdin 本文だけを executor に渡す', async () => {
+test('remote Windows GPU action は named KT2 exchange に本文だけを渡す', async () => {
   const action = { type: 'set-gpu-power-limit', params: { uuid: 'GPU-01234567-89ab-cdef-0123-456789abcdef', watts: 180, min: 100, max: 250, prev_w: 200 } };
   let call;
-  await execute({ ...node, local: false }, action, { protect: [] }, async (...args) => { call = args; return { code: 9, out: '', err: '' }; });
-  assert.equal(call[1], ACTION_RECEIVER_COMMAND);
-  assert.equal(call[2], 30000);
-  assert.ok(Buffer.isBuffer(call[3]));
-  assert.match(call[3].subarray(0, 100).toString('ascii'), /^KT1 [0-9]+ [0-9a-f]{64} [0-9]+\n/);
-  assert.match(call[3].toString('utf8'), /Stopwatch|nvidia-smi/);
-  assert.doesNotMatch(call[1], /nvidia-smi|GPU-01234567/);
-});
-
-test('Windows receiver はヘッダー終端と EOF を一つの残り時間で拒否する', () => {
-  assert.match(ACTION_RECEIVER, /\$headerDone/);
-  assert.match(ACTION_RECEIVER, /if\(-not \$headerDone\)\{exit 9\}/);
-  assert.match(ACTION_RECEIVER, /\$remaining=5000-\[int\]\$w\.ElapsedMilliseconds/);
-  assert.doesNotMatch(ACTION_RECEIVER, /\.Wait\(500\)/);
-  assert.ok(Buffer.byteLength(ACTION_RECEIVER_COMMAND) < 8191);
-  assert.throws(() => require('../lib/actions').actionInput('x'.repeat(65537)), /長さ/);
-});
-
-test('Windows receiver は空・途中・余剰・改ざん・不正 UTF-8・期限切れ・held EOF を本文評価前に拒否する', { skip: process.platform !== 'win32' }, async () => {
-  const receiver = Buffer.from(ACTION_RECEIVER, 'utf16le').toString('base64');
-  const body = Buffer.from('$global:ktMutation = 1; Write-Output "MUTATED"', 'utf8');
-  const crypto = require('node:crypto');
-  const packet = (bytes = body, hash = crypto.createHash('sha256').update(bytes).digest('hex'), expiry = Date.now() + 30000, tail = Buffer.alloc(0)) => Buffer.concat([Buffer.from(`KT1 ${bytes.length} ${hash} ${expiry}\n`, 'ascii'), bytes, tail]);
-  const run = (input) => require('node:child_process').spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', receiver], { input, encoding: 'utf8', timeout: 10000, windowsHide: true });
-  const truncated = Buffer.concat([packet().subarray(0, packet().indexOf(10) + 1), body.subarray(0, 3)]);
-  for (const input of [Buffer.alloc(0), truncated, packet(body, '0'.repeat(64)), packet(Buffer.from([0xc3, 0x28])), packet(body, undefined, Date.now() - 1), packet(body, undefined, undefined, Buffer.from('x'))]) {
-    const r = run(input); assert.equal(r.status, 9, r.stderr || r.stdout); assert.doesNotMatch(r.stdout, /MUTATED/);
-  }
-  const ok = run(packet()); assert.equal(ok.status, 0, ok.stderr || ok.stdout); assert.match(ok.stdout, /MUTATED/);
-  const held = await new Promise((resolve) => {
-    const child = require('node:child_process').spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', receiver], { windowsHide: true });
-    let out = '', err = '';
-    child.stdout.on('data', (d) => { out += d; }); child.stderr.on('data', (d) => { err += d; });
-    child.on('close', (status) => resolve({ status, out, err }));
-    child.stdin.on('error', () => {});
-    child.stdin.write(packet());
+  const action_helper = { schema: 'katala-tune/action-helper/v1', source_sha: 'a'.repeat(40), tune_sha256: 'b'.repeat(64), manifest_sha256: 'c'.repeat(64), run_id: 1, attempt: 1 };
+  const result = await execute({ ...node, local: false, action_helper }, action, { protect: [] }, async () => { throw new Error('generic transport must stay unused'); }, async (...args) => {
+    call = args;
+    return { code: 9, out: '', err: '' };
   });
-  assert.equal(held.status, 9, held.err || held.out); assert.doesNotMatch(held.out, /MUTATED/);
+  assert.equal(result.code, 9);
+  assert.equal(call[1], action_helper.tune_sha256);
+  assert.ok(Buffer.isBuffer(call[2]));
+  assert.match(call[2].toString('utf8'), /Stopwatch|nvidia-smi/);
+});
+
+test('remote Windows action は approved helper record が無いか閉じた形式でなければ transport 前に拒否する', async () => {
+  const action = { type: 'kill-process', params: { pid: 4242, name: 'Worker', start: '20261021010101000', min_cpu: 1 } };
+  for (const action_helper of [undefined, { schema: 'katala-tune/action-helper/v1', source_sha: 'a'.repeat(40), tune_sha256: 'b'.repeat(64), manifest_sha256: 'c'.repeat(64), run_id: 1, attempt: 1, extra: true }]) {
+    let calls = 0;
+    const result = await execute({ ...node, local: false, action_helper }, action, { protect: [] }, async () => { throw new Error('generic transport must stay unused'); }, async () => { calls += 1; return { code: 0, out: '', err: '' }; });
+    assert.equal(result.code, 9);
+    assert.equal(calls, 0, 'helper record rejection happens before ssh spawn');
+  }
+});
+
+test('KT2 exchange waits for READY before its only request and classifies terminal uncertainty', async () => {
+  const body = Buffer.from('action body', 'utf8');
+  const nonce = 'd'.repeat(64);
+  const helper = 'b'.repeat(64);
+  const fixture = String.raw`const crypto=require('node:crypto');let early=false, chunks=[];process.stdin.on('data',d=>{early=true;chunks.push(d)});setTimeout(()=>{if(early){process.exit(91);return}process.stdout.write('KT2 READY ${nonce}\n');process.stdin.on('end',()=>{const all=Buffer.concat(chunks);const line=all.subarray(0,all.indexOf(10)).toString('ascii').split(' ');const bytes=all.subarray(all.indexOf(10)+1);if(line.length!==5||line[0]!=='KT2'||line[1]!=='REQUEST'||line[2]!=='${nonce}'||Number(line[3])!==bytes.length||line[4]!==crypto.createHash('sha256').update(bytes).digest('hex')){process.exit(92);return}process.stdout.write('KT2 RESULT ${nonce} '+line[4]+' 0 2 0\nok')})},30);`;
+  const node2 = { ...node, local: false };
+  const options = { command: { cmd: process.execPath, args: ['-e', fixture] }, timeoutMs: 1000 };
+  const good = await actionExchange(node2, helper, body, options);
+  assert.deepEqual(good, { code: 0, out: 'ok', err: '' });
+
+  const badHash = fixture.replace("+' 0 2 0\\nok'", "+'x'.repeat(64)+' 0 2 0\\nok'");
+  const bad = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', badHash] }, timeoutMs: 1000 });
+  assert.equal(bad.code, 7);
+
+  const exit255 = `${fixture}process.on('beforeExit',()=>{process.exitCode=255});`;
+  const nonzero = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', exit255] }, timeoutMs: 1000 });
+  assert.equal(nonzero.code, 7);
+
+  const bodyHash = require('node:crypto').createHash('sha256').update(body).digest('hex');
+  const heldEof = `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('KT2 RESULT ${nonce} ${bodyHash} 0 0 0\\n');setTimeout(()=>{},2000)});`;
+  const held = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', heldEof] }, timeoutMs: 150 });
+  assert.equal(held.code, 7);
+
+  const noReady = 'setTimeout(()=>{},2000)';
+  const beforeCommit = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', noReady] }, timeoutMs: 150 });
+  assert.equal(beforeCommit.code, 9);
+
+  const oversized = `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('KT2 RESULT ${nonce} ${bodyHash} 0 65537 0\\n'+'x'.repeat(65537))});`;
+  const over = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', oversized] }, timeoutMs: 1000 });
+  assert.equal(over.code, 7);
 });
 
 test('protect_gpu は任意の真偽値で、属性の無い既存台帳を変えない', () => {

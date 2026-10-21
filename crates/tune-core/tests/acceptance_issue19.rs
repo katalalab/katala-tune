@@ -271,6 +271,13 @@ async fn ledger_change_during_confirmation_stops_execution_and_records_reason() 
         ("alias", vec![json!({ "id": "w", "alias": "mock-other", "os": "windows" })], "接続先"),
         ("os", vec![json!({ "id": "w", "alias": "mock-w", "os": "macos" })], "接続先"),
         ("local", vec![json!({ "id": "w", "alias": "mock-w", "os": "windows", "local_hostname": tune_core::nodes::local_host() })], "接続先"),
+        (
+            "action-helper",
+            vec![
+                json!({ "id": "w", "alias": "mock-w", "os": "windows", "action_helper": { "schema": "katala-tune/action-helper/v1", "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "tune_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "run_id": 1, "attempt": 1 } }),
+            ],
+            "接続先",
+        ),
         ("removed", vec![], "台帳に無い"),
         ("shared", vec![json!({ "id": "w", "alias": "mock-w", "os": "windows", "shared": true })], "共用機"),
     ];

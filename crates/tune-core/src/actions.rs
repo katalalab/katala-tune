@@ -13,7 +13,7 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::{Value, json};
 
-use crate::collect::{Runner, System, exec_on_with, exec_on_with_input};
+use crate::collect::{Runner, System, exec_on_with};
 use crate::js;
 use crate::nodes::Node;
 use crate::rules::no_kill;
@@ -25,11 +25,12 @@ static MAC_LSTART: LazyLock<Regex> =
 static WIN_START: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9]{17}$").expect("WIN_START"));
 static NVIDIA_UUID: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").expect("NVIDIA_UUID"));
+static LOWER_HEX_40: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{40}$").expect("LOWER_HEX_40"));
+static LOWER_HEX_64: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{64}$").expect("LOWER_HEX_64"));
 const GPU_ACTIVE_UTIL: i64 = 5;
 fn gpu_smi_helper() -> String {
     r#"function Stop-KatalaGpuSmiProcess { param($Process); if ($script:KatalaGpuSmiCleanupAttempted) { return $false }; $script:KatalaGpuSmiCleanupAttempted = $true; try { if ($Process.HasExited) { return $true }; $left = [Math]::Max(0, 9000 - [int]$script:KatalaGpuGuardClock.ElapsedMilliseconds); if ($left -le 0) { $script:KatalaGpuSmiTransportFailed = $true; return $false }; $Process.Kill(); $killAck = $Process.WaitForExit([Math]::Min(1000, $left)); if (-not $killAck -or -not $Process.HasExited) { $script:KatalaGpuSmiTransportFailed = $true; return $false }; return $true } catch { $script:KatalaGpuSmiTransportFailed = $true; return $false } }; function Fail-KatalaGpuSmi { param([bool]$TimedOut, [string]$Reason, [bool]$Permanent); $script:KatalaGpuSmiTimedOut = $TimedOut; $script:KatalaGpuSmiFailed = $true; $script:KatalaGpuSmiFailureReason = $Reason; if ($Permanent) { $script:KatalaGpuSmiTransportFailed = $true }; if ($script:KatalaGpuMutationStarted) { Write-Output "GPU power outcome unverified"; exit 7 }; return $null }; function Invoke-KatalaGpuSmi { param([string]$Arguments); $script:KatalaGpuSmiTimedOut = $false; $script:KatalaGpuSmiExitCode = $null; $script:KatalaGpuSmiFailed = $false; $script:KatalaGpuSmiFailureReason = "GPU activity unavailable; operation refused"; if ($script:KatalaGpuSmiTransportFailed) { return (Fail-KatalaGpuSmi $false "GPU SMI process lifetime unverified; operation refused" $true) }; $script:KatalaGpuSmiCleanupAttempted = $false; Test-KatalaGpuDeadline; if ($script:KatalaGpuSmiFunction) { $argv = @($Arguments.Split(" ")); $rows = @(& nvidia-smi.exe @argv); $script:KatalaGpuSmiExitCode = $LASTEXITCODE; if ($script:KatalaGpuSmiExitCode -ne 0) { return (Fail-KatalaGpuSmi $false "GPU SMI exited unsuccessfully; operation refused" $false) }; return $rows }; $p = $null; try { $si = New-Object Diagnostics.ProcessStartInfo; $si.FileName = $script:KatalaGpuSmiSource; $si.Arguments = $Arguments; $si.UseShellExecute = $false; $si.CreateNoWindow = $true; $si.RedirectStandardOutput = $true; $si.RedirectStandardError = $true; $p = New-Object Diagnostics.Process; $p.StartInfo = $si; $smiDeadline = [Math]::Min(9000, [int]$script:KatalaGpuGuardClock.ElapsedMilliseconds + 4000); [void]$p.Start(); $stdout = New-Object IO.MemoryStream(65536); $stderrCount = 0; $outBuffer = New-Object byte[] 4096; $errBuffer = New-Object byte[] 4096; $outRead = $p.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length); $errRead = $p.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length); $outDone = $false; $errDone = $false; $failed = $false; $timedOut = $false; $reason = "GPU SMI output exceeded limit; operation refused"; while (-not ($outDone -and $errDone)) { $left = [Math]::Max(0, $smiDeadline - [int]$script:KatalaGpuGuardClock.ElapsedMilliseconds); if ($left -le 0) { $timedOut = $true; $failed = $true; $reason = "GPU SMI timed out or held a pipe; operation refused"; break }; $pending = New-Object Collections.Generic.List[Threading.Tasks.Task]; if (-not $outDone) { $pending.Add($outRead) }; if (-not $errDone) { $pending.Add($errRead) }; if ([Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$pending.ToArray(), $left) -lt 0) { $timedOut = $true; $failed = $true; $reason = "GPU SMI timed out or held a pipe; operation refused"; break }; if (-not $outDone -and $outRead.IsCompleted) { $outCount = $outRead.Result; if ($outCount -le 0) { $outDone = $true } elseif ($stdout.Length + $outCount -gt 65536) { $failed = $true; $reason = "GPU SMI stdout exceeded limit; operation refused"; break } else { $stdout.Write($outBuffer, 0, $outCount); $outRead = $p.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length) } }; if (-not $errDone -and $errRead.IsCompleted) { $errCount = $errRead.Result; if ($errCount -le 0) { $errDone = $true } elseif ($stderrCount + $errCount -gt 65536) { $failed = $true; $reason = "GPU SMI stderr exceeded limit; operation refused"; break } else { $stderrCount += $errCount; $errRead = $p.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length) } } }; if ($failed) { $script:KatalaGpuSmiTransportFailed = $true; [void](Stop-KatalaGpuSmiProcess $p); return (Fail-KatalaGpuSmi $timedOut $reason $true) }; $left = [Math]::Max(0, $smiDeadline - [int]$script:KatalaGpuGuardClock.ElapsedMilliseconds); if ($left -le 0 -or -not $p.WaitForExit($left)) { $script:KatalaGpuSmiTransportFailed = $true; [void](Stop-KatalaGpuSmiProcess $p); return (Fail-KatalaGpuSmi $true "GPU SMI timed out or held a pipe; operation refused" $true) }; $script:KatalaGpuSmiExitCode = $p.ExitCode; if ($script:KatalaGpuSmiExitCode -ne 0) { return (Fail-KatalaGpuSmi $false "GPU SMI exited unsuccessfully; operation refused" $false) }; return @([Text.Encoding]::UTF8.GetString($stdout.ToArray()) -split "`r?`n") } catch { if ($p) { $script:KatalaGpuSmiTransportFailed = $true; [void](Stop-KatalaGpuSmiProcess $p); return (Fail-KatalaGpuSmi $false "GPU SMI transport failed; operation refused" $true) }; return (Fail-KatalaGpuSmi $false "GPU SMI transport failed; operation refused" $true) } finally { if ($p) { try { if (-not $p.HasExited -and -not $script:KatalaGpuSmiCleanupAttempted) { $cleanupAck = Stop-KatalaGpuSmiProcess $p; if (-not $cleanupAck) { $script:KatalaGpuSmiTransportFailed = $true } } } catch { $script:KatalaGpuSmiTransportFailed = $true }; $p.Dispose() } } }"#.to_string()
 }
-const ACTION_INPUT_MAX: usize = 65_536;
 static TASK_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\\([A-Za-z0-9_ .-]+\\)*$").expect("TASK_PATH"));
 static TASK_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_ .()+-]{1,120}$").expect("TASK_NAME"));
 static LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.-]{1,150}$").expect("LABEL"));
@@ -37,40 +38,37 @@ static LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.-]{1,
 pub(crate) static LAUNCH_AGENTS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^/Users/[A-Za-z0-9_.-]+/Library/LaunchAgents/[A-Za-z0-9_.-]+\.plist$").expect("LAUNCH_AGENTS"));
 
-// Only this fixed receiver goes in argv. The body and dynamic arguments stay in stdin.
-static ACTION_RECEIVER: LazyLock<String> = LazyLock::new(|| {
-    [
-    "$s=[Console]::OpenStandardInput()", "$w=[Diagnostics.Stopwatch]::StartNew()", "$b=New-Object byte[] 1", "$h=New-Object Collections.Generic.List[byte]", "$headerDone=$false",
-    "while($h.Count -lt 256){$remaining=5000-[int]$w.ElapsedMilliseconds;if($remaining -le 0){exit 9};$t=$s.ReadAsync($b,0,1);if(-not $t.Wait($remaining)){exit 9};if($t.Result -ne 1){exit 9};if($b[0]-eq 10){$headerDone=$true;break};if($b[0]-lt 32 -or $b[0]-gt 126){exit 9};$h.Add($b[0])}", "if(-not $headerDone){exit 9}",
-    "try{$m=[Text.Encoding]::ASCII.GetString($h.ToArray()) -split \" \"", "if($m.Count-ne 4 -or $m[0]-ne \"KT1\" -or $m[1]-notmatch \"^[0-9]+$\" -or $m[2]-notmatch \"^[0-9a-f]{64}$\" -or $m[3]-notmatch \"^[0-9]+$\"){exit 9}", "$n=[int]$m[1];$e=[int64]$m[3]", "if($n -lt 1 -or $n -gt 65536 -or [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt $e){exit 9}", "$d=New-Object byte[] $n;$o=0",
-    "while($o-lt$n){$remaining=5000-[int]$w.ElapsedMilliseconds;if($remaining -le 0){exit 9};$t=$s.ReadAsync($d,$o,$n-$o);if(-not $t.Wait($remaining)){exit 9};if($t.Result-le 0){exit 9};$o+=$t.Result}", "$x=New-Object byte[] 1;$remaining=5000-[int]$w.ElapsedMilliseconds;if($remaining -le 0){exit 9};$t=$s.ReadAsync($x,0,1);if(-not $t.Wait($remaining)){exit 9};if($t.Result-ne 0){exit 9}",
-    "$q=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($d)).Replace(\"-\",\"\").ToLowerInvariant()", "if($q-ne$m[2] -or [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt $e){exit 9}", "$u=New-Object Text.UTF8Encoding($false,$true);$script:KatalaActionExpiryMs=$e", "function Test-KatalaActionExpiry { if([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt $script:KatalaActionExpiryMs){if($script:KatalaGpuMutationStarted){Write-Output \"GPU power outcome unverified\";exit 7};Write-Output \"action request expired; operation refused\";exit 9} }", "Test-KatalaActionExpiry;& ([ScriptBlock]::Create($u.GetString($d)))}catch{if($script:KatalaGpuMutationStarted){Write-Output \"GPU power outcome unverified\";exit 7};exit 9}",
-].join(";")
-});
-
-fn action_receiver_command() -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes: Vec<u8> = ACTION_RECEIVER.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
-        encoded.push(char::from(ALPHABET[((n >> 18) & 63) as usize]));
-        encoded.push(char::from(ALPHABET[((n >> 12) & 63) as usize]));
-        encoded.push(if chunk.len() > 1 { char::from(ALPHABET[((n >> 6) & 63) as usize]) } else { '=' });
-        encoded.push(if chunk.len() > 2 { char::from(ALPHABET[(n & 63) as usize]) } else { '=' });
+fn action_helper(node: &Node) -> Result<String, String> {
+    let Some(helper) = node.get("action_helper").and_then(Value::as_object) else {
+        return Err("approved action helper record が無いため実行しない".into());
+    };
+    let string = |key: &str| helper.get(key).and_then(Value::as_str);
+    let positive = |key: &str| helper.get(key).and_then(Value::as_i64).is_some_and(|v| v > 0 && v <= 9_007_199_254_740_991);
+    let valid = helper.len() == 6
+        && string("schema") == Some("katala-tune/action-helper/v1")
+        && string("source_sha").is_some_and(|v| LOWER_HEX_40.is_match(v))
+        && string("tune_sha256").is_some_and(|v| LOWER_HEX_64.is_match(v))
+        && string("manifest_sha256").is_some_and(|v| LOWER_HEX_64.is_match(v))
+        && positive("run_id")
+        && positive("attempt");
+    if !valid {
+        return Err("approved action helper record が無いため実行しない".into());
     }
-    format!("powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded}")
+    Ok(string("tune_sha256").unwrap().to_string())
 }
 
-fn action_input(script: &str) -> Result<Vec<u8>, String> {
-    let body = script.as_bytes();
-    if body.is_empty() || body.len() > ACTION_INPUT_MAX {
-        return Err("action stdin 本文の長さが不正".into());
-    }
-    let expiry = crate::db::now_ms().checked_add(25_000).ok_or("action stdin 時刻が不正")?;
-    let mut input = format!("KT1 {} {} {}\n", body.len(), crate::db::sha256_hex(body), expiry).into_bytes();
-    input.extend_from_slice(body);
-    Ok(input)
+pub(crate) fn action_helper_fingerprint(node: &Node) -> Option<String> {
+    action_helper(node).ok()?;
+    let helper = node.get("action_helper")?.as_object()?;
+    Some(format!(
+        "{}\0{}\0{}\0{}\0{}\0{}",
+        helper.get("schema")?.as_str()?,
+        helper.get("source_sha")?.as_str()?,
+        helper.get("tune_sha256")?.as_str()?,
+        helper.get("manifest_sha256")?.as_str()?,
+        helper.get("run_id")?.as_i64()?,
+        helper.get("attempt")?.as_i64()?,
+    ))
 }
 
 /// 終了スクリプトの結果コード
@@ -503,8 +501,17 @@ pub async fn execute_with(runner: &dyn Runner, node: &Node, action: &Value, prot
     let stdin_transport =
         !node.local && node.os == "windows" && matches!(action.get("type").and_then(Value::as_str), Some("kill-process" | "set-gpu-power-limit"));
     let res = if stdin_transport {
-        let input = action_input(&p.script)?;
-        exec_on_with_input(runner, node, &action_receiver_command(), &input, Duration::from_secs(30)).await
+        match action_helper(node) {
+            Ok(helper) => {
+                let body = p.script.as_bytes();
+                if body.is_empty() || body.len() > 65_536 {
+                    crate::collect::RunResult { code: Some(9), out: String::new(), err: "action stdin 本文の長さが不正".into() }
+                } else {
+                    runner.action_exchange(node, &helper, body, Duration::from_secs(40)).await
+                }
+            }
+            Err(err) => crate::collect::RunResult { code: Some(9), out: String::new(), err },
+        }
     } else {
         let cmd = wrap(node, &p)?;
         exec_on_with(runner, node, &cmd, Duration::from_secs(30)).await
