@@ -571,7 +571,10 @@ fn spawn_owned(context: SpawnContext<'_>, job: &Job, stdio: [&OwnedHandle; 3], s
         if command.get_program() != pin.executable().as_os_str() {
             return Err(invalid());
         }
-        pin.executable().to_path_buf()
+        // The GUID remains the caller's authority. This fixed DOS locator was
+        // derived once from its held leaf and must still resolve to that file ID.
+        // It is used for both lpApplicationName and argv[0], with no retry.
+        pin.launch_path()?.to_path_buf()
     } else {
         user_executable_path(executable(command, values)?)?
     };

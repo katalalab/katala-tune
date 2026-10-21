@@ -247,7 +247,7 @@ mod native_windows {
     fn spawn_entry(fixture: &Fixture, entry: &str, budget: &str, digest: &str) -> Child {
         let (program, _) = artifact();
         let mut args = vec![entry, "--budget-ms", budget];
-        if entry != "topology-native-reader" {
+        if matches!(entry, "topology-supervise" | "topology-verify") {
             args.extend(["--reader-program", &program, "--helper-sha256", digest]);
         }
         launch(&args, &fixture.base)
@@ -540,6 +540,43 @@ mod native_windows {
             assert!(repository.failures.is_empty() && repository.configs.is_empty() && !repository.config_file_read);
         }
         assert!(!output.stdout.windows(b"unapproved dirty".len()).any(|bytes| bytes == b"unapproved dirty"));
+
+        // Independently approve each exact checkout as a legacy root. This
+        // selects the same repositories without overlapping enumeration roots.
+        let mut legacy_request = request.clone();
+        legacy_request.schema = reader::REQUEST_SCHEMA.into();
+        legacy_request.nonce = reader::fresh_nonce().unwrap();
+        legacy_request.probe_sha256 = reader::probe_sha256();
+        legacy_request.git_artifact_sha256 = None;
+        legacy_request.roots = vec![normal(&fixture.repo), normal(&linked)];
+        for approval in &mut legacy_request.source_allowlist {
+            approval.relative_path = ".".into();
+        }
+        legacy_request.validate().unwrap();
+        let (legacy_output, legacy_retained, legacy_body) = run(&fixture, "topology-reader", &legacy_request, true, &digest);
+        assert!(legacy_output.status.success(), "legacy Unicode/worktree reader must exit zero: code={:?}", legacy_output.status.code());
+        assert!(legacy_output.stderr.is_empty());
+        let header_len = u32::from_le_bytes(legacy_output.stdout[8..12].try_into().unwrap()) as usize;
+        let header: serde_json::Value = serde_json::from_slice(&legacy_output.stdout[16..16 + header_len]).unwrap();
+        let reported: ProcessIdentity = serde_json::from_value(header["helper_identity"].clone()).unwrap();
+        assert_eq!(reported, legacy_retained.identity, "legacy helper identity must match the retained actual process");
+        let legacy_bytes =
+            reader::decode_response(&legacy_output.stdout, &legacy_request, &legacy_body).expect("hash-bound legacy capture and actual probe cleanup receipt");
+        let legacy: RawCapture = serde_json::from_slice(legacy_bytes).unwrap();
+        assert!(legacy.failures.is_empty() && legacy.progress.is_none());
+        assert_eq!(legacy.repositories.len(), 2);
+        assert_eq!(legacy.counters.repositories, 2);
+        assert_eq!(legacy.counters.manifests, 2);
+        for (index, relative) in ["repo", checkout_relative].into_iter().enumerate() {
+            let native_root = remote::source_root_fingerprint(&request.roots[index], RemotePlatform::Windows);
+            let legacy_root = remote::source_root_fingerprint(&legacy_request.roots[index], RemotePlatform::Windows);
+            let native_repo = capture.repositories.iter().find(|repo| repo.root_fingerprint == native_root && repo.relative_path == relative).unwrap();
+            let legacy_repo = legacy.repositories.iter().find(|repo| repo.root_fingerprint == legacy_root && repo.relative_path == ".").unwrap();
+            assert!(legacy_repo.git == native_repo.git, "real legacy/native Git metadata and HEAD must agree");
+            assert!(legacy_repo.manifests == native_repo.manifests, "approved paths, kinds, content, hashes and revisions must agree");
+            assert!(legacy_repo.failures.is_empty() && legacy_repo.configs.is_empty() && !legacy_repo.config_file_read);
+        }
+        assert!(!legacy_bytes.windows(b"unapproved dirty".len()).any(|bytes| bytes == b"unapproved dirty"));
         assert!(fixture.snapshot() == normal_before, "normal checkout HEAD, bytes and dirty status must stay unchanged");
         assert!(query(&fixture, &linked, &["rev-parse", "--verify", "HEAD"]) == linked_head);
         assert!(query(&fixture, &linked, &["status", "--porcelain", "--untracked-files=all"]) == linked_status);

@@ -25,8 +25,8 @@ use windows_sys::{
         Storage::FileSystem::{
             CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_NO_RECALL,
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_TRAVERSE, FILE_TYPE_DISK, FileIdInfo,
-            GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, OPEN_EXISTING, VOLUME_NAME_GUID,
-            VOLUME_NAME_NT,
+            GetFileInformationByHandleEx, GetFileType, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, OPEN_EXISTING, VOLUME_NAME_DOS,
+            VOLUME_NAME_GUID, VOLUME_NAME_NT,
         },
         System::{
             IO::IO_STATUS_BLOCK,
@@ -189,6 +189,7 @@ impl HeldPath {
 /// Local NTFS only; unavailable volume GUIDs and unsupported launches fail closed.
 pub struct PinnedWindowsExecutable {
     executable: PathBuf,
+    launch_path: PathBuf,
     sha256: String,
     chain: Vec<HeldPath>,
     deadline: Instant,
@@ -269,12 +270,22 @@ impl PinnedWindowsExecutable {
         if !executable.as_os_str().to_string_lossy().starts_with(r"\\?\Volume{") {
             return Err(rejected());
         }
-        let pin = Self { executable, sha256: expected_sha256.to_owned(), chain, deadline };
+        // The launch representation is obtained once from the held leaf.
+        // Both representations must still resolve to the retained NTFS identity.
+        let dos_path = PathBuf::from(std::ffi::OsString::from_wide(&final_path(image, VOLUME_NAME_DOS)?));
+        let dos_text = dos_path.to_str().ok_or_else(rejected)?.strip_prefix(r"\\?\").ok_or_else(rejected)?;
+        let launch_path = PathBuf::from(dos_text);
+        components(&launch_path)?;
+        let pin = Self { executable, launch_path, sha256: expected_sha256.to_owned(), chain, deadline };
         pin.unchanged()?;
         Ok(pin)
     }
     pub fn executable(&self) -> &Path {
         &self.executable
+    }
+    pub(crate) fn launch_path(&self) -> io::Result<&Path> {
+        self.unchanged()?;
+        Ok(&self.launch_path)
     }
     pub fn sha256(&self) -> &str {
         &self.sha256
@@ -287,25 +298,28 @@ impl PinnedWindowsExecutable {
         for (index, held) in self.chain.iter().enumerate() {
             held.unchanged(index + 1 < self.chain.len())?;
         }
-        let path = wide(self.executable.as_os_str())?;
-        // SAFETY: immutable volume-GUID path, no inherited/template handle. This
-        // extra ID check is backed by the retained no-reparse chain, not a new lease.
-        let resolved = checked_file(
-            unsafe {
-                CreateFileW(
-                    path.as_ptr(),
-                    GENERIC_READ,
-                    FILE_SHARE_READ,
-                    null(),
-                    OPEN_EXISTING,
-                    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
-                    null_mut(),
-                )
-            },
-            false,
-        )?;
-        if file_identity(&resolved)? != self.chain.last().ok_or_else(rejected)?.identity {
-            return Err(rejected());
+        for representation in [&self.executable, &self.launch_path] {
+            let path = wide(representation.as_os_str())?;
+            // SAFETY: fixed read-only path, no inherited/template handle. Both
+            // representations must resolve to the retained no-reparse chain's leaf ID;
+            // resolving the DOS locator neither replaces nor extends that lease.
+            let resolved = checked_file(
+                unsafe {
+                    CreateFileW(
+                        path.as_ptr(),
+                        GENERIC_READ,
+                        FILE_SHARE_READ,
+                        null(),
+                        OPEN_EXISTING,
+                        FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_OPEN_NO_RECALL,
+                        null_mut(),
+                    )
+                },
+                false,
+            )?;
+            if file_identity(&resolved)? != self.chain.last().ok_or_else(rejected)?.identity {
+                return Err(rejected());
+            }
         }
         before(self.deadline)?;
         Ok(())
@@ -369,6 +383,36 @@ mod tests {
         assert!(other.verify_process(process).is_err());
         drop(other);
         drop(current);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fixed_launch_locator_must_resolve_to_the_held_file_identity() {
+        let root = std::env::temp_dir().join(format!("pin-locator-fixture-{}-{}", std::process::id(), crate::db::now_ms()));
+        std::fs::create_dir(&root).unwrap();
+        let bytes = b"equal bytes do not grant another file launch authority";
+        let digest: String = Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect();
+        let original = root.join("original.exe");
+        let replacement = root.join("replacement.exe");
+        std::fs::write(&original, bytes).unwrap();
+        std::fs::write(&replacement, bytes).unwrap();
+        let end = Instant::now() + std::time::Duration::from_secs(15);
+        let mut pin = PinnedWindowsExecutable::open(&original, &digest, end).unwrap();
+        let other = PinnedWindowsExecutable::open(&replacement, &digest, end).unwrap();
+        assert!(pin.chain.last().unwrap().identity != other.chain.last().unwrap().identity);
+        let fixed = pin.launch_path().unwrap().to_path_buf();
+        let authority = pin.executable().to_path_buf();
+        assert!(!fixed.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+        assert!(authority.as_os_str().to_string_lossy().starts_with(r"\\?\Volume{"));
+        // Model a changed DOS resolution without changing a real drive mapping.
+        // Equal bytes at another actual NTFS file ID must fail before spawning.
+        pin.launch_path = other.launch_path().unwrap().to_path_buf();
+        assert!(pin.launch_path().is_err());
+        assert_eq!(pin.executable(), authority);
+        pin.launch_path = fixed.clone();
+        assert_eq!(pin.launch_path().unwrap(), fixed);
+        drop(other);
+        drop(pin);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
