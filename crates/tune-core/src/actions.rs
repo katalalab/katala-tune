@@ -51,7 +51,7 @@ static ACTION_RECEIVER: LazyLock<String> = LazyLock::new(|| {
 fn action_receiver_command() -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes: Vec<u8> = ACTION_RECEIVER.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let mut encoded = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let n = (u32::from(chunk[0]) << 16) | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8) | u32::from(*chunk.get(2).unwrap_or(&0));
         encoded.push(char::from(ALPHABET[((n >> 18) & 63) as usize]));

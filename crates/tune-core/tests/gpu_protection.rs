@@ -9,8 +9,10 @@ use tune_core::{
     rules,
 };
 
+type CaptureCall = (String, Vec<String>, Option<Vec<u8>>);
+
 #[derive(Default)]
-struct CaptureRunner(Mutex<Vec<(String, Vec<String>, Option<Vec<u8>>)>>);
+struct CaptureRunner(Mutex<Vec<CaptureCall>>);
 
 impl Runner for CaptureRunner {
     fn run<'a>(&'a self, cmd: &'a str, args: &'a [String], input: Option<&'a [u8]>, _timeout: Duration) -> RunFuture<'a> {
