@@ -161,14 +161,14 @@ function MxKey([string]$exe, [string[]]$tokens) {
 $mxGroups = @(); $mxTrees = @(); $mxAvail = 'unavailable'; $mxReason = $null
 try {
   $mx = @{}
-  $mxCim = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, WorkingSetSize, SessionId, CreationDate -ErrorAction Stop)
+  $mxCim = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, WorkingSetSize, SessionId, CreationDate -OperationTimeoutSec 4 -ErrorAction Stop)
   if ($mxCim.Count -eq 0) { throw 'no-data' }
   # Command lines are queried only for interpreter executables (other processes' arguments are never read)
   $mxCmd = @{}
   $mxNames = @($mxCim | ForEach-Object { [string]$_.Name } | Where-Object { ($_ -replace '\.exe$', '') -match $mxInterp -and $_ -match '^[A-Za-z0-9._-]+$' } | Sort-Object -Unique)
   if ($mxNames.Count -gt 0) {
     $flt = ($mxNames | ForEach-Object { "Name = '$_'" }) -join ' OR '
-    foreach ($c in @(Get-CimInstance Win32_Process -Filter $flt -Property ProcessId, CommandLine)) { if ($c.CommandLine) { $mxCmd[[int]$c.ProcessId] = [string]$c.CommandLine } }
+    foreach ($c in @(Get-CimInstance Win32_Process -Filter $flt -Property ProcessId, CommandLine -OperationTimeoutSec 4 -ErrorAction Stop)) { if ($c.CommandLine) { $mxCmd[[int]$c.ProcessId] = [string]$c.CommandLine } }
   }
   foreach ($w in $mxCim) {
     $nm = ([string]$w.Name) -replace '\.exe$', ''
@@ -220,7 +220,8 @@ try {
 } catch {
   $mxReason = NsErr $_
 }
-$mx = $null; $mxCim = $null; $mxCmd = $null; $gh = $null; $th = $null; $kids = $null
+# Keep $mx for the following GPU compute PID and parent/child check, then clear it.
+$mxCim = $null; $mxCmd = $null; $gh = $null; $th = $null; $kids = $null
 
 # Memory
 $commitPct = $null
@@ -265,6 +266,30 @@ function InvokeGpuQuery($exe, $fields) {
     return @{ rows = @($text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 16); reason = $null }
   } catch { return @{ rows = @(); reason = "query-unavailable" } } finally { $p.Dispose() }
 }
+function InvokeGpuComputeQuery($exe) {
+  $p = New-Object Diagnostics.Process
+  $p.StartInfo = New-Object Diagnostics.ProcessStartInfo
+  $p.StartInfo.FileName = $exe
+  $p.StartInfo.Arguments = "--query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits"
+  $p.StartInfo.UseShellExecute = $false
+  $p.StartInfo.CreateNoWindow = $true
+  $p.StartInfo.RedirectStandardOutput = $true
+  $p.StartInfo.RedirectStandardError = $true
+  try {
+    [void]$p.Start()
+    $out = $p.StandardOutput.ReadToEndAsync()
+    $err = $p.StandardError.ReadToEndAsync()
+    if (-not $p.WaitForExit(4000)) { $p.Kill(); return @{ rows = @(); reason = "query-timeout" } }
+    if (-not $out.Wait(200)) { return @{ rows = @(); reason = "output-timeout" } }
+    $text = $out.Result
+    if ($p.ExitCode -ne 0) { return @{ rows = @(); reason = "query-failed" } }
+    if ($text.Length -gt 65536) { return @{ rows = @(); reason = "output-limit" } }
+    # nvidia-smi uses this text (rather than a blank CSV stream) for a successful empty result.
+    $rows = @($text -split "`r?`n" | Where-Object { $_.Trim() -and $_.Trim() -ne "No running processes found" })
+    if ($rows.Count -gt 16) { return @{ rows = @(); reason = "row-limit" } }
+    return @{ rows = $rows; reason = $null }
+  } catch { return @{ rows = @(); reason = "query-unavailable" } } finally { $p.Dispose() }
+}
 function GpuMemory($g, $at) {
   foreach ($key in @("mem_used_mb", "mem_total_mb", "mem_free_mb", "util", "temp_c", "power_w")) { if ($null -ne $g[$key] -and $g[$key] -lt 0) { $g[$key] = $null } }
   if ($null -ne $g.mem_total_mb -and $g.mem_total_mb -le 0) { $g.mem_total_mb = $null }
@@ -282,6 +307,7 @@ function GpuMemory($g, $at) {
   return [pscustomobject]$g
 }
 $gpus = @()
+$gpuCompute = [ordered]@{ availability = "unavailable"; apps = @(); reason = "nvidia-smi-not-found" }
 $gpuAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 $gpuReason = "nvidia-smi-not-found; other GPU vendors unsupported (AdapterRAM is not a reliable VRAM capacity)"
@@ -300,10 +326,64 @@ if ($smi) {
     $g = @{ uuid = $f[16]; throttle = $f[17]; adapter_index = (RNum $f[0] 0); name = $f[1]; util = (RNum $f[2]); mem_used_mb = (RNum $f[3] 0); mem_total_mb = (RNum $f[4] 0); mem_free_mb = (RNum $f[5] 0); temp_c = (RNum $f[6]); power_w = (RNum $f[7]); power_limit_w = (RNum $f[8]); power_min_w = (RNum $f[9]); power_max_w = (RNum $f[10]); clocks_graphics_mhz = (RNum $f[11]); clocks_sm_mhz = (RNum $f[12]); clocks_memory_mhz = (RNum $f[13]); pstate = $(if ($f[14] -match "^(N/A|Not Supported|\[N/A\])$") { $null } else { $f[14] }); driver = $f[15]; source = $(if ($memoryOnly) { "nvidia-smi memory-only fallback" } else { "nvidia-smi" }); available = $true }
     $gpus += GpuMemory $g $gpuAt
   }
+  $compute = InvokeGpuComputeQuery $smi.Source
+  if ($compute.reason) {
+    $gpuCompute.availability = "unavailable"; $gpuCompute.reason = $compute.reason
+  } else {
+    $apps = @(); $valid = $true
+    foreach ($line in $compute.rows) {
+      $f = $line -split ",\s*"
+      if ($f.Count -ne 2 -or $f[0] -notmatch "^[0-9]+$") { $valid = $false; break }
+      [int]$computePid = 0
+      if (-not [int]::TryParse($f[0], [ref]$computePid) -or $computePid -le 4) { $valid = $false; break }
+      # Keep N/A as null rather than zero; a PID still means active compute work.
+      $used = $null
+      if ($f[1] -notmatch "^(N/A|Not Supported|\[N/A\])$") { $used = RNum $f[1] 0; if ($null -eq $used -or $used -lt 0) { $valid = $false; break } }
+      $name = $null; $mxRow = $mx[$computePid]
+      if ($mxRow -and $mxRow.name -match "^[A-Za-z0-9_.+-]{1,80}$") { $name = $mxRow.name }
+      $apps += [pscustomobject]@{ pid = $computePid; name = $name; used_memory_mb = $used }
+    }
+    if ($valid) { $gpuCompute.availability = "available"; $gpuCompute.apps = @($apps); $gpuCompute.reason = $null }
+    else { $gpuCompute.availability = "unavailable"; $gpuCompute.reason = "invalid-compute-row" }
+  }
+} else {
+  try {
+    $adapters = @(Get-CimInstance Win32_VideoController -Property Name,PNPDeviceID -OperationTimeoutSec 4 -ErrorAction Stop)
+    $nvidiaAdapters = @($adapters | Where-Object { $_.Name -match "(?i)NVIDIA" -or $_.PNPDeviceID -match "(?i)VEN_10DE" })
+    if ($adapters.Count -gt 0 -and $adapters.Count -le 32 -and $nvidiaAdapters.Count -eq 0) { $gpuCompute.availability = "absent"; $gpuCompute.reason = "verified-no-nvidia-adapter" }
+    else { $gpuCompute.reason = "nvidia-smi-not-found; adapter-identity-unavailable" }
+  } catch { $gpuCompute.reason = "nvidia-smi-not-found; adapter-query-unavailable" }
 }
 if ($gpus.Count -eq 0) {
   $gpus = @([pscustomobject]@{ adapter_index = $null; name = "GPU"; source = "nvidia-smi"; available = $false; memory_kind = "unknown"; memory_unit = "MiB"; memory_status = $(if ($smi) { "unavailable" } else { "unsupported" }); memory_reason = $gpuReason; sampled_at = $gpuAt; mem_total_mb = $null; mem_used_mb = $null; mem_free_mb = $null; mem_used_pct = $null; util = $null; temp_c = $null; power_w = $null; power_limit_w = $null; process_memory_reason = "not collected" })
 }
+$gpuPids = @($gpuCompute.apps | ForEach-Object { [int]$_.pid })
+function Test-KtGpuRelated([int]$Pid, [int[]]$GpuPids, $Map) {
+  if ($GpuPids -contains $Pid) { return $true }
+  $ancestors = @{}; $cur = $Map[$Pid]
+  for ($i = 0; $i -lt 64 -and $cur -and $cur.pid -gt 0 -and -not $ancestors.ContainsKey($cur.pid); $i++) {
+    $ancestors[$cur.pid] = $true
+    $parent = $Map[$cur.ppid]
+    if (-not $parent -or -not $cur.born -or -not $parent.born -or $parent.born -gt $cur.born) { break }
+    $cur = $parent
+  }
+  foreach ($gpuPid in $GpuPids) {
+    $cur = $Map[$gpuPid]
+    for ($i = 0; $i -lt 64 -and $cur -and $cur.pid -gt 0; $i++) {
+      if ($ancestors.ContainsKey($cur.pid)) { return $true }
+      $parent = $Map[$cur.ppid]
+      if (-not $parent -or -not $cur.born -or -not $parent.born -or $parent.born -gt $cur.born) { break }
+      $cur = $parent
+    }
+  }
+  return $false
+}
+foreach ($p in $list) {
+  $row = $mx[[int]$p.pid]
+  if ($row) { $p | Add-Member -NotePropertyName ppid -NotePropertyValue $row.ppid -Force }
+  if ($gpuCompute.availability -eq "available" -and (Test-KtGpuRelated ([int]$p.pid) $gpuPids $mx)) { $p | Add-Member -NotePropertyName gpu_compute -NotePropertyValue $true -Force }
+}
+$mx = $null
 # END GPU TELEMETRY
 
 $cpuPowerW = $null; $cpuPowerSource = $null; $cpuPowerReason = "LibreHardwareMonitor CPU Package unavailable"
@@ -827,6 +907,7 @@ $result = [ordered]@{
   power = [ordered]@{ plan_guid = $guid; plan_name = $planName; plans = @($plans); package_w = $cpuPowerW; package_source = $cpuPowerSource; package_availability = $(if ($null -ne $cpuPowerW) { "available" } else { "unavailable" }); package_reason = $cpuPowerReason; soc_w = $null; soc_source = $null; low_power_mode = $null; on_battery = $null }
   defender = [ordered]@{ realtime = $mp.RealTimeProtectionEnabled; exclusions = $excl }
   gpus = @($gpus)
+  gpu_compute = [pscustomobject]$gpuCompute
   disk = @($disks)
   wsl = $wsl
   stability_7d = $stab
