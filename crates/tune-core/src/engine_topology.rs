@@ -11,6 +11,7 @@ use crate::topology::{
     Failure, FailureCode, ScopeStatus, TopologySnapshot,
     adapters::{
         assemble_capture_cached, capture_local_with_progress, capture_source_cache_keys,
+        docker::{DockerRequest, collect_docker, engine_snapshots},
         github::{GithubRequest, collect_github},
         remote::{RemotePlatform, RemoteRequest, RemoteRuntimeKind, collect_remote},
     },
@@ -121,7 +122,7 @@ impl Engine {
                 };
                 let mut progress_to_save = None;
                 let mut source_cache_saved = true;
-                let snapshots = if !enabled {
+                let mut snapshots = if !enabled {
                     vec![excluded("environment is disabled")]
                 } else if node.local && transport == "node" {
                     let progress = self.with_db(|db| db.topology_progress(&scope_id)).ok().flatten();
@@ -325,6 +326,45 @@ impl Engine {
                 } else {
                     vec![excluded("transport is unsupported")]
                 };
+                let docker = env.get("docker").unwrap_or(&Value::Null);
+                if enabled && docker.get("enabled").and_then(Value::as_bool) == Some(true) {
+                    let docker_scope = format!("{scope_id}:docker");
+                    let snapshot = if node.local && transport == "node" {
+                        let contexts = docker
+                            .get("contexts")
+                            .and_then(Value::as_array)
+                            .and_then(|rows| rows.iter().map(|v| v.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>())
+                            .unwrap_or_default();
+                        let request = DockerRequest {
+                            scope_id: docker_scope.clone(),
+                            contexts,
+                            program: docker.get("program").map(|value| value.as_str().unwrap_or("").to_owned()),
+                            observed_at_ms: now_ms(),
+                            limits: config.topology.limits.clone(),
+                        };
+                        collect_docker(&request).await
+                    } else {
+                        let mut snapshot = excluded("Docker collection requires an explicit local native environment");
+                        snapshot.scope_id = docker_scope;
+                        snapshot
+                    };
+                    let mut docker_snapshots = engine_snapshots(snapshot);
+                    let prefix = format!("{scope_id}:docker:engine:");
+                    let observed = docker_snapshots.iter().map(|s| s.scope_id.clone()).collect::<HashSet<_>>();
+                    let previous = self.with_db(|db| db.topology_scope_ids_with_prefix(&prefix)).unwrap_or_default();
+                    for missing in previous.into_iter().filter(|s| !observed.contains(s)) {
+                        docker_snapshots.push(TopologySnapshot {
+                            scope_id: missing,
+                            status: ScopeStatus::Partial,
+                            entities: vec![],
+                            edges: vec![],
+                            failures: vec![Failure::new(FailureCode::Unsupported, "Docker engine was not observed in this collection")],
+                            counters: Default::default(),
+                            observed_at_ms: now_ms(),
+                        });
+                    }
+                    snapshots.extend(docker_snapshots);
+                }
                 let mut snapshots_saved = true;
                 for snapshot in snapshots {
                     entities += snapshot.entities.len();

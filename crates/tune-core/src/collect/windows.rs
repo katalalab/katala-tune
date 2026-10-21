@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::mem::size_of;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
@@ -24,7 +24,7 @@ use windows_sys::Win32::{
         Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
         GetTokenInformation, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
-    Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING},
+    Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, GetFullPathNameW, OPEN_EXISTING},
     System::{
         JobObjects::{
             CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -264,15 +264,25 @@ fn exited(handle: &OwnedHandle) -> io::Result<bool> {
     }
 }
 
+#[cfg(test)]
+type AccountingHook = Box<dyn FnOnce(&Job, &ProcessReceipt) -> io::Result<()> + Send>;
+
 struct Job {
     handle: OwnedHandle,
     processes: Vec<Process>,
+    #[cfg(test)]
+    after_first_accounting: Option<AccountingHook>,
 }
 impl Job {
     fn new() -> io::Result<Self> {
         // SAFETY: null name creates a fresh unnamed Job; null attributes prevent inheritance.
         let handle = owned(unsafe { CreateJobObjectW(null(), null()) })?;
-        let job = Self { handle, processes: Vec::new() };
+        let job = Self {
+            handle,
+            processes: Vec::new(),
+            #[cfg(test)]
+            after_first_accounting: None,
+        };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         // SAFETY: exact documented structure and size; only the newly owned Job is modified.
@@ -290,7 +300,7 @@ impl Job {
         // SAFETY: terminate only this new Job, never a parent/shared Job or a PID.
         check(unsafe { TerminateJobObject(self.handle.as_raw_handle(), 124) })
     }
-    fn observe(&mut self, receipt: &mut ProcessReceipt) -> io::Result<()> {
+    fn accounting(&self, receipt: &mut ProcessReceipt) -> io::Result<()> {
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         // SAFETY: explicit owned Job and correctly sized aligned output structure; never use null hJob.
         check(unsafe {
@@ -304,6 +314,14 @@ impl Job {
         })?;
         receipt.total_processes = accounting.TotalProcesses;
         receipt.job_empty = accounting.ActiveProcesses == 0;
+        Ok(())
+    }
+    fn observe(&mut self, receipt: &mut ProcessReceipt) -> io::Result<()> {
+        self.accounting(receipt)?;
+        #[cfg(test)]
+        if let Some(hook) = self.after_first_accounting.take() {
+            hook(self, receipt)?;
+        }
         #[repr(C)]
         struct Pids {
             assigned: u32,
@@ -344,10 +362,6 @@ impl Job {
             receipt.observed.push(identity.clone());
             self.processes.push(Process { handle, identity });
         }
-        receipt.observed_exited = !self.processes.is_empty();
-        for process in &self.processes {
-            receipt.observed_exited &= exited(&process.handle)?;
-        }
         let root = self.processes.first().ok_or_else(invalid)?;
         receipt.root_exited = exited(&root.handle)?;
         if receipt.root_exited {
@@ -355,6 +369,15 @@ impl Job {
             // SAFETY: retained root has signaled; 259 is a valid exit value, never a liveness test.
             check(unsafe { GetExitCodeProcess(root.handle.as_raw_handle(), &mut code) })?;
             receipt.root_exit_code = Some(code as i32);
+            // The initial accounting may predate root exit. Only a subsequent
+            // sample can establish that descendants remain after that exit.
+            self.accounting(receipt)?;
+        }
+        // Sample retained members after root exit; an earlier nonsignaled root
+        // must not be mistaken for a descendant that remains after root exit.
+        receipt.observed_exited = !self.processes.is_empty();
+        for process in &self.processes {
+            receipt.observed_exited &= exited(&process.handle)?;
         }
         Ok(())
     }
@@ -407,24 +430,32 @@ fn compare_names(left: &OsStr, right: &OsStr) -> Ordering {
         _ => Ordering::Greater,
     }
 }
-fn environment(command: &std::process::Command) -> io::Result<Vec<u16>> {
-    let mut vars: Vec<_> = std::env::vars_os().collect();
-    for (name, value) in command.get_envs() {
+fn environment(command: &std::process::Command, entries: &[(OsString, OsString)]) -> io::Result<Vec<u16>> {
+    // Command does not expose its env_clear state. A separate complete map is the
+    // sole authority; reject edits rather than silently ignoring/merging them.
+    if command.get_envs().next().is_some() {
+        return Err(invalid());
+    }
+    let mut vars: Vec<_> = entries.iter().collect();
+    for (name, value) in &vars {
+        if name.len() > 1024 * 1024 || value.len() > 1024 * 1024 {
+            return Err(invalid());
+        }
         let units = wide(name)?;
         if units.len() == 1 || units.contains(&u16::from(b'=')) {
             return Err(invalid());
         }
-        vars.retain(|(key, _)| compare_names(key, name) != Ordering::Equal);
-        if let Some(value) = value {
-            vars.push((name.to_owned(), value.to_owned()));
-        }
+        wide(value)?;
     }
     vars.sort_by(|(a, _), (b, _)| compare_names(a, b));
+    if vars.windows(2).any(|pair| compare_names(&pair[0].0, &pair[1].0) == Ordering::Equal) {
+        return Err(invalid());
+    }
     let mut output = Vec::new();
     for (key, value) in vars {
-        let mut key = wide(&key)?;
+        let mut key = wide(key)?;
         key.pop();
-        let value = wide(&value)?;
+        let value = wide(value)?;
         output.extend(key);
         output.push(u16::from(b'='));
         output.extend(value);
@@ -443,7 +474,7 @@ fn path_entries(path: &OsStr) -> impl Iterator<Item = PathBuf> + '_ {
     std::env::split_paths(path).filter(|entry| !entry.as_os_str().is_empty())
 }
 
-fn executable(command: &std::process::Command) -> io::Result<PathBuf> {
+fn executable(command: &std::process::Command, environment: &[(OsString, OsString)]) -> io::Result<PathBuf> {
     let program = Path::new(command.get_program());
     let extension = program.extension().unwrap_or_default().to_string_lossy();
     if extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat") {
@@ -459,7 +490,7 @@ fn executable(command: &std::process::Command) -> io::Result<PathBuf> {
     if name.components().count() > 1 || name.is_absolute() {
         return name.canonicalize().and_then(|p| if p.is_file() { Ok(p) } else { Err(invalid()) });
     }
-    let child_path = command.get_envs().find(|(k, _)| compare_names(k, OsStr::new("PATH")) == Ordering::Equal).and_then(|(_, v)| v);
+    let child_path = environment.iter().find(|(k, _)| compare_names(k, OsStr::new("PATH")) == Ordering::Equal).map(|(_, v)| v);
     let mut paths = Vec::new();
     if let Some(path) = child_path {
         paths.extend(path_entries(path));
@@ -479,29 +510,62 @@ fn executable(command: &std::process::Command) -> io::Result<PathBuf> {
         use std::os::windows::ffi::OsStringExt;
         paths.push(PathBuf::from(OsString::from_wide(&buffer[..count as usize])));
     }
-    if let Some(path) = std::env::var_os("PATH") {
-        paths.extend(path_entries(&path));
-    }
     paths.into_iter().map(|p| p.join(&name)).find(|p| p.is_file()).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?.canonicalize()
 }
 
-fn spawn_owned(
-    command: &std::process::Command,
-    job: &Job,
-    input: &Pipe,
-    out: &Pipe,
-    err: &Pipe,
-    spawn_failed: &mut bool,
+// Match the short-path compatibility rule used by Rust Command. A verbatim path
+// cannot simply lose its prefix: Win32 normalization could select a different file.
+fn user_executable_path(path: PathBuf) -> io::Result<PathBuf> {
+    let original = wide(path.as_os_str())?;
+    if original.len() > 260 {
+        return Ok(path);
+    }
+    let prefix: Vec<_> = r"\\?\".encode_utf16().collect();
+    let unc_prefix: Vec<_> = r"\\?\UNC\".encode_utf16().collect();
+    let candidate = if original.starts_with(&unc_prefix) {
+        let mut units = vec![u16::from(b'\\'); 2];
+        units.extend_from_slice(&original[unc_prefix.len()..]);
+        units
+    } else if original.starts_with(&prefix)
+        && original.len() >= 8
+        && ((u16::from(b'A')..=u16::from(b'Z')).contains(&original[4]) || (u16::from(b'a')..=u16::from(b'z')).contains(&original[4]))
+        && original[5] == u16::from(b':')
+        && original[6] == u16::from(b'\\')
+    {
+        original[prefix.len()..].to_vec()
+    } else {
+        return Ok(path);
+    };
+    let mut normalized = [0u16; 261];
+    // SAFETY: candidate is an absolute, NUL-terminated UTF-16 drive/UNC path;
+    // the output is writable and bounded. This lexical query does not open the path.
+    let count = unsafe { GetFullPathNameW(candidate.as_ptr(), normalized.len() as u32, normalized.as_mut_ptr(), null_mut()) } as usize;
+    if count == 0 {
+        return Err(os_error());
+    }
+    if count < normalized.len() && normalized[..count] == candidate[..candidate.len() - 1] {
+        Ok(PathBuf::from(OsString::from_wide(&candidate[..candidate.len() - 1])))
+    } else {
+        Ok(path)
+    }
+}
+
+struct SpawnContext<'a> {
+    command: &'a std::process::Command,
+    environment: &'a [(OsString, OsString)],
     deadline: Instant,
-) -> io::Result<(Process, OwnedHandle)> {
-    let executable = executable(command)?;
+}
+
+fn spawn_owned(context: SpawnContext<'_>, job: &Job, stdio: [&OwnedHandle; 3], spawn_failed: &mut bool) -> io::Result<(Process, OwnedHandle)> {
+    let SpawnContext { command, environment: values, deadline } = context;
+    let env = environment(command, values)?;
+    let executable = user_executable_path(executable(command, values)?)?;
     let application = wide(executable.as_os_str())?;
     let mut argv = command_line(&executable, command)?;
-    let env = environment(command)?;
     let cwd = command.get_current_dir().map(|p| wide(p.as_os_str())).transpose()?;
     // Value arrays are declared before Attributes and remain alive until its destructor.
     let jobs = [job.handle.as_raw_handle()];
-    let handles = [input.client.as_raw_handle(), out.client.as_raw_handle(), err.client.as_raw_handle()];
+    let handles = stdio.map(AsRawHandle::as_raw_handle);
     let mut attributes = Attributes::new(&jobs, &handles)?;
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -591,13 +655,54 @@ impl Drop for Tasks {
     }
 }
 
-pub(super) async fn run(command: &std::process::Command, input: &[u8], timeout: Duration, stdout_limit: usize, stderr_limit: usize) -> BoundedResult {
+fn lingering_descendants(receipt: &ProcessReceipt) -> bool {
+    receipt.root_exited && !receipt.job_empty && !receipt.observed_exited
+}
+
+#[derive(Default)]
+struct CleanupState {
+    deadline: Option<Instant>,
+    termination_requested: bool,
+}
+
+struct CleanupStep {
+    terminate: bool,
+    expired: bool,
+}
+
+impl CleanupState {
+    fn advance(&mut self, receipt: &mut ProcessReceipt, now: Instant) -> CleanupStep {
+        if self.deadline.is_none() && (receipt.stop != ProcessStop::Completed || receipt.root_exited) {
+            self.deadline = Some(now + CLEANUP);
+        }
+        let expired = self.deadline.is_some_and(|end| now >= end);
+        if expired && receipt.stop == ProcessStop::Completed {
+            receipt.stop = ProcessStop::CleanupUnconfirmed;
+        }
+        // Decide after every stop mutation, including expiry. Record the one-shot
+        // request before the caller attempts termination; Drop remains a fallback.
+        let terminate = receipt.stop != ProcessStop::Completed && !self.termination_requested;
+        if terminate {
+            self.termination_requested = true;
+        }
+        CleanupStep { terminate, expired }
+    }
+}
+
+pub(super) async fn run(
+    command: &std::process::Command,
+    environment: &[(OsString, OsString)],
+    input: &[u8],
+    deadline: std::time::Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> BoundedResult {
     let mut answer = BoundedResult::default();
     let mut receipt = ProcessReceipt::default();
-    let deadline = Instant::now().checked_add(timeout);
+    let deadline = Instant::from_std(deadline);
     let setup = {
         let setup = async {
-            if deadline.is_none_or(|end| Instant::now() >= end) {
+            if Instant::now() >= deadline {
                 answer.timed_out = true;
                 receipt.stop = ProcessStop::Timeout;
                 return Err(io::Error::from(io::ErrorKind::TimedOut));
@@ -617,7 +722,12 @@ pub(super) async fn run(command: &std::process::Command, input: &[u8], timeout: 
             stdout.server.connect().await?;
             stderr.server.connect().await?;
             let mut job = Job::new()?;
-            let spawn = spawn_owned(command, &job, &input_pipe, &stdout, &stderr, &mut answer.spawn_failed, deadline.expect("validated deadline"));
+            let spawn = spawn_owned(
+                SpawnContext { command, environment, deadline },
+                &job,
+                [&input_pipe.client, &stdout.client, &stderr.client],
+                &mut answer.spawn_failed,
+            );
             if let Err(error) = &spawn {
                 answer.spawn_failed |= error.kind() == io::ErrorKind::NotFound;
                 if error.kind() == io::ErrorKind::TimedOut {
@@ -636,7 +746,7 @@ pub(super) async fn run(command: &std::process::Command, input: &[u8], timeout: 
             drop(client);
             let Pipe { server: stderr, client } = stderr;
             drop(client);
-            if Instant::now() >= deadline.expect("validated deadline") {
+            if Instant::now() >= deadline {
                 answer.timed_out = true;
                 receipt.stop = ProcessStop::Timeout;
                 return Err(io::Error::from(io::ErrorKind::TimedOut));
@@ -648,16 +758,13 @@ pub(super) async fn run(command: &std::process::Command, input: &[u8], timeout: 
             drop(thread);
             Ok::<_, io::Error>((job, input_pipe, stdout, stderr))
         };
-        match deadline {
-            Some(deadline) => match tokio::time::timeout_at(deadline, setup).await {
-                Ok(result) => result.ok(),
-                Err(_) => {
-                    answer.timed_out = true;
-                    receipt.stop = ProcessStop::Timeout;
-                    None
-                }
-            },
-            None => None,
+        match tokio::time::timeout_at(deadline, setup).await {
+            Ok(result) => result.ok(),
+            Err(_) => {
+                answer.timed_out = true;
+                receipt.stop = ProcessStop::Timeout;
+                None
+            }
         }
     };
     let Some((mut job, mut input_pipe, stdout, stderr)) = setup else {
@@ -681,7 +788,7 @@ pub(super) async fn run(command: &std::process::Command, input: &[u8], timeout: 
         stdout: Some(tokio::spawn(drain(stdout, stdout_limit, signal.clone()))),
         stderr: Some(tokio::spawn(drain(stderr, stderr_limit, signal))),
     };
-    let mut cleanup_deadline = None;
+    let mut cleanup = CleanupState::default();
     loop {
         if overflow.try_recv().is_ok() {
             answer.output_limited = true;
@@ -731,41 +838,400 @@ pub(super) async fn run(command: &std::process::Command, input: &[u8], timeout: 
                 receipt.stop = ProcessStop::IoFailure;
             }
         }
-        if receipt.root_exited && !receipt.job_empty && receipt.stop == ProcessStop::Completed {
+        if lingering_descendants(&receipt) && receipt.stop == ProcessStop::Completed {
             receipt.stop = ProcessStop::LingeringDescendants;
         }
         let now = Instant::now();
         // All evidence must have been observed before the fixed execution deadline, even during pipe cleanup.
-        if now >= deadline.expect("validated deadline") && receipt.stop == ProcessStop::Completed {
+        if now >= deadline && receipt.stop == ProcessStop::Completed {
             answer.timed_out = true;
             receipt.stop = ProcessStop::Timeout;
+        }
+        let step = cleanup.advance(&mut receipt, now);
+        if step.terminate {
+            let _ = job.terminate();
         }
         if receipt.cleanup_confirmed() {
             break;
         }
-        if cleanup_deadline.is_none() && (receipt.stop != ProcessStop::Completed || receipt.root_exited) {
-            cleanup_deadline = Some(now + CLEANUP);
-            if receipt.stop != ProcessStop::Completed {
-                let _ = job.terminate();
-            }
-        }
-        if cleanup_deadline.is_some_and(|end| now >= end) {
-            if receipt.stop == ProcessStop::Completed {
-                receipt.stop = ProcessStop::CleanupUnconfirmed;
-            }
+        if step.expired {
             break;
         }
         tokio::time::sleep(POLL).await;
     }
     answer.code = receipt.root_exit_code;
     answer.process_receipt = Some(receipt);
-    answer.seal_windows_payload(Instant::now() >= deadline.expect("validated deadline"));
+    answer.seal_windows_payload(Instant::now() >= deadline);
     answer
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Synthetic decision-table state only: these tests issue no OS/ownership witness.
+    fn policy_receipt() -> ProcessReceipt {
+        let owner = ProcessIdentity { pid: 1, created_filetime: "1".into(), os_session: 1 };
+        let root = ProcessIdentity { pid: 2, created_filetime: "2".into(), os_session: 1 };
+        ProcessReceipt {
+            owner_session: "a".repeat(32),
+            owner: Some(owner),
+            root: Some(root.clone()),
+            observed: vec![root],
+            total_processes: 1,
+            stop: ProcessStop::Completed,
+            root_exited: true,
+            root_exit_code: Some(0),
+            job_empty: false,
+            observed_exited: true,
+            stdout_eof: true,
+            stderr_eof: true,
+            writer_finished: true,
+        }
+    }
+
+    fn assert_unknown_payload_is_sealed(receipt: &ProcessReceipt) {
+        assert!(!receipt.cleanup_confirmed());
+        let mut result = BoundedResult {
+            code: Some(0),
+            stdout: b"parser".to_vec(),
+            stderr: b"diagnostic".to_vec(),
+            process_receipt: Some(receipt.clone()),
+            ..Default::default()
+        };
+        result.seal_windows_payload(false);
+        assert_eq!(result.code, None);
+        assert!(result.stdout.is_empty() && result.stderr.is_empty());
+    }
+
+    #[test]
+    fn classifier_requires_a_nonsignaled_member_after_root_exit() {
+        for (root_exited, job_empty, observed_exited, expected) in
+            [(true, false, true, false), (true, false, false, true), (false, false, false, false), (true, true, false, false)]
+        {
+            let mut receipt = policy_receipt();
+            receipt.root_exited = root_exited;
+            receipt.job_empty = job_empty;
+            receipt.observed_exited = observed_exited;
+            assert_eq!(lingering_descendants(&receipt), expected, "root={root_exited} empty={job_empty} observed={observed_exited}");
+        }
+    }
+
+    #[test]
+    fn pending_cleanup_then_observe_failure_requests_termination_once() {
+        let start = Instant::now();
+        let mut state = CleanupState::default();
+        let mut receipt = policy_receipt();
+        assert!(!state.advance(&mut receipt, start).terminate);
+        let fixed = state.deadline;
+        receipt.stop = ProcessStop::IoFailure;
+        let first = state.advance(&mut receipt, start + POLL);
+        let repeated = state.advance(&mut receipt, start + POLL + POLL);
+        assert_eq!(state.deadline, fixed);
+        assert_eq!(fixed, Some(start + CLEANUP));
+        assert!(!first.expired && !repeated.expired);
+        assert_unknown_payload_is_sealed(&receipt);
+        assert_eq!(usize::from(first.terminate) + usize::from(repeated.terminate), 1, "failure after pending cleanup must request once");
+        assert!(state.termination_requested);
+    }
+
+    #[test]
+    fn pending_cleanup_expiry_requests_termination_once_before_break() {
+        let start = Instant::now();
+        let mut state = CleanupState::default();
+        let mut receipt = policy_receipt();
+        assert!(!state.advance(&mut receipt, start).terminate);
+        let fixed = state.deadline;
+        let first = state.advance(&mut receipt, start + CLEANUP);
+        let repeated = state.advance(&mut receipt, start + CLEANUP + POLL);
+        assert_eq!(state.deadline, fixed);
+        assert_eq!(fixed, Some(start + CLEANUP));
+        assert!(first.expired && repeated.expired);
+        assert_eq!(receipt.stop, ProcessStop::CleanupUnconfirmed);
+        assert_unknown_payload_is_sealed(&receipt);
+        assert_eq!(usize::from(first.terminate) + usize::from(repeated.terminate), 1, "expiry must request termination before returning break");
+        assert!(state.termination_requested);
+    }
+
+    #[test]
+    fn accounting_exit_fixture() {
+        if std::env::args().any(|arg| arg == "--owned-accounting-exit") {
+            std::process::exit(0);
+        }
+    }
+
+    #[test]
+    fn root_exit_between_accounting_and_root_query_refreshes_the_job_sample() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let fixture_name = format!("{}::accounting_exit_fixture", module_path!().split_once("::").unwrap().1);
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", &fixture_name, "--nocapture", "--", "--owned-accounting-exit"]);
+        let name = wide(OsStr::new("NUL")).unwrap();
+        let security = SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: null_mut(), bInheritHandle: 1 };
+        let stdio: Vec<_> = (0..3)
+            .map(|_| {
+                // SAFETY: fixed NUL device, owned inheritable stdio handles, no pipe or filesystem payload.
+                owned(unsafe {
+                    CreateFileW(
+                        name.as_ptr(),
+                        GENERIC_READ_ACCESS | GENERIC_WRITE_ACCESS,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        &security,
+                        OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL,
+                        null_mut(),
+                    )
+                })
+                .unwrap()
+            })
+            .collect();
+        let mut job = Job::new().unwrap();
+        let mut spawn_failed = false;
+        let spawn_deadline = Instant::now() + Duration::from_secs(5);
+        let (root, thread) = spawn_owned(
+            SpawnContext { command: &command, environment: &[], deadline: spawn_deadline },
+            &job,
+            [&stdio[0], &stdio[1], &stdio[2]],
+            &mut spawn_failed,
+        )
+        .unwrap();
+        let mut receipt =
+            ProcessReceipt { root: Some(root.identity.clone()), observed: vec![root.identity.clone()], stop: ProcessStop::Completed, ..Default::default() };
+        job.processes.push(root);
+        let old_order_would_report_lingering = Arc::new(AtomicBool::new(false));
+        let observed_old_order = Arc::clone(&old_order_would_report_lingering);
+        let hook_root_wait = Arc::new(AtomicU32::new(u32::MAX));
+        let observed_hook_wait = Arc::clone(&hook_root_wait);
+        job.after_first_accounting = Some(Box::new(move |job, first| {
+            assert!(!first.job_empty, "suspended real root must be active at the first sample");
+            assert_eq!(first.total_processes, 1);
+            let primary_thread = thread; // Keep the suspended primary-thread handle until root exit is confirmed.
+            let root = &job.processes[0];
+            if Instant::now() >= spawn_deadline {
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            // SAFETY: terminate only the retained process created suspended in this test's fresh Job.
+            // Its primary thread is never resumed; this isolates accounting order from executed fixture code.
+            check(unsafe { windows_sys::Win32::System::Threading::TerminateProcess(root.handle.as_raw_handle(), 0) })?;
+            let wait_ms = spawn_deadline.saturating_duration_since(Instant::now()).as_millis().min(u128::from(u32::MAX)) as u32;
+            // SAFETY: finite wait on our retained root, bounded by the original absolute spawn deadline.
+            let wait = unsafe { WaitForSingleObject(root.handle.as_raw_handle(), wait_ms) };
+            observed_hook_wait.store(wait, Ordering::SeqCst);
+            if wait != WAIT_OBJECT_0 || Instant::now() >= spawn_deadline {
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            // The old decision combines this actual root-exit query with the earlier active sample.
+            observed_old_order.store(exited(&root.handle)? && !first.job_empty, Ordering::SeqCst);
+            drop(primary_thread);
+            Ok(())
+        }));
+        job.observe(&mut receipt).unwrap();
+        let diagnostic_started = Instant::now();
+        let final_observation_deadline = spawn_deadline.min(diagnostic_started + CLEANUP);
+        assert!(!lingering_descendants(&receipt), "an exited observed root alone is not a live descendant: {receipt:?}");
+        let diagnostic_deadline = spawn_deadline.min(diagnostic_started + Duration::from_millis(1000));
+        // Diagnostics are separate later observations; never overwrite the receipt under test.
+        let retained: Vec<_> = job
+            .processes
+            .iter()
+            .enumerate()
+            .map(|(index, process)| {
+                // SAFETY: zero wait only on a retained observer handle from this owned Job.
+                let wait = unsafe { WaitForSingleObject(process.handle.as_raw_handle(), 0) };
+                let wait_error = if wait == windows_sys::Win32::Foundation::WAIT_FAILED { os_error().raw_os_error() } else { None };
+                let mut image = vec![0u16; 32768];
+                let mut image_len = image.len() as u32;
+                // SAFETY: retained query-capable process handle and bounded writable UTF-16 buffer.
+                let image_ok = unsafe {
+                    windows_sys::Win32::System::Threading::QueryFullProcessImageNameW(process.handle.as_raw_handle(), 0, image.as_mut_ptr(), &mut image_len)
+                };
+                let image_error = if image_ok == 0 { os_error().raw_os_error() } else { None };
+                // Never place the full image path in diagnostic output, including on errors.
+                let image_basename = if image_ok != 0 && (image_len as usize) < image.len() {
+                    Path::new(&OsString::from_wide(&image[..image_len as usize])).file_name().map(OsStr::to_owned)
+                } else {
+                    None
+                };
+                let mut code = 0;
+                // SAFETY: read-only exit query on that same retained handle; wait remains the liveness evidence.
+                let code_ok = unsafe { GetExitCodeProcess(process.handle.as_raw_handle(), &mut code) };
+                let code_error = if code_ok == 0 { os_error().raw_os_error() } else { None };
+                (process.identity.clone(), index == 0, wait, wait_error, image_basename, image_error, (code_ok != 0).then_some(code as i32), code_error)
+            })
+            .collect();
+        let mut current_accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: read-only query on the owned Job into a correctly sized aligned local output.
+        let accounting_ok = unsafe {
+            QueryInformationJobObject(
+                job.handle.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                std::ptr::from_mut(&mut current_accounting).cast(),
+                size_of_val(&current_accounting) as u32,
+                null_mut(),
+            )
+        };
+        let accounting_error = if accounting_ok == 0 { os_error().raw_os_error() } else { None };
+        let mut current_root_code = 0;
+        // SAFETY: query the same retained root handle; code alone is not a liveness test.
+        let root_code_ok = unsafe { GetExitCodeProcess(job.processes[0].handle.as_raw_handle(), &mut current_root_code) };
+        let root_code_error = if root_code_ok == 0 { os_error().raw_os_error() } else { None };
+        eprintln!(
+            "accounting race metadata: fixture={fixture_name} receipt={receipt:?} observed_count={} retained_count={} retained_identity_is_root_wait_error_basename_image_error_exit_code_error={retained:?} hook_root_wait={} raw_accounting_ok={accounting_ok} raw_accounting_error={accounting_error:?} raw_active={} raw_total={} root_code_ok={root_code_ok} root_code_error={root_code_error:?} current_root_code={}",
+            receipt.observed.len(),
+            job.processes.len(),
+            hook_root_wait.load(Ordering::SeqCst),
+            current_accounting.ActiveProcesses,
+            current_accounting.TotalProcesses,
+            current_root_code as i32
+        );
+        type RetainedWaitSample = (ProcessIdentity, bool, u32, Option<i32>, Option<i32>, Option<i32>);
+        #[derive(Clone)]
+        struct AccountingSample {
+            waits: Vec<RetainedWaitSample>,
+            active: Option<u32>,
+            total: Option<u32>,
+            query_error: Option<i32>,
+            elapsed_ms: u128,
+        }
+        let first_sample = AccountingSample {
+            waits: retained
+                .iter()
+                .map(|(identity, is_root, wait, error, _, _, code, code_error)| (identity.clone(), *is_root, *wait, *error, *code, *code_error))
+                .collect(),
+            active: (accounting_ok != 0).then_some(current_accounting.ActiveProcesses),
+            total: (accounting_ok != 0).then_some(current_accounting.TotalProcesses),
+            query_error: accounting_error,
+            elapsed_ms: diagnostic_started.elapsed().as_millis(),
+        };
+        let sample = || {
+            let waits = job
+                .processes
+                .iter()
+                .enumerate()
+                .map(|(index, process)| {
+                    // SAFETY: zero wait on the same retained observer handles; no acquisition or close.
+                    let wait = unsafe { WaitForSingleObject(process.handle.as_raw_handle(), 0) };
+                    let error = if wait == windows_sys::Win32::Foundation::WAIT_FAILED { os_error().raw_os_error() } else { None };
+                    let mut code = 0;
+                    // SAFETY: read-only exit query on the same retained handle, never used instead of its wait result.
+                    let ok = unsafe { GetExitCodeProcess(process.handle.as_raw_handle(), &mut code) };
+                    let code_error = if ok == 0 { os_error().raw_os_error() } else { None };
+                    (process.identity.clone(), index == 0, wait, error, (ok != 0).then_some(code as i32), code_error)
+                })
+                .collect();
+            let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            // SAFETY: separate local output for a read-only query of the same owned Job.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    job.handle.as_raw_handle(),
+                    JobObjectBasicAccountingInformation,
+                    std::ptr::from_mut(&mut accounting).cast(),
+                    size_of_val(&accounting) as u32,
+                    null_mut(),
+                )
+            };
+            let query_error = if ok == 0 { os_error().raw_os_error() } else { None };
+            AccountingSample {
+                waits,
+                active: (ok != 0).then_some(accounting.ActiveProcesses),
+                total: (ok != 0).then_some(accounting.TotalProcesses),
+                query_error,
+                elapsed_ms: diagnostic_started.elapsed().as_millis(),
+            }
+        };
+        let mut last_sample = first_sample.clone();
+        let mut snapshots = vec![first_sample];
+        let milestones = [10, 50, 100, 500, 1000];
+        let mut milestone = 0;
+        while Instant::now() < diagnostic_deadline
+            && !(last_sample.active == Some(0) && last_sample.waits.iter().all(|(_, _, wait, _, _, _)| *wait == WAIT_OBJECT_0))
+        {
+            let remaining = diagnostic_deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            if Instant::now() >= diagnostic_deadline {
+                break;
+            }
+            last_sample = sample();
+            if milestone < milestones.len() && last_sample.elapsed_ms >= milestones[milestone] {
+                snapshots.push(last_sample.clone());
+                while milestone < milestones.len() && last_sample.elapsed_ms >= milestones[milestone] {
+                    milestone += 1;
+                }
+            }
+        }
+        snapshots.push(last_sample);
+        for (index, snapshot) in snapshots.iter().enumerate() {
+            eprintln!(
+                "accounting bounded metadata: sample={index} waits_identity_is_root_wait_error_exit_code_error={:?} active={:?} total={:?} query_error={:?} elapsed_ms={}",
+                snapshot.waits, snapshot.active, snapshot.total, snapshot.query_error, snapshot.elapsed_ms
+            );
+        }
+        eprintln!("accounting bounded observation_elapsed_ms={}", diagnostic_started.elapsed().as_millis());
+        assert!(old_order_would_report_lingering.load(Ordering::SeqCst), "the real interleaving must reproduce the old false-positive predicate");
+        let mut final_receipt = receipt.clone();
+        while Instant::now() < final_observation_deadline {
+            job.observe(&mut final_receipt).unwrap();
+            assert!(!lingering_descendants(&final_receipt), "no actual observed live descendant is expected");
+            if final_receipt.root_exited && final_receipt.observed_exited && final_receipt.job_empty {
+                break;
+            }
+            let remaining = final_observation_deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(remaining.min(POLL));
+        }
+        assert!(Instant::now() < final_observation_deadline, "final OS evidence must be observed within the original fixed deadlines");
+        assert!(final_receipt.root_exited && final_receipt.observed_exited);
+        assert_eq!(final_receipt.root_exit_code, Some(0));
+        assert_eq!(final_receipt.total_processes, 1);
+        assert!(final_receipt.job_empty, "post-root-exit accounting must eventually report actual zero within the fixed deadlines");
+        assert!(!spawn_failed);
+    }
+
+    #[test]
+    fn compatible_short_executable_paths_drop_only_a_safe_verbatim_prefix() {
+        for (original, expected) in [
+            (r"\\?\C:\fixtures\tool.exe", r"C:\fixtures\tool.exe"),
+            (r"\\?\UNC\example.invalid\share\tool.exe", r"\\example.invalid\share\tool.exe"),
+            (r"C:\fixtures\tool.exe", r"C:\fixtures\tool.exe"),
+        ] {
+            assert_eq!(user_executable_path(PathBuf::from(original)).unwrap(), PathBuf::from(expected));
+        }
+    }
+
+    #[test]
+    fn executable_path_normalization_preserves_distinct_names_and_namespaces() {
+        for original in [
+            r"\\?\C:\fixtures\tool.exe.",
+            r"\\?\C:\fixtures\tool.exe ",
+            r"\\?\C:\fixtures\..\tool.exe",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\tool.exe",
+        ] {
+            let path = PathBuf::from(original);
+            assert_eq!(user_executable_path(path.clone()).unwrap(), path);
+        }
+    }
+
+    #[test]
+    fn executable_path_prefix_conversion_respects_the_utf16_length_boundary() {
+        let prefix = r"\\?\C:\";
+        let at_limit = PathBuf::from(format!("{prefix}{}", "x".repeat(252)));
+        assert_eq!(wide(at_limit.as_os_str()).unwrap().len(), 260);
+        assert_eq!(user_executable_path(at_limit).unwrap(), PathBuf::from(format!("C:\\{}", "x".repeat(252))));
+        let over_limit = PathBuf::from(format!("{prefix}{}", "x".repeat(253)));
+        assert_eq!(user_executable_path(over_limit.clone()).unwrap(), over_limit);
+    }
+
+    #[test]
+    fn complete_environment_is_explicit_sorted_and_double_terminated() {
+        let mut command = std::process::Command::new("example.exe");
+        command.env_clear();
+        assert_eq!(environment(&command, &[]).unwrap(), vec![0, 0]);
+        let entries = [(OsString::from("b"), OsString::from("second")), (OsString::from("A"), OsString::from("first"))];
+        let expected: Vec<_> = "A=first\0b=second\0\0".encode_utf16().collect();
+        assert_eq!(environment(&command, &entries).unwrap(), expected);
+    }
+
     #[test]
     fn empty_path_entries_never_add_the_working_directory() {
         let paths: Vec<_> = path_entries(OsStr::new(r";C:\trusted;;D:\tools;")).collect();

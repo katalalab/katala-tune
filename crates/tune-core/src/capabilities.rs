@@ -397,7 +397,15 @@ function Get-CimInstance {
         let script = WIN.trim_start_matches('\u{feff}').replace(MARKER, &format!("{MARKER}\n{prefix}"));
         let input = format!("{}\n", crate::logs::base64(script.as_bytes()));
         let result = collect::run_bounded(&cmd, &args, input.as_bytes(), TIMEOUT, OUT_LIMIT, ERR_LIMIT).await;
-        assert_eq!(result.code, Some(0));
+        assert_eq!(
+            result.code,
+            Some(0),
+            "bounded metadata: timeout={} output_limit={} spawn_failed={} receipt={:?}",
+            result.timed_out,
+            result.output_limited,
+            result.spawn_failed,
+            result.process_receipt,
+        );
         assert!(!result.timed_out && !result.output_limited);
         serde_json::from_slice(&result.stdout).unwrap()
     }

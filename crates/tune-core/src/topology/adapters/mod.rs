@@ -1,3 +1,5 @@
+pub mod docker;
+
 pub mod github;
 pub mod local;
 pub mod remote;
