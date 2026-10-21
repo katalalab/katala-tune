@@ -68,6 +68,19 @@ fn plans_recheck_gpu_and_ledger_attribute_is_optional() {
         assert!(plan.script.contains("[int]::TryParse($part[0].Trim(), [ref]$gpuPid)"));
         assert!(plan.script.contains("Get-CimInstance Win32_VideoController -Property Name,PNPDeviceID"));
         assert!(plan.script.contains("exit 9"));
+        assert!(plan.script.contains("BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length)"));
+        assert!(plan.script.contains("BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length)"));
+        assert!(plan.script.contains("$stdout.Length + $outCount -gt 65536"));
+        assert!(plan.script.contains("$stderrCount + $errCount -gt 65536"));
+        assert!(plan.script.contains("[Threading.Tasks.Task]::WaitAny"));
+        assert!(plan.script.contains("if ($failed) { $script:KatalaGpuSmiTransportFailed = $true;"));
+        assert!(
+            plan.script.contains(
+                "$p.StartInfo = $si; $smiDeadline = [Math]::Min(9000, [int]$script:KatalaGpuGuardClock.ElapsedMilliseconds + 4000); [void]$p.Start();"
+            )
+        );
+        assert!(plan.script.contains("$killAck = $Process.WaitForExit([Math]::Min(1000, $left)); if (-not $killAck -or -not $Process.HasExited)"));
+        assert!(!plan.script.contains("ReadToEndAsync"));
     }
     assert_eq!(actions::exit_text(9), Some("GPU の活動を確認できた、または取得できないため中止した"));
     let protected = Node::from_value(&json!({"id":"w","alias":"w","os":"windows","protect_gpu":true}), "other");

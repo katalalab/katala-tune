@@ -11,6 +11,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const probe = fs.readFileSync(path.join(__dirname, '..', 'probes', 'win_probe.ps1'), 'utf8');
+const windowsPowerShell = process.env.KT_GPU_POWERSHELL || 'powershell.exe';
 
 const node = { id: 'gpu-node', alias: 'mock-gpu', os: 'windows', hold: false, shared: false };
 const now = Date.now();
@@ -76,11 +77,122 @@ test('Windows の終了と GPU 電力変更は、直前に GPU 使用率・compu
   assert.match(probe, /used_memory_mb = \$used/);
 });
 
+test('GPU SMI の外部 subprocess は両 pipe を同時に 64 KiB まで読み、終了 ACK を確認する', () => {
+  const kill = plan(node, { type: 'kill-process', params: { pid: 4242, name: 'TrainerHost', start: '20261021010101000' } }, { protect: [] });
+  const power = plan(node, { type: 'set-gpu-power-limit', params: { uuid: 'GPU-01234567-89ab-cdef-0123-456789abcdef', watts: 180, min: 100, max: 250, prev_w: 200 } }, { protect: [] });
+  for (const p of [kill, power]) {
+    assert.match(p.script, /BaseStream\.ReadAsync\(\$outBuffer, 0, \$outBuffer\.Length\)/);
+    assert.match(p.script, /BaseStream\.ReadAsync\(\$errBuffer, 0, \$errBuffer\.Length\)/);
+    assert.match(p.script, /\$stdout\.Length \+ \$outCount -gt 65536/);
+    assert.match(p.script, /\$stderrCount \+ \$errCount -gt 65536/);
+    assert.match(p.script, /\[Threading\.Tasks\.Task\]::WaitAny/);
+    assert.match(p.script, /\$killAck = \$Process\.WaitForExit\(\[Math\]::Min\(1000, \$left\)\); if \(-not \$killAck -or -not \$Process\.HasExited\)/);
+    assert.match(p.script, /\$script:KatalaGpuSmiTransportFailed/);
+    assert.match(p.script, /\$script:KatalaGpuSmiCleanupAttempted/);
+    assert.match(p.script, /if \(\$failed\) \{ \$script:KatalaGpuSmiTransportFailed = \$true;/);
+    assert.match(p.script, /\$p\.StartInfo = \$si; \$smiDeadline = \[Math\]::Min\(9000, \[int\]\$script:KatalaGpuGuardClock\.ElapsedMilliseconds \+ 4000\); \[void\]\$p\.Start\(\);/);
+    assert.match(p.script, /if \(\$script:KatalaGpuMutationStarted\) \{ Write-Output "GPU power outcome unverified"; exit 7 \}/);
+    assert.doesNotMatch(p.script, /ReadToEndAsync/);
+  }
+});
+
+test('GPU SMI の native Framework fixture は pipe 境界・held EOF・timeout を direct helper で検証する', { skip: process.platform !== 'win32' }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-gpu-smi-framework-'));
+  const fixture = path.join(dir, 'fixture.exe');
+  const childPid = path.join(dir, 'held-eof.pid');
+  const spawnLog = path.join(dir, 'spawn.log');
+  const source = `using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+public static class KatalaGpuFixture {
+  static void Write(Stream stream, int count) { byte[] chunk = new byte[4096]; for (int i = 0; i < chunk.Length; i++) chunk[i] = 120; while (count > 0) { int n = Math.Min(count, chunk.Length); stream.Write(chunk, 0, n); count -= n; } stream.Flush(); }
+  public static int Main(string[] args) {
+    string mode = args.Length == 0 ? "" : args[0];
+    string log = Environment.GetEnvironmentVariable("KT_GPU_SPAWN_LOG");
+    if (mode != "sleep" && !String.IsNullOrEmpty(log)) File.AppendAllText(log, mode + "\\n");
+    if (mode == "small") { Console.Write("GPU-test, 0\\n"); return 0; }
+    if (mode == "stdout-65536") { Write(Console.OpenStandardOutput(), 65536); return 0; }
+    if (mode == "stderr-65536") { Console.Write("GPU-test, 0\\n"); Write(Console.OpenStandardError(), 65536); return 0; }
+    if (mode == "stdout-65537") { Write(Console.OpenStandardOutput(), 65537); return 0; }
+    if (mode == "stderr-65537") { Console.Write("GPU-test, 0\\n"); Write(Console.OpenStandardError(), 65537); return 0; }
+    if (mode == "both-65537") { Write(Console.OpenStandardOutput(), 65537); Write(Console.OpenStandardError(), 65537); return 0; }
+    if (mode == "held-eof") { Process child = new Process(); child.StartInfo.FileName = Process.GetCurrentProcess().MainModule.FileName; child.StartInfo.Arguments = "sleep"; child.StartInfo.UseShellExecute = false; child.StartInfo.CreateNoWindow = true; child.Start(); File.WriteAllText(Environment.GetEnvironmentVariable("KT_GPU_CHILD_PID"), child.Id.ToString()); Console.Write("GPU-test, 0\\n"); return 0; }
+    if (mode == "sleep" || mode == "timeout") { Thread.Sleep(5500); return 0; }
+    return 1;
+  }
+}`;
+  const b64 = (value) => Buffer.from(value, 'utf8').toString('base64');
+  const ownEnv = { ...process.env, TEMP: dir, TMP: dir };
+  const ps = (script, timeout = 9000) => spawnSync(windowsPowerShell, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { encoding: 'utf8', timeout, windowsHide: true, env: ownEnv });
+  const helperFor = (script) => {
+    const start = script.indexOf('function Stop-KatalaGpuSmiProcess') >= 0 ? script.indexOf('function Stop-KatalaGpuSmiProcess') : script.indexOf('function Invoke-KatalaGpuSmi');
+    return script.slice(start, script.indexOf('; $smi ='));
+  };
+  const waitForOwnChild = () => {
+    if (!fs.existsSync(childPid)) return;
+    const pid = Number(fs.readFileSync(childPid, 'utf8'));
+    assert.match(String(pid), /^\d+$/);
+    const stop = Date.now() + 7000;
+    const wait = new Int32Array(new SharedArrayBuffer(4));
+    while (Date.now() < stop) {
+      try { process.kill(pid, 0); } catch { return; }
+      Atomics.wait(wait, 0, 0, 50);
+    }
+    throw new Error(`owned held-EOF child ${pid} did not exit`);
+  };
+  try {
+    const compiler = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(`$source = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${b64(source)}")); $target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${b64(fixture)}")); Add-Type -TypeDefinition $source -OutputAssembly $target -OutputType ConsoleApplication -ErrorAction Stop`, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 30000, windowsHide: true, env: ownEnv });
+    assert.equal(compiler.status, 0, compiler.stderr || compiler.stdout);
+    const power = plan(node, { type: 'set-gpu-power-limit', params: { uuid: 'GPU-01234567-89ab-cdef-0123-456789abcdef', watts: 180, min: 100, max: 250, prev_w: 200 } }, { protect: [] });
+    const helper = helperFor(power.script);
+    const run = (mode, expected) => { fs.rmSync(spawnLog, { force: true }); return ps(`function Test-KatalaGpuDeadline {}; ${helper}; $script:KatalaGpuGuardClock = [Diagnostics.Stopwatch]::StartNew(); $script:KatalaGpuMutationStarted = $false; $script:KatalaGpuSmiSource = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${b64(fixture)}")); $script:KatalaGpuSmiFunction = $false; $env:KT_GPU_CHILD_PID = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${b64(childPid)}")); $env:KT_GPU_SPAWN_LOG = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${b64(spawnLog)}")); $argsValue = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${b64(mode)}")); $rows = @(Invoke-KatalaGpuSmi $argsValue); if ([bool]$script:KatalaGpuSmiFailed -ne ${expected.failed ? '$true' : '$false'}) { exit 2 }; if ([bool]$script:KatalaGpuSmiTimedOut -ne ${expected.timedOut ? '$true' : '$false'}) { exit 3 }; if ([bool]$script:KatalaGpuSmiTransportFailed -ne ${expected.transport ? '$true' : '$false'}) { exit 4 }; ${expected.length == null ? '' : `if ($rows.Count -ne 1 -or $rows[0].Length -ne ${expected.length}) { exit 4 };`} ${expected.small ? 'if ($rows.Count -lt 1 -or $rows[0] -ne "GPU-test, 0") { exit 5 };' : ''} ${expected.reason ? `if ($script:KatalaGpuSmiFailureReason -notmatch "${expected.reason}") { exit 6 };` : ''} ${expected.twice ? 'Invoke-KatalaGpuSmi $argsValue | Out-Null; if (-not $script:KatalaGpuSmiFailed) { exit 8 };' : ''} exit 0`); };
+    for (const [mode, expected] of [
+      ['small', { failed: false, timedOut: false, transport: false, small: true }],
+      ['stdout-65536', { failed: false, timedOut: false, transport: false, length: 65536 }],
+      ['stderr-65536', { failed: false, timedOut: false, transport: false }],
+      ['stdout-65537', { failed: true, timedOut: false, transport: true, reason: 'stdout exceeded' }],
+      ['stderr-65537', { failed: true, timedOut: false, transport: true, reason: 'stderr exceeded' }],
+      ['both-65537', { failed: true, timedOut: false, transport: true }],
+      ['held-eof', { failed: true, timedOut: true, transport: true, twice: true, reason: 'timed out or held a pipe' }],
+      ['timeout', { failed: true, timedOut: true, transport: true, reason: 'timed out or held a pipe' }],
+    ]) {
+      const result = run(mode, expected);
+      assert.equal(result.status, 0, `${mode}: ${result.stderr || result.stdout}`);
+      if (mode === 'held-eof') assert.equal(fs.readFileSync(spawnLog, 'utf8'), 'held-eof\n');
+    }
+  } finally {
+    try { waitForOwnChild(); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+
+test('JS と Rust は同じ bounded GPU SMI helper を生成する', () => {
+  const power = plan(node, { type: 'set-gpu-power-limit', params: { uuid: 'GPU-01234567-89ab-cdef-0123-456789abcdef', watts: 180, min: 100, max: 250, prev_w: 200 } }, { protect: [] });
+  const jsHelper = power.script.match(/function Stop-KatalaGpuSmiProcess[\s\S]*?(?=; \$smi =)/)[0];
+  const rust = fs.readFileSync(path.join(__dirname, '..', 'crates', 'tune-core', 'src', 'actions.rs'), 'utf8');
+  const rustHelper = rust.match(/fn gpu_smi_helper\(\) -> String \{\s*r#"([\s\S]*?)"#\.to_string\(\)/)[1];
+  assert.equal(jsHelper, rustHelper);
+});
+
+
+test('GPU SMI の kill ACK 未確認は synthetic Process で false として扱う', { skip: process.platform !== 'win32' }, () => {
+  const power = plan(node, { type: 'set-gpu-power-limit', params: { uuid: 'GPU-01234567-89ab-cdef-0123-456789abcdef', watts: 180, min: 100, max: 250, prev_w: 200 } }, { protect: [] });
+  const start = power.script.indexOf('function Stop-KatalaGpuSmiProcess') >= 0 ? power.script.indexOf('function Stop-KatalaGpuSmiProcess') : power.script.indexOf('function Invoke-KatalaGpuSmi');
+  const helper = power.script.slice(start, power.script.indexOf('; $smi ='));
+  const mock = 'function Test-KatalaGpuDeadline {}; $script:KatalaGpuGuardClock = [Diagnostics.Stopwatch]::StartNew(); $p = [pscustomobject]@{ HasExited = $false }; Add-Member -InputObject $p -MemberType ScriptMethod -Name Kill -Value {}; Add-Member -InputObject $p -MemberType ScriptMethod -Name WaitForExit -Value { param($milliseconds); return $false }; if (Stop-KatalaGpuSmiProcess $p) { exit 1 }; if (-not $script:KatalaGpuSmiTransportFailed) { exit 2 }; $script:KatalaGpuSmiFunction = $true; $global:spawned = 0; function nvidia-smi.exe { $global:spawned += 1 }; $script:KatalaGpuMutationStarted = $false; $rows = @(Invoke-KatalaGpuSmi "ignored"); if (-not $script:KatalaGpuSmiFailed -or $global:spawned -ne 0) { exit 3 }; exit 0';
+  const r = spawnSync(windowsPowerShell, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(`${helper}; ${mock}`, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 5000, windowsHide: true });
+  assert.equal(r.status, 0, r.stderr || r.stdout);
+  const mutation = spawnSync(windowsPowerShell, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(`function Test-KatalaGpuDeadline {}; ${helper}; $script:KatalaGpuGuardClock = [Diagnostics.Stopwatch]::StartNew(); $script:KatalaGpuSmiTransportFailed = $true; $script:KatalaGpuMutationStarted = $true; Invoke-KatalaGpuSmi "ignored"; Write-Output "AFTER-MUTATION"`, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 5000, windowsHide: true });
+  assert.equal(mutation.status, 7, mutation.stderr || mutation.stdout);
+  assert.doesNotMatch(mutation.stdout, /AFTER-MUTATION/);
+});
+
 test('Windows PowerShell の GPU 直前ガードは NaN・PID 桁あふれを拒否し、NVIDIA 非搭載は通す', { skip: process.platform !== 'win32' }, () => {
   const kill = plan(node, { type: 'kill-process', params: { pid: 4242, name: 'TrainerHost', min_cpu: 0 } }, { protect: [] });
   const guard = kill.script.slice(0, kill.script.indexOf('; try { Stop-Process'));
   const processMock = 'function Get-Process { param([int]$Id); $p = [pscustomobject]@{ Id = $Id; ProcessName = "TrainerHost"; CPU = 1 }; Add-Member -InputObject $p -MemberType ScriptMethod -Name Refresh -Value {}; return $p }';
-  const run = (mock) => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(`${mock}; ${processMock}; ${guard}; exit 0`, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 15000, windowsHide: true });
+  const run = (mock) => spawnSync(windowsPowerShell, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(`${mock}; ${processMock}; ${guard}; exit 0`, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 15000, windowsHide: true });
   const nvidia = (gpu, compute, fail = false) => `function nvidia-smi.exe { if ($args -contains "--query-gpu=uuid,utilization.gpu") { $global:LASTEXITCODE = ${fail ? 1 : 0}; if (-not ${fail ? '$true' : '$false'}) { Write-Output "GPU-test, ${gpu}" }; return }; if ($args -contains "--query-compute-apps=pid,used_gpu_memory") { $global:LASTEXITCODE = 0; Write-Output "${compute}"; return } }`;
   const idle = run(nvidia('0', 'No running processes found'));
   assert.equal(idle.status, 0, idle.stderr || idle.stdout);
