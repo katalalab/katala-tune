@@ -364,7 +364,7 @@ impl Journal {
 async fn commit(db: &Arc<Mutex<Store>>, batch: &[Event], state: &State) -> bool {
     let db = db.clone();
     let rows = batch.to_vec();
-    // 一度に1仕事のみ。mutex競合は即Busy。blocking仕事のtimeout/dropで孤立writerを作らない。
+    // 一度に1仕事のみ。mutex/SQLite競合は即Busy。timeout/dropで孤立blocking仕事を作らない。
     let result = tokio::task::spawn_blocking(move || {
         let store = db.try_lock().map_err(|_| Category::DbBusy)?;
         store.insert_monitor_events(&rows, now_ms()).map_err(|e| Category::database(&e))
@@ -416,31 +416,23 @@ async fn finish_tail(db: &Arc<Mutex<Store>>, rx: &mut mpsc::Receiver<Command>, b
     // close前のpermitも容量256に含まれる。EmptyではなくNoneまで待ち、未確定のtailへACKしない。
     while let Some(command) = rx.recv().await {
         match command {
-            Command::Event(e) => batch.push(*e),
+            Command::Event(e) if ok => batch.push(*e),
+            Command::Event(_) => {
+                // 最初のtail失敗でDB書き込みを打ち切り、残りのaccepted行も欠落計上する。
+                state.dropped.fetch_add(1, Ordering::Relaxed);
+            }
             Command::Flush(a) | Command::Shutdown(a) => acks.push(a),
         }
-        if batch.len() == BATCH_MAX {
-            ok &= commit_tail(db, batch, state).await;
+        if batch.len() == BATCH_MAX && ok {
+            ok = commit_tail(db, batch, state).await;
         }
     }
-    if !ok
-        && let Some(e) = state.row(
-            None,
-            0,
-            0,
-            Kind::JournalGap,
-            Data { dropped: Some(state.dropped.load(Ordering::Relaxed)), db_failures: Some(state.db_failures.load(Ordering::Relaxed)), ..Data::default() },
-        )
-    {
-        batch.push(e);
-        if batch.len() == BATCH_MAX {
-            ok &= commit_tail(db, batch, state).await;
+    if ok {
+        if let Some(e) = state.row(None, 0, 0, Kind::CollectorStopped, Data::default()) {
+            batch.push(e);
         }
+        ok = commit_tail(db, batch, state).await;
     }
-    if let Some(e) = state.row(None, 0, 0, Kind::CollectorStopped, Data::default()) {
-        batch.push(e);
-    }
-    ok &= commit_tail(db, batch, state).await;
     for a in acks {
         let _ = a.send(ok);
     }
@@ -648,6 +640,56 @@ mod tests {
         assert_eq!(rows, 0);
         assert_eq!(j.health()["dropped_total"].as_u64(), Some(j.state.seq.load(Ordering::Relaxed)));
         assert!(j.health()["db_failures"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_external_write_lock_ends_writer_without_retrying_failed_tail() {
+        let dir = std::env::temp_dir().join(format!("monitor-journal-tail-lock-{}-{}", std::process::id(), now_ms()));
+        let db = Arc::new(Mutex::new(Store::open(&dir).unwrap()));
+        let blocker = Store::open(&dir).unwrap();
+        let j = Journal::start(db.clone());
+        assert!(j.flush(Duration::from_secs(2)).await);
+        let before = j.health();
+        blocker.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (stop, stopped) = oneshot::channel();
+        assert!(j.tx.try_send(Command::Shutdown(stop)).is_ok());
+        for _ in 0..128 {
+            j.record(Some("tail"), 1, 1, Kind::Checkpoint, Data::default());
+        }
+        let (flush, flushed) = oneshot::channel();
+        assert!(j.tx.try_send(Command::Flush(flush)).is_ok());
+        let began = Instant::now();
+        let stop_ack = tokio::time::timeout(Duration::from_secs(2), stopped).await;
+        let flush_ack = tokio::time::timeout(Duration::from_secs(2), flushed).await;
+        let after = j.health();
+        let finished = !j.state.running.load(Ordering::Relaxed);
+        // Keep the external lock through writer completion and verify no blocking job owns Store.
+        let store_available = db.try_lock().is_ok();
+        let elapsed = began.elapsed();
+        blocker.conn().execute_batch("ROLLBACK").unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(4), async {
+            while j.state.running.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let stopped_rows: i64 = db
+            .lock()
+            .unwrap()
+            .conn()
+            .query_row("SELECT count(*) FROM monitor_events WHERE json_extract(payload,'$.kind')='collector_stopped'", [], |r| r.get(0))
+            .unwrap();
+        drop(blocker);
+        drop(j);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(matches!(stop_ack, Ok(Ok(false))), "shutdown must fail before its deadline");
+        assert!(matches!(flush_ack, Ok(Ok(false))), "queued flush must receive the same failure");
+        assert!(finished && store_available, "writer and blocking job must finish while the lock is held");
+        assert!(elapsed < Duration::from_secs(2));
+        assert_eq!(after["db_failures"].as_u64().unwrap() - before["db_failures"].as_u64().unwrap(), 1, "shutdown does not retry a failed tail");
+        assert_eq!(after["dropped_total"], 128, "every accepted tail row is accounted for");
+        assert_eq!(stopped_rows, 0);
     }
 
     #[tokio::test]
