@@ -131,7 +131,7 @@ mod windows {
         let base = sandbox();
         let (child, reader, nonce) = receiver(&base);
         let (status, response, diagnostic) = complete(child, reader, b"exit 3", &nonce);
-        assert_eq!(status.code(), Some(0));
+        assert_eq!(status.code(), Some(0), "receiver diagnostic: {}", String::from_utf8_lossy(&diagnostic));
         assert_eq!(response, result(&nonce, b"exit 3", 3, 0, 0));
         assert!(diagnostic.is_empty());
         assert!(!base.exists());
@@ -145,7 +145,7 @@ mod windows {
             let base = sandbox();
             let (child, reader, nonce) = receiver(&base);
             let (status, response, diagnostic) = complete(child, reader, body, &nonce);
-            assert_eq!(status.code(), Some(0), "receiver must finish a complete terminal frame");
+            assert_eq!(status.code(), Some(0), "receiver must finish a complete terminal frame; diagnostic: {}", String::from_utf8_lossy(&diagnostic));
             assert_eq!(response, result(&nonce, body, action_code, 0, 0));
             assert!(diagnostic.is_empty());
             assert!(!base.exists());
