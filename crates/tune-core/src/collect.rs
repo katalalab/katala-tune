@@ -456,13 +456,60 @@ async fn probe_exchange_system(node: &Node, helper_sha256: &str, benchmark: bool
     probe_exchange_command(command, &args).await
 }
 
-async fn probe_exchange_command(mut command: Command, _args: &[String]) -> RunResult {
+async fn probe_exchange_command(command: Command, _args: &[String]) -> RunResult {
+    probe_exchange_command_until(command, tokio::time::Instant::now() + Duration::from_secs(135)).await
+}
+
+/// Fixed Windows probe transport.  Unlike generic `run_bounded_portable`, a
+/// probe is successful only when its own child has exited zero *and* stdin,
+/// stdout and stderr have all completed before one monotonic deadline.
+async fn probe_exchange_command_until(mut command: Command, deadline: tokio::time::Instant) -> RunResult {
     command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-    let result = run_bounded_portable(command, b"", Duration::from_secs(135), 1_048_576, 65_536).await;
-    if result.code != Some(0) || result.timed_out || result.output_limited || result.spawn_failed {
+    let Ok(mut child) = command.spawn() else {
+        return RunResult { code: Some(9), out: String::new(), err: "Windows probe transport outcome unverified".into() };
+    };
+    let stdin = child.stdin.take();
+    let stdin_ok = tokio::time::timeout_at(deadline, async move {
+        if let Some(mut pipe) = stdin {
+            pipe.shutdown().await.map_err(|_| ())?;
+        }
+        Ok::<(), ()>(())
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .is_some();
+    let mut stdout_task = tokio::spawn(read_probe_pipe(child.stdout.take(), 1_048_576));
+    let mut stderr_task = tokio::spawn(read_probe_pipe(child.stderr.take(), 65_536));
+    let status = tokio::time::timeout_at(deadline, child.wait()).await.ok().and_then(Result::ok);
+    let stdout = tokio::time::timeout_at(deadline, &mut stdout_task).await.ok().and_then(Result::ok).and_then(Result::ok);
+    let stderr = tokio::time::timeout_at(deadline, &mut stderr_task).await.ok().and_then(Result::ok).and_then(Result::ok);
+    if !stdin_ok || status.as_ref().and_then(|value| value.code()) != Some(0) || stdout.is_none() || stderr.is_none() {
+        stdout_task.abort();
+        stderr_task.abort();
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout_at(deadline, child.wait()).await;
         return RunResult { code: Some(9), out: String::new(), err: "Windows probe transport outcome unverified".into() };
     }
-    RunResult { code: Some(0), out: decode(&result.stdout), err: decode(&result.stderr) }
+    RunResult { code: Some(0), out: decode(&stdout.unwrap()), err: decode(&stderr.unwrap()) }
+}
+
+/// EOF is part of the proof: a missing pipe, I/O error, or `limit + 1` byte
+/// invalidates the entire exchange and callers discard even valid JSON prefixes.
+async fn read_probe_pipe<R: AsyncRead + Unpin>(pipe: Option<R>, limit: usize) -> Result<Vec<u8>, ()> {
+    let Some(mut pipe) = pipe else { return Err(()) };
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = pipe.read(&mut chunk).await.map_err(|_| ())?;
+        if count == 0 {
+            return Ok(output);
+        }
+        if output.len().checked_add(count).is_none_or(|size| size > limit) {
+            return Err(());
+        }
+        output.extend_from_slice(&chunk[..count]);
+    }
 }
 
 async fn action_exchange_system(node: &Node, helper_sha256: &str, body: &[u8], timeout: Duration) -> RunResult {
@@ -1257,5 +1304,47 @@ sys.stderr.write('z');sys.stderr.flush();time.sleep(3)"#,
         confirmed.read_exact(&mut signal).await.unwrap();
         assert_eq!(&signal, b"write-complete");
         assert_eq!(exchange.await.unwrap().code, Some(7));
+    }
+
+    #[tokio::test]
+    async fn fixed_windows_probe_transport_requires_complete_eof_and_exact_caps() {
+        if cfg!(windows) {
+            return;
+        }
+        let run = |script: &str, deadline: Duration| {
+            let script = script.to_string();
+            async move {
+                let mut command = Command::new("/usr/bin/env");
+                command.args(["python3", "-c", &script]);
+                probe_exchange_command_until(command, tokio::time::Instant::now() + deadline).await
+            }
+        };
+        let stdout_exact = run("import sys;sys.stdout.write('x'*1048576)", Duration::from_secs(3)).await;
+        assert_eq!(stdout_exact.code, Some(0));
+        assert_eq!(stdout_exact.out.len(), 1_048_576);
+        let stdout_plus = run("import sys;sys.stdout.write('x'*1048577)", Duration::from_secs(3)).await;
+        assert_eq!((stdout_plus.code, stdout_plus.out.as_str()), (Some(9), ""));
+        let stderr_exact = run("import sys;sys.stderr.write('x'*65536)", Duration::from_secs(3)).await;
+        assert_eq!((stderr_exact.code, stderr_exact.err.len()), (Some(0), 65_536));
+        let dual_plus = run("import sys;sys.stdout.write('x'*1048577);sys.stderr.write('z'*65537)", Duration::from_secs(3)).await;
+        assert_eq!((dual_plus.code, dual_plus.out.as_str()), (Some(9), ""));
+        let nonzero_json = run("import sys;print('{\\\"probe\\\":true}');sys.exit(3)", Duration::from_secs(3)).await;
+        assert_eq!((nonzero_json.code, nonzero_json.out.as_str()), (Some(9), ""));
+        let held_eof = run("import os,time;\nif os.fork()==0: time.sleep(.3);os._exit(0)\nprint('{\\\"probe\\\":true}')", Duration::from_millis(80)).await;
+        assert_eq!((held_eof.code, held_eof.out.as_str()), (Some(9), ""));
+        let missing = probe_exchange_command_until(Command::new("/definitely-not-katala-probe"), tokio::time::Instant::now() + Duration::from_secs(1)).await;
+        assert_eq!(missing.code, Some(9));
+    }
+
+    #[tokio::test]
+    #[ignore = "the controlled deadline fixture deliberately terminates its owned child"]
+    async fn fixed_windows_probe_transport_rejects_a_root_timeout() {
+        if cfg!(windows) {
+            return;
+        }
+        let mut command = Command::new("/usr/bin/env");
+        command.args(["python3", "-c", "import time;time.sleep(2)"]);
+        let result = probe_exchange_command_until(command, tokio::time::Instant::now() + Duration::from_millis(50)).await;
+        assert_eq!((result.code, result.out.as_str()), (Some(9), ""));
     }
 }

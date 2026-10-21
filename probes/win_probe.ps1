@@ -254,8 +254,10 @@ function InvokeGpuBounded($exe, $arguments) {
   $p.StartInfo.CreateNoWindow = $true
   $p.StartInfo.RedirectStandardOutput = $true
   $p.StartInfo.RedirectStandardError = $true
+  $started = $false; $cleanupAttempted = $false
   try {
     [void]$p.Start()
+    $started = $true
     $clock = [Diagnostics.Stopwatch]::StartNew(); $stdout = New-Object IO.MemoryStream; $stderr = New-Object IO.MemoryStream
     $outBuffer = New-Object byte[] 4096; $errBuffer = New-Object byte[] 4096
     $outTask = $p.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
@@ -265,7 +267,12 @@ function InvokeGpuBounded($exe, $arguments) {
       $left = 4000 - [int]$clock.ElapsedMilliseconds
       if ($left -le 0) { $reason = "query-timeout"; break }
       $pending = @(); if (-not $outEof) { $pending += $outTask }; if (-not $errEof) { $pending += $errTask }
-      if ($pending.Count -eq 0) { break }
+      # Pipe EOF alone is never success: a descendant may have closed both
+      # streams while the root nvidia-smi process remains alive.
+      if ($pending.Count -eq 0) {
+        if (-not $p.WaitForExit($left)) { $reason = "query-timeout"; break }
+        continue
+      }
       if ([Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$pending, $left) -lt 0) { $reason = "query-timeout"; break }
       if (-not $outEof -and $outTask.IsCompleted) {
         $n = $outTask.Result
@@ -276,10 +283,33 @@ function InvokeGpuBounded($exe, $arguments) {
         if ($n -eq 0) { $errEof = $true } elseif ($stderr.Length + $n -gt 65536) { $reason = "output-limit"; break } else { $stderr.Write($errBuffer, 0, $n); $errTask = $p.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length) }
       }
     }
-    if ($reason) { try { $p.Kill() } catch { }; $ack = $p.WaitForExit(250); if (-not $ack -or -not $p.HasExited) { $reason = "query-timeout" }; return @{ text = ""; reason = $reason } }
+    if ($reason) {
+      $cleanupAttempted = $true
+      try { if (-not $p.HasExited) { $p.Kill() } } catch { }
+      $left = [Math]::Max(0, 4000 - [int]$clock.ElapsedMilliseconds)
+      $ack = $p.WaitForExit([Math]::Min(1000, $left))
+      if (-not $ack -or -not $p.HasExited) { $reason = "query-timeout" }
+      return @{ text = ""; reason = $reason }
+    }
     if ($p.ExitCode -ne 0) { return @{ text = ""; reason = "query-failed" } }
     return @{ text = [Text.Encoding]::UTF8.GetString($stdout.ToArray()); reason = $null }
-  } catch { return @{ rows = @(); reason = "query-unavailable" } } finally { $p.Dispose() }
+  } catch {
+    if ($started -and -not $cleanupAttempted -and -not $p.HasExited) {
+      $cleanupAttempted = $true
+      try { $p.Kill() } catch { }
+      $left = [Math]::Max(0, 4000 - [int]$clock.ElapsedMilliseconds)
+      [void]$p.WaitForExit([Math]::Min(1000, $left))
+    }
+    return @{ rows = @(); reason = "query-unavailable" }
+  } finally {
+    if ($started -and -not $cleanupAttempted -and -not $p.HasExited) {
+      $cleanupAttempted = $true
+      try { $p.Kill() } catch { }
+      $left = [Math]::Max(0, 4000 - [int]$clock.ElapsedMilliseconds)
+      [void]$p.WaitForExit([Math]::Min(1000, $left))
+    }
+    $p.Dispose()
+  }
 }
 function InvokeGpuQuery($exe, $fields) {
   $result = InvokeGpuBounded $exe "--query-gpu=$fields --format=csv,noheader,nounits"
