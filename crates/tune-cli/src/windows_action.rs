@@ -17,9 +17,9 @@ pub fn main(args: &[String], started: Instant) -> ExitCode {
         super::topology_reader::terminate_self(9);
     };
     let input_end = hard_end.min(started + Duration::from_secs(5));
-    // The bounded backend reserves its own three-second Job cleanup window.
-    // Keep only the final protocol flush outside that deadline.
-    let Some(backend_end) = hard_end.checked_sub(Duration::from_millis(250)) else {
+    // CleanupState may start its fixed three-second observation after execution
+    // ends. Reserve it and the final protocol flush inside the outer deadline.
+    let Some(backend_end) = hard_end.checked_sub(Duration::from_millis(3250)) else {
         super::topology_reader::terminate_self(9);
     };
     if backend_end <= input_end {
@@ -27,8 +27,9 @@ pub fn main(args: &[String], started: Instant) -> ExitCode {
     }
 
     let (tx, rx) = mpsc::channel();
+    let (ack_tx, ack_rx) = mpsc::channel();
     let spawn = std::thread::Builder::new().name("windows-action-receiver".into()).spawn(move || {
-        let result = receive_once(&expected_sha256, input_end, backend_end, &tx);
+        let result = receive_once(&expected_sha256, input_end, backend_end, &tx, ack_rx);
         let _ = tx.send(Event::Finished(result));
     });
     if spawn.is_err() {
@@ -45,6 +46,11 @@ pub fn main(args: &[String], started: Instant) -> ExitCode {
             Ok(Event::Admitted) if Instant::now() < end => {
                 admitted = true;
                 end = hard_end;
+                // This unbounded send cannot block the watchdog. The worker is
+                // forbidden from spawning PowerShell until this record exists.
+                if ack_tx.send(()).is_err() {
+                    super::topology_reader::terminate_self(7);
+                }
             }
             Ok(Event::Finished(Ok(()))) if Instant::now() < hard_end => super::topology_reader::terminate_self(0),
             Ok(Event::Finished(Err(_))) if Instant::now() < hard_end => super::topology_reader::terminate_self(if admitted { 7 } else { 9 }),
@@ -60,9 +66,11 @@ const MAX_HEADER_BYTES: usize = 256;
 #[cfg(windows)]
 const MAX_BUDGET_MS: u64 = 25_000;
 #[cfg(windows)]
+const MIN_BUDGET_MS: u64 = 9_000;
+#[cfg(windows)]
 const DEFAULT_BUDGET_MS: u64 = 25_000;
 #[cfg(windows)]
-const POWERSHELL_BOOTSTRAP: &str = "$r=New-Object System.IO.StreamReader([Console]::OpenStandardInput(),[System.Text.Encoding]::ASCII,$false,1024,$true);$b=[Convert]::FromBase64String($r.ReadToEnd());$s=(New-Object System.Text.UTF8Encoding($false,$true)).GetString($b);&([ScriptBlock]::Create($s));exit $LASTEXITCODE";
+const POWERSHELL_BOOTSTRAP: &str = "$ErrorActionPreference='Stop';try{$r=New-Object System.IO.StreamReader([Console]::OpenStandardInput(),[System.Text.Encoding]::ASCII,$false,1024,$true);$b=[Convert]::FromBase64String($r.ReadToEnd());$s=(New-Object System.Text.UTF8Encoding($false,$true)).GetString($b);$sb=[ScriptBlock]::Create($s)}catch{exit 9};try{&$sb;if($null -eq $LASTEXITCODE){exit 0};exit [int]$LASTEXITCODE}catch{exit 7}";
 
 #[cfg(windows)]
 enum Event {
@@ -89,11 +97,17 @@ fn canonical_budget(value: &str) -> Option<u64> {
     (value.len() <= 5 && value.bytes().all(|byte| byte.is_ascii_digit()))
         .then(|| value.parse::<u64>().ok())
         .flatten()
-        .filter(|budget| *budget > 0 && *budget <= MAX_BUDGET_MS && budget.to_string() == value)
+        .filter(|budget| *budget >= MIN_BUDGET_MS && *budget <= MAX_BUDGET_MS && budget.to_string() == value)
 }
 
 #[cfg(windows)]
-fn receive_once(expected_sha256: &str, input_end: Instant, backend_end: Instant, events: &std::sync::mpsc::Sender<Event>) -> Result<(), ReceiverError> {
+fn receive_once(
+    expected_sha256: &str,
+    input_end: Instant,
+    backend_end: Instant,
+    events: &std::sync::mpsc::Sender<Event>,
+    ack: std::sync::mpsc::Receiver<()>,
+) -> Result<(), ReceiverError> {
     use std::{ffi::OsString, io::Write, process::Command};
     use tune_core::collect::{PinnedWindowsExecutable, ProcessStop, StandaloneWindowsEnvironment, run_standalone_windows_bounded};
 
@@ -112,9 +126,13 @@ fn receive_once(expected_sha256: &str, input_end: Instant, backend_end: Instant,
     if Instant::now() >= input_end || backend_end <= Instant::now() {
         return Err(ReceiverError);
     }
-    // An admitted frame is the only transition that gives the outer watchdog its
-    // full original deadline. It never changes that deadline or starts a retry.
+    // The worker cannot start an action until the outer watchdog has durably
+    // recorded admission and returned this acknowledgement.
     events.send(Event::Admitted).map_err(|_| ReceiverError)?;
+    ack.recv().map_err(|_| ReceiverError)?;
+    if Instant::now() >= backend_end {
+        return Err(ReceiverError);
+    }
     let shell = powershell_path()?;
     let mut command = Command::new(shell);
     command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", POWERSHELL_BOOTSTRAP]);
@@ -271,10 +289,12 @@ mod tests {
     fn arguments_require_the_caller_supplied_lowercase_sha256() {
         let hash = "a".repeat(64);
         assert_eq!(parse_arguments(&["--helper-sha256".into(), hash.clone()]), Some((hash.clone(), DEFAULT_BUDGET_MS)));
+        assert_eq!(parse_arguments(&["--helper-sha256".into(), hash.clone(), "--budget-ms".into(), "9000".into()]), Some((hash.clone(), 9_000)));
         assert_eq!(parse_arguments(&["--helper-sha256".into(), hash.clone(), "--budget-ms".into(), "25000".into()]), Some((hash, 25_000)));
         for args in [
             vec!["--helper-sha256".into(), "A".repeat(64)],
             vec!["--helper-sha256".into(), "a".repeat(63)],
+            vec!["--helper-sha256".into(), "a".repeat(64), "--budget-ms".into(), "8999".into()],
             vec!["--helper-sha256".into(), "a".repeat(64), "--budget-ms".into(), "025".into()],
             vec!["--helper-sha256".into(), "a".repeat(64), "--budget-ms".into(), "25001".into()],
         ] {
@@ -286,20 +306,20 @@ mod tests {
     fn request_accepts_exact_body_and_eof_only() {
         let body = b"exit 3";
         let hash = tune_core::db::sha256_hex(body);
-        let frame = format!("KT2 REQUEST nonce {} {hash}\\n", body.len());
+        let frame = format!("KT2 REQUEST nonce {} {hash}\n", body.len());
         let request = read_request(&mut Cursor::new([frame.as_bytes(), body].concat()), "nonce", Instant::now() + Duration::from_secs(1)).unwrap();
         assert_eq!(request.sha256, hash);
         assert_eq!(request.body, body);
 
         for frame in [
-            format!("KT2 REQUEST other {} {}\\n", body.len(), tune_core::db::sha256_hex(body)),
-            format!("KT2 REQUEST nonce 0 {}\\n", tune_core::db::sha256_hex(body)),
-            format!("KT2 REQUEST nonce 07 {}\\n", tune_core::db::sha256_hex(body)),
-            format!("KT2 REQUEST nonce {} {}\\n", body.len(), "0".repeat(64)),
+            format!("KT2 REQUEST other {} {}\n", body.len(), tune_core::db::sha256_hex(body)),
+            format!("KT2 REQUEST nonce 0 {}\n", tune_core::db::sha256_hex(body)),
+            format!("KT2 REQUEST nonce 07 {}\n", tune_core::db::sha256_hex(body)),
+            format!("KT2 REQUEST nonce {} {}\n", body.len(), "0".repeat(64)),
         ] {
             assert!(read_request(&mut Cursor::new([frame.as_bytes(), body].concat()), "nonce", Instant::now() + Duration::from_secs(1)).is_err());
         }
-        let mut extra = [format!("KT2 REQUEST nonce {} {}\\n", body.len(), tune_core::db::sha256_hex(body)).as_bytes(), body, b"x"].concat();
+        let mut extra = [format!("KT2 REQUEST nonce {} {}\n", body.len(), tune_core::db::sha256_hex(body)).as_bytes(), body, b"x"].concat();
         assert!(read_request(&mut Cursor::new(&mut extra), "nonce", Instant::now() + Duration::from_secs(1)).is_err());
     }
 
