@@ -412,7 +412,7 @@ async fn commit_tail(db: &Arc<Mutex<Store>>, batch: &mut Vec<Event>, state: &Sta
 async fn finish_tail(db: &Arc<Mutex<Store>>, rx: &mut mpsc::Receiver<Command>, batch: &mut Vec<Event>, state: &State, ack: oneshot::Sender<bool>) {
     rx.close();
     let mut acks = vec![ack];
-    let mut ok = true;
+    let mut ok = if batch.len() == BATCH_MAX { commit_tail(db, batch, state).await } else { true };
     // close前のpermitも容量256に含まれる。EmptyではなくNoneまで待ち、未確定のtailへACKしない。
     while let Some(command) = rx.recv().await {
         match command {
@@ -447,12 +447,18 @@ async fn writer(db: Arc<Mutex<Store>>, mut rx: mpsc::Receiver<Command>, state: A
     loop {
         let cmd = tokio::select! {
             _ = iv.tick() => None,
-            c = rx.recv(), if batch.len() < BATCH_MAX => match c { Some(c) => Some(c), None => break },
+            c = rx.recv() => match c { Some(c) => Some(c), None => break },
         };
         let tick = cmd.is_none();
         let mut ack = None;
         match cmd {
-            Some(Command::Event(e)) => batch.push(*e),
+            Some(Command::Event(e)) if batch.len() < BATCH_MAX => batch.push(*e),
+            Some(Command::Event(_)) => {
+                // 失敗batchは次tickまで保持するが、満杯でもcontrolへのFIFOを塞がない。
+                // DB backpressureによる欠落。channel自体のoverflowとは区別する。
+                state.dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             Some(Command::Flush(a)) => ack = Some(a),
             Some(Command::Shutdown(a)) => {
                 finish_tail(&db, &mut rx, &mut batch, &state, a).await;
@@ -693,6 +699,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_reaches_a_failed_full_batch_and_accounts_for_queued_rows() {
+        let dir = std::env::temp_dir().join(format!("monitor-journal-full-lock-{}-{}", std::process::id(), now_ms()));
+        let db = Arc::new(Mutex::new(Store::open(&dir).unwrap()));
+        let blocker = Store::open(&dir).unwrap();
+        let j = Journal::start(db.clone());
+        assert!(j.flush(Duration::from_secs(2)).await);
+        blocker.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        for _ in 0..BATCH_MAX {
+            j.record(Some("full"), 1, 1, Kind::Checkpoint, Data::default());
+        }
+        // Observe a failed full batch before enqueuing controls; a shutdown-first fixture misses this path.
+        let failed_full_batch = tokio::time::timeout(Duration::from_secs(2), async {
+            while j.state.db_failures.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        for _ in 0..128 {
+            j.record(Some("queued"), 1, 1, Kind::Checkpoint, Data::default());
+        }
+        let (stop, stopped) = oneshot::channel();
+        assert!(j.tx.try_send(Command::Shutdown(stop)).is_ok());
+        let (flush, flushed) = oneshot::channel();
+        assert!(j.tx.try_send(Command::Flush(flush)).is_ok());
+        let began = Instant::now();
+        let stop_ack = tokio::time::timeout(Duration::from_secs(2), stopped).await;
+        let flush_ack = tokio::time::timeout(Duration::from_secs(2), flushed).await;
+        let after = j.health();
+        let finished = !j.state.running.load(Ordering::Relaxed);
+        let store_available = db.try_lock().is_ok();
+        let elapsed = began.elapsed();
+        // The external writer stays locked until all completion observations above.
+        blocker.conn().execute_batch("ROLLBACK").unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(4), async {
+            while j.state.running.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let stopped_rows: i64 = db
+            .lock()
+            .unwrap()
+            .conn()
+            .query_row("SELECT count(*) FROM monitor_events WHERE json_extract(payload,'$.kind')='collector_stopped'", [], |r| r.get(0))
+            .unwrap();
+        drop(blocker);
+        drop(j);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(failed_full_batch, "fixture must observe a failed full batch before shutdown");
+        assert!(matches!(stop_ack, Ok(Ok(false))) && matches!(flush_ack, Ok(Ok(false))));
+        assert!(finished && store_available, "full failed batch must not keep controls or a blocking job alive");
+        assert!(elapsed < Duration::from_secs(2));
+        assert_eq!(after["dropped_total"], BATCH_MAX + 128, "all accepted rows remain accounted for");
+        assert_eq!(after["overflow_total"], 0);
+        assert_eq!(stopped_rows, 0);
+    }
+
+    #[tokio::test]
     async fn commits_typed_metadata_without_error_text_and_reopens_query() {
         let db = store();
         let j = Journal::start(db.clone());
@@ -741,11 +807,20 @@ mod tests {
         let j = Journal::start(db.clone());
         let held = db.lock().unwrap();
         assert!(!j.flush(Duration::from_secs(2)).await);
-        j.record(Some("fixture"), 1, 1, Kind::Open, Data::default());
+        for _ in 0..BATCH_MAX + 1 {
+            j.record(Some("fixture"), 1, 1, Kind::Open, Data::default());
+        }
+        assert!(!j.flush(Duration::from_secs(2)).await, "full failed batch must still receive controls");
         assert!(j.health()["db_failures"].as_u64().unwrap() > 0);
+        assert!(j.health()["dropped_total"].as_u64().unwrap() > 0);
+        assert_eq!(j.health()["overflow_total"], 0, "DB backpressure is distinct from channel overflow");
         drop(held);
         assert!(j.flush(Duration::from_secs(2)).await);
+        assert!(j.flush(Duration::from_secs(2)).await, "a recovered full batch leaves room for the gap record");
         assert_eq!(j.health()["status"], "degraded");
+        let dropped = j.health()["dropped_total"].as_u64();
+        let out = db.lock().unwrap().monitor_events(&Filter { limit: Some(500), ..Default::default() }).unwrap();
+        assert!(out["events"].as_array().unwrap().iter().any(|e| e["kind"] == "journal_gap" && e["data"]["dropped"].as_u64() == dropped));
         assert!(j.shutdown(Duration::from_secs(2)).await);
     }
     #[tokio::test]
