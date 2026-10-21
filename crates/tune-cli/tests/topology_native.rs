@@ -343,7 +343,7 @@ mod native_windows {
 
     #[test]
     fn native_three_entries_use_real_git_and_process_one_frame_without_eof() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture = Fixture::new(MANIFEST.to_vec());
         let before = fixture.snapshot();
         assert!(!before.3.is_empty(), "fixture must actually be dirty");
@@ -372,7 +372,7 @@ mod native_windows {
 
     #[test]
     fn native_entries_reject_wrong_helper_hash_source_drift_and_invalid_utf8() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture = Fixture::new(MANIFEST.to_vec());
         let (_, digest) = artifact();
         for entry in ["topology-supervise", "topology-verify"] {
@@ -410,7 +410,7 @@ mod native_windows {
 
     #[test]
     fn native_entries_reject_unapproved_git_artifacts_before_source_capture() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture = Fixture::new(MANIFEST.to_vec());
         let before = fixture.snapshot();
         let (_, digest) = artifact();
@@ -458,7 +458,7 @@ mod native_windows {
             files
         }
 
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture = Fixture::new(MANIFEST.to_vec());
         let unicode_root = fixture.base.join("登録ルート");
         let checkout_relative = "階層/作業-🚀-e\u{301}";
@@ -586,7 +586,7 @@ mod native_windows {
 
     #[test]
     fn native_unread_large_response_self_exits_at_hard_deadline() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let approved = format!("{{\"name\":\"large-native-fixture\",\"padding\":\"{}\"}}", "x".repeat(2 * 1024 * 1024)).into_bytes();
         let fixture = Fixture::new(approved);
         let request = fixture.request(30_000);

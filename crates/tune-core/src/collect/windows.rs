@@ -610,8 +610,12 @@ fn spawn_owned(context: SpawnContext<'_>, job: &Job, stdio: [&OwnedHandle; 3], s
         )
     };
     if spawned == 0 {
+        // Preserve GetLastError before any test-only formatting or IO changes it.
+        let error = os_error();
+        #[cfg(test)]
+        eprintln!("owned_create_process_error_code={}", error.raw_os_error().unwrap_or(-1));
         *spawn_failed = true;
-        return Err(os_error());
+        return Err(error);
     }
     let handle = owned(created.hProcess)?;
     let thread = owned(created.hThread)?;
@@ -1080,6 +1084,46 @@ mod tests {
         let pin = Arc::new(PinnedWindowsExecutable::open(&program, &artifact, end).unwrap());
         let environment = [(OsString::from("SystemRoot"), root.clone()), (OsString::from("WINDIR"), root)];
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        // Fixture-only PATH discovery. Product execution still receives one
+        // explicit pinned program and the native collector's exact nine-key map.
+        let git_program = std::env::split_paths(&std::env::var_os("PATH").expect("fixture Git PATH"))
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(|path| path.join("git.exe"))
+            .find(|path| path.is_file())
+            .expect("real fixture Git")
+            .canonicalize()
+            .unwrap();
+        let git_artifact = sha256(&std::fs::read(&git_program).unwrap());
+        let git_pin = Arc::new(PinnedWindowsExecutable::open(&git_program, &git_artifact, end).unwrap());
+        let mut git_command = std::process::Command::new(git_pin.executable());
+        git_command.current_dir(std::env::current_dir().unwrap()).args([
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=NUL",
+            "rev-parse",
+            "--absolute-git-dir",
+        ]);
+        let source = crate::topology::adapters::native_reader::windows::WindowsSourceIo::default();
+        let git_environment = crate::topology::adapters::native_reader::environment(&source).unwrap();
+        let git_result =
+            runtime.block_on(run_owned_shared(Arc::clone(&git_pin), &git_command, &git_environment, b"", end, 8192, 8192, WindowsMetadataExitPolicy::ZeroOnly));
+        let git_diagnostic = match &git_result {
+            Ok(completion) => completion.diagnostic(),
+            Err(result) => result,
+        };
+        eprintln!(
+            "shared_actual_git_metadata: code={:?} root_exit_code={:?} timeout={} limit={} spawn={} stop={:?} cleanup={}",
+            git_diagnostic.code,
+            git_diagnostic.process_receipt.as_ref().and_then(|receipt| receipt.root_exit_code),
+            git_diagnostic.timed_out,
+            git_diagnostic.output_limited,
+            git_diagnostic.spawn_failed,
+            git_diagnostic.process_receipt.as_ref().map(|receipt| receipt.stop),
+            git_diagnostic.process_receipt.as_ref().is_some_and(ProcessReceipt::cleanup_confirmed)
+        );
+        let git_passed = git_result.is_ok_and(|completion| completion.into_verified_output(b"", &git_artifact).is_ok_and(|bytes| !bytes.is_empty()));
         for (code, policy) in
             [("0", WindowsMetadataExitPolicy::ZeroOnly), ("0", WindowsMetadataExitPolicy::ZeroOnly), ("1", WindowsMetadataExitPolicy::MissingOrigin)]
         {
@@ -1131,6 +1175,7 @@ mod tests {
         assert_eq!(receipt.stop, ProcessStop::SetupFailed);
         assert!(receipt.root.is_none() && receipt.observed.is_empty(), "reject the different program before process creation");
         assert_eq!(Arc::strong_count(&pin), 1);
+        assert!(git_passed, "actual pinned Git metadata must succeed as well as the system command fixture");
         drop(other);
         std::fs::remove_dir_all(directory).unwrap();
         drop(runtime);

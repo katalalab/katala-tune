@@ -582,6 +582,122 @@ mod native_diagnostics {
         known_error_categories: Vec<&'static str>,
         capture_valid: bool,
     }
+
+    fn value_kind(value: Option<&Value>) -> &'static str {
+        match value {
+            None => "missing",
+            Some(Value::Null) => "null",
+            Some(Value::Bool(_)) => "bool",
+            Some(Value::String(_)) => "string",
+            Some(Value::Array(_)) => "array",
+            Some(Value::Object(_)) => "object",
+            Some(Value::Number(number)) if number.is_u64() => "u64",
+            Some(Value::Number(number)) if number.is_i64() => "i64",
+            Some(Value::Number(_)) => "f64",
+        }
+    }
+
+    // Names below are fixed schema keys; no incoming key, value or serde error
+    // string is copied into the diagnostic. Equality checks disclose booleans.
+    fn capture_structure(request: &ReaderRequest, bytes: &[u8]) -> Value {
+        use crate::topology::{CaptureCounters, RawCapture, RawRepository};
+        let result = remote::validate_capture_bytes(&request.remote_request(), bytes);
+        let message = result.as_ref().err().map(|failure| match failure.message.as_str() {
+            "transport contains invalid NUL" => "transport contains invalid NUL",
+            "remote report invalid" => "remote report invalid",
+            "remote runtime identity mismatch" => "remote runtime identity mismatch",
+            "remote identity or request mismatch" => "remote identity or request mismatch",
+            "remote report violates bounded schema" => "remote report violates bounded schema",
+            "remote source allowlist mismatch" => "remote source allowlist mismatch",
+            _ => "unclassified validation failure",
+        });
+        let raw = serde_json::from_slice::<Value>(bytes);
+        let parse_error = raw.as_ref().err().map(|error| {
+            let category = match error.classify() {
+                serde_json::error::Category::Io => "io",
+                serde_json::error::Category::Syntax => "syntax",
+                serde_json::error::Category::Data => "data",
+                serde_json::error::Category::Eof => "eof",
+            };
+            serde_json::json!({"category":category,"line":error.line(),"column":error.column()})
+        });
+        let raw = raw.ok();
+        let raw = raw.as_ref();
+        let field_types =
+            ["schema", "scope_id", "adapter", "observed_at_ms", "target_identity", "runtime", "limits", "repositories", "failures", "counters", "progress"]
+                .into_iter()
+                .map(|key| (key, value_kind(raw.and_then(|value| value.get(key)))))
+                .collect::<Vec<_>>();
+        let counter_types = ["entries", "files", "bytes", "repositories", "manifests", "children", "duration_ms", "config_files", "config_keys"]
+            .into_iter()
+            .map(|key| (key, value_kind(raw.and_then(|value| value.get("counters")).and_then(|value| value.get(key)))))
+            .collect::<Vec<_>>();
+        let first_repo = raw.and_then(|value| value.get("repositories")).and_then(Value::as_array).and_then(|values| values.first());
+        let repository_types = ["relative_path", "root_fingerprint", "git", "manifests", "configs", "config_file_read", "failures"]
+            .into_iter()
+            .map(|key| (key, value_kind(first_repo.and_then(|value| value.get(key)))))
+            .collect::<Vec<_>>();
+        let first_manifest = first_repo.and_then(|value| value.get("manifests")).and_then(Value::as_array).and_then(|values| values.first());
+        let manifest_types = ["relative_path", "kind", "content", "content_sha256", "revision"]
+            .into_iter()
+            .map(|key| (key, value_kind(first_manifest.and_then(|value| value.get(key)))))
+            .collect::<Vec<_>>();
+        let typed = raw.and_then(|value| serde_json::from_value::<RawCapture>(value.clone()).ok());
+        let bindings = typed.as_ref().map(|capture| {
+            [
+                capture.scope_id == request.scope_id,
+                capture.adapter == "remote",
+                capture.observed_at_ms == request.observed_at_ms,
+                capture.limits == request.limits,
+                capture.target_identity.as_deref() == Some(request.expected_identity_hash.as_str()),
+            ]
+        });
+        let source_bindings = typed.as_ref().and_then(|capture| capture.repositories.first()).map(|repo| {
+            let approved = &request.source_allowlist[0];
+            let manifest = repo.manifests.first();
+            let file = &approved.manifests[0];
+            [
+                repo.root_fingerprint == remote::source_root_fingerprint(&request.roots[approved.root_index], RemotePlatform::Windows),
+                repo.relative_path == approved.relative_path,
+                repo.git.head.as_deref() == Some(approved.expected_head.as_str()),
+                repo.git.git_dir.as_deref().is_some_and(remote::hash),
+                repo.git.common_dir.as_deref().is_some_and(remote::hash),
+                !repo.config_file_read && repo.configs.is_empty(),
+                repo.manifests.len() == approved.manifests.len(),
+                manifest.is_some_and(|value| value.relative_path == file.relative_path),
+                manifest.is_some_and(|value| value.revision.as_deref() == Some(approved.expected_head.as_str())),
+                manifest.is_some_and(|value| value.content.len() == file.bytes),
+                manifest.is_some_and(|value| value.content_sha256 == file.sha256),
+                manifest.is_some_and(|value| crate::db::sha256_hex(value.content.as_bytes()) == file.sha256),
+                manifest.is_some_and(|value| value.kind == "node"),
+            ]
+        });
+        let counts = typed.as_ref().map(|capture| {
+            [
+                capture.repositories.len(),
+                capture.failures.len(),
+                capture.repositories.iter().map(|repo| repo.failures.len()).sum(),
+                capture.counters.entries,
+                capture.counters.files,
+                capture.counters.bytes,
+                capture.counters.repositories,
+                capture.counters.manifests,
+                capture.counters.children,
+                capture.counters.config_files,
+                capture.counters.config_keys,
+            ]
+        });
+        serde_json::json!({
+            "failure_code":result.as_ref().err().map(|failure| &failure.code),"failure_message":message,
+            "stdout_bytes":bytes.len(),"stdout_sha256":crate::db::sha256_hex(bytes),"contains_nul":bytes.contains(&0),
+            "utf8_valid":std::str::from_utf8(bytes).is_ok(),"json_parse_error":parse_error,"strict_json_valid":strict_json::<Value>(bytes).is_ok(),
+            "root_type":value_kind(raw),"field_types":field_types,"counter_types":counter_types,"repository_types":repository_types,"manifest_types":manifest_types,
+            "capture_deserializable":typed.is_some(),"repository_deserializable":first_repo.is_some_and(|value| serde_json::from_value::<RawRepository>(value.clone()).is_ok()),
+            "counters_deserializable":raw.and_then(|value|value.get("counters")).is_some_and(|value| serde_json::from_value::<CaptureCounters>(value.clone()).is_ok()),
+            "request_bindings":bindings,"source_bindings":source_bindings,"counts":counts,
+            "runtime_bindings":raw.map(|value| [value["runtime"]["kind"] == "native",value["runtime"]["platform"] == "windows",value["runtime"]["kernel_wsl"] == false])
+        })
+    }
     fn diagnostic(output: &BoundedResult, capture_valid: bool) -> Diagnostic {
         let receipt = output.process_receipt.as_ref();
         let categories: &[&str] = &[
@@ -671,7 +787,8 @@ mod native_diagnostics {
             }
         };
         let capture = remote::validate_capture_bytes(&fixture.request.remote_request(), &output.stdout);
-        let record = require(serde_json::to_string(&diagnostic(&output, capture.is_ok())), "structural diagnostic");
+        let mut record = require(serde_json::to_value(diagnostic(&output, capture.is_ok())), "structural diagnostic");
+        record["validation"] = capture_structure(&fixture.request, &output.stdout);
         println!("\n{RECORD}{record}");
         assert!(
             output.code == Some(0) && !output.spawn_failed && !output.timed_out && !output.output_limited,
