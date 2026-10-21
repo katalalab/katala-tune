@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const { spawnSync, spawn } = require('node:child_process');
 const { plan, execute } = require('../lib/actions');
 const ps = process.env.KT_GPU_POWERSHELL || (process.platform === 'win32' ? 'powershell.exe' : 'pwsh');
+const testMutex=`Global\\\\KatalaTunePowerTargetTest-${process.pid}-${require('node:crypto').randomUUID()}`;
 const present = spawnSync(ps,['-NoProfile','-Command','exit 0']).status === 0;
 const node = {id:'test-node',os:'windows',local:true};
 const uuid='GPU-01234567-89ab-cdef-0123-456789abcdef';
@@ -12,7 +13,6 @@ const prev='01234567-89ab-cdef-0123-456789abcdef',desired='abcdef01-2345-6789-ab
 function run(kind, mode, busy=false) {
   const action = kind==='gpu' ? {type:'set-gpu-power-limit',params:{uuid,watts:250,min:100,max:300,prev_w:200}} : {type:'set-power-plan',params:{guid:desired,prev_guid:prev}};
   const p=plan(node,action,{protect:[]});
-  const testMutex='Global\\KatalaTunePowerTargetTest';
   // busy はWaitOneの取得拒否を差し込み、書込み口に到達しないことを確かめる。
   const isolated=p.script.replace('Global\\KatalaTunePowerControl',testMutex);
   const body=busy ? isolated.replace('$mutex.WaitOne(0)','$false') : isolated;
@@ -61,7 +61,6 @@ for (const kind of ['gpu','plan']) {
 }
 
 test('two native clients contend for the isolated target mutex; losing client performs no write',{skip:!present},async()=>{
- const testMutex='Global\\KatalaTunePowerTargetTest';
  const code=`$m=New-Object System.Threading.Mutex($false,"${testMutex}");$held=$m.WaitOne(0);if(-not $held){exit 8};try{[Console]::WriteLine("READY");[Console]::ReadLine()|Out-Null}finally{$m.ReleaseMutex();$m.Dispose()}`;
  const holder=spawn(ps,['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(code,'utf16le').toString('base64')],{windowsHide:true,stdio:['pipe','pipe','pipe']});
  try {
