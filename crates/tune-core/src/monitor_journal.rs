@@ -178,7 +178,7 @@ pub struct StreamBoundary {
     pub close_ms: Option<u32>,
     pub wait_origin: Option<WaitOrigin>,
     pub wait_before_close: Option<bool>,
-    pub forced_kill: Option<bool>,
+    pub kill_attempted: Option<bool>,
     pub overflow: bool,
 }
 
@@ -929,7 +929,7 @@ mod tests {
             close_ms: Some(u32::MAX),
             wait_origin: Some(WaitOrigin::Natural),
             wait_before_close: Some(false),
-            forced_kill: Some(false),
+            kill_attempted: Some(false),
             overflow: true,
         });
         let typical = Data {

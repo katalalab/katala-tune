@@ -570,7 +570,7 @@ pub struct Ended {
     pub stderr: PipeEnd,
     pub stdin: InputEnd,
     pub wait_origin: Option<WaitOrigin>,
-    pub forced_kill: Option<bool>,
+    pub kill_attempted: Option<bool>,
     pub io: Option<StreamBoundary>,
 }
 
@@ -626,7 +626,7 @@ impl Source {
             d.close_ms = u32::try_from(began.elapsed().as_millis()).ok();
             d.overflow |= d.close_ms.is_none();
             d.wait_origin = ended.wait_origin;
-            d.forced_kill = ended.forced_kill;
+            d.kill_attempted = ended.kill_attempted;
         }
         ended.io = io;
         ended
@@ -800,7 +800,7 @@ pub fn spawn(l: Launch) -> Result<Source, String> {
     tokio::spawn(async move {
         let mut closed_tx = Some(closed_tx);
         // stop_rx は止める指示か、Source が捨てられた（送り手が無くなった）ときに終わる
-        let mut forced_kill = false;
+        let mut kill_attempted = false;
         let (status, wait_origin) = tokio::select! {
             st = child.wait() => (st.ok(), WaitOrigin::Natural),
             _ = stop_rx => {
@@ -811,7 +811,8 @@ pub fn spawn(l: Launch) -> Result<Source, String> {
                 let status = match tokio::time::timeout(grace, child.wait()).await {
                     Ok(st) => st.ok(),
                     Err(_) => {
-                        forced_kill = true;
+                        // API attempt only; an error/already-exited race does not prove a kill.
+                        kill_attempted = true;
                         let _ = child.start_kill();
                         child.wait().await.ok()
                     }
@@ -838,7 +839,7 @@ pub fn spawn(l: Launch) -> Result<Source, String> {
             stderr,
             stdin: stdin.unwrap_or(InputEnd::Cancelled),
             wait_origin: Some(wait_origin),
-            forced_kill: Some(forced_kill),
+            kill_attempted: Some(kill_attempted),
             io: None,
         });
     });
@@ -2241,11 +2242,9 @@ for _ in range(400):
     }
 
     // No remote sampler: the owned local child exits zero only after Source closes stdin.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn journal_separates_timeout_cleanup_from_natural_zero_exit() {
-        if cfg!(windows) {
-            return;
-        }
         struct StdinRoute(bool);
         impl Route for StdinRoute {
             fn open(&self, _: &Node, _: &Opts) -> Result<Source, String> {
@@ -2273,7 +2272,7 @@ for _ in range(400):
             assert_eq!(d["wait_observed"], true);
             assert_eq!(d["category"], if silent { json!("stall_timeout") } else { Value::Null });
             assert_eq!(d["io"]["close_trigger"], if silent { "timeout" } else { "channel_end" });
-            assert_eq!(d["io"]["forced_kill"], false);
+            assert_eq!(d["io"]["kill_attempted"], false);
             assert_eq!(d["io"]["forwarded"], 1);
             if silent {
                 assert_eq!(d["io"]["wait_origin"], "close");
@@ -2356,7 +2355,7 @@ for _ in range(400):
         assert_eq!(ended.wait_observed, None);
         assert_eq!(ended.code, None);
         assert_eq!(ended.wait_origin, None);
-        assert_eq!(ended.forced_kill, None);
+        assert_eq!(ended.kill_attempted, None);
         assert_eq!(ended.io, None);
         assert_eq!(end_category(false, 1, &ended), Some(Category::WaitUnknown));
         assert_eq!(end_category(true, 1, &ended), Some(Category::StallTimeout));
