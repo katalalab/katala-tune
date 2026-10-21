@@ -258,7 +258,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    const SYSTEM32_CMD_NONZERO: &str = "& (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System) 'cmd.exe') /c exit 23";
+    const SYSTEM32_CMD_NONZERO: &str = "& (Join-Path ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::System) 'cmd.exe') /c exit 23";
 
     #[cfg(windows)]
     #[test]
