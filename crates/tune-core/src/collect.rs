@@ -697,6 +697,17 @@ pub async fn exec_on_with(runner: &dyn Runner, node: &Node, script: &str, timeou
     if node.local { runner.local_script(script, timeout).await } else { runner.run("ssh", &ssh_args(&node.alias, script), None, timeout).await }
 }
 
+/// `exec_on_with` の stdin 付き版。ローカル action が本文を黙って落とすことは許可しない。
+pub async fn exec_on_with_input(runner: &dyn Runner, node: &Node, script: &str, input: &[u8], timeout: Duration) -> RunResult {
+    if let Some(err) = node.refusal() {
+        return RunResult { code: None, out: String::new(), err };
+    }
+    if node.local {
+        return RunResult { code: None, out: String::new(), err: "ローカル action に stdin を渡す経路は未対応のため実行しない".into() };
+    }
+    runner.run("ssh", &ssh_args(&node.alias, script), Some(input), timeout).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
