@@ -81,8 +81,12 @@ async fn monitor_stops_streams_removed_or_excluded_from_the_current_ledger() {
         assert_eq!(live.status()["active-mac"]["reason"], "excluded");
     }
     live.shutdown(Duration::from_secs(1)).await;
+    // 一時DBを削除する前に、自分が開始したwriterも明示的に終了する。
+    assert!(e.finish_monitor_journal(Duration::from_secs(1)).await);
+    let journal_running = e.monitor_journal_health()["running"].as_bool();
     drop(e);
     std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(journal_running, Some(false), "live shutdown alone must not be mistaken for journal shutdown");
 }
 
 fn config() -> nodes::Config {

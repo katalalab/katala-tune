@@ -36,6 +36,7 @@ Rustの通常monitorとLiveは、接続・最初の測定・終了・再試行�
 - `overflow_total` はqueue満杯、`rejected_total` は不正/過大event、`dropped_total` は閉じたqueueを含む総欠落。DB失敗、未確認ACK、last_commit_at、pruned_totalも別に返す。保存失敗/overflowはavailableへ丸めずdegradedとし、回復後にjournal_gapを保存する。
 - 保持は最大14日またはglobal50,000行。6nodeの1分checkpointだけでも14日を全部保持できるとは限らない。実際のoldest/newest/rowsをretentionから確認する。約49MiBというpayload上限はSQLite/WAL/indexの物理ファイル容量上限ではない。VACUUMやglobal設定を変更しない。
 - DBが使えない間の最後のevent、queue欠落、強制終了/電源断のtailは保存を保証しない。最後に停止記録がないことだけでcrashとは断定しない。writerのACK失敗・remote child不在・reader EOFは別の事実である。
+- `monitor-run` はLive停止とjournalの終了時保存確認で既存の3秒予算を共有する。tail commitのACKが未確認ならexit 1とし、成功JSONは出さない。ACK確認時だけ終了直後のjournal healthを返す。ACKは保存成功の証拠であり、writerの `running` はその時点の実測値なのでtrueの場合もある。Liveのshutdownは終了成否を返さないため、CLI exit 0や `collector_stopped` の存在から手元sampler・遠隔producer・descendantの終了までは保証しない。DB処理やruntimeの後片付けを含むプロセス全体の壁時計3秒上限でもない。
 
 ## Privacy / compatibility
 
