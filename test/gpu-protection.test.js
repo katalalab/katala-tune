@@ -317,11 +317,18 @@ test('KT2 controller は単調期限、厳密な結果枠、stdin/stdio 境界�
 
   const duplicate = result(`${nonce} ${hash} 0 0 0`) + `process.stdin.on('end',()=>process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 0 0\\n'));`;
   assert.equal((await exchange(duplicate)).code, 7);
-  const exact = await exchange(result(`${nonce} ${hash} 0 65536 65536`, 'o'.repeat(65536) + 'e'.repeat(65536), 'z'.repeat(65536)));
+  const exactFrame = `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 65536 65536\\n');process.stdout.write(Buffer.alloc(65536,'o'));process.stdout.write(Buffer.alloc(65536,'e'));process.stderr.write(Buffer.alloc(65536,'z'))});`;
+  const exact = await exchange(exactFrame);
   assert.equal(exact.code, 0);
   assert.equal(Buffer.byteLength(exact.out), 65536);
   assert.equal(Buffer.byteLength(exact.err), 65536);
-  assert.equal((await exchange(result(`${nonce} ${hash} 0 0 0`, '', 'z'.repeat(65537)))).code, 7);
+  const overflowStderr = `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 0 0\\n');process.stderr.write(Buffer.alloc(65537,'z'))});`;
+  assert.equal((await exchange(overflowStderr)).code, 7);
+
+  let spawnThrows = 0;
+  const spawnFailure = await actionExchange(node2, helper, body, { spawnChild: () => { spawnThrows += 1; throw new Error('fixture spawn failure'); }, timeoutMs: 1000 });
+  assert.equal(spawnFailure.code, 9, 'a synchronous spawn failure is pre-write refusal');
+  assert.equal(spawnThrows, 1, 'spawn failure is not retried');
 
   const closedStdin = () => {
     const child = new EventEmitter();
