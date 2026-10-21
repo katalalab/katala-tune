@@ -216,6 +216,11 @@ mod tests {
         assert!(windows_argv_units(shell, &powershell_arguments()) < WINDOWS_COMMAND_LINE_LIMIT);
         let oversized_argv = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", payload.as_str()];
         assert!(windows_argv_units(shell, &oversized_argv) >= WINDOWS_COMMAND_LINE_LIMIT);
+        let max_payload = "x".repeat(MAX_PROBE_PAYLOAD_BYTES);
+        let max_input = powershell_stdin(&max_payload).unwrap();
+        assert_eq!(max_input.len(), MAX_PROBE_PAYLOAD_BYTES.div_ceil(3) * 4);
+        let max_argv = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", max_payload.as_str()];
+        assert!(windows_argv_units(shell, &max_argv) >= WINDOWS_COMMAND_LINE_LIMIT);
         assert_eq!(input, crate::windows_action::base64(payload.as_bytes()));
         assert!(input.iter().all(u8::is_ascii));
     }
