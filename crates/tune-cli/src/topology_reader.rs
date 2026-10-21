@@ -75,7 +75,7 @@ pub fn main(args: &[String], started: Instant) -> ExitCode {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn terminate_self(code: u32) -> ! {
+pub(crate) fn terminate_self(code: u32) -> ! {
     // SAFETY: borrowed pseudo-handle always names only this standalone reader.
     // No PID lookup, inherited parent Job, destructor, or DLL detach is used.
     unsafe {
@@ -88,7 +88,7 @@ fn terminate_self(code: u32) -> ! {
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn unbuffered_stdin() -> Result<std::fs::File, tune_core::topology::adapters::windows_reader::ReaderError> {
+pub(crate) fn unbuffered_stdin() -> Result<std::fs::File, tune_core::topology::adapters::windows_reader::ReaderError> {
     use std::os::windows::io::BorrowedHandle;
     use tune_core::topology::adapters::windows_reader::ReaderError;
     use windows_sys::Win32::{

@@ -43,6 +43,7 @@ use windows_sys::Win32::{
     },
 };
 
+use super::windows_pin::PinnedWindowsExecutable;
 use super::{BoundedResult, ProcessIdentity, ProcessReceipt, ProcessStop};
 
 const CLEANUP: Duration = Duration::from_secs(3);
@@ -238,6 +239,11 @@ struct Process {
 }
 fn identity(handle: &OwnedHandle, pid: u32) -> io::Result<ProcessIdentity> {
     identity_raw(handle.as_raw_handle(), pid)
+}
+pub(super) fn current_process_identity() -> io::Result<ProcessIdentity> {
+    // SAFETY: borrow our current-process pseudo-handle for read-only identity;
+    // it is never closed, and the process remains live throughout this query.
+    identity_raw(unsafe { GetCurrentProcess() }, unsafe { GetCurrentProcessId() })
 }
 fn identity_raw(handle: HANDLE, pid: u32) -> io::Result<ProcessIdentity> {
     let mut created = Default::default();
@@ -554,12 +560,20 @@ struct SpawnContext<'a> {
     command: &'a std::process::Command,
     environment: &'a [(OsString, OsString)],
     deadline: Instant,
+    pin: Option<&'a PinnedWindowsExecutable>,
 }
 
 fn spawn_owned(context: SpawnContext<'_>, job: &Job, stdio: [&OwnedHandle; 3], spawn_failed: &mut bool) -> io::Result<(Process, OwnedHandle)> {
-    let SpawnContext { command, environment: values, deadline } = context;
+    let SpawnContext { command, environment: values, deadline, pin } = context;
     let env = environment(command, values)?;
-    let executable = user_executable_path(executable(command, values)?)?;
+    let executable = if let Some(pin) = pin {
+        if command.get_program() != pin.executable().as_os_str() {
+            return Err(invalid());
+        }
+        pin.executable().to_path_buf()
+    } else {
+        user_executable_path(executable(command, values)?)?
+    };
     let application = wide(executable.as_os_str())?;
     let mut argv = command_line(&executable, command)?;
     let cwd = command.get_current_dir().map(|p| wide(p.as_os_str())).transpose()?;
@@ -600,6 +614,11 @@ fn spawn_owned(context: SpawnContext<'_>, job: &Job, stdio: [&OwnedHandle; 3], s
     }
     let handle = owned(created.hProcess)?;
     let thread = owned(created.hThread)?;
+    if let Some(pin) = pin {
+        // The actual atomically assigned root is still suspended. Never resume
+        // an image that does not match the retained, deny-write/delete lease.
+        pin.verify_process(handle.as_raw_handle())?;
+    }
     let identity = identity(&handle, created.dwProcessId)?;
     Ok((Process { handle, identity }, thread))
 }
@@ -697,6 +716,121 @@ pub(super) async fn run(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> BoundedResult {
+    run_inner(command, environment, input, deadline, stdout_limit, stderr_limit, None).await.0
+}
+
+// No constructor, serde, Clone or conversion from public diagnostic data exists.
+// Retention is intentional even after exit: only consuming/dropping completion
+// releases the empty Job, every observed process handle, and the pinned image.
+struct WindowsOsExitWitness {
+    _job: Job,
+    pin: PinnedWindowsExecutable,
+    input_sha256: String,
+    stdout_sha256: String,
+    artifact_sha256: String,
+    deadline: std::time::Instant,
+}
+
+/// Move-only successful OS observation, bound to exact request/response bytes.
+/// This local capability cannot be reconstructed from a wire receipt or JSON.
+///
+/// ```compile_fail
+/// use tune_core::collect::{OwnedWindowsCompletion, ProcessReceipt};
+/// let diagnostic = ProcessReceipt::default();
+/// let _: OwnedWindowsCompletion = diagnostic.into();
+/// ```
+pub struct OwnedWindowsCompletion {
+    answer: BoundedResult,
+    witness: WindowsOsExitWitness,
+}
+
+impl OwnedWindowsCompletion {
+    /// Read-only OS diagnostics. These public facts are not a capability issuer.
+    pub fn diagnostic(&self) -> &BoundedResult {
+        &self.answer
+    }
+
+    /// Consume this invocation once, admitting only its exact input and image.
+    /// Response hashing and admission must also finish before the original deadline.
+    #[allow(clippy::result_large_err)] // Keep failure diagnostics identical to the bounded transport result.
+    pub fn into_verified_output(mut self, expected_input: &[u8], expected_artifact: &str) -> Result<Vec<u8>, BoundedResult> {
+        let matches = self.witness.input_sha256 == sha256(expected_input)
+            && self.witness.stdout_sha256 == sha256(&self.answer.stdout)
+            && self.witness.artifact_sha256 == expected_artifact
+            && self.witness.pin.sha256() == expected_artifact;
+        let expired = std::time::Instant::now() >= self.witness.deadline;
+        if !matches || expired {
+            return Err(withhold(self.answer, expired));
+        }
+        Ok(std::mem::take(&mut self.answer.stdout))
+    }
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn withhold(mut answer: BoundedResult, expired: bool) -> BoundedResult {
+    if expired {
+        answer.timed_out = true;
+        if let Some(receipt) = answer.process_receipt.as_mut().filter(|receipt| receipt.stop == ProcessStop::Completed) {
+            receipt.stop = ProcessStop::Timeout;
+        }
+    }
+    answer.code = None;
+    answer.stdout.clear();
+    answer.stderr.clear();
+    answer
+}
+
+#[allow(clippy::result_large_err)] // The public owned API deliberately returns the existing complete diagnostic type.
+pub(super) async fn run_owned(
+    pin: PinnedWindowsExecutable,
+    command: &std::process::Command,
+    environment: &[(OsString, OsString)],
+    input: &[u8],
+    deadline: std::time::Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<OwnedWindowsCompletion, BoundedResult> {
+    if deadline > pin.deadline() {
+        // A caller may shorten the lease's original budget, never restart or
+        // extend it between pinning and actual process creation.
+        return Err(BoundedResult { process_receipt: Some(ProcessReceipt::default()), ..Default::default() });
+    }
+    let (answer, job) = run_inner(command, environment, input, deadline, stdout_limit, stderr_limit, Some(&pin)).await;
+    if answer.code != Some(0)
+        || answer.timed_out
+        || answer.output_limited
+        || answer.spawn_failed
+        || !answer.process_receipt.as_ref().is_some_and(|receipt| receipt.stop == ProcessStop::Completed && receipt.cleanup_confirmed())
+    {
+        return Err(withhold(answer, std::time::Instant::now() >= deadline));
+    }
+    let Some(job) = job else {
+        return Err(withhold(answer, false));
+    };
+    let input_sha256 = sha256(input);
+    let stdout_sha256 = sha256(&answer.stdout);
+    let artifact_sha256 = pin.sha256().to_owned();
+    // Hashing and the final actual completion admission share the caller's
+    // absolute budget. Neither a public receipt nor a caller marker mints this.
+    if std::time::Instant::now() >= deadline {
+        return Err(withhold(answer, true));
+    }
+    Ok(OwnedWindowsCompletion { answer, witness: WindowsOsExitWitness { _job: job, pin, input_sha256, stdout_sha256, artifact_sha256, deadline } })
+}
+
+async fn run_inner(
+    command: &std::process::Command,
+    environment: &[(OsString, OsString)],
+    input: &[u8],
+    deadline: std::time::Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    pin: Option<&PinnedWindowsExecutable>,
+) -> (BoundedResult, Option<Job>) {
     let mut answer = BoundedResult::default();
     let mut receipt = ProcessReceipt::default();
     let deadline = Instant::from_std(deadline);
@@ -723,7 +857,7 @@ pub(super) async fn run(
             stderr.server.connect().await?;
             let mut job = Job::new()?;
             let spawn = spawn_owned(
-                SpawnContext { command, environment, deadline },
+                SpawnContext { command, environment, deadline, pin },
                 &job,
                 [&input_pipe.client, &stdout.client, &stderr.client],
                 &mut answer.spawn_failed,
@@ -772,7 +906,7 @@ pub(super) async fn run(
             receipt.stop = ProcessStop::SpawnFailed;
         }
         answer.process_receipt = Some(receipt);
-        return answer;
+        return (answer, None);
     };
     receipt.stop = ProcessStop::Completed;
     let input = input.to_vec();
@@ -862,7 +996,7 @@ pub(super) async fn run(
     answer.code = receipt.root_exit_code;
     answer.process_receipt = Some(receipt);
     answer.seal_windows_payload(Instant::now() >= deadline);
-    answer
+    (answer, Some(job))
 }
 
 #[cfg(test)]
@@ -991,7 +1125,7 @@ mod tests {
         let mut spawn_failed = false;
         let spawn_deadline = Instant::now() + Duration::from_secs(5);
         let (root, thread) = spawn_owned(
-            SpawnContext { command: &command, environment: &[], deadline: spawn_deadline },
+            SpawnContext { command: &command, environment: &[], deadline: spawn_deadline, pin: None },
             &job,
             [&stdio[0], &stdio[1], &stdio[2]],
             &mut spawn_failed,

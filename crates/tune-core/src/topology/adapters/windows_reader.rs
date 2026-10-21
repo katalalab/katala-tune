@@ -44,6 +44,8 @@ pub struct ReaderRequest {
     pub git_program: String,
     pub limits: TopologyLimits,
     pub budget_ms: u64,
+    /// Legacy wire key: v1 hashes embedded PS; native v2 hashes the source backend.
+    /// Neither digest establishes executable artifact identity or permission.
     pub probe_sha256: String,
 }
 
@@ -83,6 +85,13 @@ pub fn valid_program_path(value: &str) -> bool {
 }
 
 impl ReaderRequest {
+    pub fn from_remote_native(request: &RemoteRequest, nonce: String, budget_ms: u64) -> Result<Self, ReaderError> {
+        let mut value = Self::from_remote(request, nonce, budget_ms)?;
+        value.schema = super::native_protocol::REQUEST_SCHEMA.into();
+        value.probe_sha256 = super::native_protocol::source_backend_sha256();
+        value.validate()?;
+        Ok(value)
+    }
     pub fn from_remote(request: &RemoteRequest, nonce: String, budget_ms: u64) -> Result<Self, ReaderError> {
         let value = Self {
             schema: REQUEST_SCHEMA.into(),
@@ -124,7 +133,8 @@ impl ReaderRequest {
         }
     }
     pub fn validate(&self) -> Result<(), ReaderError> {
-        if self.schema != REQUEST_SCHEMA
+        let native = self.schema == super::native_protocol::REQUEST_SCHEMA;
+        if (!native && self.schema != REQUEST_SCHEMA)
             || !hex(&self.nonce, 32)
             || self.scope_id.is_empty()
             || self.scope_id.len() > 512
@@ -133,7 +143,7 @@ impl ReaderRequest {
             || !hex(&self.expected_identity_hash, 64)
             || self.expected_runtime != RemoteRuntimeKind::Native
             || self.expected_distro.is_some()
-            || self.probe_sha256 != probe_sha256()
+            || (!native && self.probe_sha256 != probe_sha256())
             || self.budget_ms == 0
             || self.budget_ms > MAX_BUDGET_MS
             || self.budget_ms > self.limits.remote_timeout_seconds.saturating_mul(1000)
@@ -143,6 +153,9 @@ impl ReaderRequest {
         }
         // Reuse the product limit ceilings. Deserializing usize alone is not admission.
         TopologyConfig::from_value(Some(&serde_json::json!({"limits":self.limits}))).map_err(|_| ReaderError)?;
+        if native {
+            super::native_protocol::validate_native(self)?;
+        }
         remote::validate_collection(&self.remote_request()).map_err(|_| ReaderError)
     }
 }
@@ -249,7 +262,13 @@ fn receipt_ok(receipt: &ProcessReceipt, nonce: &str) -> bool {
     receipt.stop == ProcessStop::Completed && receipt.root_exit_code == Some(0) && receipt.owner_session != nonce && receipt.cleanup_confirmed()
 }
 pub fn encode_response(request: &ReaderRequest, request_bytes: &[u8], output: BoundedResult) -> Result<Vec<u8>, ReaderError> {
-    if output.code != Some(0) || output.spawn_failed || output.timed_out || output.output_limited || output.stdout.len() > request.limits.stdout_bytes {
+    if request.schema != REQUEST_SCHEMA
+        || output.code != Some(0)
+        || output.spawn_failed
+        || output.timed_out
+        || output.output_limited
+        || output.stdout.len() > request.limits.stdout_bytes
+    {
         return Err(ReaderError);
     }
     let receipt = output.process_receipt.ok_or(ReaderError)?;
@@ -276,6 +295,9 @@ pub fn encode_response(request: &ReaderRequest, request_bytes: &[u8], output: Bo
     write_frame(&header, &output.stdout)
 }
 pub fn decode_response<'a>(bytes: &'a [u8], request: &ReaderRequest, request_bytes: &[u8]) -> Result<&'a [u8], ReaderError> {
+    if request.schema != REQUEST_SCHEMA {
+        return Err(ReaderError);
+    }
     let prefix = bytes.get(..PREFIX).ok_or(ReaderError)?;
     let (header_len, capture_len) = lengths(prefix, MAX_RESPONSE_HEADER_BYTES, request.limits.stdout_bytes)?;
     let capture_start = PREFIX.checked_add(header_len).ok_or(ReaderError)?;
@@ -329,14 +351,17 @@ pub fn write_response(writer: &mut impl Write, bytes: &[u8]) -> Result<(), Reade
 
 #[cfg(windows)]
 pub async fn execute(request: &ReaderRequest, request_bytes: &[u8], deadline: std::time::Instant) -> Result<Vec<u8>, ReaderError> {
+    if request.schema != REQUEST_SCHEMA {
+        return Err(ReaderError);
+    }
     request.validate()?;
     if remote::identity_hash(&gethostname::gethostname().to_string_lossy()) != request.expected_identity_hash {
         return Err(ReaderError);
     }
-    let remaining = deadline.checked_duration_since(std::time::Instant::now()).ok_or(ReaderError)?;
     // The guard may spend up to three seconds observing termination. Keep that
     // and output overhead inside the standalone CLI's absolute deadline.
-    let work = remaining.checked_sub(std::time::Duration::from_millis(3500)).filter(|d| !d.is_zero()).ok_or(ReaderError)?;
+    let work_deadline = deadline.checked_sub(std::time::Duration::from_millis(3500)).ok_or(ReaderError)?;
+    let work = work_deadline.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero()).ok_or(ReaderError)?;
     let config = serde_json::json!({"source_allowlist":request.source_allowlist,"scope_id":request.scope_id,"observed_at_ms":request.observed_at_ms,
         "roots":request.roots,"configs":request.configs,"git_program":request.git_program,"limits":request.limits,"cursor":request.cursor,
         "expected_runtime":request.expected_runtime,"expected_distro":request.expected_distro,"expected_identity_hash":request.expected_identity_hash,
@@ -350,11 +375,26 @@ pub async fn execute(request: &ReaderRequest, request_bytes: &[u8], deadline: st
     if script.len() > MAX_REQUEST_BYTES {
         return Err(ReaderError);
     }
-    let loader = remote::WINDOWS_STDIN_LOADER.replace("__BYTES__", &script.len().to_string());
+    // Windows PowerShell inserts user/all-users module paths at startup even
+    // when the process environment is explicit. Disable autoload before any
+    // loader cmdlet and import only the two fixed inbox modules by full path.
+    let prelude = r#"$PSModuleAutoLoadingPreference="None";$env:PSModulePath=$PSHOME+"\Modules";Import-Module -Name ($PSHOME+"\Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1") -ErrorAction Stop;Import-Module -Name ($PSHOME+"\Modules\Microsoft.PowerShell.Management\Microsoft.PowerShell.Management.psd1") -ErrorAction Stop;"#;
+    let loader = format!("{prelude}{}", remote::WINDOWS_STDIN_LOADER.replace("__BYTES__", &script.len().to_string()));
     let loader = crate::logs::base64(&loader.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>());
     let args = vec!["-NoLogo".into(), "-NoProfile".into(), "-NonInteractive".into(), "-EncodedCommand".into(), loader];
     let program = powershell_program()?;
-    let output = crate::collect::run_bounded(&program, &args, &script, work, request.limits.stdout_bytes, request.limits.stderr_bytes).await;
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    let environment = super::native_reader::environment(&super::native_reader::windows::WindowsSourceIo::default()).map_err(|_| ReaderError)?;
+    let output = crate::collect::run_standalone_windows_bounded(
+        &command,
+        crate::collect::StandaloneWindowsEnvironment::new(&environment),
+        &script,
+        work_deadline,
+        request.limits.stdout_bytes,
+        request.limits.stderr_bytes,
+    )
+    .await;
     if output.code != Some(0)
         || output.spawn_failed
         || output.timed_out
