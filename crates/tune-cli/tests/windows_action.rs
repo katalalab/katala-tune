@@ -91,12 +91,15 @@ mod windows {
         mut reader: BufReader<std::process::ChildStdout>,
         body: &[u8],
         nonce: &str,
-    ) -> (std::process::ExitStatus, Vec<u8>) {
+    ) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
         child.stdin.as_mut().unwrap().write_all(&request(nonce, body)).unwrap();
         child.stdin.take();
         let mut response = Vec::new();
         reader.read_to_end(&mut response).unwrap();
-        (finite(&mut child, Duration::from_secs(10)), response)
+        let status = finite(&mut child, Duration::from_secs(10));
+        let mut diagnostic = Vec::new();
+        child.stderr.take().unwrap().read_to_end(&mut diagnostic).unwrap();
+        (status, response, diagnostic)
     }
 
     fn result(nonce: &str, body: &[u8], code: i32, stdout: usize, stderr: usize) -> Vec<u8> {
@@ -127,9 +130,10 @@ mod windows {
     fn clean_nonzero_action_is_framed_and_receiver_exits_zero() {
         let base = sandbox();
         let (child, reader, nonce) = receiver(&base);
-        let (status, response) = complete(child, reader, b"exit 3", &nonce);
+        let (status, response, diagnostic) = complete(child, reader, b"exit 3", &nonce);
         assert_eq!(status.code(), Some(0));
         assert_eq!(response, result(&nonce, b"exit 3", 3, 0, 0));
+        assert!(diagnostic.is_empty());
         assert!(!base.exists());
     }
 
@@ -140,9 +144,10 @@ mod windows {
         {
             let base = sandbox();
             let (child, reader, nonce) = receiver(&base);
-            let (status, response) = complete(child, reader, body, &nonce);
+            let (status, response, diagnostic) = complete(child, reader, body, &nonce);
             assert_eq!(status.code(), Some(0), "receiver must finish a complete terminal frame");
             assert_eq!(response, result(&nonce, body, action_code, 0, 0));
+            assert!(diagnostic.is_empty());
             assert!(!base.exists());
         }
     }
@@ -152,10 +157,11 @@ mod windows {
         let body = b"Write-Error 'fixture'";
         let base = sandbox();
         let (child, reader, nonce) = receiver(&base);
-        let (status, response) = complete(child, reader, body, &nonce);
+        let (status, response, diagnostic) = complete(child, reader, body, &nonce);
         assert_eq!(status.code(), Some(0));
         assert_eq!(terminal_code(&response), 7);
         assert!(response.starts_with(&format!("KT2 RESULT {nonce} {} 7 ", tune_core::db::sha256_hex(body)).into_bytes()));
+        assert!(diagnostic.is_empty());
         assert!(!base.exists());
     }
 
@@ -164,12 +170,13 @@ mod windows {
         let exact = b"$o=[Console]::OpenStandardOutput();$e=[Console]::OpenStandardError();$b=New-Object byte[] 65536;$o.Write($b,0,$b.Length);$e.Write($b,0,$b.Length);exit 0";
         let base = sandbox();
         let (child, reader, nonce) = receiver(&base);
-        let (status, response) = complete(child, reader, exact, &nonce);
+        let (status, response, diagnostic) = complete(child, reader, exact, &nonce);
         assert_eq!(status.code(), Some(0));
         let header = result(&nonce, exact, 0, 65_536, 65_536);
         assert_eq!(&response[..header.len()], header);
         assert_eq!(response.len(), header.len() + 131_072);
         assert!(response[header.len()..].iter().all(|byte| *byte == 0));
+        assert!(diagnostic.is_empty());
         assert!(!base.exists());
 
         for oversized in [
@@ -178,9 +185,13 @@ mod windows {
         ] {
             let base = sandbox();
             let (child, reader, nonce) = receiver(&base);
-            let (status, response) = complete(child, reader, oversized, &nonce);
-            assert_eq!(status.code(), Some(7));
+            let (status, response, diagnostic) = complete(child, reader, oversized, &nonce);
+            assert_eq!(status.code(), Some(7), "receiver diagnostic: {}", String::from_utf8_lossy(&diagnostic));
             assert!(response.is_empty());
+            assert_eq!(
+                String::from_utf8(diagnostic).unwrap(),
+                "KT2 DIAG stage=backend outcome=output_limited timed_out=0 output_limited=1 spawn_failed=0 receipt_stop=completed cleanup_confirmed=1 elapsed=0_5s\n"
+            );
             assert!(!base.exists());
         }
     }
@@ -217,9 +228,10 @@ mod windows {
         let body = b"$p=New-Object System.Diagnostics.Process;$p.StartInfo.FileName=$env:ComSpec;$p.StartInfo.Arguments='/c ping -n 30 127.0.0.1 >NUL';$p.StartInfo.UseShellExecute=$false;[void]$p.Start();exit 0";
         let base = sandbox();
         let (child, reader, nonce) = receiver(&base);
-        let (status, response) = complete(child, reader, body, &nonce);
+        let (status, response, diagnostic) = complete(child, reader, body, &nonce);
         assert_eq!(status.code(), Some(7));
         assert!(response.is_empty());
+        assert!(!diagnostic.is_empty());
         assert!(!base.exists());
     }
 }

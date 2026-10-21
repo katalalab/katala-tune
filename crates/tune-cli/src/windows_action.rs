@@ -1,6 +1,37 @@
 //! Dedicated one-shot Windows action receiver. It runs before application setup.
 use std::{process::ExitCode, time::Instant};
 
+#[cfg(any(windows, test))]
+struct Diagnostic<'a> {
+    stage: &'a str,
+    outcome: &'a str,
+    timed_out: bool,
+    output_limited: bool,
+    spawn_failed: bool,
+    receipt_stop: &'a str,
+    cleanup_confirmed: bool,
+    elapsed: std::time::Duration,
+}
+
+#[cfg(any(windows, test))]
+fn diagnostic_line(diagnostic: Diagnostic<'_>) -> String {
+    let elapsed = match diagnostic.elapsed.as_secs() {
+        0..=4 => "0_5s",
+        5..=7 => "5_8s",
+        _ => "8s_plus",
+    };
+    format!(
+        "KT2 DIAG stage={} outcome={} timed_out={} output_limited={} spawn_failed={} receipt_stop={} cleanup_confirmed={} elapsed={elapsed}\n",
+        diagnostic.stage,
+        diagnostic.outcome,
+        u8::from(diagnostic.timed_out),
+        u8::from(diagnostic.output_limited),
+        u8::from(diagnostic.spawn_failed),
+        diagnostic.receipt_stop,
+        u8::from(diagnostic.cleanup_confirmed),
+    )
+}
+
 #[cfg(not(windows))]
 pub fn main(_args: &[String], _started: Instant) -> ExitCode {
     ExitCode::from(2)
@@ -130,18 +161,33 @@ fn receive_once(
     // recorded admission and returned this acknowledgement.
     events.send(Event::Admitted).map_err(|_| ReceiverError)?;
     ack.recv().map_err(|_| ReceiverError)?;
+    let admitted_at = Instant::now();
     if Instant::now() >= backend_end {
+        emit_diagnostic("backend", "deadline_before_start", None, admitted_at.elapsed());
         return Err(ReceiverError);
     }
-    let shell = powershell_path()?;
+    let shell = match powershell_path() {
+        Ok(shell) => shell,
+        Err(_) => {
+            emit_diagnostic("setup", "powershell_unavailable", None, admitted_at.elapsed());
+            return Err(ReceiverError);
+        }
+    };
     let mut command = Command::new(shell);
     command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", POWERSHELL_BOOTSTRAP]);
     let environment: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     if environment.is_empty() {
+        emit_diagnostic("setup", "environment_empty", None, admitted_at.elapsed());
         return Err(ReceiverError);
     }
     let encoded = base64(&request.body);
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ReceiverError)?;
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            emit_diagnostic("setup", "runtime_failed", None, admitted_at.elapsed());
+            return Err(ReceiverError);
+        }
+    };
     let result = runtime.block_on(run_standalone_windows_bounded(
         &command,
         StandaloneWindowsEnvironment::new(&environment),
@@ -150,20 +196,80 @@ fn receive_once(
         MAX_BODY_BYTES,
         MAX_BODY_BYTES,
     ));
-    let code = result.code.ok_or(ReceiverError)?;
-    if Instant::now() >= backend_end
-        || result.timed_out
-        || result.output_limited
-        || result.spawn_failed
-        || !matches!(code, 0 | 3 | 4 | 5 | 6 | 7 | 8 | 9)
-        || !result.process_receipt.as_ref().is_some_and(|receipt| receipt.stop == ProcessStop::Completed && receipt.cleanup_confirmed())
-    {
+    let accepted = result.code.is_some_and(|code| matches!(code, 0 | 3 | 4 | 5 | 6 | 7 | 8 | 9))
+        && Instant::now() < backend_end
+        && !result.timed_out
+        && !result.output_limited
+        && !result.spawn_failed
+        && result.process_receipt.as_ref().is_some_and(|receipt| receipt.stop == ProcessStop::Completed && receipt.cleanup_confirmed());
+    if !accepted {
+        emit_diagnostic("backend", backend_outcome(&result, backend_end), Some(&result), admitted_at.elapsed());
         return Err(ReceiverError);
     }
-    writeln!(output, "KT2 RESULT {} {} {} {} {}", nonce, request.sha256, code, result.stdout.len(), result.stderr.len()).map_err(|_| ReceiverError)?;
-    output.write_all(&result.stdout).map_err(|_| ReceiverError)?;
-    output.write_all(&result.stderr).map_err(|_| ReceiverError)?;
-    output.flush().map_err(|_| ReceiverError)
+    let code = result.code.expect("accepted result has an exit code");
+    if writeln!(output, "KT2 RESULT {} {} {} {} {}", nonce, request.sha256, code, result.stdout.len(), result.stderr.len()).is_err() {
+        emit_diagnostic("terminal", "stdout_header_write_failed", Some(&result), admitted_at.elapsed());
+        return Err(ReceiverError);
+    }
+    if output.write_all(&result.stdout).is_err() || output.write_all(&result.stderr).is_err() || output.flush().is_err() {
+        emit_diagnostic("terminal", "stdout_payload_write_failed", Some(&result), admitted_at.elapsed());
+        return Err(ReceiverError);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn backend_outcome(result: &tune_core::collect::BoundedResult, backend_end: Instant) -> &'static str {
+    if Instant::now() >= backend_end {
+        "deadline_elapsed"
+    } else if result.timed_out {
+        "timed_out"
+    } else if result.output_limited {
+        "output_limited"
+    } else if result.spawn_failed {
+        "spawn_failed"
+    } else if result.code.is_none() {
+        "missing_exit_code"
+    } else if !result.code.is_some_and(|code| matches!(code, 0 | 3 | 4 | 5 | 6 | 7 | 8 | 9)) {
+        "unexpected_exit_code"
+    } else {
+        "receipt_unconfirmed"
+    }
+}
+
+#[cfg(windows)]
+fn emit_diagnostic(stage: &str, outcome: &str, result: Option<&tune_core::collect::BoundedResult>, elapsed: std::time::Duration) {
+    use std::io::Write;
+    use tune_core::collect::ProcessStop;
+
+    let (timed_out, output_limited, spawn_failed, receipt_stop, cleanup_confirmed) = match result {
+        Some(result) => {
+            let receipt = result.process_receipt.as_ref();
+            (
+                result.timed_out,
+                result.output_limited,
+                result.spawn_failed,
+                receipt.map_or("absent", |receipt| match receipt.stop {
+                    ProcessStop::SetupFailed => "setup_failed",
+                    ProcessStop::SpawnFailed => "spawn_failed",
+                    ProcessStop::Completed => "completed",
+                    ProcessStop::Timeout => "timeout",
+                    ProcessStop::OutputLimit => "output_limit",
+                    ProcessStop::LingeringDescendants => "lingering_descendants",
+                    ProcessStop::IoFailure => "io_failure",
+                    ProcessStop::CleanupUnconfirmed => "cleanup_unconfirmed",
+                }),
+                receipt.is_some_and(tune_core::collect::ProcessReceipt::cleanup_confirmed),
+            )
+        }
+        None => (false, false, false, "absent", false),
+    };
+    // This runs only in the worker. A blocked stderr may prevent Finished, so
+    // a watchdog deadline can leave no diagnostic line. The main watchdog
+    // retains its deadline and terminates independently.
+    let _ = std::io::stderr().lock().write_all(
+        diagnostic_line(Diagnostic { stage, outcome, timed_out, output_limited, spawn_failed, receipt_stop, cleanup_confirmed, elapsed }).as_bytes(),
+    );
 }
 
 #[cfg(windows)]
@@ -325,5 +431,41 @@ mod tests {
         assert_eq!(base64(b"fo"), b"Zm8=");
         assert_eq!(base64(b"foo"), b"Zm9v");
         assert_eq!(base64("日本語".as_bytes()), b"5pel5pys6Kqe");
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn diagnostic_line_uses_only_fixed_fields_and_elapsed_buckets() {
+        assert_eq!(
+            diagnostic_line(Diagnostic {
+                stage: "backend",
+                outcome: "output_limited",
+                timed_out: false,
+                output_limited: true,
+                spawn_failed: false,
+                receipt_stop: "completed",
+                cleanup_confirmed: true,
+                elapsed: Duration::from_secs(5),
+            }),
+            "KT2 DIAG stage=backend outcome=output_limited timed_out=0 output_limited=1 spawn_failed=0 receipt_stop=completed cleanup_confirmed=1 elapsed=5_8s\n"
+        );
+        assert!(
+            diagnostic_line(Diagnostic {
+                stage: "backend",
+                outcome: "timed_out",
+                timed_out: true,
+                output_limited: false,
+                spawn_failed: false,
+                receipt_stop: "timeout",
+                cleanup_confirmed: false,
+                elapsed: Duration::from_secs(8),
+            })
+            .ends_with("elapsed=8s_plus\n")
+        );
     }
 }
