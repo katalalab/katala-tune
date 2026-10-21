@@ -5,7 +5,7 @@ use std::{process::ExitCode, time::Instant};
 const BUDGET_MS: u64 = 120_000;
 #[cfg(any(windows, test))]
 const MAX_PROBE_PAYLOAD_BYTES: usize = 128 * 1024;
-#[cfg(any(windows, test))]
+#[cfg(test)]
 const WINDOWS_COMMAND_LINE_LIMIT: usize = 32_767;
 /// The probe accepts partial snapshots from its permissive observations.  Do
 /// not use the action bootstrap here: it turns a tolerated native observation
@@ -73,7 +73,7 @@ fn powershell_stdin(payload: &str) -> Option<Vec<u8>> {
     (payload.len() <= MAX_PROBE_PAYLOAD_BYTES).then(|| super::windows_action::base64(payload.as_bytes()))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn windows_argv_units(executable: &str, args: &[&str]) -> usize {
     executable.encode_utf16().count() + 3 + args.iter().map(|arg| arg.encode_utf16().count() + 3).sum::<usize>()
 }
