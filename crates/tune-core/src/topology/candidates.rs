@@ -1,4 +1,4 @@
-//! Separate Docker Partial observations. No production admission issuer exists.
+//! Separate Docker Partial observations, admitted only by the actual local IPC issuer.
 use crate::topology::{Edge, Entity};
 use serde::{Deserialize, Serialize};
 
@@ -48,11 +48,13 @@ impl CandidateAttempt {
     }
 }
 
-/// Move-only exact payload authority. Only a cfg(test) synthetic issuer exists.
+/// Move-only exact payload authority. The API issuer owns actual IPC; tests have a separate synthetic issuer.
 pub struct AdmittedDockerPartial {
     attempt: CandidateAttempt,
     payload: DockerCandidatePayload,
     digest: String,
+    // Private actual batch transcript + exact payload + reservation binding; never a JSON claim.
+    _origin_digest: String,
 }
 impl AdmittedDockerPartial {
     pub(crate) fn parts(self) -> (CandidateAttempt, DockerCandidatePayload, String) {
@@ -61,12 +63,35 @@ impl AdmittedDockerPartial {
     #[cfg(test)]
     pub(crate) fn synthetic(attempt: CandidateAttempt, payload: DockerCandidatePayload) -> Self {
         let digest = crate::db::sha256_hex(&serde_json::to_vec(&payload).unwrap());
-        Self { attempt, payload, digest }
+        Self { attempt, payload, digest, _origin_digest: "synthetic-test-only".into() }
     }
     #[cfg(test)]
     pub(crate) fn tamper(&mut self, change: impl FnOnce(&mut DockerCandidatePayload)) {
         change(&mut self.payload);
     }
+}
+
+/// A reservation is consumed once; only actual I/O ownership can reach this production issuer.
+pub(crate) fn admit_api(
+    actual: crate::topology::adapters::docker_api::ApiObservation,
+    attempt: CandidateAttempt,
+) -> Result<crate::topology::adapters::docker_api::DirectBatch, &'static str> {
+    let (snapshots, payloads, batch_digest) = actual.project()?;
+    let CandidateAttempt { id, ordinal, holder, writer_generation } = attempt;
+    let mut admissions = std::collections::HashMap::new();
+    for payload in payloads {
+        let bytes = validate(&payload, crate::db::now_ms())?;
+        let digest = crate::db::sha256_hex(&bytes);
+        let origin = crate::db::sha256_hex(
+            &serde_json::to_vec(&(&batch_digest, &digest, &payload.scope_id, &id, ordinal, &holder, writer_generation))
+                .map_err(|_| "invalid Docker admission binding")?,
+        );
+        let token = CandidateAttempt { id: id.clone(), ordinal, holder: holder.clone(), writer_generation };
+        actual.check()?;
+        admissions.insert(payload.scope_id.clone(), AdmittedDockerPartial { attempt: token, payload, digest, _origin_digest: origin });
+    }
+    actual.check()?;
+    Ok(crate::topology::adapters::docker_api::DirectBatch { snapshots, admissions })
 }
 
 pub(crate) fn validate(payload: &DockerCandidatePayload, now: i64) -> Result<Vec<u8>, &'static str> {
