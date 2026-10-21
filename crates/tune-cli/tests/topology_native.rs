@@ -353,12 +353,19 @@ mod native_windows {
             let request = fixture.request(30_000);
             let started = Instant::now();
             let (output, retained, body) = run(&fixture, entry, &request, true, &digest);
-            eprintln!(
-                "native_role={entry} elapsed_ms={} code={:?} stdout_len={} stderr_len={}",
-                started.elapsed().as_millis(),
-                output.status.code(),
-                output.stdout.len(),
-                output.stderr.len()
+            // Direct test stderr keeps successful observations visible even
+            // when libtest captures print macros. Product output is unchanged.
+            assert!(
+                writeln!(
+                    std::io::stderr().lock(),
+                    "native_role={entry} elapsed_ms={} code={:?} stdout_len={} stderr_len={}",
+                    started.elapsed().as_millis(),
+                    output.status.code(),
+                    output.stdout.len(),
+                    output.stderr.len()
+                )
+                .is_ok(),
+                "sanitized native-role observations must be recorded"
             );
             if !output.status.success() {
                 failed_roles.push(entry);
