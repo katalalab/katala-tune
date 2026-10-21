@@ -10,7 +10,9 @@ const { loadConfig } = require('../lib/nodes');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
+const { EventEmitter } = require('node:events');
+const { PassThrough } = require('node:stream');
 const probe = fs.readFileSync(path.join(__dirname, '..', 'probes', 'win_probe.ps1'), 'utf8');
 const windowsPowerShell = process.env.KT_GPU_POWERSHELL || 'powershell.exe';
 
@@ -287,6 +289,68 @@ test('KT2 exchange waits for READY before its only request and classifies termin
   const oversized = `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('KT2 RESULT ${nonce} ${bodyHash} 0 65537 0\\n'+'x'.repeat(65537))});`;
   const over = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', oversized] }, timeoutMs: 1000 });
   assert.equal(over.code, 7);
+});
+
+test('KT2 controller は単調期限、厳密な結果枠、stdin/stdio 境界を一回の子で検証する', async () => {
+  const body = Buffer.from('action body', 'utf8');
+  const nonce = 'e'.repeat(64);
+  const helper = 'b'.repeat(64);
+  const hash = require('node:crypto').createHash('sha256').update(body).digest('hex');
+  const node2 = { ...node, local: false };
+  const exchange = (script, options = {}) => actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', script] }, timeoutMs: 1000, ...options });
+  const result = (fields, payload = '', stderr = '') => `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('KT2 RESULT '+${JSON.stringify(fields)}+'\\n'+${JSON.stringify(payload)});process.stderr.write(${JSON.stringify(stderr)})});`;
+
+  let spawns = 0;
+  const valid = await exchange(result(`${nonce} ${hash} 0 2 0`, 'ok'), { spawnChild: (...args) => { spawns += 1; return spawn(...args); } });
+  assert.deepEqual(valid, { code: 0, out: 'ok', err: '' });
+  assert.equal(spawns, 1, 'KT2 exchange does not retry or send a second request');
+
+  const originalDateNow = Date.now;
+  Date.now = () => originalDateNow() + 24 * 60 * 60 * 1000;
+  try {
+    assert.equal((await exchange(result(`${nonce} ${hash} 0 0 0`))).code, 0, 'wall-clock jumps do not change the monotonic deadline');
+  } finally { Date.now = originalDateNow; }
+
+  for (const fields of [
+    `${nonce} ${'0'.repeat(64)} 0 0 0`,
+    `${'f'.repeat(64)} ${hash} 0 0 0`,
+    `${nonce} ${hash} 0 00 0`,
+    `${nonce} ${hash} 0 65537 0`,
+    `${nonce} ${hash} 0 0 65537`,
+  ]) assert.equal((await exchange(result(fields))).code, 7, fields);
+
+  const duplicate = result(`${nonce} ${hash} 0 0 0`) + `process.stdin.on('end',()=>process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 0 0\\n'));`;
+  assert.equal((await exchange(duplicate)).code, 7);
+  const exact = await exchange(result(`${nonce} ${hash} 0 65536 65536`, 'o'.repeat(65536) + 'e'.repeat(65536), 'z'.repeat(65536)));
+  assert.equal(exact.code, 0);
+  assert.equal(Buffer.byteLength(exact.out), 65536);
+  assert.equal(Buffer.byteLength(exact.err), 65536);
+  assert.equal((await exchange(result(`${nonce} ${hash} 0 0 0`, '', 'z'.repeat(65537)))).code, 7);
+
+  const closedStdin = () => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = new EventEmitter();
+    child.stdin.destroy = () => {};
+    child.stdin.end = (_request, callback) => {
+      callback(new Error('EPIPE'));
+      child.stdout.end(`KT2 RESULT ${nonce} ${hash} 0 0 0\n`);
+      child.emit('close', 0);
+    };
+    child.kill = () => {};
+    queueMicrotask(() => child.stdout.write(`KT2 READY ${nonce}\n`));
+    return child;
+  };
+  assert.equal((await actionExchange(node2, helper, body, { spawnChild: closedStdin, timeoutMs: 1000 })).code, 7, 'a failed post-READY write is outcome-unverified');
+  const afterReadyDeadline = `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 0 0\\n'),1000));`;
+  assert.equal((await exchange(afterReadyDeadline, { timeoutMs: 100 })).code, 7);
+  const heldStderr = `const cp=require('node:child_process');process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 0 0\\n');cp.spawn(process.execPath,['-e','setTimeout(()=>{},2000)'],{stdio:['ignore','ignore',process.stderr]})});`;
+  assert.equal((await exchange(heldStderr, { timeoutMs: 150 })).code, 7);
+
+  const oversizedHeader = `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write('x'.repeat(131073)));`;
+  assert.equal((await exchange(oversizedHeader)).code, 7, 'result headers never buffer payload-sized data before rejecting');
+  assert.equal((await actionExchange(node2, helper, Buffer.alloc(65537), { timeoutMs: 1000 })).code, 9);
 });
 
 test('protect_gpu は任意の真偽値で、属性の無い既存台帳を変えない', () => {

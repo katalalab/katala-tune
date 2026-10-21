@@ -494,14 +494,15 @@ async fn action_exchange_command(mut c: Command, body: &[u8], timeout: Duration)
     // The remote receiver can observe any part of this frame. From this point on,
     // a local transport failure cannot prove that the action did not run.
     let committed = true;
-    if tokio::time::timeout_at(end, async {
-        stdin.write_all(request.as_bytes()).await?;
-        stdin.write_all(body).await?;
-        stdin.shutdown().await
-    })
-    .await
-    .is_err()
-    {
+    if !matches!(
+        tokio::time::timeout_at(end, async {
+            stdin.write_all(request.as_bytes()).await?;
+            stdin.write_all(body).await?;
+            stdin.shutdown().await
+        })
+        .await,
+        Ok(Ok(()))
+    ) {
         return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 request outcome unverified").await;
     }
     drop(stdin);
@@ -1097,5 +1098,66 @@ sys.exit({exit})"#,
         assert_eq!(ssh_nonzero.code, Some(7));
         let held_eof = run_fixture(fixture(&hash, 0, true), Duration::from_millis(250)).await;
         assert_eq!(held_eof.code, Some(7));
+    }
+
+    #[tokio::test]
+    async fn kt2_exchange_rejects_closed_stdin_and_noncanonical_result_boundaries() {
+        if cfg!(windows) {
+            return;
+        }
+        let nonce = "e".repeat(64);
+        let body = b"action body";
+        let hash = crate::db::sha256_hex(body);
+        let run_fixture = |script: String, timeout: Duration| async move {
+            let mut command = Command::new("/usr/bin/env");
+            command.args(["python3", "-c", &script]);
+            action_exchange_command(command, body, timeout).await
+        };
+        let fixture = |fields: String, out: usize, err: usize, exit: i32, hold: bool| {
+            format!(
+                r#"import hashlib,sys,time
+sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush()
+line=sys.stdin.buffer.readline().decode('ascii').strip().split(' ')
+payload=sys.stdin.buffer.read()
+if len(line)!=5 or line[:3]!=['KT2','REQUEST','{nonce}'] or int(line[3])!=len(payload) or line[4]!=hashlib.sha256(payload).hexdigest(): sys.exit(92)
+sys.stdout.write('KT2 RESULT {fields}\n');sys.stdout.write('o'*{out});sys.stdout.flush()
+sys.stderr.write('z'*{err});sys.stderr.flush()
+if {hold}: time.sleep(2)
+sys.exit({exit})"#,
+                hold = if hold { "True" } else { "False" },
+            )
+        };
+
+        // Closing the receiver read end after READY makes write_all/shutdown return
+        // Ok(Err(_)); that is still after-commit uncertainty, never a successful 0.
+        let closed_stdin = format!(
+            r#"import os,sys,time
+sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush();os.close(0);time.sleep(.05)
+sys.stdout.write('KT2 RESULT {nonce} {hash} 0 0 0\n');sys.stdout.flush()"#,
+        );
+        assert_eq!(run_fixture(closed_stdin, Duration::from_secs(2)).await.code, Some(7));
+
+        for fields in [
+            format!("{nonce} {} 0 0 0", "0".repeat(64)),
+            format!("{} {hash} 0 0 0", "f".repeat(64)),
+            format!("{nonce} {hash} 0 00 0"),
+            format!("{nonce} {hash} 0 65537 0"),
+            format!("{nonce} {hash} 0 0 65537"),
+        ] {
+            assert_eq!(run_fixture(fixture(fields, 0, 0, 0, false), Duration::from_secs(2)).await.code, Some(7));
+        }
+        let duplicate = format!(
+            r#"import hashlib,sys
+sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush()
+line=sys.stdin.buffer.readline().decode('ascii').strip().split(' ');payload=sys.stdin.buffer.read()
+if len(line)!=5 or line[4]!=hashlib.sha256(payload).hexdigest(): sys.exit(92)
+sys.stdout.write('KT2 RESULT {nonce} {hash} 0 0 0\nKT2 RESULT {nonce} {hash} 0 0 0\n');sys.stdout.flush()"#,
+        );
+        assert_eq!(run_fixture(duplicate, Duration::from_secs(2)).await.code, Some(7));
+        let exact = run_fixture(fixture(format!("{nonce} {hash} 0 65536 65536"), 131_072, 65_536, 0, false), Duration::from_secs(3)).await;
+        assert_eq!(exact.code, Some(0));
+        assert_eq!((exact.out.len(), exact.err.len()), (65_536, 65_536));
+        assert_eq!(run_fixture(fixture(format!("{nonce} {hash} 0 0 0"), 0, 65_537, 0, false), Duration::from_secs(2)).await.code, Some(7));
+        assert_eq!(run_fixture(fixture(format!("{nonce} {hash} 0 0 0"), 0, 0, 0, true), Duration::from_millis(250)).await.code, Some(7));
     }
 }
