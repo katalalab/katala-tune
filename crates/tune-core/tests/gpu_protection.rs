@@ -104,7 +104,7 @@ fn plans_recheck_gpu_and_ledger_attribute_is_optional() {
 async fn remote_windows_gpu_action_uses_kt2_exchange_and_script_body() {
     let runner = CaptureRunner::default();
     let node = Node::from_value(
-        &json!({"id":"w","alias":"w","os":"windows","action_helper":{"schema":"katala-tune/action-helper/v1","source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tune_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","manifest_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","run_id":1,"attempt":1}}),
+        &json!({"id":"w","alias":"w","os":"windows","action_helper":{"schema":"katala-tune/action-helper/v2","source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tune_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","manifest_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","run_id":1,"attempt":1}}),
         "other",
     );
     let action =
@@ -125,7 +125,8 @@ async fn remote_windows_action_refuses_absent_or_nonclosed_approved_helper_befor
     let action = json!({"type":"kill-process","params":{"pid":4242,"name":"Worker","start":"20261021010101000","min_cpu":1}});
     for value in [
         json!({ "id": "w", "alias": "w", "os": "windows" }),
-        json!({ "id": "w", "alias": "w", "os": "windows", "action_helper": { "schema":"katala-tune/action-helper/v1", "source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "tune_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "manifest_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "run_id":1, "attempt":1, "extra":true } }),
+        json!({ "id": "w", "alias": "w", "os": "windows", "action_helper": { "schema":"katala-tune/action-helper/v1", "source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "tune_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "manifest_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "run_id":1, "attempt":1 } }),
+        json!({ "id": "w", "alias": "w", "os": "windows", "action_helper": { "schema":"katala-tune/action-helper/v2", "source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "tune_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "manifest_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "run_id":1, "attempt":1, "extra":true } }),
     ] {
         let runner = CaptureRunner::default();
         let node = Node::from_value(&value, "other");

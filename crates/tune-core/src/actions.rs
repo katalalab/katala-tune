@@ -38,14 +38,14 @@ static LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.-]{1,
 pub(crate) static LAUNCH_AGENTS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^/Users/[A-Za-z0-9_.-]+/Library/LaunchAgents/[A-Za-z0-9_.-]+\.plist$").expect("LAUNCH_AGENTS"));
 
-fn action_helper(node: &Node) -> Result<String, String> {
+pub(crate) fn action_helper(node: &Node) -> Result<String, String> {
     let Some(helper) = node.get("action_helper").and_then(Value::as_object) else {
         return Err("approved action helper record が無いため実行しない".into());
     };
     let string = |key: &str| helper.get(key).and_then(Value::as_str);
     let positive = |key: &str| helper.get(key).and_then(Value::as_i64).is_some_and(|v| v > 0 && v <= 9_007_199_254_740_991);
     let valid = helper.len() == 6
-        && string("schema") == Some("katala-tune/action-helper/v1")
+        && string("schema") == Some("katala-tune/action-helper/v2")
         && string("source_sha").is_some_and(|v| LOWER_HEX_40.is_match(v))
         && string("tune_sha256").is_some_and(|v| LOWER_HEX_64.is_match(v))
         && string("manifest_sha256").is_some_and(|v| LOWER_HEX_64.is_match(v))

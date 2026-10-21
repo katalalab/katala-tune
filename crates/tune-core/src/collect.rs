@@ -378,6 +378,10 @@ pub trait Runner: Send + Sync {
     fn action_exchange<'a>(&'a self, _node: &'a Node, _helper_sha256: &'a str, _body: &'a [u8], _timeout: Duration) -> RunFuture<'a> {
         Box::pin(async { RunResult { code: Some(9), out: String::new(), err: "KT2 action exchange is unavailable; operation refused".into() } })
     }
+    /// Windows probe は固定 helper 専用の有限 transport だけを通す。
+    fn probe_exchange<'a>(&'a self, _node: &'a Node, _helper_sha256: &'a str, _benchmark: bool, _network: bool, _observe_wsl: bool) -> RunFuture<'a> {
+        Box::pin(async { RunResult { code: Some(9), out: String::new(), err: "Windows probe exchange is unavailable; collection refused".into() } })
+    }
 }
 
 /// 本物の子プロセスを起こす
@@ -398,6 +402,120 @@ impl Runner for System {
     }
     fn action_exchange<'a>(&'a self, node: &'a Node, helper_sha256: &'a str, body: &'a [u8], timeout: Duration) -> RunFuture<'a> {
         Box::pin(action_exchange_system(node, helper_sha256, body, timeout))
+    }
+    fn probe_exchange<'a>(&'a self, node: &'a Node, helper_sha256: &'a str, benchmark: bool, network: bool, observe_wsl: bool) -> RunFuture<'a> {
+        Box::pin(probe_exchange_system(node, helper_sha256, benchmark, network, observe_wsl))
+    }
+}
+
+fn windows_probe_args(helper_sha256: &str, benchmark: bool, network: bool, observe_wsl: bool) -> Vec<String> {
+    vec![
+        "windows-probe-v1".into(),
+        "--helper-sha256".into(),
+        helper_sha256.into(),
+        "--benchmark".into(),
+        u8::from(benchmark).to_string(),
+        "--network".into(),
+        u8::from(network).to_string(),
+        "--observe-wsl".into(),
+        u8::from(observe_wsl).to_string(),
+        "--budget-ms".into(),
+        "120000".into(),
+    ]
+}
+
+async fn probe_exchange_system(node: &Node, helper_sha256: &str, benchmark: bool, network: bool, observe_wsl: bool) -> RunResult {
+    if node.refusal().is_some() || !lower_hex(helper_sha256, 64) {
+        return RunResult { code: Some(9), out: String::new(), err: "Windows probe request is invalid; collection refused".into() };
+    }
+    let args = windows_probe_args(helper_sha256, benchmark, network, observe_wsl);
+    if node.local {
+        #[cfg(windows)]
+        {
+            let home = crate::nodes::home();
+            let helper = home.join(".katala-tune").join("bin").join("tune.exe");
+            if !home.is_absolute()
+                || !helper.is_absolute()
+                || home.components().any(|part| matches!(part, std::path::Component::CurDir | std::path::Component::ParentDir))
+            {
+                return RunResult { code: Some(9), out: String::new(), err: "Windows probe helper path is invalid; collection refused".into() };
+            }
+            return probe_exchange_command(command(&helper), &args).await;
+        }
+        #[cfg(not(windows))]
+        return RunResult { code: Some(9), out: String::new(), err: "Windows probe is unavailable on this platform".into() };
+    }
+    let remote = format!(
+        r#"exec "$HOME/.katala-tune/bin/tune.exe" windows-probe-v1 --helper-sha256 {helper_sha256} --benchmark {} --network {} --observe-wsl {} --budget-ms 120000"#,
+        u8::from(benchmark),
+        u8::from(network),
+        u8::from(observe_wsl)
+    );
+    let mut command = command("ssh");
+    command.args(ssh_args(&node.alias, &remote));
+    probe_exchange_command(command, &args).await
+}
+
+async fn probe_exchange_command(command: Command, _args: &[String]) -> RunResult {
+    probe_exchange_command_until(command, tokio::time::Instant::now() + Duration::from_secs(135)).await
+}
+
+/// Fixed Windows probe transport.  Unlike generic `run_bounded_portable`, a
+/// probe is successful only when its own child has exited zero *and* stdin,
+/// stdout and stderr have all completed before one monotonic deadline.
+async fn probe_exchange_command_until(mut command: Command, deadline: tokio::time::Instant) -> RunResult {
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    // Leave a bounded cleanup interval inside the one absolute deadline.  A
+    // failed root must be killed and reaped; expiry may never add grace after
+    // the 135-second contract.
+    let now = tokio::time::Instant::now();
+    let remaining = deadline.saturating_duration_since(now);
+    let cleanup = (remaining / 4).min(Duration::from_secs(1));
+    let work_deadline = deadline.checked_sub(cleanup).unwrap_or(deadline);
+    let Ok(mut child) = command.spawn() else {
+        return RunResult { code: Some(9), out: String::new(), err: "Windows probe transport outcome unverified".into() };
+    };
+    let stdin = child.stdin.take();
+    let stdin_ok = tokio::time::timeout_at(work_deadline, async move {
+        if let Some(mut pipe) = stdin {
+            pipe.shutdown().await.map_err(|_| ())?;
+        }
+        Ok::<(), ()>(())
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .is_some();
+    let mut stdout_task = tokio::spawn(read_probe_pipe(child.stdout.take(), 1_048_576));
+    let mut stderr_task = tokio::spawn(read_probe_pipe(child.stderr.take(), 65_536));
+    let status = tokio::time::timeout_at(work_deadline, child.wait()).await.ok().and_then(Result::ok);
+    let stdout = tokio::time::timeout_at(work_deadline, &mut stdout_task).await.ok().and_then(Result::ok).and_then(Result::ok);
+    let stderr = tokio::time::timeout_at(work_deadline, &mut stderr_task).await.ok().and_then(Result::ok).and_then(Result::ok);
+    if !stdin_ok || status.as_ref().and_then(|value| value.code()) != Some(0) || stdout.is_none() || stderr.is_none() {
+        stdout_task.abort();
+        stderr_task.abort();
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout_at(deadline, child.wait()).await;
+        return RunResult { code: Some(9), out: String::new(), err: "Windows probe transport outcome unverified".into() };
+    }
+    RunResult { code: Some(0), out: decode(&stdout.unwrap()), err: decode(&stderr.unwrap()) }
+}
+
+/// EOF is part of the proof: a missing pipe, I/O error, or `limit + 1` byte
+/// invalidates the entire exchange and callers discard even valid JSON prefixes.
+async fn read_probe_pipe<R: AsyncRead + Unpin>(pipe: Option<R>, limit: usize) -> Result<Vec<u8>, ()> {
+    let Some(mut pipe) = pipe else { return Err(()) };
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = pipe.read(&mut chunk).await.map_err(|_| ())?;
+        if count == 0 {
+            return Ok(output);
+        }
+        if output.len().checked_add(count).is_none_or(|size| size > limit) {
+            return Err(());
+        }
+        output.extend_from_slice(&chunk[..count]);
     }
 }
 
@@ -713,28 +831,15 @@ fn mac_ssh_command(benchmark: bool, network: bool) -> String {
     format!("command -v python3 >/dev/null && exec python3 -{suffix} || exec /usr/bin/python3 -{suffix}")
 }
 
-fn windows_probe_flags(network: bool, observe_wsl: bool) -> Vec<&'static str> {
-    let mut flags = Vec::new();
-    if !network {
-        flags.push("-NoNetwork");
-    }
-    if observe_wsl {
-        flags.push("-ObserveWsl");
-    }
-    flags
-}
-
+#[cfg(test)]
 fn windows_ssh_command(benchmark: bool, network: bool, observe_wsl: bool) -> String {
-    let bench = BENCH_PY.replace('\'', "\"");
-    let flags = windows_probe_flags(network, observe_wsl).iter().map(|flag| format!(" {flag}")).collect::<String>();
-    let mut parts = vec![
-        "mkdir -p ~/.katala-tune && cat > ~/.katala-tune/probe.ps1 &&".to_string(),
-        format!("powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$(cygpath -w ~/.katala-tune/probe.ps1)\"{flags};"),
-    ];
-    if benchmark {
-        parts.extend([format!("echo {BENCH_MARK};"), format!("PY=$(command -v python3 || command -v python); [ -n \"$PY\" ] && \"$PY\" -c '{bench}'")]);
-    }
-    parts.join(" ")
+    let hash = "a".repeat(64);
+    format!(
+        r#"exec "$HOME/.katala-tune/bin/tune.exe" windows-probe-v1 --helper-sha256 {hash} --benchmark {} --network {} --observe-wsl {} --budget-ms 120000"#,
+        u8::from(benchmark),
+        u8::from(network),
+        u8::from(observe_wsl)
+    )
 }
 
 /// 1台を調べる。戻り値は `{ node_id, ok, data | error, wall_s, at }`（collect.js と同じ形）。失敗には reason・reason_text が付く
@@ -758,17 +863,11 @@ pub async fn probe_node_with(runner: &dyn Runner, node: &Node) -> Value {
         } else {
             runner.run("ssh", &ssh_args(&node.alias, &mac_ssh_command(benchmark, network)), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
         }
-    } else if node.local {
-        let params = windows_probe_flags(network, observe_wsl).join(" ");
-        let p = runner.local_powershell_file(WIN_PROBE, &params, Duration::from_secs(120)).await;
-        if benchmark {
-            let b = runner.local_python(BENCH_PY, Duration::from_secs(60)).await;
-            RunResult { out: format!("{}\n{BENCH_MARK}\n{}", p.out, b.out), ..p }
-        } else {
-            p
-        }
     } else {
-        runner.run("ssh", &ssh_args(&node.alias, &windows_ssh_command(benchmark, network, observe_wsl)), Some(WIN_PROBE), Duration::from_secs(120)).await
+        match crate::actions::action_helper(node) {
+            Ok(helper) => runner.probe_exchange(node, &helper, benchmark, network, observe_wsl).await,
+            Err(error) => RunResult { code: Some(9), out: String::new(), err: error },
+        }
     };
     let wall_s = started.elapsed().as_secs_f64();
     let (main, bench) = match res.out.split_once(BENCH_MARK) {
@@ -886,6 +985,13 @@ mod tests {
                 RunResult { code: Some(0), out: "{\"probe\":true}\n".into(), err: String::new() }
             })
         }
+        fn probe_exchange<'a>(&'a self, _node: &'a Node, helper: &'a str, benchmark: bool, network: bool, observe_wsl: bool) -> RunFuture<'a> {
+            let args = vec![helper.to_string(), benchmark.to_string(), network.to_string(), observe_wsl.to_string()];
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(("probe".into(), args));
+                RunResult { code: Some(0), out: "{\"probe\":true}\n".into(), err: String::new() }
+            })
+        }
     }
 
     #[tokio::test]
@@ -893,6 +999,7 @@ mod tests {
         for local in [true, false] {
             for configured in [None, Some(false), Some(true)] {
                 let mut value = json!({ "id": "win", "alias": "win", "os": "windows", "benchmark": false });
+                value["action_helper"] = json!({ "schema": "katala-tune/action-helper/v2", "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "tune_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "run_id": 1, "attempt": 1 });
                 if let Some(enabled) = configured {
                     value["wsl"] = json!(enabled);
                     if enabled {
@@ -909,16 +1016,10 @@ mod tests {
                 let calls = runner.calls.lock().unwrap();
                 assert_eq!(calls.len(), 1);
                 let (cmd, args) = &calls[0];
-                let invocation = if local {
-                    assert_eq!(cmd, "local:powershell");
-                    args[0].as_str()
-                } else {
-                    assert_eq!(cmd, "ssh");
-                    args.last().unwrap().as_str()
-                };
-                assert_eq!(invocation.contains("-ObserveWsl"), configured == Some(true), "local={local}, configured={configured:?}, invocation={invocation}");
+                assert_eq!(cmd, "probe");
+                assert_eq!(args[3] == "true", configured == Some(true), "local={local}, configured={configured:?}, args={args:?}");
                 if configured == Some(true) {
-                    assert!(invocation.contains("-NoNetwork -ObserveWsl"), "local={local}, invocation={invocation}");
+                    assert_eq!(&args[1..], ["false", "false", "true"]);
                 }
             }
         }
@@ -970,10 +1071,11 @@ mod tests {
     #[test]
     fn disabled_benchmark_never_sends_fixed_computation() {
         let enabled = windows_ssh_command(true, true, false);
-        assert!(enabled.contains(BENCH_MARK));
-        assert!(enabled.contains("3000000"));
+        assert!(enabled.contains("windows-probe-v1"));
+        assert!(enabled.contains("--benchmark 1"));
         let disabled = windows_ssh_command(false, true, false);
-        assert!(disabled.contains("probe.ps1"));
+        assert!(disabled.contains("--benchmark 0"));
+        assert!(!disabled.contains("probe.ps1"));
         assert!(!disabled.contains(BENCH_MARK));
         assert!(!disabled.contains("3000000"));
         assert!(!disabled.contains("command -v python"));
@@ -988,9 +1090,9 @@ mod tests {
         assert_eq!(mac_probe_args(false, false), vec!["python3", "-", "--skip-benchmark", "nonet"]);
         assert_eq!(mac_ssh_command(false, false).matches(" --skip-benchmark nonet").count(), 2);
         assert!(!mac_ssh_command(true, true).contains("nonet"));
-        assert!(windows_ssh_command(true, false, false).contains("probe.ps1)\" -NoNetwork;"));
-        assert!(windows_ssh_command(true, false, false).contains(BENCH_MARK));
-        assert!(!windows_ssh_command(false, true, false).contains("-NoNetwork"));
+        assert!(windows_ssh_command(true, false, false).contains("--network 0"));
+        assert!(windows_ssh_command(true, false, false).contains("--benchmark 1"));
+        assert!(windows_ssh_command(false, true, false).contains("--network 1"));
     }
 
     #[test]
@@ -1209,5 +1311,76 @@ sys.stderr.write('z');sys.stderr.flush();time.sleep(3)"#,
         confirmed.read_exact(&mut signal).await.unwrap();
         assert_eq!(&signal, b"write-complete");
         assert_eq!(exchange.await.unwrap().code, Some(7));
+    }
+
+    #[tokio::test]
+    async fn fixed_windows_probe_transport_requires_complete_eof_and_exact_caps() {
+        if cfg!(windows) {
+            return;
+        }
+        let run = |script: &str, deadline: Duration| {
+            let script = script.to_string();
+            async move {
+                let mut command = Command::new("/usr/bin/env");
+                command.args(["python3", "-c", &script]);
+                probe_exchange_command_until(command, tokio::time::Instant::now() + deadline).await
+            }
+        };
+        let stdout_exact = run("import sys;sys.stdout.write('x'*1048576)", Duration::from_secs(3)).await;
+        assert_eq!(stdout_exact.code, Some(0));
+        assert_eq!(stdout_exact.out.len(), 1_048_576);
+        let stdout_plus = run("import sys;sys.stdout.write('x'*1048577)", Duration::from_secs(3)).await;
+        assert_eq!((stdout_plus.code, stdout_plus.out.as_str()), (Some(9), ""));
+        let stderr_exact = run("import sys;sys.stderr.write('x'*65536)", Duration::from_secs(3)).await;
+        assert_eq!((stderr_exact.code, stderr_exact.err.len()), (Some(0), 65_536));
+        let stderr_plus = run("import sys;print('{\\\"probe\\\":true}');sys.stderr.write('x'*65537)", Duration::from_secs(3)).await;
+        assert_eq!((stderr_plus.code, stderr_plus.out.as_str()), (Some(9), ""));
+        let dual_plus = run("import sys;sys.stdout.write('x'*1048577);sys.stderr.write('z'*65537)", Duration::from_secs(3)).await;
+        assert_eq!((dual_plus.code, dual_plus.out.as_str()), (Some(9), ""));
+        let nonzero_json = run("import sys;print('{\\\"probe\\\":true}');sys.exit(3)", Duration::from_secs(3)).await;
+        assert_eq!((nonzero_json.code, nonzero_json.out.as_str()), (Some(9), ""));
+        let held_eof = run("import os,time;\nif os.fork()==0: time.sleep(.3);os._exit(0)\nprint('{\\\"probe\\\":true}')", Duration::from_millis(80)).await;
+        assert_eq!((held_eof.code, held_eof.out.as_str()), (Some(9), ""));
+        let missing = probe_exchange_command_until(Command::new("/definitely-not-katala-probe"), tokio::time::Instant::now() + Duration::from_secs(1)).await;
+        assert_eq!(missing.code, Some(9));
+    }
+
+    #[tokio::test]
+    async fn fixed_windows_probe_transport_kills_and_reaps_its_ready_root_on_timeout() {
+        if cfg!(windows) {
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut command = Command::new("/usr/bin/env");
+        command.args([
+            "python3",
+            "-c",
+            &format!("import os,socket,time\ns=socket.create_connection(('127.0.0.1',{port}));s.sendall(str(os.getpid()).encode());s.close()\ntime.sleep(5)"),
+        ]);
+        let exchange = tokio::spawn(async move { probe_exchange_command_until(command, tokio::time::Instant::now() + Duration::from_secs(1)).await });
+        let (mut ready, _) = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await.unwrap().unwrap();
+        let mut pid = Vec::new();
+        tokio::time::timeout(Duration::from_millis(100), ready.read_to_end(&mut pid)).await.unwrap().unwrap();
+        let pid = String::from_utf8(pid).unwrap().parse::<i32>().unwrap();
+        assert!(pid > 0);
+        let result = exchange.await.unwrap();
+        assert_eq!((result.code, result.out.as_str()), (Some(9), ""));
+        let reaped = tokio::time::timeout(Duration::from_millis(150), async {
+            loop {
+                let gone = !std::process::Command::new("/bin/kill")
+                    .args(["-0", &pid.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if gone {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(reaped.is_ok(), "owned timeout fixture root {pid} was not reaped");
     }
 }
