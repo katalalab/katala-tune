@@ -245,50 +245,85 @@ if ($pref -and $pref.ExclusionPath -and ($pref.ExclusionPath -notmatch 'N/A')) {
 
 # GPU: a single bounded query per analysis; no daemon, setters or process-name query.
 # BEGIN GPU TELEMETRY
-function InvokeGpuQuery($exe, $fields) {
+function InvokeGpuBounded($exe, $arguments) {
   $p = New-Object Diagnostics.Process
   $p.StartInfo = New-Object Diagnostics.ProcessStartInfo
   $p.StartInfo.FileName = $exe
-  $p.StartInfo.Arguments = "--query-gpu=$fields --format=csv,noheader,nounits"
+  $p.StartInfo.Arguments = $arguments
   $p.StartInfo.UseShellExecute = $false
   $p.StartInfo.CreateNoWindow = $true
   $p.StartInfo.RedirectStandardOutput = $true
   $p.StartInfo.RedirectStandardError = $true
+  $started = $false; $cleanupAttempted = $false; $result = $null
+  $cleanup = {
+    param($process, $clock)
+    try {
+      try { if (-not $process.HasExited) { $process.Kill() } } catch { }
+      $left = [Math]::Max(0, 4000 - [int]$clock.ElapsedMilliseconds)
+      $ack = $process.WaitForExit([Math]::Min(1000, $left))
+      return ($ack -and $process.HasExited)
+    } catch { return $false }
+  }
   try {
     [void]$p.Start()
-    $out = $p.StandardOutput.ReadToEndAsync()
-    $err = $p.StandardError.ReadToEndAsync()
-    if (-not $p.WaitForExit(4000)) { $p.Kill(); return @{ rows = @(); reason = "query-timeout" } }
-    if (-not $out.Wait(200)) { return @{ rows = @(); reason = "output-timeout" } }
-    $text = $out.Result
-    if ($p.ExitCode -ne 0) { return @{ rows = @(); reason = "query-failed" } }
-    if ($text.Length -gt 65536) { return @{ rows = @(); reason = "output-limit" } }
-    return @{ rows = @($text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 16); reason = $null }
-  } catch { return @{ rows = @(); reason = "query-unavailable" } } finally { $p.Dispose() }
+    $started = $true
+    $clock = [Diagnostics.Stopwatch]::StartNew(); $stdout = New-Object IO.MemoryStream; $stderr = New-Object IO.MemoryStream
+    $outBuffer = New-Object byte[] 4096; $errBuffer = New-Object byte[] 4096
+    $outTask = $p.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+    $errTask = $p.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+    $outEof = $false; $errEof = $false; $reason = $null
+    while (-not ($p.HasExited -and $outEof -and $errEof)) {
+      $left = 4000 - [int]$clock.ElapsedMilliseconds
+      if ($left -le 0) { $reason = "query-timeout"; break }
+      $pending = @(); if (-not $outEof) { $pending += $outTask }; if (-not $errEof) { $pending += $errTask }
+      # Pipe EOF alone is never success: a descendant may have closed both
+      # streams while the root nvidia-smi process remains alive.
+      if ($pending.Count -eq 0) {
+        if (-not $p.WaitForExit($left)) { $reason = "query-timeout"; break }
+        continue
+      }
+      if ([Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$pending, $left) -lt 0) { $reason = "query-timeout"; break }
+      if (-not $outEof -and $outTask.IsCompleted) {
+        $n = $outTask.Result
+        if ($n -eq 0) { $outEof = $true } elseif ($stdout.Length + $n -gt 65536) { $reason = "output-limit"; break } else { $stdout.Write($outBuffer, 0, $n); $outTask = $p.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length) }
+      }
+      if (-not $errEof -and $errTask.IsCompleted) {
+        $n = $errTask.Result
+        if ($n -eq 0) { $errEof = $true } elseif ($stderr.Length + $n -gt 65536) { $reason = "output-limit"; break } else { $stderr.Write($errBuffer, 0, $n); $errTask = $p.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length) }
+      }
+    }
+    if ($reason) {
+      $cleanupAttempted = $true
+      if (-not (& $cleanup $p $clock)) { $reason = "cleanup-unverified" }
+      $result = @{ text = ""; reason = $reason }
+    } elseif ($p.ExitCode -ne 0) {
+      $result = @{ text = ""; reason = "query-failed" }
+    } else {
+      $result = @{ text = [Text.Encoding]::UTF8.GetString($stdout.ToArray()); reason = $null }
+    }
+  } catch {
+    $result = @{ text = ""; reason = "query-unavailable" }
+  } finally {
+    if ($started -and -not $cleanupAttempted -and -not $p.HasExited) {
+      $cleanupAttempted = $true
+      if (-not (& $cleanup $p $clock)) { $result = @{ text = ""; reason = "cleanup-unverified" } }
+    }
+    $p.Dispose()
+  }
+  return $result
+}
+function InvokeGpuQuery($exe, $fields) {
+  $result = InvokeGpuBounded $exe "--query-gpu=$fields --format=csv,noheader,nounits"
+  if ($result.reason) { return @{ rows = @(); reason = $result.reason } }
+  return @{ rows = @($result.text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 16); reason = $null }
 }
 function InvokeGpuComputeQuery($exe) {
-  $p = New-Object Diagnostics.Process
-  $p.StartInfo = New-Object Diagnostics.ProcessStartInfo
-  $p.StartInfo.FileName = $exe
-  $p.StartInfo.Arguments = "--query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits"
-  $p.StartInfo.UseShellExecute = $false
-  $p.StartInfo.CreateNoWindow = $true
-  $p.StartInfo.RedirectStandardOutput = $true
-  $p.StartInfo.RedirectStandardError = $true
-  try {
-    [void]$p.Start()
-    $out = $p.StandardOutput.ReadToEndAsync()
-    $err = $p.StandardError.ReadToEndAsync()
-    if (-not $p.WaitForExit(4000)) { $p.Kill(); return @{ rows = @(); reason = "query-timeout" } }
-    if (-not $out.Wait(200)) { return @{ rows = @(); reason = "output-timeout" } }
-    $text = $out.Result
-    if ($p.ExitCode -ne 0) { return @{ rows = @(); reason = "query-failed" } }
-    if ($text.Length -gt 65536) { return @{ rows = @(); reason = "output-limit" } }
-    # nvidia-smi uses this text (rather than a blank CSV stream) for a successful empty result.
-    $rows = @($text -split "`r?`n" | Where-Object { $_.Trim() -and $_.Trim() -ne "No running processes found" })
-    if ($rows.Count -gt 16) { return @{ rows = @(); reason = "row-limit" } }
-    return @{ rows = $rows; reason = $null }
-  } catch { return @{ rows = @(); reason = "query-unavailable" } } finally { $p.Dispose() }
+  $result = InvokeGpuBounded $exe "--query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits"
+  if ($result.reason) { return @{ rows = @(); reason = $result.reason } }
+  # nvidia-smi uses this text (rather than a blank CSV stream) for a successful empty result.
+  $rows = @($result.text -split "`r?`n" | Where-Object { $_.Trim() -and $_.Trim() -ne "No running processes found" })
+  if ($rows.Count -gt 16) { return @{ rows = @(); reason = "row-limit" } }
+  return @{ rows = $rows; reason = $null }
 }
 function GpuMemory($g, $at) {
   foreach ($key in @("mem_used_mb", "mem_total_mb", "mem_free_mb", "util", "temp_c", "power_w")) { if ($null -ne $g[$key] -and $g[$key] -lt 0) { $g[$key] = $null } }
@@ -326,7 +361,7 @@ if ($smi) {
     $g = @{ uuid = $f[16]; throttle = $f[17]; adapter_index = (RNum $f[0] 0); name = $f[1]; util = (RNum $f[2]); mem_used_mb = (RNum $f[3] 0); mem_total_mb = (RNum $f[4] 0); mem_free_mb = (RNum $f[5] 0); temp_c = (RNum $f[6]); power_w = (RNum $f[7]); power_limit_w = (RNum $f[8]); power_min_w = (RNum $f[9]); power_max_w = (RNum $f[10]); clocks_graphics_mhz = (RNum $f[11]); clocks_sm_mhz = (RNum $f[12]); clocks_memory_mhz = (RNum $f[13]); pstate = $(if ($f[14] -match "^(N/A|Not Supported|\[N/A\])$") { $null } else { $f[14] }); driver = $f[15]; source = $(if ($memoryOnly) { "nvidia-smi memory-only fallback" } else { "nvidia-smi" }); available = $true }
     $gpus += GpuMemory $g $gpuAt
   }
-  $compute = InvokeGpuComputeQuery $smi.Source
+  $compute = if ($query.reason) { @{ rows = @(); reason = $query.reason } } else { InvokeGpuComputeQuery $smi.Source }
   if ($compute.reason) {
     $gpuCompute.availability = "unavailable"; $gpuCompute.reason = $compute.reason
   } else {

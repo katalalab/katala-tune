@@ -9,8 +9,11 @@ pub fn main(_args: &[String], _started: Instant) -> ExitCode {
 
 #[cfg(windows)]
 pub fn main(args: &[String], started: Instant) -> ExitCode {
-    use std::{sync::mpsc, time::Duration};
-    use tune_core::topology::adapters::windows_reader::{MAX_BUDGET_MS, ReaderError};
+    use std::{io::Write, sync::mpsc, time::Duration};
+    use tune_core::{
+        collect::ProcessStop,
+        topology::adapters::windows_reader::{MAX_BUDGET_MS, ReaderFailure},
+    };
     let budget = match args {
         [flag, value] if flag == "--budget-ms" && value.len() <= 7 && value.bytes().all(|b| b.is_ascii_digit()) => {
             value.parse::<u64>().ok().filter(|n| *n > 0 && *n <= MAX_BUDGET_MS && n.to_string() == *value)
@@ -20,34 +23,92 @@ pub fn main(args: &[String], started: Instant) -> ExitCode {
     let Some(budget) = budget else { terminate_self(2) };
     let Some(hard_deadline) = started.checked_add(Duration::from_millis(budget)) else { terminate_self(2) };
     let input_deadline = hard_deadline.min(started + Duration::from_secs(2));
+    enum Failure {
+        StdinHandle,
+        RequestFrame,
+        RequestAdmission,
+        RuntimeInit,
+        Core(ReaderFailure),
+        ResponseWrite,
+    }
+    impl Failure {
+        fn stage(&self) -> &'static str {
+            match self {
+                Self::StdinHandle => "stdin_handle",
+                Self::RequestFrame => "request_frame",
+                Self::RequestAdmission => "request_admission",
+                Self::RuntimeInit => "runtime_init",
+                Self::Core(failure) => failure.stage.name(),
+                Self::ResponseWrite => "response_write",
+            }
+        }
+    }
+    fn stop_name(stop: ProcessStop) -> &'static str {
+        match stop {
+            ProcessStop::SetupFailed => "setup_failed",
+            ProcessStop::SpawnFailed => "spawn_failed",
+            ProcessStop::Completed => "completed",
+            ProcessStop::Timeout => "timeout",
+            ProcessStop::OutputLimit => "output_limit",
+            ProcessStop::LingeringDescendants => "lingering_descendants",
+            ProcessStop::IoFailure => "io_failure",
+            ProcessStop::CleanupUnconfirmed => "cleanup_unconfirmed",
+        }
+    }
+    fn bit(value: bool) -> u8 {
+        if value { 1 } else { 0 }
+    }
+    fn write_failure(failure: &Failure) -> std::io::Result<()> {
+        let mut stderr = std::io::stderr().lock();
+        match failure {
+            Failure::Core(ReaderFailure { backend: Some(backend), .. }) => writeln!(
+                stderr,
+                "topology-reader failure={} backend={} spawn={} timeout={} limit={} stop={} root0={} cleanup={} receipt={}",
+                failure.stage(),
+                backend.exit.name(),
+                bit(backend.spawn_failed),
+                bit(backend.timed_out),
+                bit(backend.output_limited),
+                backend.stop.map(stop_name).unwrap_or("none"),
+                bit(backend.root_exit_zero),
+                bit(backend.cleanup_confirmed),
+                bit(backend.receipt_accepted),
+            ),
+            _ => writeln!(stderr, "topology-reader failure={} backend=none", failure.stage()),
+        }
+    }
     enum Event {
         Admitted(Instant),
-        Finished(Result<(), ReaderError>),
+        Finished(Result<(), Failure>),
     }
     let (tx, rx) = mpsc::channel();
     let spawn = std::thread::Builder::new().name("topology-reader".into()).spawn(move || {
-        let work = || -> Result<(), ReaderError> {
-            let (request, bytes) = tune_core::topology::adapters::windows_reader::read_request(&mut unbuffered_stdin()?)?;
+        let work = || -> Result<(), Failure> {
+            let mut stdin = unbuffered_stdin().map_err(|_| Failure::StdinHandle)?;
+            let (request, bytes) = tune_core::topology::adapters::windows_reader::read_request(&mut stdin).map_err(|_| Failure::RequestFrame)?;
             if request.budget_ms > budget || Instant::now() >= input_deadline {
-                return Err(ReaderError);
+                return Err(Failure::RequestAdmission);
             }
             // Request budget shares the CLI entry's time origin and can only
             // shorten the absolute argv cap. Malformed input never updates it.
-            let deadline = started.checked_add(Duration::from_millis(request.budget_ms)).ok_or(ReaderError)?.min(hard_deadline);
-            tx.send(Event::Admitted(deadline)).map_err(|_| ReaderError)?;
+            let deadline = started.checked_add(Duration::from_millis(request.budget_ms)).ok_or(Failure::RequestAdmission)?.min(hard_deadline);
+            tx.send(Event::Admitted(deadline)).map_err(|_| Failure::RequestAdmission)?;
             if Instant::now() >= deadline {
-                return Err(ReaderError);
+                return Err(Failure::RequestAdmission);
             }
             let response = {
-                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ReaderError)?;
-                runtime.block_on(tune_core::topology::adapters::windows_reader::execute(&request, &bytes, deadline))?
+                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| Failure::RuntimeInit)?;
+                runtime.block_on(tune_core::topology::adapters::windows_reader::execute_diagnostic(&request, &bytes, deadline)).map_err(Failure::Core)?
                 // All guard resources and this independent runtime are dropped
                 // before a blocking response write or successful notification.
             };
-            tune_core::topology::adapters::windows_reader::write_response(&mut std::io::stdout().lock(), &response)?;
+            tune_core::topology::adapters::windows_reader::write_response(&mut std::io::stdout().lock(), &response).map_err(|_| Failure::ResponseWrite)?;
             Ok(())
         };
         let result = work();
+        if let Err(failure) = &result {
+            let _ = write_failure(failure);
+        }
         let _ = tx.send(Event::Finished(result));
     });
     if spawn.is_err() {

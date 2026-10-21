@@ -22,6 +22,13 @@ impl Runner for CaptureRunner {
             RunResult { code: Some(9), out: "GPU activity is active; operation refused".into(), err: String::new() }
         })
     }
+    fn action_exchange<'a>(&'a self, _node: &'a Node, _helper: &'a str, input: &'a [u8], _timeout: Duration) -> RunFuture<'a> {
+        let input = input.to_vec();
+        Box::pin(async move {
+            self.0.lock().unwrap().push(("kt2".into(), vec![], Some(input)));
+            RunResult { code: Some(9), out: "GPU activity is active; operation refused".into(), err: String::new() }
+        })
+    }
 }
 
 fn worker(now: i64) -> serde_json::Value {
@@ -94,18 +101,37 @@ fn plans_recheck_gpu_and_ledger_attribute_is_optional() {
 }
 
 #[tokio::test]
-async fn remote_windows_gpu_action_uses_receiver_and_complete_stdin_packet() {
+async fn remote_windows_gpu_action_uses_kt2_exchange_and_script_body() {
     let runner = CaptureRunner::default();
-    let node = Node::from_value(&json!({"id":"w","alias":"w","os":"windows"}), "other");
+    let node = Node::from_value(
+        &json!({"id":"w","alias":"w","os":"windows","action_helper":{"schema":"katala-tune/action-helper/v2","source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tune_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","manifest_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","run_id":1,"attempt":1}}),
+        "other",
+    );
     let action =
         json!({"type":"set-gpu-power-limit","params":{"uuid":"GPU-01234567-89ab-cdef-0123-456789abcdef","watts":180,"min":100,"max":250,"prev_w":200}});
     let result = actions::execute_with(&runner, &node, &action, Some(&[])).await.unwrap();
     assert_eq!(result.code, Some(9));
     let calls = runner.0.lock().unwrap();
     let (cmd, args, input) = &calls[0];
-    assert_eq!(cmd, "ssh");
-    assert!(args.last().is_some_and(|arg| arg.starts_with("powershell.exe -NoProfile -NonInteractive -EncodedCommand ")));
+    assert_eq!(cmd, "kt2");
+    assert!(args.is_empty());
     let input = input.as_ref().unwrap();
-    assert!(input.starts_with(b"KT1 "));
+    assert!(!input.starts_with(b"KT1 "));
     assert!(std::str::from_utf8(input).unwrap().contains("Invoke-KatalaGpuSmi"));
+}
+
+#[tokio::test]
+async fn remote_windows_action_refuses_absent_or_nonclosed_approved_helper_before_transport() {
+    let action = json!({"type":"kill-process","params":{"pid":4242,"name":"Worker","start":"20261021010101000","min_cpu":1}});
+    for value in [
+        json!({ "id": "w", "alias": "w", "os": "windows" }),
+        json!({ "id": "w", "alias": "w", "os": "windows", "action_helper": { "schema":"katala-tune/action-helper/v1", "source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "tune_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "manifest_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "run_id":1, "attempt":1 } }),
+        json!({ "id": "w", "alias": "w", "os": "windows", "action_helper": { "schema":"katala-tune/action-helper/v2", "source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "tune_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "manifest_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "run_id":1, "attempt":1, "extra":true } }),
+    ] {
+        let runner = CaptureRunner::default();
+        let node = Node::from_value(&value, "other");
+        let result = actions::execute_with(&runner, &node, &action, Some(&[])).await.unwrap();
+        assert_eq!(result.code, Some(9));
+        assert!(runner.0.lock().unwrap().is_empty(), "helper record rejection happens before ssh spawn");
+    }
 }
