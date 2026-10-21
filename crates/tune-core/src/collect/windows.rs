@@ -874,8 +874,9 @@ mod tests {
             .collect();
         let mut job = Job::new().unwrap();
         let mut spawn_failed = false;
+        let spawn_deadline = Instant::now() + Duration::from_secs(5);
         let (root, thread) = spawn_owned(
-            SpawnContext { command: &command, environment: &[], deadline: Instant::now() + Duration::from_secs(5) },
+            SpawnContext { command: &command, environment: &[], deadline: spawn_deadline },
             &job,
             [&stdio[0], &stdio[1], &stdio[2]],
             &mut spawn_failed,
@@ -907,6 +908,8 @@ mod tests {
             Ok(())
         }));
         job.observe(&mut receipt).unwrap();
+        let diagnostic_started = Instant::now();
+        let diagnostic_deadline = spawn_deadline.min(diagnostic_started + Duration::from_millis(1000));
         // Diagnostics are separate later observations; never overwrite the receipt under test.
         let retained: Vec<_> = job
             .processes
@@ -961,6 +964,89 @@ mod tests {
             current_accounting.TotalProcesses,
             current_root_code as i32
         );
+        type RetainedWaitSample = (ProcessIdentity, bool, u32, Option<i32>, Option<i32>, Option<i32>);
+        #[derive(Clone)]
+        struct AccountingSample {
+            waits: Vec<RetainedWaitSample>,
+            active: Option<u32>,
+            total: Option<u32>,
+            query_error: Option<i32>,
+            elapsed_ms: u128,
+        }
+        let first_sample = AccountingSample {
+            waits: retained
+                .iter()
+                .map(|(identity, is_root, wait, error, _, _, code, code_error)| (identity.clone(), *is_root, *wait, *error, *code, *code_error))
+                .collect(),
+            active: (accounting_ok != 0).then_some(current_accounting.ActiveProcesses),
+            total: (accounting_ok != 0).then_some(current_accounting.TotalProcesses),
+            query_error: accounting_error,
+            elapsed_ms: diagnostic_started.elapsed().as_millis(),
+        };
+        let sample = || {
+            let waits = job
+                .processes
+                .iter()
+                .enumerate()
+                .map(|(index, process)| {
+                    // SAFETY: zero wait on the same retained observer handles; no acquisition or close.
+                    let wait = unsafe { WaitForSingleObject(process.handle.as_raw_handle(), 0) };
+                    let error = if wait == windows_sys::Win32::Foundation::WAIT_FAILED { os_error().raw_os_error() } else { None };
+                    let mut code = 0;
+                    // SAFETY: read-only exit query on the same retained handle, never used instead of its wait result.
+                    let ok = unsafe { GetExitCodeProcess(process.handle.as_raw_handle(), &mut code) };
+                    let code_error = if ok == 0 { os_error().raw_os_error() } else { None };
+                    (process.identity.clone(), index == 0, wait, error, (ok != 0).then_some(code as i32), code_error)
+                })
+                .collect();
+            let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            // SAFETY: separate local output for a read-only query of the same owned Job.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    job.handle.as_raw_handle(),
+                    JobObjectBasicAccountingInformation,
+                    std::ptr::from_mut(&mut accounting).cast(),
+                    size_of_val(&accounting) as u32,
+                    null_mut(),
+                )
+            };
+            let query_error = if ok == 0 { os_error().raw_os_error() } else { None };
+            AccountingSample {
+                waits,
+                active: (ok != 0).then_some(accounting.ActiveProcesses),
+                total: (ok != 0).then_some(accounting.TotalProcesses),
+                query_error,
+                elapsed_ms: diagnostic_started.elapsed().as_millis(),
+            }
+        };
+        let mut last_sample = first_sample.clone();
+        let mut snapshots = vec![first_sample];
+        let milestones = [10, 50, 100, 500, 1000];
+        let mut milestone = 0;
+        while Instant::now() < diagnostic_deadline
+            && !(last_sample.active == Some(0) && last_sample.waits.iter().all(|(_, _, wait, _, _, _)| *wait == WAIT_OBJECT_0))
+        {
+            let remaining = diagnostic_deadline.saturating_duration_since(Instant::now());
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            if Instant::now() >= diagnostic_deadline {
+                break;
+            }
+            last_sample = sample();
+            if milestone < milestones.len() && last_sample.elapsed_ms >= milestones[milestone] {
+                snapshots.push(last_sample.clone());
+                while milestone < milestones.len() && last_sample.elapsed_ms >= milestones[milestone] {
+                    milestone += 1;
+                }
+            }
+        }
+        snapshots.push(last_sample);
+        for (index, snapshot) in snapshots.iter().enumerate() {
+            eprintln!(
+                "accounting bounded metadata: sample={index} waits_identity_is_root_wait_error_exit_code_error={:?} active={:?} total={:?} query_error={:?} elapsed_ms={}",
+                snapshot.waits, snapshot.active, snapshot.total, snapshot.query_error, snapshot.elapsed_ms
+            );
+        }
+        eprintln!("accounting bounded observation_elapsed_ms={}", diagnostic_started.elapsed().as_millis());
         assert!(old_order_would_report_lingering.load(Ordering::SeqCst), "the real interleaving must reproduce the old false-positive predicate");
         assert!(receipt.root_exited && receipt.observed_exited);
         assert_eq!(receipt.root_exit_code, Some(0));
