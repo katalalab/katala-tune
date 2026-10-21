@@ -100,8 +100,8 @@ const MAX_BUDGET_MS: u64 = 25_000;
 const MIN_BUDGET_MS: u64 = 9_000;
 #[cfg(windows)]
 const DEFAULT_BUDGET_MS: u64 = 25_000;
-#[cfg(windows)]
-const POWERSHELL_BOOTSTRAP: &str = "$ErrorActionPreference='Stop';try{$r=New-Object System.IO.StreamReader([Console]::OpenStandardInput(),[System.Text.Encoding]::ASCII,$false,1024,$true);$b=[Convert]::FromBase64String($r.ReadToEnd());$s=(New-Object System.Text.UTF8Encoding($false,$true)).GetString($b);$sb=[ScriptBlock]::Create($s)}catch{exit 9};try{&$sb;if($null -eq $LASTEXITCODE){exit 0};exit [int]$LASTEXITCODE}catch{exit 7}";
+#[cfg(any(windows, test))]
+pub(crate) const POWERSHELL_BOOTSTRAP: &str = "$ErrorActionPreference='Stop';try{$r=New-Object System.IO.StreamReader([Console]::OpenStandardInput(),[System.Text.Encoding]::ASCII,$false,1024,$true);$b=[Convert]::FromBase64String($r.ReadToEnd());$s=(New-Object System.Text.UTF8Encoding($false,$true)).GetString($b);$sb=[ScriptBlock]::Create($s)}catch{exit 9};try{&$sb;if($null -eq $LASTEXITCODE){exit 0};exit [int]$LASTEXITCODE}catch{exit 7}";
 
 #[cfg(windows)]
 enum Event {
@@ -332,8 +332,8 @@ fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-#[cfg(windows)]
-fn base64(bytes: &[u8]) -> Vec<u8> {
+#[cfg(any(windows, test))]
+pub(crate) fn base64(bytes: &[u8]) -> Vec<u8> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {

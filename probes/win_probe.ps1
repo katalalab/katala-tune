@@ -254,7 +254,16 @@ function InvokeGpuBounded($exe, $arguments) {
   $p.StartInfo.CreateNoWindow = $true
   $p.StartInfo.RedirectStandardOutput = $true
   $p.StartInfo.RedirectStandardError = $true
-  $started = $false; $cleanupAttempted = $false
+  $started = $false; $cleanupAttempted = $false; $result = $null
+  $cleanup = {
+    param($process, $clock)
+    try {
+      try { if (-not $process.HasExited) { $process.Kill() } } catch { }
+      $left = [Math]::Max(0, 4000 - [int]$clock.ElapsedMilliseconds)
+      $ack = $process.WaitForExit([Math]::Min(1000, $left))
+      return ($ack -and $process.HasExited)
+    } catch { return $false }
+  }
   try {
     [void]$p.Start()
     $started = $true
@@ -285,31 +294,23 @@ function InvokeGpuBounded($exe, $arguments) {
     }
     if ($reason) {
       $cleanupAttempted = $true
-      try { if (-not $p.HasExited) { $p.Kill() } } catch { }
-      $left = [Math]::Max(0, 4000 - [int]$clock.ElapsedMilliseconds)
-      $ack = $p.WaitForExit([Math]::Min(1000, $left))
-      if (-not $ack -or -not $p.HasExited) { $reason = "query-timeout" }
-      return @{ text = ""; reason = $reason }
+      if (-not (& $cleanup $p $clock)) { $reason = "cleanup-unverified" }
+      $result = @{ text = ""; reason = $reason }
+    } elseif ($p.ExitCode -ne 0) {
+      $result = @{ text = ""; reason = "query-failed" }
+    } else {
+      $result = @{ text = [Text.Encoding]::UTF8.GetString($stdout.ToArray()); reason = $null }
     }
-    if ($p.ExitCode -ne 0) { return @{ text = ""; reason = "query-failed" } }
-    return @{ text = [Text.Encoding]::UTF8.GetString($stdout.ToArray()); reason = $null }
   } catch {
-    if ($started -and -not $cleanupAttempted -and -not $p.HasExited) {
-      $cleanupAttempted = $true
-      try { $p.Kill() } catch { }
-      $left = [Math]::Max(0, 4000 - [int]$clock.ElapsedMilliseconds)
-      [void]$p.WaitForExit([Math]::Min(1000, $left))
-    }
-    return @{ rows = @(); reason = "query-unavailable" }
+    $result = @{ text = ""; reason = "query-unavailable" }
   } finally {
     if ($started -and -not $cleanupAttempted -and -not $p.HasExited) {
       $cleanupAttempted = $true
-      try { $p.Kill() } catch { }
-      $left = [Math]::Max(0, 4000 - [int]$clock.ElapsedMilliseconds)
-      [void]$p.WaitForExit([Math]::Min(1000, $left))
+      if (-not (& $cleanup $p $clock)) { $result = @{ text = ""; reason = "cleanup-unverified" } }
     }
     $p.Dispose()
   }
+  return $result
 }
 function InvokeGpuQuery($exe, $fields) {
   $result = InvokeGpuBounded $exe "--query-gpu=$fields --format=csv,noheader,nounits"
@@ -360,7 +361,7 @@ if ($smi) {
     $g = @{ uuid = $f[16]; throttle = $f[17]; adapter_index = (RNum $f[0] 0); name = $f[1]; util = (RNum $f[2]); mem_used_mb = (RNum $f[3] 0); mem_total_mb = (RNum $f[4] 0); mem_free_mb = (RNum $f[5] 0); temp_c = (RNum $f[6]); power_w = (RNum $f[7]); power_limit_w = (RNum $f[8]); power_min_w = (RNum $f[9]); power_max_w = (RNum $f[10]); clocks_graphics_mhz = (RNum $f[11]); clocks_sm_mhz = (RNum $f[12]); clocks_memory_mhz = (RNum $f[13]); pstate = $(if ($f[14] -match "^(N/A|Not Supported|\[N/A\])$") { $null } else { $f[14] }); driver = $f[15]; source = $(if ($memoryOnly) { "nvidia-smi memory-only fallback" } else { "nvidia-smi" }); available = $true }
     $gpus += GpuMemory $g $gpuAt
   }
-  $compute = InvokeGpuComputeQuery $smi.Source
+  $compute = if ($query.reason) { @{ rows = @(); reason = $query.reason } } else { InvokeGpuComputeQuery $smi.Source }
   if ($compute.reason) {
     $gpuCompute.availability = "unavailable"; $gpuCompute.reason = $compute.reason
   } else {

@@ -3,6 +3,10 @@ use std::{process::ExitCode, time::Instant};
 
 #[cfg(windows)]
 const BUDGET_MS: u64 = 120_000;
+#[cfg(any(windows, test))]
+const MAX_PROBE_PAYLOAD_BYTES: usize = 128 * 1024;
+#[cfg(any(windows, test))]
+const WINDOWS_COMMAND_LINE_LIMIT: usize = 32_767;
 
 fn arguments(args: &[String]) -> Option<(String, bool, bool, bool)> {
     let [hash_flag, hash, benchmark_flag, benchmark, network_flag, network, wsl_flag, wsl, budget_flag, budget] = args else { return None };
@@ -49,6 +53,24 @@ fn powershell_payload(benchmark: bool, network: bool, observe_wsl: bool) -> Opti
     // neither argv nor the ambient environment can alter the Python program.
     let python = tune_core::collect::BENCH_PY.replace('\'', "''");
     Some(format!("{script}\nWrite-Output '{}'\n$katalaTuneBenchmark = '{}'\n& python -c $katalaTuneBenchmark\n", tune_core::collect::BENCH_MARK, python,))
+}
+
+#[cfg(any(windows, test))]
+fn powershell_arguments() -> [&'static str; 5] {
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", super::windows_action::POWERSHELL_BOOTSTRAP]
+}
+
+/// Build the only helper-to-PowerShell transport: a small fixed argv and an
+/// ASCII stdin body containing base64 of the compile-time payload.  This is
+/// distinct from controller-to-helper stdin, which remains EOF-only.
+#[cfg(any(windows, test))]
+fn powershell_stdin(payload: &str) -> Option<Vec<u8>> {
+    (payload.len() <= MAX_PROBE_PAYLOAD_BYTES).then(|| super::windows_action::base64(payload.as_bytes()))
+}
+
+#[cfg(any(windows, test))]
+fn windows_argv_units(executable: &str, args: &[&str]) -> usize {
+    executable.encode_utf16().count() + 3 + args.iter().map(|arg| arg.encode_utf16().count() + 3).sum::<usize>()
 }
 
 #[cfg(not(windows))]
@@ -100,8 +122,9 @@ fn run_once(sha256: String, benchmark: bool, network: bool, observe_wsl: bool, h
         Err(_) => return false,
     };
     let Some(payload) = powershell_payload(benchmark, network, observe_wsl) else { return false };
+    let Some(input) = powershell_stdin(&payload) else { return false };
     let mut command = Command::new(shell);
-    command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", &payload]);
+    command.args(powershell_arguments());
     let environment: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     if environment.is_empty() {
         return false;
@@ -111,7 +134,7 @@ fn run_once(sha256: String, benchmark: bool, network: bool, observe_wsl: bool, h
         Err(_) => return false,
     };
     let result =
-        runtime.block_on(run_standalone_windows_bounded(&command, StandaloneWindowsEnvironment::new(&environment), b"", backend_end, 1_048_576, 65_536));
+        runtime.block_on(run_standalone_windows_bounded(&command, StandaloneWindowsEnvironment::new(&environment), &input, backend_end, 1_048_576, 65_536));
     let accepted = result.code == Some(0)
         && !result.timed_out
         && !result.output_limited
@@ -181,6 +204,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn probe_payload_uses_bounded_stdin_and_never_the_windows_command_line() {
+        let payload = powershell_payload(true, false, true).unwrap();
+        let input = powershell_stdin(&payload).unwrap();
+        assert!(payload.len() > 32_767, "counterfactual oversized payload must fail when placed in argv");
+        assert!(input.len() <= MAX_PROBE_PAYLOAD_BYTES.div_ceil(3) * 4);
+        let shell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        assert!(windows_argv_units(shell, &powershell_arguments()) < WINDOWS_COMMAND_LINE_LIMIT);
+        let oversized_argv = ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", payload.as_str()];
+        assert!(windows_argv_units(shell, &oversized_argv) >= WINDOWS_COMMAND_LINE_LIMIT);
+        assert_eq!(input, crate::windows_action::base64(payload.as_bytes()));
+        assert!(input.iter().all(u8::is_ascii));
     }
 
     #[cfg(windows)]

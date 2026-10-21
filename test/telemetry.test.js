@@ -49,6 +49,14 @@ test('Windows GPU telemetry adds actual free MiB and explicit unavailable reason
   assert.match(src,/private_mb/);assert.match(src,/cpu_seconds/);assert.match(src,/handle_count/);assert.match(src,/thread_count/);
 });
 
+test('Windows GPU telemetry keeps an unacknowledged cleanup as failure and stops the later compute query', () => {
+  const src=fs.readFileSync(path.join(root,'probes/win_probe.ps1'),'utf8');
+  assert.match(src,/\$ack = \$process\.WaitForExit\(\[Math\]::Min\(1000, \$left\)\)/);
+  assert.match(src,/return \(\$ack -and \$process\.HasExited\)/);
+  assert.match(src,/reason = "cleanup-unverified"/);
+  assert.match(src,/\$compute = if \(\$query\.reason\) \{ @\{ rows = @\(\); reason = \$query\.reason \} \} else \{ InvokeGpuComputeQuery/);
+});
+
 test('macOS accumulated CPU time parses minutes, hours, days and rejects invalid time', () => {
   const values=py('print(json.dumps([m.cpu_time_seconds(x) for x in ["02:03.45", "01:02:03.50", "2-03:04:05.25", "12345:06.7", "invalid", "-1:23", "NaN"]]))');
   assert.deepEqual(values,[123.45,3723.5,183845.25,740706.7,null,null,null]);
