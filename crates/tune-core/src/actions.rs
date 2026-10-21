@@ -190,9 +190,13 @@ fn win_kill_recheck_ps(pid: i64, name: &str, start: Option<&str>, min_cpu: i64) 
     parts.extend([
         "$c2 = $p.CPU; Start-Sleep -Milliseconds 1000; $p.Refresh(); $core2 = ($p.CPU - $c2) * 100".to_string(),
         format!("if ($p.ProcessName -ne \"{name}\") {{ Write-Output \"PID {pid} changed during CPU recheck\"; exit 3 }}"),
-        start.map(|s| format!("if ($p.StartTime.ToUniversalTime().ToString(\"yyyyMMddHHmmssfff\") -ne \"{s}\") {{ Write-Output \"PID {pid} has a different start time\"; exit 3 }}")).unwrap_or_default(),
-        format!("if ($core2 -lt {min_cpu}) {{ Write-Output (\"recovered: \" + [math]::Round($core2) + \"% of one core\"); exit 4 }}; Test-KatalaGpuDeadline"),
     ]);
+    if let Some(s) = start {
+        parts.push(format!("if ($p.StartTime.ToUniversalTime().ToString(\"yyyyMMddHHmmssfff\") -ne \"{s}\") {{ Write-Output \"PID {pid} has a different start time\"; exit 3 }}"));
+    }
+    parts.push(format!(
+        "if ($core2 -lt {min_cpu}) {{ Write-Output (\"recovered: \" + [math]::Round($core2) + \"% of one core\"); exit 4 }}; Test-KatalaGpuDeadline"
+    ));
     parts.join("; ")
 }
 
