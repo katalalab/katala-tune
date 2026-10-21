@@ -97,7 +97,14 @@ pub fn stop_all(app: &AppHandle) {
 pub fn shutdown(app: &AppHandle) {
     if let Some(l) = app.try_state::<Arc<Live>>() {
         let l = l.inner().clone();
-        tauri::async_runtime::block_on(async move { l.shutdown(Duration::from_secs(3)).await });
+        let engine = app.try_state::<Arc<Engine>>().map(|e| e.inner().clone());
+        tauri::async_runtime::block_on(async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            l.shutdown(Duration::from_secs(3)).await;
+            if let Some(e) = engine {
+                let _ = e.finish_monitor_journal(deadline.saturating_duration_since(std::time::Instant::now())).await;
+            }
+        });
     }
 }
 

@@ -15,6 +15,7 @@ mod checks;
 mod inventory;
 mod logs;
 pub mod metrics;
+mod monitor_events;
 mod netsec;
 pub mod provenance;
 mod snapshots;
@@ -58,6 +59,7 @@ const SCHEMA_PARTS: &[&str] = &[
     provenance::SCHEMA,
     ai_limits::SCHEMA,
     metrics::SCHEMA,
+    monitor_events::SCHEMA,
     topology::SCHEMA,
 ];
 const META_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT, updated_at INTEGER);\n";

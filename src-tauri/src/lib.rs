@@ -156,6 +156,7 @@ pub fn run() {
             live::power_session,
             monitor::dashboard,
             monitor::monitor_settings,
+            monitor::monitor_events,
             monitor::hub_pull,
             agent::agent_peers,
             agent::agent_pair,
