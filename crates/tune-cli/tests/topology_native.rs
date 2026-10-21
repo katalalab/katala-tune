@@ -348,10 +348,25 @@ mod native_windows {
         let before = fixture.snapshot();
         assert!(!before.3.is_empty(), "fixture must actually be dirty");
         let (_, digest) = artifact();
+        let mut failed_roles = Vec::new();
         for entry in ENTRIES {
             let request = fixture.request(30_000);
+            let started = Instant::now();
             let (output, retained, body) = run(&fixture, entry, &request, true, &digest);
-            assert!(output.status.success(), "native role must exit zero: role={entry} code={:?}", output.status.code());
+            eprintln!(
+                "native_role={entry} elapsed_ms={} code={:?} stdout_len={} stderr_len={}",
+                started.elapsed().as_millis(),
+                output.status.code(),
+                output.stdout.len(),
+                output.stderr.len()
+            );
+            if !output.status.success() {
+                failed_roles.push(entry);
+                assert!(output.stdout.is_empty() && output.stderr.is_empty(), "failed native role must withhold output");
+                assert!(fixture.snapshot() == before, "failed native role must preserve the approved checkout");
+                fixture.assert_private_state_absent();
+                continue;
+            }
             assert!(output.stderr.is_empty());
             let capture = match entry {
                 "topology-native-reader" => native_protocol::decode_processing_response(&output.stdout, &request, &body).unwrap(),
@@ -368,6 +383,7 @@ mod native_windows {
             assert!(fixture.snapshot() == before, "read-only native roles must preserve HEAD, approved bytes and dirty unapproved content");
             fixture.assert_private_state_absent();
         }
+        assert!(failed_roles.is_empty(), "all native roles must exit zero: failed={failed_roles:?}");
     }
 
     #[test]

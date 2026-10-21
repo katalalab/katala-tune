@@ -41,6 +41,8 @@ struct FixedGitRunner {
 }
 impl GitRunner for FixedGitRunner {
     fn run(&self, request: &GitCommand) -> Result<Vec<u8>, NativeReaderError> {
+        #[cfg(test)]
+        let ordinal = diagnostics::begin_git(request.operation());
         if request.program() != self.approved_program {
             return Err(NativeReaderError::Git);
         }
@@ -63,6 +65,8 @@ impl GitRunner for FixedGitRunner {
                 policy,
             ))
             .map_err(|result| {
+                #[cfg(test)]
+                diagnostics::git_result(ordinal, request.operation(), "execution_rejected", &result);
                 if result.timed_out {
                     NativeReaderError::Timeout
                 } else if result.output_limited {
@@ -71,28 +75,63 @@ impl GitRunner for FixedGitRunner {
                     NativeReaderError::Git
                 }
             })?;
+        #[cfg(test)]
+        diagnostics::git_result(ordinal, request.operation(), "execution_completed", completion.diagnostic());
         // The actual OS witness is consumed here. Public receipt fields never
         // authorize source admission, including the empty missing-origin case.
-        completion.into_verified_output(b"", self.pin.sha256()).map_err(|_| NativeReaderError::Git)
+        let output = completion.into_verified_output(b"", self.pin.sha256()).map_err(|result| {
+            #[cfg(test)]
+            diagnostics::git_result(ordinal, request.operation(), "consumption_rejected", &result);
+            #[cfg(not(test))]
+            let _ = result;
+            NativeReaderError::Git
+        })?;
+        #[cfg(test)]
+        diagnostics::stage("git_consumed");
+        Ok(output)
     }
 }
 
 pub fn execute_reader(request: &ReaderRequest, exact_body: &[u8], deadline: Instant) -> Result<Vec<u8>, ReaderError> {
+    #[cfg(test)]
+    diagnostics::stage("validate_body");
     validate_body(request, exact_body, deadline)?;
+    #[cfg(test)]
+    diagnostics::stage("pin_open");
     let pin = PinnedWindowsExecutable::open(Path::new(&request.git_program), request.git_artifact_sha256.as_deref().ok_or(ReaderError)?, deadline)
         .map_err(|_| ReaderError)?;
     let source = native::windows::WindowsSourceIo::default();
+    #[cfg(test)]
+    diagnostics::stage("runtime_build");
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ReaderError)?;
     let git = FixedGitRunner { runtime, pin: Arc::new(pin), approved_program: request.git_program.clone() };
-    let capture = native::collect_with(&request.remote_request(), deadline, &source, &git).map_err(|_| ReaderError)?;
+    #[cfg(test)]
+    diagnostics::stage("collect");
+    let capture = native::collect_with(&request.remote_request(), deadline, &source, &git).map_err(|error| {
+        #[cfg(test)]
+        diagnostics::source_failure(error);
+        #[cfg(not(test))]
+        let _ = error;
+        ReaderError
+    })?;
+    #[cfg(test)]
+    diagnostics::stage("capture_serialize");
     let mut capture = serde_json::to_value(capture).map_err(|_| ReaderError)?;
     capture.as_object_mut().ok_or(ReaderError)?.insert("runtime".into(), serde_json::json!({"kind":"native","platform":"windows","kernel_wsl":false}));
     let bytes = serde_json::to_vec(&capture).map_err(|_| ReaderError)?;
+    #[cfg(test)]
+    diagnostics::stage("capture_bounds");
     if bytes.len() > request.limits.stdout_bytes || Instant::now() >= deadline {
         return Err(ReaderError);
     }
+    #[cfg(test)]
+    diagnostics::stage("reader_identity");
     let identity = current_windows_process_identity().map_err(|_| ReaderError)?;
+    #[cfg(test)]
+    diagnostics::stage("processing_encode");
     let result = protocol::encode_processing_response(request, exact_body, &identity, &bytes)?;
+    #[cfg(test)]
+    diagnostics::stage("response_deadline");
     if Instant::now() >= deadline {
         return Err(ReaderError);
     }
@@ -195,4 +234,222 @@ pub fn verify(request: &ReaderRequest, exact_body: &[u8], deadline: Instant, pro
         return Err(ReaderError);
     }
     Ok(capture)
+}
+
+#[cfg(test)]
+mod diagnostics {
+    use super::*;
+    use crate::topology::{
+        RawCapture, TopologyLimits,
+        adapters::{
+            native_reader::SourceIo,
+            remote::{RemotePlatform, RemoteRequest, RemoteRuntimeKind, RemoteSourceCheckout, RemoteSourceManifest},
+            windows_reader as reader,
+        },
+    };
+    use std::{cell::Cell, io::Read, process::Stdio};
+
+    const MARKER: &str = "--native-reader-diagnostic";
+    thread_local! {
+        static ORDINAL: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn active() -> bool {
+        std::env::args().any(|argument| argument == MARKER)
+    }
+    pub(super) fn stage(stage: &'static str) {
+        if active() {
+            eprintln!("native_reader_stage={stage}");
+        }
+    }
+    pub(super) fn source_failure(error: NativeReaderError) {
+        if active() {
+            eprintln!("native_reader_source_error={error:?}");
+        }
+    }
+    pub(super) fn begin_git(operation: GitOperation) -> usize {
+        let ordinal = ORDINAL.with(|value| {
+            let next = value.get() + 1;
+            value.set(next);
+            next
+        });
+        if active() {
+            eprintln!("native_reader_git_begin={ordinal} operation={operation:?}");
+        }
+        ordinal
+    }
+    pub(super) fn git_result(ordinal: usize, operation: GitOperation, outcome: &'static str, result: &crate::collect::BoundedResult) {
+        if !active() {
+            return;
+        }
+        let receipt = result.process_receipt.as_ref();
+        eprintln!(
+            "native_reader_git={ordinal} operation={operation:?} outcome={outcome} code={:?} timeout={} limit={} spawn={} stdout_bytes={} stderr_bytes={} receipt={} owner={} root={} root_exit_code={:?} stop={:?} root_exited={} job_empty={} observed_exited={} stdout_eof={} stderr_eof={} writer_finished={} observed_count={} total_processes={} cleanup={}",
+            result.code,
+            result.timed_out,
+            result.output_limited,
+            result.spawn_failed,
+            result.stdout.len(),
+            result.stderr.len(),
+            receipt.is_some(),
+            receipt.is_some_and(|r| r.owner.is_some()),
+            receipt.is_some_and(|r| r.root.is_some()),
+            receipt.and_then(|r| r.root_exit_code),
+            receipt.map(|r| r.stop),
+            receipt.is_some_and(|r| r.root_exited),
+            receipt.is_some_and(|r| r.job_empty),
+            receipt.is_some_and(|r| r.observed_exited),
+            receipt.is_some_and(|r| r.stdout_eof),
+            receipt.is_some_and(|r| r.stderr_eof),
+            receipt.is_some_and(|r| r.writer_finished),
+            receipt.map_or(0, |r| r.observed.len()),
+            receipt.map_or(0, |r| r.total_processes),
+            receipt.is_some_and(|r| r.cleanup_confirmed()),
+        );
+    }
+
+    fn require<T, E>(result: Result<T, E>, stage: &'static str) -> T {
+        result.unwrap_or_else(|_| panic!("native reader diagnostic failed at {stage}"))
+    }
+    fn normal(path: &Path) -> String {
+        require(path.to_str().ok_or(()), "lossless path").trim_start_matches(r"\\?\").replace('\\', "/")
+    }
+    fn finite(child: &mut std::process::Child, deadline: Instant) -> std::process::ExitStatus {
+        loop {
+            if let Some(status) = require(child.try_wait(), "process observation") {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("native reader diagnostic exceeded its fixed deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn actual_native_reader_reports_sanitized_stages() {
+        let fixture = format!("{}::native_reader_standalone_fixture", require(module_path!().split_once("::").ok_or(()), "test module").1);
+        let state = std::env::temp_dir().join(format!("native-reader-diagnostic-state-{}-{}", std::process::id(), crate::db::now_ms()));
+        assert!(!state.exists());
+        let mut command = Command::new(require(std::env::current_exe(), "test executable"));
+        command
+            .args(["--exact", &fixture, "--nocapture", "--", MARKER])
+            .env("KATALA_TUNE_CONFIG", state.join("config/nodes.json"))
+            .env("KATALA_TUNE_DATA_DIR", state.join("data"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        let mut child = require(command.spawn(), "isolated fixture spawn");
+        let status = finite(&mut child, Instant::now() + Duration::from_secs(45));
+        assert!(!state.exists(), "read-only diagnostic must not create private state");
+        assert!(status.success(), "isolated native reader diagnostic must succeed: code={:?}", status.code());
+    }
+
+    #[test]
+    fn native_reader_standalone_fixture() {
+        if !active() {
+            return;
+        }
+        stage("fixture_approval");
+        // PATH discovery and readonly HEAD/Cargo.toml reads are test approval,
+        // never production artifact discovery or a source admission capability.
+        let git = require(std::env::var_os("PATH").ok_or(()), "fixture Git search path");
+        let git = require(
+            std::env::split_paths(&git).filter(|path| !path.as_os_str().is_empty()).map(|path| path.join("git.exe")).find(|path| path.is_file()).ok_or(()),
+            "fixture Git executable",
+        );
+        let git = require(git.canonicalize(), "fixture Git canonical path");
+        let checkout = require(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize(), "CI checkout");
+        let root = require(checkout.parent().ok_or(()), "registered root");
+        let relative = require(require(checkout.file_name().ok_or(()), "checkout name").to_str().ok_or(()), "checkout UTF-8");
+        let source = native::windows::WindowsSourceIo::default();
+        let environment = require(native::environment(&source), "fixture environment");
+        let mut query = Command::new(&git);
+        query.current_dir(&checkout).env_clear().envs(environment).args([
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=NUL",
+            "rev-parse",
+            "--verify",
+            "HEAD",
+        ]);
+        query.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        let mut child = require(query.spawn(), "approved HEAD query");
+        let stdout = require(child.stdout.take().ok_or(()), "HEAD pipe");
+        let read = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stdout.take(8193).read_to_end(&mut bytes);
+            (result, bytes)
+        });
+        let query_end = Instant::now() + Duration::from_secs(10);
+        assert!(finite(&mut child, query_end).success(), "readonly HEAD approval must succeed");
+        while !read.is_finished() && Instant::now() < query_end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(read.is_finished(), "readonly HEAD query requires actual pipe EOF");
+        let (result, head) = require(read.join(), "HEAD reader");
+        require(result, "HEAD bytes");
+        assert!(head.len() <= 8192);
+        let head = require(String::from_utf8(head), "HEAD UTF-8").trim().to_owned();
+        let limits = TopologyLimits::default();
+        let mut approved = Vec::new();
+        require(
+            require(std::fs::File::open(checkout.join("Cargo.toml")), "approved manifest open").take(limits.file_bytes as u64 + 1).read_to_end(&mut approved),
+            "approved manifest bytes",
+        );
+        assert!(approved.len() <= limits.file_bytes);
+        let remote = RemoteRequest {
+            scope_id: "fixture:native-reader-diagnostic".into(),
+            alias: String::new(),
+            expected_identity_hash: Some(require(source.identity_hash(), "approved host identity")),
+            platform: RemotePlatform::Windows,
+            expected_runtime: RemoteRuntimeKind::Native,
+            expected_distro: None,
+            cursor: None,
+            roots: vec![normal(root)],
+            configs: vec![],
+            source_allowlist: Some(vec![RemoteSourceCheckout {
+                root_index: 0,
+                relative_path: relative.into(),
+                expected_head: head.clone(),
+                manifests: vec![RemoteSourceManifest { relative_path: "Cargo.toml".into(), bytes: approved.len(), sha256: crate::db::sha256_hex(&approved) }],
+            }]),
+            python_program: String::new(),
+            windows_reader_program: None,
+            git_program: Some(normal(&git)),
+            observed_at_ms: crate::db::now_ms(),
+            limits,
+        };
+        let artifact = crate::db::sha256_hex(&require(std::fs::read(&git), "approved Git artifact"));
+        let request = require(ReaderRequest::from_remote_native(&remote, require(reader::fresh_nonce(), "request nonce"), 30_000, artifact), "native request");
+        let frame = require(reader::encode_request(&request), "request frame");
+        // One execution, no retries or restarted budgets. The public response is
+        // processing completion only; this test does not assert helper self-exit.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let response = require(execute_reader(&request, &frame[16..], deadline), "execute_reader");
+        stage("processing_decode");
+        let bytes = require(protocol::decode_processing_response(&response, &request, &frame[16..]), "processing response");
+        let capture: RawCapture = require(serde_json::from_slice(bytes), "capture JSON");
+        assert!(Instant::now() < deadline, "decoding must share the original deadline");
+        assert!(capture.failures.is_empty() && capture.progress.is_none());
+        assert_eq!(capture.repositories.len(), 1);
+        assert_eq!(capture.counters.children, 5);
+        let repo = &capture.repositories[0];
+        assert!(repo.relative_path == relative && repo.git.head.as_deref() == Some(head.as_str()));
+        assert_eq!(repo.manifests.len(), 1);
+        let manifest = &repo.manifests[0];
+        assert!(manifest.relative_path == "Cargo.toml" && manifest.content.as_bytes() == approved);
+        assert!(manifest.content_sha256 == crate::db::sha256_hex(&approved) && manifest.revision.as_deref() == Some(head.as_str()));
+        eprintln!(
+            "native_reader_stage=complete repositories={} children={} response_bytes={} capture_bytes={}",
+            capture.repositories.len(),
+            capture.counters.children,
+            response.len(),
+            bytes.len()
+        );
+    }
 }

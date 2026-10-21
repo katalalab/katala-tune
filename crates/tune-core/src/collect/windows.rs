@@ -833,6 +833,19 @@ pub(super) async fn run_owned_shared(
         || answer.spawn_failed
         || !answer.process_receipt.as_ref().is_some_and(|receipt| receipt.stop == ProcessStop::Completed && receipt.cleanup_confirmed())
     {
+        #[cfg(test)]
+        eprintln!(
+            "owned_admission_rejected missing_origin={} code={:?} timeout={} limited={} spawn={} stdout_len={} stderr_len={} stop={:?} cleanup={}",
+            matches!(exit_policy, WindowsMetadataExitPolicy::MissingOrigin),
+            answer.code,
+            answer.timed_out,
+            answer.output_limited,
+            answer.spawn_failed,
+            answer.stdout.len(),
+            answer.stderr.len(),
+            answer.process_receipt.as_ref().map(|receipt| receipt.stop),
+            answer.process_receipt.as_ref().is_some_and(ProcessReceipt::cleanup_confirmed)
+        );
         return Err(withhold(answer, std::time::Instant::now() >= deadline));
     }
     let Some(job) = job else {
@@ -992,7 +1005,9 @@ async fn run_inner(
                 }
             }
         }
-        if job.observe(&mut receipt).is_err() {
+        if let Err(_error) = job.observe(&mut receipt) {
+            #[cfg(test)]
+            eprintln!("owned_observe_error_code={}", _error.raw_os_error().unwrap_or(-1));
             receipt.job_empty = false;
             receipt.observed_exited = false;
             if receipt.stop == ProcessStop::Completed {
@@ -1000,6 +1015,15 @@ async fn run_inner(
             }
         }
         if lingering_descendants(&receipt) && receipt.stop == ProcessStop::Completed {
+            #[cfg(test)]
+            eprintln!(
+                "owned_lingering root_exited={} job_empty={} observed_exited={} observed={} total={}",
+                receipt.root_exited,
+                receipt.job_empty,
+                receipt.observed_exited,
+                receipt.observed.len(),
+                receipt.total_processes
+            );
             receipt.stop = ProcessStop::LingeringDescendants;
         }
         let now = Instant::now();
@@ -1281,33 +1305,52 @@ mod tests {
                 }
             }
         }
-        let mut cmd_passed = true;
-        for (code, policy) in
-            [("0", WindowsMetadataExitPolicy::ZeroOnly), ("0", WindowsMetadataExitPolicy::ZeroOnly), ("1", WindowsMetadataExitPolicy::MissingOrigin)]
-        {
-            let mut command = std::process::Command::new(pin.executable());
-            command.current_dir(&cwd).args(["/D", "/C", "exit", code]);
-            let result = runtime.block_on(run_owned_shared(Arc::clone(&pin), &command, &git_environment, b"", end, 8192, 8192, policy));
-            report(if code == "0" { "system_cmd_zero" } else { "system_cmd_origin_one" }, true, &result);
+        // cmd /C uses shell-specific parsing rather than this backend's CRT
+        // argv contract. Test metadata policies with actual Git metadata instead.
+        let repository = temporary.0.join("metadata");
+        let mut setup = std::process::Command::new(git_pin.executable());
+        setup.current_dir(&temporary.0).args(["--no-optional-locks", "-c", "core.hooksPath=NUL", "init", "--quiet", "--template="]).arg(&repository);
+        let setup_result =
+            runtime.block_on(run_owned_shared(Arc::clone(&git_pin), &setup, &git_environment, b"", end, 8192, 8192, WindowsMetadataExitPolicy::ZeroOnly));
+        report("metadata_fixture_setup", true, &setup_result);
+        assert!(
+            setup_result.is_ok_and(|completion| completion.into_verified_output(b"", &git_artifact).is_ok()),
+            "exclusive no-origin Git fixture setup must complete and consume"
+        );
+        let mut metadata_passed = true;
+        for (arguments, policy, empty) in [
+            (vec!["rev-parse", "--absolute-git-dir"], WindowsMetadataExitPolicy::ZeroOnly, false),
+            (vec!["rev-parse", "--absolute-git-dir"], WindowsMetadataExitPolicy::ZeroOnly, false),
+            (vec!["config", "--local", "--get", "remote.origin.url"], WindowsMetadataExitPolicy::MissingOrigin, true),
+        ] {
+            let mut command = std::process::Command::new(git_pin.executable());
+            command.current_dir(&repository).args(["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=NUL"]).args(arguments);
+            let result = runtime.block_on(run_owned_shared(Arc::clone(&git_pin), &command, &git_environment, b"", end, 8192, 8192, policy));
+            report(if empty { "metadata_origin_one" } else { "metadata_zero" }, true, &result);
             let passed = result.is_ok_and(|completion| {
-                let retained = Arc::ptr_eq(&completion.witness.pin, &pin) && Arc::strong_count(&pin) == 2;
+                let retained = Arc::ptr_eq(&completion.witness.pin, &git_pin) && Arc::strong_count(&git_pin) == 2;
                 let cleanup = completion.diagnostic().process_receipt.as_ref().is_some_and(ProcessReceipt::cleanup_confirmed);
-                let consumed = completion.into_verified_output(b"", &artifact).is_ok_and(|bytes| bytes.is_empty());
-                retained && cleanup && consumed
+                let expected_code = completion.diagnostic().code == Some(if empty { 1 } else { 0 });
+                let consumed = completion.into_verified_output(b"", &git_artifact).is_ok_and(|bytes| bytes.is_empty() == empty);
+                retained && cleanup && expected_code && consumed
             });
-            cmd_passed &= passed && Arc::strong_count(&pin) == 1;
+            metadata_passed &= passed && Arc::strong_count(&git_pin) == 1;
         }
-        let mut missing = std::process::Command::new(pin.executable());
-        missing.current_dir(&cwd).args(["/D", "/C", "exit", "1"]);
+        let mut missing = std::process::Command::new(git_pin.executable());
+        missing.current_dir(&repository).args(["--no-optional-locks", "-c", "core.hooksPath=NUL", "config", "--local", "--get", "remote.origin.url"]);
         let missing_result =
-            runtime.block_on(run_owned_shared(Arc::clone(&pin), &missing, &git_environment, b"", end, 8192, 8192, WindowsMetadataExitPolicy::ZeroOnly));
-        report("system_cmd_one_zero_only", true, &missing_result);
+            runtime.block_on(run_owned_shared(Arc::clone(&git_pin), &missing, &git_environment, b"", end, 8192, 8192, WindowsMetadataExitPolicy::ZeroOnly));
+        report("metadata_one_zero_only", true, &missing_result);
         let missing_rejected = missing_result.is_err_and(|failed| {
             failed.code.is_none()
                 && failed.stdout.is_empty()
                 && failed.stderr.is_empty()
-                && failed.process_receipt.as_ref().is_some_and(ProcessReceipt::cleanup_confirmed)
+                && failed
+                    .process_receipt
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.root_exit_code == Some(1) && receipt.stop == ProcessStop::Completed && receipt.cleanup_confirmed())
         });
+        assert_eq!(Arc::strong_count(&git_pin), 1);
 
         let alternate = temporary.0.join("same-bytes.exe");
         std::fs::write(&alternate, &image).unwrap();
@@ -1328,9 +1371,9 @@ mod tests {
         assert_eq!(Arc::strong_count(&pin), 1);
         assert!(own_passed, "same-parent pinned original Rust control must complete and consume");
         assert!(copy_passed, "same-bytes Rust control must complete on the system volume and consume");
-        assert!(cmd_passed, "all shared system-command completion and lease assertions remain required");
+        assert!(metadata_passed, "all shared metadata completion, exit-policy and lease assertions remain required");
         assert!(missing_rejected, "zero-only policy still requires a real completed exit-one rejection");
-        assert!(git_passed, "actual pinned Git metadata must succeed as well as the system command fixture");
+        assert!(git_passed, "actual pinned Git metadata must succeed as well as the no-origin fixture");
         drop(other);
         drop(copy_pin);
         drop(own_pin);
