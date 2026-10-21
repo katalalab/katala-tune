@@ -1,3 +1,4 @@
+mod candidate_schema;
 mod candidates;
 mod facts;
 mod ui;

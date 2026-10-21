@@ -16,6 +16,9 @@ fn token(value: &str) -> bool {
     !value.is_empty() && value.len() <= 160 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
 }
 fn has_tables(db: &Connection) -> Result<bool> {
+    if !super::candidate_schema::ledger(db)? {
+        return Ok(false);
+    }
     // Candidate storage is optional on legacy/read-only/partially migrated DBs.
     // Fixed PRAGMA metadata distinguishes an unknown shape from SQL/IO failure.
     for (table, expected) in [
@@ -58,6 +61,9 @@ impl Store {
         }
         self.tx(|db| {
             assert_lease(db, lease, now)?;
+            if !super::candidate_schema::ledger(db)? {
+                return Err(invalid("unknown candidate ledger schema"));
+            }
             let current: i64 = db.query_row("SELECT ordinal FROM docker_candidate_sequence WHERE singleton=1", [], |row| row.get(0))?;
             if current < 0 {
                 return Err(invalid("invalid candidate sequence"));
@@ -81,6 +87,7 @@ impl Store {
         }
         self.tx(|db| {
             assert_lease(db,lease,now)?;
+            if !super::ui::known(db)? || !has_tables(db)? {return Err(invalid("unknown candidate storage schema"));}
             let bytes = validate(&payload, now).map_err(invalid)?;
             if crate::db::sha256_hex(&bytes) != digest { return Err(invalid("candidate admission binding mismatch")); }
             let reservation:Option<(i64,String,i64,i64)>=db.query_row("SELECT ordinal,holder,writer_generation,reserved_at FROM docker_candidate_attempts WHERE attempt_id=?",[attempt_id],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
@@ -110,6 +117,9 @@ impl Store {
     }
 }
 fn prune_ledgers(db: &Connection) -> Result<()> {
+    if !super::candidate_schema::ledger(db)? {
+        return Ok(());
+    }
     // Once its reservation is gone, a token cannot replay even if its empty ledger is pruned.
     db.execute("DELETE FROM docker_candidate_scopes WHERE scope_id NOT IN (SELECT scope_id FROM docker_candidates) AND latest_attempt NOT IN (SELECT attempt_id FROM docker_candidate_attempts)",[])?;
     let count: i64 = db.query_row("SELECT count(*) FROM docker_candidate_scopes", [], |row| row.get(0))?;
@@ -365,14 +375,59 @@ mod tests {
             assert!(entity["attributes"]["ports"].as_array().unwrap().len() <= 16);
         }
     }
+    fn rollback_state(db: &Store) -> Value {
+        let mut state = json!({});
+        for (table, order) in [
+            ("topology_entities", "scope_id,id"),
+            ("topology_edges", "scope_id,id"),
+            ("topology_accepted_facts", "scope_id"),
+            ("topology_runs", "run_id"),
+            ("topology_scopes", "run_id,scope_id"),
+            ("topology_observations", "run_id,scope_id"),
+            ("topology_changes", "run_id,scope_id,id,change_kind"),
+            ("docker_candidates", "scope_id"),
+            ("docker_candidate_scopes", "scope_id"),
+            ("docker_ui_envelopes", "scope_id"),
+            ("docker_ui_rows", "scope_id,row_type,id"),
+            ("docker_candidate_attempts", "ordinal"),
+            ("docker_candidate_sequence", "singleton"),
+        ] {
+            let mut statement = db.conn().prepare(&format!("SELECT * FROM {table} ORDER BY {order}")).unwrap();
+            let count = statement.column_count();
+            let mut rows = statement.query([]).unwrap();
+            let mut values = vec![];
+            while let Some(row) = rows.next().unwrap() {
+                values.push(
+                    (0..count)
+                        .map(|index| match row.get_ref(index).unwrap() {
+                            rusqlite::types::ValueRef::Null => Value::Null,
+                            rusqlite::types::ValueRef::Integer(n) => json!(["integer", n]),
+                            rusqlite::types::ValueRef::Real(n) => json!(["real", n]),
+                            rusqlite::types::ValueRef::Text(bytes) => json!(["text", bytes.len(), crate::db::sha256_hex(bytes)]),
+                            rusqlite::types::ValueRef::Blob(bytes) => json!(["blob", bytes.len(), crate::db::sha256_hex(bytes)]),
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            state[table] = json!(values);
+        }
+        state
+    }
     #[test]
     fn ui_projection_complete_expiry_eviction_and_transaction_rollback() {
         let (db, lease, now) = setup();
         let p = payload(now);
         db.record_docker_candidate_fenced(&lease, admit(&db, &lease, "ui", p.clone(), now), now).unwrap();
         drop(db.reserve_docker_attempt_fenced(&lease, "reserved-complete", now - 40).unwrap());
-        db.conn().execute_batch("CREATE TRIGGER ui_rollback BEFORE DELETE ON docker_ui_rows BEGIN SELECT RAISE(ABORT,'fixture rollback'); END;").unwrap();
-        assert!(db.record_topology("reserved-complete", &receipt(&p, ScopeStatus::Complete, now), now).is_err());
+        // Fault injection is outside the optional candidate schema. It fires only
+        // after both UI tables were cleaned, the ledger advanced and accepted
+        // entities were written, proving those writes all roll back together.
+        let scope = p.scope_id.replace('\'', "''");
+        db.conn().execute_batch(&format!("CREATE TRIGGER ui_rollback BEFORE INSERT ON topology_accepted_facts WHEN NOT EXISTS(SELECT 1 FROM docker_ui_rows WHERE scope_id='{scope}') AND NOT EXISTS(SELECT 1 FROM docker_ui_envelopes WHERE scope_id='{scope}') AND EXISTS(SELECT 1 FROM docker_candidate_scopes WHERE scope_id='{scope}' AND latest_status='complete') AND EXISTS(SELECT 1 FROM topology_entities WHERE scope_id='{scope}') BEGIN SELECT RAISE(ABORT,'fixture rollback after UI cleanup'); END;")).unwrap();
+        let before = rollback_state(&db);
+        let error = db.record_topology("reserved-complete", &receipt(&p, ScopeStatus::Complete, now), now).unwrap_err();
+        assert!(error.to_string().contains("fixture rollback after UI cleanup"));
+        assert_eq!(rollback_state(&db), before);
         assert_eq!(db.topology_ui_view(&Default::default()).unwrap()["candidates"].as_array().unwrap().len(), 1);
         db.conn().execute_batch("DROP TRIGGER ui_rollback").unwrap();
         // Unreserved legacy receipts do not promote a token; mixed writers remain
@@ -401,12 +456,27 @@ mod tests {
         db.record_docker_candidate_fenced(&lease, admit(&db, &lease, "next", next.clone(), now), now).unwrap();
         assert_eq!(db.conn().query_row("SELECT count(*) FROM docker_ui_envelopes", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
         assert_eq!(db.conn().query_row("SELECT count(*) FROM docker_ui_rows WHERE scope_id=?", [&p.scope_id], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        let original: String =
+            db.conn().query_row("SELECT display FROM docker_ui_rows WHERE kind='docker_container' AND row_type='entity'", [], |r| r.get(0)).unwrap();
+        // SQL pressure makes ui::prune evict after ui::record inserted the new
+        // scope. The conditional trigger proves new UI rows existed at abort.
         db.conn()
-            .execute_batch("CREATE TRIGGER projection_rollback BEFORE INSERT ON docker_ui_rows BEGIN SELECT RAISE(ABORT,'fixture rollback'); END;")
+            .execute("UPDATE docker_ui_rows SET display=CAST(zeroblob(67108865) AS TEXT) WHERE kind='docker_container' AND row_type='entity'", [])
             .unwrap();
         let third = relocate(p, 2);
-        assert!(db.record_docker_candidate_fenced(&lease, admit(&db, &lease, "third", third.clone(), now), now).is_err());
-        assert_eq!(db.conn().query_row("SELECT count(*) FROM docker_candidates WHERE scope_id=?", [third.scope_id], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        let scope = third.scope_id.replace('\'', "''");
+        db.conn().execute_batch(&format!("CREATE TRIGGER projection_rollback BEFORE DELETE ON docker_candidates WHEN EXISTS(SELECT 1 FROM docker_ui_rows WHERE scope_id='{scope}') AND EXISTS(SELECT 1 FROM docker_ui_envelopes WHERE scope_id='{scope}') BEGIN SELECT RAISE(ABORT,'fixture rollback after UI insert');END;")).unwrap();
+        let incoming = admit(&db, &lease, "third", third.clone(), now);
+        let before = rollback_state(&db);
+        let error = db.record_docker_candidate_fenced(&lease, incoming, now).unwrap_err();
+        assert!(error.to_string().contains("fixture rollback after UI insert"));
+        assert_eq!(rollback_state(&db), before);
+        assert_eq!(db.conn().query_row("SELECT count(*) FROM docker_candidates WHERE scope_id=?", [&third.scope_id], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(db.conn().query_row("SELECT count(*) FROM docker_ui_rows WHERE scope_id=?", [&third.scope_id], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        db.conn().execute_batch("DROP TRIGGER projection_rollback").unwrap();
+        // Restore the deliberate pressure-only corruption before displaying the
+        // prior candidate. The rollback comparison above included its full hash.
+        db.conn().execute("UPDATE docker_ui_rows SET display=? WHERE kind='docker_container' AND row_type='entity'", [original]).unwrap();
         assert_eq!(db.topology_ui_view(&Default::default()).unwrap()["candidates"][0]["scope_id"], next.scope_id);
     }
     #[test]
@@ -617,6 +687,243 @@ mod tests {
             assert_eq!(v["window"]["candidate_unavailable_reasons"], json!(["unknown_projection_schema"]));
             assert_eq!(db.conn().total_changes(), writes);
         }
+    }
+    fn constrained_fixture_ddl(table: &str, change: &str) -> String {
+        let (fields, pk, default_field) = match table {
+            "docker_ui_envelopes" => (vec![("scope_id", "TEXT"), ("envelope", "TEXT"), ("digest", "TEXT"), ("ordinal", "INTEGER")], "scope_id", "ordinal"),
+            "docker_ui_rows" => (
+                vec![
+                    ("scope_id", "TEXT"),
+                    ("row_type", "TEXT"),
+                    ("id", "TEXT"),
+                    ("kind", "TEXT"),
+                    ("search", "TEXT"),
+                    ("from_id", "TEXT"),
+                    ("to_id", "TEXT"),
+                    ("display", "TEXT"),
+                    ("digest", "TEXT"),
+                ],
+                "scope_id,row_type,id",
+                "display",
+            ),
+            _ => (
+                vec![
+                    ("scope_id", "TEXT"),
+                    ("latest_ordinal", "INTEGER"),
+                    ("latest_attempt", "TEXT"),
+                    ("latest_status", "TEXT"),
+                    ("complete_ordinal", "INTEGER"),
+                ],
+                "scope_id",
+                "complete_ordinal",
+            ),
+        };
+        let columns = fields
+            .iter()
+            .map(|(name, kind)| {
+                let nn = if change == "nullable" { "" } else { " NOT NULL" };
+                let default = if *name == "complete_ordinal" {
+                    if change == "default" {
+                        " DEFAULT 1"
+                    } else if change == "expression" {
+                        " DEFAULT (0+0)"
+                    } else if change == "equivalent" {
+                        " DEFAULT (( /* same literal */ +0))"
+                    } else {
+                        " DEFAULT 0"
+                    }
+                } else if *name == default_field && change == "default" {
+                    if *kind == "TEXT" { " DEFAULT ''" } else { " DEFAULT 0" }
+                } else if *name == default_field && change == "expression" {
+                    if *kind == "TEXT" { " DEFAULT (''||'')" } else { " DEFAULT (0+0)" }
+                } else {
+                    ""
+                };
+                let collate = if change == "collation" && (*name == "scope_id" || *name == "kind") {
+                    " COLLATE NOCASE"
+                } else if change == "equivalent" {
+                    " COLLATE BINARY"
+                } else {
+                    ""
+                };
+                format!("\"{name}\" {kind}{nn}{default}{collate}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let columns = if change == "generated" { format!("{columns},future_generated TEXT GENERATED ALWAYS AS ('future') VIRTUAL") } else { columns };
+        let primary = if change == "no_pk" {
+            String::new()
+        } else {
+            format!(
+                ",CONSTRAINT \"CHECK is a name\" PRIMARY KEY({}){}",
+                if change == "descending" { pk.replacen("scope_id", "scope_id DESC", 1) } else { pk.into() },
+                if change == "conflict" {
+                    " ON CONFLICT IGNORE"
+                } else if change == "equivalent" {
+                    " ON CONFLICT ABORT"
+                } else {
+                    ""
+                }
+            )
+        };
+        let extra = match change {
+            "unique" => format!(",UNIQUE({})", if table == "docker_candidate_scopes" { "latest_attempt" } else { default_field }),
+            "check" => ",CHECK(1)".into(),
+            "foreign" => ",FOREIGN KEY(scope_id) REFERENCES future_parent(scope_id)".into(),
+            _ => String::new(),
+        };
+        format!(
+            "CREATE TABLE \"{table}\" ({columns}{primary}{extra}){} /* CHECK and ON CONFLICT IGNORE inside a comment are not constraints */;{}",
+            if change == "no_pk" || change == "rowid" {
+                ""
+            } else if change == "strict" {
+                " WITHOUT ROWID, STRICT"
+            } else {
+                " WITHOUT ROWID"
+            },
+            if change == "trigger" { format!("CREATE TRIGGER future_trigger AFTER INSERT ON {table} BEGIN SELECT 1;END;") } else { String::new() }
+        )
+    }
+    fn fixture_rows(db: &Store, table: &str) -> Vec<Value> {
+        let order = if table == "docker_ui_rows" { "scope_id,row_type,id" } else { "scope_id" };
+        db.conn()
+            .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))
+            .unwrap()
+            .query_map([], crate::db::row_json)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap()
+    }
+    fn fixture_schema_objects(db: &Store, table: &str) -> Vec<Value> {
+        db.conn()
+            .prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name=? OR tbl_name=? ORDER BY name")
+            .unwrap()
+            .query_map(params![table, table], crate::db::row_json)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap()
+    }
+    fn fixture_reservations(db: &Store) -> Value {
+        let sequence: i64 = db.conn().query_row("SELECT ordinal FROM docker_candidate_sequence", [], |r| r.get(0)).unwrap();
+        let attempts = db
+            .conn()
+            .prepare("SELECT * FROM docker_candidate_attempts ORDER BY ordinal")
+            .unwrap()
+            .query_map([], crate::db::row_json)
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        json!({"sequence":sequence,"attempts":attempts})
+    }
+    #[test]
+    fn optional_ui_same_columns_wrong_constraints_are_unavailable() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        for table in ["docker_ui_envelopes", "docker_ui_rows", "docker_candidate_scopes"] {
+            for change in [
+                "nullable",
+                "no_pk",
+                "default",
+                "expression",
+                "unique",
+                "check",
+                "foreign",
+                "collation",
+                "conflict",
+                "generated",
+                "rowid",
+                "strict",
+                "trigger",
+                "descending",
+            ] {
+                let dir = std::env::temp_dir().join(format!(
+                    "tune-constraint-{}-{}-{}",
+                    std::process::id(),
+                    crate::db::now_ms(),
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
+                let db = Store::open(&dir).unwrap();
+                let now = crate::db::now_ms();
+                let lease = db.acquire_topology_lease_fenced("fixture-writer", now - 100, 10_000).unwrap().unwrap();
+                let p = payload(now);
+                db.record_topology("accepted", &receipt(&p, ScopeStatus::Complete, now), now).unwrap();
+                db.record_docker_candidate_fenced(&lease, admit(&db, &lease, "baseline", p.clone(), now), now).unwrap();
+                let accepted = db.topology_accepted_view().unwrap();
+                let incoming = admit(&db, &lease, "incoming", p.clone(), now);
+                drop(db.reserve_docker_attempt_fenced(&lease, "complete", now - 40).unwrap());
+                let parent = if change == "foreign" {
+                    "CREATE TABLE future_parent(scope_id TEXT PRIMARY KEY);INSERT INTO future_parent SELECT DISTINCT scope_id FROM fixture_saved;INSERT OR IGNORE INTO future_parent VALUES ('orphan');"
+                } else {
+                    ""
+                };
+                db.conn().execute_batch(&format!("ALTER TABLE {table} RENAME TO fixture_saved;{parent}{}INSERT INTO {table} SELECT * FROM fixture_saved;DROP TABLE fixture_saved;DROP INDEX IF EXISTS docker_ui_rows_selection;",constrained_fixture_ddl(table,change))).unwrap();
+                if table == "docker_candidate_scopes" {
+                    db.conn().execute("INSERT INTO docker_candidate_scopes VALUES ('orphan',2,'gone','failed',0)", []).unwrap();
+                }
+                let sql: String = db.conn().query_row("SELECT sql FROM sqlite_schema WHERE name=?", [table], |r| r.get(0)).unwrap();
+                let rows = fixture_rows(&db, table);
+                let schema_objects = fixture_schema_objects(&db, table);
+                drop(db);
+                let db = Store::open(&dir).unwrap();
+                assert_eq!(
+                    db.conn().query_row("SELECT count(*) FROM sqlite_schema WHERE name='docker_ui_rows_selection'", [], |r| r.get::<_, i64>(0)).unwrap(),
+                    0,
+                    "{table}/{change}: unknown schema must not acquire an index"
+                );
+                assert_eq!(db.topology_accepted_view().unwrap(), accepted);
+                if table == "docker_candidate_scopes" {
+                    let reserved = fixture_reservations(&db);
+                    let before = db.conn().total_changes();
+                    assert!(
+                        db.reserve_docker_attempt_fenced(&lease, "blocked-reserve", now - 40).is_err(),
+                        "unknown ledger must reject before reservation mutations"
+                    );
+                    assert_eq!(fixture_reservations(&db), reserved);
+                    assert_eq!(db.conn().total_changes(), before);
+                    super::prune_ledgers(db.conn()).unwrap();
+                    assert_eq!(db.conn().total_changes(), before);
+                } else {
+                    drop(db.reserve_docker_attempt_fenced(&lease, "known-ledger-reserve", now - 40).unwrap());
+                }
+                assert_eq!(fixture_rows(&db, table), rows, "reserve/prune must not mutate unknown ledger");
+                let before = db.conn().total_changes();
+                assert!(db.record_docker_candidate_fenced(&lease, incoming, now).is_err(), "{table}/{change}: reject before mutation");
+                assert_eq!(db.conn().total_changes(), before, "even rolled-back DML must not begin");
+                assert_eq!(fixture_rows(&db, table), rows);
+                let mut fresh = receipt(&p, ScopeStatus::Complete, now - 5);
+                for entity in &mut fresh.entities {
+                    entity.label = "new accepted".into();
+                }
+                db.record_topology_fenced(&lease, "complete", &fresh, now).unwrap();
+                assert!(db.topology_accepted_view().unwrap()["entities"].as_array().unwrap().iter().all(|e| e["label"] == "new accepted"));
+                assert_eq!(fixture_rows(&db, table), rows, "Complete must leave unknown object untouched");
+                assert_eq!(fixture_schema_objects(&db, table), schema_objects, "unknown indexes/triggers remain untouched");
+                assert_eq!(db.conn().query_row("SELECT sql FROM sqlite_schema WHERE name=?", [table], |r| r.get::<_, String>(0)).unwrap(), sql);
+                let before = db.conn().total_changes();
+                let view = db.topology_ui_view(&Default::default()).unwrap();
+                assert!(view["candidates"].as_array().unwrap().is_empty());
+                assert_eq!(view["window"]["candidate_unavailable_reasons"], json!(["unknown_projection_schema"]));
+                assert_eq!(db.conn().total_changes(), before);
+                drop(db);
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+    #[test]
+    fn optional_ui_equivalent_quoted_commented_schema_keeps_normal_save_and_index() {
+        let (db, lease, now) = setup();
+        let p = payload(now);
+        for table in ["docker_ui_envelopes", "docker_ui_rows", "docker_candidate_scopes"] {
+            db.conn()
+                .execute_batch(&format!(
+                    "ALTER TABLE {table} RENAME TO fixture_saved;{}INSERT INTO {table} SELECT * FROM fixture_saved;DROP TABLE fixture_saved;",
+                    constrained_fixture_ddl(table, "equivalent")
+                ))
+                .unwrap();
+        }
+        super::super::initialize_optional_indexes(db.conn()).unwrap();
+        assert_eq!(db.conn().query_row("SELECT count(*) FROM sqlite_schema WHERE name='docker_ui_rows_selection'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        db.record_docker_candidate_fenced(&lease, admit(&db, &lease, "equivalent", p, now), now).unwrap();
+        assert_eq!(db.topology_ui_view(&Default::default()).unwrap()["candidates"].as_array().unwrap().len(), 1);
     }
     #[test]
     fn synthetic_admission_saves_candidate_without_applying_graph() {

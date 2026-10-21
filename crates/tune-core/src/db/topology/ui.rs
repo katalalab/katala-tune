@@ -300,39 +300,8 @@ pub(super) fn initialize_index(db: &Connection) -> Result<()> {
     }
     Ok(())
 }
-fn known(db: &Connection) -> Result<bool> {
-    for (name, expected) in [
-        ("docker_ui_envelopes", vec![("scope_id", "TEXT"), ("envelope", "TEXT"), ("digest", "TEXT"), ("ordinal", "INTEGER")]),
-        (
-            "docker_ui_rows",
-            vec![
-                ("scope_id", "TEXT"),
-                ("row_type", "TEXT"),
-                ("id", "TEXT"),
-                ("kind", "TEXT"),
-                ("search", "TEXT"),
-                ("from_id", "TEXT"),
-                ("to_id", "TEXT"),
-                ("display", "TEXT"),
-                ("digest", "TEXT"),
-            ],
-        ),
-        (
-            "docker_candidate_scopes",
-            vec![("scope_id", "TEXT"), ("latest_ordinal", "INTEGER"), ("latest_attempt", "TEXT"), ("latest_status", "TEXT"), ("complete_ordinal", "INTEGER")],
-        ),
-    ] {
-        // A view can expose identical declared columns without being this table.
-        if !db.prepare("SELECT 1 FROM sqlite_schema WHERE name=? AND type='table'")?.exists([name])? {
-            return Ok(false);
-        }
-        let mut s = db.prepare(&format!("PRAGMA table_info({name})"))?;
-        let columns = s.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?.collect::<Result<Vec<_>>>()?;
-        if columns.len() != expected.len() || columns.iter().zip(expected).any(|((n, t), (en, et))| n != en || t != et) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+pub(super) fn known(db: &Connection) -> Result<bool> {
+    super::candidate_schema::projection(db)
 }
 struct Group {
     env: Envelope,
