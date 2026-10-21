@@ -40,7 +40,31 @@ impl CommandRunner for Fake {
     fn run<'a>(&'a self, program: &'a str, args: &'a [String], stdin: &'a [u8], _: Duration, _: usize, _: usize) -> CommandFuture<'a> {
         Box::pin(async move {
             self.calls.lock().unwrap().push((program.into(), args.to_vec(), stdin.to_vec()));
-            self.output.lock().unwrap().pop_front().expect("unexpected transport request")
+            let mut output = self.output.lock().unwrap().pop_front().expect("unexpected transport request");
+            if args.last().is_some_and(|command| command.contains(" topology-reader ")) && output.code == Some(0) {
+                use tune_core::collect::{ProcessIdentity, ProcessReceipt, ProcessStop};
+                use tune_core::topology::adapters::windows_reader::{encode_response, read_request};
+                let (request, body) = read_request(&mut std::io::Cursor::new(stdin)).unwrap();
+                let root = ProcessIdentity { pid: 2, created_filetime: "134000000000000001".into(), os_session: 0 };
+                output.process_receipt = Some(ProcessReceipt {
+                    owner_session: "fedcba9876543210fedcba9876543210".into(),
+                    owner: Some(ProcessIdentity { pid: 1, created_filetime: "134000000000000000".into(), os_session: 0 }),
+                    root: Some(root.clone()),
+                    observed: vec![root],
+                    total_processes: 1,
+                    stop: ProcessStop::Completed,
+                    root_exited: true,
+                    root_exit_code: Some(0),
+                    job_empty: true,
+                    observed_exited: true,
+                    stdout_eof: true,
+                    stderr_eof: true,
+                    writer_finished: true,
+                });
+                BoundedResult { code: Some(0), stdout: encode_response(&request, &body, output).unwrap(), ..Default::default() }
+            } else {
+                output
+            }
         })
     }
 }
@@ -69,6 +93,7 @@ fn remote() -> RemoteRequest {
             }],
         }]),
         python_program: "/usr/bin/python3".into(),
+        windows_reader_program: None,
         git_program: None,
         observed_at_ms: 1000,
         limits: limits(),
@@ -355,7 +380,7 @@ async fn remote_rejects_identity_scope_nul_hash_and_unsafe_alias() {
     assert!(fake.calls.lock().unwrap().is_empty());
 }
 #[tokio::test]
-async fn windows_script_has_ascii_bom_no_write_and_short_loader() {
+async fn windows_probe_has_ascii_bom_no_write_and_fixed_native_reader_command() {
     assert!(WINDOWS_PROBE.starts_with('\u{feff}'));
     assert!(WINDOWS_PROBE.trim_start_matches('\u{feff}').is_ascii());
     assert!(!WINDOWS_PROBE.contains('\''));
@@ -364,14 +389,15 @@ async fn windows_script_has_ascii_bom_no_write_and_short_loader() {
     }
     let mut request = remote();
     request.platform = RemotePlatform::Windows;
+    request.windows_reader_program = Some("C:/tools/tune.exe".into());
+    request.git_program = Some("C:/tools/git.exe".into());
     request.roots = vec!["C:\\private\\example-root".into()];
     let fake = Fake::new(vec![remote_capture(&request)]);
     assert!(collect_remote_with(&fake, &request).await.failures.is_empty());
     let calls = fake.calls.lock().unwrap();
     assert!(calls[0].1.last().unwrap().len() < 1000);
-    assert!(calls[0].1.last().unwrap().contains("-EncodedCommand"));
-    assert!(calls[0].2.starts_with(b"$TopologyRequest"));
-    assert!(String::from_utf8(calls[0].2.clone()).unwrap().ends_with(WINDOWS_PROBE.trim_start_matches('\u{feff}')));
+    assert!(calls[0].1.last().unwrap().starts_with("exec 'C:/tools/tune.exe' topology-reader --budget-ms "));
+    assert!(calls[0].2.starts_with(b"KTRDR001"));
     assert!(!POSIX_PROBE.contains("os.mkdir"));
     assert!(!POSIX_PROBE.contains("git fetch"));
 }
@@ -714,7 +740,8 @@ async fn approved_remote_smoke_receipts() {
             configs: vec![],
             source_allowlist: item.get("source_allowlist").cloned().and_then(|value| serde_json::from_value(value).ok()),
             python_program: "/usr/bin/python3".into(),
-            git_program: None,
+            windows_reader_program: item.get("windows_reader_program").and_then(Value::as_str).map(str::to_owned),
+            git_program: item.get("git_program").and_then(Value::as_str).map(str::to_owned),
             observed_at_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64,
             limits: item.get("limits").map(|value| serde_json::from_value(value.clone()).unwrap()).unwrap_or_default(),
         };
@@ -1150,9 +1177,11 @@ async fn posix_listing_cache_counts_160_directories_once_and_completes_checkout(
 }
 
 #[tokio::test]
-async fn windows_transport_sends_bounded_raw_stdin_and_rejects_oversized_before_ssh() {
+async fn windows_transport_sends_one_bounded_frame_and_rejects_oversized_before_ssh() {
     let mut request = remote();
     request.platform = RemotePlatform::Windows;
+    request.windows_reader_program = Some("C:/tools/tune.exe".into());
+    request.git_program = Some("C:/tools/git.exe".into());
     request.roots = vec!["C:\\fixture".into()];
     request.source_allowlist.as_mut().unwrap()[0].relative_path = "x".repeat(70000);
     let mut reported = remote_capture(&request);
@@ -1161,10 +1190,9 @@ async fn windows_transport_sends_bounded_raw_stdin_and_rejects_oversized_before_
     assert!(collect_remote_with(&fake, &request).await.failures.is_empty());
     {
         let calls = fake.calls.lock().unwrap();
-        assert!(calls[0].2.starts_with(b"$TopologyRequest"));
+        assert!(calls[0].2.starts_with(b"KTRDR001"));
         assert!(calls[0].2.len() > 70000);
         assert!(calls[0].2.len() <= 2 * 1024 * 1024);
-        assert!(String::from_utf8(calls[0].2.clone()).unwrap().ends_with(WINDOWS_PROBE.trim_start_matches('\u{feff}')));
     }
     request.limits.file_bytes = 4 * 1024 * 1024;
     request.source_allowlist.as_mut().unwrap()[0].relative_path = "x".repeat(2 * 1024 * 1024);
@@ -1307,4 +1335,87 @@ async fn remote_rejects_mismatched_retained_manifest_count() {
     malformed["counters"]["manifests"] = json!(0);
     let result = collect_remote_with(&Fake::new(vec![malformed]), &request).await;
     assert!(result.failures.iter().any(|failure| failure.code == FailureCode::ParseError && failure.message == "remote report violates bounded schema"));
+}
+
+#[tokio::test]
+async fn windows_never_falls_back_without_explicit_reader_policy_or_bounded_request() {
+    for case in 0..8 {
+        let mut request = remote();
+        request.platform = RemotePlatform::Windows;
+        request.windows_reader_program = Some("C:/tools/tune.exe".into());
+        request.git_program = Some("C:/tools/git.exe".into());
+        request.roots = vec!["C:/fixture".into()];
+        match case {
+            0 => request.windows_reader_program = None,
+            1 => request.windows_reader_program = Some("tune.exe".into()),
+            2 => request.windows_reader_program = Some("C:/tune.exe;command".into()),
+            3 => request.expected_identity_hash = None,
+            4 => request.git_program = None,
+            5 => request.limits.stdout_bytes = usize::MAX,
+            6 => request.source_allowlist = None,
+            _ => request.configs = vec![json!({"path":"C:/selected.json"})],
+        }
+        let fake = Fake::new(vec![]);
+        let capture = collect_remote_with(&fake, &request).await;
+        assert!(fake.calls.lock().unwrap().is_empty(), "case {case}");
+        assert!(capture.repositories.is_empty());
+        assert!(capture.progress.is_none());
+        assert!(!capture.failures.is_empty());
+    }
+}
+#[tokio::test]
+async fn controller_rejects_unowned_or_incomplete_remote_responses_before_graph_input() {
+    struct Tampered {
+        inner: Fake,
+        case: usize,
+    }
+    impl CommandRunner for Tampered {
+        fn run<'a>(&'a self, program: &'a str, args: &'a [String], stdin: &'a [u8], timeout: Duration, out: usize, err: usize) -> CommandFuture<'a> {
+            Box::pin(async move {
+                let mut output = self.inner.run(program, args, stdin, timeout, out, err).await;
+                if self.case == 0 {
+                    output.stdout = b"{\"repositories\":[]}".to_vec();
+                    return output;
+                }
+                if self.case == 1 {
+                    output.stdout.pop();
+                    return output;
+                }
+                if self.case == 2 {
+                    output.code = Some(1);
+                    return output;
+                }
+                let n = u32::from_le_bytes(output.stdout[8..12].try_into().unwrap()) as usize;
+                let mut header: Value = serde_json::from_slice(&output.stdout[16..16 + n]).unwrap();
+                match self.case {
+                    3 => header["nonce"] = json!("0".repeat(32)),
+                    4 => header["process_receipt"] = json!(null),
+                    5 => header["process_receipt"]["job_empty"] = json!(false),
+                    6 => header["process_receipt"]["root_exit_code"] = json!(1),
+                    7 => header["process_receipt"]["stop"] = json!("timeout"),
+                    _ => header["request_sha256"] = json!("0".repeat(64)),
+                }
+                let changed = serde_json::to_vec(&header).unwrap();
+                let mut frame = b"KTRDR001".to_vec();
+                frame.extend_from_slice(&(changed.len() as u32).to_le_bytes());
+                frame.extend_from_slice(&output.stdout[12..16]);
+                frame.extend_from_slice(&changed);
+                frame.extend_from_slice(&output.stdout[16 + n..]);
+                output.stdout = frame;
+                output
+            })
+        }
+    }
+    for case in 0..9 {
+        let mut request = remote();
+        request.platform = RemotePlatform::Windows;
+        request.windows_reader_program = Some("C:/tools/tune.exe".into());
+        request.git_program = Some("C:/tools/git.exe".into());
+        request.roots = vec!["C:/fixture".into()];
+        let runner = Tampered { inner: Fake::new(vec![remote_capture(&request)]), case };
+        let capture = collect_remote_with(&runner, &request).await;
+        assert!(capture.repositories.is_empty(), "case {case}");
+        assert!(capture.progress.is_none());
+        assert!(!capture.failures.is_empty());
+    }
 }

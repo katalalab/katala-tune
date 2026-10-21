@@ -1,11 +1,15 @@
 #![cfg(windows)]
 //! Dedicated single-spawner process: every native invocation and std/Tokio control holds SERIAL.
 //! Real Windows children exercise the product backend. No fleet/SSH or shared process is used.
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use tune_core::collect::{BoundedResult, ProcessStop, StandaloneWindowsEnvironment, run_standalone_windows_bounded};
+use tune_core::collect::{
+    BoundedResult, OwnedWindowsCompletion, PinnedWindowsExecutable, ProcessStop, StandaloneWindowsEnvironment, run_owned_standalone_windows_bounded,
+    run_standalone_windows_bounded,
+};
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -550,5 +554,98 @@ async fn complete_environment_rejects_ambiguous_and_invalid_inputs() {
         let receipt = result.process_receipt.unwrap();
         assert_eq!(receipt.stop, ProcessStop::SetupFailed);
         assert!(receipt.root.is_none(), "Command edits must not be silently ignored");
+    }
+}
+
+fn fixture_pin(end: Instant) -> (PinnedWindowsExecutable, String) {
+    let executable = std::env::current_exe().unwrap();
+    let bytes = std::fs::read(&executable).expect("read this test executable for its expected digest");
+    let digest = Sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let pin = PinnedWindowsExecutable::open(&executable, &digest, end).expect("pin this test executable within the original deadline");
+    (pin, digest)
+}
+
+async fn owned_fixture_run(mode: &str, input: &[u8], timeout: Duration, limit: usize) -> (Result<OwnedWindowsCompletion, BoundedResult>, String) {
+    let end = deadline(timeout);
+    let (pin, digest) = fixture_pin(end);
+    let mut command = Command::new(pin.executable());
+    command.args(["--exact", "owned_fixture", "--nocapture"]);
+    let environment = fixture_environment(mode);
+    let result = run_owned_standalone_windows_bounded(pin, &command, StandaloneWindowsEnvironment::new(&environment), input, end, limit, limit).await;
+    (result, digest)
+}
+
+#[tokio::test]
+async fn owned_completion_consumes_bound_actual_output() {
+    let _serial = SERIAL.lock().await;
+    let input: Vec<u8> = (0..128 * 1024).map(|i| b'a' + (i % 26) as u8).collect();
+    let (result, digest) = owned_fixture_run("happy", &input, Duration::from_secs(15), 256 * 1024).await;
+    let completion = result.ok().expect("owned completion requires actual success");
+    assert_ack(completion.diagnostic(), ProcessStop::Completed);
+    assert_eq!(completion.diagnostic().code, Some(0));
+    let output = completion.into_verified_output(&input, &digest).ok().expect("consume matching request and artifact once");
+    assert!(output.ends_with(&input));
+    assert_eq!(String::from_utf8_lossy(&output).matches("running 1 test").count(), 1);
+}
+
+#[tokio::test]
+async fn owned_completion_rejects_different_request_or_artifact() {
+    let _serial = SERIAL.lock().await;
+    let wrong_digest = "0".repeat(64);
+    for wrong_input in [true, false] {
+        let (result, digest) = owned_fixture_run("happy", b"bound-input", Duration::from_secs(15), 65536).await;
+        let completion = result.ok().expect("actual completion before binding rejection");
+        assert_ack(completion.diagnostic(), ProcessStop::Completed);
+        let rejected =
+            completion.into_verified_output(if wrong_input { b"changed-input" } else { b"bound-input" }, if wrong_input { &digest } else { &wrong_digest });
+        let failure = rejected.expect_err("changed request or artifact cannot consume completion");
+        assert_eq!(failure.code, None);
+        assert!(failure.stdout.is_empty() && failure.stderr.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn owned_timeout_and_overflow_issue_no_completion() {
+    let _serial = SERIAL.lock().await;
+    for (mode, timeout, limit, stop) in [
+        ("sleep", Duration::from_secs(3), 65536, ProcessStop::Timeout),
+        ("stdout", Duration::from_secs(15), 1024, ProcessStop::OutputLimit),
+        ("stderr", Duration::from_secs(15), 1024, ProcessStop::OutputLimit),
+    ] {
+        let (result, _) = owned_fixture_run(mode, b"", timeout, limit).await;
+        let failure = result.err().expect("failed native run cannot issue owned completion");
+        assert_ack(&failure, stop);
+        assert_eq!(failure.code, None);
+        assert!(failure.stdout.is_empty() && failure.stderr.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn owned_pin_budget_may_shorten_but_cannot_extend() {
+    let _serial = SERIAL.lock().await;
+    for extend in [true, false] {
+        let pin_end = deadline(Duration::from_secs(15));
+        let (pin, digest) = fixture_pin(pin_end);
+        let mut command = Command::new(pin.executable());
+        command.args(["--exact", "owned_fixture", "--nocapture"]);
+        let environment = fixture_environment("happy");
+        let run_end = if extend { pin_end.checked_add(Duration::from_secs(1)).unwrap() } else { pin_end.checked_sub(Duration::from_secs(1)).unwrap() };
+        let result =
+            run_owned_standalone_windows_bounded(pin, &command, StandaloneWindowsEnvironment::new(&environment), b"original-budget", run_end, 65536, 65536)
+                .await;
+        if extend {
+            let failure = result.err().expect("extended pin budget must fail before spawn");
+            assert_eq!(failure.code, None);
+            assert!(failure.stdout.is_empty() && failure.stderr.is_empty());
+            let receipt = failure.process_receipt.expect("rejected setup diagnostic");
+            assert_eq!(receipt.stop, ProcessStop::SetupFailed);
+            assert!(receipt.root.is_none() && receipt.observed.is_empty());
+            assert!(!receipt.cleanup_confirmed());
+        } else {
+            let completion = result.ok().expect("shortening the original pin budget is allowed");
+            assert_ack(completion.diagnostic(), ProcessStop::Completed);
+            let output = completion.into_verified_output(b"original-budget", &digest).ok().expect("shortened completion remains bound");
+            assert!(output.ends_with(b"original-budget"));
+        }
     }
 }
