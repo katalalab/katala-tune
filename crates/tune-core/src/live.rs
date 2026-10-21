@@ -957,14 +957,20 @@ async fn read_lines_from<R: AsyncRead + Unpin>(out: R, tx: mpsc::Sender<String>,
             return PipeEnd::Cancelled;
         };
         // Commit metadata before publishing: the consumer may immediately snapshot and close.
-        if let Ok(mut b) = boundary.lock() {
-            b.data.overflow |= b.data.forwarded == u32::MAX;
-            b.data.forwarded = b.data.forwarded.saturating_add(1);
-            if buf.last() == Some(&b'\n') {
-                b.data.last_line_ms = b.at_ms();
+        match boundary.lock() {
+            Ok(mut b) => {
+                b.data.overflow |= b.data.forwarded == u32::MAX;
+                b.data.forwarded = b.data.forwarded.saturating_add(1);
+                if buf.last() == Some(&b'\n') {
+                    b.data.last_line_ms = b.at_ms();
+                }
+                // No await: snapshot and publication share the same linearization boundary.
+                permit.send(frame);
             }
+            Err(_) => {
+                permit.send(frame);
+            } // Keep delivery; poisoned diagnostics stay unknown.
         }
-        permit.send(frame);
     }
 }
 
