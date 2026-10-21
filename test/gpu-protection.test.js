@@ -12,6 +12,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
 const { EventEmitter } = require('node:events');
+const net = require('node:net');
 const { createRequire } = require('node:module');
 const { PassThrough } = require('node:stream');
 const vm = require('node:vm');
@@ -300,6 +301,24 @@ test('KT2 controller は単調期限、厳密な結果枠、stdin/stdio 境界�
   const hash = require('node:crypto').createHash('sha256').update(body).digest('hex');
   const node2 = { ...node, local: false };
   const exchange = (script, options = {}) => actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', script] }, timeoutMs: 1000, ...options });
+  const exchangeAfterRequest = async (script, options = {}) => {
+    const server = net.createServer();
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    let timeout;
+    const barrier = new Promise((resolve, reject) => {
+      timeout = setTimeout(() => reject(new Error('request barrier unavailable')), 1000);
+      server.once('connection', (socket) => {
+        socket.once('error', reject);
+        socket.once('data', (data) => { clearTimeout(timeout); resolve(data.toString('ascii')); });
+      });
+    });
+    const pending = exchange(script(port), options);
+    try {
+      const marker = await barrier;
+      return { marker, result: await pending };
+    } finally { server.close(); }
+  };
   const result = (fields, payload = '', stderr = '') => `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('KT2 RESULT '+${JSON.stringify(fields)}+'\\n'+${JSON.stringify(payload)});process.stderr.write(${JSON.stringify(stderr)})});`;
 
   let spawns = 0;
@@ -380,13 +399,16 @@ test('KT2 controller は単調期限、厳密な結果枠、stdin/stdio 境界�
     assert.equal(zeroSpawns, 1, 'the expired path spawns once and never retries');
     assert.deepEqual(zeroUnhandled, [], 'destroying an unopened reader cannot leak Premature close');
   } finally { process.removeListener('unhandledRejection', onUnhandled); }
-  const afterReadyDeadline = `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>setTimeout(()=>process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 0 0\\n'),1000));`;
+  const afterReadyDeadline = (port) => `const net=require('node:net');process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{const socket=net.connect(${port},'127.0.0.1',()=>{socket.end('write-complete');setTimeout(()=>process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 0 0\\n'),2000)})});`;
   let postWriteSpawns = 0;
-  const afterReady = await exchange(afterReadyDeadline, { timeoutMs: 100, spawnChild: (...args) => { postWriteSpawns += 1; return spawn(...args); } });
-  assert.equal(afterReady.code, 7, 'an expired result deadline follows the one completed request write');
+  const afterReady = await exchangeAfterRequest(afterReadyDeadline, { timeoutMs: 1000, spawnChild: (...args) => { postWriteSpawns += 1; return spawn(...args); } });
+  assert.equal(afterReady.marker, 'write-complete', 'the child parsed the completed request before the deadline path');
+  assert.equal(afterReady.result.code, 7, 'an expired result deadline follows the one completed request write');
   assert.equal(postWriteSpawns, 1, 'the post-write deadline never retries');
-  const heldStderr = `const cp=require('node:child_process');process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 0 0\\n');cp.spawn(process.execPath,['-e','setTimeout(()=>{},2000)'],{stdio:['ignore','ignore',process.stderr]})});`;
-  assert.equal((await exchange(heldStderr, { timeoutMs: 150 })).code, 7);
+  const heldStderr = (port) => `const cp=require('node:child_process'),net=require('node:net');process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{const socket=net.connect(${port},'127.0.0.1',()=>{socket.end('write-complete');process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 0 0\\n');cp.spawn(process.execPath,['-e','setTimeout(()=>{},2000)'],{stdio:['ignore','ignore',process.stderr]})})});`;
+  const held = await exchangeAfterRequest(heldStderr, { timeoutMs: 1000 });
+  assert.equal(held.marker, 'write-complete', 'the held stderr case starts after the completed request write');
+  assert.equal(held.result.code, 7);
 
   const oversizedHeader = `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>process.stdout.write('x'.repeat(131073)));`;
   assert.equal((await exchange(oversizedHeader)).code, 7, 'result headers never buffer payload-sized data before rejecting');

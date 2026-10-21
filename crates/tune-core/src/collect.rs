@@ -1098,10 +1098,25 @@ sys.exit({exit})"#,
         assert_eq!(wrong_hash.code, Some(7));
         let ssh_nonzero = run_fixture(fixture(&hash, 255, false, true), Duration::from_secs(2)).await;
         assert_eq!(ssh_nonzero.code, Some(7));
-        // This fixture has already parsed the complete REQUEST before holding
-        // stdout open, so the expiry is causally after the write attempt.
-        let held_eof = run_fixture(fixture(&hash, 0, true, false), Duration::from_secs(1)).await;
-        assert_eq!(held_eof.code, Some(7));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held_eof = format!(
+            r#"import hashlib,socket,sys,time
+sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush()
+line=sys.stdin.buffer.readline().decode('ascii').strip().split(' ')
+payload=sys.stdin.buffer.read()
+if len(line)!=5 or line[:3]!=['KT2','REQUEST','{nonce}'] or int(line[3])!=len(payload) or line[4]!=hashlib.sha256(payload).hexdigest(): sys.exit(92)
+s=socket.create_connection(('127.0.0.1',{port}));s.sendall(b'write-complete');s.close()
+sys.stdout.write('KT2 RESULT {nonce} {hash} 0 0 0\n');sys.stdout.flush();time.sleep(3)"#,
+        );
+        let mut command = Command::new("/usr/bin/env");
+        command.args(["python3", "-c", &held_eof]);
+        let exchange = tokio::spawn(async move { action_exchange_command(command, body, Duration::from_secs(2)).await });
+        let (mut confirmed, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await.unwrap().unwrap();
+        let mut signal = [0; 14];
+        confirmed.read_exact(&mut signal).await.unwrap();
+        assert_eq!(&signal, b"write-complete");
+        assert_eq!(exchange.await.unwrap().code, Some(7));
     }
 
     #[tokio::test]
@@ -1132,14 +1147,26 @@ sys.exit({exit})"#,
             )
         };
 
-        // Close the receiver read end before READY reaches the controller. This
-        // makes the following write_all/shutdown a post-commit transport error.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // The child confirms it actually closed FD 0 before it may emit READY.
+        // The controller only then performs its one real pipe write.
         let closed_stdin = format!(
-            r#"import os,sys,time
-os.close(0);sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush();time.sleep(.05)
+            r#"import os,socket,sys,time
+os.close(0)
+s=socket.create_connection(('127.0.0.1',{port}));s.sendall(b'closed');s.recv(1);s.close()
+sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush();time.sleep(.05)
 sys.stdout.write('KT2 RESULT {nonce} {hash} 0 0 0\n');sys.stdout.flush()"#,
         );
-        assert_eq!(run_fixture(closed_stdin, Duration::from_secs(2)).await.code, Some(7));
+        let mut command = Command::new("/usr/bin/env");
+        command.args(["python3", "-c", &closed_stdin]);
+        let exchange = tokio::spawn(async move { action_exchange_command(command, body, Duration::from_secs(2)).await });
+        let (mut confirmed, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await.unwrap().unwrap();
+        let mut signal = [0; 6];
+        confirmed.read_exact(&mut signal).await.unwrap();
+        assert_eq!(&signal, b"closed");
+        confirmed.write_all(b"go").await.unwrap();
+        assert_eq!(exchange.await.unwrap().code, Some(7));
 
         for fields in [
             format!("{nonce} {} 0 0 0", "0".repeat(64)),
@@ -1162,6 +1189,25 @@ sys.stdout.write('KT2 RESULT {nonce} {hash} 0 0 0\nKT2 RESULT {nonce} {hash} 0 0
         assert_eq!(exact.code, Some(0));
         assert_eq!((exact.out.len(), exact.err.len()), (65_536, 65_536));
         assert_eq!(run_fixture(fixture(format!("{nonce} {hash} 0 0 0"), 0, 65_537, 0, false), Duration::from_secs(2)).await.code, Some(7));
-        assert_eq!(run_fixture(fixture(format!("{nonce} {hash} 0 0 0"), 0, 0, 0, true), Duration::from_millis(250)).await.code, Some(7));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held_stderr = format!(
+            r#"import hashlib,os,socket,sys,time
+sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush()
+line=sys.stdin.buffer.readline().decode('ascii').strip().split(' ')
+payload=sys.stdin.buffer.read()
+if len(line)!=5 or line[:3]!=['KT2','REQUEST','{nonce}'] or int(line[3])!=len(payload) or line[4]!=hashlib.sha256(payload).hexdigest(): sys.exit(92)
+s=socket.create_connection(('127.0.0.1',{port}));s.sendall(b'write-complete');s.close()
+sys.stdout.write('KT2 RESULT {nonce} {hash} 0 0 0\n');sys.stdout.flush();os.close(1)
+sys.stderr.write('z');sys.stderr.flush();time.sleep(3)"#,
+        );
+        let mut command = Command::new("/usr/bin/env");
+        command.args(["python3", "-c", &held_stderr]);
+        let exchange = tokio::spawn(async move { action_exchange_command(command, body, Duration::from_secs(2)).await });
+        let (mut confirmed, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await.unwrap().unwrap();
+        let mut signal = [0; 14];
+        confirmed.read_exact(&mut signal).await.unwrap();
+        assert_eq!(&signal, b"write-complete");
+        assert_eq!(exchange.await.unwrap().code, Some(7));
     }
 }
