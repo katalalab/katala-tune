@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const { spawnSync, spawn } = require('node:child_process');
 const { plan, execute } = require('../lib/actions');
 const ps = process.env.KT_GPU_POWERSHELL || (process.platform === 'win32' ? 'powershell.exe' : 'pwsh');
-const testMutex=`Global\\\\KatalaTunePowerTargetTest-${process.pid}-${require('node:crypto').randomUUID()}`;
+const testMutex=`Global\\KatalaTunePowerTargetTest-${process.pid}-${require('node:crypto').randomUUID()}`;
 const present = spawnSync(ps,['-NoProfile','-Command','exit 0']).status === 0;
 const node = {id:'test-node',os:'windows',local:true};
 const uuid='GPU-01234567-89ab-cdef-0123-456789abcdef';
