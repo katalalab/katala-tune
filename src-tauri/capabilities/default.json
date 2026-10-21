@@ -51,6 +51,7 @@
     "allow-netsec",
     "allow-dashboard",
     "allow-monitor-settings",
+    "allow-monitor-events",
     "allow-hub-pull",
     "allow-topology-view",
     "allow-topology-refresh",
