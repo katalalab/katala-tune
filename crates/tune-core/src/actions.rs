@@ -41,7 +41,7 @@ static ACTION_RECEIVER: LazyLock<String> = LazyLock::new(|| {
     "while($h.Count -lt 256){$remaining=5000-[int]$w.ElapsedMilliseconds;if($remaining -le 0){exit 9};$t=$s.ReadAsync($b,0,1);if(-not $t.Wait($remaining)){exit 9};if($t.Result -ne 1){exit 9};if($b[0]-eq 10){$headerDone=$true;break};if($b[0]-lt 32 -or $b[0]-gt 126){exit 9};$h.Add($b[0])}", "if(-not $headerDone){exit 9}",
     "try{$m=[Text.Encoding]::ASCII.GetString($h.ToArray()) -split \" \"", "if($m.Count-ne 4 -or $m[0]-ne \"KT1\" -or $m[1]-notmatch \"^[0-9]+$\" -or $m[2]-notmatch \"^[0-9a-f]{64}$\" -or $m[3]-notmatch \"^[0-9]+$\"){exit 9}", "$n=[int]$m[1];$e=[int64]$m[3]", "if($n -lt 1 -or $n -gt 65536 -or [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt $e){exit 9}", "$d=New-Object byte[] $n;$o=0",
     "while($o-lt$n){$remaining=5000-[int]$w.ElapsedMilliseconds;if($remaining -le 0){exit 9};$t=$s.ReadAsync($d,$o,$n-$o);if(-not $t.Wait($remaining)){exit 9};if($t.Result-le 0){exit 9};$o+=$t.Result}", "$x=New-Object byte[] 1;$remaining=5000-[int]$w.ElapsedMilliseconds;if($remaining -le 0){exit 9};$t=$s.ReadAsync($x,0,1);if(-not $t.Wait($remaining)){exit 9};if($t.Result-ne 0){exit 9}",
-    "$q=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($d)).Replace(\"-\",\"\").ToLowerInvariant()", "if($q-ne$m[2] -or [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt $e){exit 9}", "$u=New-Object Text.UTF8Encoding($false,$true);$script:KatalaActionExpiryMs=$e", "function Test-KatalaActionExpiry { if([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt $script:KatalaActionExpiryMs){Write-Output \"action request expired; operation refused\";exit 9} }", "Test-KatalaActionExpiry;& ([ScriptBlock]::Create($u.GetString($d)))}catch{exit 9}",
+    "$q=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($d)).Replace(\"-\",\"\").ToLowerInvariant()", "if($q-ne$m[2] -or [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt $e){exit 9}", "$u=New-Object Text.UTF8Encoding($false,$true);$script:KatalaActionExpiryMs=$e", "function Test-KatalaActionExpiry { if([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -gt $script:KatalaActionExpiryMs){if($script:KatalaGpuMutationStarted){Write-Output \"GPU power outcome unverified\";exit 7};Write-Output \"action request expired; operation refused\";exit 9} }", "Test-KatalaActionExpiry;& ([ScriptBlock]::Create($u.GetString($d)))}catch{if($script:KatalaGpuMutationStarted){Write-Output \"GPU power outcome unverified\";exit 7};exit 9}",
 ].join(";")
 });
 
@@ -186,6 +186,8 @@ fn win_kill_recheck_ps(pid: i64, name: &str, start: Option<&str>, min_cpu: i64) 
     }
     parts.extend([
         "$c2 = $p.CPU; Start-Sleep -Milliseconds 1000; $p.Refresh(); $core2 = ($p.CPU - $c2) * 100".to_string(),
+        format!("if ($p.ProcessName -ne \"{name}\") {{ Write-Output \"PID {pid} changed during CPU recheck\"; exit 3 }}"),
+        start.map(|s| format!("if ($p.StartTime.ToUniversalTime().ToString(\"yyyyMMddHHmmssfff\") -ne \"{s}\") {{ Write-Output \"PID {pid} has a different start time\"; exit 3 }}")).unwrap_or_default(),
         format!("if ($core2 -lt {min_cpu}) {{ Write-Output (\"recovered: \" + [math]::Round($core2) + \"% of one core\"); exit 4 }}; Test-KatalaGpuDeadline"),
     ]);
     parts.join("; ")
@@ -508,5 +510,11 @@ pub async fn execute_with(runner: &dyn Runner, node: &Node, action: &Value, prot
         .map(str::to_string)
         .unwrap_or_else(|| if ok { "完了".into() } else { format!("失敗（exit {}）", res.code_str()) });
     let output = js::slice16_tail(js::trim(&(res.out.clone() + &res.err)), 1500);
-    Ok(Outcome { ok, code: res.code, outcome, output, undo: if ok { p.undo.clone() } else { None } })
+    Ok(Outcome {
+        ok,
+        code: res.code,
+        outcome,
+        output,
+        undo: if ok || (res.code == Some(7) && action.get("type").and_then(Value::as_str) != Some("set-gpu-power-limit")) { p.undo.clone() } else { None },
+    })
 }

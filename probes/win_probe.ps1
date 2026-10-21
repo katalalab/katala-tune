@@ -161,14 +161,14 @@ function MxKey([string]$exe, [string[]]$tokens) {
 $mxGroups = @(); $mxTrees = @(); $mxAvail = 'unavailable'; $mxReason = $null
 try {
   $mx = @{}
-  $mxCim = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, WorkingSetSize, SessionId, CreationDate -ErrorAction Stop)
+  $mxCim = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, WorkingSetSize, SessionId, CreationDate -OperationTimeoutSec 4 -ErrorAction Stop)
   if ($mxCim.Count -eq 0) { throw 'no-data' }
   # Command lines are queried only for interpreter executables (other processes' arguments are never read)
   $mxCmd = @{}
   $mxNames = @($mxCim | ForEach-Object { [string]$_.Name } | Where-Object { ($_ -replace '\.exe$', '') -match $mxInterp -and $_ -match '^[A-Za-z0-9._-]+$' } | Sort-Object -Unique)
   if ($mxNames.Count -gt 0) {
     $flt = ($mxNames | ForEach-Object { "Name = '$_'" }) -join ' OR '
-    foreach ($c in @(Get-CimInstance Win32_Process -Filter $flt -Property ProcessId, CommandLine)) { if ($c.CommandLine) { $mxCmd[[int]$c.ProcessId] = [string]$c.CommandLine } }
+    foreach ($c in @(Get-CimInstance Win32_Process -Filter $flt -Property ProcessId, CommandLine -OperationTimeoutSec 4 -ErrorAction Stop)) { if ($c.CommandLine) { $mxCmd[[int]$c.ProcessId] = [string]$c.CommandLine } }
   }
   foreach ($w in $mxCim) {
     $nm = ([string]$w.Name) -replace '\.exe$', ''

@@ -113,6 +113,13 @@ test('GPU の実行直前拒否は既存の runner 記録に理由として残�
   assert.throws(() => plan({ ...node, protect_gpu: true }, { type: 'kill-process', params: { pid: 4242, name: 'TrainerHost' } }, { protect: [] }), /GPU 学習保護/);
 });
 
+test('GPU 電力の outcome-unverified は local/remote とも undo を出さず、既存電源操作の exit 7 undo は維持する', async () => {
+  const gpu = { type: 'set-gpu-power-limit', params: { uuid: 'GPU-01234567-89ab-cdef-0123-456789abcdef', watts: 180, min: 100, max: 250, prev_w: 200 } };
+  const power = { type: 'set-power-plan', params: { guid: '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c', prev_guid: '381b4222-f694-41f0-9685-ff5bb260df2e' } };
+  for (const n of [node, { ...node, local: true }]) assert.equal((await execute(n, gpu, { protect: [] }, async () => ({ code: 7, out: '', err: '' }))).undo, null);
+  assert.ok((await execute(node, power, { protect: [] }, async () => ({ code: 7, out: '', err: '' }))).undo);
+});
+
 test('remote Windows GPU action は固定 receiver と完全 stdin 本文だけを executor に渡す', async () => {
   const action = { type: 'set-gpu-power-limit', params: { uuid: 'GPU-01234567-89ab-cdef-0123-456789abcdef', watts: 180, min: 100, max: 250, prev_w: 200 } };
   let call;
@@ -130,6 +137,8 @@ test('Windows receiver はヘッダー終端と EOF を一つの残り時間で�
   assert.match(ACTION_RECEIVER, /if\(-not \$headerDone\)\{exit 9\}/);
   assert.match(ACTION_RECEIVER, /\$remaining=5000-\[int\]\$w\.ElapsedMilliseconds/);
   assert.doesNotMatch(ACTION_RECEIVER, /\.Wait\(500\)/);
+  assert.ok(Buffer.byteLength(ACTION_RECEIVER_COMMAND) < 8191);
+  assert.throws(() => require('../lib/actions').actionInput('x'.repeat(65537)), /長さ/);
 });
 
 test('Windows receiver は空・途中・余剰・改ざん・不正 UTF-8・期限切れ・held EOF を本文評価前に拒否する', { skip: process.platform !== 'win32' }, async () => {
@@ -138,7 +147,8 @@ test('Windows receiver は空・途中・余剰・改ざん・不正 UTF-8・期
   const crypto = require('node:crypto');
   const packet = (bytes = body, hash = crypto.createHash('sha256').update(bytes).digest('hex'), expiry = Date.now() + 30000, tail = Buffer.alloc(0)) => Buffer.concat([Buffer.from(`KT1 ${bytes.length} ${hash} ${expiry}\n`, 'ascii'), bytes, tail]);
   const run = (input) => require('node:child_process').spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', receiver], { input, encoding: 'utf8', timeout: 10000, windowsHide: true });
-  for (const input of [Buffer.alloc(0), packet(body.subarray(0, 3)), packet(body, '0'.repeat(64)), packet(Buffer.from([0xc3, 0x28])), packet(body, undefined, Date.now() - 1), packet(body, undefined, undefined, Buffer.from('x'))]) {
+  const truncated = Buffer.concat([packet().subarray(0, packet().indexOf(10) + 1), body.subarray(0, 3)]);
+  for (const input of [Buffer.alloc(0), truncated, packet(body, '0'.repeat(64)), packet(Buffer.from([0xc3, 0x28])), packet(body, undefined, Date.now() - 1), packet(body, undefined, undefined, Buffer.from('x'))]) {
     const r = run(input); assert.equal(r.status, 9, r.stderr || r.stdout); assert.doesNotMatch(r.stdout, /MUTATED/);
   }
   const ok = run(packet()); assert.equal(ok.status, 0, ok.stderr || ok.stdout); assert.match(ok.stdout, /MUTATED/);
