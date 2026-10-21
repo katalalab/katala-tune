@@ -334,7 +334,7 @@ async fn main() -> ExitCode {
         },
         "topology-export" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
             Ok(e) => {
-                let view = match e.topology_view() {
+                let view = match e.topology_accepted_view() {
                     Ok(view) => view,
                     Err(error) => {
                         eprintln!("{error}");

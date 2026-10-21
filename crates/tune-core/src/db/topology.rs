@@ -1,5 +1,10 @@
+mod candidate_schema;
+mod candidates;
+mod facts;
+mod ui;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
+pub use ui::TopologyUiRequest;
 
 use super::{Result, Store, row_json};
 use crate::topology::adapters::github::GithubCache;
@@ -17,17 +22,33 @@ pub const TOPOLOGY_GITHUB_CACHE_KEEP: i64 = 256;
 const TOPOLOGY_PROGRESS_MAX_BYTES: usize = 8_192;
 
 pub(super) const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS docker_candidate_sequence (singleton INTEGER PRIMARY KEY CHECK(singleton=1), ordinal INTEGER NOT NULL);
+INSERT OR IGNORE INTO docker_candidate_sequence (singleton,ordinal) VALUES (1,0);
+CREATE TABLE IF NOT EXISTS docker_candidate_attempts (attempt_id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL UNIQUE, holder TEXT NOT NULL, writer_generation INTEGER NOT NULL, reserved_at INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS docker_candidate_scopes (scope_id TEXT PRIMARY KEY, latest_ordinal INTEGER NOT NULL, latest_attempt TEXT NOT NULL, latest_status TEXT NOT NULL, complete_ordinal INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS docker_candidates (scope_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, ordinal INTEGER NOT NULL, writer_generation INTEGER NOT NULL, payload TEXT NOT NULL, digest TEXT NOT NULL, bytes INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS topology_accepted_facts (scope_id TEXT PRIMARY KEY, accepted_run_id TEXT NOT NULL, facts_observed_at_ms INTEGER, version INTEGER NOT NULL DEFAULT 1) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS topology_runs (run_id TEXT PRIMARY KEY, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS topology_scopes (run_id TEXT NOT NULL, scope_id TEXT NOT NULL, status TEXT NOT NULL, PRIMARY KEY (run_id, scope_id)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS topology_entities (scope_id TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL, attributes TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (scope_id, id)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS topology_edges (scope_id TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL, from_id TEXT NOT NULL, to_id TEXT NOT NULL, attributes TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (scope_id, id)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS topology_entities_ui_id ON topology_entities(id,scope_id);
+CREATE INDEX IF NOT EXISTS topology_edges_ui_id ON topology_edges(id,scope_id);
 CREATE TABLE IF NOT EXISTS topology_changes (run_id TEXT NOT NULL, scope_id TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL, change_kind TEXT NOT NULL, PRIMARY KEY (run_id, scope_id, id, change_kind)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS topology_observations (run_id TEXT NOT NULL, scope_id TEXT NOT NULL, status TEXT NOT NULL, observed_at INTEGER NOT NULL, counters TEXT NOT NULL, failures TEXT NOT NULL, PRIMARY KEY (run_id, scope_id)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS topology_refresh_lease (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), holder TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 1, heartbeat_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS topology_source_cache (source_id TEXT NOT NULL, content_sha256 TEXT NOT NULL, parser_version TEXT NOT NULL, kind TEXT NOT NULL, revision TEXT, fetched_at INTEGER NOT NULL, facts TEXT NOT NULL, PRIMARY KEY (source_id, content_sha256, parser_version, kind)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS topology_github_cache (cache_key TEXT PRIMARY KEY, fetched_at INTEGER NOT NULL, stored_at INTEGER NOT NULL, cache TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS topology_progress (scope_id TEXT PRIMARY KEY, cursor TEXT NOT NULL, updated_at INTEGER NOT NULL) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS docker_ui_envelopes (scope_id TEXT PRIMARY KEY, envelope TEXT NOT NULL, digest TEXT NOT NULL, ordinal INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS docker_ui_rows (scope_id TEXT NOT NULL, row_type TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL, search TEXT NOT NULL, from_id TEXT NOT NULL, to_id TEXT NOT NULL, display TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(scope_id,row_type,id)) WITHOUT ROWID;
 ";
+
+// Optional storage may belong to an unknown version. Never index it blindly.
+pub(super) fn initialize_optional_indexes(db: &Connection) -> Result<()> {
+    ui::initialize_index(db)
+}
 
 fn project_rows(rows: Vec<Value>) -> Vec<Value> {
     let mut projected = std::collections::BTreeMap::<String, Value>::new();
@@ -109,11 +130,23 @@ impl Store {
         statement.query_map([format!("{escaped}%")], |row| row.get(0))?.collect()
     }
 
+    /// Accepted graph and receipts only; optional candidate storage is never read.
+    pub fn topology_accepted_view(&self) -> Result<Value> {
+        self.topology_read_view(false)
+    }
+
+    /// Explicit full internal view, including admitted Partial candidates.
     pub fn topology_view(&self) -> Result<Value> {
+        self.topology_read_view(true)
+    }
+
+    fn topology_read_view(&self, include_candidates: bool) -> Result<Value> {
+        // Bind attributes, adopted facts and receipts to one read-only SQLite snapshot.
+        let read = self.conn().unchecked_transaction()?;
         let mut entities = self.conn().prepare("SELECT scope_id,id,kind,label,attributes,updated_at FROM topology_entities ORDER BY id,scope_id")?;
-        let entities = project_rows(entities.query_map([], row_json)?.collect::<Result<Vec<_>>>()?);
+        let entities = project_rows(facts::annotate(self.conn(), entities.query_map([], row_json)?.collect::<Result<Vec<_>>>()?)?);
         let mut edges = self.conn().prepare("SELECT scope_id,id,kind,from_id,to_id,attributes,updated_at FROM topology_edges ORDER BY id,scope_id")?;
-        let edges = project_rows(edges.query_map([], row_json)?.collect::<Result<Vec<_>>>()?);
+        let edges = project_rows(facts::annotate(self.conn(), edges.query_map([], row_json)?.collect::<Result<Vec<_>>>()?)?);
         // `scopes` is one current receipt per scope. `history` remains separately
         // bounded so the UI never mistakes historical rows for current coverage.
         let latest_sql = "SELECT run_id,scope_id,status,observed_at,counters,failures FROM topology_observations current WHERE NOT EXISTS (SELECT 1 FROM topology_observations newer WHERE newer.scope_id=current.scope_id AND (newer.observed_at>current.observed_at OR (newer.observed_at=current.observed_at AND newer.run_id>current.run_id))) ORDER BY observed_at DESC,run_id DESC";
@@ -125,7 +158,12 @@ impl Store {
         let history = receipt_rows(history.query_map([], row_json)?.collect::<Result<Vec<_>>>()?);
         let mut changes = self.conn().prepare("SELECT changes.run_id,changes.scope_id,changes.id,changes.kind,changes.change_kind,runs.at FROM topology_changes changes JOIN topology_runs runs ON runs.run_id=changes.run_id ORDER BY runs.at DESC,changes.scope_id,changes.id LIMIT 100")?;
         let changes = changes.query_map([], row_json)?.collect::<Result<Vec<_>>>()?;
-        Ok(json!({"schema":"katala_topology.v1","entities":entities,"edges":edges,"scopes":scopes,"history":history,"changes":changes}))
+        let mut view = json!({"schema":"katala_topology.v1","entities":entities,"edges":edges,"scopes":scopes,"history":history,"changes":changes});
+        if include_candidates {
+            view["candidates"] = Value::Array(candidates::read_candidates(self.conn(), crate::db::now_ms())?);
+        }
+        read.commit()?;
+        Ok(view)
     }
 
     pub fn topology_receipts(&self, scope_id: &str) -> Result<Vec<Value>> {
@@ -416,6 +454,7 @@ fn record_inner(db: &Connection, run_id: &str, snapshot: &TopologySnapshot, at: 
             failures
         ],
     )?;
+    candidates::record_attempt(db, run_id, snapshot, at)?;
     if snapshot.status != ScopeStatus::Complete {
         return Ok(changes);
     }
@@ -481,6 +520,7 @@ fn record_inner(db: &Connection, run_id: &str, snapshot: &TopologySnapshot, at: 
             params![snapshot.scope_id, edge.id, edge.kind.slug(), edge.from, edge.to, edge_json(edge), at],
         )?;
     }
+    facts::record(db, run_id, snapshot)?;
     for change in &changes {
         db.execute(
             "INSERT INTO topology_changes (run_id,scope_id,id,kind,change_kind) VALUES (?,?,?,?,?)",
