@@ -205,7 +205,7 @@ test('Windows PowerShell の GPU 直前ガードは NaN・PID 桁あふれを拒
   const overflow = run(nvidia('0', '2147483648, N\/A'));
   assert.equal(overflow.status, 9); assert.match(overflow.stdout, /GPU compute process list unreadable/);
   const queryFail = run(nvidia('0', 'No running processes found', true));
-  assert.equal(queryFail.status, 9); assert.match(queryFail.stdout, /GPU activity unavailable/);
+  assert.equal(queryFail.status, 9); assert.match(queryFail.stdout, /GPU SMI exited unsuccessfully; operation refused/);
   const absent = 'function Get-Command { param($Name); if ($Name -eq "nvidia-smi.exe") { return $null } }; function Get-CimInstance { [pscustomobject]@{ Name = "Intel UHD Graphics"; PNPDeviceID = "PCI\\VEN_8086" } }';
   assert.equal(run(absent).status, 0);
 });
