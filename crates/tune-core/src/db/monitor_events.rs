@@ -1,5 +1,5 @@
 //! lifecycle専用表。OSログ/FTS/署名・既存minute行の意味を変えない。
-use super::{Result, Store};
+use super::{Result, Store, now_ms};
 use crate::monitor_journal::{EVENT_BYTES, Event, Filter, KEEP_DAYS, KEEP_ROWS};
 use rusqlite::params;
 use serde_json::{Value, json};
@@ -39,12 +39,13 @@ impl Store {
         }
         let generation = f.generation.map(|v| i64::try_from(v).map_err(|_| rusqlite::Error::InvalidQuery)).transpose()?;
         let limit = f.limit.unwrap_or(100).clamp(1, 500);
+        let visible_since = now_ms() - KEEP_DAYS * 86_400_000;
         let mut st = self.conn.prepare("SELECT id,payload FROM monitor_events WHERE (?1 IS NULL OR node_id=?1) AND (?2 IS NULL OR id<?2) AND ts>=?3 AND (?5 IS NULL OR collector_id=?5) AND (?6 IS NULL OR json_extract(payload,'$.kind')=?6) AND (?7 IS NULL OR json_extract(payload,'$.generation')=?7) AND (?8 IS NULL OR json_extract(payload,'$.attempt')=?8) ORDER BY id DESC LIMIT ?4")?;
         let rows = st.query_map(
             params![
                 f.node_id,
                 f.before_id,
-                f.since.unwrap_or(0),
+                f.since.unwrap_or(0).max(visible_since),
                 limit,
                 f.collector_id,
                 f.kind.map(|k| serde_json::to_value(k).unwrap().as_str().unwrap().to_string()),
@@ -65,7 +66,8 @@ impl Store {
             out.push(v);
         }
         let (count, oldest, newest): (i64, Option<i64>, Option<i64>) =
-            self.conn.query_row("SELECT count(*),min(ts),max(ts) FROM monitor_events", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            self.conn
+                .query_row("SELECT count(*),min(ts),max(ts) FROM monitor_events WHERE ts>=?", [visible_since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(
             json!({ "events": out, "next_before_id": out.last().and_then(|e|e["id"].as_i64()), "retention": { "rows": count, "oldest_at":oldest,"newest_at":newest,"keep_days_max":KEEP_DAYS,"keep_rows_max":KEEP_ROWS } }),
         )
@@ -89,6 +91,24 @@ mod tests {
             kind: Kind::Open,
             data: Data::default(),
         }
+    }
+
+    #[test]
+    fn retention_read_hides_expired_rows_without_modifying_storage() {
+        let db = Store::open_in_memory().unwrap();
+        let now = crate::db::now_ms();
+        db.insert_monitor_events(&[event(1, now), event(2, now)], now).unwrap();
+        let expired = now - KEEP_DAYS * 86_400_000 - 1;
+        db.conn().execute("UPDATE monitor_events SET ts=?1,payload=json_set(payload,'$.ts',?1) WHERE event_seq=1", [expired]).unwrap();
+        let changes = db.conn().total_changes();
+        let out = db.monitor_events(&Filter { since: Some(0), ..Default::default() }).unwrap();
+        assert_eq!(db.conn().total_changes(), changes, "reads do not prune or start a writer");
+        let physical: i64 = db.conn().query_row("SELECT count(*) FROM monitor_events", [], |r| r.get(0)).unwrap();
+        assert_eq!(physical, 2);
+        assert_eq!(out["events"].as_array().unwrap().len(), 1);
+        assert_eq!(out["events"][0]["event_seq"], 2);
+        assert_eq!(out["retention"]["rows"], 1);
+        assert_eq!(out["retention"]["oldest_at"], now);
     }
 
     #[test]

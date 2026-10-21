@@ -14,6 +14,7 @@ pub const BATCH_MAX: usize = 64;
 pub const EVENT_BYTES: usize = 1024;
 pub const KEEP_DAYS: i64 = 14;
 pub const KEEP_ROWS: i64 = 50_000;
+pub const RETENTION_MAINTENANCE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -334,7 +335,8 @@ impl Journal {
             "last_error_category": *self.state.last_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
             "overflow_total": n(&self.state.overflow), "rejected_total": n(&self.state.rejected), "dropped_total": dropped, "db_failures": failed, "unconfirmed_acks": acks, "committed_total": n(&self.state.committed), "pruned_total": n(&self.state.pruned),
             "queue_depth": QUEUE_CAP - self.tx.capacity(), "queue_limit": QUEUE_CAP, "last_commit_at": match self.state.last_commit.load(Ordering::Relaxed) {0 => None, t => Some(t)},
-            "keep_days_max": KEEP_DAYS, "keep_rows_max": KEEP_ROWS, "event_bytes_max": EVENT_BYTES })
+            "keep_days_max": KEEP_DAYS, "keep_rows_max": KEEP_ROWS, "event_bytes_max": EVENT_BYTES,
+            "retention_maintenance_seconds": RETENTION_MAINTENANCE.as_secs() })
     }
     pub async fn flush(&self, budget: Duration) -> bool {
         self.control(budget, false).await
@@ -360,9 +362,6 @@ impl Journal {
 }
 
 async fn commit(db: &Arc<Mutex<Store>>, batch: &[Event], state: &State) -> bool {
-    if batch.is_empty() {
-        return true;
-    }
     let db = db.clone();
     let rows = batch.to_vec();
     // 一度に1仕事のみ。mutex競合は即Busy。blocking仕事のtimeout/dropで孤立writerを作らない。
@@ -373,9 +372,11 @@ async fn commit(db: &Arc<Mutex<Store>>, batch: &[Event], state: &State) -> bool 
     .await;
     match result {
         Ok(Ok(pruned)) => {
-            state.committed.fetch_add(batch.len() as u64, Ordering::Relaxed);
             state.pruned.fetch_add(pruned as u64, Ordering::Relaxed);
-            state.last_commit.store(now_ms(), Ordering::Relaxed);
+            if !batch.is_empty() {
+                state.committed.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                state.last_commit.store(now_ms(), Ordering::Relaxed);
+            }
             true
         }
         other => {
@@ -390,11 +391,67 @@ async fn commit(db: &Arc<Mutex<Store>>, batch: &[Event], state: &State) -> bool 
     }
 }
 
+async fn retention_tick(db: &Arc<Mutex<Store>>, state: &State, next: &mut Instant, now: Instant) -> Option<bool> {
+    if now < *next {
+        return None;
+    }
+    *next = now + RETENTION_MAINTENANCE;
+    Some(commit(db, &[], state).await)
+}
+
+async fn commit_tail(db: &Arc<Mutex<Store>>, batch: &mut Vec<Event>, state: &State) -> bool {
+    let ok = commit(db, batch, state).await;
+    if !ok {
+        // 保存を確認できないaccepted行を、receiverのDropで無言に失わない。
+        state.dropped.fetch_add(batch.len() as u64, Ordering::Relaxed);
+    }
+    batch.clear();
+    ok
+}
+
+async fn finish_tail(db: &Arc<Mutex<Store>>, rx: &mut mpsc::Receiver<Command>, batch: &mut Vec<Event>, state: &State, ack: oneshot::Sender<bool>) {
+    rx.close();
+    let mut acks = vec![ack];
+    let mut ok = true;
+    // close前のpermitも容量256に含まれる。EmptyではなくNoneまで待ち、未確定のtailへACKしない。
+    while let Some(command) = rx.recv().await {
+        match command {
+            Command::Event(e) => batch.push(*e),
+            Command::Flush(a) | Command::Shutdown(a) => acks.push(a),
+        }
+        if batch.len() == BATCH_MAX {
+            ok &= commit_tail(db, batch, state).await;
+        }
+    }
+    if !ok
+        && let Some(e) = state.row(
+            None,
+            0,
+            0,
+            Kind::JournalGap,
+            Data { dropped: Some(state.dropped.load(Ordering::Relaxed)), db_failures: Some(state.db_failures.load(Ordering::Relaxed)), ..Data::default() },
+        )
+    {
+        batch.push(e);
+        if batch.len() == BATCH_MAX {
+            ok &= commit_tail(db, batch, state).await;
+        }
+    }
+    if let Some(e) = state.row(None, 0, 0, Kind::CollectorStopped, Data::default()) {
+        batch.push(e);
+    }
+    ok &= commit_tail(db, batch, state).await;
+    for a in acks {
+        let _ = a.send(ok);
+    }
+}
+
 async fn writer(db: Arc<Mutex<Store>>, mut rx: mpsc::Receiver<Command>, state: Arc<State>) {
     let mut batch = Vec::with_capacity(BATCH_MAX);
     let mut iv = tokio::time::interval(Duration::from_secs(1));
     iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut noted = (0, 0);
+    let mut next_maintenance = Instant::now() + RETENTION_MAINTENANCE;
     loop {
         let cmd = tokio::select! {
             _ = iv.tick() => None,
@@ -402,16 +459,13 @@ async fn writer(db: Arc<Mutex<Store>>, mut rx: mpsc::Receiver<Command>, state: A
         };
         let tick = cmd.is_none();
         let mut ack = None;
-        let mut stop = false;
         match cmd {
             Some(Command::Event(e)) => batch.push(*e),
             Some(Command::Flush(a)) => ack = Some(a),
             Some(Command::Shutdown(a)) => {
-                if let Some(e) = state.row(None, 0, 0, Kind::CollectorStopped, Data::default()) {
-                    batch.push(e);
-                }
-                ack = Some(a);
-                stop = true;
+                finish_tail(&db, &mut rx, &mut batch, &state, a).await;
+                state.running.store(false, Ordering::Relaxed);
+                return;
             }
             None => {}
         }
@@ -424,22 +478,26 @@ async fn writer(db: Arc<Mutex<Store>>, mut rx: mpsc::Receiver<Command>, state: A
             {
                 batch.push(e);
             }
+            if batch.is_empty() && ack.is_none() {
+                let _ = retention_tick(&db, &state, &mut next_maintenance, Instant::now()).await;
+                continue;
+            }
             let ok = commit(&db, &batch, &state).await;
             if ok {
                 if let Some(e) = batch.iter().rev().find(|e| e.kind == Kind::JournalGap) {
                     noted = (e.data.dropped.unwrap_or(0), e.data.db_failures.unwrap_or(0));
                 }
                 batch.clear();
+                next_maintenance = Instant::now() + RETENTION_MAINTENANCE;
             }
             if let Some(a) = ack {
                 let _ = a.send(ok);
             }
-            if stop {
-                break;
-            }
         }
     }
-    let _ = commit(&db, &batch, &state).await;
+    if !batch.is_empty() {
+        let _ = commit(&db, &batch, &state).await;
+    }
     state.running.store(false, Ordering::Relaxed);
 }
 
@@ -465,6 +523,131 @@ mod tests {
     use super::*;
     fn store() -> Arc<Mutex<Store>> {
         Arc::new(Mutex::new(Store::open_in_memory().unwrap()))
+    }
+
+    #[tokio::test]
+    async fn retention_empty_batch_prunes_without_claiming_an_event_commit() {
+        let db = store();
+        let j = Journal::start(db.clone());
+        assert!(j.flush(Duration::from_secs(2)).await);
+        assert!(j.shutdown(Duration::from_secs(2)).await);
+        let before = j.health();
+        let expired = now_ms() - KEEP_DAYS * 86_400_000 - 1;
+        db.lock().unwrap().conn().execute("UPDATE monitor_events SET ts=?1,payload=json_set(payload,'$.ts',?1)", [expired]).unwrap();
+        let ok = commit(&db, &[], &j.state).await;
+        let remaining: i64 = db.lock().unwrap().conn().query_row("SELECT count(*) FROM monitor_events", [], |r| r.get(0)).unwrap();
+        let after = j.health();
+        assert!(ok);
+        assert_eq!(remaining, 0);
+        assert_eq!(after["committed_total"], before["committed_total"]);
+        assert_eq!(after["last_commit_at"], before["last_commit_at"]);
+        assert!(after["pruned_total"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn retention_tick_has_a_minute_cadence_including_after_failure() {
+        let db = store();
+        let j = Journal::start(db.clone());
+        assert!(j.shutdown(Duration::from_secs(2)).await);
+        let before = j.health();
+        let expired = now_ms() - KEEP_DAYS * 86_400_000 - 1;
+        db.lock().unwrap().conn().execute("UPDATE monitor_events SET ts=?1,payload=json_set(payload,'$.ts',?1)", [expired]).unwrap();
+        db.lock()
+            .unwrap()
+            .conn()
+            .execute_batch("CREATE TEMP TRIGGER block_prune BEFORE DELETE ON monitor_events BEGIN SELECT RAISE(ABORT,'fixture'); END")
+            .unwrap();
+        let due = Instant::now() + RETENTION_MAINTENANCE;
+        let mut next = due;
+        assert_eq!(retention_tick(&db, &j.state, &mut next, due - Duration::from_millis(1)).await, None);
+        assert_eq!(j.health()["db_failures"], 0, "not-due ticks perform no DB work");
+        assert_eq!(retention_tick(&db, &j.state, &mut next, due).await, Some(false));
+        let changes = db.lock().unwrap().conn().total_changes();
+        assert_eq!(retention_tick(&db, &j.state, &mut next, due + Duration::from_secs(59)).await, None);
+        assert_eq!(db.lock().unwrap().conn().total_changes(), changes);
+        db.lock().unwrap().conn().execute_batch("DROP TRIGGER block_prune").unwrap();
+        assert_eq!(retention_tick(&db, &j.state, &mut next, due + RETENTION_MAINTENANCE).await, Some(true));
+        assert_eq!(db.lock().unwrap().conn().query_row("SELECT count(*) FROM monitor_events", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(j.health()["committed_total"], before["committed_total"]);
+        assert_eq!(j.health()["last_commit_at"], before["last_commit_at"]);
+        assert_eq!(j.health()["retention_maintenance_seconds"], 60);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_accepted_tail_and_replies_to_queued_controls() {
+        let db = store();
+        let j = Journal::start(db.clone());
+        let (stop, stopped) = oneshot::channel();
+        assert!(j.tx.try_send(Command::Shutdown(stop)).is_ok());
+        for _ in 0..128 {
+            j.record(Some("tail"), 1, 1, Kind::Checkpoint, Data::default());
+        }
+        let (flush, flushed) = oneshot::channel();
+        assert!(j.tx.try_send(Command::Flush(flush)).is_ok());
+        let stop_ack = tokio::time::timeout(Duration::from_secs(4), stopped).await;
+        let flush_ack = tokio::time::timeout(Duration::from_secs(4), flushed).await;
+        let rows: i64 = db.lock().unwrap().conn().query_row("SELECT count(*) FROM monitor_events WHERE node_id='tail'", [], |r| r.get(0)).unwrap();
+        assert!(matches!(stop_ack, Ok(Ok(true))));
+        assert!(matches!(flush_ack, Ok(Ok(true))));
+        assert_eq!(rows, 128);
+        assert_eq!(j.health()["dropped_total"], 0);
+        j.record(Some("closed"), 1, 1, Kind::Checkpoint, Data::default());
+        assert_eq!(j.health()["dropped_total"], 1, "post-seal rejection must remain visible");
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_ack_before_an_issued_permit_is_drained() {
+        let db = store();
+        let j = Journal::start(db.clone());
+        let permit = j.tx.clone().reserve_owned().await.unwrap();
+        let (stop, mut stopped) = oneshot::channel();
+        assert!(j.tx.try_send(Command::Shutdown(stop)).is_ok());
+        let closed = tokio::time::timeout(Duration::from_secs(4), async {
+            while !j.tx.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let early = stopped.try_recv();
+        let waited = matches!(early, Err(oneshot::error::TryRecvError::Empty));
+        let e = j.state.row(Some("reserved-tail"), 1, 1, Kind::Checkpoint, Data::default()).unwrap();
+        // An issued permit remains valid after Receiver::close. Always release it before assertions.
+        drop(permit.send(Command::Event(Box::new(e))));
+        let ack = match early {
+            Ok(ok) => Some(ok),
+            Err(oneshot::error::TryRecvError::Empty) => tokio::time::timeout(Duration::from_secs(4), stopped).await.ok().and_then(Result::ok),
+            Err(_) => None,
+        };
+        let rows: i64 = db.lock().unwrap().conn().query_row("SELECT count(*) FROM monitor_events WHERE node_id='reserved-tail'", [], |r| r.get(0)).unwrap();
+        assert!(closed.is_ok() && waited, "a still-issued permit cannot be called a clean tail");
+        assert_eq!(ack, Some(true));
+        assert_eq!(rows, 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_failed_tail_accounts_for_every_row_and_fails_queued_controls() {
+        let db = store();
+        db.lock()
+            .unwrap()
+            .conn()
+            .execute_batch("CREATE TEMP TRIGGER reject_events BEFORE INSERT ON monitor_events BEGIN SELECT RAISE(ABORT,'fixture'); END")
+            .unwrap();
+        let j = Journal::start(db.clone());
+        let (stop, stopped) = oneshot::channel();
+        assert!(j.tx.try_send(Command::Shutdown(stop)).is_ok());
+        for _ in 0..128 {
+            j.record(Some("tail"), 1, 1, Kind::Checkpoint, Data::default());
+        }
+        let (flush, flushed) = oneshot::channel();
+        assert!(j.tx.try_send(Command::Flush(flush)).is_ok());
+        let stop_ack = tokio::time::timeout(Duration::from_secs(4), stopped).await;
+        let flush_ack = tokio::time::timeout(Duration::from_secs(4), flushed).await;
+        let rows: i64 = db.lock().unwrap().conn().query_row("SELECT count(*) FROM monitor_events", [], |r| r.get(0)).unwrap();
+        assert!(matches!(stop_ack, Ok(Ok(false))));
+        assert!(matches!(flush_ack, Ok(Ok(false))));
+        assert_eq!(rows, 0);
+        assert_eq!(j.health()["dropped_total"].as_u64(), Some(j.state.seq.load(Ordering::Relaxed)));
+        assert!(j.health()["db_failures"].as_u64().unwrap() > 0);
     }
 
     #[tokio::test]

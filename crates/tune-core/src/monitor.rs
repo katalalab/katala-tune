@@ -463,11 +463,17 @@ fn save_minute_rows(engine: &Engine, journal: &crate::monitor_journal::Journal, 
     category.is_none()
 }
 
+fn minute_from(id: &str, rolled: &HashMap<String, i64>, pending_from: &mut HashMap<String, i64>, until: i64) -> i64 {
+    // 初回未保存範囲は時計に追従させない。既存watermarkがあればその次の分が固定の下限。
+    rolled.get(id).map_or_else(|| *pending_from.entry(id.to_owned()).or_insert(until - 5 * MINUTE), |m| m + MINUTE)
+}
+
 fn commit_minute_rows(
     engine: &Engine,
     journal: &crate::monitor_journal::Journal,
     rows: &[MinuteRow],
     rolled: &mut HashMap<String, i64>,
+    pending_from: &mut HashMap<String, i64>,
     event: impl FnOnce(Value),
 ) -> bool {
     if rows.is_empty() {
@@ -478,6 +484,7 @@ fn commit_minute_rows(
     }
     for row in rows {
         rolled.insert(row.node_id.clone(), row.minute);
+        pending_from.remove(&row.node_id);
     }
     event(json!({ "rows": rows.len() }));
     true
@@ -499,6 +506,7 @@ pub async fn run(
     live.bind_journal(journal.clone());
     let mut previous_policy = None;
     let mut rolled: HashMap<String, i64> = HashMap::new();
+    let mut pending_from: HashMap<String, i64> = HashMap::new();
     let mut retry_at: HashMap<String, i64> = HashMap::new();
     let mut pushed_at: HashMap<String, i64> = HashMap::new();
     let (mut last_pull, mut last_prune) = (0i64, 0i64);
@@ -572,14 +580,14 @@ pub async fn run(
             let until_min = now.div_euclid(MINUTE) * MINUTE;
             let mut rows = Vec::new();
             for n in &cfg.nodes {
-                let from = rolled.get(&n.id).map_or(until_min - 5 * MINUTE, |m| m + MINUTE);
+                let from = minute_from(&n.id, &rolled, &mut pending_from, until_min);
                 if from >= until_min {
                     continue;
                 }
                 let got = rollup(&n.id, &live.samples(&n.id), live.procs(&n.id).as_ref(), from, until_min, &host);
                 rows.extend(got);
             }
-            commit_minute_rows(&engine, &journal, &rows, &mut rolled, &*event);
+            commit_minute_rows(&engine, &journal, &rows, &mut rolled, &mut pending_from, &*event);
         }
         if now - last_prune >= 24 * 60 * MINUTE {
             last_prune = now;
@@ -890,6 +898,44 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
+    async fn first_failed_minute_remains_pending_beyond_the_initial_five_minute_window() {
+        use crate::engine::NoHost;
+        let dir = std::env::temp_dir().join(format!("monitor-first-minute-{}-{}", std::process::id(), now_ms()));
+        let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(NoHost)).unwrap();
+        let journal = engine.start_monitor_journal();
+        let mut rolled = HashMap::new();
+        let mut pending_from = HashMap::new();
+        // A stopped stream retains this point but produces no newer samples during the outage.
+        let points = [sample(MINUTE + 1000, 5.0, 25.0, None)];
+        let from = minute_from("a", &rolled, &mut pending_from, 3 * MINUTE);
+        let first = rollup("a", &points, None, from, 3 * MINUTE, "fixture");
+        engine
+            .with_db(|d| d.conn().execute_batch("CREATE TEMP TRIGGER fail_first BEFORE INSERT ON metrics_minute BEGIN SELECT RAISE(ABORT,'fixture'); END"))
+            .unwrap();
+        let mut emitted = Vec::new();
+        let failed_ack = commit_minute_rows(&engine, &journal, &first, &mut rolled, &mut pending_from, |v| emitted.push(v));
+        let failed_rolled = rolled.clone();
+        let failed_pending = pending_from.clone();
+        engine.with_db(|d| d.conn().execute_batch("DROP TRIGGER fail_first")).unwrap();
+        let retry_from = minute_from("a", &rolled, &mut pending_from, 9 * MINUTE);
+        let retry = rollup("a", &points, None, retry_from, 9 * MINUTE, "fixture");
+        let retry_ack = commit_minute_rows(&engine, &journal, &retry, &mut rolled, &mut pending_from, |v| emitted.push(v));
+        let saved = engine.with_db(|d| d.metrics(Some("a"), 0, i64::MAX)).unwrap();
+        assert!(journal.shutdown(Duration::from_secs(2)).await);
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(!failed_ack && failed_rolled.is_empty());
+        assert_eq!(failed_pending.get("a"), Some(&from));
+        assert_eq!(retry_from, from);
+        assert_eq!(retry, first);
+        assert!(retry_ack);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(rolled.get("a"), Some(&MINUTE));
+        assert!(pending_from.is_empty());
+        assert_eq!(emitted, [json!({"rows":1})]);
+    }
+
+    #[tokio::test]
     async fn rolled_minutes_advance_only_after_batch_commit_and_retry_without_duplicates() {
         use crate::{engine::NoHost, monitor_journal::Filter};
         let dir = std::env::temp_dir().join(format!("monitor-watermark-{}-{}", std::process::id(), now_ms()));
@@ -897,6 +943,7 @@ mod tests {
         let journal = engine.start_monitor_journal();
         let initial: HashMap<String, i64> = ["a", "b"].map(|id| (id.into(), MINUTE)).into();
         let mut rolled = initial.clone();
+        let mut pending_from = HashMap::new();
         let before: Vec<MinuteRow> =
             ["a", "b"].into_iter().flat_map(|id| rollup(id, &[sample(MINUTE + 1000, 1.0, 25.0, None)], None, MINUTE, 2 * MINUTE, "fixture")).collect();
         engine.with_db(|d| d.add_metrics(&before)).unwrap();
@@ -919,14 +966,14 @@ mod tests {
         };
         let rows = pending(&rolled);
         let mut emitted = Vec::new();
-        let failed_ack = commit_minute_rows(&engine, &journal, &rows, &mut rolled, |v| emitted.push(v));
+        let failed_ack = commit_minute_rows(&engine, &journal, &rows, &mut rolled, &mut pending_from, |v| emitted.push(v));
         let failed_watermark = rolled.clone();
         let failed_emitted = emitted.len();
         let after_failure = engine.with_db(|d| d.metrics(None, 0, i64::MAX)).unwrap();
         engine.with_db(|d| d.conn().execute_batch("DROP TRIGGER fail_second")).unwrap();
         let retry = pending(&rolled);
-        let retry_ack = commit_minute_rows(&engine, &journal, &retry, &mut rolled, |v| emitted.push(v));
-        let replay_ack = commit_minute_rows(&engine, &journal, &rows, &mut rolled, |v| emitted.push(v));
+        let retry_ack = commit_minute_rows(&engine, &journal, &retry, &mut rolled, &mut pending_from, |v| emitted.push(v));
+        let replay_ack = commit_minute_rows(&engine, &journal, &rows, &mut rolled, &mut pending_from, |v| emitted.push(v));
         let saved = engine.with_db(|d| d.metrics(None, 0, i64::MAX)).unwrap();
         assert!(journal.flush(Duration::from_secs(2)).await);
         let records = engine.with_db(|d| d.monitor_events(&Filter { kind: Some(Kind::MinuteCommit), ..Default::default() })).unwrap();

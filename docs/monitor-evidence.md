@@ -27,14 +27,15 @@ Rustの通常monitorとLiveは、接続・最初の測定・終了・再試行�
 | before_id | 前pageのnext_before_id。新しい順の有界pagination |
 | limit | 既定100、1～500に制限 |
 
-応答はevents（日本語summary付き）、next_before_id、retention、health。照会でwriter開始・event生成・通知をしない。未開始のhealthはunknownで、過去のlossが0だったという意味ではない。healthのcounter_scopeはcurrent_collectorである。既存hub export/pullへ履歴を暗黙に追加していない。
+応答はevents（日本語summary付き）、next_before_id、retention、health。eventsとretentionの件数・最古/最新時刻は、読取時UTCの直近14日だけを対象にする。古いsince指定でも期限を広げない。照会で削除・writer開始・event生成・通知をしない。未開始のhealthはunknownで、過去のlossが0だったという意味ではない。healthのcounter_scopeはcurrent_collectorである。既存hub export/pullへ履歴を暗黙に追加していない。
 
 ## 保存失敗・容量
 
 - 既存Tokioのqueue256、writer1つ、最大64件または1秒でbatch。producerはtry_sendだけで、Live lock内でDB I/O/awaitをしない。同期DB仕事は同時1つ、DB mutex競合は即Busy。blocking仕事をtimeoutで放置して新writerを増やさない。
 - event全体はUTF-8 JSON 1024B以内。Node IDの切断で衝突させず、不正/長過ぎる入力は拒否して数える。自由文を受け取るAPIを持たない。
-- `overflow_total` はqueue満杯、`rejected_total` は不正/過大event、`dropped_total` は閉じたqueueを含む総欠落。DB失敗、未確認ACK、last_commit_at、pruned_totalも別に返す。保存失敗/overflowはavailableへ丸めずdegradedとし、回復後にjournal_gapを保存する。
-- 保持は最大14日またはglobal50,000行。6nodeの1分checkpointだけでも14日を全部保持できるとは限らない。実際のoldest/newest/rowsをretentionから確認する。約49MiBというpayload上限はSQLite/WAL/indexの物理ファイル容量上限ではない。VACUUMやglobal設定を変更しない。
+- 終了命令でreceiverをcloseし、発行済みpermitを含む既受理のtailをrecvがNoneになるまで最大64件ずつ保存する。未確定permitの間はACKしない。終了時に保存を確認できないbatchは欠落計上し、既受理のcontrolもfalseで応答する。close後の新しい記録は拒否・欠落として数える。
+- `overflow_total` はqueue満杯、`rejected_total` は不正/過大event、`dropped_total` は閉じたqueueや終了時に保存未確認のbatchを含む総欠落。DB失敗、未確認ACK、last_commit_at、pruned_totalも別に返す。保存失敗/overflowはavailableへ丸めずdegradedとし、回復後にjournal_gapを保存する。
+- 保存時は14日超またはglobal50,000行超を回収し、writer稼働中は無イベントでも60秒間隔で回収を試みる。healthのretention_maintenance_secondsがその間隔を示す。回収だけではcommitted_totalやlast_commit_atを更新しない。停止中やDB障害中の物理削除期限は保証しないが、read APIの14日可視期限はwriterに依存しない。6nodeの1分checkpointだけでも14日を全部保持できるとは限らない。可視範囲のoldest/newest/rowsをretentionから確認する。約49MiBというpayload上限はSQLite/WAL/indexの物理ファイル容量上限ではない。VACUUMやglobal設定を変更しない。
 - DBが使えない間の最後のevent、queue欠落、強制終了/電源断のtailは保存を保証しない。最後に停止記録がないことだけでcrashとは断定しない。writerのACK失敗・remote child不在・reader EOFは別の事実である。
 - `monitor-run` はLive停止とjournalの終了時保存確認で既存の3秒予算を共有する。tail commitのACKが未確認ならexit 1とし、成功JSONは出さない。ACK確認時だけ終了直後のjournal healthを返す。ACKは保存成功の証拠であり、writerの `running` はその時点の実測値なのでtrueの場合もある。Liveのshutdownは終了成否を返さないため、CLI exit 0や `collector_stopped` の存在から手元sampler・遠隔producer・descendantの終了までは保証しない。DB処理やruntimeの後片付けを含むプロセス全体の壁時計3秒上限でもない。
 
@@ -48,6 +49,6 @@ Rust/JSでCREATE TABLE IF NOT EXISTSのschemaを揃える。既存表や過去�
 
 専用表の欠如、typed filter未対応をsemantic REDで確認してから実装した。テストは一時DB/自分の短いfixture子だけでprivacy・queue overflow・DB競合・再読・TTL/row cap・max_age宣言/EOF・最初のsample/stall・保存ACKを確認する。同入力6node microbenchmarkは変換/rollup/Store/記録APIの比較であり、SSH・OS sampler・driverや通常アプリ全体の性能証明ではない。
 
-記録機能のcommit Xとは別のcommit Yで、monitorのrolled watermarkを分集計の保存成功ACK後だけ進める。batch失敗時は成功通知を出さず、水位を保持して次のtickで残存sampleを再集計する。同じ機体・分の再保存は既存キーで置換する。ringの長さや採取間隔は変えないため、長期間のDB障害でringから失われたsampleの回復は保証しない。過去の欠測原因をこの修正から推定しない。
+記録機能のcommit Xとは別のcommit Yで、monitorのrolled watermarkを分集計の保存成功ACK後だけ進める。batch失敗時は成功通知を出さず、水位を保持して次のtickで残存sampleを再集計する。初回保存前の下限も別mapに固定し、最初の保存失敗から5分を超えても時計で再試行対象を捨てず、ACK成功後だけ解除する。同じ機体・分の再保存は既存キーで置換する。ringの長さや採取間隔は変えないため、長期間のDB障害やアプリ再起動でringから失われたsampleの回復は保証しない。過去の欠測原因をこの修正から推定しない。
 
 正式反映・Windows実Rust/PS fallback・900秒自然交代・QA app再起動読出し・通常環境前後保全は、source freeze/review後の実機gate。ローカルfixtureやAPIの存在を通常運用での受入と呼ばない。
