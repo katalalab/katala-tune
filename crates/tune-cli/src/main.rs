@@ -44,6 +44,7 @@
 //! 変更操作（actions）はここからは実行しない（確認ダイアログを通すため、アプリからだけ）。
 
 mod agent;
+mod discovery;
 mod topology_native;
 mod topology_reader;
 
@@ -302,6 +303,9 @@ async fn live(rest: &[String]) -> Result<(), String> {
 fn main() -> ExitCode {
     let started = std::time::Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = discovery::run(&args) {
+        return code;
+    }
     if args.first().is_some_and(|cmd| cmd == "topology-reader") {
         return topology_reader::main(&args[1..], started);
     }
