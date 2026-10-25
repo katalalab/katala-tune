@@ -451,20 +451,24 @@ async fn product_guard_preserves_simple_windows_powershell_startup() {
     assert_eq!(canonical_control, (Some(0), false));
     let mut command = std::process::Command::new(normal);
     command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write('guard-marker')"]);
-    let environment = minimal_environment();
-    let result =
-        run_standalone_windows_bounded(&command, StandaloneWindowsEnvironment::new(&environment), b"", deadline(Duration::from_secs(10)), 65536, 65536).await;
-    assert_eq!(
-        result.code,
-        Some(0),
-        "guard metadata: timeout={} output_limit={} spawn_failed={} receipt={:?}",
-        result.timed_out,
-        result.output_limited,
-        result.spawn_failed,
-        result.process_receipt
-    );
-    assert_ack(&result, ProcessStop::Completed);
-    assert_eq!(result.stdout, b"guard-marker");
+    let mut drive_environment = minimal_environment();
+    drive_environment.push(("=Q:".into(), r"Q:\fixture".into()));
+    for environment in [minimal_environment(), std::env::vars_os().collect(), drive_environment] {
+        let result =
+            run_standalone_windows_bounded(&command, StandaloneWindowsEnvironment::new(&environment), b"", deadline(Duration::from_secs(10)), 65536, 65536)
+                .await;
+        assert_eq!(
+            result.code,
+            Some(0),
+            "guard metadata: timeout={} output_limit={} spawn_failed={} receipt={:?}",
+            result.timed_out,
+            result.output_limited,
+            result.spawn_failed,
+            result.process_receipt
+        );
+        assert_ack(&result, ProcessStop::Completed);
+        assert_eq!(result.stdout, b"guard-marker");
+    }
 }
 
 const CANARY: &str = "KATALA_GUARD_ENV_CANARY";
@@ -524,6 +528,10 @@ async fn complete_environment_rejects_ambiguous_and_invalid_inputs() {
         vec![("NAME".into(), "first".into()), ("NAME".into(), "second".into())],
         vec![("".into(), "value".into())],
         vec![("NAME=OTHER".into(), "value".into())],
+        vec![("=NOTDRIVE".into(), "value".into())],
+        vec![("=1:".into(), "value".into())],
+        vec![("=CC:".into(), "value".into())],
+        vec![("=C:=".into(), "value".into())],
         vec![("NAME\0".into(), "value".into())],
         vec![("NAME".into(), "value\0".into())],
     ] {
@@ -575,12 +583,51 @@ async fn owned_fixture_run(mode: &str, input: &[u8], timeout: Duration, limit: u
     (result, digest)
 }
 
+fn owned_completion_failure_diagnostic(failure: &BoundedResult) -> String {
+    let receipt = failure.process_receipt.as_ref();
+    let stop = match receipt.map(|value| value.stop) {
+        None => "missing",
+        Some(ProcessStop::SetupFailed) => "setup_failed",
+        Some(ProcessStop::SpawnFailed) => "spawn_failed",
+        Some(ProcessStop::Completed) => "completed",
+        Some(ProcessStop::Timeout) => "timeout",
+        Some(ProcessStop::OutputLimit) => "output_limit",
+        Some(ProcessStop::LingeringDescendants) => "lingering_descendants",
+        Some(ProcessStop::IoFailure) => "io_failure",
+        Some(ProcessStop::CleanupUnconfirmed) => "cleanup_unconfirmed",
+    };
+    let root_exit = match receipt.and_then(|value| value.root_exit_code) {
+        None => "missing",
+        Some(0) => "zero",
+        Some(_) => "nonzero",
+    };
+    format!(
+        "owned_completion_failure timed_out={} output_limited={} spawn_failed={} receipt_some={} stop={} root_exit={} root_exited={} job_empty={} observed_exited={} stdout_eof={} stderr_eof={} writer_finished={} cleanup_confirmed={}",
+        failure.timed_out,
+        failure.output_limited,
+        failure.spawn_failed,
+        receipt.is_some(),
+        stop,
+        root_exit,
+        receipt.is_some_and(|value| value.root_exited),
+        receipt.is_some_and(|value| value.job_empty),
+        receipt.is_some_and(|value| value.observed_exited),
+        receipt.is_some_and(|value| value.stdout_eof),
+        receipt.is_some_and(|value| value.stderr_eof),
+        receipt.is_some_and(|value| value.writer_finished),
+        receipt.is_some_and(|value| value.cleanup_confirmed()),
+    )
+}
+
 #[tokio::test]
 async fn owned_completion_consumes_bound_actual_output() {
     let _serial = SERIAL.lock().await;
     let input: Vec<u8> = (0..128 * 1024).map(|i| b'a' + (i % 26) as u8).collect();
     let (result, digest) = owned_fixture_run("happy", &input, Duration::from_secs(15), 256 * 1024).await;
-    let completion = result.ok().expect("owned completion requires actual success");
+    let completion = match result {
+        Ok(completion) => completion,
+        Err(failure) => panic!("{}", owned_completion_failure_diagnostic(&failure)),
+    };
     assert_ack(completion.diagnostic(), ProcessStop::Completed);
     assert_eq!(completion.diagnostic().code, Some(0));
     let output = completion.into_verified_output(&input, &digest).ok().expect("consume matching request and artifact once");

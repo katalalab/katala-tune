@@ -23,6 +23,47 @@ function RNum($x, $d = 1) {
   return [math]::Round($v, $d)
 }
 # Short reason for a failed read. "no-permission" when the account may not read it (no admin rights are requested).
+# Read both pipes concurrently. A root exit without EOF, or either stream over
+# its limit, discards the capture. The outer native Job owns descendant cleanup.
+function Read-KtProcessOutput($Process, $Clock, [int]$DeadlineMs, [string]$InputText = '', $Encoding = [Text.Encoding]::UTF8, [int]$StdoutLimit = 1048576, [int]$StderrLimit = 65536) {
+  $ErrorActionPreference = 'Stop'
+  $stdout = New-Object IO.MemoryStream
+  $stderr = New-Object IO.MemoryStream
+  try {
+    $outBuffer = New-Object byte[] 4096; $errBuffer = New-Object byte[] 4096
+    $outRead = $Process.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+    $errRead = $Process.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+    $write = $Process.StandardInput.WriteAsync($InputText)
+    $left = [Math]::Max(0, $DeadlineMs - [int]$Clock.ElapsedMilliseconds)
+    if ($left -le 0 -or -not $write.Wait([Math]::Min(2000, $left))) { throw 'worker stdin timeout' }
+    $Process.StandardInput.Close()
+    $outDone = $false; $errDone = $false
+    while (-not ($outDone -and $errDone)) {
+      $left = [Math]::Max(0, $DeadlineMs - [int]$Clock.ElapsedMilliseconds)
+      if ($left -le 0) { throw 'worker output timeout or missing EOF' }
+      $pending = New-Object Collections.Generic.List[Threading.Tasks.Task]
+      if (-not $outDone) { $pending.Add($outRead) }
+      if (-not $errDone) { $pending.Add($errRead) }
+      if ([Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$pending.ToArray(), $left) -lt 0) { throw 'worker output timeout or missing EOF' }
+      if (-not $outDone -and $outRead.IsCompleted) {
+        $count = $outRead.Result
+        if ($count -eq 0) { $outDone = $true }
+        elseif ($stdout.Length + $count -gt $StdoutLimit) { throw 'worker stdout exceeded limit' }
+        else { $stdout.Write($outBuffer, 0, $count); $outRead = $Process.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length) }
+      }
+      if (-not $errDone -and $errRead.IsCompleted) {
+        $count = $errRead.Result
+        if ($count -eq 0) { $errDone = $true }
+        elseif ($stderr.Length + $count -gt $StderrLimit) { throw 'worker stderr exceeded limit' }
+        else { $stderr.Write($errBuffer, 0, $count); $errRead = $Process.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length) }
+      }
+    }
+    $left = [Math]::Max(0, $DeadlineMs - [int]$Clock.ElapsedMilliseconds)
+    if ($left -le 0 -or -not $Process.WaitForExit($left)) { throw 'worker root exit timeout' }
+    return [pscustomobject]@{ out = $Encoding.GetString($stdout.ToArray()); err = $Encoding.GetString($stderr.ToArray()); code = $Process.ExitCode }
+  } finally { $stdout.Dispose(); $stderr.Dispose() }
+}
+
 function NsErr($e) {
   $x = $e.Exception
   if ($x -is [System.UnauthorizedAccessException] -or $x.HResult -eq -2147024891 -or [string]$x.NativeErrorCode -eq 'AccessDenied') { return 'no-permission' }
@@ -161,14 +202,14 @@ function MxKey([string]$exe, [string[]]$tokens) {
 $mxGroups = @(); $mxTrees = @(); $mxAvail = 'unavailable'; $mxReason = $null
 try {
   $mx = @{}
-  $mxCim = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, WorkingSetSize, SessionId, CreationDate -ErrorAction Stop)
+  $mxCim = @(Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, WorkingSetSize, SessionId, CreationDate -OperationTimeoutSec 4 -ErrorAction Stop)
   if ($mxCim.Count -eq 0) { throw 'no-data' }
   # Command lines are queried only for interpreter executables (other processes' arguments are never read)
   $mxCmd = @{}
   $mxNames = @($mxCim | ForEach-Object { [string]$_.Name } | Where-Object { ($_ -replace '\.exe$', '') -match $mxInterp -and $_ -match '^[A-Za-z0-9._-]+$' } | Sort-Object -Unique)
   if ($mxNames.Count -gt 0) {
     $flt = ($mxNames | ForEach-Object { "Name = '$_'" }) -join ' OR '
-    foreach ($c in @(Get-CimInstance Win32_Process -Filter $flt -Property ProcessId, CommandLine)) { if ($c.CommandLine) { $mxCmd[[int]$c.ProcessId] = [string]$c.CommandLine } }
+    foreach ($c in @(Get-CimInstance Win32_Process -Filter $flt -Property ProcessId, CommandLine -OperationTimeoutSec 4 -ErrorAction Stop)) { if ($c.CommandLine) { $mxCmd[[int]$c.ProcessId] = [string]$c.CommandLine } }
   }
   foreach ($w in $mxCim) {
     $nm = ([string]$w.Name) -replace '\.exe$', ''
@@ -220,7 +261,8 @@ try {
 } catch {
   $mxReason = NsErr $_
 }
-$mx = $null; $mxCim = $null; $mxCmd = $null; $gh = $null; $th = $null; $kids = $null
+# Keep $mx for the following GPU compute PID and parent/child check, then clear it.
+$mxCim = $null; $mxCmd = $null; $gh = $null; $th = $null; $kids = $null
 
 # Memory
 $commitPct = $null
@@ -244,26 +286,85 @@ if ($pref -and $pref.ExclusionPath -and ($pref.ExclusionPath -notmatch 'N/A')) {
 
 # GPU: a single bounded query per analysis; no daemon, setters or process-name query.
 # BEGIN GPU TELEMETRY
-function InvokeGpuQuery($exe, $fields) {
+function InvokeGpuBounded($exe, $arguments) {
   $p = New-Object Diagnostics.Process
   $p.StartInfo = New-Object Diagnostics.ProcessStartInfo
   $p.StartInfo.FileName = $exe
-  $p.StartInfo.Arguments = "--query-gpu=$fields --format=csv,noheader,nounits"
+  $p.StartInfo.Arguments = $arguments
   $p.StartInfo.UseShellExecute = $false
   $p.StartInfo.CreateNoWindow = $true
   $p.StartInfo.RedirectStandardOutput = $true
   $p.StartInfo.RedirectStandardError = $true
+  $started = $false; $cleanupAttempted = $false; $result = $null
+  $cleanup = {
+    param($process, $clock)
+    try {
+      try { if (-not $process.HasExited) { $process.Kill() } } catch { }
+      $left = [Math]::Max(0, 4000 - [int]$clock.ElapsedMilliseconds)
+      $ack = $process.WaitForExit([Math]::Min(1000, $left))
+      return ($ack -and $process.HasExited)
+    } catch { return $false }
+  }
   try {
     [void]$p.Start()
-    $out = $p.StandardOutput.ReadToEndAsync()
-    $err = $p.StandardError.ReadToEndAsync()
-    if (-not $p.WaitForExit(4000)) { $p.Kill(); return @{ rows = @(); reason = "query-timeout" } }
-    if (-not $out.Wait(200)) { return @{ rows = @(); reason = "output-timeout" } }
-    $text = $out.Result
-    if ($p.ExitCode -ne 0) { return @{ rows = @(); reason = "query-failed" } }
-    if ($text.Length -gt 65536) { return @{ rows = @(); reason = "output-limit" } }
-    return @{ rows = @($text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 16); reason = $null }
-  } catch { return @{ rows = @(); reason = "query-unavailable" } } finally { $p.Dispose() }
+    $started = $true
+    $clock = [Diagnostics.Stopwatch]::StartNew(); $stdout = New-Object IO.MemoryStream; $stderr = New-Object IO.MemoryStream
+    $outBuffer = New-Object byte[] 4096; $errBuffer = New-Object byte[] 4096
+    $outTask = $p.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+    $errTask = $p.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+    $outEof = $false; $errEof = $false; $reason = $null
+    while (-not ($p.HasExited -and $outEof -and $errEof)) {
+      $left = 4000 - [int]$clock.ElapsedMilliseconds
+      if ($left -le 0) { $reason = "query-timeout"; break }
+      $pending = @(); if (-not $outEof) { $pending += $outTask }; if (-not $errEof) { $pending += $errTask }
+      # Pipe EOF alone is never success: a descendant may have closed both
+      # streams while the root nvidia-smi process remains alive.
+      if ($pending.Count -eq 0) {
+        if (-not $p.WaitForExit($left)) { $reason = "query-timeout"; break }
+        continue
+      }
+      if ([Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$pending, $left) -lt 0) { $reason = "query-timeout"; break }
+      if (-not $outEof -and $outTask.IsCompleted) {
+        $n = $outTask.Result
+        if ($n -eq 0) { $outEof = $true } elseif ($stdout.Length + $n -gt 65536) { $reason = "output-limit"; break } else { $stdout.Write($outBuffer, 0, $n); $outTask = $p.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length) }
+      }
+      if (-not $errEof -and $errTask.IsCompleted) {
+        $n = $errTask.Result
+        if ($n -eq 0) { $errEof = $true } elseif ($stderr.Length + $n -gt 65536) { $reason = "output-limit"; break } else { $stderr.Write($errBuffer, 0, $n); $errTask = $p.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length) }
+      }
+    }
+    if ($reason) {
+      $cleanupAttempted = $true
+      if (-not (& $cleanup $p $clock)) { $reason = "cleanup-unverified" }
+      $result = @{ text = ""; reason = $reason }
+    } elseif ($p.ExitCode -ne 0) {
+      $result = @{ text = ""; reason = "query-failed" }
+    } else {
+      $result = @{ text = [Text.Encoding]::UTF8.GetString($stdout.ToArray()); reason = $null }
+    }
+  } catch {
+    $result = @{ text = ""; reason = "query-unavailable" }
+  } finally {
+    if ($started -and -not $cleanupAttempted -and -not $p.HasExited) {
+      $cleanupAttempted = $true
+      if (-not (& $cleanup $p $clock)) { $result = @{ text = ""; reason = "cleanup-unverified" } }
+    }
+    $p.Dispose()
+  }
+  return $result
+}
+function InvokeGpuQuery($exe, $fields) {
+  $result = InvokeGpuBounded $exe "--query-gpu=$fields --format=csv,noheader,nounits"
+  if ($result.reason) { return @{ rows = @(); reason = $result.reason } }
+  return @{ rows = @($result.text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 16); reason = $null }
+}
+function InvokeGpuComputeQuery($exe) {
+  $result = InvokeGpuBounded $exe "--query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits"
+  if ($result.reason) { return @{ rows = @(); reason = $result.reason } }
+  # nvidia-smi uses this text (rather than a blank CSV stream) for a successful empty result.
+  $rows = @($result.text -split "`r?`n" | Where-Object { $_.Trim() -and $_.Trim() -ne "No running processes found" })
+  if ($rows.Count -gt 16) { return @{ rows = @(); reason = "row-limit" } }
+  return @{ rows = $rows; reason = $null }
 }
 function GpuMemory($g, $at) {
   foreach ($key in @("mem_used_mb", "mem_total_mb", "mem_free_mb", "util", "temp_c", "power_w")) { if ($null -ne $g[$key] -and $g[$key] -lt 0) { $g[$key] = $null } }
@@ -282,6 +383,7 @@ function GpuMemory($g, $at) {
   return [pscustomobject]$g
 }
 $gpus = @()
+$gpuCompute = [ordered]@{ availability = "unavailable"; apps = @(); reason = "nvidia-smi-not-found" }
 $gpuAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 $gpuReason = "nvidia-smi-not-found; other GPU vendors unsupported (AdapterRAM is not a reliable VRAM capacity)"
@@ -300,10 +402,64 @@ if ($smi) {
     $g = @{ uuid = $f[16]; throttle = $f[17]; adapter_index = (RNum $f[0] 0); name = $f[1]; util = (RNum $f[2]); mem_used_mb = (RNum $f[3] 0); mem_total_mb = (RNum $f[4] 0); mem_free_mb = (RNum $f[5] 0); temp_c = (RNum $f[6]); power_w = (RNum $f[7]); power_limit_w = (RNum $f[8]); power_min_w = (RNum $f[9]); power_max_w = (RNum $f[10]); clocks_graphics_mhz = (RNum $f[11]); clocks_sm_mhz = (RNum $f[12]); clocks_memory_mhz = (RNum $f[13]); pstate = $(if ($f[14] -match "^(N/A|Not Supported|\[N/A\])$") { $null } else { $f[14] }); driver = $f[15]; source = $(if ($memoryOnly) { "nvidia-smi memory-only fallback" } else { "nvidia-smi" }); available = $true }
     $gpus += GpuMemory $g $gpuAt
   }
+  $compute = if ($query.reason) { @{ rows = @(); reason = $query.reason } } else { InvokeGpuComputeQuery $smi.Source }
+  if ($compute.reason) {
+    $gpuCompute.availability = "unavailable"; $gpuCompute.reason = $compute.reason
+  } else {
+    $apps = @(); $valid = $true
+    foreach ($line in $compute.rows) {
+      $f = $line -split ",\s*"
+      if ($f.Count -ne 2 -or $f[0] -notmatch "^[0-9]+$") { $valid = $false; break }
+      [int]$computePid = 0
+      if (-not [int]::TryParse($f[0], [ref]$computePid) -or $computePid -le 4) { $valid = $false; break }
+      # Keep N/A as null rather than zero; a PID still means active compute work.
+      $used = $null
+      if ($f[1] -notmatch "^(N/A|Not Supported|\[N/A\])$") { $used = RNum $f[1] 0; if ($null -eq $used -or $used -lt 0) { $valid = $false; break } }
+      $name = $null; $mxRow = $mx[$computePid]
+      if ($mxRow -and $mxRow.name -match "^[A-Za-z0-9_.+-]{1,80}$") { $name = $mxRow.name }
+      $apps += [pscustomobject]@{ pid = $computePid; name = $name; used_memory_mb = $used }
+    }
+    if ($valid) { $gpuCompute.availability = "available"; $gpuCompute.apps = @($apps); $gpuCompute.reason = $null }
+    else { $gpuCompute.availability = "unavailable"; $gpuCompute.reason = "invalid-compute-row" }
+  }
+} else {
+  try {
+    $adapters = @(Get-CimInstance Win32_VideoController -Property Name,PNPDeviceID -OperationTimeoutSec 4 -ErrorAction Stop)
+    $nvidiaAdapters = @($adapters | Where-Object { $_.Name -match "(?i)NVIDIA" -or $_.PNPDeviceID -match "(?i)VEN_10DE" })
+    if ($adapters.Count -gt 0 -and $adapters.Count -le 32 -and $nvidiaAdapters.Count -eq 0) { $gpuCompute.availability = "absent"; $gpuCompute.reason = "verified-no-nvidia-adapter" }
+    else { $gpuCompute.reason = "nvidia-smi-not-found; adapter-identity-unavailable" }
+  } catch { $gpuCompute.reason = "nvidia-smi-not-found; adapter-query-unavailable" }
 }
 if ($gpus.Count -eq 0) {
   $gpus = @([pscustomobject]@{ adapter_index = $null; name = "GPU"; source = "nvidia-smi"; available = $false; memory_kind = "unknown"; memory_unit = "MiB"; memory_status = $(if ($smi) { "unavailable" } else { "unsupported" }); memory_reason = $gpuReason; sampled_at = $gpuAt; mem_total_mb = $null; mem_used_mb = $null; mem_free_mb = $null; mem_used_pct = $null; util = $null; temp_c = $null; power_w = $null; power_limit_w = $null; process_memory_reason = "not collected" })
 }
+$gpuPids = @($gpuCompute.apps | ForEach-Object { [int]$_.pid })
+function Test-KtGpuRelated([int]$TargetPid, [int[]]$GpuPids, $Map) {
+  if ($GpuPids -contains $TargetPid) { return $true }
+  $ancestors = @{}; $cur = $Map[$TargetPid]
+  for ($i = 0; $i -lt 64 -and $cur -and $cur.pid -gt 0 -and -not $ancestors.ContainsKey($cur.pid); $i++) {
+    $ancestors[$cur.pid] = $true
+    $parent = $Map[$cur.ppid]
+    if (-not $parent -or -not $cur.born -or -not $parent.born -or $parent.born -gt $cur.born) { break }
+    $cur = $parent
+  }
+  foreach ($gpuPid in $GpuPids) {
+    $cur = $Map[$gpuPid]
+    for ($i = 0; $i -lt 64 -and $cur -and $cur.pid -gt 0; $i++) {
+      if ($ancestors.ContainsKey($cur.pid)) { return $true }
+      $parent = $Map[$cur.ppid]
+      if (-not $parent -or -not $cur.born -or -not $parent.born -or $parent.born -gt $cur.born) { break }
+      $cur = $parent
+    }
+  }
+  return $false
+}
+foreach ($p in $list) {
+  $row = $mx[[int]$p.pid]
+  if ($row) { $p | Add-Member -NotePropertyName ppid -NotePropertyValue $row.ppid -Force }
+  if ($gpuCompute.availability -eq "available" -and (Test-KtGpuRelated ([int]$p.pid) $gpuPids $mx)) { $p | Add-Member -NotePropertyName gpu_compute -NotePropertyValue $true -Force }
+}
+$mx = $null
 # END GPU TELEMETRY
 
 $cpuPowerW = $null; $cpuPowerSource = $null; $cpuPowerReason = "LibreHardwareMonitor CPU Package unavailable"
@@ -368,6 +524,7 @@ echo @@end
 function Test-KtWslInstalled { return (Test-Path (Join-Path $env:SystemRoot 'System32\wsl.exe')) }
 function Invoke-KtWsl([string[]]$WslArgs, [string]$InputText = $null, [int]$TimeoutMs = 8000, [bool]$Utf16 = $true) {
   $res = [pscustomobject]@{ ok = $false; code = $null; out = ''; err = $null }
+  $p = $null; $clock = [Diagnostics.Stopwatch]::StartNew()
   try {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = Join-Path $env:SystemRoot 'System32\wsl.exe'
@@ -378,25 +535,23 @@ function Invoke-KtWsl([string[]]$WslArgs, [string]$InputText = $null, [int]$Time
     $psi.RedirectStandardError = $true
     $psi.RedirectStandardInput = $true
     $enc = if ($Utf16) { [System.Text.Encoding]::Unicode } else { New-Object System.Text.UTF8Encoding($false) }
-    $psi.StandardOutputEncoding = $enc
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo = $psi
     [void]$p.Start()
-    $so = $p.StandardOutput.ReadToEndAsync()
-    $se = $p.StandardError.ReadToEndAsync()
-    if ($InputText) { $p.StandardInput.Write($InputText) }
-    $p.StandardInput.Close()
-    if (-not $p.WaitForExit($TimeoutMs)) {
-      try { $p.Kill() } catch { }
-      $res.err = 'timeout'
-      return $res
-    }
-    $res.code = $p.ExitCode
-    $res.out = [string]$so.Result
-    $res.ok = ($p.ExitCode -eq 0)
-    if (-not $res.ok) { $res.err = 'exit ' + $p.ExitCode }
+    $capture = Read-KtProcessOutput $p $clock $TimeoutMs $InputText $enc
+    $res.code = $capture.code
+    $res.out = $capture.out
+    $res.ok = ($capture.code -eq 0)
+    if (-not $res.ok) { $res.err = 'exit ' + $capture.code }
   } catch {
-    $res.err = 'failed'
+    $res.err = $(if ($_.Exception.Message -match 'timeout') { 'timeout' } elseif ($_.Exception.Message -match 'exceeded limit') { 'output-limit' } else { 'failed' })
+  } finally {
+    if ($p) {
+      try {
+        if (-not $p.HasExited) { $p.Kill(); if (-not $p.WaitForExit(1000)) { $res.ok = $false; $res.out = ''; $res.err = 'cleanup-unverified' } }
+      } catch { $res.ok = $false; $res.out = ''; $res.err = 'cleanup-unverified' }
+      $p.Dispose()
+    }
   }
   return $res
 }
@@ -743,20 +898,10 @@ if (-not $NoNetwork) {
     $child = New-Object Diagnostics.Process
     $child.StartInfo = $psi
     if (-not $child.Start()) { throw 'netsec worker did not start' }
-    $outTask = $child.StandardOutput.ReadToEndAsync()
-    $errTask = $child.StandardError.ReadToEndAsync()
-    $writeTask = $child.StandardInput.WriteAsync($wire)
-    if (-not $writeTask.Wait(2000)) { throw 'netsec worker stdin timeout' }
-    $child.StandardInput.Close()
-    $runLeft = [Math]::Max(0, 17000 - [int]$outerWatch.ElapsedMilliseconds)
-    $timedOut = -not $child.WaitForExit($runLeft)
-    if ($timedOut) {
-      $child.Kill()
-      $killLeft = [Math]::Max(0, 19500 - [int]$outerWatch.ElapsedMilliseconds)
-      if (-not $child.WaitForExit($killLeft)) { throw 'netsec worker did not exit after kill' }
-    }
-    $outText = $outTask.Result
-    $errText = $errTask.Result
+    $capture = Read-KtProcessOutput $child $outerWatch 17000 $wire ([Text.Encoding]::UTF8)
+    $timedOut = $false
+    $outText = $capture.out
+    $errText = $capture.err
     $workerFailed = $child.ExitCode -ne 0
     foreach ($line in @($outText -split "`r?`n")) {
       if (-not $line.Trim()) { continue }
@@ -827,6 +972,7 @@ $result = [ordered]@{
   power = [ordered]@{ plan_guid = $guid; plan_name = $planName; plans = @($plans); package_w = $cpuPowerW; package_source = $cpuPowerSource; package_availability = $(if ($null -ne $cpuPowerW) { "available" } else { "unavailable" }); package_reason = $cpuPowerReason; soc_w = $null; soc_source = $null; low_power_mode = $null; on_battery = $null }
   defender = [ordered]@{ realtime = $mp.RealTimeProtectionEnabled; exclusions = $excl }
   gpus = @($gpus)
+  gpu_compute = [pscustomobject]$gpuCompute
   disk = @($disks)
   wsl = $wsl
   stability_7d = $stab

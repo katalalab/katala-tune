@@ -64,6 +64,7 @@ pub struct Engine {
     probing: AtomicBool,
     syncing: AtomicBool,
     pub(crate) topology_refreshing: AtomicBool,
+    pub(crate) specs_running: tokio::sync::Mutex<()>,
     last_probe_error: Mutex<HashMap<String, String>>,
     fleet: Mutex<(Option<Value>, Option<i64>)>,
     action_targets: Mutex<HashSet<String>>,
@@ -134,6 +135,7 @@ impl Engine {
             probing: AtomicBool::new(false),
             syncing: AtomicBool::new(false),
             topology_refreshing: AtomicBool::new(false),
+            specs_running: tokio::sync::Mutex::new(()),
             last_probe_error: Mutex::new(HashMap::new()),
             fleet: Mutex::new((None, None)),
             action_targets: Mutex::new(HashSet::new()),
@@ -648,7 +650,7 @@ impl Engine {
                 Err(e) => return refused(e),
             };
             // 承認した接続先（どの機体に、どのシェルで送るか）。確認の後に台帳を読み直したとき、これが変わっていたら実行しない
-            let route = (node.alias.clone(), node.os.clone(), node.local);
+            let route = (node.alias.clone(), node.os.clone(), node.local, actions::action_helper_fingerprint(node));
             if !confirm(title.to_string(), format!("{}\n\n実行するコマンド:\n{}", p.describe, p.script)).await {
                 return Ok(json!({ "ok": false, "cancelled": true }));
             }
@@ -667,7 +669,7 @@ impl Engine {
                 Err(e) => return abort(format!("台帳を読めないので実行しない: {e}")),
             };
             let Some(node) = fresh.node(node_id) else { return abort("台帳に無い機体".into()) };
-            if (node.alias.clone(), node.os.clone(), node.local) != route {
+            if (node.alias.clone(), node.os.clone(), node.local, actions::action_helper_fingerprint(node)) != route {
                 return abort("確認のあいだに台帳の接続先（alias・OS・この機体かどうか）が変わったので実行しない。もう一度確認してください".into());
             }
             // 共用機・保護リスト・引数は、読み直した台帳でもう一度確かめる（実行するコマンドは接続先と操作で決まるので、承認したものと同じ）

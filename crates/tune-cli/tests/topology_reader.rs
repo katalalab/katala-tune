@@ -145,11 +145,18 @@ mod windows {
         let mut stdout = child.stdout.take().unwrap();
         let reader = std::thread::spawn(move || {
             let mut v = Vec::new();
-            stdout.read_to_end(&mut v).unwrap();
-            v
+            stdout.read_to_end(&mut v).map(|_| v)
         });
-        assert!(wait_finite(&mut child, Duration::from_secs(35)).success());
-        let bytes = reader.join().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let diagnostic = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let status = wait_finite(&mut child, Duration::from_secs(35));
+        let bytes = reader.join().unwrap().unwrap();
+        let diagnostic = diagnostic.join().unwrap().unwrap();
+        assert!(status.success(), "reader exited before response: code={:?} diagnostic={}", status.code(), String::from_utf8_lossy(&diagnostic));
+        assert!(diagnostic.is_empty());
         let header_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
         let header: Value = serde_json::from_slice(&bytes[16..16 + header_len]).unwrap();
         let reported: tune_core::collect::ProcessIdentity = serde_json::from_value(header["helper_identity"].clone()).unwrap();
@@ -168,32 +175,71 @@ mod windows {
         let mut child = spawn(&["topology-reader", "--budget-ms", "30000"], &state);
         child.stdin.as_mut().unwrap().write_all(&frame).unwrap();
         let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let diagnostic = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
         let (tx, rx) = std::sync::mpsc::channel();
         let consumer = std::thread::spawn(move || {
-            let mut prefix = [0u8; 16];
-            stdout.read_exact(&mut prefix).unwrap();
-            let n = u32::from_le_bytes(prefix[8..12].try_into().unwrap()) as usize;
-            assert!(n <= reader::MAX_RESPONSE_HEADER_BYTES);
-            let payload = u32::from_le_bytes(prefix[12..16].try_into().unwrap());
-            assert!(payload > 64 * 1024);
-            let mut header = vec![0; n];
-            stdout.read_exact(&mut header).unwrap();
-            let header: Value = serde_json::from_slice(&header).unwrap();
-            assert_eq!(header["process_receipt"]["job_empty"], true);
-            assert_eq!(header["process_receipt"]["root_exit_code"], 0);
-            tx.send(stdout).unwrap(); // Hold the pipe open without consuming any capture bytes.
+            let result = (|| -> std::io::Result<_> {
+                let mut prefix = [0u8; 16];
+                stdout.read_exact(&mut prefix)?;
+                let n = u32::from_le_bytes(prefix[8..12].try_into().unwrap()) as usize;
+                assert!(n <= reader::MAX_RESPONSE_HEADER_BYTES);
+                let payload = u32::from_le_bytes(prefix[12..16].try_into().unwrap());
+                assert!(payload > 64 * 1024);
+                let mut header = vec![0; n];
+                stdout.read_exact(&mut header)?;
+                let header: Value = serde_json::from_slice(&header).unwrap();
+                assert_eq!(header["process_receipt"]["job_empty"], true);
+                assert_eq!(header["process_receipt"]["root_exit_code"], 0);
+                Ok(stdout) // Hold the pipe open without consuming any capture bytes.
+            })();
+            let _ = tx.send(result);
         });
         let unread = match rx.recv_timeout(Duration::from_secs(32)) {
-            Ok(pipe) => pipe,
+            Ok(Ok(pipe)) => pipe,
+            Ok(Err(error)) => {
+                let status = wait_finite(&mut child, Duration::from_secs(3));
+                let diagnostic = diagnostic.join().unwrap().unwrap();
+                panic!(
+                    "probe closed before response stage: kind={:?} code={:?} diagnostic={}",
+                    error.kind(),
+                    status.code(),
+                    String::from_utf8_lossy(&diagnostic)
+                );
+            }
             Err(_) => {
                 let _ = child.kill();
-                let _ = child.wait();
-                panic!("probe did not reach response stage");
+                let status = child.wait().unwrap();
+                let diagnostic = diagnostic.join().unwrap().unwrap();
+                panic!("probe did not reach response stage: code={:?} diagnostic={}", status.code(), String::from_utf8_lossy(&diagnostic));
             }
         };
-        assert!(!wait_finite(&mut child, Duration::from_secs(35)).success());
+        let status = wait_finite(&mut child, Duration::from_secs(35));
+        let diagnostic = diagnostic.join().unwrap().unwrap();
+        assert!(!status.success(), "unread response must reach its hard exit: code={:?} diagnostic={}", status.code(), String::from_utf8_lossy(&diagnostic));
+        assert!(diagnostic.is_empty());
         drop(unread);
         consumer.join().unwrap();
+        assert!(!state.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn valid_identity_mismatch_reports_fixed_failure_stage() {
+        let (root, mut request, _) = fixture(false);
+        request.expected_identity_hash = "0".repeat(64);
+        let frame = reader::encode_request(&request).unwrap();
+        let state = base();
+        let mut child = spawn(&["topology-reader", "--budget-ms", "30000"], &state);
+        child.stdin.as_mut().unwrap().write_all(&frame).unwrap();
+        let status = wait_finite(&mut child, Duration::from_secs(3));
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, b"topology-reader failure=identity backend=none\n");
         assert!(!state.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
