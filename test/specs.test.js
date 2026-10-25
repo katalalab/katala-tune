@@ -69,7 +69,35 @@ test('a cached running backend never disables manual reload',async()=>{
 
 test('coverage separates exact products, documentation and unavailable setting values',()=>{
   const n={report:{sections:{settings:{components:[{official:{status:'not_applicable'},fields:{secure_boot:'permission_denied'},missing_fields:[]}]},storage:{components:[{official:{status:'matched'},fields:{model:'Example'},missing_fields:['firmware_version']},{official:{status:'unverified'},fields:{model:'Other'}}]}}}};
-  assert.deepEqual(model.coverage(n),{matched:1,unverified:1,notApplicable:1,missing:1,unavailable:1});
+  assert.deepEqual(model.coverage(n),{matched:1,identified:0,unverified:1,notApplicable:1,missing:1,unavailable:1});
+});
+
+test('full-body evidence and hardware function identification are separate from exact product matching',()=>{
+  const n={node_id:'Example',report:{sections:{pci:{components:[{name:'Controller',fields:{record_kind:'device'},official:{status:'identified',match_kind:'hardware_id',url:'https://edc.intel.com/example',source_access:'manufacturer_page_full_body',source_evidence:{url:'https://edc.intel.com/example',sha256:'a'.repeat(64),coverage:'full_page',notes:'Exact public ID table'},specifications:{controller_function:'SMBus'}},missing_fields:[]}]}}}};
+  assert.equal(model.coverage(n).identified,1);
+  assert.equal(model.coverage(n).matched,0);
+  const html=model.officialDetails([n]);
+  assert(html.includes('公式ID照合'));
+  assert(html.includes('本文取得・確認済み'));
+  assert(html.includes('a'.repeat(64)));
+  assert.equal(model.format('present',false),'未検出');
+  assert.equal(model.format('driver_signed',false),'署名なし');
+});
+
+test('evidence filters retain gaps and distinguish recorded full bodies from excerpt-only sources',()=>{
+  const n={node_id:'Example',report:{sections:{usb:{components:[
+    {name:'Unresolved',fields:{},official:{status:'unverified'},missing_fields:[]},
+    {name:'Complete',fields:{},official:{status:'matched',url:'https://www.rme-audio.de/example',source_access:'manufacturer_page_full_body',source_evidence:{sha256:'b'.repeat(64)}},missing_fields:[]},
+    {name:'Excerpt',fields:{},official:{status:'matched',url:'https://www.razer.com/example',source_access:'manufacturer_page_indexed_excerpt'},missing_fields:[]}
+  ]}}}};
+  const gaps=model.officialDetails([n],'gaps');
+  assert(gaps.includes('<strong>Unresolved</strong>'));
+  assert(!gaps.includes('<strong>Complete</strong>'));
+  const limits=model.officialDetails([n],'body_limits');
+  assert(limits.includes('<strong>Excerpt</strong>'));
+  assert(limits.includes('索引の抜粋'));
+  assert(!limits.includes('<strong>Complete</strong>'));
+  assert(!limits.includes('<strong>Unresolved</strong>'));
 });
 
 test('official details accept new manufacturer roots, show access limits and keep method references separate',()=>{

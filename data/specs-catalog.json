@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "verified_at": "2026-10-25",
   "products": [
     {
@@ -218,9 +218,10 @@
       "models": ["EV2750", "EIZO EV2750"],
       "name": "EIZO FlexScan EV2750 monitor",
       "url": "https://www.eizoglobal.com/press/releases/htmls/ev2750.html",
-      "source_access": "manufacturer_document_indexed_excerpt",
-      "scope": "EV2750 product capabilities from manufacturer's announcement, including when reported by an audio endpoint; no assertion of current input, active display mode or audio state. Full page fetch timed out at verification",
-      "specifications": {"display_inches": 27, "native_resolution": "2560 × 1440", "panel_type": "IPS", "backlight": "LED"}
+      "source_access": "manufacturer_page_full_body",
+      "scope": "EV2750 product capabilities from the complete manufacturer announcement; independently checked against the complete 74-page user manual, section 6-5 (page 48). Does not establish active display mode, input or audio state",
+      "specifications": {"display_inches": 27, "native_resolution": "2560 × 1440", "panel_type": "IPS", "backlight": "LED"},
+      "source_evidence": {"url": "https://www.eizoglobal.com/press/releases/htmls/ev2750.html", "sha256": "bd0b935195aec9d8d415496ffbb5ebda372490949259dfb38985699979c3e738", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete announcement downloaded and read; September 1, 2015 announcement body explicitly gives 27-inch, LED-backlit IPS and native 2560 x 1440. Manual page 48 independently confirms these values"}
     },
     {
       "models": ["Logitech StreamCam"],
@@ -228,6 +229,314 @@
       "url": "https://www.logitech.com/en-us/shop/p/streamcam",
       "scope": "StreamCam product-family camera capabilities, including when reported as an audio endpoint; does not identify color/region SKU, active recording mode or microphone configuration",
       "specifications": {"max_video_resolution": "1920 × 1080", "max_fps_at_full_hd": 60, "field_of_view_degrees": 78, "connector": "USB-C"}
+    },
+    {
+      "models": ["RME Babyface Pro"],
+      "name": "RME Babyface Pro (shared original/FS family capabilities)",
+      "url": "https://archiv.rme-audio.de/en/products/babyface_pro.php",
+      "identification_url": "https://rme-audio.de/babyface-pro-fs.html",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Shared original Babyface Pro / Babyface Pro FS capabilities verified against both manufacturer product pages. USB name alone does not establish the FS hardware revision. Maximum channel counts require suitable external digital I/O and vary with sample rate; not active channel count, clock, latency or current bus power",
+      "specifications": {"input_channels_up_to": 12, "output_channels_up_to": 12, "sample_rate_up_to_khz": 192, "usb_interface": "USB 2.0"},
+      "source_evidence": {"url": "https://archiv.rme-audio.de/en/products/babyface_pro.php", "sha256": "51fe808b303a7f76b88422bac4422bbf13bc066eb724d7b5d5e7bde178fb3cda", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete official archive page: Overview/Connectivity and title; compared with the complete Babyface Pro FS page. Only shared channel-count, sample-rate and USB-interface capabilities retained"}
+    },
+    {
+      "models": ["Razer Viper 8KHz"],
+      "name": "Razer Viper 8KHz mouse",
+      "url": "https://mysupport.razer.com/app/answers/detail/a_id/4007",
+      "source_access": "manufacturer_page_indexed_excerpt",
+      "scope": "Exact Viper 8KHz product specifications in manufacturer support table, RZ01-03580. Direct page retrieval returned a browser challenge, so source remains an indexed excerpt. Published polling/sensor limits are not current mouse settings or observed USB polling",
+      "specifications": {"polling_rate_up_to_hz": 8000, "sensor_resolution_up_to_dpi": 20000, "programmable_buttons": 8, "cable_length_m": 1.8}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A04"}],
+      "name": "Intel 700 Series PCH eSPI Controller (7A04)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "eSPI Controller", "pci_device_function": "D31:F0"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A04 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D31:F0; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A06"}],
+      "name": "Intel 700 Series PCH eSPI Controller (7A06)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "eSPI Controller", "pci_device_function": "D31:F0"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A06 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D31:F0; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A23"}],
+      "name": "Intel 700 Series PCH SMBus (7A23)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "SMBus", "pci_device_function": "D31:F4"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A23 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D31:F4; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A24"}],
+      "name": "Intel 700 Series PCH SPI (flash) Controller (7A24)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "SPI (flash) Controller", "pci_device_function": "D31:F5"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A24 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D31:F5; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A27"}],
+      "name": "Intel 700 Series PCH Shared SRAM (7A27)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "Shared SRAM", "pci_device_function": "D20:F2"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A27 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D20:F2; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A30"}],
+      "name": "Intel 700 Series PCH PCIe* Root Port #9 (7A30)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "PCIe* Root Port #9", "pci_device_function": "D29:F0"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A30 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D29:F0; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A34"}],
+      "name": "Intel 700 Series PCH PCIe Root Port #13 (7A34)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "PCIe Root Port #13", "pci_device_function": "D29:F4"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A34 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D29:F4; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A36"}],
+      "name": "Intel 700 Series PCH PCIe Root Port #15 (7A36)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "PCIe Root Port #15", "pci_device_function": "D29:F6"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A36 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D29:F6; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A38"}],
+      "name": "Intel 700 Series PCH PCIe Root Port #1 (7A38)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "PCIe Root Port #1", "pci_device_function": "D28:F0"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A38 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D28:F0; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A3B"}],
+      "name": "Intel 700 Series PCH PCIe Root Port #4 (7A3B)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "PCIe Root Port #4", "pci_device_function": "D28:F3"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A3B row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D28:F3; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A40"}],
+      "name": "Intel 700 Series PCH PCIe Root Port #17 (7A40)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "PCIe Root Port #17", "pci_device_function": "D27:F0"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A40 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D27:F0; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A48"}],
+      "name": "Intel 700 Series PCH PCIe Root Port # 25 (7A48)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "PCIe Root Port # 25", "pci_device_function": "D26:F0"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A48 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D26:F0; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A4C"}],
+      "name": "Intel 700 Series PCH I2C Controller #0 (7A4C)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "I2C Controller #0", "pci_device_function": "D21:F0"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A4C row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D21:F0; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A4D"}],
+      "name": "Intel 700 Series PCH I2C Controller #1 (7A4D)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "I2C Controller #1", "pci_device_function": "D21:F1"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A4D row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D21:F1; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A4E"}],
+      "name": "Intel 700 Series PCH I2C Controller #2 (7A4E)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "I2C Controller #2", "pci_device_function": "D21:F2"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A4E row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D21:F2; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A60"}],
+      "name": "Intel 700 Series PCH USB xHCI Host Controller (7A60)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "USB xHCI Host Controller", "pci_device_function": "D20:F0"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A60 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D20:F0; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A62"}],
+      "name": "Intel 700 Series PCH SATA Controller (AHCI) (7A62)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "SATA Controller (AHCI)", "pci_device_function": "D23:F0"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A62 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D23:F0; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7A68"}],
+      "name": "Intel 700 Series PCH Intel ® CSME: HECI #1 (7A68)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 700 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 700 Series PCH", "controller_function": "Intel ® CSME: HECI #1", "pci_device_function": "D22:F0"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/", "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7A68 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D22:F0; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7F06"}],
+      "name": "Intel 800 Series PCH eSPI Controller (7F06)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 800 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 800 Series PCH", "controller_function": "eSPI Controller", "pci_device_function": "D31:F0"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/", "sha256": "a8eec80fc6bc77ffb5d2959c1f9a7577791de2ccb5b661edbe9f3f4e60ca9e3e", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7F06 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D31:F0; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7F23"}],
+      "name": "Intel 800 Series PCH SMBus (7F23)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 800 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 800 Series PCH", "controller_function": "SMBus", "pci_device_function": "D31:F4"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/", "sha256": "a8eec80fc6bc77ffb5d2959c1f9a7577791de2ccb5b661edbe9f3f4e60ca9e3e", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7F23 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D31:F4; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7F24"}],
+      "name": "Intel 800 Series PCH SPI (flash) Controller (7F24)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 800 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 800 Series PCH", "controller_function": "SPI (flash) Controller", "pci_device_function": "D31:F5"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/", "sha256": "a8eec80fc6bc77ffb5d2959c1f9a7577791de2ccb5b661edbe9f3f4e60ca9e3e", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7F24 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D31:F5; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7F36"}],
+      "name": "Intel 800 Series PCH PCI Express Root Port #15 (7F36)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 800 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 800 Series PCH", "controller_function": "PCI Express Root Port #15", "pci_device_function": "D29:F6"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/", "sha256": "a8eec80fc6bc77ffb5d2959c1f9a7577791de2ccb5b661edbe9f3f4e60ca9e3e", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7F36 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D29:F6; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7F37"}],
+      "name": "Intel 800 Series PCH PCI Express Root Port #16 (7F37)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 800 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 800 Series PCH", "controller_function": "PCI Express Root Port #16", "pci_device_function": "D29:F7"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/", "sha256": "a8eec80fc6bc77ffb5d2959c1f9a7577791de2ccb5b661edbe9f3f4e60ca9e3e", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7F37 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D29:F7; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7F4C"}],
+      "name": "Intel 800 Series PCH I2C Controller #0 (7F4C)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 800 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 800 Series PCH", "controller_function": "I2C Controller #0", "pci_device_function": "D21:F0"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/", "sha256": "a8eec80fc6bc77ffb5d2959c1f9a7577791de2ccb5b661edbe9f3f4e60ca9e3e", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7F4C row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D21:F0; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7F4E"}],
+      "name": "Intel 800 Series PCH I2C Controller #2 (7F4E)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 800 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 800 Series PCH", "controller_function": "I2C Controller #2", "pci_device_function": "D21:F2"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/", "sha256": "a8eec80fc6bc77ffb5d2959c1f9a7577791de2ccb5b661edbe9f3f4e60ca9e3e", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7F4E row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D21:F2; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7F50"}],
+      "name": "Intel 800 Series PCH ACE (Audio Context Engine) (7F50)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 800 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 800 Series PCH", "controller_function": "ACE (Audio Context Engine)", "pci_device_function": "D31:F3"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/", "sha256": "a8eec80fc6bc77ffb5d2959c1f9a7577791de2ccb5b661edbe9f3f4e60ca9e3e", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7F50 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D31:F3; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7F62"}],
+      "name": "Intel 800 Series PCH SATA Controller (AHCI) - Desktop (7F62)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 800 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 800 Series PCH", "controller_function": "SATA Controller (AHCI) - Desktop", "pci_device_function": "D23:F0"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/", "sha256": "a8eec80fc6bc77ffb5d2959c1f9a7577791de2ccb5b661edbe9f3f4e60ca9e3e", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7F62 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D23:F0; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7F68"}],
+      "name": "Intel 800 Series PCH HECI #1 (7F68)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 800 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 800 Series PCH", "controller_function": "HECI #1", "pci_device_function": "D22:F0"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/", "sha256": "a8eec80fc6bc77ffb5d2959c1f9a7577791de2ccb5b661edbe9f3f4e60ca9e3e", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7F68 row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D22:F0; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [{"section": "pci", "vendor_id": "8086", "device_id": "7F6E"}],
+      "name": "Intel 800 Series PCH USB xHCI Host Controller (7F6E)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/",
+      "source_access": "manufacturer_page_full_body",
+      "scope": "Exact Intel vendor/device ID identifies a 800 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
+      "specifications": {"silicon_family": "Intel 800 Series PCH", "controller_function": "USB xHCI Host Controller", "pci_device_function": "D20:F0"},
+      "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/", "sha256": "a8eec80fc6bc77ffb5d2959c1f9a7577791de2ccb5b661edbe9f3f4e60ca9e3e", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7F6E row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D20:F0; revision/stepping columns deliberately excluded"}
     }
   ]
 }

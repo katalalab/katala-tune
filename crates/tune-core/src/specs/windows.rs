@@ -13,8 +13,8 @@ function Q($key, $class, $props) {
 Q "system" "Win32_ComputerSystem" @("Manufacturer","Model","SystemType","HypervisorPresent")
 Q "cpu" "Win32_Processor" @("Name","Manufacturer","NumberOfCores","NumberOfLogicalProcessors","MaxClockSpeed","CurrentClockSpeed","L2CacheSize","L3CacheSize","VirtualizationFirmwareEnabled","SecondLevelAddressTranslationExtensions")
 Q "memory" "Win32_PhysicalMemory" @("Manufacturer","PartNumber","DeviceLocator","Capacity","Speed","ConfiguredClockSpeed","SMBIOSMemoryType","FormFactor","DataWidth","ConfiguredVoltage")
-Q "gpu" "Win32_VideoController" @("Name","AdapterCompatibility","DriverVersion","DriverDate","VideoProcessor","CurrentHorizontalResolution","CurrentVerticalResolution","CurrentRefreshRate","Status")
-Q "storage" "Win32_DiskDrive" @("Index","Model","Manufacturer","FirmwareRevision","Size","InterfaceType","MediaType","Status")
+Q "gpu" "Win32_VideoController" @("Name","AdapterCompatibility","DriverVersion","DriverDate","VideoProcessor","CurrentHorizontalResolution","CurrentVerticalResolution","CurrentRefreshRate","Status","PNPDeviceID","ConfigManagerErrorCode")
+Q "storage" "Win32_DiskDrive" @("Index","Model","Manufacturer","FirmwareRevision","Size","InterfaceType","MediaType","Status","PNPDeviceID","ConfigManagerErrorCode")
 try {
   $r.modern_disks = @(Get-CimInstance -Namespace root/Microsoft/Windows/Storage -ClassName MSFT_Disk -OperationTimeoutSec 8 | Select-Object Number,BusType,LogicalSectorSize,PhysicalSectorSize,PartitionStyle,NumberOfPartitions,IsReadOnly,IsBoot,IsSystem,HealthStatus)
 } catch { $errors.modern_disks = $(if ($_.Exception.HResult -eq -2147024891) { "permission_denied" } else { "error" }) }
@@ -24,23 +24,21 @@ Q "os" "Win32_OperatingSystem" @("Caption","Version","BuildNumber","OSArchitectu
 try {
   $r.os_registry = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" | Select-Object DisplayVersion,UBR,InstallationType
 } catch { $errors.os_registry = $(if ($_.Exception.HResult -eq -2147024891) { "permission_denied" } else { "error" }) }
-Q "audio" "Win32_SoundDevice" @("Name","Manufacturer","Status")
+Q "audio" "Win32_SoundDevice" @("Name","Manufacturer","Status","PNPDeviceID","ConfigManagerErrorCode")
 try {
-  $r.network = @(Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetAdapter -OperationTimeoutSec 8 | Select-Object InterfaceDescription,DriverVersionString,DriverDate,TransmitLinkSpeed,ReceiveLinkSpeed,MediaConnectState,FullDuplex,MtuSize,Virtual,HardwareInterface,InterfaceAdminStatus)
+  $r.network = @(Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetAdapter -OperationTimeoutSec 8 | Select-Object InterfaceDescription,DriverVersionString,DriverDate,DriverProvider,PNPDeviceID,TransmitLinkSpeed,ReceiveLinkSpeed,MediaConnectState,FullDuplex,MtuSize,Virtual,HardwareInterface,InterfaceAdminStatus)
 } catch { $errors.network = $(if ($_.Exception.HResult -eq -2147024891) { "permission_denied" } else { "error" }) }
 try {
-  $pnp = @(Get-CimInstance Win32_PnPEntity -OperationTimeoutSec 8)
+  $pnp = @(Get-CimInstance Win32_PnPEntity -OperationTimeoutSec 8 | Select-Object Name,Manufacturer,PNPClass,Status,PNPDeviceID,HardwareID,Present,ConfigManagerErrorCode)
+  $r.pnp = $pnp
   foreach ($kind in @("usb","pci","thunderbolt")) {
     $r[$kind] = @($pnp | Where-Object { $(if ($kind -eq "thunderbolt") { $_.Name -match "Thunderbolt|USB4" } else { $_.PNPDeviceID -like ($kind + "\*") }) } | ForEach-Object {
-      $vendor = $null; $product = $null
-      if ($_.PNPDeviceID -match "(?:VEN|VID)_([0-9A-F]{4})") { $vendor = $Matches[1] }
-      if ($_.PNPDeviceID -match "(?:DEV|PID)_([0-9A-F]{4})") { $product = $Matches[1] }
-      [pscustomobject]@{ Name=$_.Name; Manufacturer=$_.Manufacturer; Class=$_.PNPClass; Status=$_.Status; Vendor=$vendor; Product=$product }
+      [pscustomobject]@{ Name=$_.Name; Manufacturer=$_.Manufacturer; Class=$_.PNPClass; Status=$_.Status; PNPDeviceID=$_.PNPDeviceID; HardwareID=$_.HardwareID; Present=$_.Present; ConfigManagerErrorCode=$_.ConfigManagerErrorCode }
     })
   }
-} catch { foreach ($kind in @("usb","pci","thunderbolt")) { $errors[$kind] = "error" } }
+} catch { foreach ($kind in @("pnp","usb","pci","thunderbolt")) { $errors[$kind] = "error" } }
 try {
-  $r.drivers = @(Get-CimInstance Win32_PnPSignedDriver -OperationTimeoutSec 8 | Where-Object { $_.DeviceClass -in @("DISPLAY","NET","MEDIA","USB","SCSIADAPTER","HDC") } | Select-Object DeviceName,Manufacturer,DriverVersion,DriverDate,DeviceClass)
+  $r.drivers = @(Get-CimInstance Win32_PnPSignedDriver -OperationTimeoutSec 8 | Select-Object DeviceID,DeviceName,DriverVersion,DriverDate,DriverProviderName,InfName,IsSigned)
 } catch { $errors.drivers = "error" }
 try {
   $ids = @(Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorID -OperationTimeoutSec 8)
@@ -214,6 +212,7 @@ const QUERIES: &[(&str, &str, Mapping)] = &[
             ("InterfaceDescription", "model"),
             ("DriverVersionString", "driver_version"),
             ("DriverDate", "driver_date"),
+            ("DriverProvider", "driver_provider"),
             ("TransmitLinkSpeed", "transmit_speed_bps"),
             ("ReceiveLinkSpeed", "receive_speed_bps"),
             ("MediaConnectState", "status"),
@@ -224,21 +223,9 @@ const QUERIES: &[(&str, &str, Mapping)] = &[
         ],
     ),
     ("audio", "Win32_SoundDevice", &[("Name", "model"), ("Manufacturer", "manufacturer"), ("Status", "status")]),
-    (
-        "usb",
-        "Win32_PnPEntity USB",
-        &[("Name", "model"), ("Manufacturer", "manufacturer"), ("Class", "class"), ("Status", "status"), ("Vendor", "vendor_id"), ("Product", "product_id")],
-    ),
-    (
-        "pci",
-        "Win32_PnPEntity PCI",
-        &[("Name", "model"), ("Manufacturer", "manufacturer"), ("Class", "class"), ("Status", "status"), ("Vendor", "vendor_id"), ("Product", "product_id")],
-    ),
-    (
-        "thunderbolt",
-        "Win32_PnPEntity Thunderbolt/USB4",
-        &[("Name", "model"), ("Manufacturer", "manufacturer"), ("Class", "class"), ("Status", "status"), ("Vendor", "vendor_id"), ("Product", "product_id")],
-    ),
+    ("usb", "Win32_PnPEntity USB", &[("Name", "model"), ("Manufacturer", "manufacturer"), ("Class", "class"), ("Status", "status")]),
+    ("pci", "Win32_PnPEntity PCI", &[("Name", "model"), ("Manufacturer", "manufacturer"), ("Class", "class"), ("Status", "status")]),
+    ("thunderbolt", "Win32_PnPEntity Thunderbolt/USB4", &[("Name", "model"), ("Manufacturer", "manufacturer"), ("Class", "class"), ("Status", "status")]),
     (
         "display",
         "WmiMonitorBasicDisplayParams / WmiMonitorID",
@@ -394,6 +381,144 @@ fn registry_display(value: &Value) -> Option<Map<String, Value>> {
     Some(fields)
 }
 
+// Instance IDs stay inside this module. Names are not identities when an ID is available.
+fn private_id<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value[key].as_str().map(str::trim).filter(|s| !s.is_empty() && s.len() <= 4096 && !s.chars().any(char::is_control))
+}
+
+fn unique_identity<'a>(rows: Option<&'a Vec<Value>>, key: &str, id: &str) -> Option<&'a Value> {
+    let mut matches = rows?.iter().filter(|row| private_id(row, key).is_some_and(|other| other.eq_ignore_ascii_case(id)));
+    let row = matches.next()?;
+    matches.next().is_none().then_some(row)
+}
+
+fn hex_token<'a>(token: &'a str, prefix: &str, len: usize) -> Option<&'a str> {
+    let value = token.get(prefix.len()..)?;
+    (token.get(..prefix.len())?.eq_ignore_ascii_case(prefix) && value.len() == len && value.bytes().all(|b| b.is_ascii_hexdigit())).then_some(value)
+}
+
+fn public_hardware_id(id: &str) -> Option<Map<String, Value>> {
+    let mut segments = id.split('\\');
+    let bus = segments.next()?;
+    let mut tokens = segments.next()?.split('&');
+    let (vendor_prefix, device_prefix, revision_len) = if bus.eq_ignore_ascii_case("PCI") {
+        ("VEN_", "DEV_", 2)
+    } else if bus.eq_ignore_ascii_case("USB") {
+        ("VID_", "PID_", 4)
+    } else {
+        return None;
+    };
+    let vendor = hex_token(tokens.next()?, vendor_prefix, 4)?;
+    let device = hex_token(tokens.next()?, device_prefix, 4)?;
+    let mut fields = Map::new();
+    fields.insert("vendor_id".into(), json!(vendor.to_ascii_uppercase()));
+    fields.insert("product_id".into(), json!(device.to_ascii_uppercase()));
+    if bus.eq_ignore_ascii_case("PCI") {
+        fields.insert("device_id".into(), json!(device.to_ascii_uppercase()));
+    }
+    for token in tokens {
+        if let Some(revision) = hex_token(token, "REV_", revision_len) {
+            if fields.insert("revision_id".into(), json!(revision.to_ascii_uppercase())).is_some() {
+                return None;
+            }
+        } else if bus.eq_ignore_ascii_case("PCI")
+            && let Some(subsystem) = hex_token(token, "SUBSYS_", 8)
+        {
+            if fields.insert("subsystem_device_id".into(), json!(subsystem[..4].to_ascii_uppercase())).is_some() {
+                return None;
+            }
+            fields.insert("subsystem_vendor_id".into(), json!(subsystem[4..].to_ascii_uppercase()));
+        }
+    }
+    Some(fields)
+}
+
+fn pnp_fields(value: &Value) -> Map<String, Value> {
+    let mut fields = Map::new();
+    if let Some(present) = value["Present"].as_bool() {
+        fields.insert("present".into(), json!(present));
+    }
+    if let Some(code) = value["ConfigManagerErrorCode"].as_u64().filter(|code| *code <= u32::MAX as u64) {
+        fields.insert("problem_code".into(), json!(code));
+    }
+    fields.extend(mapped(value, &[("Status", "status")]));
+    fields
+}
+
+fn driver_fields(value: &Value) -> Map<String, Value> {
+    let mut fields = mapped(value, &[("DriverVersion", "driver_version"), ("DriverDate", "driver_date"), ("DriverProviderName", "driver_provider")]);
+    if let Some(signed) = value["IsSigned"].as_bool() {
+        fields.insert("driver_signed".into(), json!(signed));
+    }
+    // InfName is a filename, never a path, driver binary name, or device instance ID.
+    if let Some(inf) = value["InfName"].as_str().filter(|name| {
+        name.len() > 4
+            && name.len() <= 128
+            && name.to_ascii_lowercase().ends_with(".inf")
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    }) {
+        fields.insert("driver_inf".into(), json!(inf));
+    }
+    fields
+}
+
+fn complete_device(raw: &Value, value: &Value, items: &[Value], model_key: &str, fields: &mut Map<String, Value>) -> bool {
+    let id = private_id(value, "PNPDeviceID");
+    let unique =
+        id.is_some_and(|id| items.iter().filter(|row| private_id(row, "PNPDeviceID").is_some_and(|other| other.eq_ignore_ascii_case(id))).count() == 1);
+    let pnp = if unique && !raw["errors"]["pnp"].is_string() { unique_identity(raw["pnp"].as_array(), "PNPDeviceID", id.unwrap()) } else { None };
+    if let Some(id_fields) = id.and_then(public_hardware_id) {
+        let mut public = id_fields;
+        let mut conflicts = Vec::new();
+        for hardware in
+            value["HardwareID"].as_array().into_iter().flatten().chain(pnp.into_iter().flat_map(|row| row["HardwareID"].as_array().into_iter().flatten()))
+        {
+            let Some(candidate) = hardware.as_str().and_then(public_hardware_id) else { continue };
+            if candidate["vendor_id"] != public["vendor_id"] || candidate["product_id"] != public["product_id"] {
+                continue;
+            }
+            for (key, extra) in candidate {
+                if public.get(&key).is_some_and(|existing| *existing != extra) {
+                    conflicts.push(key);
+                } else {
+                    public.entry(key).or_insert(extra);
+                }
+            }
+        }
+        for key in conflicts {
+            public.remove(&key);
+        }
+        fields.extend(public);
+    }
+    for extra in [Some(value), pnp].into_iter().flatten() {
+        for (key, extra) in pnp_fields(extra) {
+            fields.entry(key).or_insert(extra);
+        }
+    }
+    if raw["errors"]["drivers"].is_string() {
+        return false;
+    }
+    let driver = if let Some(id) = id {
+        unique.then(|| unique_identity(raw["drivers"].as_array(), "DeviceID", id)).flatten()
+    } else if !value["PNPDeviceID"].is_null() {
+        None
+    } else {
+        // Compatibility for older snapshots without IDs: both names must be unique and the driver must also lack an ID.
+        private_id(value, model_key).filter(|name| items.iter().filter(|row| private_id(row, model_key) == Some(*name)).count() == 1).and_then(|name| {
+            let mut matches = raw["drivers"].as_array()?.iter().filter(|driver| private_id(driver, "DeviceName") == Some(name));
+            let driver = matches.next()?;
+            (matches.next().is_none() && private_id(driver, "DeviceID").is_none()).then_some(driver)
+        })
+    };
+    if let Some(driver) = driver {
+        for (key, extra) in driver_fields(driver) {
+            fields.entry(key).or_insert(extra);
+        }
+        return true;
+    }
+    false
+}
+
 pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
     for (id, source, mapping) in QUERIES {
         if let Some(error) = raw["errors"][*id].as_str() {
@@ -445,14 +570,10 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
                     fields.insert("resolution".into(), json!(format!("{w} × {h}")));
                 }
             }
-            if let Some(model) = fields.get("model").and_then(Value::as_str) {
-                let drivers: Vec<_> = raw["drivers"].as_array().into_iter().flatten().filter(|d| d["DeviceName"].as_str() == Some(model)).collect();
-                let model_key = mapping.iter().find(|(_, target)| *target == "model").map(|(from, _)| *from);
-                let unique_device = model_key.is_some_and(|key| items.iter().filter(|item| item[key].as_str().map(str::trim) == Some(model)).count() == 1);
-                if drivers.len() == 1 && unique_device {
-                    for (key, value) in mapped(drivers[0], &[("DriverVersion", "driver_version"), ("DriverDate", "driver_date")]) {
-                        fields.entry(key).or_insert(value);
-                    }
+            if matches!(*id, "gpu" | "storage" | "audio" | "network" | "usb" | "pci" | "thunderbolt") {
+                let model_key = mapping.iter().find(|(_, target)| *target == "model").map(|(from, _)| *from).unwrap_or("Name");
+                if complete_device(raw, v, items, model_key, &mut fields) {
+                    used_source.push_str(" / Win32_PnPSignedDriver");
                 }
             }
             let name = fields.get("model").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("{id} {}", index + 1));
@@ -486,6 +607,15 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
             "ok"
         };
         sections.insert((*id).into(), section(components, status, source));
+    }
+    for id in ["gpu", "storage", "audio", "network", "usb", "pci", "thunderbolt"] {
+        for (key, source) in [("drivers", "Win32_PnPSignedDriver"), ("pnp", "Win32_PnPEntity")] {
+            if let Some(error) = raw["errors"][key].as_str() {
+                add_provider(sections, id, source, provider_error(error));
+            } else if let Some(rows) = raw[key].as_array() {
+                add_provider(sections, id, source, if rows.is_empty() { "empty" } else { "ok" });
+            }
+        }
     }
     for (key, id, source) in
         [("modern_disks", "storage", "MSFT_Disk"), ("device_guard", "settings", "Win32_DeviceGuard"), ("os_registry", "os", "Windows CurrentVersion registry")]

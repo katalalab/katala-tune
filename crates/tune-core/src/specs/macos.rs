@@ -34,16 +34,23 @@ pub async fn collect() -> Value {
         }
     }
     // Query only a finite, non-identifying set. Never persist complete command output.
-    for key in
-        ["hw.physicalcpu", "hw.logicalcpu", "hw.memsize", "hw.perflevel0.physicalcpu", "hw.perflevel1.physicalcpu", "hw.perflevel0.name", "hw.perflevel1.name"]
-    {
+    for key in [
+        "hw.physicalcpu",
+        "hw.logicalcpu",
+        "hw.memsize",
+        "hw.machine",
+        "hw.perflevel0.physicalcpu",
+        "hw.perflevel1.physicalcpu",
+        "hw.perflevel0.name",
+        "hw.perflevel1.name",
+    ] {
         let r = collect::run_bounded("/usr/sbin/sysctl", &["-n".into(), key.into()], &[], Duration::from_secs(2), 1024, 1024).await;
         if r.code == Some(0)
             && let Ok(n) = String::from_utf8_lossy(&r.stdout).trim().parse::<u64>()
         {
             raw.insert(key.into(), json!(n));
         } else if r.code == Some(0)
-            && key.ends_with(".name")
+            && (key.ends_with(".name") || key == "hw.machine")
             && let Some(v) = scalar(&json!(String::from_utf8_lossy(&r.stdout).trim()))
         {
             raw.insert(key.into(), v);
@@ -165,6 +172,34 @@ fn device_model(name: &str) -> &str {
     name
 }
 
+fn wifi_channels(value: &Value) -> Option<Value> {
+    // Group public channel numbers by band to stay inside the scalar report bound.
+    // Never traverse the nearby current-network dictionary (SSID / BSSID).
+    let mut bands = std::collections::BTreeMap::<&str, Vec<u16>>::new();
+    for channel in value.as_array()?.iter().take(256).filter_map(Value::as_str) {
+        let Some((number, band)) = channel.split_once(" (") else { continue };
+        let Some(band) = band.strip_suffix(')').filter(|b| ["2GHz", "5GHz", "6GHz"].contains(b)) else { continue };
+        let Some(number) = number.parse::<u16>().ok().filter(|n| (1..=233).contains(n)) else { continue };
+        let channels = bands.entry(band).or_default();
+        if !channels.contains(&number) {
+            channels.push(number);
+        }
+    }
+    let text = bands
+        .into_iter()
+        .map(|(band, channels)| format!("{band}: {}", channels.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    scalar(&json!(text))
+}
+
+fn public_wifi_ids(card: &str) -> Option<(String, String)> {
+    let (_, pair) = card.rsplit_once(" (")?;
+    let (vendor, device) = pair.strip_suffix(')')?.split_once(", ")?;
+    let valid = |id: &str| id.strip_prefix("0x").is_some_and(|s| s.len() == 4 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+    (valid(vendor) && valid(device)).then(|| (vendor.into(), device.into()))
+}
+
 pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
     let unified = raw["SPHardwareDataType"].as_array().into_iter().flatten().any(|v| v["chip_type"].as_str().is_some_and(|s| s.starts_with("Apple")));
     for (kind, id) in TYPES {
@@ -222,6 +257,7 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
                     ("boot_mode", "boot_mode"),
                     ("spairport_wireless_card_type", "model"),
                     ("spairport_wireless_firmware_version", "firmware_version"),
+                    ("spairport_supported_phymodes", "supported_standards"),
                     ("USBDeviceKeyVendorName", "manufacturer"),
                     ("USBDeviceKeyVendorID", "vendor_id"),
                     ("USBDeviceKeyProductID", "product_id"),
@@ -243,11 +279,25 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
             if let Some(model) = fields.get("model").and_then(Value::as_str) {
                 fields.insert("model".into(), json!(device_model(model)));
             }
-            if *kind == "SPAirPortDataType" && v.get("spairport_wireless_card_type").is_some() {
+            if *kind == "SPAirPortDataType" && (v.get("spairport_wireless_card_type").is_some() || v.get("spairport_supported_channels").is_some()) {
                 if let Some(interface) = scalar(&v["_name"]) {
                     fields.insert("interface".into(), interface);
                 }
                 let card = v["spairport_wireless_card_type"].as_str().unwrap_or("");
+                if let Some((vendor, device)) = public_wifi_ids(card) {
+                    fields.insert("vendor_id".into(), json!(vendor));
+                    fields.insert("device_id".into(), json!(device));
+                }
+                if let Some(channels) = wifi_channels(&v["spairport_supported_channels"]) {
+                    fields.insert("supported_channels".into(), channels);
+                }
+                if let Some(state) = v["spairport_status_information"]
+                    .as_str()
+                    .and_then(|s| s.strip_prefix("spairport_status_"))
+                    .filter(|s| ["connected", "disconnected", "off", "on"].contains(s))
+                {
+                    fields.insert("connection_state".into(), json!(state));
+                }
                 let lower = card.to_lowercase();
                 if lower.contains("firmware") || lower.contains("fwid") || lower.contains("chip id:") {
                     fields.insert("model".into(), json!("Wi-Fi adapter"));
@@ -284,12 +334,48 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
             if fields.is_empty() {
                 continue;
             }
+            let model = fields.get("model").and_then(Value::as_str).unwrap_or("");
+            let record_kind = match *kind {
+                "SPMemoryDataType"
+                    if unified && (model.is_empty() || model == "memory") && v.get("dimm_size").is_none() && v.get("dimm_part_number").is_none() =>
+                {
+                    fields.insert("class".into(), json!("memory_summary"));
+                    "group"
+                }
+                "SPNVMeDataType" | "SPSerialATADataType" if v.get("_items").is_some() && model.to_ascii_lowercase().contains("controller") => {
+                    fields.insert("class".into(), json!("storage_controller"));
+                    "device"
+                }
+                "SPAudioDataType" if v["coreaudio_device_transport"] == "coreaudio_device_type_virtual" => "software",
+                "SPAudioDataType" if model == "coreaudio_device" && v.get("coreaudio_device_transport").is_none() => "group",
+                "SPAirPortDataType" if model == "awdl0" || model == "llw0" => "software",
+                "SPAirPortDataType" if v.get("spairport_airport_interfaces").is_some() => "group",
+                "SPThunderboltDataType" if fields.contains_key("port") => "port",
+                _ => "device",
+            };
+            fields.insert("record_kind".into(), json!(record_kind));
+            if *kind == "SPSoftwareDataType"
+                && let Some(version) = fields.get("version").and_then(Value::as_str)
+                && let Some((version, build)) = version.rsplit_once(" (")
+                && let Some(build) = build.strip_suffix(')').filter(|s| !s.is_empty() && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_alphanumeric()))
+            {
+                let (version, build) = (version.to_string(), build.to_string());
+                fields.insert("version".into(), json!(version));
+                fields.insert("build".into(), json!(build));
+            }
+            if *kind == "SPSoftwareDataType"
+                && let Some(architecture) = scalar(&raw["hw.machine"])
+            {
+                fields.insert("architecture".into(), architecture);
+            }
             let name = if let Some(port) = fields.get("port").and_then(Value::as_str) {
                 format!("Thunderbolt port {port}")
             } else {
                 fields.get("model").and_then(Value::as_str).unwrap_or(id).to_string()
             };
-            components.push(component(&name, &source, fields));
+            let component_source =
+                if *kind == "SPSoftwareDataType" && fields.contains_key("architecture") { format!("{source} / sysctl hw.machine") } else { source.clone() };
+            components.push(component(&name, &component_source, fields));
         }
         let status = if components.is_empty() {
             "empty"
@@ -303,6 +389,9 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
     if let Some(hw) = raw["SPHardwareDataType"].as_array().and_then(|a| a.first()) {
         let mut cpu =
             mapped(hw, &[("chip_type", "model"), ("cpu_type", "model"), ("number_processors", "cores"), ("current_processor_speed", "current_clock_mhz")]);
+        if hw["chip_type"].as_str().is_some_and(|s| s.starts_with("Apple ")) {
+            cpu.insert("manufacturer".into(), json!("Apple"));
+        }
         for (key, field) in [
             ("hw.physicalcpu", "cores"),
             ("hw.logicalcpu", "threads"),
@@ -328,11 +417,20 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
             }
             let mut f = memory;
             f.insert("memory_kind".into(), json!(if unified { "unified" } else { "system_total" }));
+            f.insert("record_kind".into(), json!("aggregate"));
+            let mut memory_source = "system_profiler / sysctl hw.memsize";
+            if unified && let Some(memory) = raw["SPMemoryDataType"].as_array().and_then(|a| a.first()) {
+                let details = mapped(memory, &[("dimm_type", "memory_type"), ("dimm_manufacturer", "manufacturer")]);
+                if !details.is_empty() {
+                    memory_source = "system_profiler SPHardwareDataType / SPMemoryDataType / sysctl hw.memsize";
+                    f.extend(details);
+                }
+            }
             let entry = sections.get_mut("memory").expect("memory");
             entry["components"]
                 .as_array_mut()
                 .expect("components")
-                .insert(0, component(if unified { "Unified memory" } else { "System memory total" }, "system_profiler / sysctl hw.memsize", f));
+                .insert(0, component(if unified { "Unified memory" } else { "System memory total" }, memory_source, f));
             entry["status"] = json!("ok");
         }
     }
@@ -340,7 +438,7 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
         let mut displays = Vec::new();
         for gpu in gpus {
             for display in gpu["spdisplays_ndrvs"].as_array().into_iter().flatten() {
-                let fields = mapped(
+                let mut fields = mapped(
                     display,
                     &[
                         ("_name", "model"),
@@ -350,8 +448,17 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
                         ("spdisplays_connection_type", "interface"),
                         ("spdisplays_refreshRate", "refresh_hz"),
                         ("spdisplays_online", "status"),
+                        ("_spdisplays_display-vendor-id", "vendor_id"),
+                        ("_spdisplays_display-product-id", "product_id"),
                     ],
                 );
+                if !fields.contains_key("refresh_hz")
+                    && let Some(resolution) = display["_spdisplays_resolution"].as_str()
+                    && let Some((_, hz)) = resolution.rsplit_once(" @ ")
+                    && let Some(hz) = hz.strip_suffix("Hz").and_then(|n| n.parse::<f64>().ok()).filter(|n| n.is_finite() && *n > 0.0 && *n <= 1000.0)
+                {
+                    fields.insert("refresh_hz".into(), json!(hz));
+                }
                 let name = fields.get("model").and_then(Value::as_str).unwrap_or("Display");
                 displays.push(component(name, "system_profiler SPDisplaysDataType", fields.clone()));
             }

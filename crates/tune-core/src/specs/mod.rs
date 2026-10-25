@@ -20,10 +20,72 @@ pub fn official(model: &str) -> Value {
     let catalog = &*CATALOG;
     for p in catalog["products"].as_array().into_iter().flatten() {
         if p["models"].as_array().into_iter().flatten().any(|m| m.as_str().is_some_and(|m| m.eq_ignore_ascii_case(model.trim()))) {
-            return json!({"status":"matched", "name":p["name"],"url":p["url"],"scope":p["scope"],"source_access":p["source_access"],"specifications":p["specifications"],"verified_at":catalog["verified_at"],"catalog_version":catalog["version"]});
+            return official_product(p, "matched", "model");
         }
     }
     json!({"status":"unverified", "reason":"exact_model_not_in_catalog"})
+}
+
+fn official_product(p: &Value, status: &str, match_kind: &str) -> Value {
+    json!({"status":status,"match_kind":match_kind,"name":p["name"],"url":p["url"],"scope":p["scope"],
+        "source_access":p["source_access"],"source_evidence":p["source_evidence"],"specifications":p["specifications"],
+        "verified_at":p.get("verified_at").unwrap_or(&CATALOG["verified_at"]),"catalog_version":CATALOG["version"]})
+}
+
+fn public_id(v: &Value, length: usize) -> Option<String> {
+    let value = v.as_str()?.trim();
+    let value = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value);
+    (value.len() == length && value.bytes().all(|b| b.is_ascii_hexdigit())).then(|| value.to_ascii_uppercase())
+}
+
+fn official_for(section: &str, c: &Value) -> Value {
+    let fields = &c["fields"];
+    let model = fields["model"].as_str().or_else(|| c["name"].as_str()).unwrap_or("");
+    let exact = official(model);
+    if exact["status"] == "matched" {
+        return exact;
+    }
+    let matches: Vec<_> = CATALOG["products"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| {
+            p["hardware_ids"].as_array().into_iter().flatten().any(|identity| {
+                let Some(identity) = identity.as_object() else {
+                    return false;
+                };
+                if identity.get("section").and_then(Value::as_str) != Some(section)
+                    || !identity.contains_key("vendor_id")
+                    || (!identity.contains_key("device_id") && !identity.contains_key("product_id"))
+                {
+                    return false;
+                }
+                identity.iter().all(|(key, expected)| {
+                    if key == "section" {
+                        return true;
+                    }
+                    let length = match key.as_str() {
+                        "vendor_id" | "device_id" | "product_id" | "subsystem_vendor_id" | "subsystem_device_id" => 4,
+                        "revision_id" => {
+                            if section == "usb" {
+                                4
+                            } else {
+                                2
+                            }
+                        }
+                        _ => return false,
+                    };
+                    let observed = if section == "pci" && key == "device_id" && fields[key].is_null() { &fields["product_id"] } else { &fields[key] };
+                    public_id(expected, length).is_some_and(|id| public_id(observed, length).as_ref() == Some(&id))
+                })
+            })
+        })
+        .collect();
+    match matches.as_slice() {
+        [p] => official_product(p, "identified", "hardware_id"),
+        [] => exact,
+        _ => json!({"status":"unverified","reason":"ambiguous_hardware_id_catalog"}),
+    }
 }
 
 pub(super) fn scalar(v: &Value) -> Option<Value> {
@@ -32,6 +94,24 @@ pub(super) fn scalar(v: &Value) -> Option<Value> {
         Value::Number(n) if n.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0) => Some(v.clone()),
         Value::Bool(_) => Some(v.clone()),
         _ => None,
+    }
+}
+
+fn report_field(key: &str, v: &Value) -> Option<Value> {
+    match key {
+        "driver_inf" => {
+            let name = v.as_str()?;
+            (name.len() > 4
+                && name.len() <= 128
+                && name.to_ascii_lowercase().ends_with(".inf")
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
+            .then(|| v.clone())
+        }
+        "driver_signed" | "present" => v.is_boolean().then(|| v.clone()),
+        "problem_code" => v.as_u64().filter(|n| *n <= u32::MAX.into()).map(|n| json!(n)),
+        "subsystem_vendor_id" | "subsystem_device_id" => public_id(v, 4).map(|s| json!(s)),
+        "revision_id" => public_id(v, 2).or_else(|| public_id(v, 4)).map(|s| json!(s)),
+        _ => scalar(v),
     }
 }
 
@@ -144,6 +224,18 @@ pub const FIELDS: &[&str] = &[
     "physical_height_cm",
     "display_origin",
     "connection_status",
+    "record_kind",
+    "supported_standards",
+    "supported_channels",
+    "connection_state",
+    "subsystem_vendor_id",
+    "subsystem_device_id",
+    "revision_id",
+    "driver_provider",
+    "driver_inf",
+    "driver_signed",
+    "present",
+    "problem_code",
 ];
 
 pub(super) fn component(name: &str, source: &str, fields: Map<String, Value>) -> Value {
@@ -160,6 +252,53 @@ pub(super) fn mapped(v: &Value, mapping: &[(&str, &str)]) -> Map<String, Value> 
 pub(super) fn section(components: Vec<Value>, status: &str, source: &str) -> Value {
     let providers: Vec<Value> = if source.is_empty() { vec![] } else { vec![json!({"source":source,"status":status})] };
     json!({"status":status,"source":source,"components":components,"providers":providers})
+}
+
+fn record_kind(platform: &str, id: &str, c: &Value) -> (&'static str, Option<&'static str>) {
+    let f = &c["fields"];
+    let model = f["model"].as_str().or_else(|| c["name"].as_str()).unwrap_or("");
+    let source = c["source"].as_str().unwrap_or("");
+    if id == "memory" && matches!(f["memory_kind"].as_str(), Some("unified" | "system_total")) {
+        return ("aggregate", None);
+    }
+    if f["virtual_adapter"] == true {
+        return ("software", None);
+    }
+    if platform == "macos" {
+        if id == "memory"
+            && source == "system_profiler SPMemoryDataType"
+            && (f["model"].is_null() || model == "memory")
+            && ["part_number", "capacity_bytes", "capacity", "slot"].iter().all(|k| f[*k].is_null())
+        {
+            return ("group", Some("memory_summary"));
+        }
+        if id == "storage"
+            && ["system_profiler SPNVMeDataType", "system_profiler SPSerialATADataType"].contains(&source)
+            && model.to_ascii_lowercase().contains("controller")
+            && f["capacity_bytes"].is_null()
+        {
+            return ("device", Some("storage_controller"));
+        }
+        if id == "audio" && source == "system_profiler SPAudioDataType" {
+            if model == "coreaudio_device" && ["interface", "sample_rate_hz", "input_channels", "output_channels"].iter().all(|k| f[*k].is_null()) {
+                return ("group", None);
+            }
+            if f["interface"] == "coreaudio_device_type_virtual" {
+                return ("software", None);
+            }
+        }
+        if id == "network" && source == "system_profiler SPAirPortDataType" {
+            for prefix in ["awdl", "llw"] {
+                if model.strip_prefix(prefix).is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())) {
+                    return ("software", None);
+                }
+            }
+        }
+        if id == "thunderbolt" && source == "system_profiler SPThunderboltDataType" && f["port"].is_string() {
+            return ("port", None);
+        }
+    }
+    ("device", None)
 }
 
 // These are documentation references, never evidence of the installed product or settings.
@@ -187,28 +326,39 @@ fn finalize_sections(platform: &str, sections: &mut Map<String, Value>) {
         };
         s["references"] = references;
         for c in s["components"].as_array_mut().into_iter().flatten() {
+            let (kind, class) = record_kind(platform, id, c);
+            c["fields"]["record_kind"] = json!(kind);
+            if let Some(class) = class {
+                c["fields"]["class"] = json!(class);
+            }
             let f = &c["fields"];
             let aggregate_memory = id == "memory" && matches!(f["memory_kind"].as_str(), Some("unified" | "system_total"));
-            let expected: &[&str] = match id.as_str() {
-                "cpu" => &["model", "manufacturer", "cores", "threads"],
-                "memory" if aggregate_memory => &["capacity_bytes"],
-                "memory" => &["part_number", "manufacturer", "capacity_bytes", "configured_speed_mts"],
-                "gpu" => &["model", "driver_version"],
-                "storage" => &["model", "firmware_version", "capacity_bytes"],
-                "board" => &["model", "manufacturer", "version"],
-                "firmware" => &["firmware_version"],
-                "os" => &["version", "build", "architecture"],
-                "settings" => &[],
-                "display" => &["model", "manufacturer"],
-                "network" => &["model", "driver_version"],
-                "system" => &["model", "manufacturer"],
-                _ => &["model"],
+            let expected: &[&str] = match (kind, class, id.as_str()) {
+                ("group" | "port", _, _) => &[],
+                (_, Some("storage_controller"), _) => &["model"],
+                _ => match id.as_str() {
+                    "cpu" => &["model", "manufacturer", "cores", "threads"],
+                    "memory" if aggregate_memory => &["capacity_bytes"],
+                    "memory" => &["part_number", "manufacturer", "capacity_bytes", "configured_speed_mts"],
+                    "gpu" => &["model", "driver_version"],
+                    "storage" => &["model", "firmware_version", "capacity_bytes"],
+                    "board" => &["model", "manufacturer", "version"],
+                    "firmware" => &["firmware_version"],
+                    "os" => &["version", "build", "architecture"],
+                    "settings" => &[],
+                    "display" => &["model", "manufacturer"],
+                    "network" => &["model", "driver_version"],
+                    "system" => &["model", "manufacturer"],
+                    _ => &["model"],
+                },
             };
             let missing: Vec<_> = expected.iter().filter(|k| f.get(**k).is_none()).copied().collect();
-            let not_applicable = matches!(id.as_str(), "os" | "firmware" | "settings") || f["virtual_adapter"] == true || aggregate_memory;
+            let not_applicable = matches!(id.as_str(), "os" | "firmware" | "settings") || matches!(kind, "group" | "aggregate" | "software" | "port");
             c["missing_fields"] = json!(missing);
             if not_applicable {
                 c["official"] = json!({"status":"not_applicable","reason":"documentation_or_aggregate_not_exact_product"});
+            } else {
+                c["official"] = official_for(id, c);
             }
         }
     }
@@ -253,7 +403,7 @@ pub fn validate_report(v: &Value, platform: &str) -> Result<Value, String> {
         for c in items {
             let fields = c["fields"].as_object().ok_or("invalid fields")?;
             let fields: Map<String, Value> =
-                fields.iter().filter(|(k, _)| FIELDS.contains(&k.as_str())).filter_map(|(k, v)| scalar(v).map(|v| (k.clone(), v))).collect();
+                fields.iter().filter(|(k, _)| FIELDS.contains(&k.as_str())).filter_map(|(k, v)| report_field(k, v).map(|v| (k.clone(), v))).collect();
             let name = scalar(&c["name"]).and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| (*id).into());
             let component_source = scalar(&c["source"]).and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| source.clone());
             components.push(component(&name, &component_source, fields));
