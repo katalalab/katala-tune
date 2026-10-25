@@ -141,6 +141,7 @@ pub fn agent_outdated(node: &Node, brief: Option<&Value>) -> bool {
 }
 
 /// 送る物がその機体の OS の実行ファイルか（Windows は PE、macOS は Mach-O の 64 ビットか universal）
+/// macOS は現行 Rust サンプラーの LC_MAIN 形式に限る。publisher や接続先 CPU の保証ではない。
 pub fn agent_binary_fits(node: &Node, bytes: &[u8]) -> Result<(), String> {
     let ok = if node.is_windows() {
         binary::windows_executable(bytes)

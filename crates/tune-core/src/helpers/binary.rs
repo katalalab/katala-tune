@@ -83,8 +83,8 @@ fn pe(bytes: &[u8]) -> Option<()> {
     executable_entry.then_some(())
 }
 
-// Modern macOS samplers are little-endian 64-bit MH_EXECUTE images. Bound every
-// command and segment before examining entry-point or section references.
+// Modern Rust macOS samplers are little-endian MH_EXECUTE images with LC_MAIN.
+// Bound every command and segment before examining entry or section references.
 fn macho64(bytes: &[u8]) -> Option<(u32, u32)> {
     let header = bytes.get(..32)?;
     let cpu = u32at(header, 4, false)?;
@@ -96,7 +96,7 @@ fn macho64(bytes: &[u8]) -> Option<(u32, u32)> {
     if count == 0 || count > commands.len() / 8 {
         return None;
     }
-    let (mut at, mut entry, mut thread_entry) = (0usize, None, false);
+    let (mut at, mut entry) = (0usize, None);
     let mut executable = Vec::new();
     for _ in 0..count {
         let remaining = commands.get(at..)?;
@@ -137,28 +137,14 @@ fn macho64(bytes: &[u8]) -> Option<(u32, u32)> {
                 }
                 entry = Some(u64at(command, 8, false)?);
             }
-            5 => {
-                if size < 16 || thread_entry {
-                    return None;
-                }
-                let mut state_at = 8usize;
-                while state_at < command.len() {
-                    let words = u32at(command, state_at + 4, false)? as u64;
-                    if words == 0 {
-                        return None;
-                    }
-                    let state = range(command, (state_at + 8) as u64, words * 4)?;
-                    state_at = state_at.checked_add(8 + state.len())?;
-                }
-                thread_entry = true;
-            }
+            5 => return None, // LC_UNIXTHREAD needs CPU-specific state/PC decoding; unsupported.
             _ => {}
         }
         at = at.checked_add(size)?;
     }
     if at != commands.len()
         || executable.is_empty()
-        || !entry.map_or(thread_entry, |e| e >= 32 + commands.len() as u64 && executable.iter().any(|(start, end)| e >= *start && e < *end))
+        || !entry.is_some_and(|e| e >= 32 + commands.len() as u64 && executable.iter().any(|(start, end)| e >= *start && e < *end))
     {
         return None;
     }
@@ -322,6 +308,11 @@ pub(super) mod fixtures {
         let mut thread = macho();
         thread[104..108].copy_from_slice(&5u32.to_le_bytes());
         add("macos", "thread state outside command", thread, 116, &u32::MAX.to_le_bytes());
+        let mut invalid_thread = macho();
+        invalid_thread[104..108].copy_from_slice(&5u32.to_le_bytes());
+        invalid_thread[112..116].copy_from_slice(&0u32.to_le_bytes());
+        invalid_thread[116..120].copy_from_slice(&2u32.to_le_bytes());
+        add("macos", "unsupported thread entry", invalid_thread, 120, &[0; 8]);
         add("macos", "empty fat table", fat(false), 4, &0u32.to_be_bytes());
         add("macos", "fat table outside file", fat(false), 4, &u32::MAX.to_be_bytes());
         add("macos", "fat slice overlaps header", fat(false), 16, &0u32.to_be_bytes());
