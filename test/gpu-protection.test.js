@@ -63,6 +63,7 @@ async function exchangeAfterRequest(exchange, script, options = {}) {
 }
 
 const node = { id: 'gpu-node', alias: 'mock-gpu', os: 'windows', hold: false, shared: false };
+const approvedGpuNode = { ...node, action_helper: { schema: 'katala-tune/action-helper/v2', source_sha: 'a'.repeat(40), tune_sha256: 'b'.repeat(64), manifest_sha256: 'c'.repeat(64), run_id: 1, attempt: 1 } };
 const now = Date.now();
 const worker = () => ({
   pid: 4242, ppid: 1, name: 'TrainerHost', app: 'TrainerHost', cpu: 8, avg_core: 80, start: '20261021010101000',
@@ -101,6 +102,37 @@ test('GPU 使用率または新規 probe の取得不能は PID を特定せず�
     const finding = analyze(s, node).find((f) => f.id === 'runaway-TrainerHost-4242');
     if (s.gpu_compute.availability === 'absent' || (s.gpu_compute.availability === 'available' && Array.isArray(s.gpu_compute.apps) && s.gpu_compute.apps.length === 0 && s.gpus[0].util === 0)) assert.ok(finding.action);
     else assert.equal(finding.action, undefined);
+  }
+});
+
+test('WSL の CPU・メモリ・上限所見は GPU 活動・欠測・学習保護時の shutdown と反映の保留条件を示す', () => {
+  const gpuStates = [
+    { gpu_compute: { availability: 'available', apps: [{ pid: 4242, used_memory_mb: null }] }, gpus: [{ util: 0 }] },
+    { gpu_compute: { availability: 'available', apps: [] }, gpus: [{ util: 5 }] },
+    { gpu_compute: { availability: 'unavailable', apps: [], reason: 'query-failed' }, gpus: [{ util: null }] },
+    { gpu_compute: { availability: 'available', apps: [] }, gpus: [{ util: 0 }] },
+    {}, // Legacy snapshot: no GPU observation.
+  ];
+  for (const app of ['vmmem', 'vmmemWSL']) for (const memory of ['16GB', null]) for (const mem_mb of [16000, 7000]) for (const gpu of gpuStates) for (const protect_gpu of [false, true]) {
+    const s = {
+      probe: 'windows', host: { cores: 16 }, memory: { total_gb: 32 }, wsl: { memory }, ...gpu,
+      processes: { top_cpu: [{ pid: 500, name: app, app, cpu: 8, avg_core: 80, etime: '1:00:00' }], apps: [{ app, mem_mb, count: 1 }], apps_cpu: [] },
+    };
+    const findings = analyze(s, { ...node, protect_gpu });
+    const ids = [`runaway-${app}-500`, `mem-hog-${app}`, ...(memory ? [] : ['wsl-limit'])];
+    for (const id of ids) {
+      const finding = findings.find((f) => f.id === id);
+      assert.ok(finding, id);
+      assert.match(finding.advice, /GPU 計算 PID/);
+      assert.match(finding.advice, /GPU 使用率/);
+      assert.match(finding.advice, /GPU 状態を取得できない/);
+      assert.match(finding.advice, /GPU 学習保護/);
+      assert.match(finding.advice, /`wsl --shutdown` と上限変更の反映を保留/);
+      assert.equal(finding.action, undefined);
+      assert.ok((finding.commands || []).every((c) => !c.includes('wsl --shutdown')));
+    }
+    if (memory) assert.ok(!findings.some((f) => f.id === 'wsl-limit'));
+    else assert.equal(findings.find((f) => f.id === 'wsl-limit').severity, mem_mb >= 8192 ? 'warn' : 'info');
   }
 });
 
@@ -263,26 +295,101 @@ test('Windows PowerShell の GPU 直前ガードは NaN・PID 桁あふれを拒
   assert.equal(run(absent).status, 0);
 });
 
-test('GPU の実行直前拒否は既存の runner 記録に理由として残り、GPU 学習保護属性は台帳再読時にも拒否する', async () => {
-  const action = { type: 'set-gpu-power-limit', params: { uuid: 'GPU-01234567-89ab-cdef-0123-456789abcdef', watts: 180, min: 100, max: 250, prev_w: 200 } };
-  const direct = await execute(node, action, { protect: [] }, async () => ({ code: 9, out: 'GPU compute process is active; operation refused', err: '' }));
-  assert.equal(direct.ok, false);
-  assert.match(direct.outcome, /GPU/);
-  const rows = [];
-  const db = { addAction: (v) => rows.push(v), finishAction: (id, v) => { Object.assign(rows.find((x) => x.id === id), v); return true; } };
-  const runner = makeRunner({ loadConfig: () => ({ nodes: [node], protect: [] }), confirm: async () => true, exec: async () => ({ code: 9, out: 'GPU activity is active; operation refused', err: '' }), db, newId: () => 'gpu-guard', now: () => 1 });
-  const result = await runner.confirmAndRun(node.id, action, 'GPU power');
-  assert.equal(result.ok, false);
-  assert.match(rows[0].output, /GPU.*中止|中止.*GPU/);
-  assert.throws(() => plan({ ...node, protect_gpu: true }, action, { protect: [] }), /GPU 学習保護/);
-  assert.throws(() => plan({ ...node, protect_gpu: true }, { type: 'kill-process', params: { pid: 4242, name: 'TrainerHost' } }, { protect: [] }), /GPU 学習保護/);
+test('GPU の実行直前拒否は local/remote の KT2 を通り、具体的な理由を runner 記録に残す', async () => {
+  const actions = [
+    { type: 'kill-process', params: { pid: 4242, name: 'TrainerHost', start: '20261021010101000' } },
+    { type: 'set-gpu-power-limit', params: { uuid: 'GPU-01234567-89ab-cdef-0123-456789abcdef', watts: 180, min: 100, max: 250, prev_w: 200 } },
+  ];
+  for (const action of actions) for (const local of [false, true]) {
+    const n = { ...approvedGpuNode, local };
+    const reason = 'GPU compute process is active; operation refused';
+    let exchanges = 0, loads = 0, confirmations = 0;
+    const exec = async () => assert.fail('generic transport must stay unused');
+    const exchange = async (target, hash, body) => {
+      exchanges++;
+      assert.deepEqual(target, n);
+      assert.equal(hash, n.action_helper.tune_sha256);
+      assert.ok(Buffer.isBuffer(body));
+      assert.equal(body.toString('utf8'), plan(n, action, { protect: [] }).script);
+      assert.match(body.toString('utf8'), /--query-compute-apps=pid,used_gpu_memory/);
+      return { code: 9, out: reason, err: '' };
+    };
+    const direct = await execute(n, action, { protect: [] }, exec, exchange);
+    assert.equal(exchanges, 1);
+    assert.equal(direct.code, 9);
+    assert.equal(direct.ok, false);
+    assert.equal(direct.output, reason);
+    assert.equal(direct.undo, null);
+    const rows = [];
+    const db = { addAction: (v) => rows.push(v), finishAction: (id, v) => { Object.assign(rows.find((x) => x.id === id), v); return true; } };
+    const runner = makeRunner({ loadConfig: () => { loads++; return { nodes: [n], protect: [] }; }, confirm: async () => { confirmations++; return true; }, exec, actionExchange: exchange, db, newId: () => 'gpu-guard', now: () => 1 });
+    const result = await runner.confirmAndRun(n.id, action, 'GPU guard');
+    assert.equal(exchanges, 2, 'direct and confirmed execution each use KT2 once');
+    assert.equal(loads, 2);
+    assert.equal(confirmations, 1);
+    assert.equal(result.code, 9);
+    assert.equal(result.ok, false);
+    assert.equal(result.output, reason);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].ok, false);
+    assert.equal(rows[0].undo, null);
+    assert.equal(rows[0].output, `${result.outcome}\n${reason}`);
+  }
+});
+
+test('GPU 学習保護属性が承認中に有効になると、台帳再読で transport を止めて中止理由を記録する', async () => {
+  const actions = [
+    { type: 'kill-process', params: { pid: 4242, name: 'TrainerHost', start: '20261021010101000' } },
+    { type: 'set-gpu-power-limit', params: { uuid: 'GPU-01234567-89ab-cdef-0123-456789abcdef', watts: 180, min: 100, max: 250, prev_w: 200 } },
+  ];
+  for (const action of actions) for (const local of [false, true]) {
+    let current = { ...approvedGpuNode, local, protect_gpu: false };
+    let loads = 0, confirmations = 0, transports = 0;
+    const rows = [];
+    const transport = async () => { transports++; assert.fail('protected target must never reach transport'); };
+    const runner = makeRunner({
+      loadConfig: () => { loads++; return { nodes: [current], protect: [] }; },
+      confirm: async () => { confirmations++; current = { ...current, protect_gpu: true }; return true; },
+      exec: transport, actionExchange: transport,
+      db: { addAction: (v) => rows.push(v), finishAction: () => assert.fail('no action was started') }, newId: () => 'gpu-protected', now: () => 1,
+    });
+    const result = await runner.confirmAndRun(current.id, action, 'GPU guard');
+    assert.equal(confirmations, 1);
+    assert.equal(loads, 2);
+    assert.equal(transports, 0);
+    assert.equal(result.ok, false);
+    assert.match(result.refused, /GPU 学習保護/);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].ok, false);
+    assert.equal(rows[0].undo, null);
+    assert.equal(rows[0].output, `中止（実行していない）: ${result.refused}`);
+  }
 });
 
 test('GPU 電力の outcome-unverified は local/remote とも undo を出さず、既存電源操作の exit 7 undo は維持する', async () => {
   const gpu = { type: 'set-gpu-power-limit', params: { uuid: 'GPU-01234567-89ab-cdef-0123-456789abcdef', watts: 180, min: 100, max: 250, prev_w: 200 } };
   const power = { type: 'set-power-plan', params: { guid: '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c', prev_guid: '381b4222-f694-41f0-9685-ff5bb260df2e' } };
-  for (const n of [node, { ...node, local: true }]) assert.equal((await execute(n, gpu, { protect: [] }, async () => ({ code: 7, out: '', err: '' }))).undo, null);
-  assert.ok((await execute(node, power, { protect: [] }, async () => ({ code: 7, out: '', err: '' }))).undo);
+  for (const local of [false, true]) {
+    const n = { ...approvedGpuNode, local };
+    let calls = 0;
+    const result = await execute(n, gpu, { protect: [] }, async () => assert.fail('generic transport must stay unused'), async (target, hash, body) => {
+      calls++;
+      assert.deepEqual(target, n);
+      assert.equal(hash, n.action_helper.tune_sha256);
+      assert.equal(body.toString('utf8'), plan(n, gpu, { protect: [] }).script);
+      return { code: 7, out: 'GPU power outcome unverified', err: '' };
+    });
+    assert.equal(calls, 1);
+    assert.equal(result.code, 7);
+    assert.equal(result.ok, false);
+    assert.equal(result.output, 'GPU power outcome unverified');
+    assert.equal(result.undo, null);
+  }
+  let calls = 0;
+  const result = await execute(node, power, { protect: [] }, async () => { calls++; return { code: 7, out: '', err: '' }; });
+  assert.equal(calls, 1);
+  assert.equal(result.code, 7);
+  assert.ok(result.undo);
 });
 
 test('remote Windows GPU action は named KT2 exchange に本文だけを渡す', async () => {
