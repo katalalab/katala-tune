@@ -59,6 +59,10 @@ fn compiler_environment() -> Vec<(OsString, OsString)> {
     let mut values: Vec<_> = [
         "SystemRoot",
         "WINDIR",
+        // rustc's MSVC discovery uses these to locate VS Installer/vswhere.
+        // Without them it can fall back to an unrelated PATH link.exe.
+        "ProgramFiles(x86)",
+        "ProgramFiles",
         "TEMP",
         "TMP",
         "PATH",
@@ -103,7 +107,17 @@ async fn supervise() {
     )
     .await;
     assert_owned_cleanup(&result);
-    assert_eq!(result.code, Some(0), "fake-only rustc failed: {}", String::from_utf8_lossy(&result.stderr));
+    assert_eq!(
+        result.code,
+        Some(0),
+        "fake-only rustc failed: stop={:?} timeout={} limited={} spawn={} stdout={} stderr={}",
+        result.process_receipt.as_ref().map(|receipt| receipt.stop),
+        result.timed_out,
+        result.output_limited,
+        result.spawn_failed,
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
     std::fs::copy(fakebin.join("claude.exe"), fakebin.join("codex.exe")).unwrap();
 
     let system_root = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"));
