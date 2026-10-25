@@ -10,6 +10,7 @@ function Q($key, $class, $props) {
   try { $r[$key] = @(Get-CimInstance -ClassName $class -OperationTimeoutSec 8 | Select-Object -Property $props) }
   catch { $errors[$key] = $(if ($_.Exception.HResult -eq -2147024891) { "permission_denied" } else { "error" }) }
 }
+
 Q "system" "Win32_ComputerSystem" @("Manufacturer","Model","SystemType","HypervisorPresent")
 Q "cpu" "Win32_Processor" @("Name","Manufacturer","NumberOfCores","NumberOfLogicalProcessors","MaxClockSpeed","CurrentClockSpeed","L2CacheSize","L3CacheSize","VirtualizationFirmwareEnabled","SecondLevelAddressTranslationExtensions")
 Q "memory" "Win32_PhysicalMemory" @("Manufacturer","PartNumber","DeviceLocator","Capacity","Speed","ConfiguredClockSpeed","SMBIOSMemoryType","FormFactor","DataWidth","ConfiguredVoltage")
@@ -29,7 +30,8 @@ try {
   $r.network = @(Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetAdapter -OperationTimeoutSec 8 | Select-Object InterfaceDescription,DriverVersionString,DriverDate,DriverProvider,PNPDeviceID,TransmitLinkSpeed,ReceiveLinkSpeed,MediaConnectState,FullDuplex,MtuSize,Virtual,HardwareInterface,InterfaceAdminStatus)
 } catch { $errors.network = $(if ($_.Exception.HResult -eq -2147024891) { "permission_denied" } else { "error" }) }
 try {
-  $pnp = @(Get-CimInstance Win32_PnPEntity -OperationTimeoutSec 8 | Select-Object Name,Manufacturer,PNPClass,Status,PNPDeviceID,HardwareID,Present,ConfigManagerErrorCode)
+  $native_pnp = @(Get-CimInstance Win32_PnPEntity -OperationTimeoutSec 8)
+  $pnp = @($native_pnp | Select-Object Name,Manufacturer,PNPClass,Status,PNPDeviceID,HardwareID,Present,ConfigManagerErrorCode)
   $r.pnp = $pnp
   foreach ($kind in @("usb","pci","thunderbolt")) {
     $r[$kind] = @($pnp | Where-Object { $(if ($kind -eq "thunderbolt") { $_.Name -match "Thunderbolt|USB4" } else { $_.PNPDeviceID -like ($kind + "\*") }) } | ForEach-Object {
@@ -37,6 +39,26 @@ try {
     })
   }
 } catch { foreach ($kind in @("pnp","usb","pci","thunderbolt")) { $errors[$kind] = "error" } }
+try {
+  $r.bus_models = @()
+  if ($errors.ContainsKey("pnp")) { $errors.bus_models = $errors.pnp }
+  else {
+    $bus_clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $bus_devices = @($native_pnp | Where-Object { $_.PNPDeviceID -like "USB\*" } | Select-Object -First 129)
+    if ($bus_devices.Count -gt 128) { $errors.bus_models = "output_limit" }
+    foreach ($device in ($bus_devices | Select-Object -First 128)) {
+      if ($bus_clock.ElapsedMilliseconds -ge 8000) { $errors.bus_models = "timeout"; break }
+      try {
+        $properties = Invoke-CimMethod -InputObject $device -MethodName GetDeviceProperties -Arguments @{devicePropertyKeys=@("DEVPKEY_Device_BusReportedDeviceDesc")} -OperationTimeoutSec 2
+        if ($properties.ReturnValue -ne 0) { $errors.bus_models = "error"; continue }
+        $models = @($properties.deviceProperties | Where-Object { $_.KeyName -eq "DEVPKEY_Device_BusReportedDeviceDesc" } | ForEach-Object { $_.Data } | Where-Object { $_ -is [string] -and $_.Length -le 512 })
+        if ($models.Count -eq 1) {
+          $r.bus_models += [pscustomobject]@{PNPDeviceID=$device.PNPDeviceID; BusReportedModel=$models[0]}
+        }
+      } catch { $errors.bus_models = $(if ($_.Exception.HResult -eq -2147024891) { "permission_denied" } else { "error" }) }
+    }
+  }
+} catch { $errors.bus_models = "error" }
 try {
   $r.drivers = @(Get-CimInstance Win32_PnPSignedDriver -OperationTimeoutSec 8 | Select-Object DeviceID,DeviceName,DriverVersion,DriverDate,DriverProviderName,InfName,IsSigned)
 } catch { $errors.drivers = "error" }
@@ -401,6 +423,35 @@ fn public_hardware_id(id: &str) -> Option<Map<String, Value>> {
     let mut segments = id.split('\\');
     let bus = segments.next()?;
     let mut tokens = segments.next()?.split('&');
+    if bus.eq_ignore_ascii_case("HDAUDIO") {
+        if !tokens.next()?.eq_ignore_ascii_case("FUNC_01") {
+            return None;
+        }
+        let vendor = hex_token(tokens.next()?, "VEN_", 4)?;
+        let device = hex_token(tokens.next()?, "DEV_", 4)?;
+        if vendor == "0000" || vendor.eq_ignore_ascii_case("FFFF") {
+            return None;
+        }
+        let mut fields = Map::new();
+        fields.insert("vendor_id".into(), json!(vendor.to_ascii_uppercase()));
+        fields.insert("device_id".into(), json!(device.to_ascii_uppercase()));
+        fields.insert("hardware_id_bus".into(), json!("HDAUDIO"));
+        let mut implementation_seen = false;
+        for token in tokens {
+            if let Some(revision) = hex_token(token, "REV_", 4) {
+                if fields.insert("revision_id".into(), json!(revision.to_ascii_uppercase())).is_some() {
+                    return None;
+                }
+            } else if hex_token(token, "SUBSYS_", 8).is_some() && !implementation_seen {
+                // HDAUDIO SUBSYS is an Implementation Identification Value,
+                // not PCI subsystem vendor/device fields. Do not export it.
+                implementation_seen = true;
+            } else {
+                return None;
+            }
+        }
+        return Some(fields);
+    }
     let (vendor_prefix, device_prefix, revision_len) = if bus.eq_ignore_ascii_case("PCI") {
         ("VEN_", "DEV_", 2)
     } else if bus.eq_ignore_ascii_case("USB") {
@@ -413,6 +464,7 @@ fn public_hardware_id(id: &str) -> Option<Map<String, Value>> {
     let mut fields = Map::new();
     fields.insert("vendor_id".into(), json!(vendor.to_ascii_uppercase()));
     fields.insert("product_id".into(), json!(device.to_ascii_uppercase()));
+    fields.insert("hardware_id_bus".into(), json!(bus.to_ascii_uppercase()));
     if bus.eq_ignore_ascii_case("PCI") {
         fields.insert("device_id".into(), json!(device.to_ascii_uppercase()));
     }
@@ -474,7 +526,10 @@ fn complete_device(raw: &Value, value: &Value, items: &[Value], model_key: &str,
             value["HardwareID"].as_array().into_iter().flatten().chain(pnp.into_iter().flat_map(|row| row["HardwareID"].as_array().into_iter().flatten()))
         {
             let Some(candidate) = hardware.as_str().and_then(public_hardware_id) else { continue };
-            if candidate["vendor_id"] != public["vendor_id"] || candidate["product_id"] != public["product_id"] {
+            if candidate["vendor_id"] != public["vendor_id"]
+                || candidate["hardware_id_bus"] != public["hardware_id_bus"]
+                || candidate.get("device_id").or_else(|| candidate.get("product_id")) != public.get("device_id").or_else(|| public.get("product_id"))
+            {
                 continue;
             }
             for (key, extra) in candidate {
@@ -517,6 +572,18 @@ fn complete_device(raw: &Value, value: &Value, items: &[Value], model_key: &str,
         return true;
     }
     false
+}
+
+fn reported_model(raw: &Value, value: &Value, items: &[Value]) -> Option<Value> {
+    if raw["errors"]["bus_models"].is_string() {
+        return None;
+    }
+    let id = private_id(value, "PNPDeviceID")?;
+    if items.iter().filter(|row| private_id(row, "PNPDeviceID").is_some_and(|other| other.eq_ignore_ascii_case(id))).count() != 1 {
+        return None;
+    }
+    let row = unique_identity(raw["bus_models"].as_array(), "PNPDeviceID", id)?;
+    public_reported_model(&row["BusReportedModel"])
 }
 
 pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
@@ -576,6 +643,12 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
                     used_source.push_str(" / Win32_PnPSignedDriver");
                 }
             }
+            if *id == "usb"
+                && let Some(model) = reported_model(raw, v, items)
+            {
+                fields.insert("reported_model".into(), model);
+                used_source.push_str(" / DEVPKEY_Device_BusReportedDeviceDesc");
+            }
             let name = fields.get("model").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("{id} {}", index + 1));
             if *id == "gpu" {
                 let matches: Vec<_> = raw["nvidia"].as_array().into_iter().flatten().filter(|g| g["model"].as_str() == Some(name.as_str())).collect();
@@ -617,6 +690,12 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
             }
         }
     }
+    let bus_source = "Win32_PnPEntity.GetDeviceProperties DEVPKEY_Device_BusReportedDeviceDesc";
+    if let Some(error) = raw["errors"]["bus_models"].as_str() {
+        add_provider(sections, "usb", bus_source, provider_error(error));
+    } else if let Some(rows) = raw["bus_models"].as_array() {
+        add_provider(sections, "usb", bus_source, if rows.is_empty() { "empty" } else { "ok" });
+    }
     for (key, id, source) in
         [("modern_disks", "storage", "MSFT_Disk"), ("device_guard", "settings", "Win32_DeviceGuard"), ("os_registry", "os", "Windows CurrentVersion registry")]
     {
@@ -657,5 +736,32 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
         if let Some(error) = raw["errors"]["display_registry"].as_str() {
             add_provider(sections, "display", "Registry EDID (cached)", provider_error(error));
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod bus_model_provider_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn nonzero_cim_method_result_is_a_failed_provider_not_an_empty_success() {
+        let stubs = r#"
+function Get-CimInstance {
+  param([string]$ClassName,[string]$Namespace,[uint32]$OperationTimeoutSec)
+  if ($ClassName -eq "Win32_PnPEntity") { [pscustomobject]@{Name="Generic USB";PNPDeviceID="USB\VID_F00D&PID_0001\PRIVATE";PNPClass="USB"} }
+}
+function Invoke-CimMethod { [pscustomobject]@{ReturnValue=42;deviceProperties=@()} }
+function Get-ItemProperty { @{} }
+function Confirm-SecureBootUEFI { $false }
+function powercfg.exe { "" }
+"#;
+        let args = vec!["-NoLogo".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), format!("{stubs}\n{SCRIPT}")];
+        let result = collect::run_bounded("powershell.exe", &args, &[], Duration::from_secs(20), MAX_BYTES, 8192).await;
+        assert_eq!(result.code, Some(0), "mock provider script must complete");
+        let raw: Value = serde_json::from_slice(&result.stdout).expect("mock provider JSON");
+        assert_eq!(raw["errors"]["bus_models"], "error");
+        let report = super::super::normalize("windows", &raw);
+        assert_eq!(report["sections"]["usb"]["status"], "partial");
+        assert!(!report.to_string().contains("PRIVATE"));
     }
 }

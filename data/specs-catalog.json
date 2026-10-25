@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 5,
   "verified_at": "2026-10-25",
   "products": [
     {
@@ -1349,6 +1349,432 @@
         "coverage": "full_page",
         "verified_at": "2026-10-25",
         "notes": "Complete manufacturer StreamCam Technical Specifications HTML downloaded (193917 bytes). Webcam and Security Specifications table: USB VID_PID explicitly VID046D, PID0893; microphone presence also checked. Applied only as shared device/function identity to USB and audio endpoint records, with no endpoint-specific performance or retail revision inferred."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "usb",
+          "vendor_id": "046D",
+          "product_id": "C52B"
+        }
+      ],
+      "name": "Logitech Unifying C52B receiver family",
+      "url": "https://raw.githubusercontent.com/Logitech/fw_updates/1ddde61310573ecea54c4204b401393a90f4bbae/RQR12/RQR12.09/RQR12.09_B0030.txt",
+      "source_access": "manufacturer_document_full_body",
+      "scope": "USB receiver family only; shared endpoint IDs do not establish a paired mouse or keyboard, installed firmware, receiver silicon revision, pairing state, latency or current settings.",
+      "specifications": {
+        "controller_function": "Unifying receiver family"
+      },
+      "source_evidence": {
+        "url": "https://raw.githubusercontent.com/Logitech/fw_updates/1ddde61310573ecea54c4204b401393a90f4bbae/RQR12/RQR12.09/RQR12.09_B0030.txt",
+        "sha256": "35438e30dc2be8e0ef998aed4e5901fafad755cedfe9de06cb888d4dbe34d86c",
+        "coverage": "full_document",
+        "verified_at": "2026-10-25",
+        "material": "text_document",
+        "notes": "Official Logitech firmware repository at immutable commit. Complete RQR12.09_B0030.txt inspected: lines 8-9 describe the Unifying receiver; line 14 gives USB 046D/C52B/1209. Only VID/PID family mapping is used, not the release number as installed firmware.",
+        "lines": [
+          8,
+          9,
+          14
+        ]
+      },
+      "supporting_source_evidence": []
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "usb",
+          "vendor_id": "046D",
+          "product_id": "C548"
+        }
+      ],
+      "name": "Logitech C548 receiver / input family",
+      "url": "https://catalog.s.download.windowsupdate.com/d/msdownload/update/driver/drvs/2021/09/win%2010_110d6af3a121104f1fef0140b3b47eaf6f7eabd3.cab",
+      "source_access": "manufacturer_driver_package_full_body",
+      "scope": "USB receiver / input family based on the manufacturer MI_00 binding; parent VID/PID is shared by composite and HID observations. Other interfaces are identified only as the same parent family, not assigned MI_00 functionality. No Bolt marketing name, paired peripheral SKU, pairing state, firmware version or performance inferred.",
+      "specifications": {
+        "controller_function": "Logitech C548 receiver / input family"
+      },
+      "source_evidence": {
+        "url": "https://catalog.s.download.windowsupdate.com/d/msdownload/update/driver/drvs/2021/09/win%2010_110d6af3a121104f1fef0140b3b47eaf6f7eabd3.cab",
+        "sha256": "6eaa6e0271fc3e8e76e422610b1bc8f05e05048999d43ff2a940a6b1306b7916",
+        "coverage": "full_archive",
+        "verified_at": "2026-10-25",
+        "material": "cab_archive",
+        "notes": "Complete Microsoft Update Catalog-distributed manufacturer package inspected as data with 7-Zip, without installation or execution. unifhid.inf header identifies unifying/BLEPro receivers; lines 46/50 explicitly bind USB VID046D PIDC548 MI_00 to LogiLDA, and Strings section identifies Logitech / Logitech USB Input Device. Internal INF unifhid.inf SHA256 0124356ede51a96dffe5f5ba2e72c23117a00fd9b6fdffa3359eaf4961c5e004. Microsoft publishes the download; the INF identifies the manufacturer driver provider. CAB archive has an appended tail reported by 7-Zip; the SHA256 covers all downloaded bytes."
+      },
+      "supporting_source_evidence": [
+        {
+          "url": "https://www.catalog.update.microsoft.com/ScopedViewInline.aspx?updateid=bb4d0eb2-ad27-43b4-a82a-4f938ed75d66",
+          "sha256": "52dc282cbc251a8c95ba2dbe0eb33fd6562275068c2a899b5a92db548b160644",
+          "coverage": "full_page",
+          "verified_at": "2026-10-25",
+          "material": "html_document",
+          "notes": "Complete Microsoft Update Catalog metadata page: package title, manufacturer, provider and supported hardware IDs. Distributor metadata is supporting context; identity comes from the inspected manufacturer INF."
+        }
+      ]
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "usb",
+          "vendor_id": "046D",
+          "product_id": "C53F"
+        },
+        {
+          "section": "usb",
+          "vendor_id": "046D",
+          "product_id": "C547"
+        }
+      ],
+      "name": "Logitech LIGHTSPEED receiver C53F / C547 family",
+      "url": "https://catalog.s.download.windowsupdate.com/c/msdownload/update/driver/drvs/2026/04/drivers_64b23e8d5e948a5d4759df80f2d290e1a87dc6ef.cab",
+      "source_access": "manufacturer_driver_package_full_body",
+      "scope": "USB receiver family only; the manufacturer explicitly maps base VID/PID without an interface suffix. Shared composite/HID endpoints do not establish which mouse or keyboard is paired, current firmware, radio state, polling, latency or installed driver version.",
+      "specifications": {
+        "controller_function": "LIGHTSPEED receiver family"
+      },
+      "source_evidence": {
+        "url": "https://catalog.s.download.windowsupdate.com/c/msdownload/update/driver/drvs/2026/04/drivers_64b23e8d5e948a5d4759df80f2d290e1a87dc6ef.cab",
+        "sha256": "ba83c7316f3fa2580e790072671d404fcb70560f66cf2b934ea798b97b5c440e",
+        "coverage": "full_archive",
+        "verified_at": "2026-10-25",
+        "material": "cab_archive",
+        "notes": "Complete Microsoft Update Catalog-distributed manufacturer package inspected as data with 7-Zip, without installation or execution. logi_lamparray_usb.inf lines 23/27 and 104/108 map exact base USB VID046D PIDC53F and PIDC547 to LS2Recv, explicitly commented LIGHTSPEED Receiver. LS2RecvName string lines 4590/4665 confirms family. Provider Logitech. Internal INF logi_lamparray_usb.inf SHA256 23aa3d5d8a9e4151686e466545e02fbfa7b780dc6968a2570a106819feb1ed7c. Microsoft publishes the download; the INF identifies the manufacturer driver provider. CAB archive has an appended tail reported by 7-Zip; the SHA256 covers all downloaded bytes."
+      },
+      "supporting_source_evidence": [
+        {
+          "url": "https://www.catalog.update.microsoft.com/ScopedViewInline.aspx?updateid=4c1ee655-40d5-4b65-8c5f-3ac93ee73750",
+          "sha256": "8ef4b379d8ac5028a3b831a8f1702c82ab21d2138defc01b881f3c44c934a931",
+          "coverage": "full_page",
+          "verified_at": "2026-10-25",
+          "material": "html_document",
+          "notes": "Complete Microsoft Update Catalog metadata page: package title, manufacturer, provider and supported hardware IDs. Distributor metadata is supporting context; identity comes from the inspected manufacturer INF."
+        }
+      ]
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "usb",
+          "vendor_id": "0B05",
+          "product_id": "1AF1"
+        },
+        {
+          "section": "audio",
+          "vendor_id": "0B05",
+          "product_id": "1AF1"
+        }
+      ],
+      "name": "Realtek USB Audio family for ASUS 0B05:1AF1",
+      "url": "https://catalog.s.download.windowsupdate.com/d/msdownload/update/driver/drvs/2024/03/390e8698-cb33-4bb5-a9ed-afa9acf53dc6_17121f0fba418de747873326e82ad26002459c9a.cab",
+      "source_access": "manufacturer_driver_package_full_body",
+      "scope": "USB audio driver family based on the manufacturer MI_00 binding; composite/HID observations with the same parent VID/PID identify the parent audio-device family only, not the function of every interface. No ALC codec model, motherboard SKU, sample-rate/channel limit, active configuration or installed driver version inferred.",
+      "specifications": {
+        "controller_function": "Realtek USB Audio driver family"
+      },
+      "source_evidence": {
+        "url": "https://catalog.s.download.windowsupdate.com/d/msdownload/update/driver/drvs/2024/03/390e8698-cb33-4bb5-a9ed-afa9acf53dc6_17121f0fba418de747873326e82ad26002459c9a.cab",
+        "sha256": "6c0f5011adee49a79b56391dee0bf906106c76454a1b22fc69e0cbc3979d2a56",
+        "coverage": "full_archive",
+        "verified_at": "2026-10-25",
+        "material": "cab_archive",
+        "notes": "Complete Microsoft Update Catalog-distributed manufacturer package inspected as data with 7-Zip, without installation or execution. RtDUsbAD_asus.inf line 64 binds exact USB VID0B05 PID1AF1 MI_00 to RtkUsbAD; lines 233/235 resolve provider Realtek Semiconductor Corp. and Realtek USB Audio description. Internal INF RtDUsbAD_asus.inf SHA256 42a602955748eadab2a9d885109c01a307b7fbbfd3610a50cb092bc2a08eccf7. Microsoft publishes the download; the INF identifies the manufacturer driver provider. CAB archive has an appended tail reported by 7-Zip; the SHA256 covers all downloaded bytes."
+      },
+      "supporting_source_evidence": [
+        {
+          "url": "https://www.catalog.update.microsoft.com/ScopedViewInline.aspx?updateid=47aa7208-7a7e-486e-a2a2-61e5fa139858",
+          "sha256": "cb842d47766151bbbd9bc87ab40678cce699c486e0063230c0adac33d7297cd7",
+          "coverage": "full_page",
+          "verified_at": "2026-10-25",
+          "material": "html_document",
+          "notes": "Complete Microsoft Update Catalog metadata page: package title, manufacturer, provider and supported hardware IDs. Distributor metadata is supporting context; identity comes from the inspected manufacturer INF."
+        }
+      ]
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "usb",
+          "vendor_id": "05E3",
+          "product_id": "0749"
+        }
+      ],
+      "name": "Genesys Logic USB3.0 card reader family 05E3:0749",
+      "url": "https://catalog.s.download.windowsupdate.com/c/msdownload/update/driver/drvs/2026/01/0186ade4-0c08-4bc9-bb73-5cc21a47599e_4f699bb3d6fd767f30d25bfacd7af86664aa7c7b.cab",
+      "source_access": "manufacturer_driver_package_full_body",
+      "scope": "USB card-reader driver family only; USB3.0 is the manufacturer driver-family label, not observed negotiated speed. No GL silicon model, retail enclosure, inserted media, capacity, current speed or installed driver version inferred.",
+      "specifications": {
+        "controller_function": "Genesys Logic USB3.0 Card Reader driver family"
+      },
+      "source_evidence": {
+        "url": "https://catalog.s.download.windowsupdate.com/c/msdownload/update/driver/drvs/2026/01/0186ade4-0c08-4bc9-bb73-5cc21a47599e_4f699bb3d6fd767f30d25bfacd7af86664aa7c7b.cab",
+        "sha256": "b79b7334c4969e7b0da8fbfde236034aad7df88bf1ff2a134a9b8478759d20ef",
+        "coverage": "full_archive",
+        "verified_at": "2026-10-25",
+        "material": "cab_archive",
+        "notes": "Complete Microsoft Update Catalog-distributed manufacturer package inspected as data with 7-Zip, without installation or execution. GeneStor.inf lines 39/52 bind exact base USB VID05E3 PID0749 to GL_USB_STORAGE_3; line 258 resolves Genesys Logic USB3.0 Card Reader. Internal INF GeneStor.inf SHA256 a8df4fde8bbc490248192c2c57e380fb726b42b0467064b9e886cec5b5595334. Microsoft publishes the download; the INF identifies the manufacturer driver provider. CAB archive has an appended tail reported by 7-Zip; the SHA256 covers all downloaded bytes."
+      },
+      "supporting_source_evidence": [
+        {
+          "url": "https://www.catalog.update.microsoft.com/ScopedViewInline.aspx?updateid=527cbc57-9003-44ab-8464-a2da8647db11",
+          "sha256": "936f5ac6fb115f54aa1cd8ebdee90c58ec3e2629d73d47620583f5949e13667c",
+          "coverage": "full_page",
+          "verified_at": "2026-10-25",
+          "material": "html_document",
+          "notes": "Complete Microsoft Update Catalog metadata page: package title, manufacturer, provider and supported hardware IDs. Distributor metadata is supporting context; identity comes from the inspected manufacturer INF."
+        }
+      ]
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "usb",
+          "vendor_id": "1532",
+          "product_id": "0091"
+        }
+      ],
+      "name": "Razer Viper 8KHz USB input family 1532:0091",
+      "url": "https://catalog.s.download.windowsupdate.com/d/msdownload/update/driver/drvs/2022/06/971d480a-7637-4a25-a88e-8839e6860ba3_a088381a1c349be519d3632e93e35b433de21d97.cab",
+      "source_access": "manufacturer_driver_package_full_body",
+      "scope": "USB input-device family based on manufacturer MI_00 binding; composite/HID observations identify the parent device family, not the function of every interface. Does not replace an exact observed model match. No current polling rate, DPI, firmware or installed driver version inferred from the name or VID/PID.",
+      "specifications": {
+        "controller_function": "Razer Viper 8KHz USB input family"
+      },
+      "source_evidence": {
+        "url": "https://catalog.s.download.windowsupdate.com/d/msdownload/update/driver/drvs/2022/06/971d480a-7637-4a25-a88e-8839e6860ba3_a088381a1c349be519d3632e93e35b433de21d97.cab",
+        "sha256": "6ccb1c2274cb1d5e5f0072e05ba16717a468d2fd29c7cdf4122a484d86e21cd8",
+        "coverage": "full_archive",
+        "verified_at": "2026-10-25",
+        "material": "cab_archive",
+        "notes": "Complete Microsoft Update Catalog-distributed manufacturer package inspected as data with 7-Zip, without installation or execution. rz0091dev.inf lines 22/26/30/34 bind exact USB VID1532 PID0091 MI_00; line 102 resolves Razer Viper 8KHz; provider Razer Inc. Internal INF rz0091dev.inf SHA256 a94fbef8ce6bde1afe6d381cb6976471d18627655fb807a7e12e7cc673cd8e2b. Microsoft publishes the download; the INF identifies the manufacturer driver provider. CAB archive has an appended tail reported by 7-Zip; the SHA256 covers all downloaded bytes."
+      },
+      "supporting_source_evidence": [
+        {
+          "url": "https://www.catalog.update.microsoft.com/ScopedViewInline.aspx?updateid=7efb2d82-8883-4d93-855d-cd3c3441c9ba",
+          "sha256": "95c4f3d4ae22eecb191a5738a51826db68e0bca1af1cb6e6d53e45917a02265b",
+          "coverage": "full_page",
+          "verified_at": "2026-10-25",
+          "material": "html_document",
+          "notes": "Complete Microsoft Update Catalog metadata page: package title, manufacturer, provider and supported hardware IDs. Distributor metadata is supporting context; identity comes from the inspected manufacturer INF."
+        }
+      ]
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "7F2F"
+        }
+      ],
+      "name": "Intel Error Aggregation Handler function (8086:7F2F)",
+      "url": "https://downloadmirror.intel.com/925343/SetupChipset.exe",
+      "scope": "Exact public hardware ID identifies the documented family/function only; it does not identify an installed retail adapter, GPU or SSD SKU, capacity, firmware, PCB revision, current configuration or negotiated link.",
+      "source_access": "manufacturer_driver_package_full_body",
+      "specifications": {
+        "silicon_family": "Intel chipset Error Aggregation Handler",
+        "controller_function": "Error Aggregation Handler (EAH)"
+      },
+      "source_evidence": {
+        "url": "https://downloadmirror.intel.com/925343/SetupChipset.exe",
+        "sha256": "f20b9f97e9a81e613d4d529aad5d3948f5e449998cd118c6def4037ca6536446",
+        "coverage": "full_archive",
+        "verified_at": "2026-10-25",
+        "notes": "Complete 102896464-byte Intel package downloaded and archive-extracted without executing the installer. Outer SHA256 matches Intel download page 19347; Authenticode reports Valid Intel Corporation. Embedded ZIP extracted as data. Drivers/MeteorLakePCH-S/MeteorLakePCH-SSystem.inf lines32/74 exact PCI VEN8086 DEV7F2F map to Needs_NO_DRV, line133 names Error Aggregation Handler (EAH) - 7F2F. INF SHA256 51c3e3305852093f9cbc0dde2fee6c774f8e8b925ee0ed2c1c2c063e85d7f3ce. Null-driver description establishes function identity, not a motherboard SKU or an executing device-driver version.",
+        "material": "driver_archive"
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "10DE",
+          "device_id": "1ADB"
+        }
+      ],
+      "name": "NVIDIA USB Type-C port policy function (10DE:1ADB)",
+      "url": "https://international.download.nvidia.com/Windows/591.74/591.74-desktop-win10-win11-64bit-international-dch-whql.exe",
+      "scope": "Exact public hardware ID identifies the documented family/function only; it does not identify an installed retail adapter, GPU or SSD SKU, capacity, firmware, PCB revision, current configuration or negotiated link.",
+      "source_access": "manufacturer_driver_package_full_body",
+      "specifications": {
+        "silicon_family": "NVIDIA UCSI-compatible USB Type-C policy controller",
+        "controller_function": "USB Type-C port policy controller"
+      },
+      "source_evidence": {
+        "url": "https://international.download.nvidia.com/Windows/591.74/591.74-desktop-win10-win11-64bit-international-dch-whql.exe",
+        "sha256": "fdd72e867b193a35bd35a317abd9f3c29cca7469824be857942bdce709f66583",
+        "coverage": "full_archive",
+        "verified_at": "2026-10-25",
+        "notes": "Complete 919686600-byte NVIDIA 591.74 package downloaded and opened using 7-Zip without execution. Outer Authenticode reports Valid NVIDIA Corporation; PPC/nvppc.cat reports Valid Microsoft Windows Hardware Compatibility Publisher. PPC/nvppc.inf line34 exact PCI VEN10DE DEV1ADB maps to UcmCxUcsiNvppc_Device, line85 names NVIDIA USB Type-C Port Policy Controller. INF SHA256 e42b4db1591afc16d306da88c1266e9fe89ed844a9409a1a15290ec490894655. Package supports several IDs; this mapping establishes the UCSI policy function only and does not identify GPU silicon or a retail graphics card.",
+        "material": "driver_archive"
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "usb",
+          "vendor_id": "0BDA",
+          "product_id": "8153"
+        },
+        {
+          "section": "network",
+          "vendor_id": "0BDA",
+          "product_id": "8153"
+        }
+      ],
+      "name": "Realtek RTL8153 USB Ethernet controller family (0BDA:8153)",
+      "url": "https://s3.amazonaws.com/plugable/bin/Realtek/0026-Install_USB_Win10_10025_07252018.zip",
+      "scope": "Exact public hardware ID identifies the documented family/function only; it does not identify an installed retail adapter, GPU or SSD SKU, capacity, firmware, PCB revision, current configuration or negotiated link.",
+      "source_access": "manufacturer_driver_package_full_body",
+      "specifications": {
+        "silicon_family": "Realtek RTL8153 controller family",
+        "controller_function": "USB Ethernet controller"
+      },
+      "source_evidence": {
+        "url": "https://s3.amazonaws.com/plugable/bin/Realtek/0026-Install_USB_Win10_10025_07252018.zip",
+        "sha256": "fb04de3316ab31e74250207ddcf4b6133733da297573c88438f66ca022149d84",
+        "coverage": "full_archive",
+        "verified_at": "2026-10-25",
+        "notes": "Complete 9763533-byte archive linked by Plugable official Wired Ethernet Adapter Drivers page downloaded and extracted without executing any included installer. Install_USB_Win10_10025_07252018/WIN10/64/rtux64w10.INF line37 exact USB VID0BDA PID8153 maps to RTL8153Xx64.ndi; RTL8153.DeviceDesc names Realtek USB GbE Family Controller. INF SHA256 7a7d3da32612e1ec9f46344fa245c1a64c411a59b6797c340f739f7a116e1f04. Associated rtux64w10.cat Authenticode reports Valid Microsoft Windows Hardware Compatibility Publisher. Multiple OEM products and revisions share this ID; do not identify a Plugable retail product from it.",
+        "material": "driver_archive"
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "F1A6"
+        }
+      ],
+      "name": "Intel 760p / Pro 7600p NVMe controller family (8086:F1A6)",
+      "url": "https://raw.githubusercontent.com/torvalds/linux/v6.17/drivers/nvme/host/pci.c",
+      "scope": "Exact public hardware ID identifies the documented family/function only; it does not identify an installed retail adapter, GPU or SSD SKU, capacity, firmware, PCB revision, current configuration or negotiated link.",
+      "source_access": "os_driver_source_full_body",
+      "specifications": {
+        "silicon_family": "Intel 760p / Pro 7600p controller family",
+        "controller_function": "NVMe controller"
+      },
+      "source_evidence": {
+        "url": "https://raw.githubusercontent.com/torvalds/linux/v6.17/drivers/nvme/host/pci.c",
+        "sha256": "1693dae2b398b44e75e3608769ee0a7e57b8de5d73f649089b89156418018b80",
+        "coverage": "full_source_file",
+        "verified_at": "2026-10-25",
+        "notes": "Complete Linux v6.17 NVMe PCI host driver source file downloaded. Line3783 has PCI_VDEVICE(INTEL, 0xf1a6) and the explicit Intel 760p/Pro 7600p comment; adjacent driver quirk entry confirms NVMe controller scope. This is OS-driver-source family evidence, not manufacturer retail-SKU verification. Other Intel families, installed capacity, NAND, firmware, namespace state and current link are not inferred.",
+        "material": "source_code",
+        "lines": [
+          3783
+        ]
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "audio",
+          "vendor_id": "10DE",
+          "device_id": "0093",
+          "hardware_id_bus": "HDAUDIO"
+        },
+        {
+          "section": "audio",
+          "vendor_id": "10DE",
+          "device_id": "009E",
+          "hardware_id_bus": "HDAUDIO"
+        },
+        {
+          "section": "audio",
+          "vendor_id": "10DE",
+          "device_id": "00A3",
+          "hardware_id_bus": "HDAUDIO"
+        },
+        {
+          "section": "audio",
+          "vendor_id": "10DE",
+          "device_id": "00AD",
+          "hardware_id_bus": "HDAUDIO"
+        }
+      ],
+      "name": "NVIDIA High Definition Audio codec function family",
+      "url": "https://international.download.nvidia.com/Windows/591.74/591.74-desktop-win10-win11-64bit-international-dch-whql.exe",
+      "scope": "Exact public hardware ID identifies the documented family/function only; it does not identify an installed retail adapter, GPU or SSD SKU, capacity, firmware, PCB revision, current configuration or negotiated link.",
+      "source_access": "manufacturer_driver_package_full_body",
+      "specifications": {
+        "silicon_family": "NVIDIA High Definition Audio codec family",
+        "controller_function": "High Definition Audio codec function"
+      },
+      "source_evidence": {
+        "url": "https://international.download.nvidia.com/Windows/591.74/591.74-desktop-win10-win11-64bit-international-dch-whql.exe",
+        "sha256": "fdd72e867b193a35bd35a317abd9f3c29cca7469824be857942bdce709f66583",
+        "coverage": "full_archive",
+        "verified_at": "2026-10-25",
+        "notes": "Complete 919686600-byte NVIDIA 591.74 package downloaded and archive-extracted without execution. HDAudio/nvhda.inf lines116,124,128,135 explicitly list unrestricted HDAUDIO FUNC_01 VEN10DE DEV0093/009E/00A3/00AD codec IDs; line551 maps NVIDIA.DeviceDesc to NVIDIA High Definition Audio. INF SHA256 aa5e522fb6995b3038a3e6921be31724a8df1c64de2e9b1e1686ddbe17ca7e6b. HDAudio/nvhda.cat Authenticode reports Valid Microsoft Windows Hardware Compatibility Publisher. Microsoft Identifiers for HDAUDIO Devices documents FUNC_01 and codec vendor/device fields; HDAUDIO SUBSYS is an Implementation Identification Value, not PCI subsystem vendor/device fields. The audio codec function is distinct from PCI audio controller IDs and does not establish a retail GPU, port count, output channels, sample rate or current audio configuration.",
+        "material": "driver_archive"
+      }
+    },
+    {
+      "models": [
+        "KURO-DACHI/CLONE/CRU3"
+      ],
+      "name": "Kuroutoshikou KURO-DACHI/CLONE/CRU3 SATA drive enclosure",
+      "url": "https://www.kuroutoshikou.com/product/release/kuro-dachi-clone-cru3.html",
+      "scope": "Exact USB bus-reported enclosure model only; this two-bay SATA-to-USB enclosure does not identify either internal drive or its capacity/firmware. Published interface limits are theoretical, not current link or measured performance.",
+      "source_access": "manufacturer_page_full_body",
+      "source_evidence": {
+        "url": "https://www.kuroutoshikou.com/product/release/kuro-dachi-clone-cru3.html",
+        "sha256": "2c5fa37151850d51f6a8d39d83b20b5c35687b1cee3486363b342260ce13e92b",
+        "coverage": "full_page",
+        "material": "html_document",
+        "verified_at": "2026-10-25",
+        "notes": "Complete manufacturer product/release HTML downloaded; exact KURO-DACHI/CLONE/CRU3 model, two SATA drive bays, 2.5/3.5 inch SATA III/II/I support and theoretical USB3.2 Gen1 5Gbps statements checked. Drive models, installed capacities, clone state and current USB speed are not supplied by this enclosure document."
+      },
+      "specifications": {
+        "drive_bays": 2,
+        "max_link_gbps": 5,
+        "supported_drive_interfaces": "SATA III / II / I",
+        "supported_drive_form_factors": "2.5 / 3.5 inch"
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "audio",
+          "vendor_id": "10EC",
+          "device_id": "0897",
+          "hardware_id_bus": "HDAUDIO"
+        }
+      ],
+      "name": "Realtek ALC897 High Definition Audio codec family (10EC:0897)",
+      "url": "https://raw.githubusercontent.com/torvalds/linux/v6.12/sound/pci/hda/patch_realtek.c",
+      "scope": "Exact public hardware ID identifies the documented family/function only; it does not identify an installed retail adapter, GPU or SSD SKU, capacity, firmware, PCB revision, current configuration or negotiated link.",
+      "source_access": "os_driver_source_full_body",
+      "specifications": {
+        "silicon_family": "Realtek ALC897 codec family",
+        "controller_function": "High Definition Audio codec function"
+      },
+      "source_evidence": {
+        "url": "https://raw.githubusercontent.com/torvalds/linux/v6.12/sound/pci/hda/patch_realtek.c",
+        "sha256": "96f936bb290cf61f279ba729e20415244ae4aecc58050e11dbd397c3bee927f3",
+        "coverage": "full_source_file",
+        "verified_at": "2026-10-25",
+        "notes": "Complete Linux v6.12 Realtek HDA codec driver source downloaded. Line13338 HDA_CODEC_ENTRY(0x10ec0897, ALC897, patch_alc662) explicitly associates the full vendor-plus-codec identifier with ALC897. This is OS-driver-source codec-family evidence, not manufacturer retail motherboard verification. No channel count, sample rate, analog jack topology, enabled effects or current audio configuration is inferred.",
+        "material": "source_code",
+        "lines": [
+          13338
+        ]
       }
     }
   ]

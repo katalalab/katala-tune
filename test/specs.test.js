@@ -202,3 +202,25 @@ test('driver archive hashes are identified as archive evidence rather than saved
   n.report.sections.network.components[0].official.source_evidence.material='driver_archive';
   assert(model.officialDetails([n]).includes('ドライバー配布アーカイブ'));
 });
+
+test('official OS source, manufacturer text and CAB evidence retain distinct materials and lines',()=>{
+  const component=(url,material,coverage,lines)=>({name:'Example',fields:{reported_model:'Public model'},missing_fields:[],official:{status:'identified',url,name:'Official source',source_access:coverage==='full_source_file'?'os_driver_source_full_body':'manufacturer_document_full_body',source_evidence:{url,material,coverage,lines,sha256:'a'.repeat(64)}}});
+  const components=[
+    component('https://raw.githubusercontent.com/torvalds/linux/v6.17/drivers/nvme/host/pci.c','source_code','full_source_file',[3783]),
+    component('https://raw.githubusercontent.com/Logitech/fw_updates/'+'a'.repeat(40)+'/RQR12/example.txt','text_document','full_document',[14]),
+    component('https://catalog.s.download.windowsupdate.com/example.cab','cab_archive','full_archive',[]),
+    component('https://s3.amazonaws.com/plugable/bin/example.zip','driver_archive','full_archive',[])
+  ];
+  const nodes=[{node_id:'Example',report:{sections:{usb:{components}}}}];
+  const html=model.officialDetails(nodes);
+  for(const c of components)assert(html.includes(`href="${c.official.url}"`));
+  assert(html.includes('OS公式ドライバーソース'));
+  assert(html.includes('テキスト文書（原本）'));
+  assert(html.includes('CABドライバー配布アーカイブ'));
+  assert(html.includes('確認行 3783'));
+  assert.equal(model.label('reported_model'),'バス報告モデル（登録済み型番）');
+  for(const url of ['https://raw.githubusercontent.com/other/linux/v6.17/file','https://raw.githubusercontent.com/torvalds/linux/master/file','https://s3.amazonaws.com/another-bucket/bin/file','https://s3.amazonaws.com/plugable/bin/../../evil/file','https://catalog.s.download.windowsupdate.com.evil.example/file']) {
+    components[0].official.url=url;
+    assert(!model.officialDetails(nodes).includes(`href="${url}"`),url);
+  }
+});

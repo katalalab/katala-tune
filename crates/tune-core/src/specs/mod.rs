@@ -65,6 +65,9 @@ fn official_for(section: &str, c: &Value) -> Value {
                     if key == "section" {
                         return true;
                     }
+                    if key == "hardware_id_bus" {
+                        return matches!(expected.as_str(), Some("PCI" | "USB" | "HDAUDIO")) && *expected == fields[key];
+                    }
                     let length = match key.as_str() {
                         "vendor_id" | "device_id" | "product_id" | "subsystem_vendor_id" | "subsystem_device_id" => 4,
                         "revision_id" => {
@@ -84,6 +87,15 @@ fn official_for(section: &str, c: &Value) -> Value {
         .collect();
     match matches.as_slice() {
         [p] => official_product(p, "identified", "hardware_id"),
+        [] if section == "usb" => {
+            let mut reported = fields["reported_model"].as_str().map(official).unwrap_or(Value::Null);
+            if reported["status"] == "matched" {
+                reported["match_kind"] = json!("bus_reported_model");
+                reported
+            } else {
+                exact
+            }
+        }
         [] => exact,
         _ => json!({"status":"unverified","reason":"ambiguous_hardware_id_catalog"}),
     }
@@ -100,6 +112,8 @@ pub(super) fn scalar(v: &Value) -> Option<Value> {
 
 fn report_field(key: &str, v: &Value) -> Option<Value> {
     match key {
+        "reported_model" => public_reported_model(v),
+        "hardware_id_bus" => v.as_str().filter(|bus| ["PCI", "USB", "HDAUDIO"].contains(bus)).map(|bus| json!(bus)),
         "driver_inf" => {
             let name = v.as_str()?;
             (name.len() > 4
@@ -116,6 +130,13 @@ fn report_field(key: &str, v: &Value) -> Option<Value> {
     }
 }
 
+// USB product strings may contain serials or custom text. Only public catalog
+// aliases can be retained as an additional observation, never arbitrary text.
+pub(super) fn public_reported_model(v: &Value) -> Option<Value> {
+    let value = scalar(v)?;
+    (official(value.as_str()?)["status"] == "matched").then_some(value)
+}
+
 /// Only these named fields can cross the remote boundary or enter the private DB.
 pub const FIELDS: &[&str] = &[
     "cluster0_name",
@@ -123,6 +144,7 @@ pub const FIELDS: &[&str] = &[
     "cluster1_name",
     "cluster1_cores",
     "model",
+    "reported_model",
     "manufacturer",
     "part_number",
     "slot",
@@ -159,6 +181,7 @@ pub const FIELDS: &[&str] = &[
     "resolution",
     "refresh_hz",
     "vendor_id",
+    "hardware_id_bus",
     "product_id",
     "device_id",
     "class",

@@ -1,6 +1,8 @@
 # Official hardware source coverage
 
-Catalog revision 4 was reviewed on 2026-10-25. It contains 87 records: 33 product or product-family records and 54 manufacturer/OEM hardware-ID/function mappings. This document lists public product identities and sources only; it contains no machine inventory or assignment of products to machines.
+Revision 5 adds the [USB/audio source ledger](specs-usb-further.md), [PCI/network/codec source ledger](specs-windows-further.md) and [additional acquisition scope](specs-further-resolution.md). Manufacturer text, CAB/driver archives and official OS driver source files retain different material/coverage types. The source-file entries use fixed release versions and explicit line locations; they do not claim manufacturer verification of retail products. Microsoft-distributed manufacturer packages retain both publisher/distributor provenance and inner INF hashes. Link trust additionally permits official Windows Update download hosts, the exact Logitech/fw_updates and torvalds/linux release/commit paths, Plugable's documented S3 bucket path and kuroutoshikou.com; unrelated repositories or S3 buckets remain rejected.
+
+Catalog revision 5 was reviewed on 2026-10-25. It contains 100 records: 34 product or product-family records and 66 manufacturer/OEM/official OS-driver hardware-ID/function mappings. This document lists public product identities and sources only; it contains no machine inventory or assignment of products to machines.
 
 `models` contains explicit aliases matched case-insensitively after trimming. There is no substring, prefix, suffix, kit-name, or fuzzy matching. A match identifies the scope described by the source; it does not establish the installed configuration or enabled setting. Published maximum frequencies, transfer rates and endurance ratings are product specifications, not measurements. Every SSD performance field uses `up_to`; rated TBW is not remaining drive life.
 

@@ -487,6 +487,9 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
                 _ => "device",
             };
             fields.insert("record_kind".into(), json!(record_kind));
+            if *id == "usb" {
+                fields.insert("hardware_id_bus".into(), json!("USB"));
+            }
             if *kind == "SPSoftwareDataType"
                 && let Some(version) = fields.get("version").and_then(Value::as_str)
                 && let Some((version, build)) = version.rsplit_once(" (")

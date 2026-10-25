@@ -30,9 +30,10 @@ fn full_body_evidence_is_auditable_and_distinct_from_indexed_excerpts() {
             match access {
                 "manufacturer_document_full_body" => {
                     assert_eq!(evidence["coverage"], "full_document");
-                    let pages = evidence["pages"].as_array().unwrap();
-                    assert!(!pages.is_empty());
-                    assert!(pages.iter().all(|page| page.as_u64().unwrap() > 0));
+                    let locations = if evidence["material"] == "text_document" { &evidence["lines"] } else { &evidence["pages"] };
+                    let locations = locations.as_array().unwrap();
+                    assert!(!locations.is_empty());
+                    assert!(locations.iter().all(|position| position.as_u64().unwrap() > 0));
                 }
                 "manufacturer_page_full_body" => {
                     assert_eq!(evidence["coverage"], "full_page");
@@ -41,6 +42,14 @@ fn full_body_evidence_is_auditable_and_distinct_from_indexed_excerpts() {
                     assert_eq!(evidence["coverage"], "full_archive");
                     assert!(evidence["notes"].as_str().unwrap().contains("without"));
                     assert!(evidence["notes"].as_str().unwrap().contains("SHA256"));
+                }
+                "os_driver_source_full_body" => {
+                    assert_eq!(evidence["coverage"], "full_source_file");
+                    assert_eq!(evidence["material"], "source_code");
+                    let lines = evidence["lines"].as_array().unwrap();
+                    assert!(!lines.is_empty());
+                    assert!(lines.iter().all(|line| line.as_u64().unwrap() > 0));
+                    assert!(evidence["url"].as_str().unwrap().starts_with("https://raw.githubusercontent.com/torvalds/linux/v"));
                 }
                 other => panic!("unrecognized full-body access: {other}"),
             }
