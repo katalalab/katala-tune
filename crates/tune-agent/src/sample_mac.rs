@@ -675,6 +675,38 @@ fn macmon_path() -> PathBuf {
 /// 最新の行と、それを読んだ時刻。読み手のスレッドが書き、サンプラーが読む
 type Latest = Arc<Mutex<(Option<Map<String, Value>>, Option<Instant>)>>;
 
+fn read_macmon(out: impl Read, latest: &Latest) {
+    // 1 行は 256KiB まで。越えたら捨てて欠測にする
+    let mut r = BufReader::new(out);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match (&mut r).take(262_145).read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) if line.len() > 262_144 => {
+                *latest.lock().unwrap_or_else(|e| e.into_inner()) = (None, None);
+                // Drain only the rest of this frame, in bounded chunks. Its tail must
+                // never be parsed as a new frame, but the next valid line can recover.
+                while line.last() != Some(&b'\n') {
+                    line.clear();
+                    match (&mut r).take(8192).read_until(b'\n', &mut line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                }
+                continue;
+            }
+            Ok(_) => {}
+        }
+        let parsed = serde_json::from_slice::<Value>(&line).ok().and_then(|v| macmon_metrics(&v));
+        let mut g = latest.lock().unwrap_or_else(|e| e.into_inner());
+        *g = match parsed {
+            Some(m) => (Some(m), Some(Instant::now())),
+            None => (None, g.1),
+        };
+    }
+}
+
 struct Macmon {
     child: Child,
     latest: Latest,
@@ -701,23 +733,7 @@ impl Macmon {
         let alive = Arc::new(AtomicBool::new(true));
         let (l, a) = (latest.clone(), alive.clone());
         std::thread::spawn(move || {
-            // 1 行は 256KiB まで。越えたら捨てて欠測にする
-            let mut r = BufReader::new(out);
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                match (&mut r).take(262_145).read_until(b'\n', &mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) if line.len() > 262_144 => break,
-                    Ok(_) => {}
-                }
-                let parsed = serde_json::from_slice::<Value>(&line).ok().and_then(|v| macmon_metrics(&v));
-                let mut g = l.lock().unwrap_or_else(|e| e.into_inner());
-                *g = match parsed {
-                    Some(m) => (Some(m), Some(Instant::now())),
-                    None => (None, g.1),
-                };
-            }
+            read_macmon(out, &l);
             a.store(false, Ordering::SeqCst);
         });
         Ok(Macmon { child, latest, alive, ttl: Duration::from_secs_f64((interval * 3.0).max(3.0)) })
@@ -973,6 +989,25 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn macmon_recovers_after_oversized_frames() {
+        for size in [262_144, 262_145, 524_288] {
+            let latest: Latest = Arc::new(Mutex::new((None, None)));
+            let mut input = vec![b'x'; size];
+            input.extend_from_slice(b"\n{\"all_power\":2.5}\n");
+            read_macmon(std::io::Cursor::new(input), &latest);
+            let g = latest.lock().unwrap();
+            assert_eq!(g.0.as_ref().map(|m| m["power"]["soc_w"].clone()), Some(json!(2.5)), "oversized frame length {size}");
+        }
+    }
+
+    #[test]
+    fn macmon_oversized_frame_clears_previous_metrics_even_at_eof() {
+        let latest: Latest = Arc::new(Mutex::new((macmon_metrics(&json!({"all_power": 1})), Some(Instant::now()))));
+        read_macmon(std::io::Cursor::new(vec![b'x'; 524_288]), &latest);
+        assert!(latest.lock().unwrap().0.is_none());
+    }
 
     /// Subprocess entry: a real sampler owns real fixture macmon while stdout is full.
     #[test]
