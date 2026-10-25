@@ -39,6 +39,10 @@ impl Review {
         self.lifecycle.lock().ok().and_then(|state| state.ready.then_some(state.generation))
     }
 
+    pub async fn confirm<F: std::future::Future<Output = bool>>(&self, _generation: u64, confirm: impl FnOnce() -> F) -> bool {
+        confirm().await
+    }
+
     fn register(&self, generation: u64, id: String, tx: oneshot::Sender<bool>) -> bool {
         let Ok(mut state) = self.lifecycle.lock() else { return false };
         if !state.ready || state.generation != generation {
@@ -119,5 +123,42 @@ mod tests {
         review.ready();
         let (tx, _) = oneshot::channel();
         assert!(!review.register(before_preparation, "old-page".into(), tx));
+    }
+
+    #[tokio::test]
+    async fn queued_preview_acceptance_cannot_confirm_after_the_page_was_replaced() {
+        let review = Review::default();
+        review.ready();
+        let generation = review.generation().unwrap();
+        let (tx, rx) = oneshot::channel();
+        assert!(review.register(generation, "accepted-old-page".into(), tx));
+        assert!(review.answer("accepted-old-page", true));
+        review.cancel();
+        review.ready();
+        assert!(rx.await.unwrap(), "the old acceptance was already queued");
+        let called = std::cell::Cell::new(false);
+        let approved = review
+            .confirm(generation, || {
+                called.set(true);
+                async { true }
+            })
+            .await;
+        assert!(!approved, "a page replacement revokes the old preview");
+        assert!(!called.get(), "native approval must not be shown for an invalidated preview");
+    }
+
+    #[tokio::test]
+    async fn page_replacement_during_native_confirmation_revokes_the_approval() {
+        let review = Review::default();
+        review.ready();
+        let generation = review.generation().unwrap();
+        let approved = review
+            .confirm(generation, || async {
+                review.cancel();
+                review.ready();
+                true
+            })
+            .await;
+        assert!(!approved, "native approval cannot authorize a request whose page was replaced");
     }
 }

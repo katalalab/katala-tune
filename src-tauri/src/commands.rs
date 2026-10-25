@@ -170,7 +170,7 @@ pub async fn ai_handoff(
     }
     let title = format!("{} に調査依頼を渡しますか", agent.label());
     let detail = format!("{detail}\n\n画面で確認した全文を渡します。設定・ファイルの変更は別途承認が必要です。\n\nプロンプト SHA-256: {hash}");
-    if !crate::confirm::ask(app, crate::confirm::HANDOFF)(title, detail).await {
+    if !review.confirm(generation, || crate::confirm::ask(app, crate::confirm::HANDOFF)(title, detail)).await {
         return Ok(e.handoff_cancel(&p, agent));
     }
     Ok(e.handoff_launch(&p, agent))

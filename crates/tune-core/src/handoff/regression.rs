@@ -97,6 +97,21 @@ fn prepare_uses_the_same_fresh_config_for_the_finding_and_protection_rules() {
 }
 
 #[test]
+fn changed_protection_rules_require_a_new_preview_without_launching_the_old_prompt() {
+    let f = Fixture::new();
+    std::fs::write(f.dir.join("nodes.json"), r#"{"nodes":[{"id":"a","alias":"a","os":"macos"}],"protect":["protected-a","protected-new"]}"#).unwrap();
+    let calls = Cell::new(0);
+    let r = f.e().handoff_launch_with(&f.prepared, Agent::Codex, |_, _, _| {
+        calls.set(calls.get() + 1);
+        Ok(())
+    });
+    assert_eq!(calls.get(), 0, "new protections must not be omitted from the approved prompt");
+    assert_eq!(r["ok"], false);
+    assert!(r["refused"].as_str().unwrap().contains("保護対象"));
+    assert!(!f.dir.join("data/handoff").exists());
+}
+
+#[test]
 fn pending_insert_failure_prevents_launch() {
     let f = Fixture::new();
     f.sql("CREATE TRIGGER reject_handoff BEFORE INSERT ON tune_actions WHEN NEW.type='ai-handoff' BEGIN SELECT RAISE(FAIL,'insert rejected'); END;");
