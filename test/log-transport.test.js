@@ -146,3 +146,58 @@ test('Windows Git Bash executes >8191-byte bodies and rejects corrupt or truncat
   assert.equal(security.code, 0);
   assert.equal(security.out.trim().replace(/\r/g, ''), '9223372036854775807\n9223372036854775807');
 });
+
+test('completion observed after deadline is refused even before timer dispatch', async () => {
+  const fs = require('node:fs');
+  const vm = require('node:vm');
+  const filename = require.resolve('../lib/windows-log-transport');
+  const realRequire = require('node:module').createRequire(filename);
+  let now = 0;
+  const child = pipeFixture('unused');
+  child.stdin.end = (_input, cb) => queueMicrotask(() => {
+    cb(); child.stdout.emit('data', Buffer.from('{}'));
+    child.stdout.emit('end'); child.stderr.emit('end');
+    now = 11;
+    child.emit('close', 0);
+  });
+  const module = { exports: {} };
+  vm.runInNewContext(fs.readFileSync(filename, 'utf8'), {
+    module, __dirname: require('node:path').dirname(filename), Buffer, TextDecoder, setTimeout, clearTimeout,
+    require: name => name === 'node:perf_hooks' ? { performance: { now: () => now } } : realRequire(name),
+  });
+  const result = await module.exports.runWindowsLogs('fixture', [], { input: 'fixture', timeoutMs: 10 }, () => child);
+  assert.equal(result.code, null);
+  assert.equal(result.out, '');
+});
+
+test('fetch passes each independent stdin frame and honors disabled Security collection', async () => {
+  for (const network of [false, true]) {
+    const calls = [];
+    const db = { cursor: () => ({ cursor: '5' }), cursorError() {}, cursorOk() {}, insertLogs: () => 0 };
+    await syncNode(db, { ...node, network }, { runWindows: async (cmd, args, options) => {
+      calls.push({ cmd, args, options });
+      assert.equal(cmd, 'ssh');
+      assert.equal(args.at(-2), node.alias);
+      assert.match(options.input, /^KTLOG1\n(events|logons)\n/);
+      assert.equal(options.timeoutMs, 90000);
+      return options.input.startsWith('KTLOG1\nlogons\n')
+        ? { code: 0, out: JSON.stringify({ sources: { win_security: { cursor: '10', rows: [] } } }), err: '' } : ok;
+    } });
+    assert.equal(calls.length, network ? 2 : 1);
+    if (network) assert.notEqual(calls[0].options.input, calls[1].options.input);
+  }
+});
+
+test('Security failure keeps its prior DB cursor while verified event cursors advance', async t => {
+  const fs = require('node:fs');
+  const dir = fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'kt-log-sec-'));
+  const db = require('../lib/db').openDb(dir);
+  t.after(() => { db.db.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+  db.cursorOk(node.id, 'win_security', '5', 0, 0);
+  const summary = await syncNode(db, { ...node, network: true }, { runWindows: async (_cmd, _args, t) => t.input.startsWith('KTLOG1\nlogons\n')
+    ? { code: 255, out: JSON.stringify({ sources: { win_security: { cursor: '99', rows: [] } } }), err: 'synthetic disconnect' } : ok });
+  assert.equal(summary.sources.win_system.inserted, 0);
+  assert.equal(db.cursor(node.id, 'win_system').cursor, '10');
+  assert.equal(db.cursor(node.id, 'win_security').cursor, '5');
+  assert.equal(db.cursor(node.id, 'win_security').last_error, 'synthetic disconnect');
+});

@@ -158,7 +158,23 @@ mod tests {
             results.push(json!({"error":summary.get("error").unwrap_or(&Value::Null),"state":state}));
             let r = fixture_result(c, &json!({"sources":{"win_security":{"cursor":"9","rows":[]}}}));
             let main = RunResult { code: Some(0), out: valid.to_string(), err: String::new() };
-            security.push(crate::collect::last_json_line(&logs::merge_logons(main, r).out).unwrap());
+            let merged = logs::merge_logons(main, r);
+            let data = crate::collect::last_json_line(&merged.out).unwrap();
+            let security_node = crate::nodes::Node::from_value(&json!({"id":"example-node","os":"windows"}), "no-such-host");
+            let all = ["win_system", "win_application", "neonmonitor", "win_security"];
+            let db = Mutex::new(crate::db::Store::open_in_memory().unwrap());
+            for s in all {
+                db.with(|d| d.cursor_ok(&security_node.id, s, Some(&json!("5")), 0, &json!(0), None)).unwrap();
+            }
+            logs::ingest_result(&db, &security_node, &all, merged);
+            let state: serde_json::Map<String, Value> = ["win_system", "win_security"]
+                .iter()
+                .map(|s| {
+                    let cursor = db.with(|d| d.cursor(&security_node.id, s)).unwrap().unwrap();
+                    ((*s).into(), json!({"cursor":cursor["cursor"],"error":cursor["last_error"]}))
+                })
+                .collect();
+            security.push(json!({"data":data,"state":state}));
         }
         let expected = json!({"transport":transports,"results":results,"security":security});
         let evaluator = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/js/eval_log_transport.js");

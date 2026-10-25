@@ -25,10 +25,17 @@ const resultOf = c => ({ code: c.code, out: c.output === 'valid' ? valid : c.out
     results.push({ error: summary.error ?? null, state });
   }
   const main = { code: 0, out: valid, err: '' };
-  const security = cases.results.map(c => {
+  const security = [];
+  for (const c of cases.results) {
     const r = resultOf(c);
     if (c.output === 'valid') r.out = JSON.stringify({ sources: { win_security: { cursor: '9', rows: [] } } });
-    return collect.lastJsonLine(logs.mergeLogons(main, r).out);
-  });
+    const merged = collect.lastJsonLine(logs.mergeLogons(main, r).out);
+    const state = Object.fromEntries([...sourceNames, 'win_security'].map(s => [s, { cursor: '5', error: null }]));
+    const db = { cursor: (_n, s) => state[s], insertLogs: () => 0,
+      cursorOk: (_n, s, cursor) => { state[s] = { cursor, error: null }; },
+      cursorError: (_n, s, error) => { state[s].error = error; } };
+    await logs.syncNode(db, { ...node, network: true }, { runWindows: async (_cmd, _args, t) => t.input.startsWith('KTLOG1\nlogons\n') ? r : main });
+    security.push({ data: merged, state: { win_system: state.win_system, win_security: state.win_security } });
+  }
   process.stdout.write(JSON.stringify({ transport, results, security }));
 })().catch(() => { process.stderr.write('Log transport parity evaluation failed\n'); process.exitCode = 1; });
