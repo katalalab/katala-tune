@@ -497,15 +497,34 @@ async fn probe_exchange_command_until(mut command: Command, deadline: tokio::tim
     .is_some();
     let mut stdout_task = tokio::spawn(read_probe_pipe(child.stdout.take(), 1_048_576));
     let mut stderr_task = tokio::spawn(read_probe_pipe(child.stderr.take(), 65_536));
-    let status = tokio::time::timeout_at(work_deadline, child.wait()).await.ok().and_then(Result::ok);
-    let stdout = tokio::time::timeout_at(work_deadline, &mut stdout_task).await.ok().and_then(Result::ok).and_then(Result::ok);
-    let stderr = tokio::time::timeout_at(work_deadline, &mut stderr_task).await.ok().and_then(Result::ok).and_then(Result::ok);
+    let waited = tokio::time::timeout_at(work_deadline, child.wait()).await;
+    let out_read = tokio::time::timeout_at(work_deadline, &mut stdout_task).await;
+    let err_read = tokio::time::timeout_at(work_deadline, &mut stderr_task).await;
+    let expired = waited.is_err() || out_read.is_err() || err_read.is_err();
+    let pipe_failed = matches!(&out_read, Ok(Err(_) | Ok(Err(())))) || matches!(&err_read, Ok(Err(_) | Ok(Err(()))));
+    let status = waited.ok().and_then(Result::ok);
+    let stdout = out_read.ok().and_then(Result::ok).and_then(Result::ok);
+    let stderr = err_read.ok().and_then(Result::ok).and_then(Result::ok);
     if !stdin_ok || status.as_ref().and_then(|value| value.code()) != Some(0) || stdout.is_none() || stderr.is_none() {
         stdout_task.abort();
         stderr_task.abort();
         let _ = child.start_kill();
         let _ = tokio::time::timeout_at(deadline, child.wait()).await;
-        return RunResult { code: Some(9), out: String::new(), err: "Windows probe transport outcome unverified".into() };
+        // Classify only complete, bounded SSH diagnostics; raw host/user/path
+        // strings never leave this failure path.
+        let kind = if pipe_failed {
+            "error"
+        } else if expired {
+            "timeout"
+        } else if status.as_ref().and_then(|v| v.code()) == Some(255)
+            && stdout.is_some()
+            && let Some(stderr) = stderr.as_ref()
+        {
+            classify_failure(&RunResult { code: Some(255), out: String::new(), err: decode(stderr) })
+        } else {
+            "error"
+        };
+        return RunResult { code: Some(9), out: String::new(), err: format!("Windows probe failure={kind}") };
     }
     RunResult { code: Some(0), out: decode(&stdout.unwrap()), err: decode(&stderr.unwrap()) }
 }
@@ -773,6 +792,13 @@ async fn action_exchange_command(mut c: Command, body: &[u8], timeout: Duration)
 /// timeout: 接続はできたが、こちらの打ち切り（run が足す `timeout <ms>ms`）まで終わらなかった。
 /// unreachable: ssh が相手に届かない（名前が引けない・拒否・経路なし・接続の時間切れ）。auth: 鍵・ホスト鍵で入れない。error: それ以外
 pub fn classify_failure(res: &RunResult) -> &'static str {
+    match res.err.as_str() {
+        "Windows probe failure=timeout" => return "timeout",
+        "Windows probe failure=unreachable" => return "unreachable",
+        "Windows probe failure=auth" => return "auth",
+        "Windows probe failure=error" => return "error",
+        _ => {}
+    }
     static TIMEOUT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"timeout \d+ms\s*$").expect("TIMEOUT"));
     static AUTH: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)Permission denied|Host key verification failed|Authentication failed|Too many authentication failures").expect("AUTH")
@@ -1553,6 +1579,29 @@ sys.stderr.write('z');sys.stderr.flush();time.sleep(3)"#,
         }
         drop(fixture);
         assert!(!root.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn windows_probe_preserves_closed_ssh_failure_classification() {
+        for (diagnostic, expected) in [
+            ("fixture-private: Permission denied (publickey).", "auth"),
+            ("ssh: Could not resolve hostname fixture-private", "unreachable"),
+            ("helper rejected fixture-private", "error"),
+        ] {
+            let mut command = Command::new("/usr/bin/env");
+            command.args(["python3", "-c", "import sys; print('partial'); sys.stderr.write(sys.argv[1]); sys.exit(255)", diagnostic]);
+            let r = probe_exchange_command_until(command, tokio::time::Instant::now() + Duration::from_secs(5)).await;
+            assert_eq!(classify_failure(&r), expected);
+            assert_eq!(r.code, Some(9));
+            assert!(r.out.is_empty());
+            assert!(!r.err.contains("fixture-private"));
+        }
+        let mut command = Command::new("/usr/bin/env");
+        command.args(["python3", "-c", "import time; time.sleep(2)"]);
+        let r = probe_exchange_command_until(command, tokio::time::Instant::now() + Duration::from_millis(100)).await;
+        assert_eq!(classify_failure(&r), "timeout");
+        assert!(r.out.is_empty());
     }
 
     #[tokio::test]

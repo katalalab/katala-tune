@@ -36,7 +36,10 @@ CPU 使用率・実行ファイル名・同名プロセス数だけでは、不�
 - 承認が無ければ実行器を呼ばない。承認の後にもう一度台帳を読み直し、接続先（alias・OS・この機体か）が変わっている・共用機や保護対象になっている・台帳を読めないときは実行せず、理由（「中止（実行していない）: …」）を実行記録に残す。
 - 実行の直前に「未完了」の記録を書く（書けなければ実行しない）。実行が終わったら同じ記録に結果と戻し操作を書く。結果を書く前にアプリが止まった操作は、再起動後も「未完了」のままで、成功にも失敗にも数えない。戻す操作も出さない（状態が分からないものを戻さない）。
 - probe の失敗は `reason`（timeout・unreachable・auth・error）と画面用の `reason_text` に分ける。元のエラー文は残す。
+- 固定Windows probeの失敗は、完全に読み終えた上限内のSSH stderrを内部で分類してから破棄し、閉じた失敗種別だけを返す。SSH exit 255の認証/接続失敗とcontrollerの期限超過を区別し、helperの非0終了・不完全なpipe・上限超過は成功snapshotとして扱わない。この経路ではraw stderrを画面や記録へ渡さない。
 - 流れは `lib/runner.js`（Electron）と `Engine::confirm_and_run`（Rust）。どちらも子プロセスの実行口を差し替えられ、受入試験は偽の ssh と一時ディレクトリの偽の対象で行う（`test/acceptance-issue19.test.js`・`crates/tune-core/tests/acceptance_issue19.rs`、記録は `docs/acceptance/issue-19.md`）。
+- 戻し操作は、元操作のローカル監査記録に保存した route（SSH alias・OS・local・承認helperのartifact record）と現在の台帳が一致する場合だけ確認へ進む。記録のない旧履歴は自動で戻さない。この照合は台帳上のroute bindingであり、同じaliasのSSH設定変更や同一helperを持つ別機体を識別するhost identity証明ではない。台帳にはその証明に使えるpin済みhost key/machine identityの契約がないため、SSHの接続先変更は操作者の管理が必要。
+- Windowsタスクの有効/無効変更は、対象側で実行前の`Settings.Enabled`を読み、cmdletの非終端エラーも失敗にし、実行後の同じ値を読み戻す。閉じた前後状態の結果が一致して初めて成功とし、状態が変わった場合だけ元値への戻し操作を作る。既に要求状態なら変更もundo生成もしない。戻す直前の状態が元操作の適用後状態と違う場合は書き込まない。タスクの実行操作はStart要求の成功までを記録し、ジョブ本体の完了は保証しない。
 
 ## macOS のキャッシュ候補と保存領域
 
