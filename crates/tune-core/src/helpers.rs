@@ -1,7 +1,8 @@
 //! アプリに同梱した道具（`tune` CLI・Windows の `tune-agent` サンプラー）を、アプリと同じ版に保つ。
 //!
 //! - この機体: 起動のたびに、アプリの隣にある道具を `~/.katala-tune/bin` へ写す（中身が違うときだけ）。
-//!   ハブの写し（`tune export`）とローカルのサンプラーは常にアプリと同じ版になる
+//!   Windows の既存 tune.exe は承認済みハッシュを保つため自動で上書きせず、artifact と台帳を明示的に更新する。
+//!   ローカルのサンプラーはアプリと同じ版に保ち、Windows CLI の版は承認した更新に従う
 //! - ほかの Windows の機体: ハブ（常時監視）が、サンプラーの hello に入った版が古い・無い機体へ、同梱のサンプラーを
 //!   SSH の標準入力で送り、SHA-256 を確かめてから入れ替える（`~/.katala-tune/bin` だけ。probe.ps1 を置くのと同じ場所）
 //!
@@ -36,6 +37,10 @@ pub fn bin_dir() -> PathBuf {
 
 /// from（アプリの隣）にある道具のうち、to と中身が違うものを写す。戻り値は道具ごとの結果
 pub fn sync(from: &Path, to: &Path, names: &[&str]) -> Vec<Value> {
+    sync_with_policy(from, to, names, cfg!(windows))
+}
+
+fn sync_with_policy(from: &Path, to: &Path, names: &[&str], preserve_windows_helper: bool) -> Vec<Value> {
     names
         .iter()
         .filter_map(|n| {
@@ -45,6 +50,13 @@ pub fn sync(from: &Path, to: &Path, names: &[&str]) -> Vec<Value> {
             let hash = sha256_hex(&bytes);
             if std::fs::read(&dst).ok().is_some_and(|b| sha256_hex(&b) == hash) {
                 return Some(json!({ "name": n, "sha256": hash, "changed": false }));
+            }
+            // The ledger approves exact Windows helper bytes. App updates must not
+            // invalidate that approval; replacing tune.exe requires a coordinated
+            // artifact + ledger rollout (docs/windows-helper-approval.md).
+            if preserve_windows_helper && *n == "tune" && dst.exists() {
+                return Some(json!({ "name": n, "sha256": std::fs::read(&dst).ok().map(|bytes| sha256_hex(&bytes)), "bundled_sha256": hash, "changed": false, "approval_required": true,
+                    "error": "existing Windows helper retained; deploy the verified artifact and ledger record together" }));
             }
             Some(match replace(to, &dst, &bytes, &hash) {
                 Ok(()) => json!({ "name": n, "sha256": hash, "changed": true }),
@@ -192,16 +204,34 @@ mod tests {
         let (from, to) = (base.join("app"), base.join("bin"));
         std::fs::create_dir_all(&from).unwrap();
         std::fs::write(from.join(exe("tune")), b"v1").unwrap();
-        let r = sync(&from, &to, &["tune", "tune-agent"]);
+        let r = sync_with_policy(&from, &to, &["tune", "tune-agent"], false);
         assert_eq!(r.len(), 1, "無い道具は飛ばす");
         assert_eq!(r[0]["changed"], true);
         assert_eq!(std::fs::read(to.join(exe("tune"))).unwrap(), b"v1");
-        assert_eq!(sync(&from, &to, &["tune"])[0]["changed"], false, "同じなら写さない");
+        assert_eq!(sync_with_policy(&from, &to, &["tune"], false)[0]["changed"], false, "同じなら写さない");
         std::fs::write(from.join(exe("tune")), b"v2").unwrap();
-        assert_eq!(sync(&from, &to, &["tune"])[0]["changed"], true);
+        assert_eq!(sync_with_policy(&from, &to, &["tune"], false)[0]["changed"], true);
         assert_eq!(std::fs::read(to.join(exe("tune"))).unwrap(), b"v2");
         let left: Vec<String> = std::fs::read_dir(&to).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
         assert_eq!(left, [exe("tune")], "古い物・途中の物は残さない");
         let _ = std::fs::remove_dir_all(&base);
+    }
+    #[test]
+    fn windows_app_sync_retains_an_existing_approved_helper() {
+        let base = std::env::temp_dir().join(format!("kt-helper-pin-{}-{}", std::process::id(), now_ms()));
+        let (from, to) = (base.join("app"), base.join("bin"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(from.join(exe("tune")), b"new-app-helper").unwrap();
+        std::fs::write(to.join(exe("tune")), b"approved-helper").unwrap();
+        std::fs::write(from.join(exe("tune-agent")), b"agent").unwrap();
+        let results = sync_with_policy(&from, &to, &["tune", "tune-agent"], true);
+        assert_eq!(results[0]["changed"], false);
+        assert_eq!(results[0]["approval_required"], true);
+        assert_eq!(results[0]["sha256"], sha256_hex(b"approved-helper"));
+        assert_eq!(results[0]["bundled_sha256"], sha256_hex(b"new-app-helper"));
+        assert_eq!(std::fs::read(to.join(exe("tune"))).unwrap(), b"approved-helper");
+        assert_eq!(std::fs::read(to.join(exe("tune-agent"))).unwrap(), b"agent");
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

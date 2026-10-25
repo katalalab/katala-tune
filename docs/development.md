@@ -40,7 +40,17 @@ Tauri QA は本番アプリを終了・置換しない。別 identifier / produc
 
 ## データと検証の分離
 
-本番の台帳・DB をテストデータへ上書きしない。検証は CLI の `--help` にある DB 指定と合成台帳を使う。アプリの版・実行環境・操作結果を揃えて記録する。分析は CPU 計測を含むので、負荷試験の禁止中の機体を除き、除外理由を残す。
+本番の台帳・DB をテストデータへ上書きしない。検証は CLI の `--help` にある環境変数指定と合成台帳を使う（`logs` の DB は `--db` で指定）。アプリの版・実行環境・操作結果を揃えて記録する。分析は CPU 計測を含むので、負荷試験の禁止中の機体を除き、除外理由を残す。
+
+### CLI の発見と副作用
+
+`tune --help` / `tune help` は全公開コマンド、`tune help <command>` は引数・出力形式・副作用を表示する。成功時は stdout と exit 0、未知の help 対象や不正な discovery 引数は stderr と exit 2。内部 native reader のプロトコルは対象外。
+
+`tune cli-info --json` は `schema_version: 1`、`cli_version`、`commands` を返す。各項目は `name`、`arguments`（usage 構文の文字列配列）、`summary`、`output.default/formats`、`effects`、`notes`。引数の `[]` は任意、`<>` は必須、`...` は繰返しを表す。これは入力検証用 JSON Schema ではない。既存コマンドの出力を包む形式でもない。
+
+`effects` は台帳/DB/peer状態の読書き、機体接続、helper配布が実行条件次第で起こり得るかを示す。初期作成・移行も書込に含むので、`last` / `status` / `export` などの照会も `writes_db: true` になる。条件は `notes` を参照。collector の子プロセス・一時ファイルや接続ツール自身の状態もあり、許可判定や sandbox の代わりにはしない。
+
+help と cli-info は台帳・DB・鍵を開かず、機体へ接続しない。公開コマンドを増やすときは `crates/tune-cli/src/discovery.rs` の一覧と実行バイナリの discovery テストも更新する。
 
 Electron は比較用。必要なときだけ `npm rebuild electron` でバイナリを取得する。標準の起動・配布は Electron を使わない。共通 DB に旧版と新版が同時に書かないよう、片方を終了して切り替える。
 

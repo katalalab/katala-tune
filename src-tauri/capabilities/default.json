@@ -34,6 +34,8 @@
     "allow-set-login",
     "allow-dev-report",
     "allow-inventory",
+    "allow-specs-view",
+    "allow-specs-refresh",
     "allow-inventory-run",
     "allow-dogu-refresh",
     "allow-dogu-exclude",

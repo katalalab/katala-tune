@@ -6,7 +6,7 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
 const { loadConfig, ensureConfig } = require('./lib/nodes');
-const { probeAll, execOn } = require('./lib/collect');
+const { probeAll, execOn, actionExchange } = require('./lib/collect');
 const { analyze, score, compare } = require('./lib/rules');
 const { makeRunner } = require('./lib/runner');
 const { openDb } = require('./lib/db');
@@ -324,6 +324,7 @@ const runner = makeRunner({
     return response === 0;
   },
   exec: execOn,
+  actionExchange,
   get db() { return db; },
 });
 

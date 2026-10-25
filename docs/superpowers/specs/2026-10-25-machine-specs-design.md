@@ -1,0 +1,15 @@
+# Mac / Windows machine specification comparison
+
+The user approved implementation of Rust collectors on each machine, SSH aggregation and a comparison view. Extend the existing Rust CLI and Tauri application, retaining the vanilla JavaScript UI and private node ledger. Work in the dedicated clone for this chat; do not alter another checkout.
+
+Collect CPU, GPU, memory modules, storage, board/system, firmware, OS, displays, network adapters, USB/Thunderbolt/PCI devices and available power/security/virtualization settings. Rust owns execution, bounded output, normalization and validation. Use operating-system providers (CIM through the installed PowerShell on Windows; system_profiler/sysctl/pmset on macOS), without Python or installed scripts. The finite `tune specs-local` command requires no ledger or database. Remote collection invokes that command through the existing SSH connection; no automatic binary installation during collection.
+
+Keep observations separate from manufacturer specifications. Each component has an OS-provider source. Exact model matches in a versioned, cited official catalog expose published facts and a match status. Unmatched components explicitly remain unverified; never substitute a similarly named product. Vendor documentation links must not imply a verified product specification. Never equate unified memory and dedicated VRAM, nor interpret missing/permission-denied data as absent hardware. List unsupported settings (including unexposed BIOS/XMP/EXPO settings) explicitly.
+
+Store latest successful reports and the latest attempt separately in the existing private SQLite meta store. A failed refresh retains the previous successful report with its timestamp and failure indication. Validate schema/platform, bound rows/strings and whitelist fields before persistence. Do not collect serial numbers, UUIDs, MAC/IP addresses, SSIDs, user names or file paths. Respect retired/paused/shared/protected nodes and invalid aliases. Collect only on request, with a per-refresh lock and time/output limits.
+
+Add a sidebar view with machine selection, refresh, differences-only filter, search, copy JSON, horizontally scrollable comparison and per-component details/source references. Show freshness, missing fields and errors. Electron compatibility mode should explain that Rust collection requires Tauri. No changes to host settings, drivers or firmware.
+
+Alternatives: extending Python/PowerShell probes alone would not satisfy the Rust collector requirement; implementing every OS API through handwritten FFI adds unsafe code and dependencies to a project that denies unsafe code. The approved approach uses Rust with native OS providers and a stable report contract.
+
+Acceptance: normalization/remote-contract/privacy/catalog/failure-retention tests; renderer escaping/filter/error tests; repository check and OSS checks; real Windows and macOS collection; actual Tauri IPC and rendered comparison verification where available. Builds and local installation are within the requested update; public releases and changes to other active checkouts are separate.
