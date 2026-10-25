@@ -193,13 +193,15 @@ test('Windows のログオンの記録は別のスクリプトで、同じ運び
   assert.match(source, /\$batch\[-1\]\.RecordId \+ ':' \+ \[string\]\(EpochMs \$batch\[-1\]\.TimeCreated\)/);
 });
 
-test('Windows netsec は隔離した子だけを止め、完了済みの部分を20秒以内に残す', () => {
+test('Windows netsec は隔離した子だけを止め、期限内の両EOFと出力上限を要求する', () => {
   const source = fs.readFileSync(path.join(PROBES, 'win_probe.ps1')).subarray(3).toString('ascii');
   assert.doesNotMatch(source, /\[PowerShell\]::Create\(\)|\.Stop\(\)/);
   assert.match(source, /ProcessStartInfo/);
   assert.match(source, /RedirectStandardInput = \$true/);
   assert.match(source, /\$nsBudgetMs = 15000/);
-  assert.match(source, /17000 - \[int\]\$outerWatch\.ElapsedMilliseconds/);
+  assert.match(source, /Read-KtProcessOutput \$child \$outerWatch 17000/);
+  assert.match(source, /\$DeadlineMs - \[int\]\$Clock\.ElapsedMilliseconds/);
+  assert.doesNotMatch(source, /ReadToEndAsync/);
   assert.match(source, /19500 - \[int\]\$outerWatch\.ElapsedMilliseconds/);
   assert.match(source, /\.Kill\(\)/);
   assert.match(source, /\[Console\]::Out\.Flush\(\)/);

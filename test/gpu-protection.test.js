@@ -137,6 +137,8 @@ public static class KatalaGpuFixture {
     string log = Environment.GetEnvironmentVariable("KT_GPU_SPAWN_LOG");
     if (mode != "sleep" && !String.IsNullOrEmpty(log)) File.AppendAllText(log, mode + "\\n");
     if (mode == "small") { Console.Write("GPU-test, 0\\n"); return 0; }
+    if (mode == "crlf") { Console.Write("GPU-test, 0\\r\\n\\r\\n"); return 0; }
+    if (mode == "malformed") { Console.Write("GPU-test, 0\\r\\ninvalid\\r\\n"); return 0; }
     if (mode == "stdout-65536") { Write(Console.OpenStandardOutput(), 65536); return 0; }
     if (mode == "stderr-65536") { Console.Write("GPU-test, 0\\n"); Write(Console.OpenStandardError(), 65536); return 0; }
     if (mode == "stdout-65537") { Write(Console.OpenStandardOutput(), 65537); return 0; }
@@ -171,9 +173,11 @@ public static class KatalaGpuFixture {
     assert.equal(compiler.status, 0, compiler.stderr || compiler.stdout);
     const power = plan(node, { type: 'set-gpu-power-limit', params: { uuid: 'GPU-01234567-89ab-cdef-0123-456789abcdef', watts: 180, min: 100, max: 250, prev_w: 200 } }, { protect: [] });
     const helper = helperFor(power.script);
-    const run = (mode, expected) => { fs.rmSync(spawnLog, { force: true }); return ps(`function Test-KatalaGpuDeadline {}; ${helper}; $script:KatalaGpuGuardClock = [Diagnostics.Stopwatch]::StartNew(); $script:KatalaGpuMutationStarted = $false; $script:KatalaGpuSmiSource = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${b64(fixture)}")); $script:KatalaGpuSmiFunction = $false; $env:KT_GPU_CHILD_PID = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${b64(childPid)}")); $env:KT_GPU_SPAWN_LOG = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${b64(spawnLog)}")); $argsValue = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${b64(mode)}")); $rows = @(Invoke-KatalaGpuSmi $argsValue); if ([bool]$script:KatalaGpuSmiFailed -ne ${expected.failed ? '$true' : '$false'}) { exit 2 }; if ([bool]$script:KatalaGpuSmiTimedOut -ne ${expected.timedOut ? '$true' : '$false'}) { exit 3 }; if ([bool]$script:KatalaGpuSmiTransportFailed -ne ${expected.transport ? '$true' : '$false'}) { exit 4 }; ${expected.length == null ? '' : `if ($rows.Count -ne 1 -or $rows[0].Length -ne ${expected.length}) { exit 4 };`} ${expected.small ? 'if ($rows.Count -lt 1 -or $rows[0] -ne "GPU-test, 0") { exit 5 };' : ''} ${expected.reason ? `if ($script:KatalaGpuSmiFailureReason -notmatch "${expected.reason}") { exit 6 };` : ''} ${expected.twice ? 'Invoke-KatalaGpuSmi $argsValue | Out-Null; if (-not $script:KatalaGpuSmiFailed) { exit 8 };' : ''} exit 0`); };
+    const run = (mode, expected) => { fs.rmSync(spawnLog, { force: true }); return ps(`function Test-KatalaGpuDeadline {}; ${helper}; $script:KatalaGpuGuardClock = [Diagnostics.Stopwatch]::StartNew(); $script:KatalaGpuMutationStarted = $false; $script:KatalaGpuSmiSource = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${b64(fixture)}")); $script:KatalaGpuSmiFunction = $false; $env:KT_GPU_CHILD_PID = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${b64(childPid)}")); $env:KT_GPU_SPAWN_LOG = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${b64(spawnLog)}")); $argsValue = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${b64(mode)}")); $rows = @(Invoke-KatalaGpuSmi $argsValue); if ([bool]$script:KatalaGpuSmiFailed -ne ${expected.failed ? '$true' : '$false'}) { exit 2 }; if ([bool]$script:KatalaGpuSmiTimedOut -ne ${expected.timedOut ? '$true' : '$false'}) { exit 3 }; if ([bool]$script:KatalaGpuSmiTransportFailed -ne ${expected.transport ? '$true' : '$false'}) { exit 4 }; ${expected.length == null ? '' : `if ($rows.Count -ne 1 -or $rows[0].Length -ne ${expected.length}) { exit 4 };`} ${expected.malformed ? 'if ($rows.Count -ne 2 -or $rows[1] -ne "invalid") { exit 6 };' : ''} ${expected.small ? 'if ($rows.Count -ne 1 -or $rows[0] -ne "GPU-test, 0") { exit 5 };' : ''} ${expected.reason ? `if ($script:KatalaGpuSmiFailureReason -notmatch "${expected.reason}") { exit 6 };` : ''} ${expected.twice ? 'Invoke-KatalaGpuSmi $argsValue | Out-Null; if (-not $script:KatalaGpuSmiFailed) { exit 8 };' : ''} exit 0`); };
     for (const [mode, expected] of [
       ['small', { failed: false, timedOut: false, transport: false, small: true }],
+      ['crlf', { failed: false, timedOut: false, transport: false, small: true }],
+      ['malformed', { failed: false, timedOut: false, transport: false, malformed: true }],
       ['stdout-65536', { failed: false, timedOut: false, transport: false, length: 65536 }],
       ['stderr-65536', { failed: false, timedOut: false, transport: false }],
       ['stdout-65537', { failed: true, timedOut: false, transport: true, reason: 'stdout exceeded' }],
@@ -287,22 +291,23 @@ test('KT2 exchange waits for READY before its only request and classifies termin
   const helper = 'b'.repeat(64);
   const fixture = String.raw`const crypto=require('node:crypto');let early=false, chunks=[];process.stdin.on('data',d=>{early=true;chunks.push(d)});setTimeout(()=>{if(early){process.exit(91);return}process.stdout.write('KT2 READY ${nonce}\n');process.stdin.on('end',()=>{const all=Buffer.concat(chunks);const line=all.subarray(0,all.indexOf(10)).toString('ascii').split(' ');const bytes=all.subarray(all.indexOf(10)+1);if(line.length!==5||line[0]!=='KT2'||line[1]!=='REQUEST'||line[2]!=='${nonce}'||Number(line[3])!==bytes.length||line[4]!==crypto.createHash('sha256').update(bytes).digest('hex')){process.exit(92);return}process.stdout.write('KT2 RESULT ${nonce} '+line[4]+' 0 2 0\nok')})},30);`;
   const node2 = { ...node, local: false };
-  const options = { command: { cmd: process.execPath, args: ['-e', fixture] }, timeoutMs: 1000 };
+  // Successful exchange includes OS/Node startup; short deadlines below test timeout behavior.
+  const options = { command: { cmd: process.execPath, args: ['-e', fixture] }, timeoutMs: 5000 };
   const good = await actionExchange(node2, helper, body, options);
   assert.deepEqual(good, { code: 0, out: 'ok', err: '' });
 
   const badHash = fixture.replace("+' 0 2 0\\nok'", "+'x'.repeat(64)+' 0 2 0\\nok'");
-  const bad = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', badHash] }, timeoutMs: 1000 });
+  const bad = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', badHash] }, timeoutMs: 5000 });
   assert.equal(bad.code, 7);
 
   const exit255 = `${fixture}process.on('beforeExit',()=>{process.exitCode=255});`;
-  const nonzero = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', exit255] }, timeoutMs: 1000 });
+  const nonzero = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', exit255] }, timeoutMs: 5000 });
   assert.equal(nonzero.code, 7);
 
   const bodyHash = require('node:crypto').createHash('sha256').update(body).digest('hex');
   const heldEof = (port) => String.raw`const crypto=require('node:crypto'),net=require('node:net');let chunks=[];process.stdout.write('KT2 READY ${nonce}\n');process.stdin.on('data',d=>chunks.push(d));process.stdin.on('end',()=>{const all=Buffer.concat(chunks),at=all.indexOf(10),line=all.subarray(0,at).toString('ascii').split(' '),bytes=all.subarray(at+1);if(at<0||line.length!==5||line[0]!=='KT2'||line[1]!=='REQUEST'||line[2]!=='${nonce}'||Number(line[3])!==bytes.length||line[4]!==crypto.createHash('sha256').update(bytes).digest('hex')){process.exit(92);return}const socket=net.connect(${port},'127.0.0.1',()=>{socket.end('write-complete');process.stdout.write('KT2 RESULT ${nonce} ${bodyHash} 0 0 0\n');setTimeout(()=>{},2000)})});`;
   const held = await exchangeAfterRequest(
-    (script, options = {}) => actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', script] }, timeoutMs: 1000, ...options }),
+    (script, options = {}) => actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', script] }, timeoutMs: 5000, ...options }),
     heldEof,
     { timeoutMs: 1000 },
   );
@@ -314,7 +319,7 @@ test('KT2 exchange waits for READY before its only request and classifies termin
   assert.equal(beforeCommit.code, 9);
 
   const oversized = `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('KT2 RESULT ${nonce} ${bodyHash} 0 65537 0\\n'+'x'.repeat(65537))});`;
-  const over = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', oversized] }, timeoutMs: 1000 });
+  const over = await actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', oversized] }, timeoutMs: 5000 });
   assert.equal(over.code, 7);
 });
 
@@ -324,7 +329,7 @@ test('KT2 controller は単調期限、厳密な結果枠、stdin/stdio 境界�
   const helper = 'b'.repeat(64);
   const hash = require('node:crypto').createHash('sha256').update(body).digest('hex');
   const node2 = { ...node, local: false };
-  const exchange = (script, options = {}) => actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', script] }, timeoutMs: 1000, ...options });
+  const exchange = (script, options = {}) => actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', script] }, timeoutMs: 5000, ...options });
   const result = (fields, payload = '', stderr = '') => `process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('KT2 RESULT '+${JSON.stringify(fields)}+'\\n'+${JSON.stringify(payload)});process.stderr.write(${JSON.stringify(stderr)})});`;
 
   let spawns = 0;
@@ -431,4 +436,22 @@ test('protect_gpu は任意の真偽値で、属性の無い既存台帳を変�
   assert.throws(() => loadConfig(file), /protect_gpu/);
   fs.writeFileSync(file, JSON.stringify({ nodes: [{ ...node, protect_gpu: null }] }));
   assert.throws(() => loadConfig(file), /protect_gpu/);
+});
+
+test('native GPU process annotation binds its target PID and protects related processes', { skip: process.platform !== 'win32' }, () => {
+  const start = probe.indexOf('function Test-KtGpuRelated(');
+  const end = probe.indexOf('\nforeach ($p in $list)', start);
+  assert.ok(start >= 0 && end > start);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-gpu-related-'));
+  const script = path.join(dir, 'fixture.ps1');
+  const source = `$ErrorActionPreference = 'Stop'\n${probe.slice(start, end)}\n` +
+    `$map = @{100=[pscustomobject]@{pid=100;ppid=0;born=1};200=[pscustomobject]@{pid=200;ppid=100;born=2};250=[pscustomobject]@{pid=250;ppid=200;born=3};300=[pscustomobject]@{pid=300;ppid=0;born=1}}\n` +
+    `foreach($target in 100,200,250){if(-not (Test-KtGpuRelated $target @(200) $map)){throw 'related process was not protected'}}\n` +
+    `if(Test-KtGpuRelated 300 @(200) $map){throw 'unrelated process was marked'}\nWrite-Output 'related-ok'\n`;
+  fs.writeFileSync(script, '\ufeff' + source, 'utf8');
+  try {
+    const result = spawnSync(windowsPowerShell, ['-NoProfile', '-NonInteractive', '-File', script], { encoding: 'utf8', timeout: 10000, windowsHide: true });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /related-ok/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

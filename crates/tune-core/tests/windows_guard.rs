@@ -451,20 +451,24 @@ async fn product_guard_preserves_simple_windows_powershell_startup() {
     assert_eq!(canonical_control, (Some(0), false));
     let mut command = std::process::Command::new(normal);
     command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::Out.Write('guard-marker')"]);
-    let environment = minimal_environment();
-    let result =
-        run_standalone_windows_bounded(&command, StandaloneWindowsEnvironment::new(&environment), b"", deadline(Duration::from_secs(10)), 65536, 65536).await;
-    assert_eq!(
-        result.code,
-        Some(0),
-        "guard metadata: timeout={} output_limit={} spawn_failed={} receipt={:?}",
-        result.timed_out,
-        result.output_limited,
-        result.spawn_failed,
-        result.process_receipt
-    );
-    assert_ack(&result, ProcessStop::Completed);
-    assert_eq!(result.stdout, b"guard-marker");
+    let mut drive_environment = minimal_environment();
+    drive_environment.push(("=Q:".into(), r"Q:\fixture".into()));
+    for environment in [minimal_environment(), std::env::vars_os().collect(), drive_environment] {
+        let result =
+            run_standalone_windows_bounded(&command, StandaloneWindowsEnvironment::new(&environment), b"", deadline(Duration::from_secs(10)), 65536, 65536)
+                .await;
+        assert_eq!(
+            result.code,
+            Some(0),
+            "guard metadata: timeout={} output_limit={} spawn_failed={} receipt={:?}",
+            result.timed_out,
+            result.output_limited,
+            result.spawn_failed,
+            result.process_receipt
+        );
+        assert_ack(&result, ProcessStop::Completed);
+        assert_eq!(result.stdout, b"guard-marker");
+    }
 }
 
 const CANARY: &str = "KATALA_GUARD_ENV_CANARY";
@@ -524,6 +528,10 @@ async fn complete_environment_rejects_ambiguous_and_invalid_inputs() {
         vec![("NAME".into(), "first".into()), ("NAME".into(), "second".into())],
         vec![("".into(), "value".into())],
         vec![("NAME=OTHER".into(), "value".into())],
+        vec![("=NOTDRIVE".into(), "value".into())],
+        vec![("=1:".into(), "value".into())],
+        vec![("=CC:".into(), "value".into())],
+        vec![("=C:=".into(), "value".into())],
         vec![("NAME\0".into(), "value".into())],
         vec![("NAME".into(), "value\0".into())],
     ] {
