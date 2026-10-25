@@ -907,8 +907,10 @@ fn spawn_owned(context: SpawnContext<'_>, job: &Job, stdio: [&OwnedHandle; 3], s
     if spawned == 0 {
         // Preserve GetLastError before any test-only formatting or IO changes it.
         let error = os_error();
-        #[cfg(test)]
+        #[cfg(all(test, not(katala_private_diagnostics)))]
         eprintln!("owned_create_process_error_code={}", error.raw_os_error().unwrap_or(-1));
+        #[cfg(all(test, katala_private_diagnostics))]
+        eprintln!("owned_create_process_error={:?}", private_diagnostic::io_class(&error));
         *spawn_failed = true;
         return Err(error);
     }
