@@ -14,6 +14,7 @@ $dir = Join-Path ([IO.Path]::GetTempPath()) ('kt-worker-pipes-' + [Guid]::NewGui
 $fixture = Join-Path $dir 'child.ps1'
 $childSource = @'
 param([string]$Mode, [long]$AdoptDeadline, [long]$ReaderDeadline, [long]$DescendantDeadline)
+# RELEASE_DEFINITION
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 switch ($Mode) {
@@ -26,7 +27,7 @@ switch ($Mode) {
       [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'held.identity'), $identity)
       $release = Join-Path $PSScriptRoot 'held.release'
       while (-not (Test-Path -LiteralPath $release) -and [Diagnostics.Stopwatch]::GetTimestamp() -lt $AdoptDeadline) { [Threading.Thread]::Sleep(10) }
-      if (-not (Test-Path -LiteralPath $release)) { exit 4 }
+      if (-not (Test-KtFixtureRelease (Test-Path -LiteralPath $release) $AdoptDeadline)) { exit 4 }
       # Let the reader close stdin before the root exits; do not accept a broken stdin as held EOF.
       $inputPipe = [Console]::OpenStandardInput()
       $inputByte = New-Object byte[] 1
@@ -55,6 +56,8 @@ switch ($Mode) {
   'timeout' { [Console]::Out.Write('prefix'); [Threading.Thread]::Sleep(5000); break }
 }
 '@
+$releaseDefinition = 'function Test-KtFixtureRelease {' + [Environment]::NewLine + (Get-Command Test-KtFixtureRelease).Definition + [Environment]::NewLine + '}'
+$childSource = $childSource.Replace('# RELEASE_DEFINITION', $releaseDefinition)
 [IO.File]::WriteAllText($fixture, $childSource, [Text.UTF8Encoding]::new($true))
 $passed = 0
 $overallDeadline = Get-KtFixtureDeadline ([Diagnostics.Stopwatch]::GetTimestamp()) 25000
@@ -96,6 +99,7 @@ try {
     }
     if ($null -eq $descendant -or [Diagnostics.Stopwatch]::GetTimestamp() -gt $adoptDeadline) { throw 'fixture failed' }
     [IO.File]::WriteAllText((Join-Path $dir 'held.release'), 'ready')
+    if (-not (Test-KtFixtureRelease $true $adoptDeadline)) { throw 'fixture failed' }
    }
    $stage = 'reader'
    try { $result = Read-KtProcessOutput $process $clock 2500 '' $(if ($mode -eq 'utf16') { [Text.Encoding]::Unicode } else { [Text.Encoding]::UTF8 }) 8192 4096 } catch {

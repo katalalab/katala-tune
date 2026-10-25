@@ -8,7 +8,7 @@ function Get-KtFixtureRemainingMs([long]$DeadlineTicks, [int]$LimitMs = [int]::M
 }
 function Test-KtFixtureRelease {
   param([bool]$Released, [long]$DeadlineTicks, [long]$NowTicks = [Diagnostics.Stopwatch]::GetTimestamp())
-  return $Released
+  return $Released -and $NowTicks -le $DeadlineTicks
 }
 
 # Only the Process returned by our own Start is passed here; never reacquire a root by PID.
