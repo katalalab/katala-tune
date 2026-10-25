@@ -18,9 +18,11 @@ test('Tauri bridge sends only ids and the agent name; the prompt is built on the
   const { tune, calls } = bridge();
   await tune.aiHandoff('node-a', 'mem-high', 'claude');
   await tune.aiHandoffCopy('node-a', 'mem-high');
+  await tune.aiHandoffReview('review-id', false);
   assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
     { cmd: 'ai_handoff', args: { nodeId: 'node-a', findingId: 'mem-high', agent: 'claude' } },
     { cmd: 'ai_handoff_copy', args: { nodeId: 'node-a', findingId: 'mem-high' } },
+    { cmd: 'ai_handoff_review', args: { id: 'review-id', proceed: false } },
   ]);
 });
 
@@ -28,10 +30,10 @@ test('handoff commands are declared, permitted for the main window, and register
   const build = fs.readFileSync(require.resolve('../src-tauri/build.rs'), 'utf8');
   const capability = JSON.parse(fs.readFileSync(require.resolve('../src-tauri/capabilities/default.json'), 'utf8'));
   const handlers = fs.readFileSync(require.resolve('../src-tauri/src/lib.rs'), 'utf8');
-  for (const cmd of ['ai_handoff', 'ai_handoff_copy']) {
+  for (const cmd of ['ai_handoff', 'ai_handoff_copy', 'ai_handoff_review']) {
     assert.match(build, new RegExp(`"${cmd}",`));
     assert.ok(capability.permissions.includes(`allow-${cmd.replace(/_/g, '-')}`), cmd);
-    assert.match(handlers, new RegExp(`commands::${cmd}\\s*,`));
+    assert.match(handlers, new RegExp(`${cmd === 'ai_handoff_review' ? 'handoff_review' : 'commands'}::${cmd}\\s*,`));
   }
 });
 

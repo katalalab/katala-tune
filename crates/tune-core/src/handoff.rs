@@ -189,12 +189,10 @@ pub fn launcher(agent: Agent, windows: bool) -> (&'static str, String) {
 /// 新しいターミナルで起動スクリプトを開くコマンド（実行ファイルと引数）
 pub fn terminal(windows: bool, dir: &Path, script: &str) -> (String, Vec<String>) {
     if windows {
-        let args = ["/c", "start", "Katala Tune AI", "/D"]
-            .iter()
-            .map(|s| s.to_string())
-            .chain([dir.to_string_lossy().into_owned(), "cmd".into(), "/k".into(), script.into()])
-            .collect();
-        ("cmd".into(), args)
+        // 作業パスは shell の文字列へ入れず、current_dir で渡す。
+        // start に新しいコンソールの標準入出力を用意させ、GUI の null / ログを CLI に継がない。
+        let args = ["/D", "/V:OFF", "/C", "start", "Katala Tune AI", "cmd.exe", "/D", "/V:OFF", "/K", script].map(str::to_string).to_vec();
+        ("cmd.exe".into(), args)
     } else {
         ("open".into(), vec!["-a".into(), "Terminal".into(), dir.join(script).to_string_lossy().into_owned()])
     }
@@ -222,19 +220,26 @@ impl Engine {
         Ok(Prepared { node, finding_id: finding_id.to_string(), title: js::string(finding.get("title")), prompt })
     }
 
+    /// 確認中の取消も、承認されたプロンプトと同じ識別情報で記録する。
+    pub fn handoff_cancel(&self, p: &Prepared, agent: Agent) -> Value {
+        self.handoff_record(p, agent, false, "取消（開いていない）".into(), None);
+        json!({ "ok": false, "cancelled": true })
+    }
+
+    fn handoff_record(&self, p: &Prepared, agent: Agent, ok: bool, output: String, dir: Option<&Path>) {
+        let entry = json!({
+            "id": format!("{}-handoff-{}", now_ms(), &sha256_hex(output.as_bytes())[..6]), "at": now_ms(), "node_id": p.node.id,
+            "type": "ai-handoff",
+            "params": { "agent": agent.key(), "finding_id": p.finding_id, "prompt_sha256": sha256_hex(p.prompt.as_bytes()), "dir": dir.map(|d| d.to_string_lossy()) },
+            "label": format!("{} に渡す（{}）", agent.label(), p.title), "ok": ok, "output": output, "undo": null, "undo_of": null,
+        });
+        let _ = self.with_db(|d| d.add_action(&entry));
+    }
+
     /// 承認の後: 台帳をもう一度読み、接続先が変わっていなければ PROMPT.md と起動スクリプトを書いてターミナルを開く。
     /// 結果（開いた・開けなかった・中止）は実行記録に残す
     pub fn handoff_launch(&self, p: &Prepared, agent: Agent) -> Value {
-        let label = format!("{} に渡す（{}）", agent.label(), p.title);
-        let record = |ok: bool, output: String, dir: Option<&Path>| {
-            let entry = json!({
-                "id": format!("{}-handoff-{}", now_ms(), &sha256_hex(output.as_bytes())[..6]), "at": now_ms(), "node_id": p.node.id,
-                "type": "ai-handoff",
-                "params": { "agent": agent.key(), "finding_id": p.finding_id, "prompt_sha256": sha256_hex(p.prompt.as_bytes()), "dir": dir.map(|d| d.to_string_lossy()) },
-                "label": label, "ok": ok, "output": output, "undo": null, "undo_of": null,
-            });
-            let _ = self.with_db(|d| d.add_action(&entry));
-        };
+        let record = |ok, output, dir| self.handoff_record(p, agent, ok, output, dir);
         let refused = |m: String| {
             record(false, format!("中止（開いていない）: {m}"), None);
             json!({ "ok": false, "refused": m })
@@ -273,14 +278,18 @@ fn open(dir: &Path, prompt: &str, agent: Agent) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("{script} を実行可能にできない: {e}"))?;
     }
-    let (bin, args) = terminal(windows, dir, script);
+    open_terminal(dir, script)
+}
+
+fn open_terminal(dir: &Path, script: &str) -> Result<(), String> {
+    let (bin, args) = terminal(cfg!(windows), dir, script);
     let mut cmd = std::process::Command::new(bin);
     cmd.args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
-        // 外側の cmd（start を呼ぶだけ）の窓は出さない。start が CLI 用の新しい窓を開く
-        cmd.creation_flags(0x0800_0000);
+        // 外側は start を呼ぶだけ。パスを引数にせず OS の作業ディレクトリで指定する。
+        cmd.current_dir(dir).creation_flags(0x0800_0000);
     }
     let status = cmd.status().map_err(|e| format!("ターミナルを開けない: {e}"))?;
     if !status.success() {
@@ -369,8 +378,8 @@ mod tests {
     fn terminal_opens_a_new_window_in_the_handoff_dir() {
         let dir = Path::new("D:/data/handoff/1-a-claude");
         let (bin, args) = terminal(true, dir, "launch.cmd");
-        assert_eq!(bin, "cmd");
-        assert_eq!(args, ["/c", "start", "Katala Tune AI", "/D", "D:/data/handoff/1-a-claude", "cmd", "/k", "launch.cmd"]);
+        assert_eq!(bin, "cmd.exe");
+        assert_eq!(args, ["/D", "/V:OFF", "/C", "start", "Katala Tune AI", "cmd.exe", "/D", "/V:OFF", "/K", "launch.cmd"]);
         let (bin, args) = terminal(false, dir, "launch.command");
         assert_eq!((bin.as_str(), args[1].as_str()), ("open", "Terminal"));
         assert!(args[2].ends_with("launch.command"));
@@ -382,5 +391,94 @@ mod tests {
         assert_eq!(Agent::parse("codex"), Some(Agent::Codex));
         assert_eq!(Agent::parse("bash"), None);
         assert_eq!(safe("gpu pc/../x"), "gpu_pc____x");
+    }
+
+    #[test]
+    fn cancellation_is_audited_without_creating_a_launcher_and_changed_routes_are_refused() {
+        use crate::engine::NoHost;
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("kt-handoff-cancel-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("nodes.json");
+        std::fs::write(&config, r#"{"nodes":[{"id":"a","alias":"a","os":"macos"}]}"#).unwrap();
+        let e = Engine::open(config.clone(), dir.join("data"), Arc::new(NoHost)).unwrap();
+        let p = Prepared {
+            node: node(json!({"id":"a","alias":"a","os":"macos"})),
+            finding_id: "cpu-busy".into(),
+            title: "CPU".into(),
+            prompt: "Reviewed text".into(),
+        };
+        assert_eq!(e.handoff_cancel(&p, Agent::Claude)["cancelled"], true);
+        let actions = e.with_db(|db| db.actions(10)).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["ok"], false);
+        assert_eq!(actions[0]["params"]["agent"], "claude");
+        assert_eq!(actions[0]["params"]["finding_id"], "cpu-busy");
+        assert_eq!(actions[0]["params"]["prompt_sha256"], sha256_hex(b"Reviewed text"));
+        assert!(actions[0]["params"]["dir"].is_null());
+        assert!(!dir.join("data/handoff").exists());
+        for replacement in [
+            r#"{"nodes":[{"id":"a","alias":"changed","os":"macos"}]}"#,
+            r#"{"nodes":[{"id":"a","alias":"a","os":"macos","shared":true}]}"#,
+            r#"{"nodes":[{"id":"a","alias":"a","os":"macos","status":"paused"}]}"#,
+            r#"{"nodes":[]}"#,
+        ] {
+            std::fs::write(&config, replacement).unwrap();
+            let result = e.handoff_launch(&p, Agent::Codex);
+            assert_eq!(result["ok"], false, "{result}");
+            assert!(result["refused"].is_string());
+            assert!(!dir.join("data/handoff").exists());
+        }
+        drop(e);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_terminal_keeps_console_stdio_and_literal_working_paths() {
+        for suffix in ["simple", "space & 日本語 %KT_QA_UNSET% !"] {
+            let dir = std::env::temp_dir().join(format!("kt-handoff-{}-{}-{suffix}", std::process::id(), now_ms()));
+            let dir = std::path::PathBuf::from(dir.to_string_lossy().replace('\\', "/"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("console-stdio-fixture"), "").unwrap();
+            let exe = std::env::current_exe().unwrap().to_string_lossy().replace('%', "%%");
+            std::fs::write(
+                dir.join("launch.cmd"),
+                format!("@echo off\r\necho ran>launcher-ran.txt\r\n\"{exe}\" --exact handoff::tests::windows_console_stdio_child --nocapture\r\nexit\r\n"),
+            )
+            .unwrap();
+            open_terminal(&dir, "launch.cmd").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !dir.join("receipt.txt").exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert_eq!(std::fs::read_to_string(dir.join("receipt.txt")).unwrap(), "launched\r\n");
+            // receipt は子の test が書く。cmd が batch のハンドルを閉じるまで待つ。
+            loop {
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(()) => break,
+                    Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(50)),
+                    Err(e) => panic!("fixture cleanup: {e}"),
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_console_stdio_child() {
+        use std::io::IsTerminal;
+        if !Path::new("console-stdio-fixture").exists() {
+            return;
+        }
+        std::fs::write(
+            "stdio.json",
+            json!({"stdin":std::io::stdin().is_terminal(), "stdout":std::io::stdout().is_terminal(), "stderr":std::io::stderr().is_terminal()}).to_string(),
+        )
+        .unwrap();
+        assert!(std::io::stdin().is_terminal());
+        assert!(std::io::stdout().is_terminal());
+        assert!(std::io::stderr().is_terminal());
+        std::fs::write("receipt.txt", "launched\r\n").unwrap();
     }
 }

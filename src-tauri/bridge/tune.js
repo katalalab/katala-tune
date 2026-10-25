@@ -44,6 +44,8 @@
     // agent は 'claude' | 'codex'。確認ダイアログと台帳の読み直しは Rust 側。aiHandoffCopy はプロンプトをクリップボードへ
     aiHandoff: (nodeId, findingId, agent) => invoke('ai_handoff', { nodeId: String(nodeId), findingId: String(findingId), agent: String(agent) }),
     aiHandoffCopy: (nodeId, findingId) => invoke('ai_handoff_copy', { nodeId: String(nodeId), findingId: String(findingId) }),
+    onHandoffReview: (fn) => listen('handoff-review', fn),
+    aiHandoffReview: (id, proceed) => invoke('ai_handoff_review', { id: String(id), proceed: proceed === true }),
     openDataDir: () => invoke('open_data_dir'),
     openConfig: () => invoke('open_config'),
     status: () => invoke('status'),

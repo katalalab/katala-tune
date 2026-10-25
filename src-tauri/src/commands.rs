@@ -136,22 +136,42 @@ pub async fn logs_cursors(e: E<'_>) -> R {
 /// 所見を AI エージェントの CLI に渡す（Tauri 版だけ）。DB から所見を読み直してプロンプトを作り、
 /// 全文を確認ダイアログで見せて承認されたときだけ、新しいターミナルで読み取り寄りの権限の CLI を開く（tune-core の handoff）
 #[tauri::command]
-pub async fn ai_handoff(app: AppHandle, e: E<'_>, node_id: String, finding_id: String, agent: String) -> R {
+pub async fn ai_handoff(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    e: E<'_>,
+    review: State<'_, crate::handoff_review::Review>,
+    node_id: String,
+    finding_id: String,
+    agent: String,
+) -> R {
     let Some(agent) = handoff::Agent::parse(&agent) else {
         return Ok(json!({ "ok": false, "refused": "渡す先が分からない" }));
     };
     if !crate::confirm::SUPPORTED {
         return Ok(json!({ "ok": false, "refused": "この OS では確認ダイアログを出せないので開かない" }));
     }
+    let Ok(_guard) = review.gate.try_lock() else {
+        return Ok(json!({ "ok": false, "refused": "別の所見を確認中です" }));
+    };
+    let Some(generation) = review.generation().filter(|_| window.is_visible().is_ok()) else {
+        return Ok(json!({ "ok": false, "refused": "確認する画面が閉じられたか、読み込み中です。もう一度押してください" }));
+    };
     let p = match e.handoff_prepare(&node_id, &finding_id) {
         Ok(p) => p,
         Err(m) => return Ok(json!({ "ok": false, "refused": m })),
     };
     let title = format!("{} に渡す: {} / {}", agent.label(), p.node.id, p.title);
-    let detail =
-        format!("{} を新しいターミナルで {} で開き、次の内容を渡します。内容は {} に送られます。\n\n{}", agent.label(), agent.mode(), agent.vendor(), p.prompt);
+    let detail = format!("{} を新しいターミナルで {} で開きます。内容は {} に送られます。", agent.label(), agent.mode(), agent.vendor());
+    let hash = tune_core::db::sha256_hex(p.prompt.as_bytes());
+    let request_id = format!("{}-{hash}", tune_core::db::now_ms());
+    if !review.show(&app, generation, request_id, title, detail.clone(), &p.prompt).await {
+        return Ok(e.handoff_cancel(&p, agent));
+    }
+    let title = format!("{} に調査依頼を渡しますか", agent.label());
+    let detail = format!("{detail}\n\n画面で確認した全文を渡します。設定・ファイルの変更は別途承認が必要です。\n\nプロンプト SHA-256: {hash}");
     if !crate::confirm::ask(app, crate::confirm::HANDOFF)(title, detail).await {
-        return Ok(json!({ "ok": false, "cancelled": true }));
+        return Ok(e.handoff_cancel(&p, agent));
     }
     Ok(e.handoff_launch(&p, agent))
 }
