@@ -17,6 +17,33 @@ function runPy(code) {
   return JSON.parse(r.stdout);
 }
 
+// Execute only the multiplication section with synthetic CIM rows, never the probe entry point.
+function runWinGroups(rows) {
+  const fs = require('node:fs');
+  const src = fs.readFileSync(path.join(ROOT, 'probes', 'win_probe.ps1'), 'utf8');
+  const start = src.indexOf('$mxInterp = ');
+  const end = src.indexOf('# Keep $mx');
+  assert.ok(start > 0 && end > start);
+  const data = Buffer.from(JSON.stringify({ rows })).toString('base64');
+  const script = `
+$ErrorActionPreference = 'Stop'
+$fixtureData = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${data}')) | ConvertFrom-Json
+function Get-CimInstance {
+  param($ClassName, $Property, $OperationTimeoutSec, $ErrorAction, $Filter)
+  if ($ClassName -ne 'Win32_Process') { throw 'unexpected CIM class' }
+  # PS5.1 emits a root JSON array as one pipeline object; enumerate the property explicitly.
+  foreach ($row in $fixtureData.rows) { $row | Select-Object -Property $Property }
+}
+function NsErr($e) { throw $e }
+${src.slice(start, end)}
+@{ groups = @($mxGroups); trees = @($mxTrees); availability = $mxAvail } | ConvertTo-Json -Depth 8 -Compress
+`;
+  const r = spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 60000, windowsHide: true });
+  assert.ifError(r.error);
+  assert.equal(r.status, 0, r.stderr || r.stdout);
+  return JSON.parse(r.stdout);
+}
+
 const mac = (processes, totalGb = 64) => ({
   probe: 'mac', host: { cores: 10, uptime_h: 10 }, cpu_busy: 20,
   memory: { total_gb: totalGb, available_pct: 50, pressure: 'normal', swap_used_gb: 0, swap_total_gb: 0 },
@@ -97,6 +124,20 @@ test('probe(Windows): MxKey も値付きオプションの値を鍵に入れな�
     ['node', ['C:\\x\\node_modules\\@scope\\pdf-mcp\\dist\\index.js'], 'node:pdf-mcp'],
     ['npx', ['-y', 'some-mcp-server'], 'npx:some-mcp-server'],
     ['git', ['-c', 'core.fsmonitor=true', 'fsmonitor--daemon', 'run'], 'git:fsmonitor--daemon'],
+    ['ruby', ['-I', 'C:\\srv\\private-client', 'server.rb'], 'ruby'],
+    ['ruby', ['-i', 'private-client', 'server.rb'], 'ruby'],
+    ['node', ['-m', 'C:\\srv\\private-client'], 'node'],
+    ['Python', ['-m', 'sample_mcp.worker'], 'python:sample_mcp'],
+    ['Python3.13', ['-I', '-m', 'sample_mcp.worker'], 'python3.13:sample_mcp'],
+    ['node', ['run', 'C:\\srv\\private-client'], 'node'],
+    ['ruby', ['run', 'C:\\srv\\private-client'], 'ruby'],
+    ['python3', ['start', 'C:\\srv\\private-client'], 'python3'],
+    ['python3', ['--', '-m', 'private_client'], 'python3'],
+    ['python3', ['--', 'C:\\srv\\sample-mcp.py'], 'python3:sample-mcp'],
+    ['npm', ['exec', 'run', 'C:\\srv\\private-client'], 'npm'],
+    ['bun', ['run', 'run', 'C:\\srv\\private-client'], 'bun'],
+    ['pnpm', ['exec', 'run', 'C:\\srv\\private-client'], 'pnpm'],
+    ['uv', ['tool', 'run', 'run', 'C:\\srv\\private-client'], 'uv'],
   ];
   const q = (v) => `'${v.replace(/'/g, "''")}'`;
   const calls = cases.map(([exe, args]) => `[Console]::WriteLine((MxKey ${q(exe)} @(${args.map(q).join(',')})))`).join('\n');
@@ -105,6 +146,138 @@ test('probe(Windows): MxKey も値付きオプションの値を鍵に入れな�
   const r = spawnSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', enc], { encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(r.stdout.trim().split(/\r?\n/), cases.map((c) => c[2]));
+});
+
+test('probe: 値付きオプションを他の実行環境の値なしオプションとして読まない', () => {
+  const keys = runPy(`
+cases = [
+  ('ruby', ['-I', '/srv/private-client', 'server.rb']),
+  ('ruby', ['-i', 'private-client', 'server.rb']),
+  ('node', ['-m', '/srv/private-client']),
+  ('python3', ['-m', '/srv/private-client']),
+  ('python3', ['-I', '-m', 'sample_mcp.worker']),
+  ('node', ['--no-warnings', '/srv/sample-mcp.js']),
+  ('npx', ['-y', 'sample-mcp']),
+]
+print(json.dumps([m.proc_key(e, args) for e, args in cases]))
+`);
+  assert.deepEqual(keys, ['ruby', 'ruby', 'node', 'python3', 'python3:sample_mcp', 'node:sample-mcp', 'npx:sample-mcp']);
+  assert.doesNotMatch(JSON.stringify(keys), /private-client/);
+});
+
+test('probe: ps の曖昧な空白入りパスを鍵・所見に保存しない', () => {
+  const r = runPy(`
+base = '\\n'.join(f'{pid} 1 501 0 102400 10:00 0:00 node' for pid in range(10, 14))
+commands = '\\n'.join(f'{pid} node /srv/private-client work/server.js' for pid in range(10, 14))
+def fake_run(args, **kw):
+    if args == ['ps', '-axo', 'pid=,ppid=,uid=,pcpu=,rss=,etime=,time=,comm=']: return base
+    if args == ['ps', '-o', 'pid=,command=', '-p', '10,11,12,13']: return commands
+    if args == ['ps', '-o', 'pid=,lstart=', '-p', '10,11,12,13']: return ''
+    raise AssertionError('unexpected probe call')
+m.run = fake_run
+print(json.dumps(m.processes()))
+`);
+  assert.deepEqual(r.groups.map((g) => g.key), ['node']);
+  assert.doesNotMatch(JSON.stringify([r, analyze(mac(r))]), /private-client|server\.js/);
+});
+
+test('probe: launcher以外のスクリプト名や曖昧なpsオプション値を飛ばさない', () => {
+  const keys = runPy(`
+cases = [
+  ('node', ['run', '/srv/private-client']),
+  ('ruby', ['run', '/srv/private-client']),
+  ('python3', ['start', '/srv/private-client']),
+  ('node', ['-r', '/srv/private', 'client']),
+  ('node', ['--require=/srv/private', 'client']),
+  ('python3', ['--', '-m', 'private_client']),
+  ('python3', ['--', '/srv/sample-mcp.py']),
+  ('npm', ['exec', 'sample-mcp']),
+  ('node', ['--no-warnings', '/srv/sample-mcp.js']),
+  ('git', ['-c', 'core.fsmonitor=true', 'fsmonitor--daemon', 'run', '--detach']),
+]
+print(json.dumps([m.proc_key(e, args, flat=True) for e, args in cases]))
+`);
+  assert.deepEqual(keys, ['node', 'ruby', 'python3', 'node', 'node', 'python3', 'python3:sample-mcp', 'npm:sample-mcp', 'node:sample-mcp', 'git:fsmonitor--daemon']);
+  assert.doesNotMatch(JSON.stringify(keys), /private|client/);
+});
+
+test('probe: ランチャーの接頭辞は一度だけ読み、その後のrunを引数として飛ばさない', () => {
+  const keys = runPy(`
+cases = [
+  ('npm', ['exec', 'run', '/srv/private-client']),
+  ('bun', ['run', 'run', '/srv/private-client']),
+  ('pnpm', ['exec', 'run', '/srv/private-client']),
+  ('uv', ['run', 'run', '/srv/private-client']),
+  ('uv', ['tool', 'run', 'run', '/srv/private-client']),
+  ('uv', ['tool', 'run', 'sample-mcp']),
+  ('npm', ['exec', 'sample-mcp']),
+]
+print(json.dumps([m.proc_key(e, args, flat=True) for e, args in cases]))
+`);
+  assert.deepEqual(keys, ['npm', 'bun', 'pnpm', 'uv', 'uv', 'uv:sample-mcp', 'npm:sample-mcp']);
+});
+
+test('probe: 2本のMCP孤児を集計から所見まで残し、通常の少数群は出さない', () => {
+  const r = runPy(`
+base = '\\n'.join(f'{pid} 1 501 0 153600 10:00 0:00 node' for pid in range(10, 15))
+commands = '\\n'.join(f'{pid} node /srv/{name}.js' for pid, name in [(10, 'old-mcp'), (11, 'old-mcp'), (12, 'healthy'), (13, 'healthy'), (14, 'solo-mcp')])
+def fake_run(args, **kw):
+    if args == ['ps', '-axo', 'pid=,ppid=,uid=,pcpu=,rss=,etime=,time=,comm=']: return base
+    if args == ['ps', '-o', 'pid=,command=', '-p', '10,11,12,13,14']: return commands
+    if args == ['ps', '-o', 'pid=,lstart=', '-p', '10,11,12,13,14']: return ''
+    raise AssertionError('unexpected probe call')
+m.run = fake_run
+print(json.dumps(m.processes()))
+`);
+  assert.deepEqual(r.groups, [grp('node:old-mcp', 2, 300, { orphans: 2, orphan_mb: 300, parent: null })]);
+  const f = multi(analyze(mac(r)));
+  assert.deepEqual(f.map((f) => [f.id, f.severity]), [['proc-orphan-node:old-mcp', 'warn']]);
+  assert.equal(f[0].action, undefined);
+});
+
+test('probe(Windows): CIMの2本のMCP孤児が所見へ届く', { skip: process.platform !== 'win32' }, () => {
+  const rows = ['old-mcp', 'old-mcp', 'healthy', 'healthy', 'solo-mcp'].map((label, i) => ({
+    ProcessId: 10 + i, ParentProcessId: 999, Name: 'node.exe', WorkingSetSize: 150 * 1024 * 1024,
+    SessionId: 1, CreationDate: null, CommandLine: `node.exe C:\\srv\\${label}.js`,
+  }));
+  const r = runWinGroups(rows);
+  assert.equal(r.availability, 'available');
+  assert.deepEqual(r.groups, [grp('node:old-mcp', 2, 300, { orphans: 2, orphan_mb: 300, parent: null })]);
+  assert.deepEqual(multi(analyze(win(r))).map((f) => [f.id, f.severity]), [['proc-orphan-node:old-mcp', 'warn']]);
+});
+
+test('probe: Pythonの表記揺れを同じMCP群として検出し、表示名は保持する', () => {
+  const r = runPy(`
+names = ['Python3.13', 'python3.13', 'PYTHON3.13', 'Python3.13']
+base = '\\n'.join(f'{10+i} 1 501 0 81920 10:00 0:00 /opt/tools/{name}' for i, name in enumerate(names))
+commands = '\\n'.join(f'{10+i} /opt/tools/{name} -m sample_mcp.worker --token fixture-value' for i, name in enumerate(names))
+def fake_run(args, **kw):
+    if args == ['ps', '-axo', 'pid=,ppid=,uid=,pcpu=,rss=,etime=,time=,comm=']: return base
+    if args[:4] == ['ps', '-o', 'pid=,command=', '-p']:
+        selected = args[4].split(',')
+        assert set(selected) <= {'10', '11', '12', '13'}
+        return '\\n'.join(line for line in commands.splitlines() if line.split()[0] in selected)
+    if args == ['ps', '-o', 'pid=,lstart=', '-p', '10,11,12,13']: return ''
+    raise AssertionError('unexpected probe call')
+m.run = fake_run
+print(json.dumps(m.processes()))
+`);
+  assert.deepEqual(r.groups, [grp('python3.13:sample_mcp', 4, 320, { orphans: 4, orphan_mb: 320, parent: null })]);
+  assert.deepEqual(r.top_mem.map((p) => p.name), ['Python3.13', 'python3.13', 'PYTHON3.13', 'Python3.13']);
+  assert.deepEqual(multi(analyze(mac(r))).map((f) => f.id), ['proc-multi-python3.13:sample_mcp']);
+  assert.doesNotMatch(JSON.stringify(r), /fixture-value|--token/);
+});
+
+test('probe(Windows): Pythonの表記揺れを同じMCP群として検出する', { skip: process.platform !== 'win32' }, () => {
+  const rows = ['Python3.13.exe', 'python3.13.EXE', 'PYTHON3.13.exe', 'Python3.13.exe'].map((name, i) => ({
+    ProcessId: 10 + i, ParentProcessId: 999, Name: name, WorkingSetSize: 80 * 1024 * 1024,
+    SessionId: 1, CreationDate: null, CommandLine: `${name} -I -m sample_mcp.worker --token fixture-value`,
+  }));
+  const r = runWinGroups(rows);
+  assert.equal(r.availability, 'available');
+  assert.deepEqual(r.groups, [grp('python3.13:sample_mcp', 4, 320, { orphans: 4, orphan_mb: 320, parent: null })]);
+  assert.deepEqual(multi(analyze(win(r))).map((f) => f.id), ['proc-multi-python3.13:sample_mcp']);
+  assert.doesNotMatch(JSON.stringify(r), /fixture-value|--token/);
 });
 
 test('probe: 本数・合計・孤児（PPID 1 / 親が居ない）・親・所有者を数える', () => {
