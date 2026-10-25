@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "verified_at": "2026-10-25",
+  "products": [
+    {
+      "models": ["NVIDIA GeForce RTX 4090"],
+      "name": "NVIDIA GeForce RTX 4090 reference GPU",
+      "url": "https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf",
+      "scope": "GPU reference specifications; board partner clocks and firmware can differ",
+      "specifications": {"dedicated_vram_gib": 24, "cuda_cores": 16384, "memory_type": "GDDR6X"}
+    },
+    {
+      "models": ["Intel(R) Core(TM) i9-14900KS", "Intel Core i9-14900KS"],
+      "name": "Intel Core i9-14900KS",
+      "url": "https://www.intel.com/content/www/us/en/products/sku/237504/intel-core-i9-processor-14900ks-36m-cache-up-to-6-20-ghz/specifications.html",
+      "scope": "Processor published limits; not a measurement of current clocks or power",
+      "specifications": {"cores": 24, "threads": 32, "max_turbo_ghz": 6.2, "cache_mb": 36}
+    }
+  ]
+}

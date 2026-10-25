@@ -8,6 +8,8 @@
 //!   tune last                        DB の前回の分析結果（所見・スコアつき）を JSON で
 //!   tune power                       電力・Clockと計算条件を JSON で（読み取り専用）
 //!   tune capabilities [機体 ...] firmware 読取（省略はこの機体、保存なし）
+//!   tune specs-local                 Rust による機体仕様の読取（台帳・DB不要）
+//!   tune specs [機体 ...]            仕様を収集・保存して比較用 JSON を表示
 //!   tune maintenance-plan [機体 ...] 読取更新と実行不可の保守計画
 //!   tune network [--probe] [機体 ...] 軽量な接続診断（省略はこの機体。--probeだけHTTPS到達性・時間も測る）
 //!   tune status [--recompute]        DB の状態（機能チェック）を JSON で。--recompute で計算し直して保存する
@@ -317,7 +319,38 @@ fn main() -> ExitCode {
 async fn async_main(args: Vec<String>) -> ExitCode {
     let Some(cmd) = args.first() else { return usage() };
     let rest = &args[1..];
+    if cmd == "specs-local" {
+        if !rest.is_empty() {
+            return usage();
+        }
+        let report = tune_core::specs::collect_local().await;
+        let ok = report["ok"] == true;
+        print(&report);
+        return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
+    }
     let res: Result<(), String> = match cmd.as_str() {
+        "specs" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
+            Ok(e) => {
+                let ids = if rest.is_empty() {
+                    e.config()
+                        .nodes
+                        .iter()
+                        .filter(|n| n.is_active() && !n.shared && n.get("specs") != Some(&Value::Bool(false)))
+                        .map(|n| n.id.clone())
+                        .collect()
+                } else {
+                    rest.to_vec()
+                };
+                match e.specs_refresh(ids).await {
+                    Ok(v) => {
+                        print(&v);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        },
         "topology-refresh" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
             Ok(e) => match topology_node_ids(rest, false) {
                 Ok(ids) => {

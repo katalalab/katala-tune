@@ -47,6 +47,8 @@
     setLogin: (on) => invoke('set_login', { on: !!on }),
     // 道具の棚卸し・Do-gu（preload.js と同じ。inventory の opts = { all: true } で依存も含める）
     inventory: (opts) => invoke('inventory', { opts: opts ?? null }),
+    specsView: () => invoke('specs_view'),
+    specsRefresh: (ids) => invoke('specs_refresh', { ids: Array.isArray(ids) ? ids.map(String) : [] }),
     inventoryRun: (ids) => invoke('inventory_run', { ids: ids ?? null }),
     doguRefresh: () => invoke('dogu_refresh'),
     doguExclude: (slugs) => invoke('dogu_exclude', { slugs: slugs ?? null }),
