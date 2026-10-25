@@ -46,7 +46,7 @@ Interfaces: initialize(db), compact(db,before,now,budget?), query(db,node,since,
 - [x] Implement dedicated schema, compaction transaction, scalar singleton counters and bounds. Apply budget only after source archive and daily conversion in the same transaction.
 - [x] Test UTC cutoff/gap/clock reversal and tiny-byte/row cap fixture; implement minimal repairs.
 - [x] Run 500-day synthetic stream plus capacity pressure against the actual module, recording logical/physical storage and coverage.
-- [ ] Run focused Node suite, syntax and current/history OSS checks; gitleaks before any commit. Focused 13/13 and syntax/candidate OSS have passed; staged gitleaks/commit HEAD/history checks below remain before handoff.
+- [x] Run focused Node suite, syntax and current/history OSS checks; gitleaks before any commit. 13/13 focused, syntax, candidate OSS, staged pre-commit gitleaks, HEAD and 122-commit HEAD-history OSS passed for component4f5a747. Receipt: docs/acceptance/metrics-retention.md.
 
 ### Task 3: Rust parity module and parent integration gate
 
