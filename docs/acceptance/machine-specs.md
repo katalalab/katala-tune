@@ -19,7 +19,7 @@
 - OSS working-tree/HEAD and reachable-history scans checked; personal reports and deployment material excluded from source control.
 - Final `npm run check` passed: 437 JavaScript tests passed / 13 platform skips, 624 Rust tests passed / 4 ignored, including doc tests. Core unit tests: 291 passed / 2 ignored. Formatting, workspace Clippy and OSS scan passed within that command.
 - The previous deterministic shared-metadata fixture failure was reproduced with TEMP/TMP redirected to another volume. Its same-bytes copied control now resides beside the actual test executable and checks the original artifact volume, instead of assuming the system drive. Process ownership, lease, exit-policy and executable-identity assertions remain intact. Focused and full checks passed.
-- An initial follow-up full run also encountered an intermittent existing native-reader integration failure (early exit 2, no output). Its focused replay passed all three native roles; the next complete check passed all seven native-entry tests. Its cause is not established; no retry, skip or weakened assertion was added to the tests or product.
+- An initial follow-up full run also encountered an intermittent existing native-reader integration failure (early exit 2, no output). Its focused replay passed all three native roles; the next complete check passed all seven native-entry tests. Its cause was initially unresolved in specs.2; the later [specs.3 diagnosis and correction](native-exit-race.md) identifies the console-host terminal-exit/wait-signal race. No retry or skip was added to mask this failure.
 
 ## CLI and version management
 

@@ -21,7 +21,7 @@
 ## Tasks
 
 - [x] Reproduce original integration failure and diagnostic rejection; capture retained member state and basename. Private logs show terminal exit 0 before a conhost wait signals, then immediate erroneous `LingeringDescendants` rejection.
-- [ ] Add a failing regression for pending terminal exit, sealed output and a cleanup deadline that does not restart. Keep existing classifier tests.
-- [ ] In `collect/windows.rs`, distinguish retained terminal-exit hints from running/unknown descendants, preserving all final completion checks. Add boundary tests including 259 and errors.
-- [ ] Run real Git diagnostics and native integration repetitions, Windows guard regressions, full `npm run check`, independent review and OSS scans. Document observed cause and results.
-- [ ] Version and deliver the corrected runtime to the existing installations, retain backups, audit all authorized machines.
+- [x] Add a failing regression for pending terminal exit, sealed output and a cleanup deadline that does not restart. Keep existing classifier tests.
+- [x] In `collect/windows.rs`, distinguish retained terminal-exit hints from running/unknown descendants, preserving all final completion checks. Add boundary tests including 259 and errors.
+- [x] Run real Git diagnostics and native integration repetitions, Windows guard regressions, full `npm run check`, independent review and HEAD OSS scan. Document observed cause and results. Run the final reachable-history scan after the documentation commit.
+- [x] Version and deliver the corrected runtime to the existing installations, retain backups, audit all authorized machines.
