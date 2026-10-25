@@ -55,6 +55,10 @@ const SYNCHRONIZE_PROCESS: u32 = 0x0010_0000;
 const GENERIC_READ_ACCESS: u32 = 0x8000_0000;
 const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000;
 
+#[cfg(test)]
+#[path = "windows_diagnostics.rs"]
+mod diagnostics;
+
 fn os_error() -> io::Error {
     io::Error::last_os_error()
 }
@@ -441,6 +445,118 @@ impl Job {
 impl Drop for Job {
     fn drop(&mut self) {
         let _ = self.terminate(); // cancellation fallback, plus KILL_ON_JOB_CLOSE on the sole non-inherited handle.
+    }
+}
+
+#[cfg(test)]
+fn diagnostic_members(job: &Job) -> Vec<diagnostics::Member> {
+    use windows_sys::Win32::{Foundation::WAIT_FAILED, System::Threading::QueryFullProcessImageNameW};
+    let fixture = std::env::current_exe().ok();
+    let fixture_basename = fixture.as_deref().and_then(Path::file_name).and_then(OsStr::to_str);
+    job.processes
+        .iter()
+        .take(diagnostics::MEMBER_LIMIT)
+        .enumerate()
+        .map(|(ordinal, process)| {
+            let handle = process.handle.as_raw_handle();
+            let mut in_job = 0;
+            // SAFETY: read-only query of the same retained process and owned Job, never a PID lookup.
+            let member_ok = unsafe { IsProcessInJob(handle, job.handle.as_raw_handle(), &mut in_job) } != 0;
+            let membership_error = (!member_ok).then(|| os_error().raw_os_error()).flatten();
+            // SAFETY: zero wait on the exact retained handle; exit code is not used as liveness evidence.
+            let wait = unsafe { WaitForSingleObject(handle, 0) };
+            let wait_error = (wait == WAIT_FAILED).then(|| os_error().raw_os_error()).flatten();
+            let mut code = 0;
+            // SAFETY: same query-capable retained handle and valid writable output.
+            let code_ok = unsafe { GetExitCodeProcess(handle, &mut code) } != 0;
+            let exit_error = (!code_ok).then(|| os_error().raw_os_error()).flatten();
+            let mut image = vec![0u16; 32768];
+            let mut image_len = image.len() as u32;
+            // SAFETY: bounded UTF-16 output, same retained query-capable process handle.
+            let image_ok = unsafe { QueryFullProcessImageNameW(handle, 0, image.as_mut_ptr(), &mut image_len) } != 0;
+            let image_error = (!image_ok).then(|| os_error().raw_os_error()).flatten();
+            // Paths and arbitrary basenames stay local and are discarded into a closed enum.
+            let image = (image_ok && (image_len as usize) < image.len()).then(|| PathBuf::from(OsString::from_wide(&image[..image_len as usize])));
+            let basename = image.as_deref().and_then(Path::file_name).and_then(OsStr::to_str);
+            diagnostics::Member {
+                ordinal,
+                primary_root: ordinal == 0,
+                in_job: member_ok.then_some(in_job != 0),
+                membership_error,
+                wait,
+                wait_error,
+                exit_code: code_ok.then_some(code),
+                exit_error,
+                image: diagnostics::image_kind(basename, fixture_basename),
+                image_error,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+struct DiagnosticTrace {
+    started: Instant,
+    invocation: u64,
+    first_stop: bool,
+}
+
+#[cfg(test)]
+impl DiagnosticTrace {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self { started: Instant::now(), invocation: NEXT.fetch_add(1, Ordering::Relaxed), first_stop: false }
+    }
+    fn record_stop(&mut self, job: &Job, receipt: &ProcessReceipt, requested: bool) {
+        if receipt.stop != ProcessStop::Completed && !self.first_stop {
+            self.first_stop = true;
+            self.emit(diagnostics::Event::FirstStop, job, receipt, requested);
+        }
+    }
+    fn emit(&self, event: diagnostics::Event, job: &Job, receipt: &ProcessReceipt, requested: bool) {
+        let members = diagnostic_members(job);
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: diagnostic-only observation of the same owned Job into a correctly sized output.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job.handle.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                std::ptr::from_mut(&mut accounting).cast(),
+                size_of_val(&accounting) as u32,
+                null_mut(),
+            )
+        } != 0;
+        let error = (!ok).then(|| os_error().raw_os_error()).flatten();
+        let line = diagnostics::Snapshot {
+            event,
+            invocation: self.invocation,
+            elapsed_ms: self.started.elapsed().as_millis(),
+            receipt: diagnostics::ReceiptState {
+                stop: match receipt.stop {
+                    ProcessStop::SetupFailed => diagnostics::Stop::SetupFailed,
+                    ProcessStop::SpawnFailed => diagnostics::Stop::SpawnFailed,
+                    ProcessStop::Completed => diagnostics::Stop::Completed,
+                    ProcessStop::Timeout => diagnostics::Stop::Timeout,
+                    ProcessStop::OutputLimit => diagnostics::Stop::OutputLimit,
+                    ProcessStop::LingeringDescendants => diagnostics::Stop::LingeringDescendants,
+                    ProcessStop::IoFailure => diagnostics::Stop::IoFailure,
+                    ProcessStop::CleanupUnconfirmed => diagnostics::Stop::CleanupUnconfirmed,
+                },
+                root_exited: receipt.root_exited,
+                job_empty: receipt.job_empty,
+                observed_exited: receipt.observed_exited,
+                stdout_eof: receipt.stdout_eof,
+                stderr_eof: receipt.stderr_eof,
+                writer_finished: receipt.writer_finished,
+                termination_requested: requested,
+            },
+            accounting: diagnostics::Accounting { active: ok.then_some(accounting.ActiveProcesses), total: ok.then_some(accounting.TotalProcesses), error },
+            retained_count: job.processes.len(),
+            members: &members,
+        }
+        .line();
+        eprintln!("{line}");
     }
 }
 
@@ -1021,6 +1137,8 @@ async fn run_inner(
         stderr: Some(tokio::spawn(drain(stderr, stderr_limit, signal))),
     };
     let mut cleanup = CleanupState::default();
+    #[cfg(test)]
+    let mut diagnostic = DiagnosticTrace::new();
     loop {
         if overflow.try_recv().is_ok() {
             answer.output_limited = true;
@@ -1090,14 +1208,24 @@ async fn run_inner(
             answer.timed_out = true;
             receipt.stop = ProcessStop::Timeout;
         }
+        #[cfg(test)]
+        diagnostic.record_stop(&job, &receipt, cleanup.termination_requested);
         let step = cleanup.advance(&mut receipt, now);
+        #[cfg(test)]
+        diagnostic.record_stop(&job, &receipt, cleanup.termination_requested);
         if step.terminate {
+            #[cfg(test)]
+            diagnostic.emit(diagnostics::Event::TerminateRequested, &job, &receipt, cleanup.termination_requested);
             let _ = job.terminate();
         }
         if receipt.cleanup_confirmed() {
+            #[cfg(test)]
+            diagnostic.emit(diagnostics::Event::CleanupConfirmed, &job, &receipt, cleanup.termination_requested);
             break;
         }
         if step.expired {
+            #[cfg(test)]
+            diagnostic.emit(diagnostics::Event::CleanupExpired, &job, &receipt, cleanup.termination_requested);
             break;
         }
         tokio::time::sleep(POLL).await;
@@ -1111,6 +1239,76 @@ async fn run_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_resume_diagnostics_are_isolated_and_keep_the_strict_lifecycle() {
+        let fixture = format!("{}::real_resume_diagnostic_standalone_fixture", module_path!().split_once("::").unwrap().1);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &fixture, "--nocapture", "--", "--owned-resume-diagnostic"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(20);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= end {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("isolated real-resume diagnostic exceeded its finite deadline");
+            }
+            std::thread::sleep(POLL);
+        }
+        assert!(child.wait().unwrap().success(), "isolated real-resume diagnostic failed; closed metadata is on stderr");
+    }
+
+    #[test]
+    #[allow(clippy::zombie_processes)] // The owned Job must terminate the deliberate live descendant.
+    fn diagnostic_exit_fixture() {
+        if std::env::args().any(|arg| arg == "--owned-diagnostic-sleep") {
+            std::thread::sleep(Duration::from_secs(30));
+            std::process::exit(0);
+        }
+        if std::env::args().any(|arg| arg == "--owned-diagnostic-linger") {
+            let fixture = format!("{}::diagnostic_exit_fixture", module_path!().split_once("::").unwrap().1);
+            let _child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &fixture, "--nocapture", "--", "--owned-diagnostic-sleep"])
+                .spawn()
+                .unwrap();
+            std::process::exit(0);
+        }
+        if std::env::args().any(|arg| arg == "--owned-diagnostic-exit") {
+            std::process::exit(0);
+        }
+    }
+
+    #[test]
+    fn real_resume_diagnostic_standalone_fixture() {
+        if !std::env::args().any(|arg| arg == "--owned-resume-diagnostic") {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        for (flag, expected) in [("--owned-diagnostic-exit", ProcessStop::Completed), ("--owned-diagnostic-linger", ProcessStop::LingeringDescendants)] {
+            let fixture = format!("{}::diagnostic_exit_fixture", module_path!().split_once("::").unwrap().1);
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", &fixture, "--nocapture", "--", flag]);
+            let environment: Vec<_> =
+                ["SystemRoot", "WINDIR", "TEMP", "TMP"].into_iter().filter_map(|key| std::env::var_os(key).map(|value| (OsString::from(key), value))).collect();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (answer, job) = runtime.block_on(run_inner(&command, &environment, b"", deadline, 65536, 65536, None));
+            let receipt = answer.process_receipt.as_ref().expect("actual guard receipt");
+            let job = job.as_ref().expect("actual guard owns its Job");
+            let members = diagnostic_members(job);
+            assert!(!members.is_empty());
+            assert!(members[0].primary_root && members[0].wait == WAIT_OBJECT_0);
+            assert!(members.iter().all(|member| member.wait_error.is_none()));
+            assert_eq!(receipt.stop, expected, "unexpected lifecycle outcome; closed metadata is on stderr");
+            assert!(receipt.cleanup_confirmed());
+            assert!(std::time::Instant::now() < deadline);
+            assert_eq!(answer.code, if expected == ProcessStop::Completed { Some(0) } else { None });
+        }
+    }
+
     #[test]
     fn metadata_exit_one_is_only_the_empty_missing_origin_case() {
         // Policy truth table only: these diagnostics cannot create a witness.

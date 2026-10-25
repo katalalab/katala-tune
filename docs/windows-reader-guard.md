@@ -170,6 +170,37 @@ and cleanup-request policy, including one-shot requests after pending observatio
 fails or expires. These policy values are not OS observations and do not mint an
 ownership witness or replace the actual Job, retained-handle and EOF tests.
 
+### Test-only lifecycle diagnostics
+
+Library unit tests emit `owned_job_diagnostic` events at the first selected stop,
+immediately before the one-shot termination request, and at actual cleanup ACK
+or cleanup expiry. The stop remains visible in the ACK: an ACK after termination
+does not establish natural exit or authorize payload release. Receipt flags are
+the values used by the loop; the separately queried handle/accounting fields are
+later, sequential observations and are not an atomic snapshot.
+
+The closed output contract contains only enums, booleans and numeric results.
+It samples the root and at most fifteen further retained process handles, using
+stable ordinals rather than PIDs or creation times; a larger set is marked
+truncated. It records zero-wait results, membership and exit-query results/errors,
+and actual active/total accounting from the same owned Job. An image query is
+reduced in memory to `SelfFixture`, `Git`, `PowerShell`, `Conhost`, `WerFault`,
+`Other` or `Unknown`. A basename match establishes neither file authenticity nor
+the cause of an additional member. Arbitrary names, paths, identities, command
+lines and source output never enter this diagnostic formatter. Elapsed time is
+measured from this invocation's observation-loop setup and never controls a
+deadline or extends the existing cleanup window.
+
+`real_resume_diagnostics_are_isolated_and_keep_the_strict_lifecycle` runs an
+exact-filter standalone libtest child. It resumes a real root that exits and a
+separate root that deliberately leaves an owned live descendant; both use the
+unchanged product guard. An unexplained additional member may still fail the
+normal-exit case, with the closed diagnostics retained for investigation.
+No grace period, member exclusion or alternate completion witness is added.
+`cfg(test)` library instrumentation is not present in normal library builds
+used by integration tests or the shipped CLI; those tests do not gain internal
+events merely by being integration tests.
+
 API references: [Rust temporary handle inheritance lock](https://github.com/rust-lang/rust/blob/1.99.0/library/std/src/sys/process/windows.rs#L314-L399),
 [Job assignment at creation](https://devblogs.microsoft.com/oldnewthing/20230209-00/?p=107812%2F),
 [process attributes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute),
