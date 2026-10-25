@@ -128,6 +128,11 @@ test('probe(Windows): MxKey も値付きオプションの値を鍵に入れな�
     ['node', ['-m', 'C:\\srv\\private-client'], 'node'],
     ['Python', ['-m', 'sample_mcp.worker'], 'python:sample_mcp'],
     ['Python3.13', ['-I', '-m', 'sample_mcp.worker'], 'python3.13:sample_mcp'],
+    ['node', ['run', 'C:\\srv\\private-client'], 'node'],
+    ['ruby', ['run', 'C:\\srv\\private-client'], 'ruby'],
+    ['python3', ['start', 'C:\\srv\\private-client'], 'python3'],
+    ['python3', ['--', '-m', 'private_client'], 'python3'],
+    ['python3', ['--', 'C:\\srv\\sample-mcp.py'], 'python3:sample-mcp'],
   ];
   const q = (v) => `'${v.replace(/'/g, "''")}'`;
   const calls = cases.map(([exe, args]) => `[Console]::WriteLine((MxKey ${q(exe)} @(${args.map(q).join(',')})))`).join('\n');
@@ -169,6 +174,26 @@ print(json.dumps(m.processes()))
 `);
   assert.deepEqual(r.groups.map((g) => g.key), ['node']);
   assert.doesNotMatch(JSON.stringify([r, analyze(mac(r))]), /private-client|server\.js/);
+});
+
+test('probe: launcher以外のスクリプト名や曖昧なpsオプション値を飛ばさない', () => {
+  const keys = runPy(`
+cases = [
+  ('node', ['run', '/srv/private-client']),
+  ('ruby', ['run', '/srv/private-client']),
+  ('python3', ['start', '/srv/private-client']),
+  ('node', ['-r', '/srv/private', 'client']),
+  ('node', ['--require=/srv/private', 'client']),
+  ('python3', ['--', '-m', 'private_client']),
+  ('python3', ['--', '/srv/sample-mcp.py']),
+  ('npm', ['exec', 'sample-mcp']),
+  ('node', ['--no-warnings', '/srv/sample-mcp.js']),
+  ('git', ['-c', 'core.fsmonitor=true', 'fsmonitor--daemon', 'run', '--detach']),
+]
+print(json.dumps([m.proc_key(e, args, flat=True) for e, args in cases]))
+`);
+  assert.deepEqual(keys, ['node', 'ruby', 'python3', 'node', 'node', 'python3', 'python3:sample-mcp', 'npm:sample-mcp', 'node:sample-mcp', 'git:fsmonitor--daemon']);
+  assert.doesNotMatch(JSON.stringify(keys), /private|client/);
 });
 
 test('probe: 2本のMCP孤児を集計から所見まで残し、通常の少数群は出さない', () => {

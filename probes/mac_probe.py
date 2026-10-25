@@ -129,7 +129,7 @@ def cpu_time_seconds(text):
 INTERPRETERS = re.compile(r"^(node|nodejs|bun|deno|python3?(\.\d+)?|uv|uvx|npx|bunx|npm|pnpm|ruby|java|git)$", re.I)
 LAUNCHERS = {"launchd", "login", "sshd", "sshd-session"}
 GENERIC_LABELS = {"index", "main", "cli", "server", "bin", "run", "app", "start", "dist", "build", "lib", "src", "out", "node_modules", "__main__"}
-SKIP_WORDS = {"exec", "run", "x", "dlx", "tool", "start"}
+SKIP_WORDS = {"npm": {"exec", "run", "x"}, "pnpm": {"exec", "run", "dlx"}, "uv": {"tool", "run"}, "bun": {"run", "x"}}
 # 同じオプションでも実行環境で意味が違う（例: Python -I は値なし、Ruby -I はパス付き）。未知なら読むのをやめる。
 VALUELESS = {
     "python": {"-q", "-u", "-B", "-E", "-s", "-S", "-I", "-O", "-OO", "-i"},
@@ -168,24 +168,33 @@ def proc_key(exe, tokens, flat=False):
     family = "python" if exe.startswith("python") else "node" if exe == "nodejs" else exe
     label = None
     i = 0
+    options = True
     while i < len(tokens):
         t = tokens[i]
-        if t == "-m" and family == "python" and i + 1 < len(tokens):
+        if options and t == "--":
+            options = False
+            i += 1
+            continue
+        if options and t == "-m" and family == "python" and i + 1 < len(tokens):
             module = tokens[i + 1]
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", module):
                 label = script_label(module.split(".")[0])
             break
-        if t == "-c" and exe.startswith("python"):
+        if options and t == "-c" and exe.startswith("python"):
             break
-        if (exe == "git" and t in ("-c", "-C")) or (family == "node" and t in ("-r", "--require")):
+        if options and ((exe == "git" and t in ("-c", "-C")) or (family == "node" and t in ("-r", "--require"))):
+            if flat and exe != "git":
+                break  # ps では値自体に含まれる空白を区別できない。
             i += 2
             continue
-        if t.startswith("-"):
-            if "=" in t or t == "--" or t in VALUELESS.get(family, set()):
+        if options and t.startswith("-"):
+            if flat and "=" in t:
+                break
+            if "=" in t or t in VALUELESS.get(family, set()):
                 i += 1
                 continue
             break
-        if t in SKIP_WORDS:
+        if options and t in SKIP_WORDS.get(exe, set()):
             i += 1
             continue
         # ps command= は argv の区切りを失う。後続があれば、空白入りパスの断片かもしれない。

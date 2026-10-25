@@ -157,7 +157,7 @@ $agents = @($list | Where-Object { $_.name -match '^(claude|codex|opencode|curso
 # to build a short key (exe:script name); the command line itself is never output. Owner: session 0 (services and SSH logons) = system, otherwise user.
 $mxInterp = '^(node|nodejs|bun|deno|python3?(\.\d+)?|py|uv|uvx|npx|bunx|npm|pnpm|ruby|java|javaw|git)$'
 $mxGeneric = @('index', 'main', 'cli', 'server', 'bin', 'run', 'app', 'start', 'dist', 'build', 'lib', 'src', 'out', 'node_modules', '__main__')
-$mxSkip = @('exec', 'run', 'x', 'dlx', 'tool', 'start')
+$mxSkip = @{ npm = @('exec', 'run', 'x'); pnpm = @('exec', 'run', 'dlx'); uv = @('tool', 'run'); bun = @('run', 'x') }
 # Options are interpreter-specific: Python -I takes no value, but Ruby -I takes a path.
 $mxValueless = @{
   python = @('-q', '-u', '-B', '-E', '-s', '-S', '-I', '-O', '-OO', '-i')
@@ -191,19 +191,21 @@ function MxKey([string]$exe, [string[]]$tokens) {
   $family = $exe; if ($exe -like 'python*') { $family = 'python' } elseif ($exe -eq 'nodejs') { $family = 'node' }
   $label = $null
   $i = 0
+  $options = $true
   while ($i -lt $tokens.Count) {
     $t = [string]$tokens[$i]
-    if ($t -ceq '-m' -and $family -eq 'python' -and $i + 1 -lt $tokens.Count) {
+    if ($options -and $t -ceq '--') { $options = $false; $i++; continue }
+    if ($options -and $t -ceq '-m' -and $family -eq 'python' -and $i + 1 -lt $tokens.Count) {
       if ($tokens[$i + 1] -cmatch '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$') { $label = MxLabel (($tokens[$i + 1] -split '\.')[0]) }
       break
     }
-    if ($t -ceq '-c' -and $exe -like 'python*') { break }
-    if (($exe -eq 'git' -and ($t -ceq '-c' -or $t -ceq '-C')) -or ($family -eq 'node' -and ($t -ceq '-r' -or $t -ceq '--require'))) { $i += 2; continue }
-    if ($t.StartsWith('-')) {
-      if ($t.Contains('=') -or $t -ceq '--' -or ($mxValueless[$family] -ccontains $t)) { $i++; continue }
+    if ($options -and $t -ceq '-c' -and $exe -like 'python*') { break }
+    if ($options -and (($exe -eq 'git' -and ($t -ceq '-c' -or $t -ceq '-C')) -or ($family -eq 'node' -and ($t -ceq '-r' -or $t -ceq '--require')))) { $i += 2; continue }
+    if ($options -and $t.StartsWith('-')) {
+      if ($t.Contains('=') -or ($mxValueless[$family] -ccontains $t)) { $i++; continue }
       break
     }
-    if ($mxSkip -contains $t) { $i++; continue }
+    if ($options -and ($mxSkip[$exe] -ccontains $t)) { $i++; continue }
     if ($exe -eq 'git' -and $t -cne 'fsmonitor--daemon') { break }
     $label = MxLabel ($t -replace '(?<=.)@[^@/\\]*$', '')
     break
