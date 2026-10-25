@@ -22,7 +22,7 @@ impl Store {
         let params_json = g("params").filter(|v| !v.is_null()).map(Value::to_string).unwrap_or_else(|| "null".into());
         let undo = g("undo").filter(|v| js::truthy(Some(v))).map(Value::to_string);
         self.conn.execute(
-            "INSERT INTO tune_actions (id, at, node_id, type, params, label, ok, output, undo, undo_of) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tune_actions (id, at, node_id, type, params, label, ok, output, undo, undo_of, target) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 sql(g("id")),
                 sql(g("at")),
@@ -33,7 +33,8 @@ impl Store {
                 g("ok").filter(|v| !v.is_null()).map(|v| i64::from(js::truthy(Some(v)))),
                 sql(g("output")),
                 undo,
-                sql(g("undo_of"))
+                sql(g("undo_of")),
+                g("target").filter(|v| !v.is_null()).map(Value::to_string)
             ],
         )?;
         Ok(())
@@ -73,6 +74,8 @@ impl Store {
                     m.insert("params".into(), p);
                     let u = parse(m.get("undo"));
                     m.insert("undo".into(), u);
+                    let target = parse(m.get("target"));
+                    m.insert("target".into(), target);
                 }
                 r
             })

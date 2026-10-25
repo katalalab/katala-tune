@@ -62,6 +62,22 @@ The established relationship is that Process Lasso was the requester of a file-o
 
 No Defender policy, exclusion, Process Lasso rule or quarantine state was changed. Investigation used existing local records; no sample or analysis report was manually submitted to Microsoft or another analysis service. Existing Defender cloud protection remained enabled and its automatic requests are visible in the log. Microsoft submission is on hold at the user's explicit instruction. This new behavioral detection is distinct from the historical Bearfoos detection of an older agent; neither has a Microsoft false-positive verdict.
 
+### Protected follow-up — 2026-10-26 JST
+
+The affected machine's intelligence had advanced to `1.461.194.0`. Realtime, behavior and script protection remained enabled, cloud block level High and controlled folder access remained enabled, and Process Lasso/ProcessGovernor remained running. The original quarantined copy remained absent and was not restored. A fresh copy of the exact public CLI, with the full SHA-256 recorded above, was evaluated in a separate private canary directory. Its actual file path was checked as not excluded.
+
+| Phase | Observed result |
+| --- | --- |
+| Normal-remediation custom scan | No threats found, exit 0, using the canonical Windows path |
+| `--version`, then `--help` | Both exit 0; no new detections after each observation interval |
+| Fixed read-only probe, network off | Exit 0 and parsed snapshot; no new detections |
+| Fixed read-only probe, network on | Exit 0 and parsed snapshot including `netsec`; no new detections |
+| Application state | Private config and data destinations remained absent throughout |
+
+The first scan invocation used forward slashes and returned `0x80508023`; it was not accepted as a clean scan. Resolving the same file to its canonical Windows path allowed the normal-remediation scan to complete. Both observations are retained privately. No scan-remediation override, exclusion, definition rollback, Process Lasso stop/start or policy change was used.
+
+This follow-up did not reproduce the earlier classification under the current conditions. It does not identify the classifier's trigger, prove a false positive, or attribute the change to the updated intelligence: the earlier execution environment and dynamic verdict are not reproduced. The historical detection and stable/fleet hold remain recorded; Microsoft submission remains on hold.
+
 ## Remaining release gates
 
 1. Resolve the new Defender classification and repeat acceptance under the affected machine's unchanged protection policy. Do not hide the failure by adding an exclusion or weakening policy.
