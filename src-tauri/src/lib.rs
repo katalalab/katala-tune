@@ -16,6 +16,7 @@ mod accent;
 mod agent;
 mod commands;
 mod commands_netsec;
+mod commands_specs;
 mod commands_tools;
 mod commands_topology;
 mod confirm;
@@ -142,6 +143,8 @@ pub fn run() {
             commands_topology::topology_refresh,
             commands_topology::topology_export,
             commands_tools::inventory,
+            commands_specs::specs_view,
+            commands_specs::specs_refresh,
             commands_tools::inventory_run,
             commands_tools::dogu_refresh,
             commands_tools::dogu_exclude,

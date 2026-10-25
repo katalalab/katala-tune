@@ -165,8 +165,8 @@ test('台帳の "network": false で止める（ログインの記録も集め�
   assert.deepEqual(macProbeArgs(true, false), ['python3', '-', 'nonet']);
   assert.deepEqual(macProbeArgs(false, false), ['python3', '-', '--skip-benchmark', 'nonet']);
   assert.equal(macSshCommand(false, false).match(/ --skip-benchmark nonet/g).length, 2);
-  assert.match(windowsSshCommand(true, false), /probe\.ps1\)" -NoNetwork;/);
-  assert.doesNotMatch(windowsSshCommand(false, true), /NoNetwork/);
+  assert.match(windowsSshCommand(true, false), /--benchmark 1 --network 0 --observe-wsl 0 --budget-ms 120000$/);
+  assert.match(windowsSshCommand(false, true), /--benchmark 0 --network 1 --observe-wsl 0 --budget-ms 120000$/);
 });
 
 test('Windows のログオンの記録は別のスクリプトで、同じ運び方（8191 バイトまで）で送り、結果を1つにまとめる', () => {
@@ -193,13 +193,15 @@ test('Windows のログオンの記録は別のスクリプトで、同じ運び
   assert.match(source, /\$batch\[-1\]\.RecordId \+ ':' \+ \[string\]\(EpochMs \$batch\[-1\]\.TimeCreated\)/);
 });
 
-test('Windows netsec は隔離した子だけを止め、完了済みの部分を20秒以内に残す', () => {
+test('Windows netsec は隔離した子だけを止め、期限内の両EOFと出力上限を要求する', () => {
   const source = fs.readFileSync(path.join(PROBES, 'win_probe.ps1')).subarray(3).toString('ascii');
   assert.doesNotMatch(source, /\[PowerShell\]::Create\(\)|\.Stop\(\)/);
   assert.match(source, /ProcessStartInfo/);
   assert.match(source, /RedirectStandardInput = \$true/);
   assert.match(source, /\$nsBudgetMs = 15000/);
-  assert.match(source, /17000 - \[int\]\$outerWatch\.ElapsedMilliseconds/);
+  assert.match(source, /Read-KtProcessOutput \$child \$outerWatch 17000/);
+  assert.match(source, /\$DeadlineMs - \[int\]\$Clock\.ElapsedMilliseconds/);
+  assert.doesNotMatch(source, /ReadToEndAsync/);
   assert.match(source, /19500 - \[int\]\$outerWatch\.ElapsedMilliseconds/);
   assert.match(source, /\.Kill\(\)/);
   assert.match(source, /\[Console\]::Out\.Flush\(\)/);

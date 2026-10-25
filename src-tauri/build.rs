@@ -27,6 +27,8 @@ const COMMANDS: &[&str] = &[
     "set_login",
     "dev_report",
     "inventory",
+    "specs_view",
+    "specs_refresh",
     "inventory_run",
     "dogu_refresh",
     "dogu_exclude",

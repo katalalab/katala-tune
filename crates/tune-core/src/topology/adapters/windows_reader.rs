@@ -25,6 +25,94 @@ const RESPONSE_SCHEMA: &str = "katala_windows_reader_response.v1";
 #[derive(Debug)]
 pub struct ReaderError;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReaderFailureStage {
+    RequestValidation,
+    Identity,
+    ProbePrepare,
+    ProbeResult,
+    CaptureValidation,
+    Deadline,
+    ResponseEncode,
+}
+
+impl ReaderFailureStage {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RequestValidation => "request_validation",
+            Self::Identity => "identity",
+            Self::ProbePrepare => "probe_prepare",
+            Self::ProbeResult => "probe_result",
+            Self::CaptureValidation => "capture_validation",
+            Self::Deadline => "deadline",
+            Self::ResponseEncode => "response_encode",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReaderBackendExit {
+    Missing,
+    Zero,
+    Nonzero,
+}
+
+impl ReaderBackendExit {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Zero => "zero",
+            Self::Nonzero => "nonzero",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReaderBackendFailure {
+    pub exit: ReaderBackendExit,
+    pub spawn_failed: bool,
+    pub timed_out: bool,
+    pub output_limited: bool,
+    pub stop: Option<ProcessStop>,
+    pub root_exit_zero: bool,
+    pub cleanup_confirmed: bool,
+    pub receipt_accepted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReaderFailure {
+    pub stage: ReaderFailureStage,
+    pub backend: Option<ReaderBackendFailure>,
+}
+
+#[cfg(windows)]
+impl ReaderFailure {
+    const fn at(stage: ReaderFailureStage) -> Self {
+        Self { stage, backend: None }
+    }
+
+    fn probe_result(output: &BoundedResult, nonce: &str) -> Self {
+        let receipt = output.process_receipt.as_ref();
+        Self {
+            stage: ReaderFailureStage::ProbeResult,
+            backend: Some(ReaderBackendFailure {
+                exit: match output.code {
+                    None => ReaderBackendExit::Missing,
+                    Some(0) => ReaderBackendExit::Zero,
+                    Some(_) => ReaderBackendExit::Nonzero,
+                },
+                spawn_failed: output.spawn_failed,
+                timed_out: output.timed_out,
+                output_limited: output.output_limited,
+                stop: receipt.map(|value| value.stop),
+                root_exit_zero: receipt.is_some_and(|value| value.root_exit_code == Some(0)),
+                cleanup_confirmed: receipt.is_some_and(ProcessReceipt::cleanup_confirmed),
+                receipt_accepted: receipt.is_some_and(|value| receipt_ok(value, nonce)),
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReaderRequest {
@@ -364,32 +452,37 @@ pub fn write_response(writer: &mut impl Write, bytes: &[u8]) -> Result<(), Reade
 
 #[cfg(windows)]
 pub async fn execute(request: &ReaderRequest, request_bytes: &[u8], deadline: std::time::Instant) -> Result<Vec<u8>, ReaderError> {
+    execute_diagnostic(request, request_bytes, deadline).await.map_err(|_| ReaderError)
+}
+
+#[cfg(windows)]
+pub async fn execute_diagnostic(request: &ReaderRequest, request_bytes: &[u8], deadline: std::time::Instant) -> Result<Vec<u8>, ReaderFailure> {
     if request.schema != REQUEST_SCHEMA {
-        return Err(ReaderError);
+        return Err(ReaderFailure::at(ReaderFailureStage::RequestValidation));
     }
-    request.validate()?;
+    request.validate().map_err(|_| ReaderFailure::at(ReaderFailureStage::RequestValidation))?;
     if remote::identity_hash(&gethostname::gethostname().to_string_lossy()) != request.expected_identity_hash {
-        return Err(ReaderError);
+        return Err(ReaderFailure::at(ReaderFailureStage::Identity));
     }
     // The guard may spend up to three seconds observing termination. Keep that
     // and output overhead inside the standalone CLI's absolute deadline.
-    let work_deadline = deadline.checked_sub(std::time::Duration::from_millis(3500)).ok_or(ReaderError)?;
-    let output = run_probe(request, work_deadline).await?;
+    let work_deadline = deadline.checked_sub(std::time::Duration::from_millis(3500)).ok_or_else(|| ReaderFailure::at(ReaderFailureStage::Deadline))?;
+    let output = run_probe(request, work_deadline).await.map_err(|_| ReaderFailure::at(ReaderFailureStage::ProbePrepare))?;
     if output.code != Some(0)
         || output.spawn_failed
         || output.timed_out
         || output.output_limited
         || !output.process_receipt.as_ref().is_some_and(|receipt| receipt_ok(receipt, &request.nonce))
     {
-        return Err(ReaderError);
+        return Err(ReaderFailure::probe_result(&output, &request.nonce));
     }
     // Gate1 remains enforced before returning source bytes, in addition to the
     // embedded probe's pre-return byte checks and the controller's own check.
-    remote::validate_capture_bytes(&request.remote_request(), &output.stdout).map_err(|_| ReaderError)?;
+    remote::validate_capture_bytes(&request.remote_request(), &output.stdout).map_err(|_| ReaderFailure::at(ReaderFailureStage::CaptureValidation))?;
     if std::time::Instant::now() >= deadline {
-        return Err(ReaderError);
+        return Err(ReaderFailure::at(ReaderFailureStage::Deadline));
     }
-    encode_response(request, request_bytes, output)
+    encode_response(request, request_bytes, output).map_err(|_| ReaderFailure::at(ReaderFailureStage::ResponseEncode))
 }
 
 // Keep the exact product launch available to Windows unit diagnostics. This

@@ -43,10 +43,18 @@ test('GPU rendering exposes free VRAM, percent, source, units and missing-data r
   const missing=ctx.gpuHtml({name:'Apple GPU',memory_kind:'unified',memory_status:'not-applicable',memory_reason:'shared unified memory',sampled_at:123});
   assert.match(missing,/統合メモリ共有/);assert.doesNotMatch(missing,/null%|null°C|undefined/);
 });
-test('Windows GPU query is bounded and adds actual free MiB plus explicit unavailable reasons', () => {
+test('Windows GPU telemetry adds actual free MiB and explicit unavailable reasons', () => {
   const src=fs.readFileSync(path.join(root,'probes/win_probe.ps1'),'utf8');
-  assert.match(src,/memory\.free/);assert.match(src,/WaitForExit\(4000\)/); assert.match(src,/mem_free_mb/);assert.match(src,/memory_status/);
+  assert.match(src,/memory\.free/);assert.match(src,/mem_free_mb/);assert.match(src,/memory_status/);
   assert.match(src,/private_mb/);assert.match(src,/cpu_seconds/);assert.match(src,/handle_count/);assert.match(src,/thread_count/);
+});
+
+test('Windows GPU telemetry keeps an unacknowledged cleanup as failure and stops the later compute query', () => {
+  const src=fs.readFileSync(path.join(root,'probes/win_probe.ps1'),'utf8');
+  assert.match(src,/\$ack = \$process\.WaitForExit\(\[Math\]::Min\(1000, \$left\)\)/);
+  assert.match(src,/return \(\$ack -and \$process\.HasExited\)/);
+  assert.match(src,/reason = "cleanup-unverified"/);
+  assert.match(src,/\$compute = if \(\$query\.reason\) \{ @\{ rows = @\(\); reason = \$query\.reason \} \} else \{ InvokeGpuComputeQuery/);
 });
 
 test('macOS accumulated CPU time parses minutes, hours, days and rejects invalid time', () => {

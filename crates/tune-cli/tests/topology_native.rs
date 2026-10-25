@@ -577,7 +577,12 @@ mod native_windows {
         }
         legacy_request.validate().unwrap();
         let (legacy_output, legacy_retained, legacy_body) = run(&fixture, "topology-reader", &legacy_request, true, &digest);
-        assert!(legacy_output.status.success(), "legacy Unicode/worktree reader must exit zero: code={:?}", legacy_output.status.code());
+        assert!(
+            legacy_output.status.success(),
+            "legacy Unicode/worktree reader must exit zero: code={:?} diagnostic={}",
+            legacy_output.status.code(),
+            String::from_utf8_lossy(&legacy_output.stderr)
+        );
         assert!(legacy_output.stderr.is_empty());
         let header_len = u32::from_le_bytes(legacy_output.stdout[8..12].try_into().unwrap()) as usize;
         let header: serde_json::Value = serde_json::from_slice(&legacy_output.stdout[16..16 + header_len]).unwrap();
