@@ -2460,7 +2460,7 @@ dependencies = [
 
 [[package]]
 name = "katala-tune"
-version = "0.6.4"
+version = "0.6.5-specs.2"
 dependencies = [
  "objc2-app-kit",
  "rfd",
@@ -5294,7 +5294,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tune-agent"
-version = "0.6.4"
+version = "0.6.5-specs.2"
 dependencies = [
  "gethostname",
  "httparse",
@@ -5308,7 +5308,7 @@ dependencies = [
 
 [[package]]
 name = "tune-cli"
-version = "0.6.4"
+version = "0.6.5-specs.2"
 dependencies = [
  "serde_json",
  "tokio",
@@ -5320,7 +5320,7 @@ dependencies = [
 
 [[package]]
 name = "tune-core"
-version = "0.6.4"
+version = "0.6.5-specs.2"
 dependencies = [
  "dirs 7.0.0",
  "encoding_rs",
@@ -5342,7 +5342,7 @@ dependencies = [
 
 [[package]]
 name = "tune-link"
-version = "0.6.4"
+version = "0.6.5-specs.2"
 dependencies = [
  "curve25519-dalek 5.0.0",
  "ed25519-dalek",

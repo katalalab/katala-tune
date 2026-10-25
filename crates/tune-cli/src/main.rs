@@ -8,6 +8,8 @@
 //!   tune last                        DB の前回の分析結果（所見・スコアつき）を JSON で
 //!   tune power                       電力・Clockと計算条件を JSON で（読み取り専用）
 //!   tune capabilities [機体 ...] firmware 読取（省略はこの機体、保存なし）
+//!   tune specs-local                 Rust による機体仕様の読取（台帳・DB不要）
+//!   tune specs [機体 ...]            仕様を収集・保存して比較用 JSON を表示
 //!   tune maintenance-plan [機体 ...] 読取更新と実行不可の保守計画
 //!   tune network [--probe] [機体 ...] 軽量な接続診断（省略はこの機体。--probeだけHTTPS到達性・時間も測る）
 //!   tune status [--recompute]        DB の状態（機能チェック）を JSON で。--recompute で計算し直して保存する
@@ -44,6 +46,8 @@
 //! 変更操作（actions）はここからは実行しない（確認ダイアログを通すため、アプリからだけ）。
 
 mod agent;
+mod discovery;
+mod specs;
 mod topology_native;
 mod topology_reader;
 
@@ -60,7 +64,7 @@ use tune_core::{
 
 fn usage() -> ExitCode {
     eprintln!(
-        "使い方: tune <paths|probe|hygiene|logs|ledger|last|power|network|capabilities|maintenance-plan|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
+        "使い方: tune <paths|probe|hygiene|logs|ledger|last|power|network|capabilities|specs-local|specs|maintenance-plan|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
     );
     ExitCode::from(2)
 }
@@ -302,6 +306,9 @@ async fn live(rest: &[String]) -> Result<(), String> {
 fn main() -> ExitCode {
     let started = std::time::Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = discovery::run(&args) {
+        return code;
+    }
     if args.first().is_some_and(|cmd| cmd == "topology-reader") {
         return topology_reader::main(&args[1..], started);
     }
@@ -317,7 +324,25 @@ fn main() -> ExitCode {
 async fn async_main(args: Vec<String>) -> ExitCode {
     let Some(cmd) = args.first() else { return usage() };
     let rest = &args[1..];
+    if cmd == "specs-local" {
+        if !rest.is_empty() {
+            return usage();
+        }
+        let report = tune_core::specs::collect_local().await;
+        let ok = report["ok"] == true;
+        print(&report);
+        return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
+    }
     let res: Result<(), String> = match cmd.as_str() {
+        "specs" => specs::run(rest).await.map(|v| print(&v)),
+        "versions" => match specs::audit_targets(rest) {
+            Ok(selected) => {
+                let report = tune_core::version_inventory::audit(selected).await;
+                print(&report);
+                if report["ok"] == true { Ok(()) } else { Err("CLI の版照合に不一致または取得失敗があります".into()) }
+            }
+            Err(error) => Err(error),
+        },
         "topology-refresh" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
             Ok(e) => match topology_node_ids(rest, false) {
                 Ok(ids) => {

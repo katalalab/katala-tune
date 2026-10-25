@@ -1231,10 +1231,14 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        let directory = std::env::temp_dir().join(format!("shared-pin-fixture-{}-{}", std::process::id(), crate::db::now_ms()));
+        // The copied-image control deliberately shares the original artifact's
+        // volume. TEMP/TMP may be redirected to another drive; they do not
+        // establish where the executable under test resides.
+        let own_program = std::env::current_exe().unwrap();
+        let directory =
+            own_program.parent().expect("test executable directory").join(format!("shared-pin-fixture-{}-{}", std::process::id(), crate::db::now_ms()));
         std::fs::create_dir(&directory).unwrap();
         let temporary = TemporaryDirectory(directory);
-        let own_program = std::env::current_exe().unwrap();
         let own_image = std::fs::read(&own_program).unwrap();
         let own_artifact = sha256(&own_image);
         let own_pin = Arc::new(PinnedWindowsExecutable::open(&own_program, &own_artifact, end).unwrap());
@@ -1263,7 +1267,8 @@ mod tests {
             let volume_match = same_volume(copied);
             report("copied_rust", volume_match, &result);
             let consumed = result.is_ok_and(|completion| completion.into_verified_output(b"", &own_artifact).is_ok());
-            volume_match && consumed
+            let original_volume_match = copied.executable().components().next() == own_pin.executable().components().next();
+            original_volume_match && consumed
         } else {
             eprintln!("shared_pinned_case=copied_rust_setup_failed");
             false
@@ -1372,7 +1377,7 @@ mod tests {
         assert!(receipt.root.is_none() && receipt.observed.is_empty(), "reject the different program before process creation");
         assert_eq!(Arc::strong_count(&pin), 1);
         assert!(own_passed, "same-parent pinned original Rust control must complete and consume");
-        assert!(copy_passed, "same-bytes Rust control must complete on the system volume and consume");
+        assert!(copy_passed, "same-bytes Rust control must complete on the original artifact volume and consume");
         assert!(metadata_passed, "all shared metadata completion, exit-policy and lease assertions remain required");
         assert!(missing_rejected, "zero-only policy still requires a real completed exit-one rejection");
         assert!(git_passed, "actual pinned Git metadata must succeed as well as the no-origin fixture");
