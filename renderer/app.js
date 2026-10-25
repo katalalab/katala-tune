@@ -406,6 +406,8 @@ function findingHtml(f) {
 // WSL の中の観測。停止中は起動せず「未観測」（正常でも空でもない）。中を観測できたのは動いている distro だけ
 const WSL_STATE = { running: ['動いている', 'green'], stopped_unobserved: ['停止中（未観測）', 'gray'], unknown: ['状態を読めない', 'orange'] };
 const WSL_REASON = { 'not-running': '起動しないので観測していない', 'running-list-failed': '動いているかを読めなかった', 'internal-distro-skipped': 'Docker Desktop の内部 distro', 'observation-limit': '観測数の上限', timeout: '時間切れ', failed: '実行できなかった', 'no-data': '内側から値を読めなかった' };
+const WSL_SECTION = { swap: 'スワップ', psi: 'PSI', load: '負荷', top: '上位プロセス', disk: 'ディスク' };
+const WSL_SECTION_REASON = { 'command-failed': '取得コマンドが失敗', 'invalid-data': '値を読めなかった', 'missing-status': '取得結果を確認できなかった' };
 function wslHtml(d) {
   const w = d.wsl;
   const list = Array.isArray(w?.distros) ? w.distros : [];
@@ -416,7 +418,9 @@ function wslHtml(d) {
     if (!i) return `<span class="muted">${esc(WSL_REASON[x.reason] || x.reason || '')}</span>`;
     const used = Math.max(0, i.mem_total_mb - i.mem_available_mb);
     const top = (i.top || []).slice(0, 3).map((p) => `${esc(p.name)} ${esc(p.mem_mb)} MB`).join('、');
-    return `メモリ ${gbOf(used)} / ${gbOf(i.mem_total_mb)}${i.psi_some_avg10 != null ? `（PSI ${esc(i.psi_some_avg10)}%）` : ''}${top ? `<div class="muted">上位: ${top}</div>` : ''}`;
+    const missing = Object.entries(WSL_SECTION).filter(([key]) => i.errors && Object.hasOwn(i.errors, key) && i.errors[key] != null)
+      .map(([key, label]) => `${label}（${Object.hasOwn(WSL_SECTION_REASON, i.errors[key]) ? WSL_SECTION_REASON[i.errors[key]] : '不明'}）`).join('、');
+    return `メモリ ${gbOf(used)} / ${gbOf(i.mem_total_mb)}${i.psi_some_avg10 != null ? `（PSI ${esc(i.psi_some_avg10)}%）` : ''}${top ? `<div class="muted">上位: ${top}</div>` : ''}${missing ? `<div class="note-line">未取得: ${esc(missing)}</div>` : ''}`;
   };
   return `${UI.section('WSL の中', '停止中の distro は起動せず観測しません。メモリは WSL の VM 全体（distro は共有）')}
     ${UI.table({

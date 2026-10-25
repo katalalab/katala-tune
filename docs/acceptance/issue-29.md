@@ -23,3 +23,10 @@
 - opt-in 時の running 確認と内部実行の間に残るOS側競合（既定無効にしているが、厳密な無起動保証が要る場合の代替API）。
 - Windows 実機の「WSL なし」の記録。
 - 判定と観測の確認の間に distro が自然に止まると `wsl -d` がそれを起動しうる競合（ミリ秒。ドキュメントに明記）。
+
+## P2 修正（2026-10-26、source と回帰テスト）
+
+- 一覧取得失敗を JS/Rust の所見 `wsl-list-failed` に出し、正常な空一覧と区別する。
+- 内部のコマンドの終了状態と項目別の値を確認し、部分取得失敗を `inside.errors` の固定理由で保存する。成功したメモリを保持し、非0終了した項目の部分出力を成功として使わない。画面の機体詳細と JS/Rust の所見 `wsl-partial` に欠測項目・理由を出す。
+- 回帰テストは `test/wsl.test.js`、`test/wsl-renderer.test.js`、`test/wsl-inner-script.test.js`、`test/win-wsl-regression.ps1`、Rust の WSL 単体テストと `tests/parity.rs`。いずれも実機の WSL を起動しない fixture を使う。
+- これは新しい実機受入記録ではない。P1 の停止競合・Docker/コンテナ・全件台帳・Windows 実機3条件の残件は維持し、Issue #29 を閉じない。merge と実機受入は親の調整下で別途行う。

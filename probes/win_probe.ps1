@@ -509,16 +509,22 @@ if (Test-Path $wcfg) {
 # no -d, no --exec, nothing runs inside it. If the running list cannot be read, no distro is touched either.
 # Invoke-KtWsl is the only place that starts wsl.exe, so a regression test can replace it with a fake.
 $KtWslInnerScript = @'
+LC_ALL=C
+export LC_ALL
 echo @@mem
 grep -E "^(MemTotal|MemAvailable|SwapTotal|SwapFree):" /proc/meminfo 2>/dev/null
+echo "@@status mem $?"
 echo @@psi
 cat /proc/pressure/memory 2>/dev/null
+echo "@@status psi $?"
 echo @@load
 cat /proc/loadavg 2>/dev/null
+echo "@@status load $?"
 echo @@ps
-ps -eo pid=,rss=,pcpu=,comm= --sort=-rss 2>/dev/null | head -n 8
+{ ps -eo pid=,rss=,pcpu=,comm= --sort=-rss 2>/dev/null; echo "@@status ps $?"; } | awk "NR <= 8 || /^@@status ps /"
 echo @@df
-df -P -k / 2>/dev/null | tail -n +2
+df -P -k / 2>/dev/null
+echo "@@status df $?"
 echo @@end
 '@
 function Test-KtWslInstalled { return (Test-Path (Join-Path $env:SystemRoot 'System32\wsl.exe')) }
@@ -594,33 +600,55 @@ function ConvertFrom-KtWslInside([string]$Text) {
   $load = $null
   $top = @()
   $disk = @()
+  $status = @{}
+  $invalid = @{}
   foreach ($line in ($Text -split "`n")) {
     $t = $line.TrimEnd("`r")
+    if ($t -match '^@@status (mem|psi|load|ps|df) ([0-9]+)$') { $status[$Matches[1]] = $Matches[2]; continue }
     if ($t -match '^@@(\w+)$') { $sec = $Matches[1]; continue }
     if ($sec -eq 'mem' -and $t -match '^(\w+):\s+(\d+)\s*kB') { $kv[$Matches[1]] = [double]$Matches[2] }
-    elseif ($sec -eq 'psi' -and $t -match '^(some|full)\s.*avg10=([0-9.]+)') { $psi[$Matches[1]] = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture) }
-    elseif ($sec -eq 'load' -and $t -match '^([0-9.]+)\s') { $load = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture) }
-    elseif ($sec -eq 'ps' -and $t -match '^\s*(\d+)\s+(\d+)\s+([0-9.]+)\s+(\S.*)$') {
+    elseif ($sec -eq 'psi' -and $t -match '^(some|full)\s.*avg10=([0-9]+(?:\.[0-9]+)?)\s') { $psi[$Matches[1]] = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture) }
+    elseif ($sec -eq 'load' -and $t -match '^([0-9]+(?:\.[0-9]+)?)\s') { $load = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture) }
+    elseif ($sec -eq 'ps' -and $t -match '^\s*(\d+)\s+(\d+)\s+([0-9]+(?:\.[0-9]+)?)\s+(\S.*)$') {
       $top += [pscustomobject]@{ pid = [int]$Matches[1]; name = $Matches[4].Trim(); mem_mb = [int]([double]$Matches[2] / 1024); cpu = [double]::Parse($Matches[3], [Globalization.CultureInfo]::InvariantCulture) }
     }
     elseif ($sec -eq 'df' -and $t -match '^\S+\s+(\d+)\s+(\d+)\s+(\d+)\s+\d+%\s+(\S+)$') {
       $tot = [double]$Matches[1]
-      if ($tot -gt 0) { $disk += [pscustomobject]@{ mount = $Matches[4]; total_gb = (R1 ($tot / 1048576)); free_gb = (R1 ([double]$Matches[3] / 1048576)); free_pct = (R1 ([double]$Matches[3] / $tot * 100)) } }
+      if ($tot -gt 0 -and [double]$Matches[3] -le $tot) { $disk += [pscustomobject]@{ mount = $Matches[4]; total_gb = (R1 ($tot / 1048576)); free_gb = (R1 ([double]$Matches[3] / 1048576)); free_pct = (R1 ([double]$Matches[3] / $tot * 100)) } } else { $invalid['df'] = $true }
     }
+    elseif ($t.Trim() -and $sec -in @('psi', 'load', 'ps', 'df') -and -not ($sec -eq 'df' -and $t -match '^Filesystem\s')) { $invalid[$sec] = $true }
   }
-  if (-not $kv.ContainsKey('MemTotal') -or -not $kv.ContainsKey('MemAvailable')) { return $null }
-  $swapTotal = if ($kv.ContainsKey('SwapTotal')) { $kv['SwapTotal'] } else { 0 }
-  $swapFree = if ($kv.ContainsKey('SwapFree')) { $kv['SwapFree'] } else { 0 }
+  if ($status['mem'] -ne '0' -or -not $kv.ContainsKey('MemTotal') -or -not $kv.ContainsKey('MemAvailable')) { return $null }
+  if ($kv['MemTotal'] -le 0 -or $kv['MemAvailable'] -gt $kv['MemTotal']) { return $null }
+  $errors = [ordered]@{}
+  foreach ($pair in @(@('psi', 'psi'), @('load', 'load'), @('ps', 'top'), @('df', 'disk'))) {
+    $section = $pair[0]; $key = $pair[1]
+    if (-not $status.ContainsKey($section)) { $errors[$key] = 'missing-status' }
+    elseif ($status[$section] -ne '0') { $errors[$key] = 'command-failed' }
+    elseif ($invalid[$section]) { $errors[$key] = 'invalid-data' }
+  }
+  if (-not $errors.Contains('psi') -and (-not $psi.ContainsKey('some') -or -not $psi.ContainsKey('full') -or $psi['some'] -gt 100 -or $psi['full'] -gt 100)) { $errors['psi'] = 'invalid-data' }
+  if (-not $errors.Contains('load') -and $null -eq $load) { $errors['load'] = 'invalid-data' }
+  if (-not $errors.Contains('disk') -and $disk.Count -eq 0) { $errors['disk'] = 'invalid-data' }
+  if ($errors.Contains('psi')) { $psi = @{} }
+  if ($errors.Contains('load')) { $load = $null }
+  if ($errors.Contains('top')) { $top = @() }
+  if ($errors.Contains('disk')) { $disk = @() }
+  $swapTotal = $null; $swapUsed = $null
+  if ($kv.ContainsKey('SwapTotal') -and $kv.ContainsKey('SwapFree') -and $kv['SwapFree'] -le $kv['SwapTotal']) {
+    $swapTotal = [int]($kv['SwapTotal'] / 1024); $swapUsed = [int](($kv['SwapTotal'] - $kv['SwapFree']) / 1024)
+  } else { $errors['swap'] = 'invalid-data' }
   return [ordered]@{
     mem_total_mb = [int]($kv['MemTotal'] / 1024)
     mem_available_mb = [int]($kv['MemAvailable'] / 1024)
-    swap_total_mb = [int]($swapTotal / 1024)
-    swap_used_mb = [int](($swapTotal - $swapFree) / 1024)
+    swap_total_mb = $swapTotal
+    swap_used_mb = $swapUsed
     psi_some_avg10 = $psi['some']
     psi_full_avg10 = $psi['full']
     load1 = $load
     top = @($top)
     disk = @($disk)
+    errors = $errors
   }
 }
 function Get-KtWslObservation([bool]$Enabled = $false) {

@@ -227,6 +227,7 @@ Windows の GPU 開発機では、メモリ・CPU・ディスクの実消費の�
 - 内側で読むのは、`/proc/meminfo` の MemTotal・MemAvailable・Swap、`/proc/pressure/memory`（PSI）、`/proc/loadavg`、メモリ上位8件のプロセス名（コマンドラインは読まない）、`/` の使用量。distro の VHDX の大きさは Windows 側のファイルの大きさだけを読む（停止中でも読めるが、中には入らない）。WSL2 の distro は1つの VM を共有するので、内側のメモリは VM 全体の値で、distro を足さずに最大を使う。
 - Windows 側との突き合わせ: 内側の使用が VM の上限の 90% 以上（`wsl-inside-memory`）、`vmmem` が内側の実使用より 4 GB 以上多く、物理メモリの 25% 以上を持っている（`wsl-reclaim`。`.wslconfig` の `autoMemoryReclaim=gradual` の提案）。観測できていない distro があるときは比べない。
 - 判定は `lib/wsl.js`（JS）と `crates/tune-core/src/wsl.rs`（Rust）で同じ。`crates/tune-core/tests/parity.rs` の固定の例で一致を確かめる。
+- 一覧自体の取得失敗は `wsl.list_error` と所見 `wsl-list-failed` に残し、確認済みの空一覧と区別する。内部の項目別失敗は `inside.errors`（`swap` / `psi` / `load` / `top` / `disk`）に固定理由 `command-failed`・`invalid-data`・`missing-status` を保存し、機体の詳細と所見 `wsl-partial` に出す。成功したメモリは保持し、非0終了した項目の途中の値は捨てる。`observed: true` はメモリ取得成功を示し、全項目成功の意味ではない。旧 snapshot の `errors` 省略は変更しない。
 - まだ無いもの: Docker／コンテナの使用量、台帳の「全件台帳」への WSL の欄、CPU の内側の値。
 
 ## 順番

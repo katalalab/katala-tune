@@ -468,6 +468,23 @@ fn fixtures() -> Vec<(Value, Value)> {
             json!({}),
         ),
         (win_fixture(json!({ "wsl": { "config": false, "memory": null, "installed": true, "listed": true, "distros": [] } })), json!({})),
+        (win_fixture(json!({ "wsl": { "observation_enabled": true, "installed": true, "listed": false, "list_error": "timeout", "distros": [] } })), json!({})),
+        (win_fixture(json!({ "wsl": { "list_error": "exit 1", "distros": [] } })), json!({})),
+        (win_fixture(json!({ "wsl": { "list_error": "output-limit", "distros": [] } })), json!({})),
+        (
+            win_fixture(json!({ "wsl": { "distros": [
+            { "name": "dev-a", "state": "running", "observed": true, "inside": { "mem_total_mb": 24000, "mem_available_mb": 1000,
+                "errors": { "swap": "invalid-data", "psi": "missing-status", "load": "command-failed", "top": "command-failed", "disk": "invalid-data" } } },
+            { "name": "dev-b", "state": "running", "observed": true, "inside": { "mem_total_mb": 24000, "mem_available_mb": 20000, "errors": { "top": "future-reason" } } }
+        ] } })),
+            json!({}),
+        ),
+        (
+            win_fixture(json!({ "wsl": { "distros": [
+            { "name": "dev-a", "state": "running", "observed": true, "inside": { "mem_total_mb": 24000, "mem_available_mb": 20000, "errors": { "top": null, "unexpected": "ignored" } } }
+        ] } })),
+            json!({}),
+        ),
     ]
 }
 
