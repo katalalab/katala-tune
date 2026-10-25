@@ -27,6 +27,8 @@
     "allow-logs-signatures",
     "allow-logs-cursors",
     "allow-copy",
+    "allow-ai-handoff",
+    "allow-ai-handoff-copy",
     "allow-open-data-dir",
     "allow-open-config",
     "allow-status",

@@ -40,6 +40,10 @@
     logsSignatures: (filter) => invoke('logs_signatures', { filter: filter ?? null }),
     logsCursors: () => invoke('logs_cursors'),
     copy: (text) => invoke('copy', { text: String(text) }),
+    // 所見を AI エージェントへ渡す（Tauri 版だけ。Electron 版の preload.js には無いので、画面は有無で判定する）。
+    // agent は 'claude' | 'codex'。確認ダイアログと台帳の読み直しは Rust 側。aiHandoffCopy はプロンプトをクリップボードへ
+    aiHandoff: (nodeId, findingId, agent) => invoke('ai_handoff', { nodeId: String(nodeId), findingId: String(findingId), agent: String(agent) }),
+    aiHandoffCopy: (nodeId, findingId) => invoke('ai_handoff_copy', { nodeId: String(nodeId), findingId: String(findingId) }),
     openDataDir: () => invoke('open_data_dir'),
     openConfig: () => invoke('open_config'),
     status: () => invoke('status'),

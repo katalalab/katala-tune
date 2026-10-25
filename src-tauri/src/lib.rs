@@ -130,6 +130,8 @@ pub fn run() {
             commands::logs_signatures,
             commands::logs_cursors,
             commands::copy,
+            commands::ai_handoff,
+            commands::ai_handoff_copy,
             commands::open_data_dir,
             commands::open_config,
             commands::status,

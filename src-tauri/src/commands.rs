@@ -9,7 +9,7 @@ use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_clipboard_manager::ClipboardExt as _;
 use tauri_plugin_opener::OpenerExt as _;
 use tune_core::engine::Engine;
-use tune_core::{js, nodes};
+use tune_core::{handoff, js, nodes};
 
 type R = Result<Value, String>;
 type E<'a> = State<'a, Arc<Engine>>;
@@ -131,6 +131,40 @@ pub async fn logs_signatures(e: E<'_>, filter: Option<Value>) -> R {
 #[tauri::command]
 pub async fn logs_cursors(e: E<'_>) -> R {
     e.logs_cursors().map(Value::Array)
+}
+
+/// 所見を AI エージェントの CLI に渡す（Tauri 版だけ）。DB から所見を読み直してプロンプトを作り、
+/// 全文を確認ダイアログで見せて承認されたときだけ、新しいターミナルで読み取り寄りの権限の CLI を開く（tune-core の handoff）
+#[tauri::command]
+pub async fn ai_handoff(app: AppHandle, e: E<'_>, node_id: String, finding_id: String, agent: String) -> R {
+    let Some(agent) = handoff::Agent::parse(&agent) else {
+        return Ok(json!({ "ok": false, "refused": "渡す先が分からない" }));
+    };
+    if !crate::confirm::SUPPORTED {
+        return Ok(json!({ "ok": false, "refused": "この OS では確認ダイアログを出せないので開かない" }));
+    }
+    let p = match e.handoff_prepare(&node_id, &finding_id) {
+        Ok(p) => p,
+        Err(m) => return Ok(json!({ "ok": false, "refused": m })),
+    };
+    let title = format!("{} に渡す: {} / {}", agent.label(), p.node.id, p.title);
+    let detail =
+        format!("{} を新しいターミナルで {} で開き、次の内容を渡します。内容は {} に送られます。\n\n{}", agent.label(), agent.mode(), agent.vendor(), p.prompt);
+    if !crate::confirm::ask(app, crate::confirm::HANDOFF)(title, detail).await {
+        return Ok(json!({ "ok": false, "cancelled": true }));
+    }
+    Ok(e.handoff_launch(&p, agent))
+}
+
+/// 所見のプロンプトをクリップボードへ（Desktop 版や Web に貼る用）。プロンプトは Rust 側で作り、画面には渡さない
+#[tauri::command]
+pub async fn ai_handoff_copy(app: AppHandle, e: E<'_>, node_id: String, finding_id: String) -> R {
+    let p = match e.handoff_prepare(&node_id, &finding_id) {
+        Ok(p) => p,
+        Err(m) => return Ok(json!({ "ok": false, "refused": m })),
+    };
+    app.clipboard().write_text(p.prompt).map_err(|e| e.to_string())?;
+    Ok(json!({ "ok": true }))
 }
 
 #[tauri::command]

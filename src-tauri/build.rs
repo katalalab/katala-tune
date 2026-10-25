@@ -18,6 +18,8 @@ const COMMANDS: &[&str] = &[
     "logs_signatures",
     "logs_cursors",
     "copy",
+    "ai_handoff",
+    "ai_handoff_copy",
     "open_data_dir",
     "open_config",
     "status",

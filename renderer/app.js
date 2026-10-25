@@ -373,6 +373,9 @@ async function renderNode(id) {
     $$('[data-copy]', el).forEach((b) => { b.onclick = async () => { await window.tune.copy(f.commands[+b.dataset.copy]); b.textContent = 'コピー済み'; }; });
     const a = $('[data-act]', el);
     if (a) a.onclick = () => runAction(n, f);
+    $$('[data-ai]', el).forEach((b) => { b.onclick = () => handoff(n, f, b.dataset.ai); });
+    const ac = $('[data-ai-copy]', el);
+    if (ac) ac.onclick = async () => { const res = await window.tune.aiHandoffCopy(n.id, f.id); if (res.ok) ac.textContent = 'コピー済み'; else toast(`コピーしませんでした: ${res.refused}`, 5000); };
     const lq = $('[data-logq]', el);
     if (lq) lq.onclick = () => { state.logFilter = { ...state.logFilter, q: f.log_query?.q || '', node_id: n.id, level: f.log_query?.level || '' }; go('logs'); };
   });
@@ -396,6 +399,8 @@ function findingHtml(f) {
       : `<div class="act"><button class="btn ${f.action.type === 'kill-process' ? 'danger' : 'primary'}" data-act="1">${esc(f.action.label)}</button><span>実行前に確認します。直前に状態を確かめ直し、変わっていれば中止します</span></div>`;
   }
   if (f.log_query) act += `<div class="act"><button class="btn small" data-logq="1">${icon('logs')}関連するログを見る</button></div>`;
+  // AI エージェントへ渡す（Tauri 版だけ）。開く前に、渡す全文を確認ダイアログで見せる
+  if (window.tune.aiHandoff) act += `<div class="act"><button class="btn small" data-ai="claude">${icon('bulb')}Claude Code で調べる</button><button class="btn small" data-ai="codex">${icon('bulb')}Codex で調べる</button><button class="btn small" data-ai-copy="1">${icon('copy')}AI 用にコピー</button></div>`;
   return UI.toggle({
     cls: `f sev-${f.severity}`, attrs: `data-fid="${esc(f.id)}"`, open: f.severity !== 'info',
     summary: `<span class="f-title">${esc(f.title)}</span>${f.category ? `<span class="f-cat">${esc(CAT_LABEL[f.category] || f.category)}</span>` : ''}`,
@@ -958,6 +963,13 @@ async function runAction(n, f) {
   if (r.refused) return toast(`実行しませんでした: ${r.refused}`, 5000);
   toast(`${n.id}: ${r.outcome}`, 5000);
   await probe([n.id]);
+}
+
+async function handoff(n, f, agent) {
+  const r = await window.tune.aiHandoff(n.id, f.id, agent);
+  if (r.cancelled) return toast('取り消しました');
+  if (!r.ok) return toast(`開きませんでした: ${r.refused}`, 5000);
+  toast(`${agent === 'codex' ? 'Codex' : 'Claude Code'} を新しいターミナルで開きました（実行記録に残しました）`, 5000);
 }
 
 // ---- 分析・同期 ----
