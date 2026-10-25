@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public X25519 test vector derived from the synthetic input [0x24; 32]"
+condition = "AND"
+paths = ['''^crates/tune-link/tests/fixtures/ed25519-v2-card\.json$''']
+regexTarget = "secret"
+regexes = ['''^04bcd2e0d00f2cce5fe8f1c6c2fbec5c07fa56e3aa5c88a5689975d88b3fce05$''']
