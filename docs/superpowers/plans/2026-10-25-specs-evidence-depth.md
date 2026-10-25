@@ -20,10 +20,10 @@
 
 ## Tasks
 
-- [ ] Refresh all six reports and group remaining gaps by native source and identity specificity.
-- [ ] Obtain full manufacturer documents for the excerpt-only Crucial/EIZO records; verify exact SKU rows and record hashes/access evidence privately. Research additional exact product identities using public IDs where manufacturer evidence exists.
-- [ ] Add failing native Windows regressions, then implement private device-instance association for drivers, public PCI/USB identity details and additional supported metadata. Verify exact native property names against actual providers.
-- [ ] Add failing macOS regressions, then improve grouping/aggregate handling and exposed identity/configuration properties. Retain non-public fields as unavailable.
-- [ ] Add trusted source-evidence and applicability handling at normalization/remote validation boundaries, with escaped and source-aware comparison details.
-- [ ] Run focused regressions and independent review, then the complete repository checks. Synchronize versions and build immutable platform artifacts.
-- [ ] Back up and update six CLIs plus the two Mac applications and Windows console app, collect fresh reports from all three consoles, inspect actual UI and record remaining limitations.
+- [x] Refresh all six reports and group remaining gaps by native source and identity specificity.
+- [x] Obtain accessible manufacturer bodies, verify claims and retain hashes/access evidence privately. EIZO, RME and Intel bodies were checked; Crucial's original/regional/current routes remained blocked and their limits were preserved. Research additional exact identities using manufacturer public-ID tables.
+- [x] Add failing native Windows regressions, then implement private device-instance association for drivers, public PCI/USB identity details and additional supported metadata. Verify exact native property names against actual providers.
+- [x] Add failing macOS regressions, then improve grouping/aggregate handling and exposed identity/configuration properties. Retain non-public fields as unavailable.
+- [x] Add trusted source-evidence and applicability handling at normalization/remote validation boundaries, with escaped and source-aware comparison details.
+- [x] Run focused regressions and independent review, then the complete repository checks. Synchronize versions and build immutable platform artifacts.
+- [x] Back up and update six CLIs plus the two Mac applications and Windows console app, collect fresh reports from all three consoles, inspect actual UI and record remaining limitations.
