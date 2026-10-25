@@ -13,6 +13,12 @@ $childSource = @'
 param([string]$Mode)
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 switch ($Mode) {
+  'utf16' { [Console]::OutputEncoding = [Text.Encoding]::Unicode; [Console]::Out.Write([char]0x65e5); break }
+  'held-eof' {
+    $desc = Start-Process -FilePath ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -ArgumentList '-NoProfile -NonInteractive -Command "[Threading.Thread]::Sleep(15000)"' -NoNewWindow -PassThru
+    [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'held.pid'), [string]$desc.Id)
+    [Console]::Out.Write('prefix'); break
+  }
   'small' { [Console]::Out.Write('ok'); break }
   'out-exact' { [Console]::Out.Write(('x' * 8192)); break }
   'out-over' { [Console]::Out.Write(('x' * 8193)); break }
@@ -26,7 +32,7 @@ switch ($Mode) {
 [IO.File]::WriteAllText($fixture, $childSource, [Text.UTF8Encoding]::new($true))
 $passed = 0
 try {
- foreach ($mode in 'small','out-exact','out-over','err-exact','err-over','dual','exit','timeout') {
+ foreach ($mode in 'small','out-exact','out-over','err-exact','err-over','dual','exit','timeout','utf16','held-eof') {
   $process = [Diagnostics.Process]::new()
   $process.StartInfo = [Diagnostics.ProcessStartInfo]::new()
   $process.StartInfo.FileName = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
@@ -40,22 +46,30 @@ try {
   $failed = $false
   try {
    [void]$process.Start()
-   try { $result = Read-KtProcessOutput $process $clock 2500 '' ([Text.Encoding]::UTF8) 8192 4096 } catch { $failed = $true }
-   if ($mode -in 'out-over','err-over','timeout') {
+   try { $result = Read-KtProcessOutput $process $clock 2500 '' $(if ($mode -eq 'utf16') { [Text.Encoding]::Unicode } else { [Text.Encoding]::UTF8 }) 8192 4096 } catch { $failed = $true }
+   if ($mode -in 'out-over','err-over','timeout','held-eof') {
     if (-not $failed) { throw ('accepted incomplete/overflow output: ' + $mode) }
    } else {
     if ($failed) { throw ('unexpected read failure: ' + $mode) }
+    if ($mode -eq 'utf16' -and $result.out -ne [string][char]0x65e5) { throw 'UTF16 output lost' }
     if ($mode -eq 'small' -and $result.out -ne 'ok') { throw 'small output lost' }
     if ($mode -in 'out-exact','dual' -and $result.out.Length -ne 8192) { throw 'stdout boundary lost' }
     if ($mode -in 'err-exact','dual' -and $result.err.Length -ne 4096) { throw 'stderr boundary lost' }
     if ($mode -eq 'exit' -and ($result.code -ne 3 -or $result.out -ne 'partial')) { throw 'exit status lost' }
    }
    if ($clock.ElapsedMilliseconds -gt 4000) { throw 'reader exceeded finite deadline' }
+   if ($mode -eq 'held-eof' -and -not $process.HasExited) { throw 'held-EOF root did not exit' }
    $passed++
   } finally {
    if (-not $process.HasExited) { $process.Kill(); if (-not $process.WaitForExit(2000)) { throw 'owned fixture exit unconfirmed' } }
    $process.Dispose()
   }
  }
-} finally { Remove-Item -LiteralPath $dir -Recurse -Force }
+} finally {
+ $marker = Join-Path $dir 'held.pid'
+ if (Test-Path -LiteralPath $marker) {
+  $owned = Get-Process -Id ([int][IO.File]::ReadAllText($marker)) -ErrorAction SilentlyContinue
+  if ($owned) { $owned.Kill(); if (-not $owned.WaitForExit(2000)) { throw 'owned descendant exit unconfirmed' }; $owned.Dispose() }
+ }
+ Remove-Item -LiteralPath $dir -Recurse -Force }
 Write-Output ('worker-pipes: ' + $passed + ' passed')

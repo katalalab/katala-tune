@@ -532,13 +532,25 @@ async fn action_exchange_system(node: &Node, helper_sha256: &str, body: &[u8], t
     if let Some(err) = node.refusal() {
         return RunResult { code: Some(9), out: String::new(), err };
     }
-    if node.local
-        || body.is_empty()
-        || body.len() > 65_536
-        || helper_sha256.len() != 64
-        || !helper_sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    if body.is_empty() || body.len() > 65_536 || helper_sha256.len() != 64 || !helper_sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
         return RunResult { code: Some(9), out: String::new(), err: "KT2 action request is invalid; operation refused".into() };
+    }
+    if node.local {
+        #[cfg(windows)]
+        {
+            let helper = match local_probe_path(&crate::helpers::bin_dir()) {
+                Ok(helper) => helper,
+                Err(error) => return RunResult { code: Some(9), out: String::new(), err: error.into() },
+            };
+            let Some(helper) = helper.to_str() else {
+                return RunResult { code: Some(9), out: String::new(), err: "Windows action helper path is invalid; operation refused".into() };
+            };
+            let mut c = command(helper);
+            c.args(["windows-action-receiver-v2", "--helper-sha256", helper_sha256, "--budget-ms", "25000"]);
+            return action_exchange_command(c, body, timeout).await;
+        }
+        #[cfg(not(windows))]
+        return RunResult { code: Some(9), out: String::new(), err: "Windows action receiver is unavailable on this platform".into() };
     }
     let remote_command = format!(r#"exec "$HOME/.katala-tune/bin/tune.exe" windows-action-receiver-v2 --helper-sha256 {helper_sha256} --budget-ms 25000"#);
     let mut c = command("ssh");

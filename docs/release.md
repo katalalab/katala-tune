@@ -100,3 +100,5 @@ CI（`scripts/verify-release.js`）は、下書きに置く前に更新ファイ
 旧 Electron 版と Tauri 版をともに終了し、台帳 `~/.config/katala-tune/nodes.json` とアプリのデータディレクトリをコピーして退避する。DB が WAL を使っている間に `.db` だけをコピーしない。検証では `KATALA_TUNE_CONFIG` と `KATALA_TUNE_DATA_DIR` で台帳・データを隔離し、自動スキャンを無効にする。旧版と新版を同じ DB に同時接続させない。
 
 公開後に配布の問題が判明した場合は、まず問題の release を prerelease または draft に戻し latest の対象から外す。DB を古い版に上書きしない。updater は版を下げないため、修正版をより高い版で旧署名鍵により配布する。旧アプリの手動復旧には事前の DB バックアップと schema の互換確認が必要。鍵を捨てたり保護ルールを外して出し直したりしない。
+
+Windows の既存 `tune.exe` は承認済みハッシュを維持するため自動で上書きしない。通常収集にも v2 record が必要である。初回導入・更新・ロールバックは [Windows helper の承認手順](windows-helper-approval.md) を実施する。

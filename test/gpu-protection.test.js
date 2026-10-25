@@ -455,3 +455,42 @@ test('native GPU process annotation binds its target PID and protects related pr
     assert.match(result.stdout, /related-ok/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('local Windows GPU actions use the same approved finite receiver as remote actions', async () => {
+  const action = { type: 'set-gpu-power-limit', params: { uuid: 'GPU-01234567-89ab-cdef-0123-456789abcdef', watts: 180, min: 100, max: 250, prev_w: 200 } };
+  const action_helper = { schema: 'katala-tune/action-helper/v2', source_sha: 'a'.repeat(40), tune_sha256: 'b'.repeat(64), manifest_sha256: 'c'.repeat(64), run_id: 1, attempt: 1 };
+  let calls = 0;
+  const result = await execute({ ...node, local: true, action_helper }, action, { protect: [] }, async () => { throw new Error('generic local PowerShell must stay unused'); }, async (target, hash, body) => {
+    calls++; assert.equal(target.local, true); assert.equal(hash, action_helper.tune_sha256); assert.match(body.toString('utf8'), /Invoke-KatalaGpuSmi/);
+    return { code: 9, out: '', err: 'fixture refusal' };
+  });
+  assert.equal(calls, 1); assert.equal(result.code, 9);
+});
+
+test('local KT2 spawns the isolated helper directly with closed arguments', async () => {
+  const path = require('node:path');
+  const os = require('node:os');
+  const { spawn } = require('node:child_process');
+  const prior = process.env.KATALA_TUNE_DATA_DIR;
+  const isolated = path.join(os.tmpdir(), 'katala-local-action-fixture');
+  process.env.KATALA_TUNE_DATA_DIR = isolated;
+  const hash = 'b'.repeat(64);
+  let calls = 0;
+  try {
+    const result = await actionExchange({ ...node, local: true }, hash, Buffer.from('owned body'), {
+      timeoutMs: 5000,
+      spawnChild(cmd, args, options) {
+        calls++;
+        assert.equal(cmd, path.join(isolated, 'bin', 'tune.exe'));
+        assert.deepEqual(args, ['windows-action-receiver-v2', '--helper-sha256', hash, '--budget-ms', '25000']);
+        // Reject before READY; fixture proves there is no generic shell or SSH fallback.
+        return spawn(process.execPath, ['-e', 'process.exit(9)'], options);
+      },
+    });
+    assert.equal(calls, 1);
+    assert.equal(result.code, 9);
+  } finally {
+    if (prior === undefined) delete process.env.KATALA_TUNE_DATA_DIR;
+    else process.env.KATALA_TUNE_DATA_DIR = prior;
+  }
+});

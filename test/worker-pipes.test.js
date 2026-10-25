@@ -12,5 +12,5 @@ test('nested Windows collectors have a bounded shared output reader', () => {
 test('PS5.1 exercises nested collector limits, exit and EOF using owned children', { skip: process.platform !== 'win32' }, () => {
   const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', path.join(__dirname, 'win-worker-pipes-regression.ps1')], { encoding: 'utf8', timeout: 30000, windowsHide: true });
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.match(result.stdout, /worker-pipes: 8 passed/);
+  assert.match(result.stdout, /worker-pipes: 10 passed/);
 });

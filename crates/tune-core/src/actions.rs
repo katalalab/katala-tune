@@ -498,8 +498,7 @@ pub async fn execute(node: &Node, action: &Value, protect: Option<&[String]>) ->
 /// `execute` の子プロセスの実行口を差し替えられる版（テストは偽の実行器を渡す。承認なしで呼ばれていないことを数えるため）
 pub async fn execute_with(runner: &dyn Runner, node: &Node, action: &Value, protect: Option<&[String]>) -> Result<Outcome, String> {
     let p = plan(node, action, protect)?;
-    let stdin_transport =
-        !node.local && node.os == "windows" && matches!(action.get("type").and_then(Value::as_str), Some("kill-process" | "set-gpu-power-limit"));
+    let stdin_transport = node.os == "windows" && matches!(action.get("type").and_then(Value::as_str), Some("kill-process" | "set-gpu-power-limit"));
     let res = if stdin_transport {
         match action_helper(node) {
             Ok(helper) => {

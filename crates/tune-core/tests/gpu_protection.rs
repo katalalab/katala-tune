@@ -135,3 +135,20 @@ async fn remote_windows_action_refuses_absent_or_nonclosed_approved_helper_befor
         assert!(runner.0.lock().unwrap().is_empty(), "helper record rejection happens before ssh spawn");
     }
 }
+
+#[tokio::test]
+async fn local_windows_gpu_action_uses_the_approved_finite_receiver() {
+    let runner = CaptureRunner::default();
+    let mut node = Node::from_value(
+        &json!({"id":"w","os":"windows","action_helper":{"schema":"katala-tune/action-helper/v2","source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tune_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","manifest_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","run_id":1,"attempt":1}}),
+        "other",
+    );
+    node.local = true;
+    let action =
+        json!({"type":"set-gpu-power-limit","params":{"uuid":"GPU-01234567-89ab-cdef-0123-456789abcdef","watts":180,"min":100,"max":250,"prev_w":200}});
+    let result = actions::execute_with(&runner, &node, &action, Some(&[])).await.unwrap();
+    assert_eq!(result.code, Some(9));
+    let calls = runner.0.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "kt2");
+}
