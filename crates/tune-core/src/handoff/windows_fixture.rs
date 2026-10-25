@@ -63,6 +63,8 @@ fn compiler_environment() -> Vec<(OsString, OsString)> {
         // Without them it can fall back to an unrelated PATH link.exe.
         "ProgramFiles(x86)",
         "ProgramFiles",
+        // Preserve VS Setup's instance-cache root in this cleared environment.
+        "ProgramData",
         "TEMP",
         "TMP",
         "PATH",
@@ -87,6 +89,34 @@ fn compiler_environment() -> Vec<(OsString, OsString)> {
     values
 }
 
+async fn compiler_program(environment: &[(OsString, OsString)]) -> OsString {
+    if let Some(rustc) = std::env::var_os("RUSTC") {
+        return rustc;
+    }
+    // The backend canonicalizes executable paths. A rustup rustc symlink would
+    // then become rustup.exe, whose argv[0] selects the wrong CLI mode. Ask the
+    // installed, auto-install-disabled rustup for the active real compiler.
+    let mut query = Command::new("rustup");
+    query.args(["which", "rustc"]);
+    let result = run_standalone_windows_bounded(
+        &query,
+        StandaloneWindowsEnvironment::new(environment),
+        b"",
+        Instant::now() + Duration::from_secs(15),
+        16 * 1024,
+        16 * 1024,
+    )
+    .await;
+    assert_compiler_success(&result, "locate real rustc");
+    let output = std::str::from_utf8(&result.stdout).expect("rustup compiler path must be UTF-8");
+    let path = PathBuf::from(output.trim_end_matches(['\r', '\n']));
+    assert!(
+        path.is_absolute() && path.is_file() && path.file_name().is_some_and(|name| name.eq_ignore_ascii_case("rustc.exe")),
+        "rustup must locate an existing absolute rustc.exe"
+    );
+    path.into_os_string()
+}
+
 async fn supervise() {
     let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
     let fakebin = root.join("fakebin");
@@ -94,9 +124,9 @@ async fn supervise() {
     let source = root.join("fake_agent.rs");
     // Rust source data, passed as a file to rustc, never interpolated into cmd.
     std::fs::write(&source, format!("const EXPECTED_PROMPT: &str = {PROMPT:?};\nconst RECEIPT: &str = {RECEIPT:?};\n{FAKE_AGENT}")).unwrap();
-    let mut compiler = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
-    compiler.args(["--edition=2024", "--crate-name", "katala_fake_agent"]).arg(&source).arg("-o").arg(fakebin.join("claude.exe"));
     let environment = compiler_environment();
+    let mut compiler = Command::new(compiler_program(&environment).await);
+    compiler.args(["--edition=2024", "--crate-name", "katala_fake_agent"]).arg(&source).arg("-o").arg(fakebin.join("claude.exe"));
     let result = run_standalone_windows_bounded(
         &compiler,
         StandaloneWindowsEnvironment::new(&environment),
@@ -106,18 +136,7 @@ async fn supervise() {
         16 * 1024,
     )
     .await;
-    assert_owned_cleanup(&result);
-    assert_eq!(
-        result.code,
-        Some(0),
-        "fake-only rustc failed: stop={:?} timeout={} limited={} spawn={} stdout={} stderr={}",
-        result.process_receipt.as_ref().map(|receipt| receipt.stop),
-        result.timed_out,
-        result.output_limited,
-        result.spawn_failed,
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
+    assert_compiler_success(&result, "compile fake-only agent");
     std::fs::copy(fakebin.join("claude.exe"), fakebin.join("codex.exe")).unwrap();
 
     let system_root = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"));
@@ -183,6 +202,21 @@ async fn supervise() {
             verify_receipt(&dir, agent);
         }
     }
+}
+
+fn assert_compiler_success(result: &crate::collect::BoundedResult, stage: &str) {
+    assert_owned_cleanup(result);
+    assert_eq!(
+        result.code,
+        Some(0),
+        "{stage} failed: stop={:?} timeout={} limited={} spawn={} stdout={} stderr={}",
+        result.process_receipt.as_ref().map(|receipt| receipt.stop),
+        result.timed_out,
+        result.output_limited,
+        result.spawn_failed,
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
 }
 
 fn assert_owned_cleanup(result: &crate::collect::BoundedResult) {
