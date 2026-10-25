@@ -50,7 +50,7 @@
 
 | 層 | 中身 | 置き場所 |
 |---|---|---|
-| サンプラー | 読み取り専用。1 行目に hello、以後 1 行 1 JSON を出し続ける。macOS は標準ライブラリだけ（ctypes で OS の統計を読み、他ユーザーのプロセスは setuid の ps を 15 秒ごと）。Windows は Rust のネイティブ版（`tune-agent sample`。PDH で性能カウンタを直接読み、プロセスは NtQuerySystemInformation 1 回。`~/.katala-tune/bin/tune-agent.exe` に置く）を先に使い、無ければ PowerShell 版（.NET の性能カウンタ）。GPU はどちらも 120 回で自分から終わる `nvidia-smi dmon` | `crates/tune-agent/src/sample*.rs`・`probes/live_mac.py`・`probes/live_win.ps1` |
+| サンプラー | 読み取り専用。1 行目に hello、以後 1 行 1 JSON を出し続ける。macOS は標準ライブラリだけ（ctypes で OS の統計を読み、他ユーザーのプロセスは setuid の ps を 15 秒ごと）。同じ値を sysctl・mach・libproc・IOKit で直接読む Rust 版（`tune-agent sample`、`sample_mac.rs`。live_mac.py と同時に動かして突き合わせる試験つき）もあるが、アプリはまだ使わない（各 Mac へ置く手順ができてから切り替える）。Windows は Rust のネイティブ版（`tune-agent sample`。PDH で性能カウンタを直接読み、プロセスは NtQuerySystemInformation 1 回。`~/.katala-tune/bin/tune-agent.exe` に置く）を先に使い、無ければ PowerShell 版（.NET の性能カウンタ）。GPU はどちらも 120 回で自分から終わる `nvidia-smi dmon` | `crates/tune-agent/src/sample*.rs`・`probes/live_mac.py`・`probes/live_win.ps1` |
 | 取得の経路 | 今は子プロセス（この機体はローカル、ほかは SSH）。将来は tune-agent の暗号化通信に差し替える | `tune-core::live::Route` |
 | 解析・保持 | 行を読んで範囲に収め、機体ごとに直近 300 点を Rust 側に持つ | `tune-core::live`（`parse_line`・`Ring`） |
 | 管理 | 開始・停止、画面からの合図（liveStart の呼び直し）が 2 分途切れたら自動停止、同時に 6 台まで、続けての失敗は 3 回までつなぎ直す、アプリの終了・ウィンドウを閉じたときの停止 | `tune-core::live::Live`、`src-tauri/src/live.rs` |

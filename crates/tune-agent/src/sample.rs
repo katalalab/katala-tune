@@ -9,7 +9,8 @@
 //!
 //! PowerShell 版は 1 回ごとに .NET の性能カウンタを読み、起動と常駐に CPU とメモリを使う（実機で 1 コア比 4〜7%・
 //! 120〜150MB）。ここでは同じカウンタを PDH で直接読み、プロセスは NtQuerySystemInformation 1 回で全部読む。
-//! macOS は probes/live_mac.py のまま（すでに 1 コア比 0.5% 未満）。
+//! macOS は live_mac.py と同じ値を sysctl・mach・libproc・IOKit で直接読む（sample_mac.rs）。Python の起動と
+//! ctypes の呼び出しが要らなくなる。アプリが macOS でこれを使うのは、各機体へ置く手順ができてから（それまでは live_mac.py）。
 // 下の部品（行の組み立て・GPU・プロセス）は Windows の取得部分（sample_win.rs）だけが使う。テストはどの OS でも動かす
 #![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 
@@ -64,7 +65,7 @@ pub fn round(x: f64, d: i32) -> Value {
 }
 
 /// 1 行書いて flush。書けなければ false（読み手が居ない）
-fn emit(out: &mut impl Write, v: &Value) -> bool {
+pub(crate) fn emit(out: &mut impl Write, v: &Value) -> bool {
     let mut s = v.to_string();
     s.push('\n');
     out.write_all(s.as_bytes()).and_then(|_| out.flush()).is_ok()
@@ -72,7 +73,7 @@ fn emit(out: &mut impl Write, v: &Value) -> bool {
 
 /// 標準入力を読み捨て、閉じたら印を立てる（ローカル実行ではアプリが標準入力を開いたまま持つ。
 /// SSH 経由では予備のスクリプトのバイト列も届くので、それも読み捨てる）
-fn watch_stdin(gone: Arc<AtomicBool>) {
+pub(crate) fn watch_stdin(gone: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         let mut si = std::io::stdin().lock();
@@ -155,9 +156,14 @@ fn run(a: &Args) -> Result<(), String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn run(a: &Args) -> Result<(), String> {
+    crate::sample_mac::run(a)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn run(_a: &Args) -> Result<(), String> {
-    Err("この OS のネイティブのサンプラーはまだ無い（macOS は probes/live_mac.py を使う）".into())
+    Err("この OS のネイティブのサンプラーはまだ無い".into())
 }
 
 /// s 行に種類・時刻・番号を付ける（時刻は書き出す直前）

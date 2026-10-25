@@ -1,5 +1,9 @@
 # 変更履歴
 
+## 未リリース
+
+- macOS のネイティブのサンプラー（`tune-agent sample`）: live_mac.py と同じ行・同じ値を sysctl・mach・libproc・IOKit で直接読む。Python 版と同時に動かして行の形と値を突き合わせる試験（`crates/tune-agent/tests/live_mac_parity.rs`）と、計算部分を Python の関数と同じ入力で比べる試験を追加。アプリのライブ表示は引き続き live_mac.py を使い、切り替えは各 Mac へ置く手順と合わせて行う。
+
 ## 0.7.0-rc.1
 
 検証候補。正式公開・自動配信は Windows の検出調査、helper 配備と実機受入の完了後に判断する。
