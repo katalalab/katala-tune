@@ -570,13 +570,88 @@ fn canonical_usize(value: &str) -> Option<usize> {
     (parsed.to_string() == value).then_some(parsed)
 }
 
-async fn action_exchange_failure(child: &mut tokio::process::Child, read_err: &mut JoinHandle<()>, committed: bool, message: &str) -> RunResult {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActionStderrError {
+    Missing,
+    Io,
+    Limit,
+    Task,
+}
+
+/// Unlike the generic collector, KT2 requires a real EOF, not just a stopped
+/// reader. Keep this proof separate so other collection policies stay unchanged.
+struct ActionStderr {
+    task: Option<JoinHandle<Result<(), ActionStderrError>>>,
+    result: Option<Result<(), ActionStderrError>>,
+}
+
+impl ActionStderr {
+    fn new<R: AsyncRead + Unpin + Send + 'static>(pipe: Option<R>) -> Self {
+        let task = tokio::spawn(async move {
+            let Some(mut pipe) = pipe else { return Err(ActionStderrError::Missing) };
+            let mut count = 0usize;
+            let mut chunk = [0u8; 8192];
+            loop {
+                let size = pipe.read(&mut chunk).await.map_err(|_| ActionStderrError::Io)?;
+                if size == 0 {
+                    return Ok(());
+                }
+                count += size;
+                if count > 65_536 {
+                    return Err(ActionStderrError::Limit);
+                }
+            }
+        });
+        Self { task: Some(task), result: None }
+    }
+
+    /// Poll stderr failure before each protocol operation, including the first
+    /// REQUEST write. Successful EOF may arrive before READY and is retained.
+    async fn guard<F: std::future::Future>(&mut self, operation: F) -> Result<F::Output, ActionStderrError> {
+        tokio::pin!(operation);
+        if let Some(task) = self.task.as_mut() {
+            tokio::select! {
+                biased;
+                result = task => {
+                    self.task = None;
+                    self.result = Some(result.map_err(|_| ActionStderrError::Task).and_then(|result| result));
+                }
+                result = &mut operation => return Ok(result),
+            }
+        }
+        self.result.unwrap_or(Ok(()))?;
+        Ok(operation.await)
+    }
+
+    async fn finish(&mut self) -> Result<(), ActionStderrError> {
+        if let Some(task) = self.task.as_mut() {
+            let result = task.await;
+            self.task = None;
+            self.result = Some(result.map_err(|_| ActionStderrError::Task).and_then(|result| result));
+        }
+        self.result.unwrap_or(Err(ActionStderrError::Task))
+    }
+
+    async fn stop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for ActionStderr {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+async fn action_exchange_failure(child: &mut tokio::process::Child, read_err: &mut ActionStderr, committed: bool, message: &str) -> RunResult {
     let _ = child.start_kill();
     let _ = tokio::time::timeout(PIPE_GRACE, child.wait()).await;
-    if !read_err.is_finished() {
-        read_err.abort();
-    }
-    let _ = read_err.await;
+    read_err.stop().await;
     RunResult { code: Some(if committed { 7 } else { 9 }), out: String::new(), err: message.into() }
 }
 
@@ -597,8 +672,7 @@ async fn action_exchange_command(mut c: Command, body: &[u8], timeout: Duration)
     let Some(mut stdout) = child.stdout.take() else {
         return RunResult { code: Some(9), out: String::new(), err: "KT2 stdout unavailable; operation refused".into() };
     };
-    let (signal, mut exceeded) = tokio::sync::mpsc::channel(1);
-    let (_stderr, mut read_err) = read_bounded(child.stderr.take(), 65_536, signal);
+    let mut read_err = ActionStderr::new(child.stderr.take());
     let mut header = Vec::new();
     let mut one = [0u8; 1];
     let ready = async {
@@ -616,7 +690,7 @@ async fn action_exchange_command(mut c: Command, body: &[u8], timeout: Duration)
         }
         None
     };
-    let ready = match tokio::time::timeout_at(ready_end, ready).await.ok().flatten() {
+    let ready = match tokio::time::timeout_at(ready_end, read_err.guard(ready)).await.ok().and_then(Result::ok).flatten() {
         Some(v) => v,
         None => {
             return action_exchange_failure(&mut child, &mut read_err, false, "KT2 READY unavailable; operation refused").await;
@@ -625,22 +699,23 @@ async fn action_exchange_command(mut c: Command, body: &[u8], timeout: Duration)
     let Some(nonce) = ready.strip_prefix("KT2 READY ").filter(|v| lower_hex(v, 64)) else {
         return action_exchange_failure(&mut child, &mut read_err, false, "KT2 READY invalid; operation refused").await;
     };
-    if exceeded.try_recv().is_ok() {
-        return action_exchange_failure(&mut child, &mut read_err, false, "KT2 stderr exceeded limit; operation refused").await;
-    }
     let hash = crate::db::sha256_hex(body);
     let request = format!("KT2 REQUEST {nonce} {} {hash}\n", body.len());
     // The remote receiver can observe any part of this frame. From this point on,
     // a local transport failure cannot prove that the action did not run.
-    let committed = true;
+    let mut committed = false;
     if !matches!(
-        tokio::time::timeout_at(end, async {
-            stdin.write_all(request.as_bytes()).await?;
-            stdin.write_all(body).await?;
-            stdin.shutdown().await
-        })
+        tokio::time::timeout_at(
+            end,
+            read_err.guard(async {
+                committed = true;
+                stdin.write_all(request.as_bytes()).await?;
+                stdin.write_all(body).await?;
+                stdin.shutdown().await
+            })
+        )
         .await,
-        Ok(Ok(()))
+        Ok(Ok(Ok(())))
     ) {
         return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 request outcome unverified").await;
     }
@@ -659,7 +734,7 @@ async fn action_exchange_command(mut c: Command, body: &[u8], timeout: Duration)
         }
         Err(std::io::Error::other("long header"))
     };
-    if tokio::time::timeout_at(end, read_result_header).await.ok().and_then(Result::ok).is_none() {
+    if !matches!(tokio::time::timeout_at(end, read_err.guard(read_result_header)).await, Ok(Ok(Ok(())))) {
         return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 result outcome unverified").await;
     }
     let Ok(result_header) = std::str::from_utf8(&result_header) else {
@@ -683,13 +758,13 @@ async fn action_exchange_command(mut c: Command, body: &[u8], timeout: Duration)
         let n = stdout.read(&mut trailing).await?;
         if n == 0 { Ok(()) } else { Err(std::io::Error::other("surplus")) }
     };
-    if tokio::time::timeout_at(end, complete).await.ok().and_then(Result::ok).is_none() {
+    if !matches!(tokio::time::timeout_at(end, read_err.guard(complete)).await, Ok(Ok(Ok(())))) {
         return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 result outcome unverified").await;
     }
-    let status = tokio::time::timeout_at(end, child.wait()).await.ok().and_then(Result::ok);
-    let stderr_complete = tokio::time::timeout_at(end, &mut read_err).await.is_ok() && exceeded.try_recv().is_err();
+    let status = tokio::time::timeout_at(end, read_err.guard(child.wait())).await.ok().and_then(Result::ok).and_then(Result::ok);
+    let stderr_complete = matches!(tokio::time::timeout_at(end, read_err.finish()).await, Ok(Ok(())));
     if !status.is_some_and(|s| s.code() == Some(0)) || !stderr_complete {
-        return RunResult { code: Some(7), out: String::new(), err: "KT2 ssh closure unverified".into() };
+        return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 ssh closure unverified").await;
     }
     RunResult { code: Some(code), out: decode(&payload[..a]), err: decode(&payload[a..]) }
 }
@@ -991,6 +1066,94 @@ pub async fn exec_on_with_input(runner: &dyn Runner, node: &Node, script: &str, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // An OS read error / failed reader task without an OS child. The signal
+    // places failure on either side of the first REQUEST operation.
+    struct FailingActionStderr {
+        signal: tokio::sync::oneshot::Receiver<()>,
+        panic: bool,
+    }
+
+    impl AsyncRead for FailingActionStderr {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if std::future::Future::poll(std::pin::Pin::new(&mut self.signal), cx).is_pending() {
+                return std::task::Poll::Pending;
+            }
+            assert!(!self.panic, "synthetic stderr reader task failure");
+            std::task::Poll::Ready(Err(std::io::Error::other("synthetic stderr read failure")))
+        }
+    }
+
+    #[tokio::test]
+    async fn kt2_stderr_rejects_io_and_join_errors_before_request() {
+        for (panic, expected) in [(false, ActionStderrError::Io), (true, ActionStderrError::Task)] {
+            let (signal, receiver) = tokio::sync::oneshot::channel();
+            let mut stderr = ActionStderr::new(Some(FailingActionStderr { signal: receiver, panic }));
+            signal.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !stderr.task.as_ref().unwrap().is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut committed = false;
+            let result = stderr
+                .guard(async {
+                    committed = true;
+                })
+                .await;
+            assert_eq!(result, Err(expected));
+            assert!(!committed, "a failed reader cannot admit a REQUEST");
+            assert_eq!(stderr.finish().await, Err(expected), "failure must never become EOF on a later check");
+        }
+    }
+
+    #[tokio::test]
+    async fn kt2_stderr_rejects_io_and_join_errors_during_request() {
+        for (panic, expected) in [(false, ActionStderrError::Io), (true, ActionStderrError::Task)] {
+            let (signal, receiver) = tokio::sync::oneshot::channel();
+            let mut stderr = ActionStderr::new(Some(FailingActionStderr { signal: receiver, panic }));
+            let mut committed = false;
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                stderr.guard(async {
+                    committed = true;
+                    signal.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, Err(expected));
+            assert!(committed, "the REQUEST has already started when its stderr fails");
+            assert_eq!(stderr.finish().await, Err(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn kt2_stderr_requires_a_present_pipe_and_exact_cap_with_eof() {
+        let mut missing = ActionStderr::new(None::<&[u8]>);
+        assert_eq!(missing.finish().await, Err(ActionStderrError::Missing));
+        for (size, expected) in [(0, Ok(())), (65_536, Ok(())), (65_537, Err(ActionStderrError::Limit))] {
+            let mut stderr = ActionStderr::new(Some(std::io::Cursor::new(vec![b'z'; size])));
+            assert_eq!(stderr.finish().await, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn kt2_stderr_cannot_complete_until_its_real_eof() {
+        let (reader, writer) = tokio::io::duplex(64);
+        let mut stderr = ActionStderr::new(Some(reader));
+        assert!(tokio::time::timeout(Duration::from_millis(10), stderr.finish()).await.is_err());
+        drop(writer);
+        assert_eq!(stderr.finish().await, Ok(()));
+        assert_eq!(stderr.guard(async { "valid payload" }).await, Ok("valid payload"));
+    }
 
     #[derive(Default)]
     struct CaptureRunner {
