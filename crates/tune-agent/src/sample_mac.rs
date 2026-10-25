@@ -935,7 +935,13 @@ pub fn run(a: &Args) -> Result<(), String> {
         return Ok(());
     }
     let out = Output::open();
-    if !out.emit(s.hello(), &control) {
+    // Initialization may have exhausted max while waiting for ps. Preserve hello-first
+    // for a writable consumer, with only the same bounded notification grace as end.
+    let hello_control = Control { gone: control.gone.clone(), deadline: control.deadline.max(Instant::now() + Duration::from_millis(100)) };
+    if !out.emit(s.hello(), &hello_control) {
+        return Ok(());
+    }
+    if control.stopped() {
         out.end_if_expired(&control);
         return Ok(());
     }
@@ -989,6 +995,30 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
+
+    #[test]
+    #[ignore = "owned subprocess invoked by expired startup test"]
+    fn expired_startup_fixture() {
+        let a = Args { interval: 0.2, procs_every: 1.0, max_seconds: 0.0, count: 0, watch: false };
+        run(&a).unwrap();
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn startup_deadline_preserves_hello_before_end() {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "sample_mac::tests::expired_startup_fixture", "--ignored", "--nocapture"])
+            .env("HOME", std::env::temp_dir().join(format!("sampler-expired-{}", std::process::id())))
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let rows: Vec<Value> = String::from_utf8_lossy(&out.stdout).lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["type"], "hello");
+        assert_eq!(rows[1], json!({"type": "end", "reason": "max_age"}));
+    }
 
     #[test]
     fn macmon_recovers_after_oversized_frames() {
@@ -1051,7 +1081,7 @@ mod tests {
             let bin = dir.join(".katala-tune/bin");
             std::fs::create_dir_all(&bin).unwrap();
             let script = bin.join("macmon");
-            std::fs::write(&script, "#!/usr/bin/python3\nimport os,signal,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nwith open(os.path.join(os.environ['HOME'],'macmon-pid'),'w') as f: f.write(str(os.getpid()))\nwhile True: time.sleep(1)\n").unwrap();
+            std::fs::write(&script, "#!/usr/bin/python3\nimport os,signal,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nwith open(os.path.join(os.environ['HOME'],'macmon-pid'),'w') as f: f.write(str(os.getpid()))\nuntil=time.monotonic()+10\nwhile time.monotonic()<until: time.sleep(0.05)\n").unwrap();
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
             let child = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "sample_mac::tests::blocked_stdout_fixture", "--ignored", "--nocapture"])
