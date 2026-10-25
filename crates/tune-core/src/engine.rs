@@ -645,6 +645,16 @@ impl Engine {
                 Err(e) => return refused(format!("台帳を読めないので実行しない: {e}")),
             };
             let Some(node) = fresh.node(node_id) else { return refused("台帳に無い機体".into()) };
+            // Bind history to the configured route. This does not attest the
+            // remote host behind an unchanged SSH alias.
+            let target = json!([node.alias, node.os, node.local, actions::action_helper_fingerprint(node)]);
+            if let Some(original_id) = undo_of {
+                let history = self.with_db(|d| d.actions(1000))?;
+                let original = history.iter().find(|a| js::is_str(a.get("id"), original_id));
+                if original.and_then(|a| a.get("target")) != Some(&target) {
+                    return refused("元の操作の接続先情報と一致しないか、記録がないため、元に戻さない".into());
+                }
+            }
             let p = match actions::plan(node, action, Some(&fresh.protect)) {
                 Ok(p) => p,
                 Err(e) => return refused(e),
@@ -682,6 +692,7 @@ impl Engine {
                 "id": id, "at": now_ms(), "node_id": node.id,
                 "type": action.get("type"), "params": action.get("params"), "label": title, "ok": null,
                 "output": PENDING_OUTPUT, "undo": null, "undo_of": undo_of,
+                "target": target,
             });
             if let Err(e) = self.with_db(|d| d.add_action(&entry)) {
                 return refused(format!("実行記録を書けないので実行しない: {e}"));
