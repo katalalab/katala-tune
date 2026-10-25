@@ -287,6 +287,30 @@ fn check_task(p: &Value) -> Result<(String, String), String> {
     Ok((path.into(), name.into()))
 }
 
+fn task_script(path: &str, name: &str, p: &Value, enabled: bool) -> Result<String, String> {
+    let expected = match p.get("expected_enabled") {
+        None => None,
+        Some(Value::Bool(v)) => Some(*v),
+        Some(_) => return Err("タスクの期待状態が不正".into()),
+    };
+    let read = format!("(Get-ScheduledTask -TaskPath \"{path}\" -TaskName \"{name}\" -ErrorAction Stop).Settings.Enabled");
+    let desired = if enabled { "$true" } else { "$false" };
+    let mut parts = vec!["try {".to_string(), format!("$before = {read}"), "if ($before -isnot [bool]) { throw \"task state unavailable\" }".into()];
+    if let Some(expected) = expected {
+        parts.push(format!("if ($before -ne ${expected}) {{ throw \"task state changed; operation refused\" }}"));
+    }
+    let verb = if enabled { "Enable" } else { "Disable" };
+    parts.extend([
+        format!("if ($before -ne {desired}) {{ {verb}-ScheduledTask -TaskPath \"{path}\" -TaskName \"{name}\" -ErrorAction Stop | Out-Null }}"),
+        format!("$after = {read}"),
+        format!("if ($after -isnot [bool] -or $after -ne {desired}) {{ throw \"task readback mismatch\" }}"),
+        "Write-Output (\"KT_TASK_STATE \" + [int]$before + \" \" + [int]$after)".into(),
+        "exit 0".into(),
+        "} catch { Write-Output \"task outcome unverified\"; exit 7 }".into(),
+    ]);
+    Ok(parts.join("; "))
+}
+
 fn check_label(p: &Value) -> Result<(String, Option<String>), String> {
     let label = str_of(p.get("label")).filter(|s| LABEL.is_match(s) && !s.starts_with("com.apple.")).ok_or("ラベルが不正")?;
     let plist = match p.get("plist") {
@@ -414,21 +438,16 @@ pub fn plan(node: &Node, action: &Value, protect: Option<&[String]>) -> Result<P
         }
         "task-disable" | "task-enable" | "task-run" => {
             let (path, name) = check_task(p)?;
-            let state = format!("(Get-ScheduledTask -TaskPath \"{path}\" -TaskName \"{name}\").State");
             let (describe, script, undo) = match ty.as_str() {
-                "task-disable" => (
-                    format!("{id} のタスク「{path}{name}」を無効にする（予定どおりに動かなくなる）。元に戻せる。"),
-                    format!("Disable-ScheduledTask -TaskPath \"{path}\" -TaskName \"{name}\" | Out-Null; {state}"),
-                    Some(json!({ "type": "task-enable", "params": { "path": path, "name": name } })),
-                ),
-                "task-enable" => (
-                    format!("{id} のタスク「{path}{name}」を有効にする。元に戻せる。"),
-                    format!("Enable-ScheduledTask -TaskPath \"{path}\" -TaskName \"{name}\" | Out-Null; {state}"),
-                    Some(json!({ "type": "task-disable", "params": { "path": path, "name": name } })),
-                ),
+                "task-disable" => {
+                    (format!("{id} のタスク「{path}{name}」を無効にする（予定どおりに動かなくなる）。元に戻せる。"), task_script(&path, &name, p, false)?, None)
+                }
+                "task-enable" => (format!("{id} のタスク「{path}{name}」を有効にする。元に戻せる。"), task_script(&path, &name, p, true)?, None),
                 _ => (
                     format!("{id} のタスク「{path}{name}」を今すぐ1回実行する。中身（バックアップ・同期など）が実際に動く。元には戻せない。"),
-                    format!("Start-ScheduledTask -TaskPath \"{path}\" -TaskName \"{name}\"; Start-Sleep -Seconds 2; {state}"),
+                    format!(
+                        "try {{ Start-ScheduledTask -TaskPath \"{path}\" -TaskName \"{name}\" -ErrorAction Stop; Write-Output \"KT_TASK_RUN\"; exit 0 }} catch {{ Write-Output \"task outcome unverified\"; exit 7 }}"
+                    ),
                     None,
                 ),
             };
@@ -499,7 +518,7 @@ pub async fn execute(node: &Node, action: &Value, protect: Option<&[String]>) ->
 pub async fn execute_with(runner: &dyn Runner, node: &Node, action: &Value, protect: Option<&[String]>) -> Result<Outcome, String> {
     let p = plan(node, action, protect)?;
     let stdin_transport = node.os == "windows" && matches!(action.get("type").and_then(Value::as_str), Some("kill-process" | "set-gpu-power-limit"));
-    let res = if stdin_transport {
+    let mut res = if stdin_transport {
         match action_helper(node) {
             Ok(helper) => {
                 let body = p.script.as_bytes();
@@ -515,6 +534,33 @@ pub async fn execute_with(runner: &dyn Runner, node: &Node, action: &Value, prot
         let cmd = wrap(node, &p)?;
         exec_on_with(runner, node, &cmd, Duration::from_secs(30)).await
     };
+    let mut undo = p.undo.clone();
+    let ty = action.get("type").and_then(Value::as_str).unwrap_or("");
+    if matches!(ty, "task-enable" | "task-disable") {
+        let receipt = match res.out.trim() {
+            "KT_TASK_STATE 0 0" => Some((false, false)),
+            "KT_TASK_STATE 0 1" => Some((false, true)),
+            "KT_TASK_STATE 1 0" => Some((true, false)),
+            "KT_TASK_STATE 1 1" => Some((true, true)),
+            _ => None,
+        };
+        let desired = ty == "task-enable";
+        let params = &action["params"];
+        let valid = receipt.is_some_and(|(before, after)| after == desired && params.get("expected_enabled").is_none_or(|v| v.as_bool() == Some(before)));
+        if res.code == Some(0) && (!valid || !res.err.trim().is_empty()) {
+            res = crate::collect::RunResult { code: Some(7), out: "task outcome unverified".into(), err: String::new() };
+        }
+        if res.code == Some(0)
+            && let Some((before, after)) = receipt
+            && before != after
+        {
+            undo = Some(
+                json!({ "type": if desired { "task-disable" } else { "task-enable" }, "params": { "path": params["path"], "name": params["name"], "expected_enabled": desired } }),
+            );
+        }
+    } else if ty == "task-run" && res.code == Some(0) && (res.out.trim() != "KT_TASK_RUN" || !res.err.trim().is_empty()) {
+        res = crate::collect::RunResult { code: Some(7), out: "task outcome unverified".into(), err: String::new() };
+    }
     let ok = res.code == Some(0);
     let outcome = res
         .code
@@ -523,11 +569,5 @@ pub async fn execute_with(runner: &dyn Runner, node: &Node, action: &Value, prot
         .map(str::to_string)
         .unwrap_or_else(|| if ok { "完了".into() } else { format!("失敗（exit {}）", res.code_str()) });
     let output = js::slice16_tail(js::trim(&(res.out.clone() + &res.err)), 1500);
-    Ok(Outcome {
-        ok,
-        code: res.code,
-        outcome,
-        output,
-        undo: if ok || (res.code == Some(7) && action.get("type").and_then(Value::as_str) != Some("set-gpu-power-limit")) { p.undo.clone() } else { None },
-    })
+    Ok(Outcome { ok, code: res.code, outcome, output, undo: if ok || (res.code == Some(7) && ty != "set-gpu-power-limit") { undo } else { None } })
 }
