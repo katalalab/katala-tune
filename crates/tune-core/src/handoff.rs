@@ -209,31 +209,45 @@ pub struct Prepared {
 impl Engine {
     /// 台帳を読み直し、最新の分析結果から所見を探してプロンプトを作る
     pub fn handoff_prepare(&self, node_id: &str, finding_id: &str) -> Result<Prepared, String> {
-        let cfg = self.reload_config();
+        // reload_config は表示継続用に古い Config を返す。外部へ渡す許可判断には使わない。
+        let cfg = crate::nodes::load_config(self.config_path()).map_err(|e| format!("台帳を読めないので渡さない: {e}"))?;
         let node = cfg.node(node_id).cloned().ok_or("台帳に無い機体")?;
         if let Some(r) = refusal(&node) {
             return Err(r);
         }
-        let last = self.last()?;
-        let (result, finding) = find(&last, node_id, finding_id)?;
+        // Engine::last のキャッシュ済み Config に戻らず、同じ fresh Config で所見も組み立てる。
+        let result = self.with_db(|db| {
+            let snaps = db.last_snapshots(node_id, 2)?;
+            if db.probe_error(node_id, snaps.first().map(|s| s.at))?.is_some() {
+                return Ok(json!({"node_id": node_id, "ok": false}));
+            }
+            let Some(last) = snaps.first() else { return Ok(Value::Null) };
+            let r = json!({"node_id": node_id, "ok": true, "at": last.at, "wall_s": last.wall_s, "data": last.data});
+            Ok(self.enrich(db, &cfg, &r, snaps.get(1).map(|s| &s.data)))
+        })?;
+        let (result, finding) = find(&[result], node_id, finding_id)?;
         let prompt = prompt(&node, &cfg.protect, &result, &finding, now_ms());
         Ok(Prepared { node, finding_id: finding_id.to_string(), title: js::string(finding.get("title")), prompt })
     }
 
     /// 確認中の取消も、承認されたプロンプトと同じ識別情報で記録する。
     pub fn handoff_cancel(&self, p: &Prepared, agent: Agent) -> Value {
-        self.handoff_record(p, agent, false, "取消（開いていない）".into(), None);
-        json!({ "ok": false, "cancelled": true })
+        let audit_error = self.handoff_record(p, agent, Some(false), "取消（開いていない）", None).err();
+        json!({ "ok": false, "cancelled": true, "audit_error": audit_error })
     }
 
-    fn handoff_record(&self, p: &Prepared, agent: Agent, ok: bool, output: String, dir: Option<&Path>) {
+    fn handoff_record(&self, p: &Prepared, agent: Agent, ok: Option<bool>, output: &str, dir: Option<&Path>) -> Result<String, String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let id = format!("{}-handoff-{}-{}", now_ms(), std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
         let entry = json!({
-            "id": format!("{}-handoff-{}", now_ms(), &sha256_hex(output.as_bytes())[..6]), "at": now_ms(), "node_id": p.node.id,
+            "id": id, "at": now_ms(), "node_id": p.node.id,
             "type": "ai-handoff",
             "params": { "agent": agent.key(), "finding_id": p.finding_id, "prompt_sha256": sha256_hex(p.prompt.as_bytes()), "dir": dir.map(|d| d.to_string_lossy()) },
             "label": format!("{} に渡す（{}）", agent.label(), p.title), "ok": ok, "output": output, "undo": null, "undo_of": null,
         });
-        let _ = self.with_db(|d| d.add_action(&entry));
+        self.with_db(|d| d.add_action(&entry))?;
+        Ok(id)
     }
 
     /// 承認の後: 台帳をもう一度読み、接続先が変わっていなければ PROMPT.md と起動スクリプトを書いてターミナルを開く。
@@ -243,12 +257,14 @@ impl Engine {
     }
 
     fn handoff_launch_with(&self, p: &Prepared, agent: Agent, launch: impl FnOnce(&Path, &str, Agent) -> Result<(), String>) -> Value {
-        let record = |ok, output, dir| self.handoff_record(p, agent, ok, output, dir);
         let refused = |m: String| {
-            record(false, format!("中止（開いていない）: {m}"), None);
-            json!({ "ok": false, "refused": m })
+            let audit_error = self.handoff_record(p, agent, Some(false), &format!("中止（開いていない）: {m}"), None).err();
+            json!({ "ok": false, "refused": m, "audit_error": audit_error })
         };
-        let cfg = self.reload_config();
+        let cfg = match crate::nodes::load_config(self.config_path()) {
+            Ok(cfg) => cfg,
+            Err(e) => return refused(format!("台帳を読めないので開かない: {e}")),
+        };
         let Some(node) = cfg.node(&p.node.id) else { return refused("台帳に無い機体".into()) };
         if let Some(r) = refusal(node) {
             return refused(r);
@@ -257,16 +273,25 @@ impl Engine {
             return refused("確認のあいだに台帳の接続先（alias・OS・この機体かどうか）が変わった。もう一度押してください".into());
         }
         let dir = self.data_dir().join("handoff").join(format!("{}-{}-{}", now_ms(), safe(&p.node.id), agent.key()));
-        match launch(&dir, &p.prompt, agent) {
-            Ok(()) => {
-                record(true, format!("{} を新しいターミナルで開いた（{}）", agent.label(), dir.display()), Some(&dir));
-                json!({ "ok": true, "dir": dir })
-            }
-            Err(e) => {
-                record(false, format!("開けなかった: {e}"), Some(&dir));
-                json!({ "ok": false, "refused": format!("開けなかった: {e}") })
-            }
+        // 未完了行を書けなければ、ファイル作成もターミナル要求も行わない。
+        let id = match self.handoff_record(p, agent, None, "起動要求の結果は未確認", Some(&dir)) {
+            Ok(id) => id,
+            Err(e) => return json!({"ok": false, "refused": format!("実行記録を書けないので開かない: {e}"), "launch_requested": false}),
+        };
+        let (ok, output) = match launch(&dir, &p.prompt, agent) {
+            Ok(()) => (true, format!("{} を新しいターミナルで開いた（{}）", agent.label(), dir.display())),
+            Err(e) => (false, format!("開けなかった: {e}")),
+        };
+        let audit_error = match self.with_db(|d| d.finish_action(&id, ok, &output, None)) {
+            Ok(true) => None,
+            Ok(false) => Some("未完了の実行記録を更新できなかった".to_string()),
+            Err(e) => Some(format!("結果の実行記録を書けなかった: {e}")),
+        };
+        if let Some(error) = audit_error {
+            // 要求後なので、開いていないと断定せず、呼び直しもしない。pending を保持する。
+            return json!({"ok": false, "launch_requested": true, "audit_incomplete": true, "error": error, "dir": dir});
         }
+        if ok { json!({"ok": true, "dir": dir}) } else { json!({"ok": false, "refused": output, "launch_requested": true}) }
     }
 }
 

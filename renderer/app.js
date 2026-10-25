@@ -967,8 +967,10 @@ async function runAction(n, f) {
 
 async function handoff(n, f, agent) {
   const r = await window.tune.aiHandoff(n.id, f.id, agent);
-  if (r.cancelled) return toast('取り消しました');
-  if (!r.ok) return toast(`開きませんでした: ${r.refused}`, 5000);
+  if (r.audit_incomplete) return toast(`起動を試みましたが、結果の記録が未完了です: ${r.error}。再実行せず、ターミナルと実行記録を確認してください`, 10000);
+  const audit = r.audit_error ? `（実行記録を書けませんでした: ${r.audit_error}）` : '';
+  if (r.cancelled) return toast(`取り消しました${audit}`, r.audit_error ? 10000 : 3200);
+  if (!r.ok) return toast(`開きませんでした: ${r.refused}${audit}`, 5000);
   toast(`${agent === 'codex' ? 'Codex' : 'Claude Code'} を新しいターミナルで開きました（実行記録に残しました）`, 5000);
 }
 

@@ -44,3 +44,9 @@ The macOS computer-use tool refused direct access to the Terminal app. macOS ter
 ## Remaining limits
 
 This is source/debug-build acceptance, not an installer, signing, notarization, updater, or release certification. It does not accept every supported OS version or every third-party CLI installation layout. Actual system findings were not submitted as test prompts, and no extra CLI execution permissions were granted. Private screenshots and process/audit receipts are retained outside the public repository.
+
+## 2026-10-26 review follow-up (validation pending)
+
+The native results above describe the original debug-build repair. Subsequent review changes use fresh, fallible configuration reads at both preparation and launch, and write a pending audit row before file creation or terminal launch. Completion updates that same row. Failed completion writes are reported as incomplete without retrying launch; cancellation audit errors are surfaced as well. Shared database signatures and schema are unchanged.
+
+Regression sources use synthetic configuration, a real temporary SQLite database and an injected terminal launcher. They cover malformed/missing/unreadable configuration, audit insert rejection, audit completion failure or zero updated rows, and interruption followed by database reopen. No real AI CLI is called by these regressions. Rust RED/GREEN and OS acceptance for these follow-up changes await the assigned validation slot; earlier native acceptance does not certify these new changes.
