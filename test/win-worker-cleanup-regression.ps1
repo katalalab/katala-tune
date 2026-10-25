@@ -6,7 +6,12 @@ function Assert-KtEqual($Actual, $Expected) {
   if ($Actual -cne $Expected) { throw 'fixture assertion failed' }
 }
 function New-KtFakeProcess([string]$Mode) {
-  $fake = [pscustomobject]@{ state = @{ mode = $Mode; exited = ($Mode -eq 'exited'); observed = 0; kills = 0; waits = 0; disposed = 0; wait_ms = -1 } }
+  $fake = [pscustomobject]@{ state = @{ mode = $Mode; exited = ($Mode -eq 'exited'); observed = 0; kills = 0; waits = 0; disposed = 0; wait_ms = -1; handles = 0 } }
+  $fake | Add-Member ScriptProperty Handle { $this.state.handles++; return [IntPtr]::new(1) }
+  $fake | Add-Member ScriptProperty StartTime {
+    if ($this.state.handles -eq 0) { throw 'handle was not retained' }
+    return [datetime]::new(2026, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+  }
   $fake | Add-Member ScriptProperty HasExited {
     $this.state.observed++
     if ($this.state.mode -eq 'not-started') { throw 'not started' }
@@ -51,6 +56,46 @@ try {
     Assert-KtEqual $fake.state.disposed 1
     if ($started -and ($fake.state.wait_ms -lt 0 -or $fake.state.wait_ms -gt 2000)) { throw 'unbounded wait' }
     if (-not $started) { Assert-KtEqual $fake.state.observed 0 }
+  }
+  $stage = 'absolute-deadline'
+  $base = [Diagnostics.Stopwatch]::Frequency * 100
+  $deadline = Get-KtFixtureDeadline $base 8000
+  Assert-KtEqual (Get-KtFixtureRemainingMs $deadline 2000 ($base + [Diagnostics.Stopwatch]::Frequency * 7)) 1000
+  Assert-KtEqual (Get-KtFixtureRemainingMs $deadline 2000 ($base + [Diagnostics.Stopwatch]::Frequency * 7.5)) 500
+  Assert-KtEqual (Get-KtFixtureRemainingMs $deadline 2000 ($base + [Diagnostics.Stopwatch]::Frequency * 9)) 0
+  $fake = New-KtFakeProcess 'normal'
+  $result = Stop-KtOwnedFixtureRoot $fake $true ([Diagnostics.Stopwatch]::GetTimestamp() - 1)
+  Assert-KtEqual $result.exit_confirmed $false
+  Assert-KtEqual $fake.state.wait_ms 0
+  $stage = 'descendant-wait'
+  foreach ($mode in 'exited','normal','wait-throws','inconsistent') {
+    $fake = New-KtFakeProcess $mode
+    $deadline = Get-KtFixtureDeadline ([Diagnostics.Stopwatch]::GetTimestamp()) 1000
+    $result = Wait-KtFixtureDescendant $fake $deadline
+    Assert-KtEqual $result.exit_confirmed ($mode -eq 'exited')
+    Assert-KtEqual $result.wait_failed ($mode -eq 'wait-throws')
+    Assert-KtEqual $fake.state.kills 0
+    Assert-KtEqual $fake.state.waits 1
+    Assert-KtEqual $fake.state.disposed 1
+    if ($fake.state.wait_ms -lt 0 -or $fake.state.wait_ms -gt 1000) { throw 'unbounded descendant wait' }
+  }
+  $stage = 'descendant-identity'
+  function Get-Process {
+    param([int]$Id, $ErrorAction)
+    if ($Id -ne 42) { throw 'unexpected fake lookup' }
+    return $script:adoptionFixture
+  }
+  $ticks = [datetime]::new(2026, 1, 1, 0, 0, 0, [DateTimeKind]::Utc).Ticks
+  foreach ($identityMatches in $true, $false) {
+    $fake = New-KtFakeProcess 'normal'
+    $script:adoptionFixture = $fake
+    $identity = ([pscustomobject]@{ pid = 42; start_ticks = $(if ($identityMatches) { $ticks } else { $ticks + 1 }) } | ConvertTo-Json -Compress) | ConvertFrom-Json
+    $adopted = Get-KtFixtureDescendant $identity
+    Assert-KtEqual ([object]::ReferenceEquals($adopted, $fake)) $identityMatches
+    Assert-KtEqual $fake.state.kills 0
+    Assert-KtEqual $fake.state.handles 1
+    Assert-KtEqual $fake.state.disposed $(if ($identityMatches) { 0 } else { 1 })
+    if ($identityMatches) { $adopted.Dispose() }
   }
   Write-Output 'worker-cleanup-fakes: PASS'
 } catch {
