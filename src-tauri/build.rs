@@ -20,6 +20,7 @@ const COMMANDS: &[&str] = &[
     "copy",
     "ai_handoff",
     "ai_handoff_copy",
+    "ai_handoff_review",
     "open_data_dir",
     "open_config",
     "status",
