@@ -1,6 +1,8 @@
 //! Private compile-time failure observations. Never admission authority or IO.
 use std::cell::Cell;
 
+const RESERVED: [i32; 10] = [0, 1, 2, 3, 7, 9, 101, 124, 126, 127];
+
 macro_rules! stages {
     ($($name:ident = $code:literal),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,19 +94,22 @@ impl Failure {
             Self::Git(operation, stop) => 150 + (operation as u32) * 8 + stop as u32,
             Self::Owned(role, stop) => {
                 (match role {
-                    Role::Verify => 100,
+                    Role::Verify => 200,
                     Role::Supervise => 110,
                 }) + stop as u32
             }
         }
     }
     pub fn from_code(code: i32) -> Option<Self> {
+        if RESERVED.contains(&code) {
+            return None;
+        }
         if let Some(stage) = Stage::from_code(code) {
             return Some(Self::Stage(stage));
         }
         match code {
             60..=67 => Some(Self::Source(SOURCES[(code - 60) as usize])),
-            100..=107 => Some(Self::Owned(Role::Verify, STOPS[(code - 100) as usize])),
+            200..=207 => Some(Self::Owned(Role::Verify, STOPS[(code - 200) as usize])),
             110..=117 => Some(Self::Owned(Role::Supervise, STOPS[(code - 110) as usize])),
             150..=181 => Some(Self::Git(OPERATIONS[((code - 150) / 8) as usize], STOPS[((code - 150) % 8) as usize])),
             _ => None,
@@ -167,7 +172,7 @@ mod tests {
         let mut codes = std::collections::BTreeSet::new();
         for failure in failures() {
             let code = failure.code();
-            assert!(![0, 2, 124].contains(&code) && code < 256);
+            assert!(!RESERVED.contains(&(code as i32)) && code < 256);
             assert!(codes.insert(code));
             assert_eq!(Failure::from_code(code as i32), Some(failure));
         }
@@ -180,6 +185,17 @@ mod tests {
             }
             assert_eq!(Failure::from_code(code), None);
             assert_eq!(child_failure(Role::Verify, Stop::Completed, true, true, Some(code)), Failure::Owned(Role::Verify, Stop::Completed));
+        }
+    }
+    #[test]
+    fn panic_and_common_cli_codes_are_never_decoded_as_diagnostics() {
+        for code in RESERVED {
+            assert_eq!(Failure::from_code(code), None, "reserved process code {code}");
+            assert_eq!(
+                child_failure(Role::Verify, Stop::Completed, true, true, Some(code)),
+                Failure::Owned(Role::Verify, Stop::Completed),
+                "a reserved process code must remain a generic child rejection"
+            );
         }
     }
     #[test]
