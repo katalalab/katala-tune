@@ -414,10 +414,10 @@ pub fn run(args: &[String]) -> Option<ExitCode> {
         ("version", [option]) if option == "--json" => {
             println!("{}", tune_core::version_inventory::local());
         }
-        (name, [option]) if option == "--help" || option == "-h" => match COMMANDS.iter().find(|c| c.name == name) {
-            Some(c) => help(Some(c)),
-            None => return None,
-        },
+        (name, [option]) if option == "--help" || option == "-h" => {
+            let command = COMMANDS.iter().find(|c| c.name == name)?;
+            help(Some(command));
+        }
         ("help", [name]) => match COMMANDS.iter().find(|c| c.name == name) {
             Some(c) => help(Some(c)),
             None => {
