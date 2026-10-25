@@ -37,7 +37,14 @@ try {
   $r.drivers = @(Get-CimInstance Win32_PnPSignedDriver -OperationTimeoutSec 8 | Where-Object { $_.DeviceClass -in @("DISPLAY","NET","MEDIA","USB","SCSIADAPTER","HDC") } | Select-Object DeviceName,Manufacturer,DriverVersion,DriverDate,DeviceClass)
 } catch { $errors.drivers = "error" }
 try {
-  $r.display = @(Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBasicDisplayParams -OperationTimeoutSec 8 | Select-Object MaxHorizontalImageSize,MaxVerticalImageSize,VideoInputType,Active)
+  $ids = @()
+  try { $ids = @(Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorID -OperationTimeoutSec 8) } catch {}
+  $r.display = @(Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBasicDisplayParams -OperationTimeoutSec 8 | ForEach-Object {
+    $basic = $_; $identity = $ids | Where-Object { $_.InstanceName -eq $basic.InstanceName } | Select-Object -First 1
+    $model = ($identity.UserFriendlyName | Where-Object { $_ -gt 0 } | ForEach-Object { [char]$_ }) -join ""
+    $maker = ($identity.ManufacturerName | Where-Object { $_ -gt 0 } | ForEach-Object { [char]$_ }) -join ""
+    [pscustomobject]@{ Name=$model; Manufacturer=$maker; MaxHorizontalImageSize=$basic.MaxHorizontalImageSize; MaxVerticalImageSize=$basic.MaxVerticalImageSize; VideoInputType=$basic.VideoInputType; Active=$basic.Active }
+  })
 } catch { $errors.display = "error" }
 $secure = "unsupported"
 try { $secure = $(if (Confirm-SecureBootUEFI) { "enabled" } else { "disabled" }) }
@@ -198,7 +205,11 @@ const QUERIES: &[(&str, &str, Mapping)] = &[
         "Win32_PnPEntity Thunderbolt/USB4",
         &[("Name", "model"), ("Manufacturer", "manufacturer"), ("Class", "class"), ("Status", "status"), ("Vendor", "vendor_id"), ("Product", "product_id")],
     ),
-    ("display", "WmiMonitorBasicDisplayParams", &[("Active", "enabled"), ("VideoInputType", "interface")]),
+    (
+        "display",
+        "WmiMonitorBasicDisplayParams / WmiMonitorID",
+        &[("Name", "model"), ("Manufacturer", "manufacturer"), ("Active", "enabled"), ("VideoInputType", "interface")],
+    ),
     ("settings", "Confirm-SecureBootUEFI / powercfg", &[("SecureBoot", "secure_boot"), ("PowerPlan", "power_plan"), ("XmpExpo", "xmp_expo")]),
 ];
 

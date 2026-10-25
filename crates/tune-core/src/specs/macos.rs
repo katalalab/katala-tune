@@ -37,10 +37,11 @@ pub async fn collect() -> Value {
             && let Ok(n) = String::from_utf8_lossy(&r.stdout).trim().parse::<u64>()
         {
             raw.insert(key.into(), json!(n));
-        } else if r.code == Some(0) && key.ends_with(".name") {
-            if let Some(v) = scalar(&json!(String::from_utf8_lossy(&r.stdout).trim())) {
-                raw.insert(key.into(), v);
-            }
+        } else if r.code == Some(0)
+            && key.ends_with(".name")
+            && let Some(v) = scalar(&json!(String::from_utf8_lossy(&r.stdout).trim()))
+        {
+            raw.insert(key.into(), v);
         }
     }
     let r = collect::run_bounded("/usr/bin/pmset", &["-g".into(), "custom".into()], &[], Duration::from_secs(3), 16384, 1024).await;
@@ -113,10 +114,8 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
     for (kind, id) in TYPES {
         let source = format!("system_profiler {kind}");
         if let Some(error) = raw["errors"][*kind].as_str() {
-            if sections[*id]["status"] == "not_collected" {
-                let error = if ["timeout", "tool_missing", "output_limit", "permission_denied"].contains(&error) { error } else { "error" };
-                sections.insert((*id).into(), section(vec![], error, &source));
-            }
+            let error = if ["timeout", "tool_missing", "output_limit", "permission_denied"].contains(&error) { error } else { "error" };
+            merge(sections, id, vec![], error, &source);
             continue;
         }
         let Some(items) = raw[*kind].as_array() else { continue };
@@ -199,14 +198,7 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
         } else {
             "ok"
         };
-        let existing = sections.get_mut(*id).expect("known section");
-        if existing["status"] == "ok" {
-            let old = existing["components"].as_array_mut().expect("components");
-            old.extend(components);
-            old.truncate(MAX_COMPONENTS);
-        } else {
-            *existing = section(components, status, &source);
-        }
+        merge(sections, id, components, status, &source);
     }
     if let Some(hw) = raw["SPHardwareDataType"].as_array().and_then(|a| a.first()) {
         let mut cpu =
@@ -229,15 +221,18 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
             "firmware".into(),
             section(vec![component("System firmware", "system_profiler SPHardwareDataType", firmware)], "ok", "system_profiler SPHardwareDataType"),
         );
-        if unified {
+        if unified || raw["hw.memsize"].is_u64() {
             let mut memory = mapped(hw, &[("physical_memory", "capacity")]);
             if let Some(v) = scalar(&raw["hw.memsize"]) {
                 memory.insert("capacity_bytes".into(), v);
             }
             let mut f = memory;
-            f.insert("memory_kind".into(), json!("unified"));
+            f.insert("memory_kind".into(), json!(if unified { "unified" } else { "system_total" }));
             let entry = sections.get_mut("memory").expect("memory");
-            entry["components"].as_array_mut().expect("components").insert(0, component("Unified memory", "system_profiler SPHardwareDataType", f));
+            entry["components"]
+                .as_array_mut()
+                .expect("components")
+                .insert(0, component(if unified { "Unified memory" } else { "System memory total" }, "system_profiler / sysctl hw.memsize", f));
             entry["status"] = json!("ok");
         }
     }
@@ -291,6 +286,41 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
         }
     }
     let entry = sections.get_mut("settings").expect("settings");
+    let actual_components = entry["components"].as_array().map_or(0, Vec::len);
     entry["components"].as_array_mut().expect("components").extend(settings);
-    entry["status"] = json!(if raw.get("power_settings").is_some() { "ok" } else { "partial" });
+    if raw["power_settings"].as_array().is_some_and(|a| !a.is_empty()) {
+        let old = entry["status"].as_str().unwrap_or("not_collected");
+        entry["status"] = json!(if ["ok", "empty", "not_collected"].contains(&old) { "ok" } else { "partial" });
+    } else if actual_components > 0 {
+        entry["status"] = json!("partial");
+    } else if entry["status"] == "empty" {
+        entry["status"] = json!("not_collected");
+    }
+    let pmset_state = if raw.get("power_settings").is_some() {
+        "ok"
+    } else {
+        raw["errors"]["settings"].as_str().filter(|s| ["error", "timeout", "permission_denied"].contains(s)).unwrap_or("not_collected")
+    };
+    entry["providers"].as_array_mut().expect("providers").push(json!({"source":"pmset -g custom","status":pmset_state}));
+}
+
+fn merge(sections: &mut Map<String, Value>, id: &str, components: Vec<Value>, status: &str, source: &str) {
+    let entry = sections.get_mut(id).expect("known section");
+    let items = entry["components"].as_array_mut().expect("components");
+    items.extend(components);
+    items.truncate(MAX_COMPONENTS);
+    entry["providers"].as_array_mut().expect("providers").push(json!({"source":source,"status":status}));
+    let has_data = entry["components"].as_array().is_some_and(|c| !c.is_empty());
+    let failure = entry["providers"].as_array().into_iter().flatten().any(|p| !matches!(p["status"].as_str(), Some("ok" | "empty")));
+    entry["status"] = json!(if has_data && failure {
+        "partial"
+    } else if has_data {
+        "ok"
+    } else if failure {
+        "error"
+    } else {
+        status
+    });
+    let sources: Vec<_> = entry["providers"].as_array().into_iter().flatten().filter_map(|p| p["source"].as_str()).collect();
+    entry["source"] = json!(sources.join(" / "));
 }

@@ -122,7 +122,8 @@ pub(super) fn mapped(v: &Value, mapping: &[(&str, &str)]) -> Map<String, Value> 
 }
 
 pub(super) fn section(components: Vec<Value>, status: &str, source: &str) -> Value {
-    json!({"status":status,"source":source,"components":components})
+    let providers: Vec<Value> = if source.is_empty() { vec![] } else { vec![json!({"source":source,"status":status})] };
+    json!({"status":status,"source":source,"components":components,"providers":providers})
 }
 
 pub fn normalize(platform: &str, raw: &Value) -> Value {
@@ -135,7 +136,8 @@ pub fn normalize(platform: &str, raw: &Value) -> Value {
         "macos" => macos::normalize(raw, &mut sections),
         _ => {}
     }
-    let collected = sections.values().any(|s| s["status"] == "ok");
+    let collected =
+        sections.values().any(|s| matches!(s["status"].as_str(), Some("ok" | "partial")) && s["components"].as_array().is_some_and(|c| !c.is_empty()));
     json!({"schema":SCHEMA,"platform":platform,"at":now_ms(),"ok":collected,"collector_version":env!("CARGO_PKG_VERSION"),"sections":sections})
 }
 
@@ -167,7 +169,24 @@ pub fn validate_report(v: &Value, platform: &str) -> Result<Value, String> {
             let component_source = scalar(&c["source"]).and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| source.clone());
             components.push(component(&name, &component_source, fields));
         }
-        sections.insert((*id).into(), section(components, status, &source));
+        let mut safe_section = section(components, status, &source);
+        if let Some(providers) = s["providers"].as_array() {
+            safe_section["providers"] = json!(
+                providers
+                    .iter()
+                    .take(8)
+                    .filter_map(|p| {
+                        let source = scalar(&p["source"])?;
+                        let state = p["status"].as_str().filter(|s| {
+                            ["ok", "partial", "empty", "not_collected", "permission_denied", "unsupported", "error", "timeout", "tool_missing", "output_limit"]
+                                .contains(s)
+                        })?;
+                        Some(json!({"source":source,"status":state}))
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+        sections.insert((*id).into(), safe_section);
     }
     let ok = sections.values().any(|s| matches!(s["status"].as_str(), Some("ok" | "partial")) && s["components"].as_array().is_some_and(|c| !c.is_empty()));
     Ok(json!({"schema":SCHEMA,"platform":platform,"at":at,"ok":ok,"collector_version":scalar(&v["collector_version"]),"sections":sections}))

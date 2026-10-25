@@ -51,3 +51,18 @@ test('Tauri command permissions and bridge include both specification endpoints'
   assert(bridge.includes("invoke('specs_view')"));
   assert(bridge.includes("invoke('specs_refresh'"));
 });
+
+test('differences retain per-device value associations',()=>{
+  const r=(a,b)=>({sections:{gpu:{status:'ok',components:[{name:'GPU A',fields:{model:'GPU A',driver_version:a}},{name:'GPU B',fields:{model:'GPU B',driver_version:b}}]}}});
+  const rows=model.rows([{report:r('1','2')},{report:r('2','1')}]);
+  assert.equal(rows.find(r=>r.field==='driver_version').different,true);
+});
+
+test('a cached running backend never disables manual reload',async()=>{
+  let html='';
+  const element = {onclick:null,onchange:null,oninput:null};
+  const ctx={window:{tune:{specsView:async()=>({nodes:[],running:true})}},UI:require('../renderer/ui.js'),state:{view:'specs',nodes:[]},setCrumbs:()=>{},page:s=>{html=s;},document:{querySelector:()=>element,querySelectorAll:()=>[]},console};
+  vm.runInNewContext(fs.readFileSync('renderer/specs.js','utf8'),ctx);
+  await ctx.window.KT_VIEWS[0].render();
+  assert(!/id="specsReload"[^>]*disabled/.test(html));
+});

@@ -125,3 +125,52 @@ fn nvidia_smi_provides_large_vram_without_cim_adapterram_guessing() {
     assert_eq!(gpu["fields"]["dedicated_vram_bytes"], 25757220864_u64);
     assert!(gpu["source"].as_str().unwrap().contains("nvidia-smi"));
 }
+
+#[test]
+fn total_mac_provider_failure_cannot_replace_a_successful_report() {
+    let failed = specs::normalize("macos", &json!({"errors":{"SPHardwareDataType":"timeout","SPPowerDataType":"timeout","settings":"timeout"}}));
+    let validated = specs::validate_report(&failed, "macos").unwrap();
+    assert_eq!(validated["ok"], false);
+    use tune_core::{db::Store, engine_specs};
+    let db = Store::open_in_memory().unwrap();
+    let node = Node::from_value(&json!({"id":"mac","os":"macos"}), "test");
+    let good = specs::normalize("macos", &json!({"SPHardwareDataType":[{"chip_type":"Apple Test"}]}));
+    engine_specs::save_attempt(&db, &node, &json!({"ok":true,"report":good})).unwrap();
+    assert!(engine_specs::save_attempt(&db, &node, &json!({"ok":true,"report":validated})).is_err());
+    assert_eq!(engine_specs::load_node(&db, &node).unwrap()["report"]["sections"]["cpu"]["components"][0]["fields"]["model"], "Apple Test");
+}
+
+#[test]
+fn mac_multi_provider_sections_keep_failures_in_both_orders() {
+    for raw in [
+        json!({"SPNVMeDataType":[{"_name":"SSD"}],"errors":{"SPSerialATADataType":"timeout"}}),
+        json!({"SPSerialATADataType":[{"_name":"SSD"}],"errors":{"SPNVMeDataType":"timeout"}}),
+    ] {
+        let r = specs::normalize("macos", &raw);
+        assert_eq!(r["sections"]["storage"]["status"], "partial");
+        let safe = specs::validate_report(&r, "macos").unwrap();
+        assert!(safe["sections"]["storage"]["providers"].as_array().unwrap().iter().any(|p| p["status"] == "timeout"));
+    }
+}
+
+#[test]
+fn intel_mac_total_memory_uses_numeric_sysctl_bytes() {
+    let r = specs::normalize(
+        "macos",
+        &json!({"SPHardwareDataType":[{"cpu_type":"Intel Core i7","physical_memory":"16 GB"}],"hw.memsize":17179869184_u64,"SPMemoryDataType":[{"dimm_size":"8 GB"},{"dimm_size":"8 GB"}]}),
+    );
+    assert_eq!(r["sections"]["memory"]["components"][0]["fields"]["capacity_bytes"], 17179869184_u64);
+    assert_eq!(r["sections"]["memory"]["components"][0]["fields"]["memory_kind"], "system_total");
+}
+
+#[test]
+fn windows_displays_keep_model_and_manufacturer_without_edid_serials() {
+    let r = specs::normalize(
+        "windows",
+        &json!({"display":[{"Name":"Example Panel","Manufacturer":"ABC","Active":true,"SerialNumberID":"PRIVATE","MaxHorizontalImageSize":60,"MaxVerticalImageSize":34}]}),
+    );
+    let fields = &r["sections"]["display"]["components"][0]["fields"];
+    assert_eq!(fields["model"], "Example Panel");
+    assert_eq!(fields["manufacturer"], "ABC");
+    assert!(!r.to_string().contains("PRIVATE"));
+}

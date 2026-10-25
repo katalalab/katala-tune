@@ -62,7 +62,7 @@ use tune_core::{
 
 fn usage() -> ExitCode {
     eprintln!(
-        "使い方: tune <paths|probe|hygiene|logs|ledger|last|power|network|capabilities|maintenance-plan|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
+        "使い方: tune <paths|probe|hygiene|logs|ledger|last|power|network|capabilities|specs-local|specs|maintenance-plan|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
     );
     ExitCode::from(2)
 }

@@ -3,6 +3,56 @@
   "verified_at": "2026-10-25",
   "products": [
     {
+      "models": ["13th Gen Intel(R) Core(TM) i5-13500", "Intel Core i5-13500"],
+      "name": "Intel Core i5-13500",
+      "url": "https://www.intel.com/content/www/us/en/products/sku/230580/intel-core-i513500-processor-24m-cache-up-to-4-80-ghz/specifications.html",
+      "scope": "Processor published limits; not measured clocks or current power",
+      "specifications": {"cores": 14, "threads": 20, "max_turbo_ghz": 4.8, "cache_mb": 24}
+    },
+    {
+      "models": ["13th Gen Intel(R) Core(TM) i9-13900KF", "Intel Core i9-13900KF"],
+      "name": "Intel Core i9-13900KF",
+      "url": "https://www.intel.com/content/www/us/en/products/sku/230497/intel-core-i913900kf-processor-36m-cache-up-to-5-80-ghz/specifications.html",
+      "scope": "Processor published limits; not measured clocks or current power",
+      "specifications": {"cores": 24, "threads": 32, "max_turbo_ghz": 5.8, "cache_mb": 36}
+    },
+    {
+      "models": ["Apple M2 Pro"],
+      "name": "Apple M2 Pro (MacBook Pro configurations)",
+      "url": "https://support.apple.com/en-us/111340",
+      "scope": "Chip family with multiple configurations; installed CPU/GPU core counts are observed separately",
+      "specifications": {"cpu_core_options": "10 / 12", "gpu_core_options": "16 / 19", "memory_bandwidth_gbs": 200, "neural_engine_cores": 16}
+    },
+    {
+      "models": ["Mac14,5", "Mac14,9"],
+      "name": "MacBook Pro 14-inch (2023)",
+      "url": "https://support.apple.com/en-us/111340",
+      "identification_url": "https://support.apple.com/en-us/108052",
+      "scope": "Model family; installed chip, memory and storage are observed separately",
+      "specifications": {"display_inches": 14.2, "native_resolution": "3024 × 1964", "thunderbolt_ports": 3, "thunderbolt_generation": 4}
+    },
+    {
+      "models": ["NVIDIA GeForce RTX 3070"],
+      "name": "NVIDIA GeForce RTX 3070 reference GPU",
+      "url": "https://www.nvidia.com/en-us/geforce/graphics-cards/30-series/rtx-3070-3070ti/",
+      "scope": "Reference GPU specifications; board partner clocks and firmware can differ",
+      "specifications": {"dedicated_vram_gib": 8, "cuda_cores": 5888, "memory_type": "GDDR6"}
+    },
+    {
+      "models": ["NVIDIA GeForce RTX 2070"],
+      "name": "NVIDIA GeForce RTX 2070 reference GPU",
+      "url": "https://www.nvidia.com/content/nvidiaGDC/gb/en_GB/geforce/graphics-cards/rtx-2070.html",
+      "scope": "Reference GPU specifications; board partner clocks and firmware can differ",
+      "specifications": {"dedicated_vram_gib": 8, "cuda_cores": 2304, "memory_type": "GDDR6"}
+    },
+    {
+      "models": ["B760M Pro RS/D4"],
+      "name": "ASRock B760M Pro RS/D4",
+      "url": "https://www.asrock.com/mb/Intel/B760M%20Pro%20RSD4/index.asp#Specification",
+      "scope": "Motherboard supported specifications; installed modules and XMP state are observed separately",
+      "specifications": {"socket": "LGA1700", "chipset": "Intel B760", "memory_type": "DDR4", "memory_slots": 4, "supported_xmp": "2.0"}
+    },
+    {
       "models": ["Mac17,6", "Mac17,8"],
       "name": "MacBook Pro 16-inch (M5 Pro or M5 Max, 2026)",
       "url": "https://support.apple.com/en-us/126319",
