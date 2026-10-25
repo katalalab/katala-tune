@@ -164,8 +164,9 @@ impl Runner for FakeTaskHost {
             if self.fail_next.swap(false, Ordering::SeqCst) {
                 return res(Some(1), "", "access denied");
             }
+            let before = std::fs::read_to_string(&file).unwrap() == "Ready";
             std::fs::write(&file, verb).unwrap();
-            res(Some(0), &format!("{verb}\n"), "")
+            res(Some(0), &format!("KT_TASK_STATE {} {}\n", u8::from(before), u8::from(verb == "Ready")), "")
         })
     }
 }
@@ -365,8 +366,8 @@ async fn reversible_action_on_fake_target_records_before_after_and_rollback() {
         (Some("ok"), Some(true), Some("w"), Some("task-disable"))
     );
     assert_eq!(row["params"], json!({ "path": "\\Katala\\", "name": "Backup" })); // 対象 ID
-    assert!(row["output"].as_str().unwrap().contains("Disabled")); // 実行後の状態
-    assert_eq!(row["undo"], json!({ "type": "task-enable", "params": { "path": "\\Katala\\", "name": "Backup" } })); // 実行前の状態へ戻す操作
+    assert!(row["output"].as_str().unwrap().contains("KT_TASK_STATE 1 0")); // 実行後の状態
+    assert_eq!(row["undo"], json!({ "type": "task-enable", "params": { "path": "\\Katala\\", "name": "Backup", "expected_enabled": false } })); // 実行前の状態へ戻す操作
     let id = row["id"].as_str().unwrap().to_string();
 
     let u = s.engine.undo_with(s.host.as_ref(), &id, approve(true, || {})).await.unwrap();
@@ -376,7 +377,7 @@ async fn reversible_action_on_fake_target_records_before_after_and_rollback() {
     assert_eq!(log.len(), 2);
     let undo_row = log.iter().find(|a| a["undo_of"] == json!(id)).unwrap();
     assert_eq!((undo_row["state"].as_str(), undo_row["type"].as_str(), undo_row["node_id"].as_str()), (Some("ok"), Some("task-enable"), Some("w")));
-    assert!(undo_row["output"].as_str().unwrap().contains("Ready"));
+    assert!(undo_row["output"].as_str().unwrap().contains("KT_TASK_STATE 0 1"));
     let again = s.engine.undo_with(s.host.as_ref(), &id, approve(true, || {})).await.unwrap();
     assert!(again["refused"].as_str().unwrap().contains("すでに元に戻した"));
     assert_eq!(s.host.calls.load(Ordering::SeqCst), 2);
@@ -497,7 +498,7 @@ impl Runner for CountLocal {
     fn run<'a>(&'a self, cmd: &'a str, _args: &'a [String], _input: Option<&'a [u8]>, _timeout: Duration) -> RunFuture<'a> {
         Box::pin(async move {
             self.0.lock().unwrap().push(cmd.to_string());
-            res(Some(0), "{\"probe\":\"windows\"}\n", "")
+            res(Some(0), "KT_TASK_STATE 1 0\n", "")
         })
     }
     fn probe_exchange<'a>(&'a self, _node: &'a Node, _helper: &'a str, _benchmark: bool, _network: bool, _observe_wsl: bool) -> RunFuture<'a> {
@@ -535,7 +536,7 @@ impl Runner for FinishesEarly {
         Box::pin(async move {
             let id = actions_of(&self.0)[0]["id"].as_str().unwrap().to_string();
             assert!(self.0.with_db(|d| d.finish_action(&id, false, "別の手", None)).unwrap());
-            res(Some(0), "Disabled\n", "")
+            res(Some(0), "KT_TASK_STATE 1 0\n", "")
         })
     }
 }
@@ -563,4 +564,38 @@ async fn internal_error_result_has_reason_like_other_failures() {
     assert_eq!(results[0]["ok"], json!(false));
     assert_eq!(results[0]["reason"], json!("error"));
     assert_eq!(results[0]["reason_text"], json!(reason_text("error")));
+}
+
+#[tokio::test]
+async fn undo_refuses_a_reassigned_original_target_and_legacy_audit() {
+    for replacement in [
+        json!({"id":"w","alias":"mock-other","os":"windows"}),
+        {
+            let mut n = node_json("w");
+            n["action_helper"]["attempt"] = json!(2);
+            n
+        },
+        json!({"id":"w","alias":"mock-w","os":"macos"}),
+        {
+            let mut n = node_json("w");
+            n["local_hostname"] = json!(tune_core::nodes::local_host());
+            n
+        },
+    ] {
+        let s = setup(&[node_json("w")], &[]);
+        s.engine.confirm_and_run_with(s.host.as_ref(), "w", &disable(), "t", None, approve(true, || {})).await.unwrap();
+        let original = s.engine.with_db(|d| d.actions(1000)).unwrap()[0].clone();
+        assert!(!original["undo"].is_null());
+        write_ledger(&s.ledger, &[replacement], &[]);
+        let reopened = Engine::open(s.ledger.clone(), s.dir.join("data"), Arc::new(NoHost)).unwrap();
+        let r = reopened.undo_with(s.host.as_ref(), original["id"].as_str().unwrap(), approve(true, || {})).await.unwrap();
+        assert_eq!(r["ok"], false);
+        assert!(r["refused"].as_str().unwrap().contains("接続先"));
+        assert_eq!(s.host.calls.load(Ordering::SeqCst), 1);
+    }
+    let s = setup(&[node_json("w")], &[]);
+    s.engine.with_db(|d| d.add_action(&json!({"id":"legacy","at":1,"node_id":"w","type":"task-disable","params":disable()["params"],"ok":true,"undo":{"type":"task-enable","params":disable()["params"]}}))).unwrap();
+    let r = s.engine.undo_with(s.host.as_ref(), "legacy", approve(true, || {})).await.unwrap();
+    assert_eq!(r["ok"], false);
+    assert_eq!(s.host.calls.load(Ordering::SeqCst), 0);
 }
