@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use windows_sys::Win32::{
-    Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT},
     Globalization::{CSTR_EQUAL, CSTR_LESS_THAN, CompareStringOrdinal},
     Security::{
         Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
@@ -273,12 +273,33 @@ fn exited(handle: &OwnedHandle) -> io::Result<bool> {
 
 #[cfg(test)]
 type AccountingHook = Box<dyn FnOnce(&Job, &ProcessReceipt) -> io::Result<()> + Send>;
+#[cfg(test)]
+type PidListHook = Box<dyn FnOnce(&Job, &[u32]) -> io::Result<()> + Send>;
+
+fn complete_pid_list(assigned: u32, count: u32, pids: &[usize]) -> io::Result<Vec<u32>> {
+    if assigned != count || count as usize > MAX_ACTIVE || count as usize > pids.len() {
+        return Err(invalid());
+    }
+    let mut result = Vec::with_capacity(count as usize);
+    for value in &pids[..count as usize] {
+        let pid = u32::try_from(*value).map_err(|_| invalid())?;
+        if pid == 0 || result.contains(&pid) {
+            return Err(invalid());
+        }
+        result.push(pid);
+    }
+    Ok(result)
+}
 
 struct Job {
     handle: OwnedHandle,
     processes: Vec<Process>,
     #[cfg(test)]
     after_first_accounting: Option<AccountingHook>,
+    #[cfg(test)]
+    after_pid_list: Option<PidListHook>,
+    #[cfg(test)]
+    injected_open_error: Option<(u32, i32)>,
 }
 impl Job {
     fn new() -> io::Result<Self> {
@@ -289,6 +310,10 @@ impl Job {
             processes: Vec::new(),
             #[cfg(test)]
             after_first_accounting: None,
+            #[cfg(test)]
+            after_pid_list: None,
+            #[cfg(test)]
+            injected_open_error: None,
         };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -323,12 +348,7 @@ impl Job {
         receipt.job_empty = accounting.ActiveProcesses == 0;
         Ok(())
     }
-    fn observe(&mut self, receipt: &mut ProcessReceipt) -> io::Result<()> {
-        self.accounting(receipt)?;
-        #[cfg(test)]
-        if let Some(hook) = self.after_first_accounting.take() {
-            hook(self, receipt)?;
-        }
+    fn process_ids(&self) -> io::Result<Vec<u32>> {
         #[repr(C)]
         struct Pids {
             assigned: u32,
@@ -346,19 +366,39 @@ impl Job {
                 null_mut(),
             )
         })?;
-        if pids.count as usize > MAX_ACTIVE || pids.assigned as usize > MAX_ACTIVE {
-            return Err(invalid());
+        complete_pid_list(pids.assigned, pids.count, &pids.pids)
+    }
+    fn observe(&mut self, receipt: &mut ProcessReceipt) -> io::Result<()> {
+        self.accounting(receipt)?;
+        #[cfg(test)]
+        if let Some(hook) = self.after_first_accounting.take() {
+            hook(self, receipt)?;
         }
-        for pid in &pids.pids[..pids.count as usize] {
-            let pid = u32::try_from(*pid).map_err(|_| invalid())?;
+        let pids = self.process_ids()?;
+        #[cfg(test)]
+        if let Some(hook) = self.after_pid_list.take() {
+            hook(self, &pids)?;
+        }
+        for pid in pids {
             if self.processes.iter().any(|p| p.identity.pid == pid) {
                 continue;
             }
             if self.processes.len() >= MAX_OBSERVED {
                 return Err(invalid());
             }
-            // SAFETY: observation only; retain query/synchronize handle, no terminate rights requested.
-            let handle = owned(unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | SYNCHRONIZE_PROCESS, 0, pid) })?;
+            let handle = match self.open_candidate(pid) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    // A snapshot PID can exit before OpenProcess. Only the specific
+                    // disappearance error plus a complete fresh query of this owned
+                    // Job permits skipping it. No identity/exit is fabricated; actual
+                    // Job emptiness and retained handles still gate completion later.
+                    if error.raw_os_error() != Some(ERROR_INVALID_PARAMETER as i32) || self.process_ids()?.contains(&pid) {
+                        return Err(error);
+                    }
+                    continue;
+                }
+            };
             let mut member = 0;
             // SAFETY: recheck membership on the opened object, closing enumeration/PID reuse races.
             check(unsafe { IsProcessInJob(handle.as_raw_handle(), self.handle.as_raw_handle(), &mut member) })?;
@@ -387,6 +427,15 @@ impl Job {
             receipt.observed_exited &= exited(&process.handle)?;
         }
         Ok(())
+    }
+    fn open_candidate(&mut self, pid: u32) -> io::Result<OwnedHandle> {
+        #[cfg(test)]
+        if let Some((expected, error)) = self.injected_open_error.take() {
+            assert_eq!(pid, expected, "fault injection targets only the captured fixture member");
+            return Err(io::Error::from_raw_os_error(error));
+        }
+        // SAFETY: observation only; retain query/synchronize handle, no terminate rights requested.
+        owned(unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | SYNCHRONIZE_PROCESS, 0, pid) })
     }
 }
 impl Drop for Job {
@@ -1487,6 +1536,176 @@ mod tests {
         if std::env::args().any(|arg| arg == "--owned-accounting-exit") {
             std::process::exit(0);
         }
+    }
+
+    fn suspended_observation_member(job: &Job, deadline: Instant) -> (Process, OwnedHandle) {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let fixture = format!("{}::accounting_exit_fixture", module_path!().split_once("::").unwrap().1);
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", &fixture, "--nocapture", "--", "--owned-accounting-exit"]);
+        let name = wide(OsStr::new("NUL")).unwrap();
+        let security = SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: null_mut(), bInheritHandle: 1 };
+        let stdio: Vec<_> = (0..3)
+            .map(|_| {
+                // SAFETY: only fixture-owned inheritable NUL handles; no application IO or file payload.
+                owned(unsafe {
+                    CreateFileW(
+                        name.as_ptr(),
+                        GENERIC_READ_ACCESS | GENERIC_WRITE_ACCESS,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        &security,
+                        OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL,
+                        null_mut(),
+                    )
+                })
+                .unwrap()
+            })
+            .collect();
+        let mut failed = false;
+        let member =
+            spawn_owned(SpawnContext { command: &command, environment: &[], deadline, pin: None }, job, [&stdio[0], &stdio[1], &stdio[2]], &mut failed)
+                .unwrap();
+        assert!(!failed);
+        member
+    }
+
+    fn fixture_job_pids(job: &Job) -> io::Result<Vec<u32>> {
+        #[repr(C)]
+        struct Pids {
+            assigned: u32,
+            count: u32,
+            values: [usize; MAX_ACTIVE],
+        }
+        let mut pids = Pids { assigned: 0, count: 0, values: [0; MAX_ACTIVE] };
+        // SAFETY: independent native observation of this fixture's retained Job, fixed aligned output.
+        check(unsafe {
+            QueryInformationJobObject(
+                job.handle.as_raw_handle(),
+                JobObjectBasicProcessIdList,
+                std::ptr::from_mut(&mut pids).cast(),
+                size_of_val(&pids) as u32,
+                null_mut(),
+            )
+        })?;
+        if pids.assigned != pids.count || pids.count as usize > MAX_ACTIVE {
+            return Err(invalid());
+        }
+        pids.values[..pids.count as usize].iter().map(|pid| u32::try_from(*pid).map_err(|_| invalid())).collect()
+    }
+
+    fn remove_fixture_member_after_snapshot(job: &mut Job, root_pid: u32, member: Process, member_thread: OwnedHandle, deadline: Instant) {
+        let member_pid = member.identity.pid;
+        job.after_pid_list = Some(Box::new(move |job, snapshot| {
+            assert!(snapshot.contains(&root_pid) && snapshot.contains(&member_pid));
+            // SAFETY: terminate only the exact suspended member owned by this fixture; never a PID lookup.
+            check(unsafe { windows_sys::Win32::System::Threading::TerminateProcess(member.handle.as_raw_handle(), 0) })?;
+            let wait_ms = deadline.saturating_duration_since(Instant::now()).as_millis().min(u128::from(u32::MAX)) as u32;
+            // SAFETY: retained handle of this fixture member; bounded by the original absolute deadline.
+            if unsafe { WaitForSingleObject(member.handle.as_raw_handle(), wait_ms) } != WAIT_OBJECT_0 || Instant::now() >= deadline {
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            drop(member_thread);
+            drop(member);
+            while fixture_job_pids(job)? != vec![root_pid] {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::from(io::ErrorKind::TimedOut));
+                }
+                std::thread::sleep(POLL);
+            }
+            Ok(())
+        }));
+    }
+
+    #[test]
+    fn exited_member_between_pid_snapshot_and_open_does_not_invent_an_identity() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut job = Job::new().unwrap();
+        let (root, root_thread) = suspended_observation_member(&job, deadline);
+        let (member, member_thread) = suspended_observation_member(&job, deadline);
+        let root_pid = root.identity.pid;
+        let member_pid = member.identity.pid;
+        let mut receipt =
+            ProcessReceipt { root: Some(root.identity.clone()), observed: vec![root.identity.clone()], stop: ProcessStop::Completed, ..Default::default() };
+        job.processes.push(root);
+        remove_fixture_member_after_snapshot(&mut job, root_pid, member, member_thread, deadline);
+        // Fault injection is explicit: object lifetime/other observers can keep an exited PID openable.
+        // Actual member exit and Job absence above are real, not mocked.
+        job.injected_open_error = Some((member_pid, ERROR_INVALID_PARAMETER as i32));
+        job.observe(&mut receipt).expect("a disappeared member needs fresh Job evidence, not an invented identity");
+        assert!(job.injected_open_error.is_none(), "one error must be consumed for the captured member");
+        assert_eq!(job.processes.len(), 1);
+        assert_eq!(receipt.observed.len(), 1);
+        assert_eq!(receipt.observed[0].pid, root_pid);
+        assert_eq!(receipt.total_processes, 2);
+        assert!(!receipt.root_exited && !receipt.job_empty && !receipt.observed_exited);
+        assert!(!receipt.cleanup_confirmed(), "an active root/Job must never acquire a completion witness");
+        job.terminate().unwrap();
+        let root = &job.processes[0];
+        let wait_ms = deadline.saturating_duration_since(Instant::now()).as_millis().min(u128::from(u32::MAX)) as u32;
+        // SAFETY: wait only for the retained root of the terminated owned Job.
+        assert_eq!(unsafe { WaitForSingleObject(root.handle.as_raw_handle(), wait_ms) }, WAIT_OBJECT_0);
+        while Instant::now() < deadline {
+            job.observe(&mut receipt).unwrap();
+            if receipt.root_exited && receipt.job_empty && receipt.observed_exited {
+                break;
+            }
+            std::thread::sleep(POLL);
+        }
+        assert!(Instant::now() < deadline && receipt.root_exited && receipt.job_empty && receipt.observed_exited);
+        assert!(!receipt.cleanup_confirmed(), "exit observation cannot manufacture missing pipe/owner evidence");
+        drop(root_thread);
+    }
+
+    #[test]
+    fn member_open_error_does_not_hide_a_live_pid_or_access_denial() {
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        for (disappear, error) in [(false, ERROR_INVALID_PARAMETER), (false, ERROR_ACCESS_DENIED), (true, ERROR_ACCESS_DENIED)] {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut job = Job::new().unwrap();
+            let (root, root_thread) = suspended_observation_member(&job, deadline);
+            let (member, member_thread) = suspended_observation_member(&job, deadline);
+            let root_pid = root.identity.pid;
+            let member_pid = member.identity.pid;
+            let mut receipt =
+                ProcessReceipt { root: Some(root.identity.clone()), observed: vec![root.identity.clone()], stop: ProcessStop::Completed, ..Default::default() };
+            job.processes.push(root);
+            let retained = if disappear {
+                remove_fixture_member_after_snapshot(&mut job, root_pid, member, member_thread, deadline);
+                None
+            } else {
+                Some((member, member_thread))
+            };
+            job.injected_open_error = Some((member_pid, error as i32));
+            let failed = job.observe(&mut receipt).expect_err("only a confirmed-gone invalid-parameter candidate can be skipped");
+            assert_eq!(failed.raw_os_error(), Some(error as i32));
+            assert!(job.injected_open_error.is_none());
+            assert!(!exited(&job.processes[0].handle).unwrap());
+            assert_eq!(receipt.observed.len(), 1);
+            assert_eq!(job.processes.len(), 1);
+            assert!(!receipt.cleanup_confirmed());
+            job.terminate().unwrap();
+            for handle in std::iter::once(&job.processes[0].handle).chain(retained.iter().map(|(member, _)| &member.handle)) {
+                let wait_ms = deadline.saturating_duration_since(Instant::now()).as_millis().min(u128::from(u32::MAX)) as u32;
+                // SAFETY: only retained fixture handles from this terminated owned Job, under the original deadline.
+                assert_eq!(unsafe { WaitForSingleObject(handle.as_raw_handle(), wait_ms) }, WAIT_OBJECT_0);
+            }
+            assert!(Instant::now() < deadline);
+            drop(root_thread);
+        }
+    }
+
+    #[test]
+    fn incomplete_or_malformed_pid_lists_cannot_prove_absence() {
+        assert_eq!(complete_pid_list(2, 2, &[17, 23]).unwrap(), vec![17, 23]);
+        assert!(complete_pid_list(2, 1, &[17]).is_err(), "missing candidate in a partial list is not absence");
+        assert!(complete_pid_list(1, 2, &[17, 23]).is_err());
+        assert!(complete_pid_list(2, 2, &[17]).is_err());
+        assert!(complete_pid_list(0, 0, &[]).unwrap().is_empty());
+        assert!(complete_pid_list(1, 1, &[0]).is_err());
+        assert!(complete_pid_list(2, 2, &[17, 17]).is_err());
+        assert!(complete_pid_list(1, 1, &[usize::MAX]).is_err());
+        assert!(complete_pid_list(MAX_ACTIVE as u32 + 1, MAX_ACTIVE as u32 + 1, &[17; MAX_ACTIVE + 1]).is_err());
     }
 
     #[test]
