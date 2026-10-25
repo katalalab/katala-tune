@@ -327,6 +327,20 @@ fn exited(handle: &OwnedHandle) -> io::Result<bool> {
 type AccountingHook = Box<dyn FnOnce(&Job, &ProcessReceipt) -> io::Result<()> + Send>;
 #[cfg(test)]
 type PidListHook = Box<dyn FnOnce(&Job, &[u32]) -> io::Result<()> + Send>;
+#[cfg(all(test, katala_private_diagnostics))]
+type CandidateOpenAction = Box<dyn FnOnce(&OwnedHandle, &ProcessIdentity) -> io::Result<()> + Send>;
+#[cfg(all(test, katala_private_diagnostics))]
+struct CandidateOpenProbe {
+    expected: ProcessIdentity,
+    action: Option<CandidateOpenAction>,
+    current_is_target: bool,
+}
+#[cfg(all(test, katala_private_diagnostics))]
+#[path = "windows_open_probe.rs"]
+mod open_probe;
+#[cfg(all(test, katala_private_diagnostics))]
+#[path = "windows_open_probe_native.rs"]
+mod open_probe_native;
 
 fn complete_pid_list(assigned: u32, count: u32, pids: &[usize]) -> io::Result<Vec<u32>> {
     if assigned != count || count as usize > MAX_ACTIVE || count as usize > pids.len() {
@@ -355,6 +369,8 @@ struct Job {
     after_pid_list: Option<PidListHook>,
     #[cfg(test)]
     injected_open_error: Option<(u32, i32)>,
+    #[cfg(all(test, katala_private_diagnostics))]
+    candidate_open_probe: Option<CandidateOpenProbe>,
 }
 impl Job {
     fn new() -> io::Result<Self> {
@@ -372,6 +388,8 @@ impl Job {
             after_pid_list: None,
             #[cfg(test)]
             injected_open_error: None,
+            #[cfg(all(test, katala_private_diagnostics))]
+            candidate_open_probe: None,
         };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -431,6 +449,10 @@ impl Job {
         complete_pid_list(pids.assigned, pids.count, &pids.pids)
     }
     fn observe(&mut self, receipt: &mut ProcessReceipt) -> io::Result<()> {
+        #[cfg(all(test, katala_private_diagnostics))]
+        if let Some(probe) = self.candidate_open_probe.as_mut() {
+            probe.current_is_target = false;
+        }
         macro_rules! site {
             ($site:ident) => {
                 #[cfg(katala_private_diagnostics)]
@@ -452,6 +474,10 @@ impl Job {
         for pid in pids {
             if self.processes.iter().any(|p| p.identity.pid == pid) {
                 continue;
+            }
+            #[cfg(all(test, katala_private_diagnostics))]
+            if let Some(probe) = self.candidate_open_probe.as_mut() {
+                probe.current_is_target = probe.expected.pid == pid;
             }
             if self.processes.len() >= MAX_OBSERVED {
                 site!(RetentionCap);
@@ -475,6 +501,13 @@ impl Job {
                     continue;
                 }
             };
+            #[cfg(all(test, katala_private_diagnostics))]
+            if let Some(probe) = self.candidate_open_probe.as_mut()
+                && probe.current_is_target
+                && let Some(action) = probe.action.take()
+            {
+                action(&handle, &probe.expected)?;
+            }
             let mut member = 0;
             site!(MembershipQuery);
             // SAFETY: recheck membership on the opened object, closing enumeration/PID reuse races.
@@ -1874,11 +1907,15 @@ mod tests {
     }
 
     fn suspended_observation_member(job: &Job, deadline: Instant) -> (Process, OwnedHandle) {
+        observation_member(job, deadline).unwrap_or_else(|_| panic!("owned observation fixture setup failed"))
+    }
+
+    pub(super) fn observation_member(job: &Job, deadline: Instant) -> io::Result<(Process, OwnedHandle)> {
         use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-        let fixture = format!("{}::accounting_exit_fixture", module_path!().split_once("::").unwrap().1);
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        let fixture = format!("{}::accounting_exit_fixture", module_path!().split_once("::").ok_or_else(invalid)?.1);
+        let mut command = std::process::Command::new(std::env::current_exe()?);
         command.args(["--exact", &fixture, "--nocapture", "--", "--owned-accounting-exit"]);
-        let name = wide(OsStr::new("NUL")).unwrap();
+        let name = wide(OsStr::new("NUL"))?;
         let security = SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: null_mut(), bInheritHandle: 1 };
         let stdio: Vec<_> = (0..3)
             .map(|_| {
@@ -1894,15 +1931,15 @@ mod tests {
                         null_mut(),
                     )
                 })
-                .unwrap()
             })
-            .collect();
+            .collect::<io::Result<Vec<_>>>()?;
         let mut failed = false;
         let member =
-            spawn_owned(SpawnContext { command: &command, environment: &[], deadline, pin: None }, job, [&stdio[0], &stdio[1], &stdio[2]], &mut failed)
-                .unwrap();
-        assert!(!failed);
-        member
+            spawn_owned(SpawnContext { command: &command, environment: &[], deadline, pin: None }, job, [&stdio[0], &stdio[1], &stdio[2]], &mut failed)?;
+        if failed {
+            return Err(invalid());
+        }
+        Ok(member)
     }
 
     fn fixture_job_pids(job: &Job) -> io::Result<Vec<u32>> {
