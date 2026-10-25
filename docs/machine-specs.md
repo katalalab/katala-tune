@@ -6,7 +6,7 @@ Tauri版のサイドバー「スペック比較」から機体を選び、「仕
 
 Rustの `tune specs-local` は台帳・DBを開かず、その機体の読取結果を `katala_specs.v1` JSONで返す。WindowsはOS内蔵のCIM（PowerShell経由）と、導入済みの場合は `nvidia-smi` を使う。macOSは `system_profiler`、`sysctl`、`pmset` を使う。Pythonや配置した調査スクリプトは使わない。追加ソフトウェアはインストールしない。
 
-`tune specs [機体ID ...]` はローカルまたは既存SSH接続で収集し、私有DBに最新の成功結果と最終試行を保存する。引数省略時は稼働中の非共用機が対象。画面では明示的に選択した機体のみを収集する。台帳の `specs: false`、共用機、退役・一時停止・対象外の機体は収集を拒否する。
+`tune specs [機体ID ...]` はローカルまたは既存SSH接続で収集し、私有DBに最新の成功結果と最終試行を保存する。引数省略時は稼働中の収集許可機が対象。画面では明示的に選択した機体のみを収集する。共用機は既定で除外し、台帳の `specs: true` による明示的な読取許可がある場合だけ対象になる。`shared` 自体や最適化の許可は変更しない。台帳の `specs: false`、退役・一時停止・対象外の機体は収集を拒否する。
 
 `tune specs --saved [機体ID ...]` は収集せず保存済みの仕様・最終試行を表示する。既存DBを読取専用で開き、未作成なら欠測として返す。`tune specs --help`、`tune --version`、機械向けの `tune version --json`・`tune cli-info --json`、全機体の版照合 `tune versions` は [CLIの使い方](cli.md)を参照。
 

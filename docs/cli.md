@@ -1,5 +1,16 @@
 # CLI の使い方と版の確認
 
+アプリ同梱CLIの通常の配置先は macOS で `~/.katala-tune/bin/tune`、Windows で `$HOME\.katala-tune\bin\tune.exe`。PATH未登録ならこのパスで実行する。Windows PowerShellの例:
+
+```powershell
+& "$HOME\.katala-tune\bin\tune.exe" --help
+& "$HOME\.katala-tune\bin\tune.exe" versions
+& "$HOME\.katala-tune\bin\tune.exe" specs
+& "$HOME\.katala-tune\bin\tune.exe" specs --saved
+```
+
+macOSでは `~/.katala-tune/bin/tune versions` のように実行する。各JSONの標準出力はファイルに保存して比較できる。実機の出力は個人用フォルダーに保存し、ソースリポジトリには追加しない。
+
 `tune --help`（`-h`）は公開コマンド一覧、`tune help specs` または `tune specs --help` は各コマンドの引数・出力形式・副作用を表示する。ヘルプは台帳・DB・接続の状態を開かず、不正な設定ファイルがあっても使用できる。
 
 `tune --version`（`-V`、`tune version`）はインストールされたCLIの版を表示する。`tune version --json` は `katala_cli_version.v1` として版・OS・アーキテクチャ・仕様schema・実行ファイルのSHA-256を返す。版はビルド時のCargo package versionで、`cli_version` は `version` と同じ値。設定・DB・接続は不要。
