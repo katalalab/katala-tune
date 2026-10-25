@@ -490,6 +490,61 @@ fn commit_minute_rows(
     true
 }
 
+#[derive(Default)]
+struct RetentionSchedule {
+    next_attempt: Option<std::time::Instant>,
+    last_success: Option<i64>,
+}
+fn maintain_retention(
+    engine: &Engine,
+    journal: &crate::monitor_journal::Journal,
+    now: i64,
+    tick: std::time::Instant,
+    schedule: &mut RetentionSchedule,
+) -> Option<bool> {
+    if schedule.next_attempt.is_some_and(|at| tick < at) {
+        return None;
+    }
+    if schedule.next_attempt.is_none() {
+        schedule.last_success =
+            engine.with_db(|d| d.get_meta("metricsRetentionMaintenance")).ok().flatten().and_then(|v| v["last_success_at"].as_i64()).filter(|at| *at >= 0);
+    }
+    let result = engine.with_db(|d| Ok(d.prune_metrics(now - KEEP_DAYS * 24 * 60 * MINUTE).map_err(|e| Category::database(&e))));
+    let (rows, primary_error) = match result {
+        Ok(Ok(n)) => (Some(n as u64), None),
+        Ok(Err(c)) => (None, Some(c)),
+        Err(_) => (None, Some(Category::Unknown)),
+    };
+    let primary_ok = primary_error.is_none();
+    let planned_delay = if primary_ok { 24 * 60 * MINUTE } else { 5 * MINUTE };
+    let receipt = json!({
+        "at": now, "ok": primary_ok, "category": primary_error,
+        "last_success_at": if primary_ok { Some(now) } else { schedule.last_success },
+        "next_attempt_at": now.saturating_add(planned_delay),
+    });
+    // A failed receipt write cannot turn a failed archive into a successful cycle.
+    let saved = engine.with_db(|d| Ok(d.set_meta("metricsRetentionMaintenance", &receipt).map_err(|e| Category::database(&e))));
+    let receipt_error = match saved {
+        Ok(Ok(())) => None,
+        Ok(Err(c)) => Some(c),
+        Err(_) => Some(Category::Unknown),
+    };
+    let ok = primary_ok && receipt_error.is_none();
+    let delay = if ok { 24 * 60 * MINUTE } else { 5 * MINUTE };
+    schedule.next_attempt = tick.checked_add(Duration::from_millis(delay as u64));
+    if ok {
+        schedule.last_success = Some(now);
+    }
+    journal.record(
+        None,
+        0,
+        0,
+        Kind::Checkpoint,
+        Data { committed: Some(ok), rows, category: primary_error.or(receipt_error), delay_ms: Some(delay as u64), ..Data::default() },
+    );
+    Some(ok)
+}
+
 /// 15 秒ごとに: 常時監視が入っていてハブの数字が新しくなければ全機体のライブに合図を送って保ち、
 /// 終わった分を集計して保存し、ハブを選んでいれば 1 分ごとに写す。14 日より古い集計は 1 日 1 回消す。
 /// agent（同梱のサンプラー。Windows の操作卓だけ）があれば、hello の版が古い・無い Windows の機体へ入れ替えを送る（helpers.rs）。
@@ -509,7 +564,8 @@ pub async fn run(
     let mut pending_from: HashMap<String, i64> = HashMap::new();
     let mut retry_at: HashMap<String, i64> = HashMap::new();
     let mut pushed_at: HashMap<String, i64> = HashMap::new();
-    let (mut last_pull, mut last_prune) = (0i64, 0i64);
+    let mut last_pull = 0i64;
+    let mut retention_schedule = RetentionSchedule::default();
     let host = crate::nodes::local_host();
     let mut iv = tokio::time::interval(Duration::from_secs(15));
     loop {
@@ -589,10 +645,7 @@ pub async fn run(
             }
             commit_minute_rows(&engine, &journal, &rows, &mut rolled, &mut pending_from, &*event);
         }
-        if now - last_prune >= 24 * 60 * MINUTE {
-            last_prune = now;
-            let _ = engine.with_db(|d| d.prune_metrics(now - KEEP_DAYS * 24 * 60 * MINUTE));
-        }
+        maintain_retention(&engine, &journal, now, std::time::Instant::now(), &mut retention_schedule);
         if until.is_some_and(|u| std::time::Instant::now() >= u) {
             return;
         }
@@ -682,6 +735,87 @@ mod tests {
             gpu: gtemp.map(|g| vec![Gpu { util: Some(10.0), temp_c: Some(g), ..Default::default() }]),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn retention_failure_is_visible_and_retries_before_daily_success_interval() {
+        use crate::engine::NoHost;
+        use crate::monitor_journal::Filter;
+        let dir = std::env::temp_dir().join(format!("monitor-retention-{}-{}", std::process::id(), now_ms()));
+        let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(NoHost)).unwrap();
+        let journal = engine.start_monitor_journal();
+        let now = now_ms() - 30 * MINUTE;
+        let at = (now - 15 * 24 * 60 * MINUTE).div_euclid(MINUTE) * MINUTE;
+        engine.with_db(|d| d.add_metrics(&[MinuteRow { node_id: "fixture".into(), minute: at, n: 60, v: json!({"cpu":[4,4]}), src: None }])).unwrap();
+        engine
+            .with_db(|d| d.conn().execute_batch("CREATE TRIGGER fail_retention BEFORE INSERT ON metrics_history BEGIN SELECT RAISE(ABORT,'fixture'); END"))
+            .unwrap();
+        let mut schedule = RetentionSchedule::default();
+        let tick = std::time::Instant::now();
+        assert_eq!(maintain_retention(&engine, &journal, now, tick, &mut schedule), Some(false));
+        assert_eq!(schedule.next_attempt, Some(tick + Duration::from_secs(300)));
+        let failed = engine.with_db(|d| d.metrics_retention()).unwrap();
+        assert_eq!(failed["rows"], 0);
+        assert_eq!(failed["sealed_before"], 0);
+        assert_eq!(failed["maintenance"]["ok"], false);
+        assert_eq!(failed["maintenance"]["last_success_at"], Value::Null);
+        assert_eq!(failed["maintenance"]["next_attempt_at"], now + 5 * MINUTE);
+        assert_eq!(maintain_retention(&engine, &journal, now + 5 * MINUTE - 1, tick + Duration::from_millis(299999), &mut schedule), None);
+        engine.with_db(|d| d.conn().execute_batch("DROP TRIGGER fail_retention")).unwrap();
+        assert_eq!(maintain_retention(&engine, &journal, now + 5 * MINUTE, tick + Duration::from_secs(300), &mut schedule), Some(true));
+        assert_eq!(schedule.next_attempt, Some(tick + Duration::from_secs(300 + 86400)));
+        let recovered = engine.with_db(|d| d.metrics_retention()).unwrap();
+        assert_eq!(recovered["maintenance"]["ok"], true);
+        assert_eq!(recovered["rows"], 1);
+        assert!(journal.flush(Duration::from_secs(2)).await);
+        let events = engine.with_db(|d| d.monitor_events(&Filter { kind: Some(Kind::Checkpoint), ..Default::default() })).unwrap();
+        assert_eq!(events["events"].as_array().unwrap().len(), 2);
+        assert_eq!(events["events"][0]["data"]["committed"], true);
+        assert_eq!(events["events"][1]["data"]["committed"], false);
+        // A new monitor run must retain the previous success even if only its
+        // receipt write fails after a successful archive transaction.
+        let mut restarted = RetentionSchedule::default();
+        engine
+            .with_db(|d| {
+                d.conn().execute_batch(
+                    "CREATE TRIGGER fail_receipt BEFORE INSERT ON meta WHEN NEW.k='metricsRetentionMaintenance' BEGIN SELECT RAISE(ABORT,'fixture'); END",
+                )
+            })
+            .unwrap();
+        assert_eq!(maintain_retention(&engine, &journal, now + 6 * MINUTE, tick + Duration::from_secs(360), &mut restarted), Some(false));
+        assert_eq!(restarted.last_success, Some(now + 5 * MINUTE));
+        assert_eq!(restarted.next_attempt, Some(tick + Duration::from_secs(660)));
+        assert_eq!(engine.with_db(|d| d.metrics_retention()).unwrap()["sealed_before"], now + 6 * MINUTE - KEEP_DAYS * 24 * 60 * MINUTE);
+        engine.with_db(|d| d.conn().execute_batch("DROP TRIGGER fail_receipt")).unwrap();
+        assert_eq!(maintain_retention(&engine, &journal, now + 11 * MINUTE, tick + Duration::from_secs(660), &mut restarted), Some(true));
+        assert_eq!(engine.with_db(|d| d.metrics_retention()).unwrap()["rows"], 1);
+        assert!(journal.shutdown(Duration::from_secs(2)).await);
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retention_failure_receipt_error_never_acknowledges_success() {
+        use crate::engine::NoHost;
+        use crate::monitor_journal::Filter;
+        let dir = std::env::temp_dir().join(format!("monitor-retention-readonly-{}-{}", std::process::id(), now_ms()));
+        let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(NoHost)).unwrap();
+        let journal = engine.start_monitor_journal();
+        engine.with_db(|d| d.conn().execute_batch("PRAGMA query_only=ON")).unwrap();
+        let now = now_ms() - 10 * MINUTE;
+        let tick = std::time::Instant::now();
+        let mut schedule = RetentionSchedule::default();
+        assert_eq!(maintain_retention(&engine, &journal, now, tick, &mut schedule), Some(false));
+        assert_eq!(schedule.last_success, None);
+        assert_eq!(schedule.next_attempt, Some(tick + Duration::from_secs(300)));
+        assert_eq!(engine.with_db(|d| d.get_meta("metricsRetentionMaintenance")).unwrap(), None);
+        engine.with_db(|d| d.conn().execute_batch("PRAGMA query_only=OFF")).unwrap();
+        assert!(journal.flush(Duration::from_secs(2)).await);
+        let events = engine.with_db(|d| d.monitor_events(&Filter { kind: Some(Kind::Checkpoint), ..Default::default() })).unwrap();
+        assert_eq!(events["events"][0]["data"]["committed"], false);
+        assert!(journal.shutdown(Duration::from_secs(2)).await);
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
