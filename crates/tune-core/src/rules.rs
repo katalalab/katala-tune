@@ -17,6 +17,7 @@ static SAFE_LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.
 pub const SHARED_BLOCKED: &str = "共用機のため、この画面からは実行しない（持ち主と相談）";
 /// 起動からこれより短いプロセスは暴走に数えない（数十秒で終わるバッチなど）
 const MIN_RUNAWAY_SEC: f64 = 120.0;
+const GPU_ACTIVE_UTIL: f64 = 5.0;
 static ETIME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(?:(?:([0-9]+)-)?([0-9]+):)?([0-9]+):([0-9]+)$").expect("ETIME"));
 
 /// ps の etime（[[dd-]hh:]mm:ss）を秒に。読めなければ None（lib/rules.js の etimeSec。JS と同じく f64 で数える）
@@ -116,6 +117,35 @@ static NO_KILL: LazyLock<Regex> = LazyLock::new(|| {
 /// 終了を提案しないプロセスか（`NO_KILL.test(name)`）
 pub fn no_kill(name: &str) -> bool {
     NO_KILL.is_match(&name.to_ascii_lowercase())
+}
+
+// gpu_compute is the bounded NVIDIA compute-apps observation. Legacy snapshots
+// omit it and retain their old behavior; a newly observed failure is protected.
+fn gpu_protects_process(snap: &Value, p: &Value) -> bool {
+    if p.get("gpu_compute") == Some(&Value::Bool(true)) {
+        return true;
+    }
+    let Some(compute) = snap.get("gpu_compute").filter(|v| v.is_object()) else { return false };
+    if compute.get("availability").and_then(Value::as_str) == Some("absent") {
+        return false;
+    }
+    if compute.get("availability").and_then(Value::as_str) != Some("available") {
+        return true;
+    }
+    let Some(apps) = compute.get("apps").and_then(Value::as_array) else {
+        return true;
+    };
+    if apps.iter().any(|app| app.get("pid").and_then(Value::as_i64).is_none_or(|pid| pid <= 0)) {
+        return true;
+    }
+    if !apps.is_empty() {
+        return true;
+    }
+    let gpus = arr(snap.get("gpus"));
+    if gpus.is_empty() || gpus.iter().any(|gpu| gpu.get("util").and_then(Value::as_f64).is_none_or(|util| !(0.0..=100.0).contains(&util))) {
+        return true;
+    }
+    gpus.iter().any(|gpu| gpu.get("util").and_then(Value::as_f64).is_some_and(|util| util >= GPU_ACTIVE_UTIL))
 }
 
 // 名前ごとの対処の知見（app 名かプロセス名に当てる）
@@ -353,7 +383,10 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
     for p in hogs {
         let name = p.get("name");
         let app = p.get("app");
-        let protected = no_kill(&string(name)) || no_kill(&if truthy(app) { string(app) } else { String::new() });
+        let protected = node.get("protect_gpu") == Some(&Value::Bool(true))
+            || no_kill(&string(name))
+            || no_kill(&if truthy(app) { string(app) } else { String::new() })
+            || gpu_protects_process(snap, p);
         let prefix = if truthy(app) && !js::strict_eq(app, name) { format!("{} / ", string(app)) } else { String::new() };
         let etime = p.get("etime");
         let detail = format!(
@@ -760,7 +793,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 "memory",
                 format!("WSL が {} GB を使っていて上限が無い", gb(vm.get("mem_mb"))),
                 ".wslconfig に memory の指定が無い".into(),
-                "Windows 側が足りなくなる前に上限を付ける。反映には `wsl --shutdown` が要る。".into(),
+                "Windows 側が足りなくなる前に上限を付ける。反映前の `wsl --shutdown` は、GPU 計算 PID がある・GPU 使用率が高い・GPU 状態を取得できない場合には実行しない。".into(),
                 Some(vec![wslconfig(num(get(get(s, "memory"), "total_gb")))]),
                 None,
             );
@@ -771,7 +804,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 "memory",
                 "WSL のメモリ上限が未設定".into(),
                 "既定では実メモリの半分まで使う".into(),
-                "常用するなら上限と autoMemoryReclaim を設定しておくと、使い終わったメモリが Windows に戻る。".into(),
+                "常用するなら上限と autoMemoryReclaim を設定しておくと、使い終わったメモリが Windows に戻る。反映前の `wsl --shutdown` は GPU 計算中・GPU 活動不明なら保留する。".into(),
                 Some(vec![wslconfig(num(or(get(get(s, "memory"), "total_gb"), Some(&Value::from(16)))))]),
                 None,
             );

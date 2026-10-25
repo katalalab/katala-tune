@@ -165,8 +165,8 @@ test('台帳の "network": false で止める（ログインの記録も集め�
   assert.deepEqual(macProbeArgs(true, false), ['python3', '-', 'nonet']);
   assert.deepEqual(macProbeArgs(false, false), ['python3', '-', '--skip-benchmark', 'nonet']);
   assert.equal(macSshCommand(false, false).match(/ --skip-benchmark nonet/g).length, 2);
-  assert.match(windowsSshCommand(true, false), /probe\.ps1\)" -NoNetwork;/);
-  assert.doesNotMatch(windowsSshCommand(false, true), /NoNetwork/);
+  assert.match(windowsSshCommand(true, false), /--benchmark 1 --network 0 --observe-wsl 0 --budget-ms 120000$/);
+  assert.match(windowsSshCommand(false, true), /--benchmark 0 --network 1 --observe-wsl 0 --budget-ms 120000$/);
 });
 
 test('Windows のログオンの記録は別のスクリプトで、同じ運び方（8191 バイトまで）で送り、結果を1つにまとめる', () => {

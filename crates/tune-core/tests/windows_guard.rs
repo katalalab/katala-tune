@@ -575,12 +575,51 @@ async fn owned_fixture_run(mode: &str, input: &[u8], timeout: Duration, limit: u
     (result, digest)
 }
 
+fn owned_completion_failure_diagnostic(failure: &BoundedResult) -> String {
+    let receipt = failure.process_receipt.as_ref();
+    let stop = match receipt.map(|value| value.stop) {
+        None => "missing",
+        Some(ProcessStop::SetupFailed) => "setup_failed",
+        Some(ProcessStop::SpawnFailed) => "spawn_failed",
+        Some(ProcessStop::Completed) => "completed",
+        Some(ProcessStop::Timeout) => "timeout",
+        Some(ProcessStop::OutputLimit) => "output_limit",
+        Some(ProcessStop::LingeringDescendants) => "lingering_descendants",
+        Some(ProcessStop::IoFailure) => "io_failure",
+        Some(ProcessStop::CleanupUnconfirmed) => "cleanup_unconfirmed",
+    };
+    let root_exit = match receipt.and_then(|value| value.root_exit_code) {
+        None => "missing",
+        Some(0) => "zero",
+        Some(_) => "nonzero",
+    };
+    format!(
+        "owned_completion_failure timed_out={} output_limited={} spawn_failed={} receipt_some={} stop={} root_exit={} root_exited={} job_empty={} observed_exited={} stdout_eof={} stderr_eof={} writer_finished={} cleanup_confirmed={}",
+        failure.timed_out,
+        failure.output_limited,
+        failure.spawn_failed,
+        receipt.is_some(),
+        stop,
+        root_exit,
+        receipt.is_some_and(|value| value.root_exited),
+        receipt.is_some_and(|value| value.job_empty),
+        receipt.is_some_and(|value| value.observed_exited),
+        receipt.is_some_and(|value| value.stdout_eof),
+        receipt.is_some_and(|value| value.stderr_eof),
+        receipt.is_some_and(|value| value.writer_finished),
+        receipt.is_some_and(|value| value.cleanup_confirmed()),
+    )
+}
+
 #[tokio::test]
 async fn owned_completion_consumes_bound_actual_output() {
     let _serial = SERIAL.lock().await;
     let input: Vec<u8> = (0..128 * 1024).map(|i| b'a' + (i % 26) as u8).collect();
     let (result, digest) = owned_fixture_run("happy", &input, Duration::from_secs(15), 256 * 1024).await;
-    let completion = result.ok().expect("owned completion requires actual success");
+    let completion = match result {
+        Ok(completion) => completion,
+        Err(failure) => panic!("{}", owned_completion_failure_diagnostic(&failure)),
+    };
     assert_ack(completion.diagnostic(), ProcessStop::Completed);
     assert_eq!(completion.diagnostic().code, Some(0));
     let output = completion.into_verified_output(&input, &digest).ok().expect("consume matching request and artifact once");

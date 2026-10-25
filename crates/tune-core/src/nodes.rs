@@ -290,6 +290,9 @@ pub fn parse_config(text: &str, file: &Path, host: &str) -> Result<Config, Strin
         Some(Value::Array(a)) => a,
         _ => return Err(format!("{}: nodes が配列ではない", file.display())),
     };
+    if nodes.iter().any(|n| n.get("protect_gpu").is_some_and(|v| !v.is_boolean())) {
+        return Err(format!("{}: protect_gpu は true/false", file.display()));
+    }
     let protect = match v.get("protect") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(a)) => a.iter().map(|x| js::string(Some(x))).collect(),

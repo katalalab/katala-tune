@@ -13,7 +13,8 @@ const { openDb } = require('../lib/db');
 const { loadConfig } = require('../lib/nodes');
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'kt-accept19-'));
-const nodeOf = (id, extra = {}) => ({ id, alias: `mock-${id}`, os: 'windows', ...extra });
+const helper = () => ({ schema: 'katala-tune/action-helper/v2', source_sha: 'a'.repeat(40), tune_sha256: 'b'.repeat(64), manifest_sha256: 'c'.repeat(64), run_id: 1, attempt: 1 });
+const nodeOf = (id, extra = {}) => ({ id, alias: `mock-${id}`, os: 'windows', action_helper: helper(), ...extra });
 
 // ---- 偽の ssh（呼び出しを数え、台本どおりの結果を返す。本物の子プロセスは作らない） ----
 function mockSsh(script) {
@@ -26,7 +27,8 @@ function mockSsh(script) {
     if (!r) throw new Error(`台本に無い host: ${alias}`);
     return r;
   };
-  return { run, calls };
+  const probeExchange = async (node) => run('ssh', ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', node.alias]);
+  return { run, probeExchange, calls };
 }
 
 // ---- 条件1: read-only probe が host 別の成功・timeout・unreachable・認証失敗を分ける ----
@@ -91,16 +93,12 @@ test('条件1: ssh を呼べない・例外でも host の失敗として返り�
 
 test('条件1: この機体（local）の調査も、渡された実行口を通り、本物のローカル実行に迂回しない', async () => {
   const calls = [];
-  const localShell = {
-    async powershellFile() { calls.push('powershellFile'); return { code: 0, out: '{"probe":"windows"}\n', err: '' }; },
-    async python() { calls.push('python'); return { code: 0, out: '{"runs_ms":[1],"median_ms":1}\n', err: '' }; },
-  };
   const ssh = mockSsh({});
   const local = nodeOf('here', { local_hostname: 'x' });
   local.local = true;
-  const r = await probeNode(local, { run: ssh.run, localShell });
+  const r = await probeNode(local, { run: ssh.run, probeExchange: async () => { calls.push('probeExchange'); return { code: 0, out: '{"probe":"windows"}\n', err: '' }; } });
   assert.equal(r.ok, true);
-  assert.deepEqual(calls, ['powershellFile', 'python']);
+  assert.deepEqual(calls, ['probeExchange']);
   assert.equal(ssh.calls.length, 0);
 });
 
@@ -187,6 +185,7 @@ test('条件3: 承認のあいだに台帳の接続先・OS・機体が変わっ
     ['alias', (n) => [{ ...n, alias: 'mock-other' }], /接続先/],
     ['os', (n) => [{ ...n, os: 'macos' }], /接続先|Windows だけ/],
     ['local', (n) => [{ ...n, local_hostname: os.hostname().replace(/\.local$/, '') }], /接続先/],
+    ['action-helper', (n) => [{ ...n, action_helper: { schema: 'katala-tune/action-helper/v2', source_sha: 'a'.repeat(40), tune_sha256: 'b'.repeat(64), manifest_sha256: 'd'.repeat(64), run_id: 1, attempt: 1 } }], /接続先/],
     ['removed', () => [], /台帳に無い/],
   ];
   for (const [name, change, expected] of cases) {

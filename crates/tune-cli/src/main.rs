@@ -50,6 +50,8 @@ mod discovery;
 mod specs;
 mod topology_native;
 mod topology_reader;
+mod windows_action;
+mod windows_probe;
 
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -314,6 +316,12 @@ fn main() -> ExitCode {
     }
     if let Some(entry) = args.first().filter(|entry| matches!(entry.as_str(), "topology-native-reader" | "topology-supervise" | "topology-verify")) {
         return topology_native::main(entry, &args[1..], started);
+    }
+    if args.first().is_some_and(|entry| entry == "windows-action-receiver-v2") {
+        return windows_action::main(&args[1..], started);
+    }
+    if args.first().is_some_and(|entry| entry == "windows-probe-v1") {
+        return windows_probe::main(&args[1..], started);
     }
     match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime.block_on(async_main(args)),
