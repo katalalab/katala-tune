@@ -151,6 +151,44 @@ fn pending_row_exists_before_launch_and_the_same_row_is_finalized() {
 }
 
 #[test]
+fn handoff_audits_survive_legacy_action_schema_migration_with_no_undo_target() {
+    let mut f = Fixture::new();
+    f.e()
+        .with_db(|d| {
+            d.add_action(&json!({
+                "id": "legacy-handoff", "at": 0, "node_id": "a", "type": "ai-handoff",
+                "params": {"agent": "codex", "fixture": "legacy"}, "ok": true,
+                "output": "synthetic previous result"
+            }))?;
+            // Recreate the pre-target action schema using only this temporary DB.
+            d.conn().execute_batch("ALTER TABLE tune_actions DROP COLUMN target;")
+        })
+        .unwrap();
+    drop(f.engine.take());
+    f.engine = Some(Engine::open(f.dir.join("nodes.json"), f.dir.join("data"), Arc::new(NoHost)).unwrap());
+    let legacy = f.actions();
+    assert_eq!(legacy.len(), 1);
+    assert_eq!(legacy[0]["params"]["fixture"], "legacy");
+    assert_eq!(legacy[0]["output"], "synthetic previous result");
+    assert!(legacy[0]["target"].is_null());
+
+    let calls = Cell::new(0);
+    let result = f.e().handoff_launch_with(&f.prepared, Agent::Codex, |_, _, _| {
+        calls.set(calls.get() + 1);
+        let pending = f.actions();
+        assert_eq!(pending[0]["state"], "incomplete");
+        assert!(pending[0]["target"].is_null());
+        Ok(())
+    });
+    assert_eq!(calls.get(), 1);
+    assert_eq!(result["ok"], true);
+    let rows = f.actions();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row["state"] == "ok" && row["target"].is_null() && row["undo"].is_null()));
+    assert_eq!(rows[0]["params"]["prompt_sha256"], sha256_hex(f.prepared.prompt.as_bytes()));
+}
+
+#[test]
 fn finalize_error_or_zero_rows_reports_an_incomplete_launch_without_retrying() {
     for statement in ["SELECT RAISE(FAIL,'finalize rejected');", "SELECT RAISE(IGNORE);"] {
         let f = Fixture::new();
