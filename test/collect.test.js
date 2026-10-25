@@ -147,3 +147,29 @@ test('Windows probe は v1・欠落・余分な helper を transport 前に拒�
     assert.equal(calls, 0);
   }
 });
+
+test('local Windows probe uses isolated QA helpers instead of the live HOME helper', async () => {
+  const { EventEmitter } = require('node:events');
+  const path = require('node:path');
+  const { probeExchange } = require('../lib/collect');
+  const previous = process.env.KATALA_TUNE_DATA_DIR;
+  const isolated = path.join(require('node:os').tmpdir(), 'katala-qa-fixture');
+  process.env.KATALA_TUNE_DATA_DIR = isolated;
+  let program;
+  try {
+    const result = await probeExchange({ local: true }, 'a'.repeat(64), false, false, false, {
+      spawnChild(command) {
+        program = command;
+        const child = new EventEmitter();
+        child.stdin = Object.assign(new EventEmitter(), { end() { process.nextTick(() => child.emit('close', 0)); } });
+        child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+        return child;
+      },
+    });
+    assert.equal(result.code, 0);
+    assert.equal(program, path.join(isolated, 'bin', 'tune.exe'));
+  } finally {
+    if (previous === undefined) delete process.env.KATALA_TUNE_DATA_DIR;
+    else process.env.KATALA_TUNE_DATA_DIR = previous;
+  }
+});

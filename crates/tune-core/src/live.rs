@@ -2222,16 +2222,32 @@ for _ in range(400):
 
     #[tokio::test]
     async fn journal_distinguishes_first_sample_and_stall_timeout() {
-        if cfg!(windows) {
-            return;
+        // Classification must depend on whether a sample arrived, not whether
+        // the OS happened to start a shell within the 150 ms silence window.
+        // Native source termination remains covered by the adjacent tests.
+        struct SilentRoute(bool);
+        impl Route for SilentRoute {
+            fn open(&self, _: &Node, _: &Opts) -> Result<Source, String> {
+                let (lines, received) = mpsc::channel(2);
+                lines.try_send(r#"{"type":"hello"}"#.into()).unwrap();
+                if self.0 {
+                    lines.try_send(r#"{"type":"s","seq":1}"#.into()).unwrap();
+                }
+                let (stop, stopped) = oneshot::channel();
+                let (done, ended) = oneshot::channel();
+                tokio::spawn(async move {
+                    let _ = stopped.await;
+                    drop(lines);
+                    let _ = done.send(Ended { code: Some(0), wait_observed: Some(true), ..Ended::default() });
+                });
+                Ok(Source::new(received, stop, ended))
+            }
         }
-        for (line, category) in [("", "first_sample_timeout"), ("echo '{\"type\":\"s\",\"seq\":1}';", "stall_timeout")] {
-            let script = format!("echo '{{\"type\":\"hello\"}}'; {line} while true; do sleep 0.05; done");
-            let (route, dir) = fake(&script);
+        for (sample, category) in [(false, "first_sample_timeout"), (true, "stall_timeout")] {
             let db = Arc::new(Mutex::new(crate::db::Store::open_in_memory().unwrap()));
             let journal = Journal::start(db.clone());
             let live = Live::new(
-                route,
+                Arc::new(SilentRoute(sample)),
                 Opts { first_line_timeout: Duration::from_millis(150), stall_timeout: Duration::from_millis(150), max_retries: 0, ..quick() },
                 Box::new(|_| {}),
             );
@@ -2240,10 +2256,12 @@ for _ in range(400):
             until("disconnected", || state(&live, "fixture").1 == "disconnected").await;
             assert!(journal.flush(Duration::from_secs(2)).await);
             let v = db.lock().unwrap().monitor_events(&crate::monitor_journal::Filter::default()).unwrap();
-            assert!(v["events"].as_array().unwrap().iter().any(|e| e["kind"] == "end" && e["data"]["category"] == category));
+            let events = v["events"].as_array().unwrap();
+            assert!(events.iter().any(|e| e["kind"] == "hello"));
+            assert_eq!(events.iter().any(|e| e["kind"] == "first_sample"), sample);
+            assert!(events.iter().any(|e| e["kind"] == "end" && e["data"]["category"] == category && e["data"]["samples"] == u64::from(sample)));
             live.shutdown(Duration::from_secs(3)).await;
             assert!(journal.shutdown(Duration::from_secs(2)).await);
-            std::fs::remove_dir_all(dir).unwrap();
         }
     }
 

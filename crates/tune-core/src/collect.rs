@@ -425,6 +425,14 @@ fn windows_probe_args(helper_sha256: &str, benchmark: bool, network: bool, obser
     ]
 }
 
+#[cfg(any(windows, test))]
+fn local_probe_path(bin: &std::path::Path) -> Result<PathBuf, &'static str> {
+    if !bin.is_absolute() || bin.components().any(|part| matches!(part, std::path::Component::CurDir | std::path::Component::ParentDir)) {
+        return Err("Windows probe helper path is invalid; collection refused");
+    }
+    Ok(bin.join("tune.exe"))
+}
+
 async fn probe_exchange_system(node: &Node, helper_sha256: &str, benchmark: bool, network: bool, observe_wsl: bool) -> RunResult {
     if node.refusal().is_some() || !lower_hex(helper_sha256, 64) {
         return RunResult { code: Some(9), out: String::new(), err: "Windows probe request is invalid; collection refused".into() };
@@ -433,14 +441,10 @@ async fn probe_exchange_system(node: &Node, helper_sha256: &str, benchmark: bool
         #[cfg(windows)]
         {
             let args = windows_probe_args(helper_sha256, benchmark, network, observe_wsl);
-            let home = crate::nodes::home();
-            let helper = home.join(".katala-tune").join("bin").join("tune.exe");
-            if !home.is_absolute()
-                || !helper.is_absolute()
-                || home.components().any(|part| matches!(part, std::path::Component::CurDir | std::path::Component::ParentDir))
-            {
-                return RunResult { code: Some(9), out: String::new(), err: "Windows probe helper path is invalid; collection refused".into() };
-            }
+            let helper = match local_probe_path(&crate::helpers::bin_dir()) {
+                Ok(helper) => helper,
+                Err(error) => return RunResult { code: Some(9), out: String::new(), err: error.into() },
+            };
             let Some(helper) = helper.to_str() else {
                 return RunResult { code: Some(9), out: String::new(), err: "Windows probe helper path is invalid; collection refused".into() };
             };
@@ -1319,6 +1323,15 @@ sys.stderr.write('z');sys.stderr.flush();time.sleep(3)"#,
     }
 
     #[cfg(unix)]
+    #[test]
+    fn local_probe_uses_selected_helper_directory_and_rejects_relative_or_parent_paths() {
+        let root = std::env::temp_dir().join("katala-qa-fixture");
+        let bin = root.join("bin");
+        assert_eq!(local_probe_path(&bin).unwrap(), bin.join("tune.exe"));
+        assert!(local_probe_path(std::path::Path::new("relative/bin")).is_err());
+        assert!(local_probe_path(&root.join("..").join("live-bin")).is_err());
+    }
+
     #[tokio::test]
     async fn fixed_windows_probe_launches_exact_arguments_with_empty_stdin() {
         use std::os::unix::fs::PermissionsExt;
@@ -1399,6 +1412,18 @@ sys.stderr.write('z');sys.stderr.flush();time.sleep(3)"#,
         assert_eq!(missing.code, Some(9));
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    #[ignore = "owned native child for the probe timeout integration test"]
+    fn probe_transport_ready_fixture() {
+        use std::io::Write;
+        let port: u16 = std::env::var("KATALA_TUNE_TEST_READY_PORT").unwrap().parse().unwrap();
+        let mut ready = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        write!(ready, "{}", std::process::id()).unwrap();
+        drop(ready);
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
     #[tokio::test]
     async fn fixed_windows_probe_transport_kills_and_reaps_its_ready_root_on_timeout() {
         if cfg!(windows) {
@@ -1406,20 +1431,22 @@ sys.stderr.write('z');sys.stderr.flush();time.sleep(3)"#,
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let mut command = Command::new("/usr/bin/env");
-        command.args([
-            "python3",
-            "-c",
-            &format!("import os,socket,time\ns=socket.create_connection(('127.0.0.1',{port}));s.sendall(str(os.getpid()).encode());s.close()\ntime.sleep(5)"),
-        ]);
-        let exchange = tokio::spawn(async move { probe_exchange_command_until(command, tokio::time::Instant::now() + Duration::from_secs(1)).await });
-        let (mut ready, _) = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await.unwrap().unwrap();
+        // Test the actual owned native root, independently of Python/mise
+        // discovery and interpreter startup on an overloaded CI runner.
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        let fixture = format!("{}::probe_transport_ready_fixture", module_path!().split_once("::").unwrap().1);
+        command.args(["--ignored", "--exact", &fixture, "--nocapture"]).env("KATALA_TUNE_TEST_READY_PORT", port.to_string());
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_secs(8);
+        let exchange = tokio::spawn(async move { probe_exchange_command_until(command, deadline).await });
+        let (mut ready, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
         let mut pid = Vec::new();
         tokio::time::timeout(Duration::from_millis(100), ready.read_to_end(&mut pid)).await.unwrap().unwrap();
         let pid = String::from_utf8(pid).unwrap().parse::<i32>().unwrap();
         assert!(pid > 0);
         let result = exchange.await.unwrap();
         assert_eq!((result.code, result.out.as_str()), (Some(9), ""));
+        assert!(tokio::time::Instant::now() <= deadline + Duration::from_millis(250), "transport exceeded its fixed outer deadline");
         let reaped = tokio::time::timeout(Duration::from_millis(150), async {
             loop {
                 let gone = !std::process::Command::new("/bin/kill")

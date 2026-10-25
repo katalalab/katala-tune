@@ -258,7 +258,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    const SYSTEM32_CMD_NONZERO: &str = "& (Join-Path ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::System) 'cmd.exe') /c exit 23";
+    const SYSTEM32_CMD_NONZERO: &str = "& (Join-Path ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::System)) 'cmd.exe') /c exit 23";
 
     #[cfg(windows)]
     #[test]
@@ -266,7 +266,7 @@ mod tests {
         let payload = format!("Write-Output '{{\"probe\":\"windows\"}}'\n{SYSTEM32_CMD_NONZERO}\n");
         let input = powershell_stdin(&payload).unwrap();
         let action = run_bootstrap(crate::windows_action::POWERSHELL_BOOTSTRAP, &input);
-        assert!(!action.status.success(), "the action bootstrap demonstrates the stale LASTEXITCODE counterfactual");
+        assert_eq!(action.status.code(), Some(23), "the control must execute the native command, not fail while parsing its payload");
 
         let probe = run_probe_payload(&payload);
         assert!(probe.status.success(), "probe completion, not a tolerated observation, sets its exit status: {:?}", probe.status);

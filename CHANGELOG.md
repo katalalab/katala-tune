@@ -1,6 +1,12 @@
 # 変更履歴
 
-## 未リリース
+## 0.7.0-rc.1
+
+検証候補。正式公開・自動配信は Windows の検出調査、helper 配備と実機受入の完了後に判断する。
+
+- Windows の収集・変更操作を固定 helper と期限・出力上限・所有子プロセスの終了確認で囲む。承認済み helper の v2 record が無い Windows 収集は拒否する。既存台帳への配備受入は別工程。
+- CLI の help / cli-info と版の照合を統合し、設定・DB を初期化しない発見経路を追加。
+- 隔離した Windows QA の収集は専用 data/bin の helper を使い、通常運用の helper を呼び出さない。
 
 - Mac / Windowsのスペック比較（0.6.5-specs.1）: Rustの `tune specs-local` / `tune specs`、部品・版・構成・取得可能な設定、出典付き公式仕様の完全一致照合、失敗時の前回値保持、Tauriの比較表・差分・検索・JSONコピー。詳細は docs/machine-specs.md。
 
