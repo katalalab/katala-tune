@@ -63,6 +63,11 @@ try {
   Assert-KtEqual (Get-KtFixtureRemainingMs $deadline 2000 ($base + [Diagnostics.Stopwatch]::Frequency * 7)) 1000
   Assert-KtEqual (Get-KtFixtureRemainingMs $deadline 2000 ($base + [Diagnostics.Stopwatch]::Frequency * 7.5)) 500
   Assert-KtEqual (Get-KtFixtureRemainingMs $deadline 2000 ($base + [Diagnostics.Stopwatch]::Frequency * 9)) 0
+  $stage = 'release-deadline'
+  Assert-KtEqual (Test-KtFixtureRelease $false 10000 9999) $false
+  Assert-KtEqual (Test-KtFixtureRelease $true 10000 9999) $true
+  Assert-KtEqual (Test-KtFixtureRelease $true 10000 10000) $true
+  Assert-KtEqual (Test-KtFixtureRelease $true 10000 10001) $false
   $fake = New-KtFakeProcess 'normal'
   $result = Stop-KtOwnedFixtureRoot $fake $true ([Diagnostics.Stopwatch]::GetTimestamp() - 1)
   Assert-KtEqual $result.exit_confirmed $false

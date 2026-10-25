@@ -6,6 +6,10 @@ function Get-KtFixtureRemainingMs([long]$DeadlineTicks, [int]$LimitMs = [int]::M
   $left = [Math]::Floor(($DeadlineTicks - $NowTicks) * 1000.0 / [Diagnostics.Stopwatch]::Frequency)
   return [int][Math]::Max(0, [Math]::Min($LimitMs, $left))
 }
+function Test-KtFixtureRelease {
+  param([bool]$Released, [long]$DeadlineTicks, [long]$NowTicks = [Diagnostics.Stopwatch]::GetTimestamp())
+  return $Released
+}
 
 # Only the Process returned by our own Start is passed here; never reacquire a root by PID.
 function Stop-KtOwnedFixtureRoot($Process, [bool]$Started, [long]$DeadlineTicks) {
