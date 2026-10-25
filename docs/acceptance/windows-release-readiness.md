@@ -1,5 +1,7 @@
 # Windows release readiness — 2026-10-25
 
+This is the pre-publication candidate record. See [signed RC1 distribution and updater acceptance](signed-rc1.md) for the subsequent authorized release, actual update test and new Defender hold affecting the published CLI.
+
 Runtime candidate: `ba01c81811471ba1198deef10d500bf0dca0d19e`, version `0.7.0-rc.1`, [integration PR #83](https://github.com/katalalab/katala-tune/pull/83). [CI run 40165177157](https://github.com/katalalab/katala-tune/actions/runs/40165177157) succeeded on all six Windows/macOS/Linux JS/Rust jobs, including the actual embedded Windows collector. Private machine names, inventories, raw security history and screenshots are kept outside the repository.
 
 ## Reproduced fixes
