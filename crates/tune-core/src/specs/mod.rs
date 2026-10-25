@@ -4,7 +4,10 @@ mod windows;
 
 use crate::{collect, db::now_ms, nodes::Node};
 use serde_json::{Map, Value, json};
-use std::time::Duration;
+use std::{sync::LazyLock, time::Duration};
+
+static CATALOG: LazyLock<Value> =
+    LazyLock::new(|| serde_json::from_str(include_str!("../../../../data/specs-catalog.json")).expect("bundled specifications catalog"));
 
 pub const SCHEMA: &str = "katala_specs.v1";
 pub const MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -14,10 +17,10 @@ pub const SECTIONS: &[&str] =
 
 /// No fuzzy model matching: suffixes and variants are materially different hardware.
 pub fn official(model: &str) -> Value {
-    let catalog: Value = serde_json::from_str(include_str!("../../../../data/specs-catalog.json")).expect("bundled specifications catalog");
+    let catalog = &*CATALOG;
     for p in catalog["products"].as_array().into_iter().flatten() {
         if p["models"].as_array().into_iter().flatten().any(|m| m.as_str().is_some_and(|m| m.eq_ignore_ascii_case(model.trim()))) {
-            return json!({"status":"matched", "name":p["name"],"url":p["url"],"scope":p["scope"],"specifications":p["specifications"],"verified_at":catalog["verified_at"],"catalog_version":catalog["version"]});
+            return json!({"status":"matched", "name":p["name"],"url":p["url"],"scope":p["scope"],"source_access":p["source_access"],"specifications":p["specifications"],"verified_at":catalog["verified_at"],"catalog_version":catalog["version"]});
         }
     }
     json!({"status":"unverified", "reason":"exact_model_not_in_catalog"})
@@ -108,6 +111,37 @@ pub const FIELDS: &[&str] = &[
     "enabled",
     "dhcp_enabled",
     "mtu_bytes",
+    "trim_support",
+    "smart_status",
+    "system_integrity_protection",
+    "filevault",
+    "port",
+    "sample_rate_hz",
+    "input_channels",
+    "output_channels",
+    "logical_sector_bytes",
+    "physical_sector_bytes",
+    "partition_style",
+    "partition_count",
+    "read_only",
+    "boot_disk",
+    "system_disk",
+    "health_status",
+    "vbs_status",
+    "credential_guard_configured",
+    "credential_guard_running",
+    "memory_integrity_configured",
+    "memory_integrity_running",
+    "display_version",
+    "update_build_revision",
+    "installation_type",
+    "virtual_adapter",
+    "hardware_interface",
+    "admin_status",
+    "physical_width_cm",
+    "physical_height_cm",
+    "display_origin",
+    "connection_status",
 ];
 
 pub(super) fn component(name: &str, source: &str, fields: Map<String, Value>) -> Value {
@@ -126,6 +160,58 @@ pub(super) fn section(components: Vec<Value>, status: &str, source: &str) -> Val
     json!({"status":status,"source":source,"components":components,"providers":providers})
 }
 
+// These are documentation references, never evidence of the installed product or settings.
+// Both local and remote reports derive them here; remote URLs and gap claims are discarded.
+fn finalize_sections(platform: &str, sections: &mut Map<String, Value>) {
+    for (id, s) in sections {
+        let references = match (platform, id.as_str()) {
+            ("windows", "settings") => {
+                json!([{"name":"Microsoft: VBS / メモリ整合性の状態","url":"https://learn.microsoft.com/en-us/windows/security/hardware-security/enable-virtualization-based-protection-of-code-integrity"}])
+            }
+            ("windows", "firmware") => {
+                json!([{"name":"Microsoft: Win32_BIOS の公開情報","url":"https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-bios"}])
+            }
+            ("windows", "os") => {
+                json!([{"name":"Microsoft: OS の公開情報","url":"https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-operatingsystem"}])
+            }
+            ("macos", "settings") => json!([
+                {"name":"Apple: System Integrity Protection","url":"https://support.apple.com/en-us/102149"},
+                {"name":"Apple: FileVault","url":"https://support.apple.com/guide/mac-help/protect-data-on-your-mac-with-filevault-mh11785/mac"}
+            ]),
+            ("macos", "os" | "firmware") => {
+                json!([{"name":"Apple: システム情報の確認方法","url":"https://support.apple.com/guide/system-information/welcome/mac"}])
+            }
+            _ => json!([]),
+        };
+        s["references"] = references;
+        for c in s["components"].as_array_mut().into_iter().flatten() {
+            let f = &c["fields"];
+            let aggregate_memory = id == "memory" && matches!(f["memory_kind"].as_str(), Some("unified" | "system_total"));
+            let expected: &[&str] = match id.as_str() {
+                "cpu" => &["model", "manufacturer", "cores", "threads"],
+                "memory" if aggregate_memory => &["capacity_bytes"],
+                "memory" => &["part_number", "manufacturer", "capacity_bytes", "configured_speed_mts"],
+                "gpu" => &["model", "driver_version"],
+                "storage" => &["model", "firmware_version", "capacity_bytes"],
+                "board" => &["model", "manufacturer", "version"],
+                "firmware" => &["firmware_version"],
+                "os" => &["version", "build", "architecture"],
+                "settings" => &[],
+                "display" => &["model", "manufacturer"],
+                "network" => &["model", "driver_version"],
+                "system" => &["model", "manufacturer"],
+                _ => &["model"],
+            };
+            let missing: Vec<_> = expected.iter().filter(|k| f.get(**k).is_none()).copied().collect();
+            let not_applicable = matches!(id.as_str(), "os" | "firmware" | "settings") || f["virtual_adapter"] == true || aggregate_memory;
+            c["missing_fields"] = json!(missing);
+            if not_applicable {
+                c["official"] = json!({"status":"not_applicable","reason":"documentation_or_aggregate_not_exact_product"});
+            }
+        }
+    }
+}
+
 pub fn normalize(platform: &str, raw: &Value) -> Value {
     let mut sections = Map::new();
     for id in SECTIONS {
@@ -136,9 +222,10 @@ pub fn normalize(platform: &str, raw: &Value) -> Value {
         "macos" => macos::normalize(raw, &mut sections),
         _ => {}
     }
+    finalize_sections(platform, &mut sections);
     let collected =
         sections.values().any(|s| matches!(s["status"].as_str(), Some("ok" | "partial")) && s["components"].as_array().is_some_and(|c| !c.is_empty()));
-    json!({"schema":SCHEMA,"platform":platform,"at":now_ms(),"ok":collected,"collector_version":env!("CARGO_PKG_VERSION"),"sections":sections})
+    json!({"schema":SCHEMA,"platform":platform,"at":now_ms(),"ok":collected,"collector_version":env!("CARGO_PKG_VERSION"),"catalog_version":CATALOG["version"],"sections":sections})
 }
 
 pub fn validate_report(v: &Value, platform: &str) -> Result<Value, String> {
@@ -188,8 +275,11 @@ pub fn validate_report(v: &Value, platform: &str) -> Result<Value, String> {
         }
         sections.insert((*id).into(), safe_section);
     }
+    finalize_sections(platform, &mut sections);
     let ok = sections.values().any(|s| matches!(s["status"].as_str(), Some("ok" | "partial")) && s["components"].as_array().is_some_and(|c| !c.is_empty()));
-    Ok(json!({"schema":SCHEMA,"platform":platform,"at":at,"ok":ok,"collector_version":scalar(&v["collector_version"]),"sections":sections}))
+    Ok(
+        json!({"schema":SCHEMA,"platform":platform,"at":at,"ok":ok,"collector_version":scalar(&v["collector_version"]),"catalog_version":CATALOG["version"],"sections":sections}),
+    )
 }
 
 /// A shared node needs an explicit specs-only read opt-in; other shared policies remain intact.

@@ -4,7 +4,7 @@ Tauri版のサイドバー「スペック比較」から機体を選び、「仕
 
 ## 収集方法
 
-Rustの `tune specs-local` は台帳・DBを開かず、その機体の読取結果を `katala_specs.v1` JSONで返す。WindowsはOS内蔵のCIM（PowerShell経由）と、導入済みの場合は `nvidia-smi` を使う。macOSは `system_profiler`、`sysctl`、`pmset` を使う。Pythonや配置した調査スクリプトは使わない。追加ソフトウェアはインストールしない。
+Rustの `tune specs-local` は台帳・DBを開かず、その機体の読取結果を `katala_specs.v1` JSONで返す。WindowsはOS内蔵のCIM（PowerShell経由）、限定したレジストリ読取と、導入済みの場合は `nvidia-smi` を使う。macOSは `system_profiler`、`sysctl`、`pmset`、`csrutil status`、`fdesetup status` を使う。Pythonや配置した調査スクリプトは使わない。追加ソフトウェアはインストールしない。
 
 `tune specs [機体ID ...]` はローカルまたは既存SSH接続で収集し、私有DBに最新の成功結果と最終試行を保存する。引数省略時は稼働中の収集許可機が対象。画面では明示的に選択した機体のみを収集する。共用機は既定で除外し、台帳の `specs: true` による明示的な読取許可がある場合だけ対象になる。`shared` 自体や最適化の許可は変更しない。台帳の `specs: false`、退役・一時停止・対象外の機体は収集を拒否する。
 
@@ -21,12 +21,17 @@ Rustの `tune specs-local` は台帳・DBを開かず、その機体の読取結
 - WindowsのCIM `AdapterRAM` は専用VRAMとして使用しない。NVIDIAはモデルが一意に照合できる場合のみドライバー報告を採用。同名GPUが複数ある場合、AMD/Intelの専用VRAM、未提供のドライバー/ファームウェア情報は未取得になる。
 - セキュアブートの権限不足、OSが公開しないXMP/EXPO、MacのRecoveryポリシーなどは理由を表示する。標準APIに出ない電源ユニット・ケーブル・筐体・冷却部品やBIOSの全設定を推測しない。
 - 「OSからの報告なし」「未取得」「未対応」「権限不足」を区別する。OSの仮想デバイスも含むため、デバイス数は物理部品の数ではない。最大クロックや公式仕様だけで性能順位を付けない。
+- Windowsのストレージは一意なOSディスク番号で `MSFT_Disk` と関連付け、NVMe/SATA等のバス、セクター、パーティション方式、読み取り専用・起動属性を追加する。OSの `SCSI` 表記だけで物理接続方式を推測しない。VBS・Credential Guard・メモリ整合性は設定と実行状態を分ける。OSリリース版・UBR、NICのMTU・仮想/物理属性も表示する。
+- Windowsの画面WMI取得失敗時は、最大64件の保存済みEDIDを検査し、チェックサムが正しい基本情報だけを表示する。これは過去の接続を含み、現在接続・有効状態は未確認。元のWMI失敗も残す。シリアル番号やEDID本体を保存しない。
+- macOSは利用可能なUSB providerを選び、新しい `SPUSBHostDataType` にも対応。公開されたTRIM/SMART、Wi-Fiファームウェア、Thunderboltの物理ポート、音声のサンプルレート・入出力チャンネル、SIP・FileVaultを表示する。ポートの広告速度と実効転送速度は区別する。
 
 ## 公式仕様
 
-`data/specs-catalog.json` に確認日、完全一致する型番、メーカーの出典URL、適用範囲と公表仕様を持つ。初期登録はApple M2 Pro/M5 Maxと対応するMacBook Pro、Intel Core i5-13500/i9-13900KF/i9-14900KS、GeForce RTX 2070/3070/4090/5060 Ti、ASRock B760M Pro RS/D4。構成違いやボードメーカー固有のクロックを推測しない。未登録型番は「未照合」と明示する。新しい公式仕様はメーカー資料を確認して型番単位で追加する。
+`data/specs-catalog.json` に確認日、完全一致する型番、メーカーの出典URL、適用範囲と公表仕様を持つ。カタログv2はCPU/GPU/本体に加え、マザーボード、SSD、メモリ、NIC、ディスプレイ等の31製品を登録する。[公式資料と照合範囲](specs-official-sources.md)に出典と未確定の型番を記録する。メーカー資料の索引抜粋で確認した項目は本文取得の制約も表示する。構成違いやボードメーカー固有のクロックを推測しない。未登録型番は「未照合」と明示する。
 
 OSが報告した構成と公式の選択肢・上限は別に表示する。インターネットへの機体情報送信や自動検索はしない。出典リンクが開けない環境では「URLをコピー」を使う。
+
+各機体に公式照合・未照合・照合対象外・不足項目・取得制約の件数とCLI/カタログ版を表示する。不足項目は区分ごとに算出し、OS・設定・集約メモリ・仮想NICを物理製品の未照合数に含めない。OS・設定・ファームウェアに添える公式の説明資料は、実機の設定値や搭載ファームウェア版の照合を意味しない。文書参照とカタログ照合はSSH受信時にもローカルの信頼済み資料から再生成する。
 
 ## 私有データ
 
@@ -34,4 +39,4 @@ OSが報告した構成と公式の選択肢・上限は別に表示する。イ
 
 ## 検証
 
-`cargo test -p tune-core --test specs --locked`、`node --test test/specs.test.js`、`npm run check`。実機では `tune specs-local` と画面からの収集を確認する。Electron互換版ではRust版の利用案内を表示する。
+`cargo test -p tune-core --test specs --test specs_coverage --test specs_macos_expansion --test specs_windows_expansion --locked`、`node --test test/specs.test.js`、`npm run check`。実機では `tune specs-local` と画面からの収集を確認する。Electron互換版ではRust版の利用案内を表示する。

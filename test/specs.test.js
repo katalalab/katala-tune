@@ -66,3 +66,21 @@ test('a cached running backend never disables manual reload',async()=>{
   await ctx.window.KT_VIEWS[0].render();
   assert(!/id="specsReload"[^>]*disabled/.test(html));
 });
+
+test('coverage separates exact products, documentation and unavailable setting values',()=>{
+  const n={report:{sections:{settings:{components:[{official:{status:'not_applicable'},fields:{secure_boot:'permission_denied'},missing_fields:[]}]},storage:{components:[{official:{status:'matched'},fields:{model:'Example'},missing_fields:['firmware_version']},{official:{status:'unverified'},fields:{model:'Other'}}]}}}};
+  assert.deepEqual(model.coverage(n),{matched:1,unverified:1,notApplicable:1,missing:1,unavailable:1});
+});
+
+test('official details accept new manufacturer roots, show access limits and keep method references separate',()=>{
+  const n={node_id:'Example',report:{sections:{storage:{components:[{name:'SSD',fields:{},official:{status:'matched',url:'https://content.crucial.com/example.pdf',source_access:'manufacturer_document_indexed_excerpt',scope:'Excerpt only'},missing_fields:[]}],references:[{name:'Method',url:'https://learn.microsoft.com/en-us/windows/example'}]},settings:{components:[{name:'Settings',fields:{},official:{status:'not_applicable'},missing_fields:[]}]}}}};
+  const html=model.officialDetails([n]);
+  assert(html.includes('href="https://content.crucial.com/example.pdf"'));
+  assert(html.includes('索引の抜粋'));
+  assert(html.includes('公式の項目説明・取得方法'));
+  assert(html.includes('製品仕様の照合対象外'));
+  n.report.sections.storage.components[0].official.url='https://evilcrucial.com/example';
+  assert(!model.officialDetails([n]).includes('href="https://evilcrucial.com'));
+  n.report.sections.storage.references[0].url='https://learn.microsoft.com.evil.example/test';
+  assert(!model.officialDetails([n]).includes('href="https://learn.microsoft.com.evil'));
+});

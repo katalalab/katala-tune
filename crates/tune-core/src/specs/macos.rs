@@ -6,8 +6,13 @@ pub async fn collect() -> Value {
     let mut raw = Map::new();
     let mut errors = Map::new();
     let mut jobs = tokio::task::JoinSet::new();
+    let types = collect::run_bounded("/usr/sbin/system_profiler", &["-listDataTypes".into()], &[], Duration::from_secs(3), 32768, 1024).await;
+    let host_usb = types.code == Some(0) && String::from_utf8_lossy(&types.stdout).split_whitespace().any(|t| t == "SPUSBHostDataType");
     for (kind, _) in TYPES {
         let kind = *kind;
+        if (kind == "SPUSBHostDataType" && !host_usb) || (kind == "SPUSBDataType" && host_usb) {
+            continue;
+        }
         jobs.spawn(async move {
             (
                 kind,
@@ -71,6 +76,37 @@ pub async fn collect() -> Value {
     } else {
         errors.insert("settings".into(), json!("error"));
     }
+    let mut security = Map::new();
+    for (tool, field) in [("csrutil", "system_integrity_protection"), ("fdesetup", "filevault")] {
+        let result = collect::run_bounded(&format!("/usr/bin/{tool}"), &["status".into()], &[], Duration::from_secs(3), 4096, 1024).await;
+        if result.code == Some(0) {
+            let text = String::from_utf8_lossy(&result.stdout).to_lowercase();
+            let state = match tool {
+                "csrutil" if text.starts_with("system integrity protection status: enabled.") => Some("enabled"),
+                "csrutil" if text.starts_with("system integrity protection status: disabled.") => Some("disabled"),
+                "csrutil" if text.starts_with("system integrity protection status: unknown (custom configuration)") => Some("custom"),
+                "fdesetup" if text.starts_with("filevault is on.") => Some("enabled"),
+                "fdesetup" if text.starts_with("filevault is off.") => Some("disabled"),
+                _ => None,
+            };
+            if let Some(state) = state {
+                security.insert(field.into(), json!(state));
+            } else {
+                errors.insert(tool.into(), json!("unsupported"));
+            }
+        } else {
+            let stderr = String::from_utf8_lossy(&result.stderr).to_lowercase();
+            let state = if result.timed_out {
+                "timeout"
+            } else if stderr.contains("permission") || stderr.contains("not permitted") {
+                "permission_denied"
+            } else {
+                "error"
+            };
+            errors.insert(tool.into(), json!(state));
+        }
+    }
+    raw.insert("security_settings".into(), Value::Object(security));
     raw.insert("errors".into(), Value::Object(errors));
     Value::Object(raw)
 }
@@ -85,6 +121,7 @@ const TYPES: &[(&str, &str)] = &[
     ("SPEthernetDataType", "network"),
     ("SPAirPortDataType", "network"),
     ("SPUSBDataType", "usb"),
+    ("SPUSBHostDataType", "usb"),
     ("SPThunderboltDataType", "thunderbolt"),
     ("SPPCIDataType", "pci"),
     ("SPAudioDataType", "audio"),
@@ -106,7 +143,26 @@ fn walk<'a>(items: &'a [Value], out: &mut Vec<&'a Value>, depth: usize) {
         if let Some(children) = v["spairport_airport_interfaces"].as_array() {
             walk(children, out, depth + 1);
         }
+        if let Some(fields) = v.as_object() {
+            for (_, port) in fields.iter().filter(|(key, _)| key.starts_with("receptacle_") && key.ends_with("_tag")).take(64) {
+                walk(std::slice::from_ref(port), out, depth + 1);
+            }
+        }
     }
+}
+
+fn device_model(name: &str) -> &str {
+    // RME exposes an eight-digit unit serial in these device names. Keep unrelated
+    // numeric model/SKU suffixes intact, including other manufacturers' products.
+    for model in ["Babyface Pro", "Babyface Pro FS"] {
+        if let Some(serial) = name.strip_prefix(model).and_then(|s| s.strip_prefix(" (")).and_then(|s| s.strip_suffix(')'))
+            && serial.len() == 8
+            && serial.bytes().all(|b| b.is_ascii_digit())
+        {
+            return model;
+        }
+    }
+    name
 }
 
 pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
@@ -166,8 +222,48 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
                     ("boot_mode", "boot_mode"),
                     ("spairport_wireless_card_type", "model"),
                     ("spairport_wireless_firmware_version", "firmware_version"),
+                    ("USBDeviceKeyVendorName", "manufacturer"),
+                    ("USBDeviceKeyVendorID", "vendor_id"),
+                    ("USBDeviceKeyProductID", "product_id"),
+                    ("USBDeviceKeyProductVersion", "version"),
+                    ("USBDeviceKeyLinkSpeed", "link_speed"),
+                    ("spnvme_trim_support", "trim_support"),
+                    ("smart_status", "smart_status"),
+                    ("vendor_name_key", "manufacturer"),
+                    ("current_speed_key", "link_speed"),
+                    ("receptacle_status_key", "status"),
+                    ("receptacle_id_key", "port"),
+                    ("coreaudio_device_manufacturer", "manufacturer"),
+                    ("coreaudio_device_transport", "interface"),
+                    ("coreaudio_device_srate", "sample_rate_hz"),
+                    ("coreaudio_device_input", "input_channels"),
+                    ("coreaudio_device_output", "output_channels"),
                 ],
             );
+            if let Some(model) = fields.get("model").and_then(Value::as_str) {
+                fields.insert("model".into(), json!(device_model(model)));
+            }
+            if *kind == "SPAirPortDataType" && v.get("spairport_wireless_card_type").is_some() {
+                if let Some(interface) = scalar(&v["_name"]) {
+                    fields.insert("interface".into(), interface);
+                }
+                let card = v["spairport_wireless_card_type"].as_str().unwrap_or("");
+                let lower = card.to_lowercase();
+                if lower.contains("firmware") || lower.contains("fwid") || lower.contains("chip id:") {
+                    fields.insert("model".into(), json!("Wi-Fi adapter"));
+                }
+                if let Some(firmware) = v["spairport_wireless_firmware_version"].as_str()
+                    && let Some(firmware) = scalar(&json!(firmware.split_whitespace().collect::<Vec<_>>().join(" ")))
+                {
+                    fields.insert("firmware_version".into(), firmware);
+                }
+            }
+            if *id == "thunderbolt" && fields.contains_key("port") {
+                let physical = fields["port"].as_str().is_some_and(|p| p.len() <= 3 && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+                if !physical {
+                    fields.remove("port");
+                }
+            }
             if *id == "gpu" {
                 fields.insert("memory_kind".into(), json!(if unified { "unified" } else { "unknown" }));
                 if unified {
@@ -188,7 +284,11 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
             if fields.is_empty() {
                 continue;
             }
-            let name = fields.get("model").and_then(Value::as_str).unwrap_or(id).to_string();
+            let name = if let Some(port) = fields.get("port").and_then(Value::as_str) {
+                format!("Thunderbolt port {port}")
+            } else {
+                fields.get("model").and_then(Value::as_str).unwrap_or(id).to_string()
+            };
             components.push(component(&name, &source, fields));
         }
         let status = if components.is_empty() {
@@ -302,6 +402,15 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
         raw["errors"]["settings"].as_str().filter(|s| ["error", "timeout", "permission_denied"].contains(s)).unwrap_or("not_collected")
     };
     entry["providers"].as_array_mut().expect("providers").push(json!({"source":"pmset -g custom","status":pmset_state}));
+    for (tool, field) in [("csrutil", "system_integrity_protection"), ("fdesetup", "filevault")] {
+        let source = format!("{tool} status");
+        if let Some(state) = raw["security_settings"][field].as_str().filter(|s| ["enabled", "disabled", "custom"].contains(s)) {
+            merge(sections, "settings", vec![component(field, &source, mapped(&json!({field:state}), &[(field, field)]))], "ok", &source);
+        } else if let Some(error) = raw["errors"][tool].as_str() {
+            let state = if ["timeout", "tool_missing", "permission_denied", "unsupported"].contains(&error) { error } else { "error" };
+            merge(sections, "settings", vec![], state, &source);
+        }
+    }
 }
 
 fn merge(sections: &mut Map<String, Value>, id: &str, components: Vec<Value>, status: &str, source: &str) {
