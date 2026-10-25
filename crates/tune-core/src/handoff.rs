@@ -239,6 +239,10 @@ impl Engine {
     /// 承認の後: 台帳をもう一度読み、接続先が変わっていなければ PROMPT.md と起動スクリプトを書いてターミナルを開く。
     /// 結果（開いた・開けなかった・中止）は実行記録に残す
     pub fn handoff_launch(&self, p: &Prepared, agent: Agent) -> Value {
+        self.handoff_launch_with(p, agent, open)
+    }
+
+    fn handoff_launch_with(&self, p: &Prepared, agent: Agent, launch: impl FnOnce(&Path, &str, Agent) -> Result<(), String>) -> Value {
         let record = |ok, output, dir| self.handoff_record(p, agent, ok, output, dir);
         let refused = |m: String| {
             record(false, format!("中止（開いていない）: {m}"), None);
@@ -253,7 +257,7 @@ impl Engine {
             return refused("確認のあいだに台帳の接続先（alias・OS・この機体かどうか）が変わった。もう一度押してください".into());
         }
         let dir = self.data_dir().join("handoff").join(format!("{}-{}-{}", now_ms(), safe(&p.node.id), agent.key()));
-        match open(&dir, &p.prompt, agent) {
+        match launch(&dir, &p.prompt, agent) {
             Ok(()) => {
                 record(true, format!("{} を新しいターミナルで開いた（{}）", agent.label(), dir.display()), Some(&dir));
                 json!({ "ok": true, "dir": dir })
