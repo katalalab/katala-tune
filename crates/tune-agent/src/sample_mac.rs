@@ -197,8 +197,10 @@ unsafe extern "C" {
     fn IOServiceMatching(name: *const c_char) -> *mut c_void;
     fn IOServiceGetMatchingServices(main_port: u32, matching: *mut c_void, iter: *mut u32) -> c_int;
     fn IOIteratorNext(iter: u32) -> u32;
+    fn IOIteratorIsValid(iter: u32) -> u32;
     fn IOObjectRelease(obj: u32) -> c_int;
     fn IORegistryEntryCreateCFProperty(entry: u32, key: *const c_void, allocator: *const c_void, options: u32) -> *const c_void;
+    fn IORegistryEntryGetRegistryEntryID(entry: u32, id: *mut u64) -> c_int;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -206,6 +208,9 @@ unsafe extern "C" {
     fn CFStringCreateWithCString(alloc: *const c_void, s: *const c_char, encoding: u32) -> *const c_void;
     fn CFDictionaryGetValue(d: *const c_void, key: *const c_void) -> *const c_void;
     fn CFNumberGetValue(n: *const c_void, kind: c_int, out: *mut c_void) -> bool;
+    fn CFGetTypeID(cf: *const c_void) -> usize;
+    fn CFDictionaryGetTypeID() -> usize;
+    fn CFNumberGetTypeID() -> usize;
     fn CFRelease(cf: *const c_void);
 }
 
@@ -353,6 +358,31 @@ pub fn net_rate(prev: Option<&NetBytes>, cur: Option<&NetBytes>, dt: f64) -> Val
 // ディスク
 // ---------------------------------------------------------------------------
 
+type DiskBytes = HashMap<u64, (Option<i64>, Option<i64>)>;
+
+/// Identities stay internal: replacement/reset or incomplete coverage is unknown,
+/// not an idle disk. Each direction can recover independently after two valid points.
+fn disk_rate(prev: &DiskBytes, cur: &DiskBytes, dt: f64) -> Value {
+    let mut result = json!({"read_bps":null,"write_bps":null});
+    if prev.is_empty() || cur.is_empty() || prev.len() != cur.len() || !cur.keys().all(|k| prev.contains_key(k)) || !dt.is_finite() || dt <= 0.0 {
+        return result;
+    }
+    for (direction, key) in ["read_bps", "write_bps"].into_iter().enumerate() {
+        let delta = cur.iter().try_fold(0i64, |sum, (id, after)| {
+            let before = prev[id];
+            let (a, b) = if direction == 0 { (before.0?, after.0?) } else { (before.1?, after.1?) };
+            if a < 0 || b < a { None } else { sum.checked_add(b - a) }
+        });
+        if let Some(delta) = delta {
+            let rate = delta as f64 / dt;
+            if rate.is_finite() && rate < i64::MAX as f64 {
+                result[key] = py_int(rate);
+            }
+        }
+    }
+    result
+}
+
 struct Disk {
     k_stats: *const c_void,
     k_read: *const c_void,
@@ -371,7 +401,7 @@ impl Disk {
         if d.k_stats.is_null() || d.k_read.is_null() || d.k_write.is_null() { Err("CFString を作れない".into()) } else { Ok(d) }
     }
 
-    fn enumerate(&mut self) {
+    fn enumerate(&mut self) -> bool {
         for s in self.services.drain(..) {
             // SAFETY: IOIteratorNext で得た参照を 1 回だけ返す
             unsafe { IOObjectRelease(s) };
@@ -379,7 +409,7 @@ impl Disk {
         let mut it = 0u32;
         // SAFETY: 名前は NUL 終端。matching は IOServiceGetMatchingServices が受け取って解放する
         if unsafe { IOServiceGetMatchingServices(0, IOServiceMatching(c"IOBlockStorageDriver".as_ptr()), &mut it) } != 0 {
-            return;
+            return false;
         }
         loop {
             // SAFETY: it は有効なイテレータ
@@ -389,36 +419,59 @@ impl Disk {
             }
             self.services.push(s);
         }
+        // SAFETY: it is owned until release; invalidation means partial enumeration.
+        let valid = unsafe { IOIteratorIsValid(it) } != 0;
         // SAFETY: イテレータを 1 回だけ返す
         unsafe { IOObjectRelease(it) };
+        valid
     }
 
-    fn num(d: *const c_void, k: *const c_void) -> i64 {
+    fn num(d: *const c_void, k: *const c_void) -> Option<i64> {
         let mut v = 0i64;
         // SAFETY: d は CFDictionary、k は CFString。値が無ければ null。v は 64 ビットの書き込み先
         let p = unsafe { CFDictionaryGetValue(d, k) };
-        if !p.is_null() && unsafe { CFNumberGetValue(p, CF_SINT64, (&mut v as *mut i64).cast()) } { v } else { 0 }
+        // SAFETY: borrowed non-null CF value; check its type before using CFNumber.
+        if !p.is_null() && unsafe { CFGetTypeID(p) == CFNumberGetTypeID() && CFNumberGetValue(p, CF_SINT64, (&mut v as *mut i64).cast()) } && v >= 0 {
+            Some(v)
+        } else {
+            None
+        }
     }
 
-    fn bytes(&mut self, now: Instant) -> (i64, i64) {
+    fn bytes(&mut self, now: Instant) -> DiskBytes {
         // 外付けの抜き差しに追従する
         if self.found_at.is_none_or(|t| now.duration_since(t) > Duration::from_secs(30)) {
-            self.enumerate();
+            let valid = self.enumerate();
             self.found_at = Some(now);
+            if !valid {
+                for s in self.services.drain(..) {
+                    // SAFETY: partial enumeration still owns each returned service.
+                    unsafe { IOObjectRelease(s) };
+                }
+                return HashMap::new();
+            }
         }
-        let (mut r, mut w) = (0, 0);
+        let mut counters = HashMap::new();
         for s in &self.services {
+            let mut id = 0u64;
+            // SAFETY: s is owned; id is writable. Failure cannot identify coverage.
+            if unsafe { IORegistryEntryGetRegistryEntryID(*s, &mut id) } != 0 || counters.contains_key(&id) {
+                return HashMap::new();
+            }
             // SAFETY: s は有効な IORegistry の項目。返る辞書は下で解放する
             let st = unsafe { IORegistryEntryCreateCFProperty(*s, self.k_stats, std::ptr::null(), 0) };
             if st.is_null() {
+                counters.insert(id, (None, None));
                 continue;
             }
-            r += Self::num(st, self.k_read);
-            w += Self::num(st, self.k_write);
+            // SAFETY: property is a live CF value; use it as a dictionary only after type validation.
+            let values =
+                if unsafe { CFGetTypeID(st) == CFDictionaryGetTypeID() } { (Self::num(st, self.k_read), Self::num(st, self.k_write)) } else { (None, None) };
+            counters.insert(id, values);
             // SAFETY: Create で得た参照を 1 回だけ返す
             unsafe { CFRelease(st) };
         }
-        (r, w)
+        counters
     }
 }
 
@@ -810,7 +863,7 @@ pub struct Sampler {
     monitor: Option<Macmon>,
     cpu_prev: Option<Ticks>,
     net_prev: Option<NetBytes>,
-    disk_prev: Option<(i64, i64)>,
+    disk_prev: DiskBytes,
     started_ms: i64,
 }
 
@@ -836,7 +889,7 @@ impl Sampler {
                 None
             }
         };
-        let disk_prev = disk.as_mut().ok().map(|d| d.bytes(t0));
+        let disk_prev = disk.as_mut().ok().map(|d| d.bytes(t0)).unwrap_or_default();
         let mut s = Sampler {
             a: a.clone(),
             host,
@@ -860,7 +913,7 @@ impl Sampler {
         let has = json!({
             "cpu": self.cpu_prev.is_some(),
             "mem": true,
-            "disk": self.disk_prev.is_some(),
+            "disk": self.disk.is_some(),
             "net": self.net_prev.is_some(),
             "procs": self.procs.is_some(),
             "gpu": self.monitor.is_some(),
@@ -902,15 +955,10 @@ impl Sampler {
             self.cpu_prev = cur;
         }
         s.insert("mem".into(), memory());
-        if let (Some(d), Some(prev)) = (self.disk.as_mut(), self.disk_prev) {
-            let (r, w) = d.bytes(now);
-            let v = if dt > 0.0 {
-                json!({"read_bps": py_int((r - prev.0).max(0) as f64 / dt), "write_bps": py_int((w - prev.1).max(0) as f64 / dt)})
-            } else {
-                Value::Null
-            };
-            s.insert("disk".into(), v);
-            self.disk_prev = Some((r, w));
+        if let Some(d) = self.disk.as_mut() {
+            let cur = d.bytes(now);
+            s.insert("disk".into(), disk_rate(&self.disk_prev, &cur, dt));
+            self.disk_prev = if dt.is_finite() && dt > 0.0 { cur } else { HashMap::new() };
         }
         if self.net_prev.is_some() {
             let cur = net_bytes();
@@ -999,6 +1047,37 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn disk_empty_provider_is_unknown_instead_of_idle() {
+        let now = Instant::now();
+        let mut d = Disk { k_stats: std::ptr::null(), k_read: std::ptr::null(), k_write: std::ptr::null(), services: vec![], found_at: Some(now) };
+        assert_eq!(json!(d.bytes(now)), json!({}));
+    }
+
+    #[test]
+    fn disk_rates_match_missing_recovery_fixtures_and_python() {
+        let cases: Value = serde_json::from_str(include_str!("../../../test/fixtures/disk-rates.json")).unwrap();
+        for case in cases.as_array().unwrap() {
+            let mut prev = HashMap::new();
+            for frame in case["frames"].as_array().unwrap() {
+                let cur = serde_json::from_value(frame["c"].clone()).unwrap();
+                let dt = frame["dt"].as_f64().unwrap_or(1.0);
+                let want = json!({"read_bps": frame["want"][0], "write_bps": frame["want"][1]});
+                assert_eq!(disk_rate(&prev, &cur, dt), want, "{}", case["name"]);
+                let py = python("print(json.dumps(m.disk_rate(I[0],I[1],I[2])))", &json!([prev, cur, dt]));
+                assert_eq!(py, want, "Python {}", case["name"]);
+                prev = if dt.is_finite() && dt > 0.0 { cur } else { HashMap::new() };
+            }
+        }
+        let counters = HashMap::from([(1, (Some(0), Some(0)))]);
+        for dt in [f64::NAN, f64::INFINITY] {
+            assert_eq!(disk_rate(&counters, &counters, dt), json!({"read_bps":null,"write_bps":null}));
+        }
+        let prev = HashMap::from([(1, (Some(0), Some(0))), (2, (Some(0), Some(0)))]);
+        let cur = HashMap::from([(1, (Some(i64::MAX), Some(1))), (2, (Some(i64::MAX), Some(1)))]);
+        assert_eq!(disk_rate(&prev, &cur, 1.0), json!({"read_bps":null,"write_bps":2}));
+    }
 
     fn fixture_marker(path: &std::path::Path, value: &[u8]) {
         let tmp = path.with_extension("tmp");

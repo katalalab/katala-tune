@@ -2,6 +2,7 @@
 
 ## 未リリース
 
+- macOS のディスク測定で、取得失敗を 0 B/s と扱わない。Python/Rust とも読取・書込を別々に欠測にし、復帰・ディスク交換・counter reset 後は基点を取り直す。欠測を除いた分集計と保存後の再読を合成試験で確認する。
 - macOS のネイティブのサンプラー（`tune-agent sample`）: live_mac.py と同じ行・同じ値を sysctl・mach・libproc・IOKit で直接読む。Python 版と同時に動かして行の形と値を突き合わせる試験（`crates/tune-agent/tests/live_mac_parity.rs`）と、計算部分を Python の関数と同じ入力で比べる試験を追加。ライブ表示は `~/.katala-tune/bin/tune-agent` があれば先に使い、無い・動かないときは live_mac.py に戻る。
 - サンプラーの配置: Mac の .app に universal の `tune-agent` を同梱し、Mac のハブもほかの Mac の古いサンプラーを入れ替える。違う OS の機体へは新しい `tune agent-push <機体> [--file PATH]` で送る（SHA-256 確認・OS の実行形式の確認つき）。
 
