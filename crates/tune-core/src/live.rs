@@ -689,8 +689,10 @@ fn windows_boot(n: usize, params: &str) -> String {
     )
 }
 
-/// 各機体に置くネイティブのサンプラー（`tune-agent sample`。Windows だけ。置き方は docs/architecture.md）
+/// 各機体に置くネイティブのサンプラー（`tune-agent sample`。置き方は docs/architecture.md）
 pub const NATIVE_REMOTE: &str = "~/.katala-tune/bin/tune-agent.exe";
+/// macOS の置き場所（名前に .exe が付かない）
+pub const NATIVE_REMOTE_MAC: &str = "~/.katala-tune/bin/tune-agent";
 
 fn native_args(o: &Opts) -> Vec<String> {
     [
@@ -706,8 +708,9 @@ fn native_args(o: &Opts) -> Vec<String> {
 /// この機体のネイティブのサンプラー: アプリの隣、無ければ helpers の namespace。
 /// `KATALA_TUNE_DATA_DIR` を明示した QA では `data/bin` に閉じ、通常は従来の HOME を使う。
 fn local_native() -> Option<PathBuf> {
-    let beside = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("tune-agent.exe")));
-    let managed = crate::helpers::bin_dir().join("tune-agent.exe");
+    let name = crate::helpers::exe("tune-agent");
+    let beside = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(&name)));
+    let managed = crate::helpers::bin_dir().join(&name);
     [beside, Some(managed)].into_iter().flatten().find(|p| p.is_file())
 }
 
@@ -721,12 +724,24 @@ pub fn launch(node: &Node, o: &Opts) -> Result<Launch, String> {
         let a = format!("interval={} procs={} max={} watch=1", secs(o.interval), secs(o.procs_every), secs(o.sampler_max_age));
         let boot = python_boot(MAC_LIVE.len());
         let stdin = MAC_LIVE.as_bytes().to_vec();
+        // ネイティブ（tune-agent sample）を先に使い、置いていない・起動できない（古い版・合わないアーキテクチャ）なら
+        // Python 版。ネイティブは起動に失敗するとき標準入力を読まずに終わるので、Python 版はそのままスクリプトを読める。
+        // ネイティブが動いたときは、標準入力のスクリプトを読み捨てる
+        let native = native_args(o).join(" ");
         if node.local {
+            if let Some(exe) = local_native() {
+                // パスは引数で渡す（空白を含む .app の中でも引用符を組み立てない）
+                let script = format!("\"$0\" {native} || exec /usr/bin/env python3 -c '{boot}' {a}");
+                let args = vec!["-c".to_string(), script, exe.to_string_lossy().into_owned()];
+                return Ok(Launch { program: "/bin/sh".into(), args, stdin, keep_stdin: true, cleanup: None });
+            }
             let mut args = vec!["python3".to_string(), "-c".to_string(), boot];
             args.extend(a.split(' ').map(str::to_string));
             return Ok(Launch { program: "/usr/bin/env".into(), args, stdin, keep_stdin: true, cleanup: None });
         }
-        let remote = format!("command -v python3 >/dev/null && exec python3 -c '{boot}' {a} || exec /usr/bin/python3 -c '{boot}' {a}");
+        let remote = format!(
+            "[ -x {NATIVE_REMOTE_MAC} ] && {NATIVE_REMOTE_MAC} {native} || {{ command -v python3 >/dev/null && exec python3 -c '{boot}' {a} || exec /usr/bin/python3 -c '{boot}' {a}; }}"
+        );
         return Ok(Launch { program: "ssh".into(), args: live_ssh_args(&node.alias, &remote), stdin, keep_stdin: true, cleanup: None });
     }
     if node.is_windows() {
@@ -1799,6 +1814,10 @@ mod tests {
         let mac = launch(&node("m", "macos"), &o).unwrap();
         assert_eq!(mac.program, "ssh");
         let cmd = mac.args.last().unwrap();
+        assert!(
+            cmd.starts_with("[ -x ~/.katala-tune/bin/tune-agent ] && ~/.katala-tune/bin/tune-agent sample interval=1 procs=5 max=900 watch=1 || { "),
+            "ネイティブを先に使う: {cmd}"
+        );
         assert!(cmd.contains(&format!("exec python3 -c '{}' interval=1 procs=5 max=900 watch=1", python_boot(MAC_LIVE.len()))), "{cmd}");
         assert_eq!(cmd.matches('\'').count(), 4, "python3 -c の中身にシングルクォートを入れない");
         for opt in ["BatchMode=yes", "ControlMaster=no", "ControlPath=none"] {
@@ -2081,6 +2100,56 @@ mod tests {
         assert!(live.status()["a"]["detail"].as_str().unwrap().contains("データが来ない"));
         until("黙ったサンプラーも終わる", || pids(&dir, "a").iter().all(|p| !alive(*p))).await;
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// macOS の起動コマンドを実際のシェルで動かす: 置いたネイティブが動けばそれだけ、起動できなければ Python 版
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_launch_prefers_native_and_falls_back_to_python() {
+        use std::os::unix::fs::PermissionsExt;
+        let o = Opts { sampler_max_age: Duration::from_secs(1), ..Opts::default() };
+        // 古い版（macOS のサンプラーが無い）は標準入力を読まずに失敗する。動く版は hello を出して正常に終わる
+        for (native, want) in [
+            (
+                "#!/bin/sh
+exit 1
+",
+                None,
+            ),
+            (
+                "#!/bin/sh
+echo '{\"type\":\"hello\",\"os\":\"macos\",\"impl\":\"rust\"}'
+",
+                Some("rust"),
+            ),
+        ] {
+            let (_, dir) = fake("");
+            let bin = dir.join(".katala-tune/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("tune-agent"), native).unwrap();
+            std::fs::set_permissions(bin.join("tune-agent"), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let l = launch(&node("m", "macos"), &o).unwrap();
+            let remote = l.args.last().unwrap().clone();
+            let mut src = spawn(Launch {
+                program: "/usr/bin/env".into(),
+                args: vec![format!("HOME={}", dir.display()), "PATH=/usr/bin:/bin".into(), "/bin/sh".into(), "-c".into(), remote],
+                stdin: l.stdin,
+                keep_stdin: true,
+                cleanup: None,
+            })
+            .unwrap();
+            // Python 版は max=1 で自分から終わる
+            let mut msgs = Vec::new();
+            while let Ok(Some(line)) = tokio::time::timeout(Duration::from_secs(20), src.lines.recv()).await {
+                msgs.push(parse_line(&line).unwrap_or_else(|| panic!("読めない行: {line}")));
+            }
+            let ended = src.close().await;
+            assert_eq!(ended.code, Some(0), "{}", ended.err);
+            let Some(Msg::Hello(h)) = msgs.first() else { panic!("1 行目は hello") };
+            assert_eq!(h.implementation.as_deref(), want, "{native}");
+            assert_eq!(msgs.iter().filter(|m| matches!(m, Msg::Hello(_))).count(), 1, "動くのはどちらか一方");
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     /// 必須のOS統計を保ち、任意センサーの有無を独立した環境で確かめる。

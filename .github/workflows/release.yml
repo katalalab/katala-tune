@@ -72,8 +72,8 @@ jobs:
           # shellcheck disable=SC2086 # 複数のターゲットを空白で区切って渡す
           rustup target add $RUST_TARGETS
           cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
-      - name: 同梱する道具（tune CLI・Windows の tune-agent サンプラー）
-        # アプリの隣に置かれ、起動のたびに ~/.katala-tune/bin へ写る。ハブはほかの Windows の機体へサンプラーを配り直す（crates/tune-core/src/helpers.rs）
+      - name: 同梱する道具（tune CLI・tune-agent サンプラー）
+        # アプリの隣に置かれ、起動のたびに ~/.katala-tune/bin へ写る。ハブは同じ OS のほかの機体へサンプラーを配り直す（crates/tune-core/src/helpers.rs）
         shell: bash
         run: |
           set -euo pipefail
@@ -81,11 +81,13 @@ jobs:
           if [ "$RUNNER_OS" = macOS ]; then
             # universal のビルドは各アーキテクチャを別にビルドする（tauri-build がそれぞれの名前を探す）ので、両方と universal を置く
             for t in aarch64-apple-darwin x86_64-apple-darwin; do
-              cargo build --release --locked -p tune-cli --target "$t"
-              cp "target/$t/release/tune" "src-tauri/binaries/tune-$t"
+              cargo build --release --locked -p tune-cli -p tune-agent --target "$t"
+              for b in tune tune-agent; do cp "target/$t/release/$b" "src-tauri/binaries/$b-$t"; done
             done
-            lipo -create -output src-tauri/binaries/tune-universal-apple-darwin target/aarch64-apple-darwin/release/tune target/x86_64-apple-darwin/release/tune
-            echo '{"bundle":{"externalBin":["binaries/tune"]}}' > sidecars.json
+            for b in tune tune-agent; do
+              lipo -create -output "src-tauri/binaries/$b-universal-apple-darwin" "target/aarch64-apple-darwin/release/$b" "target/x86_64-apple-darwin/release/$b"
+            done
+            echo '{"bundle":{"externalBin":["binaries/tune","binaries/tune-agent"]}}' > sidecars.json
           else
             cargo build --release --locked -p tune-cli -p tune-agent --target "$TARGET"
             cp "target/$TARGET/release/tune.exe" "src-tauri/binaries/tune-$TARGET.exe"
@@ -107,6 +109,7 @@ jobs:
           # 同梱できたことを確かめる（Mac は .app の中、Windows はアプリの隣にコピーされる）
           if [ "$RUNNER_OS" = macOS ]; then
             test -x "target/$TARGET/release/bundle/macos/Katala Tune.app/Contents/MacOS/tune"
+            test -x "target/$TARGET/release/bundle/macos/Katala Tune.app/Contents/MacOS/tune-agent"
           else
             test -f "target/$TARGET/release/tune.exe" && test -f "target/$TARGET/release/tune-agent.exe"
           fi

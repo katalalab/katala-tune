@@ -3,8 +3,10 @@
 //! - この機体: 起動のたびに、アプリの隣にある道具を `~/.katala-tune/bin` へ写す（中身が違うときだけ）。
 //!   Windows の既存 tune.exe は承認済みハッシュを保つため自動で上書きせず、artifact と台帳を明示的に更新する。
 //!   ローカルのサンプラーはアプリと同じ版に保ち、Windows CLI の版は承認した更新に従う
-//! - ほかの Windows の機体: ハブ（常時監視）が、サンプラーの hello に入った版が古い・無い機体へ、同梱のサンプラーを
-//!   SSH の標準入力で送り、SHA-256 を確かめてから入れ替える（`~/.katala-tune/bin` だけ。probe.ps1 を置くのと同じ場所）
+//! - ほかの機体: ハブ（常時監視）が、サンプラーの hello に入った版が古い・無い機体へ、同梱のサンプラーを
+//!   SSH の標準入力で送り、SHA-256 を確かめてから入れ替える（`~/.katala-tune/bin` だけ。probe.ps1 を置くのと同じ場所）。
+//!   同梱物はハブと同じ OS の物なので、送るのはハブと同じ OS の機体だけ（Windows のハブから Mac へは送らない）。
+//!   ほかの OS の機体へは `tune agent-push <機体> --file <tune-agent>` で手で送る（docs/architecture.md）
 //!
 //! 動いているサンプラーがあっても置き換えられるよう、古い物は名前を変えて退け、使われていない古い物は消す。
 
@@ -22,6 +24,11 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn exe(name: &str) -> String {
     if cfg!(windows) { format!("{name}.exe") } else { name.to_string() }
+}
+
+/// 実行中のアプリ・CLI の隣に同梱したサンプラー（この OS の物。Windows は tune-agent.exe、macOS は universal の tune-agent）
+pub fn bundled_agent() -> Option<Vec<u8>> {
+    std::fs::read(std::env::current_exe().ok()?.parent()?.join(exe("tune-agent"))).ok()
 }
 
 /// 同梱道具の保存先。検証用に `KATALA_TUNE_DATA_DIR` を明示したときは
@@ -113,9 +120,14 @@ pub fn older(a: &str, b: &str) -> bool {
     }
 }
 
-/// 機体のサンプラーを入れ替えるべきか（Windows のほかの機体で、hello の版が古い・ネイティブが無い）
+/// 機体の OS が、この道具（ハブ）と同じか。同梱のサンプラーはこの OS の物なので、同じ OS の機体にだけ送れる
+fn same_os(node: &Node) -> bool {
+    (node.is_windows() && cfg!(windows)) || (node.is_mac() && cfg!(target_os = "macos"))
+}
+
+/// 機体のサンプラーを入れ替えるべきか（ハブと同じ OS のほかの機体で、hello の版が古い・ネイティブが無い）
 pub fn agent_outdated(node: &Node, brief: Option<&Value>) -> bool {
-    if !node.is_active() || !node.is_windows() || node.local {
+    if !node.is_active() || !same_os(node) || node.local {
         return false;
     }
     let Some(b) = brief else { return false };
@@ -126,17 +138,33 @@ pub fn agent_outdated(node: &Node, brief: Option<&Value>) -> bool {
     }
 }
 
-/// サンプラーを SSH の標準入力で送り、SHA-256 を確かめてから入れ替える（既定シェルは Git Bash。collect.rs と同じ）
+/// 送る物がその機体の OS の実行ファイルか（Windows は PE、macOS は Mach-O の 64 ビットか universal）
+pub fn agent_binary_fits(node: &Node, bytes: &[u8]) -> Result<(), String> {
+    let head = bytes.get(..4).unwrap_or_default();
+    let ok = if node.is_windows() {
+        head.starts_with(b"MZ")
+    } else if node.is_mac() {
+        head == [0xcf, 0xfa, 0xed, 0xfe] || head == [0xca, 0xfe, 0xba, 0xbe]
+    } else {
+        return Err(format!("この OS（{}）へはサンプラーを送らない", node.os));
+    };
+    if ok { Ok(()) } else { Err(format!("{} 用の実行ファイルではない", node.os)) }
+}
+
+/// サンプラーを SSH の標準入力で送り、SHA-256 を確かめてから入れ替える。
+/// Windows の既定シェルは Git Bash（collect.rs と同じ）。macOS は sha256sum が無い版があるので shasum を使う
 pub async fn push_agent(node: &Node, bytes: &[u8]) -> Result<String, String> {
     if let Some(err) = node.refusal() {
         return Err(err);
     }
+    agent_binary_fits(node, bytes)?;
     let hash = sha256_hex(bytes);
     let stamp = now_ms();
+    let (name, sum, mode) = if node.is_mac() { ("tune-agent", "shasum -a 256", "chmod 755 tune-agent.new && ") } else { ("tune-agent.exe", "sha256sum", "") };
     let remote = format!(
-        "mkdir -p ~/.katala-tune/bin && cd ~/.katala-tune/bin && cat > tune-agent.exe.new && [ \"$(sha256sum tune-agent.exe.new | cut -c1-64)\" = {hash} ] \
-         && {{ [ ! -e tune-agent.exe ] || mv -f tune-agent.exe tune-agent.exe.old-{stamp}; }} && mv -f tune-agent.exe.new tune-agent.exe \
-         && {{ rm -f tune-agent.exe.old-* 2>/dev/null; true; }} && echo pushed-{hash}"
+        "mkdir -p ~/.katala-tune/bin && cd ~/.katala-tune/bin && cat > {name}.new && [ \"$({sum} {name}.new | cut -c1-64)\" = {hash} ] \
+         && {mode}{{ [ ! -e {name} ] || mv -f {name} {name}.old-{stamp}; }} && mv -f {name}.new {name} \
+         && {{ rm -f {name}.old-* 2>/dev/null; true; }} && echo pushed-{hash}"
     );
     let r = collect::run("ssh", &collect::ssh_args(&node.alias, &remote), Some(bytes), Duration::from_secs(120)).await;
     if r.out.contains(&format!("pushed-{hash}")) {
@@ -173,20 +201,39 @@ mod tests {
     }
 
     #[test]
-    fn outdated_agents_are_only_remote_windows() {
+    fn outdated_agents_are_only_remote_machines_of_the_hub_os() {
         let n = |os: &str, local: bool| {
             let mut x = Node::from_value(&json!({"id": "x", "alias": "x", "os": os}), "h");
             x.local = local;
             x
         };
         let rust = |v: &str| json!({"impl": "rust", "agent": v});
-        assert!(agent_outdated(&n("windows", false), Some(&rust("0.0.1"))));
-        assert!(agent_outdated(&n("windows", false), Some(&json!({"impl": "script"}))), "ネイティブが無ければ入れる");
-        assert!(!agent_outdated(&n("windows", false), Some(&rust(VERSION))));
-        assert!(!agent_outdated(&n("windows", false), Some(&json!({"impl": null}))), "hello の前は判断しない");
-        assert!(!agent_outdated(&n("windows", true), Some(&rust("0.0.1"))), "この機体は sync で揃える");
-        assert!(!agent_outdated(&n("macos", false), Some(&json!({"impl": "script"}))));
-        assert!(!agent_outdated(&n("windows", false), None));
+        // 同梱物はハブの OS の物。ほかの OS の機体へは送らない
+        let (hub, other) = if cfg!(target_os = "macos") { ("macos", "windows") } else { ("windows", "macos") };
+        assert!(!agent_outdated(&n(other, false), Some(&json!({"impl": "script"}))), "{other}");
+        assert!(!agent_outdated(&n("linux", false), Some(&json!({"impl": "script"}))));
+        if !cfg!(any(windows, target_os = "macos")) {
+            return;
+        }
+        assert!(agent_outdated(&n(hub, false), Some(&rust("0.0.1"))));
+        assert!(agent_outdated(&n(hub, false), Some(&json!({"impl": "script"}))), "ネイティブが無ければ入れる");
+        assert!(!agent_outdated(&n(hub, false), Some(&rust(VERSION))));
+        assert!(!agent_outdated(&n(hub, false), Some(&json!({"impl": null}))), "hello の前は判断しない");
+        assert!(!agent_outdated(&n(hub, true), Some(&rust("0.0.1"))), "この機体は sync で揃える");
+        assert!(!agent_outdated(&n(hub, false), None));
+    }
+
+    #[test]
+    fn pushed_binaries_must_fit_the_os() {
+        let n = |os: &str| Node::from_value(&json!({"id": "x", "alias": "x", "os": os}), "h");
+        assert!(agent_binary_fits(&n("windows"), b"MZ\x90\0rest").is_ok());
+        assert!(agent_binary_fits(&n("macos"), &[0xcf, 0xfa, 0xed, 0xfe, 7]).is_ok(), "Mach-O 64");
+        assert!(agent_binary_fits(&n("macos"), &[0xca, 0xfe, 0xba, 0xbe, 0]).is_ok(), "universal");
+        assert!(agent_binary_fits(&n("macos"), b"MZ\x90\0").is_err(), "Windows の物を Mac へ送らない");
+        assert!(agent_binary_fits(&n("windows"), &[0xcf, 0xfa, 0xed, 0xfe]).is_err());
+        assert!(agent_binary_fits(&n("macos"), b"#!/bin/sh").is_err());
+        assert!(agent_binary_fits(&n("linux"), b"\x7fELF").is_err());
+        assert!(agent_binary_fits(&n("macos"), b"").is_err());
     }
 
     #[test]

@@ -2,7 +2,8 @@
 
 ## 未リリース
 
-- macOS のネイティブのサンプラー（`tune-agent sample`）: live_mac.py と同じ行・同じ値を sysctl・mach・libproc・IOKit で直接読む。Python 版と同時に動かして行の形と値を突き合わせる試験（`crates/tune-agent/tests/live_mac_parity.rs`）と、計算部分を Python の関数と同じ入力で比べる試験を追加。アプリのライブ表示は引き続き live_mac.py を使い、切り替えは各 Mac へ置く手順と合わせて行う。
+- macOS のネイティブのサンプラー（`tune-agent sample`）: live_mac.py と同じ行・同じ値を sysctl・mach・libproc・IOKit で直接読む。Python 版と同時に動かして行の形と値を突き合わせる試験（`crates/tune-agent/tests/live_mac_parity.rs`）と、計算部分を Python の関数と同じ入力で比べる試験を追加。ライブ表示は `~/.katala-tune/bin/tune-agent` があれば先に使い、無い・動かないときは live_mac.py に戻る。
+- サンプラーの配置: Mac の .app に universal の `tune-agent` を同梱し、Mac のハブもほかの Mac の古いサンプラーを入れ替える。違う OS の機体へは新しい `tune agent-push <機体> [--file PATH]` で送る（SHA-256 確認・OS の実行形式の確認つき）。
 
 ## 0.7.0-rc.1
 

@@ -261,7 +261,7 @@ test('macOS real arm64 signed bundle survives archive/extraction and rejects cha
   const proof = sourceProof(f.root, 'macos-arm64', env, f.version);
   const payload = path.join(f.root, 'payload'), app = path.join(payload, 'Katala Tune.app');
   fs.mkdirSync(path.join(app, 'Contents/MacOS'), { recursive: true }); fs.mkdirSync(path.join(app, 'Contents/Resources'));
-  for (const bin of ['tune', 'katala-tune']) { fs.copyFileSync(tune, path.join(app, 'Contents/MacOS', bin)); fs.chmodSync(path.join(app, 'Contents/MacOS', bin), 0o755); }
+  for (const bin of ['tune', 'tune-agent', 'katala-tune']) { fs.copyFileSync(tune, path.join(app, 'Contents/MacOS', bin)); fs.chmodSync(path.join(app, 'Contents/MacOS', bin), 0o755); }
   fs.writeFileSync(path.join(app, 'Contents/Info.plist'), '<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>katala-tune</string><key>CFBundleIdentifier</key><string>org.katala.tune.tauri</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleShortVersionString</key><string>0.6.4</string></dict></plist>');
   const proofFile = path.join(f.root, 'proof.json'), bytes = JSON.stringify(proof, null, 2) + '\n';
   fs.writeFileSync(proofFile, bytes); fs.writeFileSync(path.join(app, 'Contents/Resources/katala-source.json'), bytes);
