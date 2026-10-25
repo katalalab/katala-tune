@@ -2,3 +2,4 @@
 
 .specs-view .ph-row{flex-wrap:wrap;gap:12px}.specs-view .ph-title{white-space:nowrap}.specs-view .ph-actions{flex-wrap:wrap}.specs-view .ph-actions .btn:not(.primary){background:var(--bg-raised);color:var(--text)}
 .specs-coverage{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:24px 0 12px}.specs-coverage section{padding:16px;border:1px solid var(--line2);border-radius:10px;background:var(--bg-raised);overflow-wrap:anywhere}.specs-coverage p{margin:8px 0;font-size:13px;line-height:1.7}.specs-coverage small{color:var(--text2)}
+.specs-component{overflow-wrap:anywhere}
