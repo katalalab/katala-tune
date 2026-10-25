@@ -1071,18 +1071,24 @@ mod tests {
 
     #[test]
     fn startup_deadline_preserves_hello_before_end() {
-        let out = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "sample_mac::tests::expired_startup_fixture", "--ignored", "--nocapture"])
-            .env("HOME", std::env::temp_dir().join(format!("sampler-expired-{}", std::process::id())))
-            .env("PATH", "/usr/bin:/bin")
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        let rows: Vec<Value> = String::from_utf8_lossy(&out.stdout).lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
-        assert_eq!(rows.len(), 2, "{rows:?}");
-        assert_eq!(rows[0]["type"], "hello");
-        assert_eq!(rows[1], json!({"type": "end", "reason": "max_age"}));
+        // Pretty libtest prefixes the test name before running a single-threaded
+        // child, corrupting the first JSON line. Terse prints status only after
+        // completion. Keep the real hello/end assertions in both execution modes.
+        for threads in ["1", "2"] {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "sample_mac::tests::expired_startup_fixture", "--ignored", "--nocapture", "--format=terse", "--test-threads", threads])
+                .env("HOME", std::env::temp_dir().join(format!("sampler-expired-{}", std::process::id())))
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let rows: Vec<Value> = stdout.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+            assert_eq!(rows.len(), 2, "child threads={threads}, stdout={stdout:?}");
+            assert_eq!(rows[0]["type"], "hello");
+            assert_eq!(rows[1], json!({"type": "end", "reason": "max_age"}));
+        }
     }
 
     #[test]
