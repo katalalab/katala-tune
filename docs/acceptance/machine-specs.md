@@ -1,4 +1,6 @@
-# Machine specifications acceptance — 0.6.5-specs.2
+# Machine specifications acceptance
+
+The initial acceptance below records specs.2. The latest six-machine expansion is recorded at the end of this document.
 
 ## Scope and evidence
 
@@ -34,3 +36,22 @@ Independent review identified four issues, each reproduced before its fix: stati
 ## Limits
 
 The official catalog is finite, versioned and sourced. Registered models are matched exactly, including explicit family/variant notes. Unregistered parts stay unverified. Standard OS providers cannot expose every firmware setting, PSU/cooling/cable model or peripheral firmware version. XMP/EXPO state and macOS Recovery policy are explicitly unavailable, rather than inferred. NVIDIA boards with duplicate reported model names retain unknown dedicated memory when the CIM-to-driver association cannot be established uniquely. No host setting, driver or firmware is changed by collecting specifications.
+
+## Coverage expansion — 0.6.5-specs.5
+
+Runtime source: `21505991063f1b68f3a6f865e9df3dba6dac6109`. Catalog v2 contains 31 products and 47 exact model aliases; [source evidence and access limitations](../specs-official-sources.md) remain explicit.
+
+- Six authorized machines (two Macs, four Windows PCs), including the explicitly opted-in shared machine: all CLI versions matched, all collections succeeded, and all reports identified collector specs.5. The shared flag and optimization policies were preserved.
+- Compared with the saved baseline, the final observation contained 400 component records versus 351, 2,505 scalar fields versus 1,985, and 53 exact product observations versus 21. These are OS report units, not physical component counts. Device attachment changed during the work, so count differences are not a controlled measurement of implementation changes alone.
+- macOS: the available USB host provider, Wi-Fi firmware whitespace/model handling, SMART/TRIM, physical Thunderbolt ports, audio channels/sample rates, SIP and FileVault were exercised on both machines. Known audio serial-in-model suffixes are stripped. Final USB observations were four and six; an earlier observation with a connected hub tree contained nineteen on one machine.
+- Windows: unique disk-number joins supplied bus/sector/partition attributes; DeviceGuard states, OS release/UBR and NIC properties were collected. Native inspection exposed incorrect adapter property names; the collector now uses `InterfaceAdminStatus`, `TransmitLinkSpeed` and `ReceiveLinkSpeed`, preserves asymmetric rates and omits unknown zero MTUs. Actual link attributes and administrative states were confirmed after rebuilding.
+- On two Windows hosts with failed monitor WMI providers, validated cached EDID recovered five and four records. Cached/unconfirmed connection markers and original provider failures remain visible. No display serial descriptors or raw EDID enter reports.
+- Contextual gaps, documentation-only references and exact product matches remain separate. Remote validation rebuilds links and gap claims from trusted local data. An independent review caught aggregate memory classification incorrectly affecting Apple GPUs; a failing regression demonstrated the issue before the fix.
+
+Final `npm run check` passed: JavaScript 439 passed / 13 platform skips; Rust 643 passed / 4 ignored, with zero failures. Formatting, all-targets workspace Clippy and OSS checks passed. Specifications regressions comprise 31 tests, including Windows/macOS shapes, privacy, ambiguous joins, missing-data behavior and remote round trips. The native integration and process guard suites also passed. Reachable Git history passed the personal-data scan.
+
+Both Mac GUI bundles, bundled and standalone CLIs were replaced at their existing paths from the committed source, with identical platform hashes and valid strict signatures. Live/backup database checks, byte-identical ledgers and unchanged login items passed. On one Mac, a volatile WAL disappearance during plain copying was resolved using a query-only SQLite online backup, verified with an unchanged source database hash. Unrelated application paths were excluded from process stopping. Windows was installed side by side with application/helper/data/shortcut backups; the Start Menu and local helpers point to specs.5. Remote Windows CLIs were staged, hash checked, backed up and replaced.
+
+Actual installed Tauri IPC and its private DB showed six selected/successful machines, 190 comparison rows and 175 difference rows. Search, difference toggles, official-source access limitations, cached-display failures and documentation references passed UI checks; no page errors were observed. Light, dark and narrow layouts were inspected. The updated Mac GUI also displayed six current reports and 190 rows. Temporary Windows WebView debugging was removed and the normal application restarted; live/backup database integrity and unchanged ledger checks passed again.
+
+Private machine reports, before/after coverage, unresolved-product lists, screenshots, build/test logs, source fingerprints and deployment receipts remain outside this repository. Generic or ambiguous models, non-public firmware/settings and manufacturer documents available only through indexed excerpts retain their stated limitations. No optimization, firmware, driver or host security setting was changed.
