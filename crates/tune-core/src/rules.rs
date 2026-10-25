@@ -563,13 +563,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
             None,
         );
     }
-    let tree_dup = |t: &Value| {
-        arr(get(procs, "apps")).iter().any(|a| {
-            matches!((a.get("app"), t.get("root")), (Some(Value::String(x)), Some(Value::String(y))) if x == y)
-                && total_mb_truthy
-                && num(a.get("mem_mb")) >= total_mb * 0.2
-        })
-    };
+    // 名前別の apps と根 PID 別の trees は集計対象が異なるため、同名でも帰属を残す。
     for t in arr(get(procs, "trees"))
         .iter()
         .filter(|t| {
@@ -578,7 +572,6 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 && total_mb_truthy
                 && num0(t.get("count")) >= 3.0
                 && num0(t.get("mem_mb")) >= total_mb * 0.2
-                && !tree_dup(t)
         })
         .take(2)
     {
@@ -1042,6 +1035,45 @@ pub fn compare(prev: Option<&Value>, cur: Option<&Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_name_app_keeps_tree_attribution() {
+        for (probe, metric) in [("mac", "RSS"), ("windows", "ワーキングセット")] {
+            for (case, apps, has_hog) in [
+                ("same total", json!([{ "app": "Browser", "mem_mb": 20000, "count": 9 }]), true),
+                ("different membership", json!([{ "app": "Browser", "mem_mb": 40000, "count": 18 }]), true),
+                (
+                    "app outside top three",
+                    json!([
+                        { "app": "First", "mem_mb": 20000, "count": 9 },
+                        { "app": "Second", "mem_mb": 20000, "count": 9 },
+                        { "app": "Third", "mem_mb": 20000, "count": 9 },
+                        { "app": "Browser", "mem_mb": 20000, "count": 9 }
+                    ]),
+                    false,
+                ),
+            ] {
+                let findings = analyze(
+                    &json!({ "probe": probe, "memory": { "total_gb": 64 }, "processes": {
+                        "apps": apps,
+                        "trees": [{ "root": "Browser", "pid": 4242, "owner": "user", "count": 9, "children": 3, "mem_mb": 20000 }]
+                    } }),
+                    &json!({}),
+                );
+                assert_eq!(findings.iter().any(|f| f["id"] == "mem-hog-Browser"), has_hog, "{probe}: {case}");
+                let tree = findings.iter().find(|f| f["id"] == "mem-tree-Browser").unwrap_or_else(|| panic!("{probe}: {case}: missing tree"));
+                assert_eq!(tree["title"], "Browser を根とするプロセス群が 19.5 GB（実メモリの 31%、9 プロセス）");
+                let detail = tree["detail"].as_str().unwrap();
+                assert!(detail.contains("根: Browser（PID 4242）、直下の子 3 本、所有者 ユーザー、群の合計"));
+                assert!(detail.contains(metric));
+                let advice = tree["advice"].as_str().unwrap();
+                assert!(advice.contains("単一プロセスの RSS だけで止める判断はしない"));
+                assert!(advice.contains("依存先を確かめるまで止めない"));
+                assert!(tree.get("action").is_none());
+                assert!(tree.get("commands").is_none());
+            }
+        }
+    }
 
     #[test]
     fn cache_accounting_regressions() {

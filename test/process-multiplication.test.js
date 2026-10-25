@@ -411,12 +411,37 @@ test('所見: プロセス木は群の合計・根・所有者・子の数を示
   ];
   const f = analyze(mac({ trees, apps: [{ app: 'Dup', mem_mb: 20 * 1024, count: 9, cpu: 1 }] }));
   const t = f.filter((x) => x.id.startsWith('mem-tree-'));
-  assert.deepEqual(t.map((x) => x.id), ['mem-tree-BigApp'], 'システム所有・2 プロセス・mem-hog と重なる根は出さない');
+  assert.deepEqual(t.map((x) => x.id), ['mem-tree-BigApp', 'mem-tree-Dup'], 'システム所有・2 プロセスは除き、同名アプリの警告があっても根を残す');
   assert.match(t[0].title, /15\.0 GB.*23%.*40 プロセス/);
   assert.match(t[0].detail, /根: BigApp（PID 4242）.*直下の子 12 本.*所有者 ユーザー.*群の合計/);
   assert.match(t[0].advice, /単一プロセスの RSS だけで止める判断はしない/);
   assert.equal(t[0].action, undefined);
   assert.equal(f.some((x) => x.action && /^(proc-|mem-tree)/.test(x.id)), false, '終了の操作は付けない');
+});
+
+test('所見: 同名アプリの集計があっても、木ごとの合計・帰属と停止しない注意を残す', () => {
+  const cases = [
+    { name: '同じ合計', apps: [{ app: 'Browser', mem_mb: 20000, count: 9 }], hog: true },
+    { name: '名前別の合計は木より大きい', apps: [{ app: 'Browser', mem_mb: 40000, count: 18 }], hog: true },
+    { name: '同名アプリが所見の上位3件外', apps: ['First', 'Second', 'Third', 'Browser'].map((app) => ({ app, mem_mb: 20000, count: 9 })), hog: false },
+  ];
+  for (const [snapshot, metric] of [[mac, 'RSS'], [win, 'ワーキングセット']]) {
+    for (const c of cases) {
+      const findings = analyze(snapshot({ apps: c.apps, trees: [
+        { root: 'Browser', pid: 4242, owner: 'user', count: 9, children: 3, mem_mb: 20000 },
+      ] }));
+      assert.equal(findings.some((f) => f.id === 'mem-hog-Browser'), c.hog, c.name);
+      const tree = findings.find((f) => f.id === 'mem-tree-Browser');
+      assert.ok(tree, c.name);
+      assert.equal(tree.title, 'Browser を根とするプロセス群が 19.5 GB（実メモリの 31%、9 プロセス）');
+      assert.match(tree.detail, /根: Browser（PID 4242）、直下の子 3 本、所有者 ユーザー、群の合計/);
+      assert.ok(tree.detail.includes(metric));
+      assert.match(tree.advice, /単一プロセスの RSS だけで止める判断はしない/);
+      assert.match(tree.advice, /依存先を確かめるまで止めない/);
+      assert.equal(tree.action, undefined);
+      assert.equal(tree.commands, undefined);
+    }
+  }
 });
 
 test('出力に本文・引数・環境変数・パスを持ち込まない: 所見は鍵・名前・数だけから作る', () => {
