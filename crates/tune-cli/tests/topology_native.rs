@@ -13,7 +13,10 @@ fn sandbox() -> std::path::PathBuf {
     ))
 }
 fn launch(arguments: &[&str], base: &std::path::Path) -> std::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_tune"))
+    launch_program(arguments, base, std::path::Path::new(env!("CARGO_BIN_EXE_tune")))
+}
+fn launch_program(arguments: &[&str], base: &std::path::Path, program: &std::path::Path) -> std::process::Child {
+    Command::new(program)
         .args(arguments)
         .env("KATALA_TUNE_CONFIG", base.join("config/nodes.json"))
         .env("KATALA_TUNE_DATA_DIR", base.join("data"))
@@ -82,7 +85,7 @@ fn native_partial_input_remains_finite_without_eof_or_private_state() {
 
 #[cfg(windows)]
 mod native_windows {
-    use super::{finite, launch, sandbox};
+    use super::{finite, launch_program, sandbox};
     use std::{
         io::{Read, Write},
         os::windows::io::{AsRawHandle, BorrowedHandle, OwnedHandle},
@@ -117,9 +120,16 @@ mod native_windows {
         git: PathBuf,
         head: String,
         approved: Vec<u8>,
+        program: PathBuf,
+        program_sha256: String,
+        program_lease: Option<std::fs::File>,
     }
     impl Fixture {
         fn new(approved: Vec<u8>) -> Self {
+            Self::from_program(approved, Path::new(env!("CARGO_BIN_EXE_tune")))
+        }
+
+        fn from_program(approved: Vec<u8>, program: &Path) -> Self {
             // PATH is fixture setup discovery only. The product receives this
             // canonical absolute executable and an explicit complete environment.
             let git = std::env::split_paths(&std::env::var_os("PATH").expect("Windows fixture PATH"))
@@ -131,7 +141,25 @@ mod native_windows {
                 .unwrap();
             let base = sandbox();
             std::fs::create_dir(&base).unwrap();
-            let mut fixture = Self { repo: base.join("repo"), base, git, head: String::new(), approved };
+            // Cargo can publish another target/debug/tune.exe after releasing
+            // its build lock while this integration executable is still running.
+            // Approve one fixture-owned copy and deny replacement through every
+            // role; never combine a cached hash with the mutable Cargo path.
+            let approved_program = base.join("approved-helper.exe");
+            std::fs::copy(program, &approved_program).unwrap();
+            use std::os::windows::fs::OpenOptionsExt;
+            let program_lease =
+                std::fs::OpenOptions::new().read(true).share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ).open(&approved_program).unwrap();
+            let mut fixture = Self {
+                repo: base.join("repo"),
+                base,
+                git,
+                head: String::new(),
+                approved,
+                program_sha256: tune_core::db::sha256_hex(&std::fs::read(&approved_program).unwrap()),
+                program: approved_program,
+                program_lease: Some(program_lease),
+            };
             std::fs::create_dir(&fixture.repo).unwrap();
             fixture.git(&["init", "--quiet"]);
             fixture.git(&["config", "remote.origin.url", "https://example.org/native-fixture.git"]);
@@ -208,7 +236,7 @@ mod native_windows {
                     }],
                 }]),
                 python_program: String::new(),
-                windows_reader_program: Some(normal(Path::new(env!("CARGO_BIN_EXE_tune")))),
+                windows_reader_program: Some(normal(&self.program)),
                 git_program: Some(normal(&self.git)),
                 observed_at_ms: tune_core::db::now_ms(),
                 limits: TopologyLimits { file_bytes: 4 * 1024 * 1024, stdout_bytes: 16 * 1024 * 1024, ..Default::default() },
@@ -236,21 +264,26 @@ mod native_windows {
     impl Drop for Fixture {
         fn drop(&mut self) {
             // This unique directory was created exclusively by this fixture.
+            self.program_lease.take();
             let _ = std::fs::remove_dir_all(&self.base);
         }
     }
 
-    fn artifact() -> (String, String) {
-        (normal(Path::new(env!("CARGO_BIN_EXE_tune"))), tune_core::db::sha256_hex(&std::fs::read(env!("CARGO_BIN_EXE_tune")).unwrap()))
+    fn artifact(fixture: &Fixture) -> (String, String) {
+        (normal(&fixture.program), fixture.program_sha256.clone())
     }
 
     fn spawn_entry(fixture: &Fixture, entry: &str, budget: &str, digest: &str) -> Child {
-        let (program, _) = artifact();
+        spawn_entry_at(fixture, entry, budget, digest, &fixture.program)
+    }
+
+    fn spawn_entry_at(fixture: &Fixture, entry: &str, budget: &str, digest: &str, executable: &Path) -> Child {
+        let program = normal(executable);
         let mut args = vec![entry, "--budget-ms", budget];
         if matches!(entry, "topology-supervise" | "topology-verify") {
             args.extend(["--reader-program", &program, "--helper-sha256", digest]);
         }
-        launch(&args, &fixture.base)
+        launch_program(&args, &fixture.base, executable)
     }
 
     struct RetainedChild {
@@ -277,9 +310,13 @@ mod native_windows {
     }
 
     fn run(fixture: &Fixture, entry: &str, request: &ReaderRequest, trailing: bool, digest: &str) -> (Output, RetainedChild, Vec<u8>) {
+        run_at(fixture, entry, request, trailing, digest, &fixture.program)
+    }
+
+    fn run_at(fixture: &Fixture, entry: &str, request: &ReaderRequest, trailing: bool, digest: &str, executable: &Path) -> (Output, RetainedChild, Vec<u8>) {
         let frame = reader::encode_request(request).unwrap();
         let end = Instant::now() + Duration::from_millis(request.budget_ms + 5000);
-        let mut child = spawn_entry(fixture, entry, &request.budget_ms.to_string(), digest);
+        let mut child = spawn_entry_at(fixture, entry, &request.budget_ms.to_string(), digest, executable);
         let identity = retained_identity(&child);
         let stdout = bounded_reader(child.stdout.take().unwrap(), 18 * 1024 * 1024 + reader::MAX_RESPONSE_HEADER_BYTES);
         let stderr = bounded_reader(child.stderr.take().unwrap(), request.limits.stderr_bytes);
@@ -342,12 +379,49 @@ mod native_windows {
     }
 
     #[test]
+    fn native_fixture_keeps_approved_helper_when_build_output_changes_between_roles() {
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let builder = Fixture::new(MANIFEST.to_vec());
+        let build_output = builder.base.join("mutable-build.exe");
+        std::fs::copy(env!("CARGO_BIN_EXE_tune"), &build_output).unwrap();
+        let fixture = Fixture::from_program(MANIFEST.to_vec(), &build_output);
+        let (_, digest) = artifact(&fixture);
+        let before = fixture.snapshot();
+        let request = fixture.request(30_000);
+        let (reader_output, _, _) = run(&fixture, ENTRIES[0], &request, false, &digest);
+        assert!(reader_output.status.success());
+
+        // Model an external Cargo build publishing different executable bytes.
+        // This is our disposable source copy, never the real build output.
+        let mut rebuilt = std::fs::read(&build_output).unwrap();
+        rebuilt.extend_from_slice(b"native-fixture-rebuild-overlay");
+        std::fs::write(&build_output, &rebuilt).unwrap();
+        let rebuilt_digest = tune_core::db::sha256_hex(&rebuilt);
+        assert_ne!(rebuilt_digest, digest);
+        let end = Instant::now() + Duration::from_secs(10);
+        assert!(tune_core::collect::PinnedWindowsExecutable::open(&build_output, &digest, end).is_err());
+        assert!(tune_core::collect::PinnedWindowsExecutable::open(&build_output, &rebuilt_digest, end).is_ok());
+        for entry in ["topology-supervise", "topology-verify"] {
+            let request = fixture.request(30_000);
+            let (rejected, _, _) = run_at(&fixture, entry, &request, false, &digest, &build_output);
+            assert_eq!(rejected.status.code(), Some(2), "stale approval at the rebuilt path must fail closed");
+            assert!(rejected.stdout.is_empty() && rejected.stderr.is_empty());
+            let (approved, _, _) = run(&fixture, entry, &request, false, &digest);
+            assert!(approved.status.success(), "fixture-approved helper must survive external build publication: {entry} code={:?}", approved.status.code());
+            assert!(approved.stderr.is_empty());
+            assert_eq!(tune_core::db::sha256_hex(&std::fs::read(&fixture.program).unwrap()), digest);
+        }
+        assert!(fixture.snapshot() == before);
+        fixture.assert_private_state_absent();
+    }
+
+    #[test]
     fn native_three_entries_use_real_git_and_process_one_frame_without_eof() {
         let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture = Fixture::new(MANIFEST.to_vec());
         let before = fixture.snapshot();
         assert!(!before.3.is_empty(), "fixture must actually be dirty");
-        let (_, digest) = artifact();
+        let (_, digest) = artifact(&fixture);
         let mut failed_roles = Vec::new();
         for entry in ENTRIES {
             let request = fixture.request(30_000);
@@ -397,7 +471,7 @@ mod native_windows {
     fn native_entries_reject_wrong_helper_hash_source_drift_and_invalid_utf8() {
         let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture = Fixture::new(MANIFEST.to_vec());
-        let (_, digest) = artifact();
+        let (_, digest) = artifact(&fixture);
         for entry in ["topology-supervise", "topology-verify"] {
             let request = fixture.request(30_000);
             let before = fixture.snapshot();
@@ -436,7 +510,7 @@ mod native_windows {
         let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let fixture = Fixture::new(MANIFEST.to_vec());
         let before = fixture.snapshot();
-        let (_, digest) = artifact();
+        let (_, digest) = artifact(&fixture);
         for entry in ENTRIES {
             let mut request = fixture.request(30_000);
             assert_ne!(request.git_artifact_sha256.as_deref(), Some("0".repeat(64).as_str()));
@@ -527,7 +601,7 @@ mod native_windows {
         assert!(git_metadata_before.contains_key(Path::new("config")));
         assert!(git_metadata_before.keys().any(|path| path.starts_with("worktrees")));
 
-        let (_, digest) = artifact();
+        let (_, digest) = artifact(&fixture);
         // Exercise the independent verifier once, without repeating all roles.
         let (output, _retained, _) = run(&fixture, "topology-verify", &request, true, &digest);
         assert!(output.status.success(), "native Unicode/worktree verification must exit zero: code={:?}", output.status.code());
@@ -651,7 +725,7 @@ mod native_windows {
         let fixture = Fixture::new(approved);
         let request = fixture.request(30_000);
         let before = fixture.snapshot();
-        let (_, digest) = artifact();
+        let (_, digest) = artifact(&fixture);
         let started = Instant::now();
         let mut child = spawn_entry(&fixture, "topology-native-reader", "30000", &digest);
         child.stdin.as_mut().unwrap().write_all(&reader::encode_request(&request).unwrap()).unwrap();
