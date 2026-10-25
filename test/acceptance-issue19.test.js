@@ -113,8 +113,9 @@ function fakeTaskHost(dir) {
     const file = stateFile(m[3]);
     if (!fs.existsSync(file)) return { code: 1, out: '', err: 'no such task' };
     if (exec.failNext) { exec.failNext = false; return { code: 1, out: '', err: 'access denied' }; }
+    const before = fs.readFileSync(file, 'utf8') === 'Ready';
     fs.writeFileSync(file, m[1] === 'Disable' ? 'Disabled' : 'Ready');
-    return { code: 0, out: `${fs.readFileSync(file, 'utf8')}\n`, err: '' };
+    return { code: 0, out: `KT_TASK_STATE ${Number(before)} ${Number(m[1] === 'Enable')}\n`, err: '' };
   };
   return { exec, calls, stateFile, state: (name) => fs.readFileSync(stateFile(name), 'utf8') };
 }
@@ -246,8 +247,8 @@ test('条件4: 偽のタスクを止めて（成功）→ 元に戻す（rollbac
   let [row] = t.db.actions();
   assert.deepEqual([row.state, row.ok, row.node_id, row.type], ['ok', true, 'w', 'task-disable']);
   assert.deepEqual(row.params, { path: '\\Katala\\', name: 'Backup' }); // 対象 ID
-  assert.match(row.output, /Disabled/); // 実行後の状態
-  assert.deepEqual(row.undo, { type: 'task-enable', params: { path: '\\Katala\\', name: 'Backup' } }); // 実行前の状態へ戻す操作
+  assert.match(row.output, /KT_TASK_STATE 1 0/); // 実行後の状態
+  assert.deepEqual(row.undo, { type: 'task-enable', params: { path: '\\Katala\\', name: 'Backup', expected_enabled: false } }); // 実行前の状態へ戻す操作
 
   const u = await t.runner.undo(row.id);
   assert.equal(u.ok, true);
@@ -256,7 +257,7 @@ test('条件4: 偽のタスクを止めて（成功）→ 元に戻す（rollbac
   assert.equal(all.length, 2);
   const undoRow = all.find((a) => a.undo_of === row.id);
   assert.deepEqual([undoRow.state, undoRow.type, undoRow.node_id], ['ok', 'task-enable', 'w']);
-  assert.match(undoRow.output, /Ready/);
+  assert.match(undoRow.output, /KT_TASK_STATE 0 1/);
   // 二度は戻さない
   assert.match((await t.runner.undo(row.id)).refused, /すでに元に戻した/);
   assert.equal(t.host.calls.length, 2);
@@ -396,4 +397,17 @@ test('条件3: プロセス終了スクリプトは、名前・起動時刻・�
   } finally {
     child.kill('SIGKILL');
   }
+});
+
+test('task no-op is recorded without a rollback that would change the original state', async () => {
+  const t = setup({ nodes: [nodeOf('w')] });
+  fs.writeFileSync(t.host.stateFile('Backup'), 'Disabled');
+  const r = await t.runner.confirmAndRun('w', disable, 't');
+  assert.equal(r.ok, true);
+  assert.equal(t.host.state('Backup'), 'Disabled');
+  const [row] = t.db.actions();
+  assert.equal(row.undo, null);
+  assert.match((await t.runner.undo(row.id)).refused, /元に戻せる記録が無い/);
+  assert.equal(t.host.state('Backup'), 'Disabled');
+  t.db.db.close();
 });
