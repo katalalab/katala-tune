@@ -155,6 +155,8 @@ mod windows;
 #[cfg(windows)]
 mod windows_pin;
 #[cfg(windows)]
+mod windows_quiescence;
+#[cfg(windows)]
 pub use windows::OwnedWindowsCompletion;
 #[cfg(windows)]
 pub use windows_pin::PinnedWindowsExecutable;
