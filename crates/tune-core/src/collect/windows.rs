@@ -18,7 +18,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use windows_sys::Win32::{
-    Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     Globalization::{CSTR_EQUAL, CSTR_LESS_THAN, CompareStringOrdinal},
     Security::{
         Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
@@ -271,6 +271,12 @@ fn exited(handle: &OwnedHandle) -> io::Result<bool> {
     }
 }
 
+// A terminal code can precede the process object's signal (notably conhost).
+// This is only a hint to continue bounded cleanup, never completion evidence.
+fn terminal_exit_hint(signaled: bool, status: impl FnOnce() -> io::Result<u32>) -> io::Result<bool> {
+    Ok(signaled || status()? != STILL_ACTIVE as u32)
+}
+
 #[cfg(test)]
 type AccountingHook = Box<dyn FnOnce(&Job, &ProcessReceipt) -> io::Result<()> + Send>;
 
@@ -281,6 +287,19 @@ struct Job {
     after_first_accounting: Option<AccountingHook>,
 }
 impl Job {
+    fn descendants_exiting(&self) -> io::Result<bool> {
+        for process in self.processes.iter().skip(1) {
+            if !terminal_exit_hint(exited(&process.handle)?, || {
+                let mut code = 0;
+                // SAFETY: query only this Job's already retained process handle.
+                check(unsafe { GetExitCodeProcess(process.handle.as_raw_handle(), &mut code) })?;
+                Ok(code)
+            })? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
     fn new() -> io::Result<Self> {
         // SAFETY: null name creates a fresh unnamed Job; null attributes prevent inheritance.
         let handle = owned(unsafe { CreateJobObjectW(null(), null()) })?;
@@ -682,8 +701,8 @@ impl Drop for Tasks {
     }
 }
 
-fn lingering_descendants(receipt: &ProcessReceipt) -> bool {
-    receipt.root_exited && !receipt.job_empty && !receipt.observed_exited
+fn lingering_descendants(receipt: &ProcessReceipt, terminal_exits_pending: bool) -> bool {
+    receipt.root_exited && !receipt.job_empty && !receipt.observed_exited && !terminal_exits_pending
 }
 
 #[derive(Default)]
@@ -1016,17 +1035,17 @@ async fn run_inner(
                 receipt.stop = ProcessStop::IoFailure;
             }
         }
-        if lingering_descendants(&receipt) && receipt.stop == ProcessStop::Completed {
-            #[cfg(test)]
-            eprintln!(
-                "owned_lingering root_exited={} job_empty={} observed_exited={} observed={} total={}",
-                receipt.root_exited,
-                receipt.job_empty,
-                receipt.observed_exited,
-                receipt.observed.len(),
-                receipt.total_processes
-            );
-            receipt.stop = ProcessStop::LingeringDescendants;
+        if lingering_descendants(&receipt, false) && receipt.stop == ProcessStop::Completed {
+            match job.descendants_exiting() {
+                // Do not set any receipt evidence from exit codes. The next
+                // ordinary observation must still prove signaled handles,
+                // actual Job emptiness and pipe EOF within the original bounds.
+                Ok(terminal_exits_pending) if lingering_descendants(&receipt, terminal_exits_pending) => {
+                    receipt.stop = ProcessStop::LingeringDescendants;
+                }
+                Ok(_) => {}
+                Err(_) => receipt.stop = ProcessStop::IoFailure,
+            }
         }
         let now = Instant::now();
         // All evidence must have been observed before the fixed execution deadline, even during pipe cleanup.
@@ -1435,8 +1454,41 @@ mod tests {
             receipt.root_exited = root_exited;
             receipt.job_empty = job_empty;
             receipt.observed_exited = observed_exited;
-            assert_eq!(lingering_descendants(&receipt), expected, "root={root_exited} empty={job_empty} observed={observed_exited}");
+            assert_eq!(lingering_descendants(&receipt, false), expected, "root={root_exited} empty={job_empty} observed={observed_exited}");
         }
+    }
+
+    #[test]
+    fn terminal_exit_hint_keeps_running_unknown_and_signaled_259_distinct() {
+        assert!(terminal_exit_hint(false, || Ok(0)).unwrap());
+        assert!(terminal_exit_hint(false, || Ok(1)).unwrap());
+        assert!(!terminal_exit_hint(false, || Ok(259)).unwrap());
+        assert!(terminal_exit_hint(false, || Err(invalid())).is_err());
+        // A signaled process may legitimately have exited with 259. Do not
+        // query/reinterpret its status or convert that code into liveness.
+        assert!(terminal_exit_hint(true, || panic!("a signaled handle needs no exit-code hint")).unwrap());
+        assert!(terminal_exit_hint(true, || Ok(259)).unwrap());
+    }
+
+    #[test]
+    fn terminal_descendant_exit_waits_for_evidence_without_restarting_cleanup() {
+        let start = Instant::now();
+        let mut state = CleanupState::default();
+        let mut receipt = policy_receipt();
+        receipt.observed_exited = false;
+        // Reproduced conhost snapshot: terminal code is reported before its
+        // retained wait signals. This hint cannot authorize output or completion.
+        assert!(!lingering_descendants(&receipt, true), "terminal exit must remain pending rather than being rejected immediately");
+        assert_unknown_payload_is_sealed(&receipt);
+        assert!(!state.advance(&mut receipt, start).terminate);
+        assert!(!state.advance(&mut receipt, start + POLL).terminate);
+        assert_eq!(state.deadline, Some(start + CLEANUP));
+        assert_unknown_payload_is_sealed(&receipt);
+        let expired = state.advance(&mut receipt, start + CLEANUP);
+        assert!(expired.expired && expired.terminate);
+        assert_eq!(receipt.stop, ProcessStop::CleanupUnconfirmed);
+        assert_eq!(state.deadline, Some(start + CLEANUP));
+        assert_unknown_payload_is_sealed(&receipt);
     }
 
     #[test]
@@ -1553,7 +1605,7 @@ mod tests {
         job.observe(&mut receipt).unwrap();
         let diagnostic_started = Instant::now();
         let final_observation_deadline = spawn_deadline.min(diagnostic_started + CLEANUP);
-        assert!(!lingering_descendants(&receipt), "an exited observed root alone is not a live descendant: {receipt:?}");
+        assert!(!lingering_descendants(&receipt, false), "an exited observed root alone is not a live descendant: {receipt:?}");
         let diagnostic_deadline = spawn_deadline.min(diagnostic_started + Duration::from_millis(1000));
         // Diagnostics are separate later observations; never overwrite the receipt under test.
         let retained: Vec<_> = job
@@ -1696,7 +1748,7 @@ mod tests {
         let mut final_receipt = receipt.clone();
         while Instant::now() < final_observation_deadline {
             job.observe(&mut final_receipt).unwrap();
-            assert!(!lingering_descendants(&final_receipt), "no actual observed live descendant is expected");
+            assert!(!lingering_descendants(&final_receipt, false), "no actual observed live descendant is expected");
             if final_receipt.root_exited && final_receipt.observed_exited && final_receipt.job_empty {
                 break;
             }
