@@ -127,7 +127,7 @@ AI のセッション中に落ちた常駐、負荷の高い時間帯との重�
 | 待ち受け | macOS: `nettop -L 1`（root のプロセスも見える。名前は `proc_pidpath` の実行ファイル名）、Windows: `MSFT_NetTCPConnection`・`MSFT_NetUDPEndpoint`（CIM、8 秒で打ち切り） | 全部の口・特定のアドレス・この機体の中に分ける。前回の分析に無かった (プロトコル, プロセス, 番号) で外から届くものを所見に（TCP は注意、UDP は提案）。10000 以上の番号はプロセスごとに1つとして比べる（起動ごとに変わるため）。macOS のファイアウォールが「すべて遮断」なら提案にとどめる |
 | 防御 | macOS: `socketfilterfw`・`spctl --status`・`xprotect version`（無ければバンドルの版）、Windows: `Get-MpComputerStatus`・SecurityCenter2 の `AntiVirusProduct`・`Get-NetFirewallProfile -PolicyStore ActiveStore`・`MSFT_MpThreatDetection` | リアルタイムのウイルス対策が無い（Defender が止まっていて、ほかの製品も動いていない）・Gatekeeper の無効・今つながっているネットワークのファイアウォールの無効は**異常**。定義が 7 日以上古い・XProtect が 45 日以上古い・他のプロファイルのファイアウォールの無効・未解決の検出は注意。隔離・削除済みの検出は提案 |
 | 常駐の増減 | macOS: `~/Library/LaunchAgents`・`/Library/LaunchAgents`・`/Library/LaunchDaemons` の plist（`com.apple.*` も数える）、Windows: `\Microsoft\` 以外のタスク・全サービス（ユーザーごとのサービスの接尾辞はまとめる）・HKCU/HKLM の Run・スタートアップのフォルダ。名前と実行ファイルの名前だけ | 道具の棚卸しと同じ型（初回は記録だけ、取れなかった種類は削除と見なさない）。増えたものは注意。記録は `net_events`（180 日） |
-| ログイン | ログの取り込みに `mac_auth`（統合ログの sshd の `Failed ...` 認証試行を1件ずつ。`Invalid user`・preauth切断・maximumだけの行は重複を避けるため単独では数えない。最大 7 日・300 件）と `win_security`（4625、4624 のうち種別 3・8・10 で送り元のあるもの。読めなければ note と cursor の error に「権限が無い」）を足す。Windows は前回イベントの番号と記録時刻を照合し、消去・番号の再利用や前回イベントの消失を検出したら時刻窓から取り直す。イベント番号と時刻を合わせて重複を防ぐ。`probes/win_logons.ps1` を `win_logs.ps1` と並べて別に流す（取り込みはスクリプトを Base64 にしてコマンド行で渡すので、1 本では 8191 バイトに収まらないため）。送り元のアドレスは provider に入る | 24 時間の失敗が 10 件以上で注意、100 件以上で重大、外部のアドレスからの失敗だけなら提案。外部のアドレスからの成功（7 日）は注意。洪水の所見には数えない |
+| ログイン | ログの取り込みに `mac_auth`（統合ログの sshd の `Failed ...` 認証試行を1件ずつ。`Invalid user`・preauth切断・maximumだけの行は重複を避けるため単独では数えない。最大 7 日・300 件）と `win_security`（4625、4624 のうち種別 3・8・10 で送り元のあるもの。読めなければ note と cursor の error に「権限が無い」）を足す。Windows は前回イベントの番号と記録時刻を照合し、消去・番号の再利用や前回イベントの消失を検出したら時刻窓から取り直す。イベント番号と時刻を合わせて重複を防ぐ。`probes/win_logons.ps1` を `win_logs.ps1` と並べて別に流し、収集の無効化・権限欠測・転送失敗を独立して扱う。送り元のアドレスは provider に入る | 24 時間の失敗が 10 件以上で注意、100 件以上で重大、外部のアドレスからの失敗だけなら提案。外部のアドレスからの成功（7 日）は注意。洪水の所見には数えない |
 | 外向きの接続 | 分析のときに1回。確立した TCP のうち、自分の待ち受けの番号で受けたもの（外から来た接続）とこの機体の中を除く | 機体・プロセスごとに覚え（`net_peers`、30 日見なければ消す）、最初の 7 日は覚えるだけ。新しいプロセス・新しいポート・決まった宛先（10 以下）としか話さないプロセスの新しい宛先を提案に。状態を注意にするのは、外と初めて通信したプロセスが公開アドレスの 80・443 以外へ通信した場合だけ。その他と共用機は提案表示のみ |
 
 - snapshot に宛先は残さない（`outbound`・`persist` は件数だけにする）。宛先・送り元は手元の DB（`net_peers`・ログ）にだけ置く
@@ -188,7 +188,7 @@ Codex の `codex.tool_result` には引数と出力の断片が入るが、受�
 - 対応: probe が、同じ鍵（小文字にして GUID・`0x…`・パス・引用符の中身・数字を伏せたもの。`lib/logs.js` の `fingerprint` と同じ伏せ方）の行を、**代表1行（最初の uid・本文）＋ `count`（実際の件数）＋ 最後に出た時刻**にまとめてから、新しい順に300行の上限を掛ける。上限で切った行が持っていた件数は `dropped` に数える（行数ではなく実際の件数）。`events` に、その回に見た件数の総数を入れる
 - DB: `logs.occurrences`（既定 1）に件数を持つ。署名の合計・洪水の判定・7日の集計・画面の同種ログは `sum(occurrences)`。既存の行は 1 件として数える（古い分は過小のまま）。列は開くときに足す（`lib/db.js`・`db/mod.rs`）
 - 鍵は `lib/logs.js` の `redact` → `fingerprint` と同じ手順で作る（秘密らしい値を伏せる → 1,000 文字で切る → 小文字 → GUID・16進・パス・引用符・数字・空白を伏せる → 400 文字で切る）。`token=alpha` と `token=beta` のように値だけが違う行や、400 文字目以降だけが違う行を別の組にすると、保存側では同じ指紋になるのに300行の枠を使い切るため。`mac_logs.py` は同じ規則を移してあり、`win_logs.ps1` の `Norm` も同じ 7 つの伏せ字と 6 つの正規化を同じ順で持つ。`test/log-resilience.test.js` が、同じ入力（秘密らしい値だけが違う・400 文字目以降だけが違う・数字や GUID だけが違う）で3者の組み分けが一致することを確かめる（`mac_logs.py` は実行、`win_logs.ps1` は文面から手順を取り出して JS で再現。PowerShell 自体は実行しない）
-- PowerShell の正規表現は `\b`・`\s` が Unicode 対応なので、ASCII の範囲外（日本語の直後の `token=` など）では JS と分け方が違いうる。細かく分かれる側に倒れるだけで件数の合計は変わらない。コマンド行に 8191 バイトの上限があるため、`win_logs.ps1` は字下げとコメントを省いている
+- PowerShell の正規表現は `\b`・`\s` が Unicode 対応なので、ASCII の範囲外（日本語の直後の `token=` など）では JS と分け方が違いうる。細かく分かれる側に倒れるだけで件数の合計は変わらない。`win_logs.ps1` の字下げ・コメント省略は旧コマンド行転送の名残で、現在は本体を SSH の標準入力へ渡す
 - 秘密らしい値を増やさない: 持ち出す本文は代表の1件だけ。繰り返しの本文は捨てる。代表行には従来どおり `redact` を掛ける
 - まとめない取り込み元: `mac_diag`（ファイル1つが1件）・`mac_auth` / `win_security`（1試行1件で、送り元ごとの件数が意味を持つ）・`neonmonitor`（行が少ない）。これらは従来どおり行数で300までで、溢れた分は `dropped` に数える
 - 未対応: Windows の `Get-WinEvent` は1回に新しい 2,000 件までしか読まない（`-MaxEvents`）。それを超える洪水は、読めなかった古い側が数えられない。洪水の件数は下限になる
@@ -255,3 +255,11 @@ Windows の GPU 開発機では、メモリ・CPU・ディスクの実消費の�
 - Codex の設定（OpenTelemetry）: https://learn.chatgpt.com/docs/config-file/config-advanced
 - DeepSeek Harness: https://github.com/deepseek-ai/deepseek-harness （dsh-trace・dsh-flow でツールコール・承認・リトライ・圧縮を見せる考え方を参考にする）
 - agentsview（単機のローカルビューア）: https://github.com/kenn-io/agentsview
+
+### Windows ログの SSH 転送
+
+System/Application/NeonMonitor と Security は同じ固定 `win_logs_bootstrap.ps1` を使う。コマンド行にはその UTF-16LE/Base64 だけを置き、8191 バイト未満を検査する。本体は BOM 除去・LF 正規化後に Base64 化し、`KTLOG1`、種別、3つの数値カーソル、バイト長、SHA-256とともに8行の標準入力で渡す。本体は空を拒否し、最大1MiB。bootstrapは行数・種別・カーソルの型と範囲・長さ・canonical Base64・SHA-256・厳密なUTF-8復号をすべて確認してから実行する。SHA-256は転送完全性の確認であり、送り手の認証を追加するものではない。出力は UTF-8（BOMなし）を維持する。
+
+JS/Rust のログ専用runnerは、90秒以内のstdin送信完了・子のexit 0・stdout/stderr両方のEOFを要求する。stdoutは4MiB、stderrは64KiBを上限とし、上限超過・I/O失敗・時間切れ・非0終了ではJSONを採用せず、前回カーソルを保って取得エラーを記録する。成功JSONが先に出ていても同じ。Securityだけが失敗した場合は、完了を確認した他sourceの取り込みを維持する。DBの冪等性は従来の `(node, source, uid)` で保つ。ローカルのファイル実行経路は引き続き既存の実行口を使い、ログ取り込み時には非0終了を拒否する。
+
+`test/log-transport.test.js` は合成データで転送・失敗受理・DB冪等性を検査し、Windows上ではGit Bash→PowerShell 5.1で8191バイト超の本体、空入力、途中切断、破損を実行検査する。`logs::transport::tests::windows_log_transport_parity_matches_js` は共通fixtureでcommand/bootstrap/input、失敗時のカーソル保持とSecurityの部分失敗を両言語で比較する。実機の旧方式との件数比較・配備の承認とは区別する。
