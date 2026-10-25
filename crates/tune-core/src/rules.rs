@@ -166,7 +166,7 @@ static ADVICE: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         ),
         (
             d("^vmmemWSL$|^vmmem$"),
-            "WSL の VM。使い終わったら `wsl --shutdown` でメモリを返す。常時大きいなら %UserProfile%\\.wslconfig の memory で上限を付ける。",
+            "WSL の VM。GPU 計算 PID がある・GPU 使用率が高い・GPU 状態を取得できない、または GPU 学習保護の機体では、`wsl --shutdown` と上限変更の反映を保留する。使い終わったことを確認してからメモリを返す。常時大きいなら %UserProfile%\\.wslconfig の memory で上限を付ける。",
         ),
         (
             d("^(Discord|Slack|Microsoft Teams|ChatGPT|Claude|Notion|Spotify)$"),
@@ -793,7 +793,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 "memory",
                 format!("WSL が {} GB を使っていて上限が無い", gb(vm.get("mem_mb"))),
                 ".wslconfig に memory の指定が無い".into(),
-                "Windows 側が足りなくなる前に上限を付ける。反映前の `wsl --shutdown` は、GPU 計算 PID がある・GPU 使用率が高い・GPU 状態を取得できない場合には実行しない。".into(),
+                "Windows 側が足りなくなる前に上限を付ける。GPU 計算 PID がある・GPU 使用率が高い・GPU 状態を取得できない、または GPU 学習保護の機体では、`wsl --shutdown` と上限変更の反映を保留する。".into(),
                 Some(vec![wslconfig(num(get(get(s, "memory"), "total_gb")))]),
                 None,
             );
@@ -804,7 +804,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 "memory",
                 "WSL のメモリ上限が未設定".into(),
                 "既定では実メモリの半分まで使う".into(),
-                "常用するなら上限と autoMemoryReclaim を設定しておくと、使い終わったメモリが Windows に戻る。反映前の `wsl --shutdown` は GPU 計算中・GPU 活動不明なら保留する。".into(),
+                "常用するなら上限と autoMemoryReclaim を設定しておくと、使い終わったメモリが Windows に戻る。GPU 計算 PID がある・GPU 使用率が高い・GPU 状態を取得できない、または GPU 学習保護の機体では、`wsl --shutdown` と上限変更の反映を保留する。".into(),
                 Some(vec![wslconfig(num(or(get(get(s, "memory"), "total_gb"), Some(&Value::from(16)))))]),
                 None,
             );
