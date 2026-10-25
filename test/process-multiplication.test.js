@@ -24,14 +24,15 @@ function runWinGroups(rows) {
   const start = src.indexOf('$mxInterp = ');
   const end = src.indexOf('# Keep $mx');
   assert.ok(start > 0 && end > start);
-  const data = Buffer.from(JSON.stringify(rows)).toString('base64');
+  const data = Buffer.from(JSON.stringify({ rows })).toString('base64');
   const script = `
 $ErrorActionPreference = 'Stop'
-$fixtureRows = @([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${data}')) | ConvertFrom-Json)
+$fixtureData = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${data}')) | ConvertFrom-Json
 function Get-CimInstance {
   param($ClassName, $Property, $OperationTimeoutSec, $ErrorAction, $Filter)
   if ($ClassName -ne 'Win32_Process') { throw 'unexpected CIM class' }
-  $fixtureRows | Select-Object -Property $Property
+  # PS5.1 emits a root JSON array as one pipeline object; enumerate the property explicitly.
+  foreach ($row in $fixtureData.rows) { $row | Select-Object -Property $Property }
 }
 function NsErr($e) { throw $e }
 ${src.slice(start, end)}
