@@ -41,6 +41,8 @@
 //!   tune agent-peers                 ペア済みの tune-agent（公開鍵の指紋だけ）
 //!   tune agent-probe <名前|指紋|addr> ペア済みの tune-agent で調査を 1 回（SSH を使わない。src/agent.rs）
 //!   tune agent-unpair <名前|指紋>    ペア済みの tune-agent を台帳から消す
+//!   tune agent-push <機体> [--file PATH] その機体の ~/.katala-tune/bin へサンプラーを SSH で置く（既定は CLI の隣の tune-agent。
+//!                                    ハブと違う OS の機体へはその OS 用の物を --file で渡す。SHA-256 を確かめてから入れ替える）
 //!
 //! 台帳と DB は Electron 版と同じ場所（KATALA_TUNE_CONFIG・KATALA_TUNE_DATA_DIR で差し替えられる）。
 //! 変更操作（actions）はここからは実行しない（確認ダイアログを通すため、アプリからだけ）。
@@ -66,7 +68,7 @@ use tune_core::{
 
 fn usage() -> ExitCode {
     eprintln!(
-        "使い方: tune <paths|probe|hygiene|logs|ledger|last|power|network|capabilities|specs-local|specs|maintenance-plan|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
+        "使い方: tune <paths|probe|hygiene|logs|ledger|last|power|network|capabilities|specs-local|specs|maintenance-plan|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|agent-push|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
     );
     ExitCode::from(2)
 }
@@ -118,6 +120,27 @@ fn targets(ids: &[String]) -> Result<Vec<nodes::Node>, String> {
         );
     }
     Ok(targets)
+}
+
+/// 指定の機体（1 台）へサンプラーを置く。台帳の除外・SSH 禁止に従い、OS に合わない実行ファイルは送らない
+async fn agent_push(rest: &[String]) -> Result<Value, String> {
+    let usage = || "使い方: tune agent-push <機体> [--file PATH]".to_string();
+    let (mut ids, mut file, mut args) = (Vec::new(), None, rest.iter());
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--file" => file = Some(args.next().ok_or_else(usage)?.clone()),
+            x if x.starts_with('-') => return Err(usage()),
+            x => ids.push(x.to_string()),
+        }
+    }
+    let [id] = ids.as_slice() else { return Err(usage()) };
+    let node = targets(std::slice::from_ref(id))?.into_iter().next().ok_or_else(|| format!("{id}: 運用対象の機体ではない"))?;
+    let (bytes, from) = match &file {
+        Some(p) => (std::fs::read(p).map_err(|e| format!("{p}: {e}"))?, p.clone()),
+        None => (tune_core::helpers::bundled_agent().ok_or("CLI の隣に tune-agent が無い（--file で渡す）")?, "bundled".into()),
+    };
+    let sha256 = tune_core::helpers::push_agent(&node, &bytes).await.map_err(|e| format!("{id}: {e}"))?;
+    Ok(json!({ "node_id": id, "ok": true, "sha256": sha256, "bytes": bytes.len(), "from": from }))
 }
 
 /// 台帳と既存の観測だけ読む。初回閲覧でも見本・DB を作らない
@@ -433,6 +456,7 @@ async fn async_main(args: Vec<String>) -> ExitCode {
             Ok(())
         }
         "hygiene" => hygiene(rest).await,
+        "agent-push" => agent_push(rest).await.map(|v| print(&v)),
         "probe" => match targets(rest) {
             Ok(t) => {
                 let rs = collect::probe_all(&t, |r| {
@@ -649,13 +673,8 @@ async fn async_main(args: Vec<String>) -> ExitCode {
                 let live = Live::new(Arc::new(ProcessRoute), tune_core::monitor::live_opts(e.config().nodes.len()), Box::new(|_| {}));
                 tokio::spawn(live.clone().run_ticker());
                 let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
-                // 同梱のサンプラー（CLI の隣。Windows だけ）があれば、古い機体へ入れ替えを送る（アプリと同じ）
-                let agent = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.join("tune-agent.exe")))
-                    .filter(|_| cfg!(windows))
-                    .and_then(|p| std::fs::read(p).ok())
-                    .map(Arc::new);
+                // 同梱のサンプラー（CLI の隣）があれば、同じ OS の古い機体へ入れ替えを送る（アプリと同じ）
+                let agent = tune_core::helpers::bundled_agent().map(Arc::new);
                 tune_core::monitor::run(e.clone(), live.clone(), |ev| eprintln!("monitor: {ev}"), Some(until), agent).await;
                 let v = tune_core::monitor::dashboard(&e, Some(&live), 60);
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);

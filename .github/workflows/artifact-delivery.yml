@@ -73,9 +73,11 @@ jobs:
           set -euo pipefail
           mkdir src-tauri/binaries
           if [ "$PLATFORM" = macos-arm64 ]; then
-            cargo build --release --locked -p tune-cli --target "$TARGET"
-            cp "target/$TARGET/release/tune" "src-tauri/binaries/tune-$TARGET"
-            printf '%s\n' '{"bundle":{"externalBin":["binaries/tune"]}}' > sidecars.json
+            cargo build --release --locked -p tune-cli -p tune-agent --target "$TARGET"
+            for bin in tune tune-agent; do
+              cp "target/$TARGET/release/$bin" "src-tauri/binaries/$bin-$TARGET"
+            done
+            printf '%s\n' '{"bundle":{"externalBin":["binaries/tune","binaries/tune-agent"]}}' > sidecars.json
           else
             cargo build --release --locked -p tune-cli -p tune-agent --target "$TARGET"
             cp "target/$TARGET/release/tune.exe" "src-tauri/binaries/tune-$TARGET.exe"
@@ -99,6 +101,7 @@ jobs:
           if [ "$PLATFORM" = macos-arm64 ]; then
             app="target/$TARGET/release/bundle/macos/Katala Tune.app"
             cmp "target/$TARGET/release/tune" "$app/Contents/MacOS/tune"
+            cmp "target/$TARGET/release/tune-agent" "$app/Contents/MacOS/tune-agent"
             ditto "$app" "$payload/Katala Tune.app"
             cp -n "$RUNNER_TEMP/katala-source.json" "$payload/Katala Tune.app/Contents/Resources/katala-source.json"
             codesign --force --deep --sign - "$payload/Katala Tune.app"
