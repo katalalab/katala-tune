@@ -44,4 +44,3 @@
 - [x] Implement selection, refresh, copy JSON, search and comparison/details using existing UI conventions.
 - [x] Run `npm run check`, `npm run oss-check -- --history`, actual Mac/Windows collection and rendered UI checks. Expected: pass, or record environmental/baseline limitations precisely.
 - [x] Review full diff, build requested update and provide reviewable artifacts with remaining limitations.
-
