@@ -384,7 +384,10 @@ async fn cancelling_after_root_exit_still_terminates_the_owned_pending_child() {
     }
     assert!(signaled(&run.root) && !signaled(&run.child));
     run.task.abort();
-    assert!(run.task.await.unwrap_err().is_cancelled());
+    match run.task.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => panic!("owned pending invocation finished before cancellation"),
+    }
     let end = deadline(Duration::from_secs(3));
     while !signaled(&run.child) && Instant::now() < end {
         tokio::time::sleep(Duration::from_millis(5)).await;
