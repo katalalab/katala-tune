@@ -45,9 +45,9 @@ Root acquisition addition: Windows PnP `DEVPKEY_Device_BusReportedDeviceDesc` re
 
 ## Task 3: Verify and deliver
 
-- [ ] Obtain independent source/contract review and resolve important findings.
-- [ ] Synchronize version metadata, run focused and full checks, commit immutable runtime source and scan HEAD/history.
-- [ ] Build Windows after checks and Mac from the immutable archive. Validate artifact/source hashes and signatures.
-- [ ] Back up and update six CLIs, the existing Windows application and both existing Mac applications without changing ledgers/login items.
-- [ ] Collect sequentially from all three consoles, reconcile baseline/current results, verify actual UI and remove temporary Windows debugging.
-- [ ] Record acceptance evidence, final history scan and clean Git state.
+- [x] Obtain independent source/contract review and resolve important findings.
+- [x] Synchronize version metadata, run focused and full checks, commit immutable runtime source and scan HEAD/history.
+- [x] Build Windows after checks and Mac from the immutable archive. Validate artifact/source hashes and signatures.
+- [x] Back up and update six CLIs, the existing Windows application and both existing Mac applications without changing ledgers/login items.
+- [x] Collect sequentially from all three consoles, reconcile baseline/current results, verify actual UI and remove temporary Windows debugging.
+- [x] Record acceptance evidence, final history scan and clean Git state.
