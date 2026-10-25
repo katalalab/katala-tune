@@ -334,6 +334,9 @@ fn open_terminal(dir: &Path, script: &str) -> Result<(), String> {
 #[cfg(test)]
 mod regression;
 
+#[cfg(all(test, windows))]
+mod windows_fixture;
+
 #[cfg(test)]
 mod tests {
     use super::*;

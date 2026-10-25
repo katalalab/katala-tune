@@ -1,0 +1,49 @@
+From 5c666c0dfce428d0ec22ea4e212c5fc147af661b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Nicolas=20Hidemaru=20Ogoshi=20/=20=E5=A4=A7=E8=B6=8A?=
+ =?UTF-8?q?=E3=83=8B=E3=82=B3=E3=83=A9=E3=82=B9=E7=A7=80=E4=B8=B8?=
+ <40846197+Nicolas0315@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 05:22:23 +0900
+Subject: [PATCH] test: preserve MSVC discovery paths for isolated fake agent
+ compiler
+
+---
+ crates/tune-core/src/handoff/windows_fixture.rs | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/crates/tune-core/src/handoff/windows_fixture.rs b/crates/tune-core/src/handoff/windows_fixture.rs
+index 265be00..e6ae2bb 100644
+--- a/crates/tune-core/src/handoff/windows_fixture.rs
++++ b/crates/tune-core/src/handoff/windows_fixture.rs
+@@ -59,6 +59,10 @@ fn compiler_environment() -> Vec<(OsString, OsString)> {
+     let mut values: Vec<_> = [
+         "SystemRoot",
+         "WINDIR",
++        // rustc's MSVC discovery uses these to locate VS Installer/vswhere.
++        // Without them it can fall back to an unrelated PATH link.exe.
++        "ProgramFiles(x86)",
++        "ProgramFiles",
+         "TEMP",
+         "TMP",
+         "PATH",
+@@ -103,7 +107,17 @@ async fn supervise() {
+     )
+     .await;
+     assert_owned_cleanup(&result);
+-    assert_eq!(result.code, Some(0), "fake-only rustc failed: {}", String::from_utf8_lossy(&result.stderr));
++    assert_eq!(
++        result.code,
++        Some(0),
++        "fake-only rustc failed: stop={:?} timeout={} limited={} spawn={} stdout={} stderr={}",
++        result.process_receipt.as_ref().map(|receipt| receipt.stop),
++        result.timed_out,
++        result.output_limited,
++        result.spawn_failed,
++        String::from_utf8_lossy(&result.stdout),
++        String::from_utf8_lossy(&result.stderr)
++    );
+     std::fs::copy(fakebin.join("claude.exe"), fakebin.join("codex.exe")).unwrap();
+ 
+     let system_root = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"));
+-- 
+2.56.0
+
