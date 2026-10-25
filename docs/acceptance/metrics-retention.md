@@ -21,3 +21,11 @@ Syntax check, staged gitleaks pre-commit scan, candidate privacy scan, HEAD OSS 
 Parent sequences issue19's shared DB/action changes first. Common DB initialization/migration numbering and monitor prune remain untouched. Rust parity/build, full project suite, Electron embedded Node, application wiring and native verification await the parent slot; none is claimed passing. No release/tag/feed/deployment, external notification, startup registration, host setting/action/process changes, push, PR status change or merge was performed.
 
 The original#34 acceptance remains open: the capacity condition has component-level synthetic evidence only; end-to-end retention is not integrated. Snapshot long-term summaries, mature baseline/normal/degradation/trend and insufficient-data fixtures, event overlays and GUI evidence are still outstanding. The parent alone decides integration/merge order.
+
+## Connected backend follow-up (verification in progress)
+
+Common table registration and actual Store::prune_metrics are now connected; the pre-existing monitor maintenance reaches transactional archiving. JS compatible DB initialization and read APIs coexist with the additive action target column. Snapshot200, GUI/CLI history, baseline and event overlays remain unchanged/unimplemented in this slice.
+
+Focused follow-up:9Rust integration tests (shared7scenarios including logical byte limits/UTF8 ordering/clock rollback and actual Store metadata reader parity),2Rust retry tests,17Node tests passed. Existing DB with action target survives initialization, compaction and reopen. A BLOB source mismatch and a recent-raw clock rollback deletion were each reproduced and repaired. Silent24h suppression after maintenance failure was corrected to monotonic5minute retry, success24h; archive-only and receipt-only failures remain false, old success survives restart and recovery is idempotent. Independent review reports no remaining blockers.
+
+The prior Electron all-suite467pass/22skip and468pass/22skip runs were successful pre-final-stage checks; they do not verify the final clock rollback patch. Final verification follows normal merge of parent main26b86e4 (PR95), then final Electron and full CI. No ordinary app or host has been operated or deployed.

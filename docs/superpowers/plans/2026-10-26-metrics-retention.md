@@ -53,10 +53,10 @@ Interfaces: initialize(db), compact(db,before,now,budget?), query(db,node,since,
 Files: create crates/tune-core/src/db/retention.rs and crates/tune-core/tests/retention.rs; later register in db/mod.rs only after parent clears issue19 schema. Test fixture helper under crates/tune-core/tests/js/.
 Interfaces: equivalent Connection-based functions; shared SQL file; Store::prune_metrics retains its deleted-row result while calling atomic maintenance.
 
-- [ ] Prepare shared literal fixtures and Rust real-SQLite tests before implementation.
-- [ ] Obtain parent schema clearance and Rust test slot; watch focused Rust failure, then implement parity and integration.
+- [x] Prepare shared literal fixtures and Rust real-SQLite tests before implementation.
+- [x] Obtain parent schema clearance and Rust test slot; observe BLOB/registration RED, then parity/Store integration GREEN. Clock rollback literal RED -> cutoff fix GREEN in both implementations.
 - [ ] Run targeted Rust/parity, Electron compatibility and required full check only in assigned slot; report any baseline failures by name.
-- [ ] Obtain fresh independent whole-diff review; fix important findings with RED/GREEN.
+- [x] Obtain fresh independent whole-diff review; P2 silent retry fixed/tested, restart/receipt-only minors fixed/tested. Clock rollback P2 reviewed after literal RED/GREEN; no new blockers.
 - [ ] Commit small verified changes, provide SHA and evidence to parent. Parent decides PR/merge order. Keep #34 open until baseline/events/UI remaining acceptance is satisfied.
 
 ## Execution ledger
@@ -69,3 +69,6 @@ Interfaces: equivalent Connection-based functions; shared SQL file; Store::prune
 - Independent code review: one P2 unsafe SQLite sample-count integer blocked all maintenance. Mixed valid/unsafe count fixture reproduced RangeError; SQL normalization now omits/counts that row before JS conversion. Fresh reviewer rechecked 13/13 with no remaining findings in this slice.
 - Latest focused verification: 13 pass / 0 fail / 0 skip; default row+byte pressure and 500-day six-node fixture run in about 2.4 seconds. Retained 12,804 rows / 1,473,312 logical bytes, allocated DB 2,371,584 bytes, WAL 5,248,912 bytes. These are component fixtures, not application or native acceptance.
 - Task 3 remains gated on parent issue19 schema clearance and heavy-test slot. No common init, monitor, Rust or action changes have been made.
+- Parent approved schema coexistence without private commit import; source integration complete. Final local focused results:9Rust integration/parity,2Rust monitor retry tests,17Node tests. Existing monitor checkpoint schema stays unchanged.
+- Final audit found clock rollback DELETE using old monotonic seal could remove recent raw. Both literal tests reproduced count0vs1; fixed raw cutoff to caller before and late counter to min(before,old seal), kept seal monotonic. Shared scenario7 added and green; independent spot check found no blockers.
+- Latest main dependency is public26b86e4 (PR95). Normal merge is required before final verification and Draft. Earlier Electron full467/22skip and468/22skip receipts precede final rollback fix; final merged-head Electron/CI evidence remains pending.

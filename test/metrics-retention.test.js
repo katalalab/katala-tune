@@ -258,3 +258,61 @@ test('unsafe SQLite sample counts are omitted without blocking valid history', (
   assert.deepEqual(rows(db)[0].v.cpu, { mean: 4, max: 4, minutes: 1 });
   db.close();
 });
+
+test('non-text minute payload is omitted while valid text rows are archived', () => {
+  const db = dbFixture();
+  init(db);
+  put(db, 10 * DAY, 4);
+  db.prepare('INSERT INTO metrics_minute VALUES (?, ?, 60, ?, NULL)').run('fixture', 10 * DAY + 60000, Buffer.from('{"cpu":[9,9]}'));
+  const s = retention.compact(db, 16 * DAY, 30 * DAY);
+  assert.equal(s.omitted_rows, 1);
+  assert.deepEqual(rows(db)[0].v.cpu, { mean: 4, max: 4, minutes: 1 });
+  db.close();
+});
+
+test('compatibility DB initialization preserves an existing action target column', (t) => {
+  const { openDb } = require('../lib/db');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-retention-coexist-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const prior = new DatabaseSync(path.join(dir, 'katala-tune.db'));
+  prior.exec('CREATE TABLE tune_actions(id TEXT PRIMARY KEY,at INTEGER NOT NULL,node_id TEXT NOT NULL,type TEXT NOT NULL,params TEXT,label TEXT,ok INTEGER,output TEXT,undo TEXT,undo_of TEXT,target TEXT)');
+  const target = '{"alias":"example","os":"windows","local":false}';
+  prior.prepare("INSERT INTO tune_actions(id,at,node_id,type,target) VALUES ('fixture-audit',0,'fixture','fixture',?)").run(target);
+  prior.close();
+  const store = openDb(dir);
+  assert.equal(store.db.prepare('SELECT count(*) AS n FROM metrics_retention_state').get().n, 1);
+  assert.equal(store.db.prepare("SELECT target FROM tune_actions WHERE id='fixture-audit'").get().target, target);
+  assert.equal(store.metricsRetention().rows, 0);
+  assert.deepEqual(store.metricsHistory('fixture', 0, DAY, 'hour'), []);
+  store.db.close();
+});
+
+test('compatibility retention status exposes bounded maintenance outcome without writes', (t) => {
+  const { openDb } = require('../lib/db');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-retention-status-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = openDb(dir);
+  const failure = { at: 10, ok: false, category: 'db_busy', next_attempt_at: 300010, last_success_at: null };
+  store.setMeta('metricsRetentionMaintenance', failure);
+  const changes = store.db.prepare('SELECT total_changes() AS n').get().n;
+  assert.deepEqual(store.metricsRetention().maintenance, failure);
+  assert.equal(store.db.prepare('SELECT total_changes() AS n').get().n, changes);
+  store.db.close();
+});
+
+test('clock rollback preserves new recent raw rows below the frozen watermark', () => {
+  const db = dbFixture();
+  init(db);
+  put(db, 10 * DAY, 4);
+  retention.compact(db, 26 * DAY, 40 * DAY);
+  // A twenty-day clock rollback makes this a fresh observation below the old seal.
+  put(db, 20 * DAY, 9);
+  retention.compact(db, 6 * DAY, 20 * DAY);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM metrics_minute').get().n, 1);
+  assert.equal(retention.status(db).late_rows, 0);
+  assert.equal(retention.status(db).sealed_before, 26 * DAY);
+  retention.compact(db, 26 * DAY, 40 * DAY);
+  assert.equal(retention.status(db).late_rows, 1);
+  assert.deepEqual(rows(db)[0].v.cpu, { mean: 4, max: 4, minutes: 1 });
+  db.close();
+});
