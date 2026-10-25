@@ -192,6 +192,11 @@ pub fn validate_report(v: &Value, platform: &str) -> Result<Value, String> {
     Ok(json!({"schema":SCHEMA,"platform":platform,"at":at,"ok":ok,"collector_version":scalar(&v["collector_version"]),"sections":sections}))
 }
 
+/// A shared node needs an explicit specs-only read opt-in; other shared policies remain intact.
+pub fn enabled(node: &Node) -> bool {
+    node.get("specs") != Some(&Value::Bool(false)) && (!node.shared || node.get("specs") == Some(&Value::Bool(true)))
+}
+
 pub fn select(nodes: &[Node], ids: &[String]) -> Result<Vec<Node>, String> {
     if ids.len() > 64 || ids.iter().any(|id| !nodes.iter().any(|n| &n.id == id)) {
         return Err("未知の機体です".into());
@@ -204,8 +209,8 @@ pub fn select(nodes: &[Node], ids: &[String]) -> Result<Vec<Node>, String> {
         if let Some(reason) = n.refusal() {
             return Err(reason);
         }
-        if n.shared || n.get("specs") == Some(&Value::Bool(false)) {
-            return Err("共用機または台帳で収集を停止した機体です".into());
+        if !enabled(n) {
+            return Err("共用機の詳細仕様には台帳の specs: true が必要です。specs: false の機体は収集しません".into());
         }
         if !n.is_mac() && !n.is_windows() {
             return Err("macOS / Windows のみ対応しています".into());

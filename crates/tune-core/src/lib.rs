@@ -56,4 +56,5 @@ pub mod prices;
 pub mod rules;
 pub mod specs;
 pub mod topology;
+pub mod version_inventory;
 pub mod wsl;

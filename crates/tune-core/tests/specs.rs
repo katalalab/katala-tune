@@ -174,3 +174,16 @@ fn windows_displays_keep_model_and_manufacturer_without_edid_serials() {
     assert_eq!(fields["manufacturer"], "ABC");
     assert!(!r.to_string().contains("PRIVATE"));
 }
+
+#[test]
+fn shared_machine_requires_explicit_specs_read_opt_in_and_keeps_shared_policy() {
+    let mut raw = json!({"id":"shared","alias":"example","os":"windows","shared":true});
+    let node = Node::from_value(&raw, "none");
+    assert!(specs::select(&[node], &["shared".into()]).is_err());
+    raw["specs"] = json!(true);
+    let node = Node::from_value(&raw, "none");
+    assert!(node.shared);
+    assert_eq!(specs::select(&[node], &["shared".into()]).unwrap().len(), 1);
+    raw["status"] = json!("paused");
+    assert!(specs::select(&[Node::from_value(&raw, "none")], &["shared".into()]).is_err());
+}

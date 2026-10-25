@@ -8,6 +8,8 @@ Rustの `tune specs-local` は台帳・DBを開かず、その機体の読取結
 
 `tune specs [機体ID ...]` はローカルまたは既存SSH接続で収集し、私有DBに最新の成功結果と最終試行を保存する。引数省略時は稼働中の非共用機が対象。画面では明示的に選択した機体のみを収集する。台帳の `specs: false`、共用機、退役・一時停止・対象外の機体は収集を拒否する。
 
+`tune specs --saved [機体ID ...]` は収集せず保存済みの仕様・最終試行を表示する。既存DBを読取専用で開き、未作成なら欠測として返す。`tune specs --help`、`tune --version`、機械向けの `tune version --json`・`tune cli-info --json`、全機体の版照合 `tune versions` は [CLIの使い方](cli.md)を参照。
+
 遠隔機の `~/.katala-tune/bin/tune`（Windowsは `tune.exe`）にも、この機能を含むRust CLIが必要。見つからなければPATH上のCLIを試す。古いCLIやSSHの失敗は画面で案内し、前回の成功結果を消さない。収集時にはバイナリの自動配布を行わない。通常のアプリ更新で同梱CLIも更新する。
 
 収集は1回限りで、4機体ずつ処理する。遠隔機は1台120秒、WindowsのCIMは100秒、macOSの各providerは22秒、標準出力は2MiBを上限とする。セクションは最大256件。閲覧だけでは再収集せず、24時間以上前の結果と失敗後の前回値には要更新を表示する。

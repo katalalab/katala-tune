@@ -46,6 +46,8 @@
 //! 変更操作（actions）はここからは実行しない（確認ダイアログを通すため、アプリからだけ）。
 
 mod agent;
+mod discovery;
+mod specs;
 mod topology_native;
 mod topology_reader;
 
@@ -304,6 +306,9 @@ async fn live(rest: &[String]) -> Result<(), String> {
 fn main() -> ExitCode {
     let started = std::time::Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = discovery::run(&args) {
+        return code;
+    }
     if args.first().is_some_and(|cmd| cmd == "topology-reader") {
         return topology_reader::main(&args[1..], started);
     }
@@ -329,27 +334,14 @@ async fn async_main(args: Vec<String>) -> ExitCode {
         return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
     }
     let res: Result<(), String> = match cmd.as_str() {
-        "specs" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
-            Ok(e) => {
-                let ids = if rest.is_empty() {
-                    e.config()
-                        .nodes
-                        .iter()
-                        .filter(|n| n.is_active() && !n.shared && n.get("specs") != Some(&Value::Bool(false)))
-                        .map(|n| n.id.clone())
-                        .collect()
-                } else {
-                    rest.to_vec()
-                };
-                match e.specs_refresh(ids).await {
-                    Ok(v) => {
-                        print(&v);
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                }
+        "specs" => specs::run(rest).await.map(|v| print(&v)),
+        "versions" => match specs::audit_targets(rest) {
+            Ok(selected) => {
+                let report = tune_core::version_inventory::audit(selected).await;
+                print(&report);
+                if report["ok"] == true { Ok(()) } else { Err("CLI の版照合に不一致または取得失敗があります".into()) }
             }
-            Err(e) => Err(e),
+            Err(error) => Err(error),
         },
         "topology-refresh" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
             Ok(e) => match topology_node_ids(rest, false) {
