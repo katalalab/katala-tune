@@ -2071,7 +2071,7 @@ mod tests {
     fn install_launch_fixture(dir: &std::path::Path, case: &str, bytes: &[u8]) -> Option<PathBuf> {
         let name = crate::helpers::exe("tune-agent");
         let beside = dir.join("owned app").join(&name);
-        let managed = dir.join("synthetic-home/.katala-tune/bin").join(&name);
+        let managed = dir.join("synthetic-home").join(".katala-tune").join("bin").join(&name);
         assert_eq!(std::env::current_exe().unwrap().parent().unwrap(), beside.parent().unwrap());
         assert_eq!(crate::helpers::bin_dir(), managed.parent().unwrap());
         #[cfg(not(windows))]
