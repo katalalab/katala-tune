@@ -192,6 +192,7 @@ function MxKey([string]$exe, [string[]]$tokens) {
   $label = $null
   $i = 0
   $options = $true
+  $launcher = $true
   while ($i -lt $tokens.Count) {
     $t = [string]$tokens[$i]
     if ($options -and $t -ceq '--') { $options = $false; $i++; continue }
@@ -205,7 +206,13 @@ function MxKey([string]$exe, [string[]]$tokens) {
       if ($t.Contains('=') -or ($mxValueless[$family] -ccontains $t)) { $i++; continue }
       break
     }
-    if ($options -and ($mxSkip[$exe] -ccontains $t)) { $i++; continue }
+    if ($options -and $launcher -and ($mxSkip[$exe] -ccontains $t)) {
+      if ($exe -eq 'uv' -and $t -ceq 'tool') {
+        if ($i + 1 -ge $tokens.Count -or $tokens[$i + 1] -cne 'run') { break }
+        $i++
+      }
+      $i++; $launcher = $false; continue
+    }
     if ($exe -eq 'git' -and $t -cne 'fsmonitor--daemon') { break }
     $label = MxLabel ($t -replace '(?<=.)@[^@/\\]*$', '')
     break

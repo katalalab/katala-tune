@@ -169,6 +169,7 @@ def proc_key(exe, tokens, flat=False):
     label = None
     i = 0
     options = True
+    launcher = True
     while i < len(tokens):
         t = tokens[i]
         if options and t == "--":
@@ -194,8 +195,13 @@ def proc_key(exe, tokens, flat=False):
                 i += 1
                 continue
             break
-        if options and t in SKIP_WORDS.get(exe, set()):
+        if options and launcher and t in SKIP_WORDS.get(exe, set()):
+            if exe == "uv" and t == "tool":
+                if tokens[i + 1:i + 2] != ["run"]:
+                    break
+                i += 1
             i += 1
+            launcher = False
             continue
         # ps command= は argv の区切りを失う。後続があれば、空白入りパスの断片かもしれない。
         if flat and i != len(tokens) - 1 and not (exe == "git" and t == "fsmonitor--daemon"):
