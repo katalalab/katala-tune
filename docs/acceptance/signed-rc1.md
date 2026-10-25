@@ -41,9 +41,26 @@ Failed private-harness attempts were retained: the node-local marker was initial
 
 The exact published CLI returned network-enabled snapshots on three non-excluded Windows machines. Two reported no new detections. The third reported `Behavior:Win32/DefenseEvasion.A!ml` (threat ID `2147738096`) at `2026-10-25T07:16:18.427Z`; event 1117 confirms successful quarantine at `07:16:41.939Z`, and that test copy is absent. Runtime acceptance therefore **failed** on that machine, despite its preceding clean static scan and returned snapshot.
 
-Defender's `Process Name` field names Process Lasso. This does not establish it as the cause or as the detecting engine. Process Lasso/ProcessGovernor had identical binaries on all three machines, version `18.4.0.48`, with valid Bitsum signatures. The affected machine used cloud block level High and controlled folder access; the unaffected machine with the same Defender engine and intelligence version used different policy settings. These are observed correlations, not a causal diagnosis. No relevant process-access trace was available to establish the interaction.
+### Local CLI / Process Lasso investigation
 
-No Defender policy, exclusion, Process Lasso rule or quarantine state was changed. The affected copy was not restored or retried. This new behavioral detection is distinct from the historical Bearfoos detection of an older agent. Neither has a Microsoft false-positive verdict. A sanitized analysis report and exact public artifacts are prepared privately; no sample has been submitted.
+Read-only inspection of the affected machine's existing Defender support log establishes a narrower relationship than the event's `Process Name` alone. The mini-filter recorded Process Lasso opening the exact CLI file with `Reason: OnOpen`, and Defender blocked that file access. It is evidence of a file-open request, not evidence of process-memory access, injection, or Process Lasso launching the CLI.
+
+| Time (UTC, 2026-10-25) | Existing local log evidence |
+| --- | --- |
+| 07:16:00.196 | CLI path receives an engine `lofi/sample/expensive` result; cloud requests follow |
+| 07:16:15 | Behavior-monitor telemetry for a PowerShell child lists the CLI and SSH/bash ancestry; Process Lasso is absent from that recorded ancestry |
+| 07:16:17.648–17.657 | Dynamic signature receipt follows a cloud request |
+| 07:16:18.292–18.425 | An SDN query explicitly names the published CLI's full SHA-256 above and completes |
+| 07:16:18.426 | Engine blocks the CLI, threat ID `0x8003e1f0`, signature sequence `0x26673684da86` |
+| 07:16:18.430 | Mini-filter names `ProcessLasso.exe` as the process for the blocked CLI file-open, `Reason: OnOpen` |
+| 07:16:18.433–18.437 | Realtime detection and `Behavior:Win32/DefenseEvasion.A!ml` detection-add are recorded |
+| 07:16:41.939 | Operational event 1117 confirms successful quarantine |
+
+Process Lasso/ProcessGovernor had identical binaries on all three machines, version `18.4.0.48`, with valid Bitsum signatures. Both processes were present on the two machines without a new CLI detection as well as on the affected machine. Thus their presence alone does not explain the difference. The affected machine used cloud block level High and controlled folder access; one unaffected machine had the same Defender engine and intelligence version but different policy settings. Readback of both unaffected machines found no new threat detections and no matching CLI-path/hash entries in the inspected support logs. Absence of those entries does not prove that no file-open occurred.
+
+The established relationship is that Process Lasso was the requester of a file-open blocked by Defender. The logs do not expose which behavior or classifier feature caused the verdict, nor whether removing Process Lasso would change it. Cloud/signature timing and policy differences remain correlations. No controlled stop/start comparison was performed: ordinary applications and agents were active on the affected machine, and the quarantined copy was not restored or retried. Raw support logs, process inventories and paths remain private.
+
+No Defender policy, exclusion, Process Lasso rule or quarantine state was changed. Investigation used existing local records; no sample or analysis report was manually submitted to Microsoft or another analysis service. Existing Defender cloud protection remained enabled and its automatic requests are visible in the log. Microsoft submission is on hold at the user's explicit instruction. This new behavioral detection is distinct from the historical Bearfoos detection of an older agent; neither has a Microsoft false-positive verdict.
 
 ## Remaining release gates
 
