@@ -1322,7 +1322,6 @@ sys.stderr.write('z');sys.stderr.flush();time.sleep(3)"#,
         assert_eq!(exchange.await.unwrap().code, Some(7));
     }
 
-    #[cfg(unix)]
     #[test]
     fn local_probe_uses_selected_helper_directory_and_rejects_relative_or_parent_paths() {
         let root = std::env::temp_dir().join("katala-qa-fixture");
@@ -1332,6 +1331,7 @@ sys.stderr.write('z');sys.stderr.flush();time.sleep(3)"#,
         assert!(local_probe_path(&root.join("..").join("live-bin")).is_err());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn fixed_windows_probe_launches_exact_arguments_with_empty_stdin() {
         use std::os::unix::fs::PermissionsExt;
