@@ -155,11 +155,17 @@ $agents = @($list | Where-Object { $_.name -match '^(claude|codex|opencode|curso
 
 # Process multiplication and trees (issues 38 and 30). Read-only. Command lines are read only for interpreters (node, python, git ...)
 # to build a short key (exe:script name); the command line itself is never output. Owner: session 0 (services and SSH logons) = system, otherwise user.
-$mxInterp = '^(node|nodejs|bun|deno|python3?|py|uv|uvx|npx|bunx|npm|pnpm|ruby|java|javaw|git)$'
+$mxInterp = '^(node|nodejs|bun|deno|python3?(\.\d+)?|py|uv|uvx|npx|bunx|npm|pnpm|ruby|java|javaw|git)$'
 $mxGeneric = @('index', 'main', 'cli', 'server', 'bin', 'run', 'app', 'start', 'dist', 'build', 'lib', 'src', 'out', 'node_modules', '__main__')
 $mxSkip = @('exec', 'run', 'x', 'dlx', 'tool', 'start')
-# Options known to take no value. Any other option may be followed by a value (a token etc.), so stop reading there.
-$mxValueless = @('-y', '--yes', '-q', '--quiet', '--silent', '-u', '-B', '-E', '-s', '-S', '-I', '-O', '-OO', '-i', '--no-warnings', '--no-deprecation', '--trace-warnings', '--enable-source-maps', '--inspect', '--')
+# Options are interpreter-specific: Python -I takes no value, but Ruby -I takes a path.
+$mxValueless = @{
+  python = @('-q', '-u', '-B', '-E', '-s', '-S', '-I', '-O', '-OO', '-i')
+  node = @('--no-warnings', '--no-deprecation', '--trace-warnings', '--enable-source-maps', '--inspect', '-i')
+  npx = @('-y', '--yes', '-q', '--quiet', '--silent'); bunx = @('-y', '--yes')
+  npm = @('-y', '--yes', '-q', '--quiet', '--silent', '-s'); pnpm = @('--silent', '-s')
+  uv = @('-q', '--quiet'); uvx = @('-q', '--quiet')
+}
 $mxLaunchers = @('explorer', 'services', 'wininit', 'winlogon', 'svchost', 'sihost', 'csrss', 'smss', 'userinit', 'System', 'Idle', 'sshd')
 # Label = the script file name; for a generic name (index.js ...) only the package directly under node_modules.
 # Arbitrary parent directories (project or customer names) are never used.
@@ -181,18 +187,24 @@ function MxLabel([string]$path) {
 }
 function MxKey([string]$exe, [string[]]$tokens) {
   if ($exe -notmatch $mxInterp) { return $exe.Substring(0, [Math]::Min(48, $exe.Length)) }
+  $exe = $exe.ToLowerInvariant()
+  $family = $exe; if ($exe -like 'python*') { $family = 'python' } elseif ($exe -eq 'nodejs') { $family = 'node' }
   $label = $null
   $i = 0
   while ($i -lt $tokens.Count) {
     $t = [string]$tokens[$i]
-    if ($t -ceq '-m' -and $i + 1 -lt $tokens.Count) { $label = MxLabel (($tokens[$i + 1] -split '\.')[0]); break }
+    if ($t -ceq '-m' -and $family -eq 'python' -and $i + 1 -lt $tokens.Count) {
+      if ($tokens[$i + 1] -cmatch '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$') { $label = MxLabel (($tokens[$i + 1] -split '\.')[0]) }
+      break
+    }
     if ($t -ceq '-c' -and $exe -like 'python*') { break }
-    if (($t -ceq '-c' -or $t -ceq '-C' -or $t -ceq '-r' -or $t -ceq '--require') -and ($exe -eq 'git' -or $exe -eq 'node')) { $i += 2; continue }
+    if (($exe -eq 'git' -and ($t -ceq '-c' -or $t -ceq '-C')) -or ($family -eq 'node' -and ($t -ceq '-r' -or $t -ceq '--require'))) { $i += 2; continue }
     if ($t.StartsWith('-')) {
-      if ($t.Contains('=') -or ($mxValueless -ccontains $t)) { $i++; continue }
+      if ($t.Contains('=') -or $t -ceq '--' -or ($mxValueless[$family] -ccontains $t)) { $i++; continue }
       break
     }
     if ($mxSkip -contains $t) { $i++; continue }
+    if ($exe -eq 'git' -and $t -cne 'fsmonitor--daemon') { break }
     $label = MxLabel ($t -replace '(?<=.)@[^@/\\]*$', '')
     break
   }
@@ -247,7 +259,7 @@ try {
     if (-not $t) { $t = @{ root = $x.name; pid = $x.pid; sys = $x.sys; count = 0; kb = 0.0; children = [int]$kids[$x.pid] }; $th[$x.pid] = $t }
     $t.count++; $t.kb += $r.kb
   }
-  $mxGroups = @($gh.Values | Where-Object { $_.count -ge 3 } | ForEach-Object {
+  $mxGroups = @($gh.Values | Where-Object { $_.count -ge 3 -or ($_.orphans -ge 2 -and $_.key -match 'mcp') } | ForEach-Object {
     $top = $null
     if ($_.parents.Count -gt 0) { $top = ($_.parents.GetEnumerator() | Sort-Object @{ e = 'Value'; Descending = $true }, @{ e = 'Name'; Descending = $false } | Select-Object -First 1).Key }
     $own = 'mixed'; if ($_.sys -eq 0) { $own = 'user' } elseif ($_.usr -eq 0) { $own = 'system' }
