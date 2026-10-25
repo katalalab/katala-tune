@@ -565,3 +565,37 @@ async fn internal_error_result_has_reason_like_other_failures() {
     assert_eq!(results[0]["reason"], json!("error"));
     assert_eq!(results[0]["reason_text"], json!(reason_text("error")));
 }
+
+#[tokio::test]
+async fn undo_refuses_a_reassigned_original_target_and_legacy_audit() {
+    for replacement in [
+        json!({"id":"w","alias":"mock-other","os":"windows"}),
+        {
+            let mut n = node_json("w");
+            n["action_helper"]["attempt"] = json!(2);
+            n
+        },
+        json!({"id":"w","alias":"mock-w","os":"macos"}),
+        {
+            let mut n = node_json("w");
+            n["local_hostname"] = json!(tune_core::nodes::local_host());
+            n
+        },
+    ] {
+        let s = setup(&[node_json("w")], &[]);
+        s.engine.confirm_and_run_with(s.host.as_ref(), "w", &disable(), "t", None, approve(true, || {})).await.unwrap();
+        let original = s.engine.with_db(|d| d.actions(1000)).unwrap()[0].clone();
+        assert!(!original["undo"].is_null());
+        write_ledger(&s.ledger, &[replacement], &[]);
+        let reopened = Engine::open(s.ledger.clone(), s.dir.join("data"), Arc::new(NoHost)).unwrap();
+        let r = reopened.undo_with(s.host.as_ref(), original["id"].as_str().unwrap(), approve(true, || {})).await.unwrap();
+        assert_eq!(r["ok"], false);
+        assert!(r["refused"].as_str().unwrap().contains("接続先"));
+        assert_eq!(s.host.calls.load(Ordering::SeqCst), 1);
+    }
+    let s = setup(&[node_json("w")], &[]);
+    s.engine.with_db(|d| d.add_action(&json!({"id":"legacy","at":1,"node_id":"w","type":"task-disable","params":disable()["params"],"ok":true,"undo":{"type":"task-enable","params":disable()["params"]}}))).unwrap();
+    let r = s.engine.undo_with(s.host.as_ref(), "legacy", approve(true, || {})).await.unwrap();
+    assert_eq!(r["ok"], false);
+    assert_eq!(s.host.calls.load(Ordering::SeqCst), 0);
+}

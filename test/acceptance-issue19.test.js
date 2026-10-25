@@ -399,6 +399,38 @@ test('条件3: プロセス終了スクリプトは、名前・起動時刻・�
   }
 });
 
+// Audit binds the original configured route; it does not attest remote host identity.
+test('rollback refuses a changed route or helper after reopening the audit DB', async () => {
+  for (const replacement of [nodeOf('w', { alias: 'mock-other' }), nodeOf('w', { action_helper: { ...helper(), attempt: 2 } }), nodeOf('w', { os: 'macos' }), nodeOf('w', { local_hostname: os.hostname().replace(/\.local$/, '') })]) {
+    const t = setup({ nodes: [nodeOf('w')] });
+    await t.runner.confirmAndRun('w', disable, 't');
+    const original = t.db.actions()[0];
+    assert.ok(original.undo);
+    t.writeLedger([replacement]);
+    const reopened = openDb(path.join(t.dir, 'data'));
+    let confirmations = 0;
+    const runner = makeRunner({ db: reopened, loadConfig: () => loadConfig(t.ledger), confirm: async () => { confirmations++; return true; }, exec: t.host.exec });
+    const r = await runner.undo(original.id);
+    assert.equal(r.ok, false);
+    assert.match(r.refused, /接続先|記録/);
+    assert.equal(t.host.calls.length, 1);
+    assert.equal(reopened.actions().some(a => a.undo_of === original.id && a.ok), false);
+    assert.equal(confirmations, 0);
+    reopened.db.close(); t.db.db.close();
+  }
+});
+
+test('rollback refuses legacy records without an original target', async () => {
+  const t = setup({ nodes: [nodeOf('w')] });
+  t.db.addAction({ id: 'legacy', at: 1, node_id: 'w', type: 'task-disable', params: disable.params, ok: true, undo: { type: 'task-enable', params: disable.params } });
+  const r = await t.runner.undo('legacy');
+  assert.equal(r.ok, false);
+  assert.match(r.refused, /接続先|記録/);
+  assert.equal(t.host.calls.length, 0);
+  assert.equal(t.confirmations.length, 0);
+  t.db.db.close();
+});
+
 test('task no-op is recorded without a rollback that would change the original state', async () => {
   const t = setup({ nodes: [nodeOf('w')] });
   fs.writeFileSync(t.host.stateFile('Backup'), 'Disabled');
@@ -410,4 +442,16 @@ test('task no-op is recorded without a rollback that would change the original s
   assert.match((await t.runner.undo(row.id)).refused, /元に戻せる記録が無い/);
   assert.equal(t.host.state('Backup'), 'Disabled');
   t.db.db.close();
+});
+
+test('same-route rollback survives audit reopen and restores the original state', async () => {
+  const t = setup({ nodes: [nodeOf('w')] });
+  await t.runner.confirmAndRun('w', disable, 't');
+  const [original] = t.db.actions();
+  const reopened = openDb(path.join(t.dir, 'data'));
+  const runner = makeRunner({ db: reopened, loadConfig: () => loadConfig(t.ledger), confirm: async () => true, exec: t.host.exec });
+  assert.equal((await runner.undo(original.id)).ok, true);
+  assert.equal(t.host.state('Backup'), 'Ready');
+  assert.equal(reopened.actions().some(a => a.undo_of === original.id && a.ok), true);
+  reopened.db.close(); t.db.db.close();
 });

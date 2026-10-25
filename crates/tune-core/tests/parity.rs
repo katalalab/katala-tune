@@ -1000,7 +1000,7 @@ fn write_spec(now: i64) -> Value {
         .collect();
     let actions = json!([
         { "id": "1-a", "at": now - 5000, "node_id": "n1", "type": "kill-process", "params": { "pid": 500, "name": "Google Drive" }, "label": "n1: 終了", "ok": true, "output": "終了を確認した", "undo": null, "undo_of": null },
-        { "id": "2-b", "at": now - 4000, "node_id": "n2", "type": "set-power-plan", "params": { "guid": rules::HIGH_PERF_GUID }, "label": "n2: 高パフォーマンス", "ok": true, "output": "完了", "undo": { "type": "set-power-plan", "params": { "guid": rules::BALANCED_GUID } }, "undo_of": null },
+        { "id": "2-b", "at": now - 4000, "node_id": "n2", "target": ["mock-power", "windows", false, null], "type": "set-power-plan", "params": { "guid": rules::HIGH_PERF_GUID }, "label": "n2: 高パフォーマンス", "ok": true, "output": "完了", "undo": { "type": "set-power-plan", "params": { "guid": rules::BALANCED_GUID } }, "undo_of": null },
         { "id": "3-c", "at": now - 3000, "node_id": "n2", "type": "set-power-plan", "params": { "guid": rules::BALANCED_GUID }, "label": "n2: 元に戻す", "ok": false, "output": "失敗（exit 1）", "undo_of": "2-b" }
     ]);
     let logs: Vec<Value> = (0..6)
@@ -1177,6 +1177,8 @@ fn db_files_are_interchangeable_with_electron() {
         "同じ操作で書いた DB の中身が違う（左: Rust が書いた、右: JS が書いた）\n{}",
         diff(&stable(rust_written.clone()), &stable(js_written_by_rust.clone()))
     );
+    let saved_target = rust_written["actions"].as_array().unwrap().iter().find(|a| a["id"] == "2-b").unwrap();
+    assert_eq!(saved_target["target"], json!(["mock-power", "windows", false, null]));
     // 4) 伏せ字が効いていて、全文検索も通る
     let q = rust_written["query:1"].as_array().unwrap();
     assert!(!q.is_empty() && q.iter().all(|r| !r["message"].as_str().unwrap().contains("ghp_aaa")));
