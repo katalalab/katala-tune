@@ -19,6 +19,8 @@ use crate::collect;
 use crate::db::{now_ms, sha256_hex};
 use crate::nodes::Node;
 
+mod binary;
+
 /// この版（アプリ・CLI・サンプラーはワークスペースで同じ版）
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -140,11 +142,10 @@ pub fn agent_outdated(node: &Node, brief: Option<&Value>) -> bool {
 
 /// 送る物がその機体の OS の実行ファイルか（Windows は PE、macOS は Mach-O の 64 ビットか universal）
 pub fn agent_binary_fits(node: &Node, bytes: &[u8]) -> Result<(), String> {
-    let head = bytes.get(..4).unwrap_or_default();
     let ok = if node.is_windows() {
-        head.starts_with(b"MZ")
+        binary::windows_executable(bytes)
     } else if node.is_mac() {
-        head == [0xcf, 0xfa, 0xed, 0xfe] || head == [0xca, 0xfe, 0xba, 0xbe]
+        binary::mac_executable(bytes)
     } else {
         return Err(format!("この OS（{}）へはサンプラーを送らない", node.os));
     };
@@ -154,6 +155,10 @@ pub fn agent_binary_fits(node: &Node, bytes: &[u8]) -> Result<(), String> {
 /// サンプラーを SSH の標準入力で送り、SHA-256 を確かめてから入れ替える。
 /// Windows の既定シェルは Git Bash（collect.rs と同じ）。macOS は sha256sum が無い版があるので shasum を使う
 pub async fn push_agent(node: &Node, bytes: &[u8]) -> Result<String, String> {
+    push_agent_with(node, bytes, &collect::System).await
+}
+
+async fn push_agent_with(node: &Node, bytes: &[u8], runner: &dyn collect::Runner) -> Result<String, String> {
     if let Some(err) = node.refusal() {
         return Err(err);
     }
@@ -166,7 +171,7 @@ pub async fn push_agent(node: &Node, bytes: &[u8]) -> Result<String, String> {
          && {mode}{{ [ ! -e {name} ] || mv -f {name} {name}.old-{stamp}; }} && mv -f {name}.new {name} \
          && {{ rm -f {name}.old-* 2>/dev/null; true; }} && echo pushed-{hash}"
     );
-    let r = collect::run("ssh", &collect::ssh_args(&node.alias, &remote), Some(bytes), Duration::from_secs(120)).await;
+    let r = runner.run("ssh", &collect::ssh_args(&node.alias, &remote), Some(bytes), Duration::from_secs(120)).await;
     if r.out.contains(&format!("pushed-{hash}")) {
         Ok(hash)
     } else {
@@ -226,14 +231,77 @@ mod tests {
     #[test]
     fn pushed_binaries_must_fit_the_os() {
         let n = |os: &str| Node::from_value(&json!({"id": "x", "alias": "x", "os": os}), "h");
-        assert!(agent_binary_fits(&n("windows"), b"MZ\x90\0rest").is_ok());
-        assert!(agent_binary_fits(&n("macos"), &[0xcf, 0xfa, 0xed, 0xfe, 7]).is_ok(), "Mach-O 64");
-        assert!(agent_binary_fits(&n("macos"), &[0xca, 0xfe, 0xba, 0xbe, 0]).is_ok(), "universal");
+        assert!(agent_binary_fits(&n("windows"), &binary::fixtures::pe()).is_ok());
+        assert!(agent_binary_fits(&n("macos"), &binary::fixtures::macho()).is_ok(), "Mach-O 64");
+        assert!(agent_binary_fits(&n("macos"), &binary::fixtures::fat(false)).is_ok(), "universal");
         assert!(agent_binary_fits(&n("macos"), b"MZ\x90\0").is_err(), "Windows の物を Mac へ送らない");
         assert!(agent_binary_fits(&n("windows"), &[0xcf, 0xfa, 0xed, 0xfe]).is_err());
         assert!(agent_binary_fits(&n("macos"), b"#!/bin/sh").is_err());
         assert!(agent_binary_fits(&n("linux"), b"\x7fELF").is_err());
         assert!(agent_binary_fits(&n("macos"), b"").is_err());
+    }
+
+    struct FixtureSsh {
+        old_agent: PathBuf,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl collect::Runner for FixtureSsh {
+        fn run<'a>(&'a self, cmd: &'a str, _args: &'a [String], input: Option<&'a [u8]>, _timeout: Duration) -> collect::RunFuture<'a> {
+            Box::pin(async move {
+                assert_eq!(cmd, "ssh");
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let bytes = input.unwrap();
+                std::fs::write(&self.old_agent, bytes).unwrap();
+                collect::RunResult { code: Some(0), out: format!("pushed-{}", sha256_hex(bytes)), err: String::new() }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_agent_inputs_never_reach_ssh_or_replace_the_existing_agent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("kt-agent-push-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ssh = FixtureSsh { old_agent: dir.join("agent-fixture"), calls: AtomicUsize::new(0) };
+        let old = b"existing sampler fixture";
+        std::fs::write(&ssh.old_agent, old).unwrap();
+        let node = |os, status| Node::from_value(&json!({"id": "fixture", "alias": "unused-fixture", "os": os, "status": status}), "not-local");
+        let mut rejected = binary::fixtures::rejected();
+        for (os, b) in [
+            ("windows", binary::fixtures::pe()),
+            ("macos", binary::fixtures::macho()),
+            ("macos", binary::fixtures::fat(false)),
+            ("macos", binary::fixtures::fat(true)),
+        ] {
+            for length in [0, 4, b.len() - 1] {
+                rejected.push((os, "truncated input", b[..length].to_vec()));
+            }
+        }
+        for (os, label, b) in rejected {
+            assert!(push_agent_with(&node(os, "online"), &b, &ssh).await.is_err(), "{os}: {label}");
+            assert_eq!(ssh.calls.load(Ordering::SeqCst), 0, "{os}: {label}");
+            assert_eq!(std::fs::read(&ssh.old_agent).unwrap(), old, "{os}: {label}");
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no staging or backup files");
+        }
+        for status in ["retired", "no-ssh", "paused", "out-of-scope", "invalid"] {
+            assert!(push_agent_with(&node("macos", status), &binary::fixtures::macho(), &ssh).await.is_err());
+        }
+        assert_eq!(ssh.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&ssh.old_agent).unwrap(), old);
+        // Positive controls establish that valid inputs use the same transport.
+        for (os, b) in [
+            ("windows", binary::fixtures::pe()),
+            ("macos", binary::fixtures::macho()),
+            ("macos", binary::fixtures::fat(false)),
+            ("macos", binary::fixtures::fat(true)),
+        ] {
+            assert_eq!(push_agent_with(&node(os, "online"), &b, &ssh).await.unwrap(), sha256_hex(&b));
+            assert_eq!(std::fs::read(&ssh.old_agent).unwrap(), b);
+        }
+        assert_eq!(ssh.calls.load(Ordering::SeqCst), 4);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
