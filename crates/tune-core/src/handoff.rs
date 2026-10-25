@@ -83,11 +83,13 @@ pub fn find(last: &[Value], node_id: &str, finding_id: &str) -> Result<(Value, V
     if r.get("ok").and_then(Value::as_bool) != Some(true) {
         return Err(format!("{node_id} の最新の分析は失敗している"));
     }
-    let f = r
-        .get("findings")
-        .and_then(Value::as_array)
-        .and_then(|fs| fs.iter().find(|f| f.get("id").and_then(Value::as_str) == Some(finding_id)))
-        .ok_or_else(|| "この所見は最新の分析に無い（分析し直して消えた可能性がある）".to_string())?;
+    let missing = || "この所見は最新の分析に無い（分析し直して消えた可能性がある）".to_string();
+    let findings = r.get("findings").and_then(Value::as_array).ok_or_else(missing)?;
+    let mut matches = findings.iter().filter(|f| f.get("id").and_then(Value::as_str) == Some(finding_id));
+    let f = matches.next().ok_or_else(missing)?;
+    if matches.next().is_some() {
+        return Err("所見 ID が重複して対象を特定できない。分析し直してください".into());
+    }
     Ok((r.clone(), f.clone()))
 }
 
@@ -362,6 +364,34 @@ mod tests {
         assert!(find(&last(), "a", "gone").unwrap_err().contains("最新の分析に無い"));
         assert!(find(&last(), "b", "x").unwrap_err().contains("失敗"));
         assert!(find(&last(), "z", "x").unwrap_err().contains("分析結果が無い"));
+    }
+
+    #[test]
+    fn duplicate_requested_finding_ids_are_refused_in_either_order() {
+        for pids in [[101, 202], [202, 101]] {
+            let rows = [json!({"node_id": "a", "ok": true, "findings": [
+                {"id": "mem-tree-fixture", "detail": format!("PID {}", pids[0])},
+                {"id": "mem-tree-fixture", "detail": format!("PID {}", pids[1])}
+            ]})];
+            assert!(find(&rows, "a", "mem-tree-fixture").unwrap_err().contains("重複"));
+        }
+    }
+
+    #[test]
+    fn unique_finding_selection_is_scoped_to_the_requested_node_and_id() {
+        for findings in [
+            json!([{"id": "tree-202", "detail": "PID 202"}]),
+            json!([{"id": "tree-101", "detail": "PID 101"}, {"id": "tree-202", "detail": "PID 202"}]),
+            json!([{"id": "other", "detail": "PID 101"}, {"id": "other", "detail": "PID 303"}, {"id": "tree-202", "detail": "PID 202"}]),
+        ] {
+            let rows = [
+                json!({"node_id": "a", "ok": true, "findings": findings}),
+                json!({"node_id": "b", "ok": true, "findings": [{"id": "tree-202", "detail": "PID 909"}]}),
+            ];
+            let (result, finding) = find(&rows, "a", "tree-202").unwrap();
+            assert_eq!(result["node_id"], "a");
+            assert_eq!(finding["detail"], "PID 202");
+        }
     }
 
     #[test]
