@@ -303,6 +303,9 @@ fn open_terminal(dir: &Path, script: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
+mod regression;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
