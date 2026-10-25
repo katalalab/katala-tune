@@ -18,6 +18,7 @@ pub mod metrics;
 mod monitor_events;
 mod netsec;
 pub mod provenance;
+pub mod retention;
 mod snapshots;
 mod topology;
 
@@ -59,6 +60,7 @@ const SCHEMA_PARTS: &[&str] = &[
     provenance::SCHEMA,
     ai_limits::SCHEMA,
     metrics::SCHEMA,
+    retention::SCHEMA,
     monitor_events::SCHEMA,
     topology::SCHEMA,
 ];
