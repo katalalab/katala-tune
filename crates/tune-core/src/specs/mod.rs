@@ -34,6 +34,10 @@ pub(super) fn scalar(v: &Value) -> Option<Value> {
 
 /// Only these named fields can cross the remote boundary or enter the private DB.
 pub const FIELDS: &[&str] = &[
+    "cluster0_name",
+    "cluster0_cores",
+    "cluster1_name",
+    "cluster1_cores",
     "model",
     "manufacturer",
     "part_number",
@@ -160,7 +164,8 @@ pub fn validate_report(v: &Value, platform: &str) -> Result<Value, String> {
             let fields: Map<String, Value> =
                 fields.iter().filter(|(k, _)| FIELDS.contains(&k.as_str())).filter_map(|(k, v)| scalar(v).map(|v| (k.clone(), v))).collect();
             let name = scalar(&c["name"]).and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| (*id).into());
-            components.push(component(&name, &source, fields));
+            let component_source = scalar(&c["source"]).and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| source.clone());
+            components.push(component(&name, &component_source, fields));
         }
         sections.insert((*id).into(), section(components, status, &source));
     }

@@ -3,6 +3,7 @@
 const SpecsModel = (() => {
   const categories = {system:'本体',cpu:'CPU',memory:'メモリ',gpu:'GPU',storage:'ストレージ',board:'マザーボード',firmware:'ファームウェア',os:'OS',display:'ディスプレイ',network:'ネットワーク',usb:'USB',thunderbolt:'Thunderbolt / USB4',pci:'PCI',audio:'オーディオ',settings:'機能・設定'};
   const labels = {model:'型番・モデル',manufacturer:'メーカー',part_number:'部品番号',slot:'スロット',cores:'物理コア',threads:'論理スレッド',p_cores:'Pコア',e_cores:'Eコア',architecture:'アーキテクチャ',max_clock_mhz:'OS報告の最大クロック (MHz)',current_clock_mhz:'取得時クロック (MHz)',l2_cache_kib:'L2キャッシュ (KiB)',l3_cache_kib:'L3キャッシュ (KiB)',capacity_bytes:'容量',total_capacity_bytes:'合計容量',capacity:'OS表記の容量',rated_speed_mts:'公称転送速度 (MT/s)',configured_speed_mts:'設定転送速度 (MT/s)',memory_type:'メモリ種別',form_factor:'フォームファクター',data_width_bits:'データ幅 (bit)',voltage_mv:'設定電圧 (mV)',memory_kind:'メモリ方式',dedicated_vram_bytes:'専用VRAM容量',vram:'OS表記のVRAM',driver_version:'ドライバー版',driver_date:'ドライバー日付',firmware_version:'ファームウェア版',bios_date:'BIOS日付',interface:'インターフェース',media_type:'媒体',link_speed:'リンク速度',status:'デバイス状態',resolution:'解像度',refresh_hz:'リフレッシュレート (Hz)',vendor_id:'ベンダーID',product_id:'製品ID',device_id:'デバイスID',class:'種別',version:'バージョン',build:'ビルド',kernel:'カーネル',metal:'Metal',cuda_version:'CUDA対応版',vbios_version:'VBIOS版',power_limit_w:'電力上限 (W)',pcie_generation:'PCIe世代',pcie_width:'PCIeレーン幅',secure_boot:'セキュアブート',virtualization_firmware:'BIOS仮想化',hypervisor_present:'ハイパーバイザー',slat:'SLAT',power_plan:'電源プラン',low_power_mode:'低電力モード',sleep_minutes:'スリープ (分)',display_sleep_minutes:'画面スリープ (分)',disk_sleep_minutes:'ディスクスリープ (分)',hibernate_mode:'休止モード',battery_cycles:'充放電回数',battery_condition:'バッテリー状態',battery_max_capacity_pct:'バッテリー最大容量 (%)',xmp_expo:'XMP / EXPO',boot_mode:'起動モード',duplex:'全二重',speed_bps:'リンク速度 (bit/s)',enabled:'有効',dhcp_enabled:'DHCP',mtu_bytes:'MTU (byte)',_coverage:'取得状況',_count:'デバイス数'};
+  Object.assign(labels,{cluster0_name:'CPUクラスタ0 種別',cluster0_cores:'CPUクラスタ0 コア数',cluster1_name:'CPUクラスタ1 種別',cluster1_cores:'CPUクラスタ1 コア数',cuda_cores:'CUDAコア数',dedicated_vram_gib:'公称専用VRAM (GiB)',gpu_core_options:'GPUコア構成の選択肢',memory_bandwidth_options_gbs:'メモリ帯域の選択肢 (GB/s)',neural_engine_cores:'Neural Engineコア数',display_inches:'画面サイズ (インチ)',native_resolution:'パネル解像度',thunderbolt_ports:'Thunderboltポート数',thunderbolt_generation:'Thunderbolt世代',vram_options_gib:'VRAM構成の選択肢 (GiB)',memory_bus_bits:'メモリバス (bit)',max_turbo_ghz:'公称最大ターボ (GHz)',cache_mb:'公称キャッシュ (MB)'});
   const states = {ok:'取得済み',partial:'一部取得',empty:'OSからの報告なし',not_collected:'未取得',permission_denied:'権限不足',unsupported:'未対応',error:'取得失敗',timeout:'時間切れ',tool_missing:'取得ツールなし',output_limit:'取得量の上限'};
   const terms = {unified:'共有メモリ（CPU / GPU）',dedicated:'専用メモリ',unknown:'不明',enabled:'有効',disabled:'無効',balanced:'バランス',high_performance:'高パフォーマンス',power_saver:'省電力',custom_or_unknown:'カスタム／不明',not_exposed_by_standard_provider:'標準APIでは取得不可',not_collected_requires_recovery_policy_inspection:'未取得（Recoveryポリシーの確認が必要）',not_applicable:'対象外'};
   const esc = s => String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -10,6 +11,9 @@ const SpecsModel = (() => {
   function format(k,v) {
     if(v == null || v === '') return '未取得';
     if(typeof v === 'boolean') return v ? '有効' : '無効';
+    if(k==='memory_type' && typeof v==='number') return ({26:'DDR4',30:'LPDDR4',34:'DDR5',35:'LPDDR5'}[v] || `SMBIOS ${v}`);
+    if(k==='form_factor' && typeof v==='number') return ({8:'DIMM',12:'SO-DIMM'}[v] || `SMBIOS ${v}`);
+    if(k.endsWith('_date') && typeof v==='string' && /^\/Date\(-?\d+/.test(v)) return new Date(Number(/-?\d+/.exec(v)[0])).toLocaleDateString('ja-JP');
     if(k.endsWith('capacity_bytes') || k === 'dedicated_vram_bytes') return `${Number((Number(v)/2**30).toFixed(2))} GiB`;
     return terms[v] || (k === '_coverage' ? states[v] : null) || String(v);
   }
@@ -28,7 +32,9 @@ const SpecsModel = (() => {
       for(const field of fields) add(field,sections.map(s=>(s?.components || []).filter(c=>c.fields?.[field] != null).map(c=>({name:c.name,value:c.fields[field],source:c.source}))));
       if(id==='memory' && sections.some(s=>s?.components?.some(c=>typeof c.fields?.capacity_bytes === 'number'))) {
         add('total_capacity_bytes',sections.map(s=>{
-          const items = s?.components || [];
+          const all = s?.components || [];
+          const unified = all.filter(c=>c.fields?.memory_kind==='unified' && typeof c.fields?.capacity_bytes==='number');
+          const items = unified.length ? unified : all;
           const capacities = items.map(c=>c.fields?.capacity_bytes);
           return capacities.length && capacities.every(v=>typeof v==='number') ? [{name:'',value:capacities.reduce((a,b)=>a+b,0)}] : [];
         }));

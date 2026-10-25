@@ -3,6 +3,28 @@
   "verified_at": "2026-10-25",
   "products": [
     {
+      "models": ["Mac17,6", "Mac17,8"],
+      "name": "MacBook Pro 16-inch (M5 Pro or M5 Max, 2026)",
+      "url": "https://support.apple.com/en-us/126319",
+      "identification_url": "https://support.apple.com/en-us/108052",
+      "scope": "Model family specifications; actual CPU/GPU/memory/storage configuration is reported separately",
+      "specifications": {"display_inches": 16.2, "native_resolution": "3456 × 2234", "thunderbolt_ports": 3, "thunderbolt_generation": 5}
+    },
+    {
+      "models": ["Apple M5 Max"],
+      "name": "Apple M5 Max (MacBook Pro configurations)",
+      "url": "https://support.apple.com/en-us/126319",
+      "scope": "Chip family; GPU and bandwidth vary by configuration. Do not infer the installed variant from this catalog",
+      "specifications": {"cores": 18, "gpu_core_options": "32 / 40", "memory_bandwidth_options_gbs": "460 / 614", "neural_engine_cores": 16}
+    },
+    {
+      "models": ["NVIDIA GeForce RTX 5060 Ti"],
+      "name": "NVIDIA GeForce RTX 5060 Ti reference GPU",
+      "url": "https://www.nvidia.com/en-us/geforce/graphics-cards/50-series/rtx-5060-family/",
+      "scope": "Reference GPU family has 8 GB and 16 GB variants; installed VRAM must come from the driver",
+      "specifications": {"cuda_cores": 4608, "vram_options_gib": "8 / 16", "memory_type": "GDDR7", "memory_bus_bits": 128}
+    },
+    {
       "models": ["NVIDIA GeForce RTX 4090"],
       "name": "NVIDIA GeForce RTX 4090 reference GPU",
       "url": "https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf",

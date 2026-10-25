@@ -1,5 +1,7 @@
 # Katala Tune
 
+Tauri版に[Mac / Windowsのスペック比較](docs/machine-specs.md)を追加。Rustで部品・バージョン・構成・設定を収集し、公式仕様の出典・照合状況とともに機体間の差分を表示します。`tune specs-local` は単体収集、`tune specs` は台帳の機体を集約します。
+
 手元の Mac / Windows 機を SSH で並列に調べ、所見と最適化の提案を出し、ログを集めるデスクトップアプリ（Rust ＋ Tauri 2、macOS / Windows）。
 変更を加える操作は許可リストにあるものだけで、毎回確認ダイアログで承認し、実行の直前に状態を確かめ直してから実行する。
 

@@ -56,10 +56,50 @@ $r | ConvertTo-Json -Depth 8 -Compress
 pub async fn collect() -> Value {
     let utf16: Vec<u8> = SCRIPT.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &crate::logs::base64(&utf16)].map(str::to_string);
-    match provider("powershell.exe", &args, 100).await {
+    let mut raw = match provider("powershell.exe", &args, 100).await {
         Ok(raw) => raw,
         Err(e) => json!({"errors":SECTIONS.iter().map(|k| ((*k).to_string(),json!(e))).collect::<Map<String,Value>>()}),
+    };
+    let r = collect::run_bounded(
+        "nvidia-smi",
+        &[
+            "--query-gpu=name,memory.total,vbios_version,power.limit,pcie.link.gen.max,pcie.link.width.max,driver_version".into(),
+            "--format=csv,noheader,nounits".into(),
+        ],
+        &[],
+        Duration::from_secs(8),
+        65536,
+        2048,
+    )
+    .await;
+    if r.code == Some(0) && !r.timed_out && !r.output_limited {
+        let mut gpus = Vec::new();
+        for line in String::from_utf8_lossy(&r.stdout).lines().take(32) {
+            let values: Vec<_> = line.split(',').map(str::trim).collect();
+            if values.len() != 7 {
+                continue;
+            }
+            let mut gpu = json!({"model":values[0]});
+            for (index, field) in [(1, "dedicated_vram_bytes"), (3, "power_limit_w"), (4, "pcie_generation"), (5, "pcie_width")] {
+                if let Ok(n) = values[index].parse::<f64>()
+                    && n.is_finite()
+                    && n >= 0.0
+                {
+                    gpu[field] = json!(if index == 1 { n * 1048576.0 } else { n });
+                }
+            }
+            for (index, field) in [(2, "vbios_version"), (6, "driver_version")] {
+                if !values[index].contains("N/A")
+                    && let Some(v) = scalar(&json!(values[index]))
+                {
+                    gpu[field] = v;
+                }
+            }
+            gpus.push(gpu);
+        }
+        raw["nvidia"] = json!(gpus);
     }
+    raw
 }
 
 type Mapping = &'static [(&'static str, &'static str)];
@@ -186,7 +226,28 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
                 fields.extend(mapped(driver, &[("DriverVersion", "driver_version"), ("DriverDate", "driver_date")]));
             }
             let name = fields.get("model").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("{id} {}", index + 1));
-            components.push(component(&name, source, fields));
+            let mut used_source = (*source).to_string();
+            if *id == "gpu" {
+                let matches: Vec<_> = raw["nvidia"].as_array().into_iter().flatten().filter(|g| g["model"].as_str() == Some(name.as_str())).collect();
+                if matches.len() == 1 && items.iter().filter(|g| g["Name"].as_str() == Some(name.as_str())).count() == 1 {
+                    fields.extend(mapped(
+                        matches[0],
+                        &[
+                            ("dedicated_vram_bytes", "dedicated_vram_bytes"),
+                            ("vbios_version", "vbios_version"),
+                            ("driver_version", "driver_version"),
+                            ("power_limit_w", "power_limit_w"),
+                            ("pcie_generation", "pcie_generation"),
+                            ("pcie_width", "pcie_width"),
+                        ],
+                    ));
+                    if fields.contains_key("dedicated_vram_bytes") {
+                        fields.insert("memory_kind".into(), json!("dedicated"));
+                    }
+                    used_source.push_str(" / nvidia-smi");
+                }
+            }
+            components.push(component(&name, &used_source, fields));
         }
         let status = if items.len() > MAX_COMPONENTS {
             "partial"

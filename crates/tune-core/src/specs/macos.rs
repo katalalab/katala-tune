@@ -29,12 +29,18 @@ pub async fn collect() -> Value {
         }
     }
     // Query only a finite, non-identifying set. Never persist complete command output.
-    for key in ["hw.physicalcpu", "hw.logicalcpu", "hw.perflevel0.physicalcpu", "hw.perflevel1.physicalcpu"] {
+    for key in
+        ["hw.physicalcpu", "hw.logicalcpu", "hw.memsize", "hw.perflevel0.physicalcpu", "hw.perflevel1.physicalcpu", "hw.perflevel0.name", "hw.perflevel1.name"]
+    {
         let r = collect::run_bounded("/usr/sbin/sysctl", &["-n".into(), key.into()], &[], Duration::from_secs(2), 1024, 1024).await;
         if r.code == Some(0)
             && let Ok(n) = String::from_utf8_lossy(&r.stdout).trim().parse::<u64>()
         {
             raw.insert(key.into(), json!(n));
+        } else if r.code == Some(0) && key.ends_with(".name") {
+            if let Some(v) = scalar(&json!(String::from_utf8_lossy(&r.stdout).trim())) {
+                raw.insert(key.into(), v);
+            }
         }
     }
     let r = collect::run_bounded("/usr/bin/pmset", &["-g".into(), "custom".into()], &[], Duration::from_secs(3), 16384, 1024).await;
@@ -96,7 +102,7 @@ fn walk<'a>(items: &'a [Value], out: &mut Vec<&'a Value>, depth: usize) {
         if let Some(children) = v["_items"].as_array() {
             walk(children, out, depth + 1);
         }
-        if let Some(children) = v["spdisplays_ndrvs"].as_array() {
+        if let Some(children) = v["spairport_airport_interfaces"].as_array() {
             walk(children, out, depth + 1);
         }
     }
@@ -139,6 +145,8 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
                     ("sppci_model", "model"),
                     ("spdisplays_vendor", "manufacturer"),
                     ("spdisplays_metal", "metal"),
+                    ("spdisplays_mtlgpufamilysupport", "metal"),
+                    ("sppci_cores", "cores"),
                     ("spdisplays_vram", "vram"),
                     ("spdisplays_resolution", "resolution"),
                     ("spdisplays_refreshRate", "refresh_hz"),
@@ -203,9 +211,14 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
     if let Some(hw) = raw["SPHardwareDataType"].as_array().and_then(|a| a.first()) {
         let mut cpu =
             mapped(hw, &[("chip_type", "model"), ("cpu_type", "model"), ("number_processors", "cores"), ("current_processor_speed", "current_clock_mhz")]);
-        for (key, field) in
-            [("hw.physicalcpu", "cores"), ("hw.logicalcpu", "threads"), ("hw.perflevel0.physicalcpu", "p_cores"), ("hw.perflevel1.physicalcpu", "e_cores")]
-        {
+        for (key, field) in [
+            ("hw.physicalcpu", "cores"),
+            ("hw.logicalcpu", "threads"),
+            ("hw.perflevel0.physicalcpu", "cluster0_cores"),
+            ("hw.perflevel1.physicalcpu", "cluster1_cores"),
+            ("hw.perflevel0.name", "cluster0_name"),
+            ("hw.perflevel1.name", "cluster1_name"),
+        ] {
             if let Some(v) = scalar(&raw[key]) {
                 cpu.insert(field.into(), v);
             }
@@ -217,7 +230,10 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
             section(vec![component("System firmware", "system_profiler SPHardwareDataType", firmware)], "ok", "system_profiler SPHardwareDataType"),
         );
         if unified {
-            let memory = mapped(hw, &[("physical_memory", "capacity")]);
+            let mut memory = mapped(hw, &[("physical_memory", "capacity")]);
+            if let Some(v) = scalar(&raw["hw.memsize"]) {
+                memory.insert("capacity_bytes".into(), v);
+            }
             let mut f = memory;
             f.insert("memory_kind".into(), json!("unified"));
             let entry = sections.get_mut("memory").expect("memory");
@@ -225,6 +241,31 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
             entry["status"] = json!("ok");
         }
     }
+    if let Some(gpus) = raw["SPDisplaysDataType"].as_array() {
+        let mut displays = Vec::new();
+        for gpu in gpus {
+            for display in gpu["spdisplays_ndrvs"].as_array().into_iter().flatten() {
+                let fields = mapped(
+                    display,
+                    &[
+                        ("_name", "model"),
+                        ("_spdisplays_resolution", "resolution"),
+                        ("spdisplays_resolution", "resolution"),
+                        ("spdisplays_pixelresolution", "resolution"),
+                        ("spdisplays_connection_type", "interface"),
+                        ("spdisplays_refreshRate", "refresh_hz"),
+                        ("spdisplays_online", "status"),
+                    ],
+                );
+                let name = fields.get("model").and_then(Value::as_str).unwrap_or("Display");
+                displays.push(component(name, "system_profiler SPDisplaysDataType", fields.clone()));
+            }
+        }
+        let status = if displays.is_empty() { "empty" } else { "ok" };
+        displays.truncate(MAX_COMPONENTS);
+        sections.insert("display".into(), section(displays, status, "system_profiler SPDisplaysDataType"));
+    }
+    sections.insert("board".into(), section(vec![], "unsupported", "system_profiler: board product identifier not exposed"));
     let mut settings = vec![component(
         "Unavailable firmware settings",
         "OS provider coverage",

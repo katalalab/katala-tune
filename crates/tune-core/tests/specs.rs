@@ -94,3 +94,34 @@ fn failed_refresh_retains_last_success_and_tracks_attempt_separately() {
     assert_eq!(row["last_attempt"]["error"], "timeout");
     assert_eq!(row["stale"], true);
 }
+
+#[test]
+fn mac_displays_are_not_gpus_and_super_cores_are_not_efficiency_cores() {
+    let r = specs::normalize(
+        "macos",
+        &json!({
+            "SPHardwareDataType":[{"chip_type":"Apple M5 Max","physical_memory":"64 GB"}],
+            "hw.memsize":68719476736_u64,"hw.physicalcpu":18,"hw.logicalcpu":18,
+            "hw.perflevel0.physicalcpu":6,"hw.perflevel1.physicalcpu":12,
+            "hw.perflevel0.name":"Super","hw.perflevel1.name":"Performance",
+            "SPDisplaysDataType":[{"sppci_model":"Apple M5 Max","spdisplays_ndrvs":[{"_name":"Color LCD","_spdisplays_resolution":"3456 x 2234"}]}]
+        }),
+    );
+    assert_eq!(r["sections"]["gpu"]["components"].as_array().unwrap().len(), 1);
+    assert_eq!(r["sections"]["display"]["components"][0]["fields"]["resolution"], "3456 x 2234");
+    assert!(r["sections"]["cpu"]["components"][0]["fields"]["e_cores"].is_null());
+    assert_eq!(r["sections"]["cpu"]["components"][0]["fields"]["cluster0_name"], "Super");
+    assert_eq!(r["sections"]["memory"]["components"][0]["fields"]["capacity_bytes"], 68719476736_u64);
+}
+
+#[test]
+fn nvidia_smi_provides_large_vram_without_cim_adapterram_guessing() {
+    let r = specs::normalize(
+        "windows",
+        &json!({"gpu":[{"Name":"NVIDIA GeForce RTX 4090","AdapterRAM":4294967295_u64}],"nvidia":[{"model":"NVIDIA GeForce RTX 4090","dedicated_vram_bytes":25757220864_u64,"vbios_version":"EXAMPLE"}]}),
+    );
+    let gpu = &r["sections"]["gpu"]["components"][0];
+    assert_eq!(gpu["fields"]["memory_kind"], "dedicated");
+    assert_eq!(gpu["fields"]["dedicated_vram_bytes"], 25757220864_u64);
+    assert!(gpu["source"].as_str().unwrap().contains("nvidia-smi"));
+}
