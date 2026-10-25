@@ -576,7 +576,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
         .take(2)
     {
         out.add(
-            format!("mem-tree-{}", string(t.get("root"))),
+            format!("mem-tree-{}-{}", string(t.get("root")), string(t.get("pid"))),
             "info",
             "memory",
             format!(
@@ -1037,6 +1037,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn same_name_roots_have_distinct_selectable_ids() {
+        for probe in ["mac", "windows"] {
+            let trees = vec![
+                json!({ "root": "Browser", "pid": 4242, "owner": "user", "count": 9, "children": 3, "mem_mb": 20000 }),
+                json!({ "root": "Browser", "pid": 4343, "owner": "user", "count": 7, "children": 2, "mem_mb": 18000 }),
+            ];
+            for rows in [trees.clone(), trees.into_iter().rev().collect()] {
+                let findings = analyze(
+                    &json!({ "probe": probe, "memory": { "total_gb": 64 }, "processes": {
+                        "apps": [{ "app": "Browser", "mem_mb": 38000, "count": 16 }], "trees": rows
+                    } }),
+                    &json!({}),
+                );
+                let mut ids: Vec<_> = findings.iter().filter_map(|f| f["id"].as_str().filter(|id| id.starts_with("mem-tree-"))).collect();
+                ids.sort_unstable();
+                assert_eq!(ids, ["mem-tree-Browser-4242", "mem-tree-Browser-4343"], "{probe}");
+                let selected = findings.iter().find(|f| f["id"] == "mem-tree-Browser-4343").unwrap();
+                assert!(selected["detail"].as_str().unwrap().contains("根: Browser（PID 4343）、直下の子 2 本"));
+                assert_eq!(selected["title"], "Browser を根とするプロセス群が 17.6 GB（実メモリの 27%、7 プロセス）");
+                assert!(!findings.iter().any(|f| f["id"] == "mem-tree-Browser"));
+            }
+        }
+    }
+
+    #[test]
     fn same_name_app_keeps_tree_attribution() {
         for (probe, metric) in [("mac", "RSS"), ("windows", "ワーキングセット")] {
             for (case, apps, has_hog) in [
@@ -1061,7 +1086,7 @@ mod tests {
                     &json!({}),
                 );
                 assert_eq!(findings.iter().any(|f| f["id"] == "mem-hog-Browser"), has_hog, "{probe}: {case}");
-                let tree = findings.iter().find(|f| f["id"] == "mem-tree-Browser").unwrap_or_else(|| panic!("{probe}: {case}: missing tree"));
+                let tree = findings.iter().find(|f| f["id"] == "mem-tree-Browser-4242").unwrap_or_else(|| panic!("{probe}: {case}: missing tree"));
                 assert_eq!(tree["title"], "Browser を根とするプロセス群が 19.5 GB（実メモリの 31%、9 プロセス）");
                 let detail = tree["detail"].as_str().unwrap();
                 assert!(detail.contains("根: Browser（PID 4242）、直下の子 3 本、所有者 ユーザー、群の合計"));

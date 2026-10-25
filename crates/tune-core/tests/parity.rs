@@ -552,6 +552,19 @@ fn rules_health_logs_actions_match_js() {
 
     // 判定（rules）
     let mut analyze_in: Vec<Value> = fixtures().into_iter().map(|(snap, node)| json!({ "snap": snap, "node": node })).collect();
+    analyze_in.extend(["mac", "windows"].map(|probe| {
+        json!({
+            "snap": {
+                "probe": probe, "memory": { "total_gb": 64 }, "processes": {
+                    "apps": [{ "app": "Browser", "mem_mb": 38000, "count": 16 }],
+                    "trees": [
+                        { "root": "Browser", "pid": 4242, "owner": "user", "count": 9, "children": 3, "mem_mb": 20000 },
+                        { "root": "Browser", "pid": 4343, "owner": "user", "count": 7, "children": 2, "mem_mb": 18000 }
+                    ]
+                }
+            }, "node": {}
+        })
+    }));
     let cache_cases: Value = serde_json::from_str(include_str!("../../../test/fixtures/cache-accounting.json")).unwrap();
     analyze_in.extend(cache_cases.as_array().unwrap().iter().map(|c| json!({ "snap": c["snap"], "node": {} })));
     for gb in [Value::Null, json!("20"), json!(-1), json!(true), json!({}), json!([])] {
