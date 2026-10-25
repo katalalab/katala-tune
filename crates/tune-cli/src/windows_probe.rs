@@ -43,12 +43,16 @@ fn arguments(args: &[String]) -> Option<(String, bool, bool, bool)> {
 /// PowerShell payload invalid.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_payload(benchmark: bool, network: bool, observe_wsl: bool) -> Option<String> {
-    let script = std::str::from_utf8(tune_core::collect::WIN_PROBE).ok()?;
+    let stored = std::str::from_utf8(tune_core::collect::WIN_PROBE).ok()?;
+    // PS5.1 needs a BOM when reading the .ps1 file, but ScriptBlock::Create
+    // receives decoded text: a leading U+FEFF becomes a command before the
+    // header and param block. Strip only the file's encoding marker here.
+    let script = stored.strip_prefix('\u{feff}').unwrap_or(stored);
     let boundary = "param([switch]$NoNetwork, [switch]$ObserveWsl)";
     let switches =
         format!("{boundary}\n$NoNetwork = ${}\n$ObserveWsl = ${}", if network { "false" } else { "true" }, if observe_wsl { "true" } else { "false" },);
     let script = script.replacen(boundary, &switches, 1);
-    if script == std::str::from_utf8(tune_core::collect::WIN_PROBE).ok()? {
+    if !script.contains(&switches) {
         return None;
     }
     if !benchmark {
@@ -201,6 +205,7 @@ mod tests {
             for network in [false, true] {
                 for observe_wsl in [false, true] {
                     let payload = powershell_payload(benchmark, network, observe_wsl).unwrap();
+                    assert!(!payload.starts_with('\u{feff}'), "file BOM must not become a PowerShell command in ScriptBlock::Create");
                     assert_eq!(payload.matches("param([switch]$NoNetwork, [switch]$ObserveWsl)").count(), 1);
                     assert!(payload.contains(if network { "$NoNetwork = $false" } else { "$NoNetwork = $true" }));
                     assert!(payload.contains(if observe_wsl { "$ObserveWsl = $true" } else { "$ObserveWsl = $false" }));
@@ -259,6 +264,20 @@ mod tests {
 
     #[cfg(windows)]
     const SYSTEM32_CMD_NONZERO: &str = "& (Join-Path ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::System)) 'cmd.exe') /c exit 23";
+
+    #[cfg(windows)]
+    #[test]
+    fn actual_probe_header_executes_without_treating_the_file_bom_as_a_command() {
+        let payload = powershell_payload(false, false, false).unwrap();
+        let (header, _) = payload.split_once("\n$os = Get-CimInstance").expect("fixed observation boundary");
+        let fixture = format!("{header}\nWrite-Output 'actual-header'\n");
+        let result = run_probe_payload(&fixture);
+        assert!(result.status.success(), "actual embedded header must execute: {:?}", result.status);
+        assert_eq!(result.stdout, b"actual-header\r\n");
+        let counterfactual = run_probe_payload(&format!("\u{feff}{fixture}"));
+        assert_eq!(counterfactual.status.code(), Some(7), "a file BOM in a string is an executable token, not an encoding marker");
+        assert!(counterfactual.stdout.is_empty());
+    }
 
     #[cfg(windows)]
     #[test]
