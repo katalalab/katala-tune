@@ -53,6 +53,8 @@ function Get-KtEnteredNames { return @($script:Calls | Where-Object { $_ -like '
 
 $inner = "@@mem`nMemTotal:       32870000 kB`nMemAvailable:   16000000 kB`nSwapTotal:       8388608 kB`nSwapFree:       8388000 kB`n@@psi`nsome avg10=1.25 avg60=0.50 avg300=0.10 total=1234`nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0`n@@load`n0.52 0.40 0.30 1/200 999`n@@ps`n  100  2048000  3.5 python3`n  101  1024000  1.0 node`n@@df`n/dev/sdc 1055762868 123456789 875000000 13% /`n@@end`n"
 
+$inner += "@@status mem 0`n@@status psi 0`n@@status load 0`n@@status ps 0`n@@status df 0`n"
+
 # 0. no opt-in: no WSL command is called
 $script:Installed = $true
 $script:Calls.Clear()
@@ -246,5 +248,48 @@ try {
   [void]$dynamicFailures.Add("budget: $($_.Exception.Message)")
 }
 if ($dynamicFailures.Count -gt 0) { throw ($dynamicFailures -join "`n") }
+
+# 14. Section failures stay separate from successful memory and serialize with the snapshot.
+$cases = @(
+  @{ name = 'failed-process'; text = ($inner -replace '@@status ps 0', '@@status ps 127'); key = 'top'; reason = 'command-failed' },
+  @{ name = 'failed-disk'; text = ($inner -replace '@@status df 0', '@@status df 1'); key = 'disk'; reason = 'command-failed' },
+  @{ name = 'unsupported-psi'; text = ($inner -replace '@@status psi 0', '@@status psi 1'); key = 'psi'; reason = 'command-failed' },
+  @{ name = 'missing-process-status'; text = ($inner -replace '@@status ps 0', ''); key = 'top'; reason = 'missing-status' },
+  @{ name = 'malformed-process'; text = ($inner -replace '100  2048000  3.5 python3', 'invalid-row'); key = 'top'; reason = 'invalid-data' },
+  @{ name = 'missing-load'; text = ($inner -replace '0.52 0.40 0.30 1/200 999', ''); key = 'load'; reason = 'invalid-data' },
+  @{ name = 'missing-disk'; text = ($inner -replace '/dev/sdc 1055762868 123456789 875000000 13% /', ''); key = 'disk'; reason = 'invalid-data' }
+)
+foreach ($case in $cases) {
+  $script:Calls.Clear()
+  $script:Script = @{
+    '-l -q' = (New-KtRes "Fixture`r`n")
+    '-l --running -q' = (New-KtRes "Fixture`r`n")
+    '-d Fixture --exec /bin/sh -s' = (New-KtRes $case.text)
+  }
+  $r = Get-KtWslObservation -Enabled $true
+  $d = $r.distros[0]
+  Assert-KtEqual $d.observed $true ($case.name + ': successful memory is retained')
+  Assert-KtEqual $d.inside.mem_total_mb 32100 ($case.name + ': memory')
+  Assert-KtEqual $d.inside.errors[$case.key] $case.reason ($case.name + ': fixed error reason')
+  if ($case.key -eq 'top') { Assert-KtEqual $d.inside.top.Count 0 ($case.name + ': failed/invalid partial rows discarded') }
+  if ($case.key -eq 'disk') { Assert-KtEqual $d.inside.disk.Count 0 ($case.name + ': failed/invalid disk discarded') }
+  if ($case.key -eq 'psi') { Assert-KtTrue ($null -eq $d.inside.psi_some_avg10) ($case.name + ': failed PSI discarded') }
+  if ($case.key -eq 'load') { Assert-KtTrue ($null -eq $d.inside.load1) ($case.name + ': missing load remains null') }
+  $saved = $r | ConvertTo-Json -Depth 10 -Compress | ConvertFrom-Json
+  Assert-KtEqual $saved.distros[0].inside.errors.($case.key) $case.reason ($case.name + ': persisted reason')
+  Assert-KtEqual ((Get-KtEnteredNames) -join ',') 'Fixture' ($case.name + ': no retry/extra entry')
+}
+
+# 15. Successful empty process output is distinct from failed or malformed output.
+$empty = $inner -replace '(?m)^  10[01]  [^\r\n]*', ''
+$inside = ConvertFrom-KtWslInside $empty
+Assert-KtEqual $inside.top.Count 0 'successful empty process list'
+Assert-KtTrue (-not $inside.errors.Contains('top')) 'empty successful process list has no failure'
+$inside = ConvertFrom-KtWslInside $inner
+Assert-KtEqual $inside.errors.Count 0 'complete observation has no section errors'
+Assert-KtEqual $inside.top.Count 2 'complete observation retains processes'
+Assert-KtEqual $inside.disk.Count 1 'complete observation retains disk'
+Assert-KtTrue ($null -eq (ConvertFrom-KtWslInside ($inner -replace '@@status mem 0', '@@status mem 1'))) 'failed memory command cannot publish partial values'
+Assert-KtTrue ($null -eq (ConvertFrom-KtWslInside ($inner -replace 'MemAvailable:   16000000', 'MemAvailable:   99000000'))) 'invalid memory availability is rejected'
 
 Write-Output 'win-wsl-regression: ok'
