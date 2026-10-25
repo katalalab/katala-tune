@@ -58,6 +58,43 @@ fn owned_fixture() {
             drop(ready);
             std::thread::sleep(Duration::from_secs(30));
         }
+        "root-first" => {
+            let directory = std::path::PathBuf::from(std::env::var_os("KATALA_GUARD_QUIET_DIR").unwrap());
+            let _child = fixture_command("root-first-child")
+                .env("KATALA_GUARD_QUIET_DIR", &directory)
+                .env("KATALA_GUARD_ROOT_PID", std::process::id().to_string())
+                .spawn()
+                .unwrap();
+            let end = deadline(Duration::from_secs(5));
+            while !directory.join("release-root").exists() {
+                assert!(Instant::now() < end, "fixture root release deadline");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        "root-first-child" => {
+            let directory = std::path::PathBuf::from(std::env::var_os("KATALA_GUARD_QUIET_DIR").unwrap());
+            let pid = std::env::var("KATALA_GUARD_ROOT_PID").unwrap().parse().unwrap();
+            // Our root remains alive until the test retains this child and releases
+            // it. Retain that exact live root for observation only, never PID mutation.
+            let root = retain_test_child(pid);
+            let mut ready = std::fs::OpenOptions::new().create_new(true).write(true).open(directory.join("child-ready")).unwrap();
+            writeln!(ready, "{}", std::process::id()).unwrap();
+            ready.flush().unwrap();
+            drop(ready);
+            let end = deadline(Duration::from_secs(5));
+            while !signaled(&root) {
+                assert!(Instant::now() < end, "fixture retained root exit deadline");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // This intentional post-root side effect characterizes the new lifetime
+            // policy. It is not evidence that arbitrary descendants are read-only.
+            std::thread::sleep(Duration::from_millis(250));
+            let mut marker = std::fs::OpenOptions::new().create_new(true).write(true).open(directory.join("after-root")).unwrap();
+            marker.write_all(b"post-root fixture write\n").unwrap();
+            drop(marker);
+            std::io::stdout().write_all(b"natural-child-exit\n").unwrap();
+            std::io::stdout().flush().unwrap();
+        }
         "close-exit" => close_fixture_outputs(),
         "early-eof" => {
             close_fixture_outputs();
@@ -181,6 +218,83 @@ async fn root_exit_with_lingering_descendant_is_a_failure_with_ack() {
     assert!(result.stdout.is_empty());
     assert_ack(&result, ProcessStop::LingeringDescendants);
     assert!(result.process_receipt.as_ref().unwrap().total_processes >= 2);
+}
+
+struct QuiescenceDirectory(std::path::PathBuf);
+impl QuiescenceDirectory {
+    fn new() -> Self {
+        let name =
+            format!("katala-root-first-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let directory = std::env::temp_dir().join(name);
+        std::fs::create_dir(&directory).unwrap();
+        Self(directory)
+    }
+}
+impl Drop for QuiescenceDirectory {
+    fn drop(&mut self) {
+        // Only this create-new fixture directory, after the owned invocation's cleanup.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[allow(unsafe_code)]
+fn observer_exit_code(handle: &std::os::windows::io::OwnedHandle) -> u32 {
+    use std::os::windows::io::AsRawHandle;
+    let mut code = 0;
+    // SAFETY: retained query-capable fixture observer; caller separately requires actual signal.
+    assert_ne!(unsafe { windows_sys::Win32::System::Threading::GetExitCodeProcess(handle.as_raw_handle(), &mut code) }, 0);
+    code
+}
+
+#[tokio::test]
+async fn root_first_child_naturally_exits_and_writes_only_its_private_marker() {
+    let _serial = SERIAL.lock().await;
+    let directory = QuiescenceDirectory::new();
+    let mut environment = fixture_environment("root-first");
+    environment.push(("KATALA_GUARD_QUIET_DIR".into(), directory.0.as_os_str().to_owned()));
+    let end = deadline(Duration::from_secs(5));
+    let invocation = tokio::spawn(async move {
+        run_standalone_windows_bounded(&fixture_invocation(), StandaloneWindowsEnvironment::new(&environment), b"", end, 65536, 65536).await
+    });
+    let child = loop {
+        if let Ok(value) = std::fs::read_to_string(directory.0.join("child-ready"))
+            && let Ok(pid) = value.trim().parse::<u32>()
+        {
+            break retain_test_child(pid);
+        }
+        if Instant::now() >= end || invocation.is_finished() {
+            invocation.abort();
+            let _ = invocation.await;
+            panic!("owned root-first fixture did not reach child-ready before its original deadline");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    // The actual child observer is retained before its root can exit. Its own
+    // retained-root wait gates the subsequent marker write and natural exit.
+    std::fs::OpenOptions::new().create_new(true).write(true).open(directory.0.join("release-root")).unwrap();
+    let result = invocation.await.unwrap();
+    let receipt = result.process_receipt.as_ref().expect("actual guard receipt");
+    let child_signaled = signaled(&child);
+    let child_code = child_signaled.then(|| observer_exit_code(&child));
+    eprintln!(
+        "root_first_fixture stop={:?} root_code={:?} child_signaled={} child_code={:?} job_empty={} eof={} writer={} marker={}",
+        receipt.stop,
+        receipt.root_exit_code,
+        child_signaled,
+        child_code,
+        receipt.job_empty,
+        receipt.stdout_eof && receipt.stderr_eof,
+        receipt.writer_finished,
+        directory.0.join("after-root").exists()
+    );
+    assert_eq!(result.code, Some(0), "natural whole-invocation completion must be admitted");
+    assert_eq!(receipt.stop, ProcessStop::Completed);
+    assert!(receipt.cleanup_confirmed());
+    assert_eq!(child_code, Some(0), "child must exit naturally, never by owned-Job termination");
+    assert!(receipt.total_processes >= 2);
+    assert!(result.stdout.ends_with(b"natural-child-exit\n"));
+    assert!(std::fs::read(directory.0.join("after-root")).is_ok_and(|bytes| bytes == b"post-root fixture write\n"));
+    assert!(Instant::now() < end);
 }
 
 #[tokio::test]
