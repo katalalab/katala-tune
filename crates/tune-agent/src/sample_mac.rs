@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -53,9 +53,13 @@ struct Output {
 
 impl Output {
     fn open() -> Output {
+        Self::with_writer(|| std::io::stdout().lock())
+    }
+
+    fn with_writer<W: Write>(make_writer: impl FnOnce() -> W + Send + 'static) -> Output {
         let (requests, rows) = mpsc::sync_channel::<(Value, Sender<bool>)>(1);
         std::thread::spawn(move || {
-            let mut out = std::io::stdout().lock();
+            let mut out = make_writer();
             while let Ok((value, ack)) = rows.recv() {
                 let ok = emit(&mut out, &value);
                 if ack.send(ok).is_err() || !ok {
@@ -996,6 +1000,67 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
 
+    fn fixture_marker(path: &std::path::Path, value: &[u8]) {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, value).unwrap();
+        std::fs::rename(tmp, path).unwrap();
+    }
+
+    struct FixtureStdout<W> {
+        inner: W,
+        started: PathBuf,
+    }
+
+    impl<W: Write> Write for FixtureStdout<W> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.started.exists() {
+                fixture_marker(&self.started, b"writing");
+            }
+            self.inner.write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    /// Fill only this subprocess's piped stdout, ending at an actual one-byte
+    /// WouldBlock. Restore its flags before exercising the production writer.
+    fn fill_fixture_stdout(deadline: Instant) -> usize {
+        let fd = std::io::stdout().as_raw_fd();
+        // SAFETY: the fixture alone owns this pipe write end; no caller shares it.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) }, 0);
+        let filled = (|| -> std::io::Result<usize> {
+            let chunk = [b'x'; 8192];
+            let mut total = 0;
+            for width in [chunk.len(), 1] {
+                loop {
+                    if Instant::now() >= deadline || total >= 16 * 1024 * 1024 {
+                        return Err(std::io::Error::other("fixture stdout did not fill within setup budget"));
+                    }
+                    // SAFETY: chunk is readable for width bytes and fd is this fixture's pipe.
+                    let written = unsafe { libc::write(fd, chunk.as_ptr().cast(), width) };
+                    if written > 0 {
+                        total += written as usize;
+                    } else {
+                        let error = std::io::Error::last_os_error();
+                        match error.kind() {
+                            std::io::ErrorKind::WouldBlock => break,
+                            std::io::ErrorKind::Interrupted => continue,
+                            _ => return Err(error),
+                        }
+                    }
+                }
+            }
+            Ok(total)
+        })();
+        // SAFETY: restore the exact original flags even when prefill failed.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }, 0);
+        filled.unwrap()
+    }
+
     #[test]
     #[ignore = "owned subprocess invoked by expired startup test"]
     fn expired_startup_fixture() {
@@ -1046,13 +1111,40 @@ mod tests {
         let dir = PathBuf::from(std::env::var_os("PR87_FIXTURE_DIR").unwrap());
         let a = Args { interval: 0.2, procs_every: 1.0, max_seconds: std::env::var("PR87_FIXTURE_MAX").unwrap().parse().unwrap(), count: 0, watch: true };
         let t0 = Instant::now();
-        let control = Control { gone: Arc::new(AtomicBool::new(false)), deadline: t0 + Duration::from_secs_f64(a.max_seconds) };
-        watch_stdin(control.gone.clone());
-        let sampler = Sampler::open(&a, t0, &control);
+        // Setup has its own finite budget. This is the blocked-writer test, not
+        // the separate run/startup max regression: never spend its 2s on setup.
+        let setup = Control { gone: Arc::new(AtomicBool::new(false)), deadline: t0 + Duration::from_secs(15) };
+        watch_stdin(setup.gone.clone());
+        let setup_ms = std::env::var("PR87_FIXTURE_SETUP_MS").unwrap_or_else(|_| "0".into()).parse::<u64>().unwrap();
+        std::thread::sleep(Duration::from_millis(setup_ms));
+        let sampler = Sampler::open(&a, t0, &setup);
         assert!(sampler.monitor.is_some());
-        std::fs::write(dir.join("ready"), b"ready").unwrap();
-        assert!(!Output::open().emit(json!({"payload": "x".repeat(1024 * 1024)}), &control));
+        let filled = fill_fixture_stdout(setup.deadline);
+        let paths = dir.clone();
+        let out = Output::with_writer(move || {
+            let inner = std::io::stdout().lock();
+            fixture_marker(&paths.join("worker-ready"), b"ready");
+            FixtureStdout { inner, started: paths.join("write-started") }
+        });
+        fixture_marker(&dir.join("ready"), filled.to_string().as_bytes());
+        while !dir.join("arm").exists() {
+            assert!(!setup.stopped(), "fixture setup deadline elapsed before measurement arm");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Set this deadline once, after the parent confirmed the full pipe and
+        // live owned sensor. Never restart it while waiting for writer/cleanup.
+        let measured = Instant::now();
+        let control = Control { gone: setup.gone.clone(), deadline: measured + Duration::from_secs_f64(a.max_seconds) };
+        assert!(!out.emit(json!({"payload": "x".repeat(1024 * 1024)}), &control));
+        assert!(control.stopped(), "an output error is not evidence of cancellation or max expiry");
         drop(sampler);
+        if !control.gone.load(Ordering::SeqCst) {
+            assert!(
+                measured.elapsed() < Duration::from_secs_f64(a.max_seconds) + Duration::from_millis(1500),
+                "max cleanup exceeded its original measurement budget"
+            );
+        }
+        fixture_marker(&dir.join("cleanup-done"), b"done");
         // libtest would print its result to the deliberately full stdout pipe.
         std::process::exit(0);
     }
@@ -1077,17 +1169,22 @@ mod tests {
 
     impl OutputFixture {
         fn open(max: u64, name: &str) -> OutputFixture {
-            let dir = std::env::temp_dir().join(format!("sampler-output-{}-{name}", std::process::id()));
+            Self::with_setup_delay(max, name, 0)
+        }
+
+        fn with_setup_delay(max: u64, name: &str, setup_ms: u64) -> OutputFixture {
+            let dir = std::env::temp_dir().join(format!("sampler-output-{}-{name}-{}", std::process::id(), tune_link::now_ms()));
             let bin = dir.join(".katala-tune/bin");
             std::fs::create_dir_all(&bin).unwrap();
             let script = bin.join("macmon");
-            std::fs::write(&script, "#!/usr/bin/python3\nimport os,signal,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nwith open(os.path.join(os.environ['HOME'],'macmon-pid'),'w') as f: f.write(str(os.getpid()))\nuntil=time.monotonic()+10\nwhile time.monotonic()<until: time.sleep(0.05)\n").unwrap();
+            std::fs::write(&script, "#!/usr/bin/python3\nimport os,signal,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\np=os.path.join(os.environ['HOME'],'macmon-pid')\nwith open(p+'.tmp','w') as f: f.write(str(os.getpid()))\nos.replace(p+'.tmp',p)\nuntil=time.monotonic()+30\nwhile time.monotonic()<until: time.sleep(0.05)\n").unwrap();
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
             let child = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "sample_mac::tests::blocked_stdout_fixture", "--ignored", "--nocapture"])
                 .env("HOME", &dir)
                 .env("PR87_FIXTURE_DIR", &dir)
                 .env("PR87_FIXTURE_MAX", max.to_string())
+                .env("PR87_FIXTURE_SETUP_MS", setup_ms.to_string())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -1095,16 +1192,31 @@ mod tests {
                 .spawn()
                 .unwrap();
             let fixture = OutputFixture { child, dir, exited: false };
-            let until = Instant::now() + Duration::from_secs(5);
+            let until = Instant::now() + Duration::from_secs(15);
             loop {
                 let mut queued = 0;
                 // SAFETY: stdout read end stays owned by fixture. FIONREAD only reads its byte count.
                 let r = unsafe { libc::ioctl(fixture.child.stdout.as_ref().unwrap().as_raw_fd(), libc::FIONREAD, &mut queued) };
                 assert_eq!(r, 0);
-                if queued >= 8192 && fixture.dir.join("macmon-pid").exists() && fixture.dir.join("ready").exists() {
+                let filled = std::fs::read_to_string(fixture.dir.join("ready")).ok().and_then(|s| s.parse::<usize>().ok());
+                let pid = std::fs::read_to_string(fixture.dir.join("macmon-pid")).ok().and_then(|s| s.parse::<u32>().ok());
+                if let Some(pid) = pid
+                    && filled.is_some_and(|n| n > 0 && queued as usize >= n)
+                    && fixture.dir.join("worker-ready").exists()
+                {
+                    let pid = pid.to_string();
+                    assert!(
+                        Command::new("/bin/kill").args(["-0", &pid]).stderr(Stdio::null()).status().unwrap().success(),
+                        "owned sensor must be alive before measurement"
+                    );
                     break;
                 }
-                assert!(Instant::now() < until, "fixture did not reach a blocked stdout write");
+                assert!(Instant::now() < until, "fixture did not prepare a full stdout pipe: queued={queued} filled={filled:?} pid={pid:?}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            fixture_marker(&fixture.dir.join("arm"), b"measure");
+            while !fixture.dir.join("write-started").exists() {
+                assert!(Instant::now() < until, "production writer did not start against the prepared full pipe");
                 std::thread::sleep(Duration::from_millis(10));
             }
             fixture
@@ -1112,6 +1224,14 @@ mod tests {
 
         fn wait_and_check_cleanup(&mut self, timeout: Duration) {
             let until = Instant::now() + timeout;
+            while !self.dir.join("cleanup-done").exists() {
+                assert!(Instant::now() < until, "sampler stayed blocked on stdout after cancellation/deadline");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Check the owned sensor before reaping the root, so failure still
+            // leaves an unreaped process-group anchor for Drop's exact cleanup.
+            let pid = std::fs::read_to_string(self.dir.join("macmon-pid")).unwrap();
+            assert!(!Command::new("/bin/kill").args(["-0", &pid]).stderr(Stdio::null()).status().unwrap().success(), "owned macmon was not reaped");
             let status = loop {
                 if let Some(status) = self.child.try_wait().unwrap() {
                     self.exited = true;
@@ -1121,8 +1241,6 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             };
             assert!(status.success(), "fixture failed: {status}");
-            let pid = std::fs::read_to_string(self.dir.join("macmon-pid")).unwrap();
-            assert!(!Command::new("/bin/kill").args(["-0", &pid]).stderr(Stdio::null()).status().unwrap().success(), "owned macmon was not reaped");
         }
     }
 
@@ -1136,6 +1254,12 @@ mod tests {
     #[test]
     fn stdout_backpressure_does_not_block_max_cleanup() {
         let mut fixture = OutputFixture::open(2, "max");
+        fixture.wait_and_check_cleanup(Duration::from_millis(3500));
+    }
+
+    #[test]
+    fn stdout_backpressure_max_survives_slow_setup() {
+        let mut fixture = OutputFixture::with_setup_delay(2, "slow-max", 2500);
         fixture.wait_and_check_cleanup(Duration::from_millis(3500));
     }
 
