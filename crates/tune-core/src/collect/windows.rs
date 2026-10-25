@@ -59,6 +59,24 @@ const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000;
 #[path = "windows_diagnostics.rs"]
 mod diagnostics;
 
+#[cfg(katala_private_diagnostics)]
+use crate::topology::adapters::native_private_diagnostics as private_diagnostic;
+
+#[cfg(katala_private_diagnostics)]
+fn private_io(site: private_diagnostic::IoSite, class: private_diagnostic::IoClass) {
+    private_diagnostic::backend_record(private_diagnostic::IoFault { site, class });
+}
+#[cfg(katala_private_diagnostics)]
+fn private_join(error: &tokio::task::JoinError) -> private_diagnostic::IoClass {
+    if error.is_cancelled() {
+        private_diagnostic::IoClass::JoinCancelled
+    } else if error.is_panic() {
+        private_diagnostic::IoClass::JoinPanic
+    } else {
+        private_diagnostic::IoClass::Other
+    }
+}
+
 fn os_error() -> io::Error {
     io::Error::last_os_error()
 }
@@ -242,26 +260,56 @@ struct Process {
     handle: OwnedHandle,
     identity: ProcessIdentity,
 }
-fn identity(handle: &OwnedHandle, pid: u32) -> io::Result<ProcessIdentity> {
-    identity_raw(handle.as_raw_handle(), pid)
+fn identity(
+    handle: &OwnedHandle,
+    pid: u32,
+    #[cfg(katala_private_diagnostics)] site: Option<&std::cell::Cell<private_diagnostic::IoSite>>,
+) -> io::Result<ProcessIdentity> {
+    identity_raw(
+        handle.as_raw_handle(),
+        pid,
+        #[cfg(katala_private_diagnostics)]
+        site,
+    )
 }
 pub(super) fn current_process_identity() -> io::Result<ProcessIdentity> {
     // SAFETY: borrow our current-process pseudo-handle for read-only identity;
     // it is never closed, and the process remains live throughout this query.
-    identity_raw(unsafe { GetCurrentProcess() }, unsafe { GetCurrentProcessId() })
+    identity_raw(
+        unsafe { GetCurrentProcess() },
+        unsafe { GetCurrentProcessId() },
+        #[cfg(katala_private_diagnostics)]
+        None,
+    )
 }
-fn identity_raw(handle: HANDLE, pid: u32) -> io::Result<ProcessIdentity> {
+fn identity_raw(
+    handle: HANDLE,
+    pid: u32,
+    #[cfg(katala_private_diagnostics)] site: Option<&std::cell::Cell<private_diagnostic::IoSite>>,
+) -> io::Result<ProcessIdentity> {
     let mut created = Default::default();
     let mut exit = Default::default();
     let mut kernel = Default::default();
     let mut user = Default::default();
+    #[cfg(katala_private_diagnostics)]
+    if let Some(site) = site {
+        site.set(private_diagnostic::IoSite::IdentityTimes);
+    }
     // SAFETY: retained handle has query rights; all FILETIME outputs are valid writable values.
     check(unsafe { GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user) })?;
     let created = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
     let mut session = 0;
+    #[cfg(katala_private_diagnostics)]
+    if let Some(site) = site {
+        site.set(private_diagnostic::IoSite::IdentitySession);
+    }
     // SAFETY: retained process object and query rights preserve identity while session is queried.
     check(unsafe { ProcessIdToSessionId(pid, &mut session) })?;
     if pid == 0 || created == 0 {
+        #[cfg(katala_private_diagnostics)]
+        if let Some(site) = site {
+            site.set(private_diagnostic::IoSite::IdentityInvariant);
+        }
         return Err(invalid());
     }
     Ok(ProcessIdentity { pid, created_filetime: created.to_string(), os_session: session })
@@ -299,6 +347,8 @@ struct Job {
     handle: OwnedHandle,
     processes: Vec<Process>,
     root_exit_at: Option<std::time::Instant>,
+    #[cfg(katala_private_diagnostics)]
+    observation_site: std::cell::Cell<private_diagnostic::IoSite>,
     #[cfg(test)]
     after_first_accounting: Option<AccountingHook>,
     #[cfg(test)]
@@ -314,6 +364,8 @@ impl Job {
             handle,
             processes: Vec::new(),
             root_exit_at: None,
+            #[cfg(katala_private_diagnostics)]
+            observation_site: std::cell::Cell::new(private_diagnostic::IoSite::AccountingInitial),
             #[cfg(test)]
             after_first_accounting: None,
             #[cfg(test)]
@@ -372,14 +424,26 @@ impl Job {
                 null_mut(),
             )
         })?;
+        #[cfg(katala_private_diagnostics)]
+        if self.observation_site.get() == private_diagnostic::IoSite::PidListQuery {
+            self.observation_site.set(private_diagnostic::IoSite::PidListShape);
+        }
         complete_pid_list(pids.assigned, pids.count, &pids.pids)
     }
     fn observe(&mut self, receipt: &mut ProcessReceipt) -> io::Result<()> {
+        macro_rules! site {
+            ($site:ident) => {
+                #[cfg(katala_private_diagnostics)]
+                self.observation_site.set(private_diagnostic::IoSite::$site);
+            };
+        }
+        site!(AccountingInitial);
         self.accounting(receipt)?;
         #[cfg(test)]
         if let Some(hook) = self.after_first_accounting.take() {
             hook(self, receipt)?;
         }
+        site!(PidListQuery);
         let pids = self.process_ids()?;
         #[cfg(test)]
         if let Some(hook) = self.after_pid_list.take() {
@@ -390,8 +454,10 @@ impl Job {
                 continue;
             }
             if self.processes.len() >= MAX_OBSERVED {
+                site!(RetentionCap);
                 return Err(invalid());
             }
+            site!(OpenCandidate);
             let handle = match self.open_candidate(pid) {
                 Ok(handle) => handle,
                 Err(error) => {
@@ -399,22 +465,34 @@ impl Job {
                     // disappearance error plus a complete fresh query of this owned
                     // Job permits skipping it. No identity/exit is fabricated; actual
                     // Job emptiness and retained handles still gate completion later.
-                    if error.raw_os_error() != Some(ERROR_INVALID_PARAMETER as i32) || self.process_ids()?.contains(&pid) {
+                    if error.raw_os_error() != Some(ERROR_INVALID_PARAMETER as i32) || {
+                        site!(DisappearanceQuery);
+                        self.process_ids()?.contains(&pid)
+                    } {
+                        site!(OpenCandidate);
                         return Err(error);
                     }
                     continue;
                 }
             };
             let mut member = 0;
+            site!(MembershipQuery);
             // SAFETY: recheck membership on the opened object, closing enumeration/PID reuse races.
             check(unsafe { IsProcessInJob(handle.as_raw_handle(), self.handle.as_raw_handle(), &mut member) })?;
             if member == 0 {
+                site!(NonMember);
                 return Err(invalid());
             }
-            let identity = identity(&handle, pid)?;
+            let identity = identity(
+                &handle,
+                pid,
+                #[cfg(katala_private_diagnostics)]
+                Some(&self.observation_site),
+            )?;
             receipt.observed.push(identity.clone());
             self.processes.push(Process { handle, identity });
         }
+        site!(RootWait);
         let root = self.processes.first().ok_or_else(invalid)?;
         let root_observed_at = Instant::now().into_std();
         receipt.root_exited = exited(&root.handle)?;
@@ -423,16 +501,19 @@ impl Job {
             // scheduling after it must not move either completion clock later.
             self.root_exit_at.get_or_insert(root_observed_at);
             let mut code = 0;
+            site!(RootExitCode);
             // SAFETY: retained root has signaled; 259 is a valid exit value, never a liveness test.
             check(unsafe { GetExitCodeProcess(root.handle.as_raw_handle(), &mut code) })?;
             receipt.root_exit_code = Some(code as i32);
             // The initial accounting may predate root exit. Only a subsequent
             // sample can establish that descendants remain after that exit.
+            site!(AccountingAfterRoot);
             self.accounting(receipt)?;
         }
         // Sample retained members after root exit; an earlier nonsignaled root
         // must not be mistaken for a descendant that remains after root exit.
         receipt.observed_exited = !self.processes.is_empty();
+        site!(RetainedWait);
         for process in &self.processes {
             receipt.observed_exited &= exited(&process.handle)?;
         }
@@ -805,7 +886,12 @@ fn spawn_owned(context: SpawnContext<'_>, job: &Job, stdio: [&OwnedHandle; 3], s
         // an image that does not match the retained, deny-write/delete lease.
         pin.verify_process(handle.as_raw_handle())?;
     }
-    let identity = identity(&handle, created.dwProcessId)?;
+    let identity = identity(
+        &handle,
+        created.dwProcessId,
+        #[cfg(katala_private_diagnostics)]
+        None,
+    )?;
     Ok((Process { handle, identity }, thread))
 }
 
@@ -815,6 +901,8 @@ struct PipeOutput {
     eof: bool,
     limited: bool,
     failed: bool,
+    #[cfg(katala_private_diagnostics)]
+    failure_class: Option<private_diagnostic::IoClass>,
 }
 async fn drain(mut pipe: NamedPipeServer, limit: usize, signal: mpsc::Sender<()>) -> PipeOutput {
     let mut output = PipeOutput::default();
@@ -833,8 +921,12 @@ async fn drain(mut pipe: NamedPipeServer, limit: usize, signal: mpsc::Sender<()>
                     let _ = signal.try_send(());
                 }
             }
-            Err(_) => {
+            Err(_error) => {
                 output.failed = true;
+                #[cfg(katala_private_diagnostics)]
+                {
+                    output.failure_class = Some(private_diagnostic::io_class(&_error));
+                }
                 break;
             }
         }
@@ -1053,6 +1145,8 @@ async fn run_inner(
     stderr_limit: usize,
     pin: Option<&PinnedWindowsExecutable>,
 ) -> (BoundedResult, Option<Job>) {
+    #[cfg(katala_private_diagnostics)]
+    private_diagnostic::backend_begin();
     let mut answer = BoundedResult::default();
     let mut receipt = ProcessReceipt::default();
     let deadline = Instant::from_std(deadline);
@@ -1159,6 +1253,12 @@ async fn run_inner(
             let result = tasks.writer.take().expect("present writer").await;
             receipt.writer_finished = true;
             if !matches!(result, Ok(Ok(()))) && receipt.stop == ProcessStop::Completed {
+                #[cfg(katala_private_diagnostics)]
+                match &result {
+                    Ok(Err(error)) => private_io(private_diagnostic::IoSite::WriterWrite, private_diagnostic::io_class(error)),
+                    Err(error) => private_io(private_diagnostic::IoSite::WriterJoin, private_join(error)),
+                    _ => {}
+                }
                 receipt.stop = ProcessStop::IoFailure;
             }
         }
@@ -1172,6 +1272,11 @@ async fn run_inner(
                             receipt.stop = ProcessStop::OutputLimit;
                         }
                         if output.failed && receipt.stop == ProcessStop::Completed {
+                            #[cfg(katala_private_diagnostics)]
+                            private_io(
+                                if error { private_diagnostic::IoSite::StderrRead } else { private_diagnostic::IoSite::StdoutRead },
+                                output.failure_class.unwrap_or(private_diagnostic::IoClass::Other),
+                            );
                             receipt.stop = ProcessStop::IoFailure;
                         }
                         if error {
@@ -1182,8 +1287,13 @@ async fn run_inner(
                             answer.stdout = output.bytes;
                         }
                     }
-                    Err(_) => {
+                    Err(_error) => {
                         if receipt.stop == ProcessStop::Completed {
+                            #[cfg(katala_private_diagnostics)]
+                            private_io(
+                                if error { private_diagnostic::IoSite::StderrJoin } else { private_diagnostic::IoSite::StdoutJoin },
+                                private_join(&_error),
+                            );
                             receipt.stop = ProcessStop::IoFailure;
                         }
                     }
@@ -1196,6 +1306,8 @@ async fn run_inner(
             receipt.job_empty = false;
             receipt.observed_exited = false;
             if receipt.stop == ProcessStop::Completed {
+                #[cfg(katala_private_diagnostics)]
+                private_io(job.observation_site.get(), private_diagnostic::io_class(&_error));
                 receipt.stop = ProcessStop::IoFailure;
             }
         }
@@ -1220,7 +1332,11 @@ async fn run_inner(
                 }
                 QuiescenceDecision::Lingering => receipt.stop = ProcessStop::LingeringDescendants,
                 QuiescenceDecision::CleanupExpired => receipt.stop = ProcessStop::CleanupUnconfirmed,
-                QuiescenceDecision::Stopped => receipt.stop = ProcessStop::IoFailure,
+                QuiescenceDecision::Stopped => {
+                    #[cfg(katala_private_diagnostics)]
+                    private_io(private_diagnostic::IoSite::QuiescenceStopped, private_diagnostic::IoClass::Invariant);
+                    receipt.stop = ProcessStop::IoFailure;
+                }
                 QuiescenceDecision::Observe | QuiescenceDecision::Quiescent => {}
             }
         }

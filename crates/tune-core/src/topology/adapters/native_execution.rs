@@ -49,6 +49,12 @@ fn private_stop(result: &crate::collect::BoundedResult) -> super::native_private
 #[cfg(katala_private_diagnostics)]
 fn private_owned(role: super::native_private_diagnostics::Role, result: &crate::collect::BoundedResult) {
     use super::native_private_diagnostics as diagnostic;
+    if private_stop(result) == diagnostic::Stop::IoFailure
+        && let Some(fault) = diagnostic::backend_take()
+    {
+        diagnostic::record(diagnostic::Failure::Io(role, fault));
+        return;
+    }
     let receipt = result.process_receipt.as_ref();
     diagnostic::record(diagnostic::child_failure(
         role,

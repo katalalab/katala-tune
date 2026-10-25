@@ -80,11 +80,129 @@ pub enum Role {
     Supervise,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IoSite {
+    WriterWrite,
+    WriterJoin,
+    StdoutRead,
+    StdoutJoin,
+    StderrRead,
+    StderrJoin,
+    AccountingInitial,
+    PidListQuery,
+    PidListShape,
+    RetentionCap,
+    OpenCandidate,
+    DisappearanceQuery,
+    MembershipQuery,
+    NonMember,
+    IdentityTimes,
+    IdentitySession,
+    IdentityInvariant,
+    RootWait,
+    RootExitCode,
+    AccountingAfterRoot,
+    RetainedWait,
+    QuiescenceStopped,
+}
+const IO_SITES: [IoSite; 22] = [
+    IoSite::WriterWrite,
+    IoSite::WriterJoin,
+    IoSite::StdoutRead,
+    IoSite::StdoutJoin,
+    IoSite::StderrRead,
+    IoSite::StderrJoin,
+    IoSite::AccountingInitial,
+    IoSite::PidListQuery,
+    IoSite::PidListShape,
+    IoSite::RetentionCap,
+    IoSite::OpenCandidate,
+    IoSite::DisappearanceQuery,
+    IoSite::MembershipQuery,
+    IoSite::NonMember,
+    IoSite::IdentityTimes,
+    IoSite::IdentitySession,
+    IoSite::IdentityInvariant,
+    IoSite::RootWait,
+    IoSite::RootExitCode,
+    IoSite::AccountingAfterRoot,
+    IoSite::RetainedWait,
+    IoSite::QuiescenceStopped,
+];
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IoClass {
+    InvalidParameter,
+    PermissionDenied,
+    InvalidHandle,
+    MoreData,
+    BrokenPipe,
+    Aborted,
+    InvalidInput,
+    NotFound,
+    JoinCancelled,
+    JoinPanic,
+    Other,
+    Invariant,
+}
+const IO_CLASSES: [IoClass; 12] = [
+    IoClass::InvalidParameter,
+    IoClass::PermissionDenied,
+    IoClass::InvalidHandle,
+    IoClass::MoreData,
+    IoClass::BrokenPipe,
+    IoClass::Aborted,
+    IoClass::InvalidInput,
+    IoClass::NotFound,
+    IoClass::JoinCancelled,
+    IoClass::JoinPanic,
+    IoClass::Other,
+    IoClass::Invariant,
+];
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IoFault {
+    pub site: IoSite,
+    pub class: IoClass,
+}
+
+pub fn io_class(error: &std::io::Error) -> IoClass {
+    use std::io::ErrorKind;
+    match error.raw_os_error() {
+        Some(87) => IoClass::InvalidParameter,
+        Some(5) => IoClass::PermissionDenied,
+        Some(6) => IoClass::InvalidHandle,
+        Some(234) => IoClass::MoreData,
+        Some(109 | 232 | 233) => IoClass::BrokenPipe,
+        Some(995) => IoClass::Aborted,
+        Some(2 | 3) => IoClass::NotFound,
+        _ => match error.kind() {
+            ErrorKind::InvalidInput => IoClass::InvalidInput,
+            ErrorKind::PermissionDenied => IoClass::PermissionDenied,
+            ErrorKind::BrokenPipe => IoClass::BrokenPipe,
+            ErrorKind::NotFound => IoClass::NotFound,
+            _ => IoClass::Other,
+        },
+    }
+}
+thread_local! { static BACKEND: Cell<Option<IoFault>> = const { Cell::new(None) }; }
+pub fn backend_begin() {
+    BACKEND.with(|state| state.set(None));
+}
+pub fn backend_record(fault: IoFault) {
+    BACKEND.with(|state| {
+        if state.get().is_none() {
+            state.set(Some(fault));
+        }
+    });
+}
+pub fn backend_take() -> Option<IoFault> {
+    BACKEND.with(Cell::take)
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Failure {
     Stage(Stage),
     Source(Source),
     Git(Operation, Stop),
     Owned(Role, Stop),
+    Io(Role, IoFault),
 }
 impl Failure {
     pub fn code(self) -> u32 {
@@ -98,6 +216,7 @@ impl Failure {
                     Role::Supervise => 110,
                 }) + stop as u32
             }
+            Self::Io(role, fault) => 1000 + role as u32 * 512 + fault.site as u32 * 16 + fault.class as u32,
         }
     }
     pub fn from_code(code: i32) -> Option<Self> {
@@ -108,6 +227,12 @@ impl Failure {
             return Some(Self::Stage(stage));
         }
         match code {
+            1000..=2023 => {
+                let offset = (code - 1000) as usize;
+                let role = [Role::Verify, Role::Supervise][offset / 512];
+                let slot = offset % 512;
+                Some(Self::Io(role, IoFault { site: *IO_SITES.get(slot / 16)?, class: *IO_CLASSES.get(slot % 16)? }))
+            }
             60..=67 => Some(Self::Source(SOURCES[(code - 60) as usize])),
             200..=207 => Some(Self::Owned(Role::Verify, STOPS[(code - 200) as usize])),
             110..=117 => Some(Self::Owned(Role::Supervise, STOPS[(code - 110) as usize])),
@@ -165,6 +290,13 @@ mod tests {
                 result.push(Failure::Git(operation, stop));
             }
         }
+        for role in [Role::Verify, Role::Supervise] {
+            for site in IO_SITES {
+                for class in IO_CLASSES {
+                    result.push(Failure::Io(role, IoFault { site, class }));
+                }
+            }
+        }
         result
     }
     #[test]
@@ -172,14 +304,14 @@ mod tests {
         let mut codes = std::collections::BTreeSet::new();
         for failure in failures() {
             let code = failure.code();
-            assert!(!RESERVED.contains(&(code as i32)) && code < 256);
+            assert!(!RESERVED.contains(&(code as i32)) && code < 2048);
             assert!(codes.insert(code));
             assert_eq!(Failure::from_code(code as i32), Some(failure));
         }
     }
     #[test]
     fn unknown_and_reserved_codes_stay_generic_child_rejections() {
-        for code in -1..=256 {
+        for code in -1..=2048 {
             if failures().iter().any(|failure| failure.code() as i32 == code) {
                 continue;
             }
@@ -230,6 +362,36 @@ mod tests {
         assert_eq!(rx.recv().unwrap(), Failure::Stage(Stage::ReaderPin).code());
         assert_eq!(code(), 2, "the receiver cannot read the worker's thread-local failure");
         worker.join().unwrap();
+    }
+    #[test]
+    fn backend_cause_is_first_only_and_resets_between_invocations() {
+        let first = IoFault { site: IoSite::OpenCandidate, class: IoClass::PermissionDenied };
+        let later = IoFault { site: IoSite::RootWait, class: IoClass::InvalidHandle };
+        backend_begin();
+        backend_record(first);
+        backend_record(later);
+        assert_eq!(backend_take(), Some(first));
+        assert_eq!(backend_take(), None);
+        backend_record(later);
+        backend_begin();
+        assert_eq!(backend_take(), None);
+    }
+    #[test]
+    fn os_errors_become_only_fixed_classes() {
+        for (code, expected) in [
+            (87, IoClass::InvalidParameter),
+            (5, IoClass::PermissionDenied),
+            (6, IoClass::InvalidHandle),
+            (234, IoClass::MoreData),
+            (109, IoClass::BrokenPipe),
+            (995, IoClass::Aborted),
+            (2, IoClass::NotFound),
+            (3, IoClass::NotFound),
+        ] {
+            assert_eq!(io_class(&std::io::Error::from_raw_os_error(code)), expected);
+        }
+        assert_eq!(io_class(&std::io::Error::from(std::io::ErrorKind::InvalidInput)), IoClass::InvalidInput);
+        assert_eq!(io_class(&std::io::Error::from(std::io::ErrorKind::Other)), IoClass::Other);
     }
     #[test]
     fn emit_private_table() {
