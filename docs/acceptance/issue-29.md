@@ -30,3 +30,10 @@
 - 内部のコマンドの終了状態と項目別の値を確認し、部分取得失敗を `inside.errors` の固定理由で保存する。成功したメモリを保持し、非0終了した項目の部分出力を成功として使わない。画面の機体詳細と JS/Rust の所見 `wsl-partial` に欠測項目・理由を出す。
 - 回帰テストは `test/wsl.test.js`、`test/wsl-renderer.test.js`、`test/wsl-inner-script.test.js`、`test/win-wsl-regression.ps1`、Rust の WSL 単体テストと `tests/parity.rs`。いずれも実機の WSL を起動しない fixture を使う。
 - これは新しい実機受入記録ではない。P1 の停止競合・Docker/コンテナ・全件台帳・Windows 実機3条件の残件は維持し、Issue #29 を閉じない。merge と実機受入は親の調整下で別途行う。
+
+### P2 の検証結果と統合判断
+
+- [PR #89](https://github.com/katalalab/katala-tune/pull/89) の runtime/test head `16f530013a65f40df09c45a2755b9be4f324a36a` を対象に、[CI 40225139327](https://github.com/katalalab/katala-tune/actions/runs/40225139327) は macOS / Linux / Windows の JS・Rust 全6ジョブが成功。Windows PowerShell 5.1 の偽WSL回帰 step も成功した。独立レビューのCRLF fixture抽出の指摘は同headで修正し、LF/CRLFの実payload回帰で失敗から成功を確認した。
+- P2固有の追加必須検査・holdは残っておらず、このP2差分はDraft解除可能と判断する。mergeは親の調整下で行う。上のCI成功は未解決のWindows間欠code 2の原因解明や、通常機体への配布承認を意味しない。
+- 今回の差分は内部payload・結果parser・所見・表示に限り、`Get-KtWslObservation` の明示opt-in・running再確認・停止中の拒否と `Invoke-KtWsl` の実行経路、呼出順序・回数・期限は変更していない。内部観測に入る前の admission は同じであり、P1の「最後のrunning確認後、内部実行前の自然停止」の窓を新たに広げる変更はない。厳密な無起動保証は依然として未達であり、deadlineやopt-in変更による解決を主張しない。
+- この検証結果の追補は文書のみ。実WSL操作や新しい実機受入は実施していない。P1と実機3条件の解決をこのPRのclose/merge条件に混ぜず、Issue #29 の残件として維持する。
