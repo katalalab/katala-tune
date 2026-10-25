@@ -129,6 +129,7 @@ impl Store {
             ("logs", "occurrences", "INTEGER NOT NULL DEFAULT 1"),
             ("log_cursors", "fail_streak", "INTEGER NOT NULL DEFAULT 0"),
             ("log_cursors", "note", "TEXT"),
+            ("tune_actions", "target", "TEXT"),
             ("topology_refresh_lease", "generation", "INTEGER NOT NULL DEFAULT 1"),
         ] {
             let has: i64 = self.conn.query_row(&format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name = ?"), [name], |r| r.get(0))?;
