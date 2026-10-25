@@ -23,19 +23,43 @@ async function exchangeAfterRequest(exchange, script, options = {}) {
   const server = net.createServer();
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
-  let timeout;
+  let timeout, rejectBarrier;
   const barrier = new Promise((resolve, reject) => {
-    timeout = setTimeout(() => reject(new Error('request barrier unavailable')), 1000);
+    rejectBarrier = () => reject(new Error('request barrier unavailable'));
     server.once('connection', (socket) => {
       socket.once('error', reject);
       socket.once('data', (data) => { clearTimeout(timeout); resolve(data.toString('ascii')); });
     });
   });
-  const pending = exchange(script(port), options);
+  // These cases measure a post-request deadline, not Node startup under a
+  // parallel test load. Warm the same child through a separate IPC channel;
+  // READY stays buffered on stdout until the real exchange reads it.
+  const child = spawn(process.execPath, ['-e', `${script(port)};process.send('fixture-started');`], { stdio: ['pipe', 'pipe', 'pipe', 'ipc'], windowsHide: true });
   try {
+    await new Promise((resolve, reject) => {
+      const startup = setTimeout(() => finish(new Error('fixture startup unavailable')), 5000);
+      const message = (value) => finish(value === 'fixture-started' ? null : new Error('unexpected fixture startup message'));
+      const exited = () => finish(new Error('fixture exited before startup'));
+      function finish(error) {
+        clearTimeout(startup);
+        child.off('message', message);
+        child.off('error', finish);
+        child.off('exit', exited);
+        if (error) reject(error); else resolve();
+      }
+      child.once('message', message);
+      child.once('error', finish);
+      child.once('exit', exited);
+    });
+    child.disconnect();
+    timeout = setTimeout(rejectBarrier, 1000);
+    let controllerSpawns = 0;
+    const pending = exchange('prestarted fixture', { ...options, spawnChild: () => { controllerSpawns += 1; return child; } });
     const marker = await barrier;
-    return { marker, result: await pending };
-  } finally { server.close(); }
+    const result = await pending;
+    assert.equal(controllerSpawns, 1, 'the post-request controller never retries');
+    return { marker, result };
+  } finally { clearTimeout(timeout); child.kill('SIGKILL'); server.close(); }
 }
 
 const node = { id: 'gpu-node', alias: 'mock-gpu', os: 'windows', hold: false, shared: false };
@@ -308,7 +332,7 @@ test('KT2 exchange waits for READY before its only request and classifies termin
   const heldEof = (port) => String.raw`const crypto=require('node:crypto'),net=require('node:net');let chunks=[];process.stdout.write('KT2 READY ${nonce}\n');process.stdin.on('data',d=>chunks.push(d));process.stdin.on('end',()=>{const all=Buffer.concat(chunks),at=all.indexOf(10),line=all.subarray(0,at).toString('ascii').split(' '),bytes=all.subarray(at+1);if(at<0||line.length!==5||line[0]!=='KT2'||line[1]!=='REQUEST'||line[2]!=='${nonce}'||Number(line[3])!==bytes.length||line[4]!==crypto.createHash('sha256').update(bytes).digest('hex')){process.exit(92);return}const socket=net.connect(${port},'127.0.0.1',()=>{socket.end('write-complete');process.stdout.write('KT2 RESULT ${nonce} ${bodyHash} 0 0 0\n');setTimeout(()=>{},2000)})});`;
   const held = await exchangeAfterRequest(
     (script, options = {}) => actionExchange(node2, helper, body, { command: { cmd: process.execPath, args: ['-e', script] }, timeoutMs: 5000, ...options }),
-    heldEof,
+    (port) => `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,1200);${heldEof(port)}`,
     { timeoutMs: 1000 },
   );
   assert.equal(held.marker, 'write-complete', 'the held EOF case starts after the completed request write');
@@ -411,11 +435,9 @@ test('KT2 controller は単調期限、厳密な結果枠、stdin/stdio 境界�
     assert.deepEqual(zeroUnhandled, [], 'destroying an unopened reader cannot leak Premature close');
   } finally { process.removeListener('unhandledRejection', onUnhandled); }
   const afterReadyDeadline = (port) => `const net=require('node:net');process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{const socket=net.connect(${port},'127.0.0.1',()=>{socket.end('write-complete');setTimeout(()=>process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 0 0\\n'),2000)})});`;
-  let postWriteSpawns = 0;
-  const afterReady = await exchangeAfterRequest(exchange, afterReadyDeadline, { timeoutMs: 1000, spawnChild: (...args) => { postWriteSpawns += 1; return spawn(...args); } });
+  const afterReady = await exchangeAfterRequest(exchange, afterReadyDeadline, { timeoutMs: 1000 });
   assert.equal(afterReady.marker, 'write-complete', 'the child parsed the completed request before the deadline path');
   assert.equal(afterReady.result.code, 7, 'an expired result deadline follows the one completed request write');
-  assert.equal(postWriteSpawns, 1, 'the post-write deadline never retries');
   const heldStderr = (port) => `const cp=require('node:child_process'),net=require('node:net');process.stdout.write('KT2 READY ${nonce}\\n');process.stdin.resume();process.stdin.on('end',()=>{const socket=net.connect(${port},'127.0.0.1',()=>{socket.end('write-complete');process.stdout.write('KT2 RESULT ${nonce} ${hash} 0 0 0\\n');cp.spawn(process.execPath,['-e','setTimeout(()=>{},2000)'],{stdio:['ignore','ignore',process.stderr]})})});`;
   const held = await exchangeAfterRequest(exchange, heldStderr, { timeoutMs: 1000 });
   assert.equal(held.marker, 'write-complete', 'the held stderr case starts after the completed request write');
