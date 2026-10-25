@@ -128,12 +128,14 @@ OS の鍵置き場（Keychain・資格情報マネージャー）は使わない
 |---|---|---|---|---|
 | `spake2` | 0.4.0 | PAKE | RustCrypto の PAKEs。Rust の SPAKE2 で最も使われ（magic-wormhole の Rust 版など）、python-spake2 と互換 | 独立した監査は受けていない |
 | `snow` | 0.10.0 | Noise | Rust で最も使われている Noise の実装（libp2p の Noise も使う）。Noise の仕様のテストベクタで試験する仕組みがある | 正式な監査は受けていない。中の暗号は下の RustCrypto と curve25519-dalek |
-| `ed25519-dalek` | 2.2.0 | 機体鍵の署名 | 最も使われている Ed25519。`verify_strict` で小さい位数の鍵などを拒む | 記載なし |
-| `curve25519-dalek` | 5.0.0（直接依存）・4.1.3（他クレートの依存） | X25519 の公開鍵の計算だけ | このクレートは 5.0.0 を直接使う。spake2・snow・ed25519-dalek は 4.1.3 を使うため、Cargo.lock には両版が入る | 記載なし |
+| `ed25519-dalek` | 3.0.0 | 機体鍵の署名 | 最も使われている Ed25519。`verify_strict` で小さい位数の鍵などを拒む | 記載なし |
+| `curve25519-dalek` | 5.0.0（直接依存・ed25519-dalek）・4.1.3（spake2・snow） | 直接使うのは X25519 の公開鍵の計算。Ed25519 の署名・検証にも間接的に使う | spake2・snow が 4.1.3 を使うため、Cargo.lock には両版が入る | 記載なし |
 | `chacha20poly1305`・`blake2` | 0.10.1・0.10.6 | snow の中の AEAD とハッシュ | snow の既定の選択 | chacha20poly1305 は NCC Group の監査あり |
-| `sha2`・`rand_core`（getrandom）・`zeroize` | 0.10・0.6・1 | 指紋・OS の乱数・使い終えた秘密を消す | spake2 などが既に使っているもの | |
+| `sha2`・`rand_core`（getrandom）・`zeroize` | 0.11・0.6・1（直接依存） | 指紋・OS の乱数・使い終えた秘密を消す | spake2 などの依存では sha2 0.10 も残る。乱数から作った seed を ed25519-dalek の `from_bytes` に渡す | |
 
 snow は `std` の feature を入れない（入れると ring まで入る。alloc だけで動く）。HTTP（OTLP の受け口）の解析だけ `httparse` 1（hyper の中で使われている、依存の無い解析器）を足した。
+
+ed25519-dalek 2.2.0 → 3.0.0 の互換性は `keys::tests::ed25519_compat_*` で確かめる。旧版で生成・厳密検証した公開の合成 fixture（`crates/tune-link/tests/fixtures/ed25519-v2-card.json`）を新版で検証し、新版の署名出力が旧版とバイト単位で一致すること、旧形式の鍵ファイルを再生成・書き換えせず読めることを確認する。弱い公開鍵の偽造と非正規 scalar（元の S + L）は引き続き拒否する。実際の機体鍵・リリース鍵は使わない。
 
 ### 脅威と対策
 

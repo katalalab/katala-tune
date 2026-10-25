@@ -737,6 +737,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn disk_missing_rollup_and_reopened_store_do_not_fill_zero() {
+        let dir = std::env::temp_dir().join(format!("disk-missing-{}-{}", std::process::id(), now_ms()));
+        let make = |t, r, w| Sample { t, disk: Some(crate::live::Disk { read_bps: r, write_bps: w }), ..Default::default() };
+        let samples = [
+            make(1000, Some(120.0), None),
+            make(2000, None, None),
+            make(3000, Some(60.0), None),
+            make(4000, Some(0.0), None),
+            make(MINUTE + 1000, None, None),
+            make(2 * MINUTE + 1000, Some(0.0), Some(0.0)),
+        ];
+        let rows = rollup("fixture", &samples, None, 0, 3 * MINUTE, "fixture");
+        assert_eq!(rows[0].v, json!({"dr":[60.0,120.0]}));
+        assert_eq!(rows[1].v, json!({}));
+        assert_eq!(rows[2].v, json!({"dr":[0.0,0.0],"dw":[0.0,0.0]}));
+        {
+            let db = Store::open(&dir).unwrap();
+            db.add_metrics(&rows).unwrap();
+        }
+        let db = Store::open(&dir).unwrap();
+        let saved = db.metrics(Some("fixture"), 0, 3 * MINUTE).unwrap();
+        assert_eq!(saved, rows);
+        let series = series(&saved, 0, 3 * MINUTE, 3);
+        assert_eq!(series["dr"], json!([60.0, null, 0.0]));
+        assert_eq!(series["dw"], json!([null, null, 0.0]));
+        assert_eq!(series["dr_max"], json!([120.0, null, 0.0]));
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn retention_failure_is_visible_and_retries_before_daily_success_interval() {
         use crate::engine::NoHost;

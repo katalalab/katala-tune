@@ -50,7 +50,7 @@
 
 | 層 | 中身 | 置き場所 |
 |---|---|---|
-| サンプラー | 読み取り専用。1 行目に hello、以後 1 行 1 JSON を出し続ける。macOS は標準ライブラリだけ（ctypes で OS の統計を読み、他ユーザーのプロセスは setuid の ps を 15 秒ごと）。同じ値を sysctl・mach・libproc・IOKit で直接読む Rust 版（`tune-agent sample`、`sample_mac.rs`。live_mac.py と同時に動かして突き合わせる試験つき）もあるが、アプリはまだ使わない（各 Mac へ置く手順ができてから切り替える）。Windows は Rust のネイティブ版（`tune-agent sample`。PDH で性能カウンタを直接読み、プロセスは NtQuerySystemInformation 1 回。`~/.katala-tune/bin/tune-agent.exe` に置く）を先に使い、無ければ PowerShell 版（.NET の性能カウンタ）。GPU はどちらも 120 回で自分から終わる `nvidia-smi dmon` | `crates/tune-agent/src/sample*.rs`・`probes/live_mac.py`・`probes/live_win.ps1` |
+| サンプラー | 読み取り専用。1 行目に hello、以後 1 行 1 JSON を出し続ける。macOS は標準ライブラリだけ（ctypes で OS の統計を読み、他ユーザーのプロセスは setuid の ps を 15 秒ごと）。同じ値を sysctl・mach・libproc・IOKit で直接読む Rust 版（`tune-agent sample`、`sample_mac.rs`。live_mac.py と同時に動かして突き合わせる試験つき）を `~/.katala-tune/bin/tune-agent` に置いてあれば先に使い、無い・動かない（古い版・違うアーキテクチャ）ときは live_mac.py に戻る。Windows は Rust のネイティブ版（`tune-agent sample`。PDH で性能カウンタを直接読み、プロセスは NtQuerySystemInformation 1 回。`~/.katala-tune/bin/tune-agent.exe` に置く）を先に使い、無ければ PowerShell 版（.NET の性能カウンタ）。GPU はどちらも 120 回で自分から終わる `nvidia-smi dmon` | `crates/tune-agent/src/sample*.rs`・`probes/live_mac.py`・`probes/live_win.ps1` |
 | 取得の経路 | 今は子プロセス（この機体はローカル、ほかは SSH）。将来は tune-agent の暗号化通信に差し替える | `tune-core::live::Route` |
 | 解析・保持 | 行を読んで範囲に収め、機体ごとに直近 300 点を Rust 側に持つ | `tune-core::live`（`parse_line`・`Ring`） |
 | 管理 | 開始・停止、画面からの合図（liveStart の呼び直し）が 2 分途切れたら自動停止、同時に 6 台まで、続けての失敗は 3 回までつなぎ直す、アプリの終了・ウィンドウを閉じたときの停止 | `tune-core::live::Live`、`src-tauri/src/live.rs` |
@@ -62,6 +62,13 @@
 - SSH の多重化（ControlMaster）は使わない。多重化の親が接続を持ち続けると、ssh を止めても機体側に伝わらない
 - Windows の SSH（Git Bash 経由）は、セッションが終わってもサンプラーの標準入出力が開いたまま残る。サンプラーは自分の上にいる sshd のプロセスを見張り、終わったら止まる
 - どの場合も、サンプラーは 15 分（`sampler_max_age`）で自分から終わり、続けるなら数えずにつなぎ直す
+
+サンプラーの置き方（`~/.katala-tune/bin` だけ。`crates/tune-core/src/helpers.rs`）:
+
+- この機体: アプリは起動のたびに、隣に同梱した `tune`・`tune-agent` を `~/.katala-tune/bin` へ写す（Mac の .app は universal の `tune-agent` を同梱）
+- 同じ OS のほかの機体: 常時監視のハブが、hello の版が古い・ネイティブが無い機体へ同梱のサンプラーを SSH の標準入力で送り、SHA-256 を確かめてから入れ替える（1 機体 1 時間に 1 回まで）
+- 違う OS の機体（Windows のハブから Mac など）: `tune agent-push <機体> --file <その OS 用の tune-agent>` で手で送る。中身がその OS の実行ファイル（PE・Mach-O）でなければ送らない。除外・SSH 禁止の機体へは送らない
+- 送らなくても動く: 無ければ macOS は live_mac.py、Windows は live_win.ps1 に戻る
 
 ## 電力・Clockと手動の接続診断
 

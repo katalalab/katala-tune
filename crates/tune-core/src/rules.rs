@@ -166,7 +166,7 @@ static ADVICE: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         ),
         (
             d("^vmmemWSL$|^vmmem$"),
-            "WSL の VM。使い終わったら `wsl --shutdown` でメモリを返す。常時大きいなら %UserProfile%\\.wslconfig の memory で上限を付ける。",
+            "WSL の VM。GPU 計算 PID がある・GPU 使用率が高い・GPU 状態を取得できない、または GPU 学習保護の機体では、`wsl --shutdown` と上限変更の反映を保留する。使い終わったことを確認してからメモリを返す。常時大きいなら %UserProfile%\\.wslconfig の memory で上限を付ける。",
         ),
         (
             d("^(Discord|Slack|Microsoft Teams|ChatGPT|Claude|Notion|Spotify)$"),
@@ -563,13 +563,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
             None,
         );
     }
-    let tree_dup = |t: &Value| {
-        arr(get(procs, "apps")).iter().any(|a| {
-            matches!((a.get("app"), t.get("root")), (Some(Value::String(x)), Some(Value::String(y))) if x == y)
-                && total_mb_truthy
-                && num(a.get("mem_mb")) >= total_mb * 0.2
-        })
-    };
+    // 名前別の apps と根 PID 別の trees は集計対象が異なるため、同名でも帰属を残す。
     for t in arr(get(procs, "trees"))
         .iter()
         .filter(|t| {
@@ -578,12 +572,11 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 && total_mb_truthy
                 && num0(t.get("count")) >= 3.0
                 && num0(t.get("mem_mb")) >= total_mb * 0.2
-                && !tree_dup(t)
         })
         .take(2)
     {
         out.add(
-            format!("mem-tree-{}", string(t.get("root"))),
+            format!("mem-tree-{}-{}", string(t.get("root")), string(t.get("pid"))),
             "info",
             "memory",
             format!(
@@ -793,7 +786,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 "memory",
                 format!("WSL が {} GB を使っていて上限が無い", gb(vm.get("mem_mb"))),
                 ".wslconfig に memory の指定が無い".into(),
-                "Windows 側が足りなくなる前に上限を付ける。反映前の `wsl --shutdown` は、GPU 計算 PID がある・GPU 使用率が高い・GPU 状態を取得できない場合には実行しない。".into(),
+                "Windows 側が足りなくなる前に上限を付ける。GPU 計算 PID がある・GPU 使用率が高い・GPU 状態を取得できない、または GPU 学習保護の機体では、`wsl --shutdown` と上限変更の反映を保留する。".into(),
                 Some(vec![wslconfig(num(get(get(s, "memory"), "total_gb")))]),
                 None,
             );
@@ -804,7 +797,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 "memory",
                 "WSL のメモリ上限が未設定".into(),
                 "既定では実メモリの半分まで使う".into(),
-                "常用するなら上限と autoMemoryReclaim を設定しておくと、使い終わったメモリが Windows に戻る。反映前の `wsl --shutdown` は GPU 計算中・GPU 活動不明なら保留する。".into(),
+                "常用するなら上限と autoMemoryReclaim を設定しておくと、使い終わったメモリが Windows に戻る。GPU 計算 PID がある・GPU 使用率が高い・GPU 状態を取得できない、または GPU 学習保護の機体では、`wsl --shutdown` と上限変更の反映を保留する。".into(),
                 Some(vec![wslconfig(num(or(get(get(s, "memory"), "total_gb"), Some(&Value::from(16)))))]),
                 None,
             );
@@ -1042,6 +1035,70 @@ pub fn compare(prev: Option<&Value>, cur: Option<&Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_name_roots_have_distinct_selectable_ids() {
+        for probe in ["mac", "windows"] {
+            let trees = vec![
+                json!({ "root": "Browser", "pid": 4242, "owner": "user", "count": 9, "children": 3, "mem_mb": 20000 }),
+                json!({ "root": "Browser", "pid": 4343, "owner": "user", "count": 7, "children": 2, "mem_mb": 18000 }),
+            ];
+            for rows in [trees.clone(), trees.into_iter().rev().collect()] {
+                let findings = analyze(
+                    &json!({ "probe": probe, "memory": { "total_gb": 64 }, "processes": {
+                        "apps": [{ "app": "Browser", "mem_mb": 38000, "count": 16 }], "trees": rows
+                    } }),
+                    &json!({}),
+                );
+                let mut ids: Vec<_> = findings.iter().filter_map(|f| f["id"].as_str().filter(|id| id.starts_with("mem-tree-"))).collect();
+                ids.sort_unstable();
+                assert_eq!(ids, ["mem-tree-Browser-4242", "mem-tree-Browser-4343"], "{probe}");
+                let selected = findings.iter().find(|f| f["id"] == "mem-tree-Browser-4343").unwrap();
+                assert!(selected["detail"].as_str().unwrap().contains("根: Browser（PID 4343）、直下の子 2 本"));
+                assert_eq!(selected["title"], "Browser を根とするプロセス群が 17.6 GB（実メモリの 27%、7 プロセス）");
+                assert!(!findings.iter().any(|f| f["id"] == "mem-tree-Browser"));
+            }
+        }
+    }
+
+    #[test]
+    fn same_name_app_keeps_tree_attribution() {
+        for (probe, metric) in [("mac", "RSS"), ("windows", "ワーキングセット")] {
+            for (case, apps, has_hog) in [
+                ("same total", json!([{ "app": "Browser", "mem_mb": 20000, "count": 9 }]), true),
+                ("different membership", json!([{ "app": "Browser", "mem_mb": 40000, "count": 18 }]), true),
+                (
+                    "app outside top three",
+                    json!([
+                        { "app": "First", "mem_mb": 20000, "count": 9 },
+                        { "app": "Second", "mem_mb": 20000, "count": 9 },
+                        { "app": "Third", "mem_mb": 20000, "count": 9 },
+                        { "app": "Browser", "mem_mb": 20000, "count": 9 }
+                    ]),
+                    false,
+                ),
+            ] {
+                let findings = analyze(
+                    &json!({ "probe": probe, "memory": { "total_gb": 64 }, "processes": {
+                        "apps": apps,
+                        "trees": [{ "root": "Browser", "pid": 4242, "owner": "user", "count": 9, "children": 3, "mem_mb": 20000 }]
+                    } }),
+                    &json!({}),
+                );
+                assert_eq!(findings.iter().any(|f| f["id"] == "mem-hog-Browser"), has_hog, "{probe}: {case}");
+                let tree = findings.iter().find(|f| f["id"] == "mem-tree-Browser-4242").unwrap_or_else(|| panic!("{probe}: {case}: missing tree"));
+                assert_eq!(tree["title"], "Browser を根とするプロセス群が 19.5 GB（実メモリの 31%、9 プロセス）");
+                let detail = tree["detail"].as_str().unwrap();
+                assert!(detail.contains("根: Browser（PID 4242）、直下の子 3 本、所有者 ユーザー、群の合計"));
+                assert!(detail.contains(metric));
+                let advice = tree["advice"].as_str().unwrap();
+                assert!(advice.contains("単一プロセスの RSS だけで止める判断はしない"));
+                assert!(advice.contains("依存先を確かめるまで止めない"));
+                assert!(tree.get("action").is_none());
+                assert!(tree.get("commands").is_none());
+            }
+        }
+    }
 
     #[test]
     fn cache_accounting_regressions() {
