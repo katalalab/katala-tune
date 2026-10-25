@@ -1808,6 +1808,218 @@ mod tests {
         assert_eq!(downsample(&pts[..3], 4).len(), 3, "少なければそのまま");
     }
 
+    struct LaunchTestDir {
+        path: PathBuf,
+        cleanup: bool,
+    }
+
+    impl LaunchTestDir {
+        fn create(path: PathBuf) -> std::io::Result<Self> {
+            std::fs::create_dir(&path)?;
+            Ok(Self { path, cleanup: true })
+        }
+
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            Self::create(std::env::temp_dir().join(format!("kt-live-launch-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)))).unwrap()
+        }
+    }
+
+    impl Drop for LaunchTestDir {
+        fn drop(&mut self) {
+            if self.cleanup {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    struct ExactChildOutput {
+        status: Option<std::process::ExitStatus>,
+        reason: Option<&'static str>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    }
+
+    // Keep the exact Child handle; never rediscover or signal an arbitrary PID.
+    struct RetainedExactChild {
+        child: std::process::Child,
+        status: Option<std::process::ExitStatus>,
+        stopped: bool,
+    }
+
+    impl RetainedExactChild {
+        fn reap(&mut self) -> std::io::Result<bool> {
+            if self.status.is_none() {
+                self.status = self.child.try_wait()?;
+            }
+            Ok(self.status.is_some())
+        }
+
+        fn stop_and_reap(&mut self) {
+            if self.stopped || self.status.is_some() {
+                return;
+            }
+            self.stopped = true;
+            let _ = self.child.kill();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match self.reap() {
+                    Ok(true) | Err(_) => return,
+                    Ok(false) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        }
+    }
+
+    impl Drop for RetainedExactChild {
+        fn drop(&mut self) {
+            self.stop_and_reap();
+        }
+    }
+
+    fn capture_exact_child(command: &mut std::process::Command, dir: &mut LaunchTestDir, limit: Duration, cap: usize) -> ExactChildOutput {
+        use std::io::Read as _;
+        let deadline = Instant::now() + limit;
+        let out_path = dir.path.join("stdout");
+        let err_path = dir.path.join("stderr");
+        let out_file = std::fs::OpenOptions::new().write(true).create_new(true).open(&out_path).unwrap();
+        let err_file = std::fs::OpenOptions::new().write(true).create_new(true).open(&err_path).unwrap();
+        command.stdout(out_file.try_clone().unwrap()).stderr(err_file.try_clone().unwrap());
+        let mut child = RetainedExactChild { child: command.spawn().unwrap(), status: None, stopped: false };
+        // If anything fails before confirmed reap, leave the owned directory for
+        // diagnosis rather than removing files still used by a retained child.
+        dir.cleanup = false;
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let reason = loop {
+            if Instant::now() >= deadline {
+                break Some("deadline");
+            }
+            let reaped = child.reap().unwrap();
+            // Regular files avoid pipe-reader joins. Poll size and stop excess
+            // output; only cap bytes in total are ever loaded into diagnostics.
+            if out_file.metadata().unwrap().len().saturating_add(err_file.metadata().unwrap().len()) > cap as u64 {
+                break Some("output limit");
+            }
+            if reaped {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        child.stop_and_reap();
+        dir.cleanup = child.status.is_some();
+        let mut stdout = Vec::new();
+        std::fs::File::open(out_path).unwrap().take(cap as u64).read_to_end(&mut stdout).unwrap();
+        let mut stderr = Vec::new();
+        std::fs::File::open(err_path).unwrap().take((cap - stdout.len()) as u64).read_to_end(&mut stderr).unwrap();
+        ExactChildOutput { status: child.status, reason, stdout, stderr }
+    }
+
+    fn launch_test_command(dir: &std::path::Path, test: &str, case: &str) -> std::process::Command {
+        let app = dir.join("owned app");
+        let home = dir.join("synthetic-home");
+        std::fs::create_dir(&app).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let executable = app.join(crate::helpers::exe("live-test"));
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let mut child = std::process::Command::new(&executable);
+        child
+            .args(["--exact", test, "--nocapture", "--test-threads=1", "--format=terse"])
+            .env("KT_LIVE_LAUNCH_TEST_ROOT", dir)
+            .env("KT_LIVE_LAUNCH_TEST_CASE", case)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("KATALA_TUNE_DATA_DIR", home.join(".katala-tune"))
+            .stdin(Stdio::null());
+        #[cfg(target_os = "macos")]
+        child.env("PATH", "/usr/bin:/bin");
+        child
+    }
+
+    #[test]
+    fn launch_test_directory_rejects_collisions_and_cleans_only_owned_paths() {
+        let owner = LaunchTestDir::new();
+        let existing = owner.path.join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let canary = existing.join("canary");
+        std::fs::write(&canary, b"keep").unwrap();
+        let collision = LaunchTestDir::create(existing.clone());
+        assert!(matches!(collision, Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists));
+        drop(collision);
+        assert_eq!(std::fs::read(&canary).unwrap(), b"keep");
+        let path = owner.path.clone();
+        drop(owner);
+        assert!(!path.exists(), "successful exclusive owner cleans its own fixture");
+    }
+
+    // Invoked only as an exact child with the test-only case environment set.
+    #[test]
+    #[ignore]
+    fn launch_test_watchdog_fixture() {
+        println!("watchdog fixture ready");
+        match std::env::var("KT_LIVE_LAUNCH_TEST_CASE").unwrap().as_str() {
+            "hung" => loop {
+                std::thread::park();
+            },
+            "noisy" => {
+                use std::io::Write as _;
+                std::io::stdout().write_all(&vec![b'x'; 262144]).unwrap();
+                std::io::stderr().write_all(&vec![b'y'; 262144]).unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
+            "stderr" => {
+                use std::io::Write as _;
+                std::io::stderr().write_all(&vec![b'y'; 262144]).unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
+            "normal" => (),
+            other => panic!("unknown fixture case: {other}"),
+        }
+    }
+
+    fn watchdog_case(case: &str, expected: Option<&str>) {
+        let mut dir = LaunchTestDir::new();
+        let mut command = launch_test_command(&dir.path, "live::tests::launch_test_watchdog_fixture", case);
+        command.arg("--ignored");
+        let limit = if case == "hung" { Duration::from_secs(2) } else { Duration::from_secs(5) };
+        let began = Instant::now();
+        let output = capture_exact_child(&mut command, &mut dir, limit, 4096);
+        assert_eq!(output.reason, expected);
+        assert!(output.status.is_some(), "retained child must be reaped before cleanup");
+        assert!(began.elapsed() < limit + Duration::from_secs(3));
+        assert!(output.stdout.len() + output.stderr.len() <= 4096, "capture must be bounded");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("watchdog fixture ready"),
+            "child must reach the controlled fixture before watchdog termination"
+        );
+        if expected.is_none() {
+            assert!(output.status.unwrap().success());
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+        let path = dir.path.clone();
+        drop(dir);
+        assert!(!path.exists(), "reaped child fixture can be removed");
+    }
+
+    #[test]
+    fn launch_test_watchdog_stops_hung_exact_child() {
+        watchdog_case("hung", Some("deadline"));
+    }
+
+    #[test]
+    fn launch_test_watchdog_caps_noisy_exact_child() {
+        watchdog_case("noisy", Some("output limit"));
+        watchdog_case("stderr", Some("output limit"));
+    }
+
+    #[test]
+    fn launch_test_watchdog_accepts_normal_exact_child() {
+        watchdog_case("normal", None);
+    }
+
     // Only child processes receive this HOME/data namespace. Copying the test
     // executable also confines the beside-app search; no installed helper runs.
     fn isolated_launch_child(test: &str, cases: &[&str]) -> Option<(PathBuf, String)> {
@@ -1817,29 +2029,15 @@ mod tests {
             return Some((PathBuf::from(dir), std::env::var(CASE).unwrap()));
         }
         for case in cases {
-            let (_, dir) = fake("");
-            let app = dir.join("owned app");
-            let home = dir.join("synthetic-home");
-            std::fs::create_dir_all(&app).unwrap();
-            std::fs::create_dir_all(&home).unwrap();
-            let executable = app.join(crate::helpers::exe("live-test"));
-            std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
-            let mut child = std::process::Command::new(&executable);
-            child
-                .args(["--exact", test, "--nocapture", "--test-threads=1", "--format=terse"])
-                .env(ROOT, &dir)
-                .env(CASE, case)
-                .env("HOME", &home)
-                .env("USERPROFILE", &home)
-                .env("KATALA_TUNE_DATA_DIR", home.join(".katala-tune"));
-            #[cfg(target_os = "macos")]
-            child.env("PATH", "/usr/bin:/bin");
-            let output = child.output().unwrap();
-            std::fs::remove_dir_all(&dir).unwrap();
+            let mut dir = LaunchTestDir::new();
+            let mut command = launch_test_command(&dir.path, test, case);
+            let output = capture_exact_child(&mut command, &mut dir, Duration::from_secs(45), 65536);
             assert!(
-                output.status.success(),
-                "{test} case={case}: {:?}\nstdout: {}\nstderr: {}",
+                output.reason.is_none() && output.status.is_some_and(|status| status.success()),
+                "{test} case={case}: {:?}, {:?}, fixture={}\nstdout: {}\nstderr: {}",
                 output.status,
+                output.reason,
+                dir.path.display(),
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
