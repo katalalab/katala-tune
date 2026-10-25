@@ -45,10 +45,23 @@ The macOS computer-use tool refused direct access to the Terminal app. macOS ter
 
 This is source/debug-build acceptance, not an installer, signing, notarization, updater, or release certification. It does not accept every supported OS version or every third-party CLI installation layout. Actual system findings were not submitted as test prompts, and no extra CLI execution permissions were granted. Private screenshots and process/audit receipts are retained outside the public repository.
 
-## 2026-10-26 review follow-up (validation pending)
+## 2026-10-26 review follow-up (focused Rust verified; native follow-up pending)
 
 The native results above describe the original debug-build repair. Subsequent review changes use fresh, fallible configuration reads at both preparation and launch, and write a pending audit row before file creation or terminal launch. Completion updates that same row. Failed completion writes are reported as incomplete without retrying launch; cancellation audit errors are surfaced as well. Shared database signatures and schema are unchanged.
 
 The prepared protection list is retained with the prompt; a changed protection list requires a new preview. The page generation is checked after receiving preview acceptance and on both sides of native confirmation, so page replacement invalidates an already queued acceptance or a native approval in progress.
 
-Regression sources use synthetic configuration, a real temporary SQLite database and an injected terminal launcher. They cover malformed/missing/unreadable configuration, audit insert rejection, audit completion failure or zero updated rows, and interruption followed by database reopen. No real AI CLI is called by these regressions. Rust RED/GREEN and OS acceptance for these follow-up changes await the assigned validation slot; earlier native acceptance does not certify these new changes.
+Regression sources use synthetic configuration, a real temporary SQLite database and an injected terminal launcher. They cover malformed/missing/unreadable configuration, audit insert rejection, audit completion failure or zero updated rows, and interruption followed by database reopen. No real AI CLI is called by these regressions.
+
+Focused Rust verification on macOS used `CARGO_BUILD_JOBS=2` and `RUST_TEST_THREADS=1`, with a dedicated target directory. The intentionally failing baselines compiled before their tests failed:
+
+| Source revision | Focused command | Result |
+|---|---|---|
+| `59e5296` | `cargo test -p tune-core --lib handoff::regression --locked` | Expected RED: 7 failed, 2 passed; stale permissions and missing audit outcomes reproduced |
+| `b71530e` | `cargo test -p tune-core --lib handoff::regression --locked` | Expected RED: protection change test failed, 9 passed |
+| `b71530e` | `cargo test -p katala-tune --lib handoff_review::tests --locked` | Expected RED: queued acceptance/page replacement and page replacement during native confirmation failed, 3 passed |
+| `d0699ea68ac5b0197ec552c5d1f7259ddf381b61` | `cargo test -p tune-core --lib handoff --locked` | GREEN: 17 passed |
+| `d0699ea68ac5b0197ec552c5d1f7259ddf381b61` | `cargo test -p katala-tune --lib handoff_review::tests --locked` | GREEN: 5 passed |
+| `d0699ea68ac5b0197ec552c5d1f7259ddf381b61` | `cargo test -p katala-tune --lib confirm:: --locked` | GREEN: 2 passed |
+
+These focused runs required no compile fixes. They do not run the full workspace, the Windows-specific console tests, or real application windows. Earlier native acceptance does not certify the follow-up changes. Remaining native checks must use isolated application data and synthetic findings: cancel/reload after preview acceptance and during native confirmation, protection/configuration changes while confirmation is open, and audit failure outcomes without claiming that an uncertain launch never occurred. Recheck bounded text/visible buttons and default cancellation on both supported platforms, and use a fake CLI rather than submitting to an AI service.
