@@ -50,7 +50,7 @@
 
 | 層 | 中身 | 置き場所 |
 |---|---|---|
-| サンプラー | 読み取り専用。1 行目に hello、以後 1 行 1 JSON を出し続ける。macOS は標準ライブラリだけ（ctypes で OS の統計を読み、他ユーザーのプロセスは setuid の ps を 15 秒ごと）。Windows は Rust のネイティブ版（`tune-agent sample`。PDH で性能カウンタを直接読み、プロセスは NtQuerySystemInformation 1 回。`~/.katala-tune/bin/tune-agent.exe` に置く）を先に使い、無ければ PowerShell 版（.NET の性能カウンタ）。GPU はどちらも 120 回で自分から終わる `nvidia-smi dmon` | `crates/tune-agent/src/sample*.rs`・`probes/live_mac.py`・`probes/live_win.ps1` |
+| サンプラー | 読み取り専用。1 行目に hello、以後 1 行 1 JSON を出し続ける。macOS は標準ライブラリだけ（ctypes で OS の統計を読み、他ユーザーのプロセスは setuid の ps を 15 秒ごと）。同じ値を sysctl・mach・libproc・IOKit で直接読む Rust 版（`tune-agent sample`、`sample_mac.rs`。live_mac.py と同時に動かして突き合わせる試験つき）もあるが、アプリはまだ使わない（各 Mac へ置く手順ができてから切り替える）。Windows は Rust のネイティブ版（`tune-agent sample`。PDH で性能カウンタを直接読み、プロセスは NtQuerySystemInformation 1 回。`~/.katala-tune/bin/tune-agent.exe` に置く）を先に使い、無ければ PowerShell 版（.NET の性能カウンタ）。GPU はどちらも 120 回で自分から終わる `nvidia-smi dmon` | `crates/tune-agent/src/sample*.rs`・`probes/live_mac.py`・`probes/live_win.ps1` |
 | 取得の経路 | 今は子プロセス（この機体はローカル、ほかは SSH）。将来は tune-agent の暗号化通信に差し替える | `tune-core::live::Route` |
 | 解析・保持 | 行を読んで範囲に収め、機体ごとに直近 300 点を Rust 側に持つ | `tune-core::live`（`parse_line`・`Ring`） |
 | 管理 | 開始・停止、画面からの合図（liveStart の呼び直し）が 2 分途切れたら自動停止、同時に 6 台まで、続けての失敗は 3 回までつなぎ直す、アプリの終了・ウィンドウを閉じたときの停止 | `tune-core::live::Live`、`src-tauri/src/live.rs` |
@@ -72,7 +72,7 @@
 
 ## 常時監視とハブ（画面が見ていなくても集める）
 
-ライブと同じサンプラー・同じ管理（`tune-core::live::Live`）を使い、`tune-core::monitor::run` が 15 秒ごとに合図を送って流れを保つ。終わった 1 分ぶんを `metrics_minute`（1 機体 1 分 1 行、項目ごとに [平均, 最大]、14 日）へ集計する。
+ライブと同じサンプラー・同じ管理（`tune-core::live::Live`）を使い、`tune-core::monitor::run` が 15 秒ごとに合図を送って流れを保つ。終わった 1 分ぶんを `metrics_minute`（1 機体 1 分 1 行、項目ごとに [平均, 最大]、14 日）へ集計する。 古い分は削除と同じトランザクションで数値だけの時間集約（90日）・日集約（400日）へ移す。集約は指標ごとの有効minute数で重みを付け、欠測を0にしない。全体5万行または16MiBの論理payloadを上限に古いbucketから整理し、容量による欠落を件数で残す。共有DB/WALファイル全体のhard capではない。整理失敗は内部記録へ残して5分後、成功後は24時間後に試す。既存画面の推移範囲は引き続き最大24時間で、長期履歴のUI/CLI・baseline・イベント重畳は別工程。
 
 | 役割 | 動き |
 |---|---|
