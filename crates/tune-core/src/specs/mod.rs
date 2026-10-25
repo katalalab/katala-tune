@@ -108,6 +108,8 @@ pub const FIELDS: &[&str] = &[
     "value",
     "duplex",
     "speed_bps",
+    "transmit_speed_bps",
+    "receive_speed_bps",
     "enabled",
     "dhcp_enabled",
     "mtu_bytes",

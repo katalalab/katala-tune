@@ -26,7 +26,7 @@ try {
 } catch { $errors.os_registry = $(if ($_.Exception.HResult -eq -2147024891) { "permission_denied" } else { "error" }) }
 Q "audio" "Win32_SoundDevice" @("Name","Manufacturer","Status")
 try {
-  $r.network = @(Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetAdapter -OperationTimeoutSec 8 | Select-Object InterfaceDescription,DriverVersionString,DriverDate,LinkSpeed,MediaConnectState,FullDuplex,MtuSize,Virtual,HardwareInterface,AdminStatus)
+  $r.network = @(Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetAdapter -OperationTimeoutSec 8 | Select-Object InterfaceDescription,DriverVersionString,DriverDate,TransmitLinkSpeed,ReceiveLinkSpeed,MediaConnectState,FullDuplex,MtuSize,Virtual,HardwareInterface,InterfaceAdminStatus)
 } catch { $errors.network = $(if ($_.Exception.HResult -eq -2147024891) { "permission_denied" } else { "error" }) }
 try {
   $pnp = @(Get-CimInstance Win32_PnPEntity -OperationTimeoutSec 8)
@@ -214,7 +214,8 @@ const QUERIES: &[(&str, &str, Mapping)] = &[
             ("InterfaceDescription", "model"),
             ("DriverVersionString", "driver_version"),
             ("DriverDate", "driver_date"),
-            ("LinkSpeed", "speed_bps"),
+            ("TransmitLinkSpeed", "transmit_speed_bps"),
+            ("ReceiveLinkSpeed", "receive_speed_bps"),
             ("MediaConnectState", "status"),
             ("FullDuplex", "duplex"),
             ("MtuSize", "mtu_bytes"),
@@ -420,10 +421,19 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
                     &[("DisplayVersion", "display_version"), ("UBR", "update_build_revision"), ("InstallationType", "installation_type")],
                 ));
             }
-            if *id == "network"
-                && let Some(status) = enum_name(&v["AdminStatus"], &[(1, "up"), (2, "down"), (3, "testing")])
-            {
-                fields.insert("admin_status".into(), status);
+            if *id == "network" {
+                if let Some(status) = enum_name(&v["InterfaceAdminStatus"], &[(1, "up"), (2, "down"), (3, "testing")]) {
+                    fields.insert("admin_status".into(), status);
+                }
+                if v["MtuSize"].as_u64() == Some(0) {
+                    fields.remove("mtu_bytes");
+                }
+                // Preserve asymmetric rates; a single common rate is valid only when both agree.
+                if let (Some(tx), Some(rx)) = (v["TransmitLinkSpeed"].as_u64(), v["ReceiveLinkSpeed"].as_u64())
+                    && tx == rx
+                {
+                    fields.insert("speed_bps".into(), json!(tx));
+                }
             }
             if *id == "display" {
                 fields.extend(mapped(v, &[("MaxHorizontalImageSize", "physical_width_cm"), ("MaxVerticalImageSize", "physical_height_cm")]));

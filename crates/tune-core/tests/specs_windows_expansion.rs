@@ -74,7 +74,7 @@ fn device_guard_arrays_become_scalar_states_and_missing_data_is_not_false() {
 #[test]
 fn network_keeps_adapter_settings_and_driver_completion_requires_unique_names() {
     let r = report(
-        json!({"network":[{"InterfaceDescription":"Example NIC","DriverVersionString":"authoritative","MtuSize":1500,"Virtual":false,"HardwareInterface":true,"AdminStatus":1}],
+        json!({"network":[{"InterfaceDescription":"Example NIC","DriverVersionString":"authoritative","MtuSize":1500,"Virtual":false,"HardwareInterface":true,"InterfaceAdminStatus":1}],
         "drivers":[{"DeviceName":"Example NIC","DriverVersion":"supplemental"}]}),
     );
     let f = fields(&r, "network", 0);
@@ -89,6 +89,24 @@ fn network_keeps_adapter_settings_and_driver_completion_requires_unique_names() 
     ] {
         assert!(fields(&report(raw), "audio", 0)["driver_version"].is_null());
     }
+}
+
+#[test]
+fn native_adapter_property_names_keep_asymmetric_rates_and_unknown_mtu() {
+    let r = report(json!({"network":[
+        {"InterfaceDescription":"Example NIC","InterfaceAdminStatus":1,"TransmitLinkSpeed":1000000000_u64,"ReceiveLinkSpeed":2500000000_u64,"MtuSize":0},
+        {"InterfaceDescription":"Example NIC 2","InterfaceAdminStatus":2,"TransmitLinkSpeed":1000000000_u64,"ReceiveLinkSpeed":1000000000_u64,"MtuSize":1500}
+    ]}));
+    let f = fields(&r, "network", 0);
+    assert_eq!(f["admin_status"], "up");
+    assert_eq!(f["transmit_speed_bps"], 1000000000_u64);
+    assert_eq!(f["receive_speed_bps"], 2500000000_u64);
+    assert!(f["speed_bps"].is_null());
+    assert!(f["mtu_bytes"].is_null());
+    assert_eq!(fields(&r, "network", 1)["speed_bps"], 1000000000_u64);
+    assert_eq!(fields(&r, "network", 1)["admin_status"], "down");
+    let safe = specs::validate_report(&r, "windows").unwrap();
+    assert_eq!(fields(&safe, "network", 0)["receive_speed_bps"], 2500000000_u64);
 }
 
 fn edid() -> Vec<u8> {

@@ -24,6 +24,7 @@ Rustの `tune specs-local` は台帳・DBを開かず、その機体の読取結
 - Windowsのストレージは一意なOSディスク番号で `MSFT_Disk` と関連付け、NVMe/SATA等のバス、セクター、パーティション方式、読み取り専用・起動属性を追加する。OSの `SCSI` 表記だけで物理接続方式を推測しない。VBS・Credential Guard・メモリ整合性は設定と実行状態を分ける。OSリリース版・UBR、NICのMTU・仮想/物理属性も表示する。
 - Windowsの画面WMI取得失敗時は、最大64件の保存済みEDIDを検査し、チェックサムが正しい基本情報だけを表示する。これは過去の接続を含み、現在接続・有効状態は未確認。元のWMI失敗も残す。シリアル番号やEDID本体を保存しない。
 - macOSは利用可能なUSB providerを選び、新しい `SPUSBHostDataType` にも対応。公開されたTRIM/SMART、Wi-Fiファームウェア、Thunderboltの物理ポート、音声のサンプルレート・入出力チャンネル、SIP・FileVaultを表示する。ポートの広告速度と実効転送速度は区別する。
+- NICの送受信リンク速度は別々に保持し、同じ場合だけ共通速度も表示する。これはOSが報告するリンク属性で、仮想NICの値を含み、通信の実測性能を意味しない。未公開のMTU（0）は表示しない。Windowsの項目は [MSFT_NetAdapterの公式定義](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/legacy/hh968170(v=vs.85)) に従う。
 
 ## 公式仕様
 
