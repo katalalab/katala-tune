@@ -1808,8 +1808,78 @@ mod tests {
         assert_eq!(downsample(&pts[..3], 4).len(), 3, "少なければそのまま");
     }
 
+    // Only child processes receive this HOME/data namespace. Copying the test
+    // executable also confines the beside-app search; no installed helper runs.
+    fn isolated_launch_child(test: &str, cases: &[&str]) -> Option<(PathBuf, String)> {
+        const ROOT: &str = "KT_LIVE_LAUNCH_TEST_ROOT";
+        const CASE: &str = "KT_LIVE_LAUNCH_TEST_CASE";
+        if let Some(dir) = std::env::var_os(ROOT) {
+            return Some((PathBuf::from(dir), std::env::var(CASE).unwrap()));
+        }
+        for case in cases {
+            let (_, dir) = fake("");
+            let app = dir.join("owned app");
+            let home = dir.join("synthetic-home");
+            std::fs::create_dir_all(&app).unwrap();
+            std::fs::create_dir_all(&home).unwrap();
+            let executable = app.join(crate::helpers::exe("live-test"));
+            std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+            let mut child = std::process::Command::new(&executable);
+            child
+                .args(["--exact", test, "--nocapture", "--test-threads=1", "--format=terse"])
+                .env(ROOT, &dir)
+                .env(CASE, case)
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("KATALA_TUNE_DATA_DIR", home.join(".katala-tune"));
+            #[cfg(target_os = "macos")]
+            child.env("PATH", "/usr/bin:/bin");
+            let output = child.output().unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert!(
+                output.status.success(),
+                "{test} case={case}: {:?}\nstdout: {}\nstderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "exact child must run one test");
+            eprintln!("{test} case={case}: passed");
+        }
+        None
+    }
+
+    fn install_launch_fixture(dir: &std::path::Path, case: &str, bytes: &[u8]) -> Option<PathBuf> {
+        let name = crate::helpers::exe("tune-agent");
+        let beside = dir.join("owned app").join(&name);
+        let managed = dir.join("synthetic-home/.katala-tune/bin").join(&name);
+        assert_eq!(std::env::current_exe().unwrap().parent().unwrap(), beside.parent().unwrap());
+        assert_eq!(crate::helpers::bin_dir(), managed.parent().unwrap());
+        #[cfg(not(windows))]
+        assert_eq!(crate::nodes::home(), dir.join("synthetic-home"));
+        assert!(!beside.exists() && !managed.exists());
+        if case == "absent" {
+            assert_eq!(local_native(), None);
+            return None;
+        }
+        assert!(case == "managed" || case == "bundled");
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        std::fs::write(&managed, bytes).unwrap();
+        if case == "bundled" {
+            std::fs::write(&beside, bytes).unwrap();
+            assert_eq!(local_native(), Some(beside.clone()), "beside-app wins when both exist");
+            Some(beside)
+        } else {
+            std::fs::create_dir(&beside).unwrap();
+            assert_eq!(local_native(), Some(managed.clone()));
+            Some(managed)
+        }
+    }
+
     #[test]
     fn launch_follows_the_probe_conventions() {
+        let Some((dir, case)) = isolated_launch_child("live::tests::launch_follows_the_probe_conventions", &["absent", "managed", "bundled"]) else { return };
+        let native = install_launch_fixture(&dir, &case, b"owned fixture - never execute");
         let o = Opts::default();
         let mac = launch(&node("m", "macos"), &o).unwrap();
         assert_eq!(mac.program, "ssh");
@@ -1841,11 +1911,39 @@ mod tests {
         let mut local_node = node("local", "windows");
         local_node.local = true;
         let local = launch(&local_node, &o).unwrap();
-        if local.program == "powershell.exe" {
-            assert!(local.cleanup.is_none() && local.keep_stdin && local.stdin == WIN_LIVE[3..]);
-        } else {
-            assert!(local.program.ends_with("tune-agent.exe") && local.keep_stdin && local.stdin.is_empty());
+        assert!(local.cleanup.is_none() && local.keep_stdin);
+        if let Some(native) = native.as_ref() {
+            assert_eq!(local.program, native.to_str().unwrap());
+            #[cfg(windows)]
+            assert!(local.program.ends_with("tune-agent.exe"));
+            assert!(local.stdin.is_empty());
             assert_eq!(local.args, ["sample", "interval=1", "procs=5", "max=900", "watch=1"]);
+        } else {
+            assert_eq!(local.program, "powershell.exe");
+            assert_eq!(local.stdin, WIN_LIVE[3..]);
+            assert_eq!(local.args[..4], ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+            assert_eq!(local.args.len(), 5);
+        }
+        local_node.os = "macos".into();
+        let local = launch(&local_node, &o).unwrap();
+        assert!(local.keep_stdin && local.cleanup.is_none());
+        assert_eq!(local.stdin, MAC_LIVE.as_bytes());
+        if let Some(native) = native {
+            assert_eq!(local.program, "/bin/sh");
+            assert_eq!(
+                local.args,
+                [
+                    "-c",
+                    &format!(
+                        "\"$0\" sample interval=1 procs=5 max=900 watch=1 || exec /usr/bin/env python3 -c '{}' interval=1 procs=5 max=900 watch=1",
+                        python_boot(MAC_LIVE.len())
+                    ),
+                    native.to_str().unwrap()
+                ]
+            );
+        } else {
+            assert_eq!(local.program, "/usr/bin/env");
+            assert_eq!(local.args, ["python3", "-c", &python_boot(MAC_LIVE.len()), "interval=1", "procs=5", "max=900", "watch=1"]);
         }
         assert!(WIN_LIVE[3..].iter().all(|b| b.is_ascii()), "probes/live_win.ps1 は ASCII のみ");
         assert!(launch(&node("x", "linux"), &o).is_err());
@@ -2245,9 +2343,13 @@ for _ in range(400):
     #[tokio::test]
     async fn mac_sampler_ends_by_itself_when_stdin_closes() {
         let me = Node::from_value(&json!({ "id": "me", "alias": "me", "os": "macos", "local_hostname": "this-host" }), "this-host");
+        let Some((dir, case)) = isolated_launch_child("live::tests::mac_sampler_ends_by_itself_when_stdin_closes", &["absent"]) else { return };
+        assert_eq!(install_launch_fixture(&dir, &case, b""), None);
         let l = launch(&me, &Opts::default()).unwrap();
         assert!(l.keep_stdin && l.args[1] == "-c");
-        let mut src = spawn(l).unwrap();
+        assert_eq!(l.program, "/usr/bin/env");
+        assert_eq!(l.stdin, MAC_LIVE.as_bytes());
+        let mut src = spawn(with_isolated_mac_sensor_env(l, &dir)).unwrap();
         let mut got = 0;
         while got < 2 {
             let line = tokio::time::timeout(Duration::from_secs(20), src.lines.recv()).await.unwrap().expect("行が来る");
@@ -2258,6 +2360,51 @@ for _ in range(400):
         let t0 = Instant::now();
         let ended = src.close().await;
         // 強制終了ならシグナルで終わり code は None。0 は標準入力が閉じたのを見て自分で終わったということ
+        assert_eq!(ended.code, Some(0), "{}", ended.err);
+        assert!(t0.elapsed() < Duration::from_millis(2500));
+    }
+
+    // collect::command enriches PATH. Set these again in the spawned process so
+    // the real Python script cannot discover a normal HOME/Homebrew macmon.
+    #[cfg(target_os = "macos")]
+    fn with_isolated_mac_sensor_env(mut launch: Launch, dir: &std::path::Path) -> Launch {
+        let mut args = vec![format!("HOME={}", dir.join("synthetic-home").display()), "PATH=/usr/bin:/bin".into(), launch.program];
+        args.extend(launch.args);
+        launch.program = "/usr/bin/env".into();
+        launch.args = args;
+        launch
+    }
+
+    /// Owned fake: this checks the native launcher's stdin/EOF contract only.
+    /// Actual native sampler EOF behavior stays covered by tune-agent tests.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_native_launcher_preserves_stdin_until_close() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Some((dir, case)) = isolated_launch_child("live::tests::mac_native_launcher_preserves_stdin_until_close", &["managed", "bundled"]) else { return };
+        let script = b"#!/bin/sh\nprintf '%s\\n' '{\"type\":\"hello\",\"impl\":\"rust\",\"os\":\"macos\"}' '{\"type\":\"s\",\"seq\":1}' '{\"type\":\"s\",\"seq\":2}'\nwhile IFS= read -r line; do :; done\n";
+        let native = install_launch_fixture(&dir, &case, script).unwrap();
+        std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut me = node("me", "macos");
+        me.local = true;
+        let l = launch(&me, &Opts::default()).unwrap();
+        assert_eq!(l.program, "/bin/sh");
+        assert_eq!(l.args[0], "-c");
+        assert_eq!(l.args[2], native.to_str().unwrap());
+        assert!(l.keep_stdin && l.cleanup.is_none());
+        assert_eq!(l.stdin, MAC_LIVE.as_bytes());
+        let mut src = spawn(with_isolated_mac_sensor_env(l, &dir)).unwrap();
+        for expected in ["hello", "s", "s"] {
+            let line = tokio::time::timeout(Duration::from_secs(20), src.lines.recv()).await.unwrap().expect("fixture frame");
+            let value: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(value["type"], expected);
+            if expected == "hello" {
+                assert_eq!(value["impl"], "rust");
+            }
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(100), src.lines.recv()).await.is_err(), "owned fake stays alive while stdin is open");
+        let t0 = Instant::now();
+        let ended = src.close().await;
         assert_eq!(ended.code, Some(0), "{}", ended.err);
         assert!(t0.elapsed() < Duration::from_millis(2500));
     }
