@@ -26,5 +26,9 @@ zeroize = "1"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Performance", "Win32_System_SystemInformation", "Win32_System_Threading", "Wdk_System_SystemInformation"] }
 
+# macOS の sample（sysctl・libproc・getifaddrs の宣言と構造体）。tokio などがすでに使っている版（Cargo.lock に既にある）
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true
