@@ -1,3 +1,7 @@
-# GPU action transport hold
+# Release acceptance gate
 
-The controller's SSH timeout does not prove that a remote PowerShell action stopped. The stdin receiver rejects malformed or expired requests before evaluating the action body, but no clock-offset bound has been established between controller and target. Do not enable or claim real-host GPU action safety from this fixture-only implementation. Native Windows acceptance must prove bounded receipt, expiry behavior, and post-timeout action state before activation.
+The former wall-clock-expiry hold describes the legacy action wrapper. Windows GPU actions now use the KT2 receiver's independent monotonic budget, nonce-bound request and private process Job. Local and SSH controllers use the same receiver. A controller timeout still reports an unverified outcome; it does not report remote success or cleanup by inference.
+
+Native acceptance for runtime commit `ba01c81` includes a real SSH action whose controller was cut off after committing its body. The body and its descendant started; after the receiver's 25-second budget, both recorded process instances were absent and neither delayed marker was written. The actual GUI confirmation/cancel flow, GPU-unknown refusal with an audit entry, real collection on three Windows machines, and fresh live-session shutdown were also exercised. No production GPU workload or power limit was changed. See [Windows release readiness](docs/acceptance/windows-release-readiness.md).
+
+Public distribution remains a separate gate: merge/release authorization, production-identity signed RC verification, updater acceptance, and coordinated helper/ledger rollout. Existing Windows helpers must not be replaced by app sync; use [the approval and rollback procedure](docs/windows-helper-approval.md). Historical Defender alerts have not received a Microsoft false-positive verdict; current clean scans and native canaries must not be described as that verdict.

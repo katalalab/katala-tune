@@ -119,3 +119,5 @@ Tauri 版のリリース（タグ `v*` で macOS / Windows をビルドして Gi
 ## ライセンス
 
 MIT（[LICENSE](LICENSE)）
+
+Windows の 0.7 系候補では、通常収集にも承認済み helper の v2 record が必要です。初回導入・更新は [helper の承認とロールバック](docs/windows-helper-approval.md)、検証済みの範囲と公開前の条件は [Windows release readiness](docs/acceptance/windows-release-readiness.md) を参照してください。

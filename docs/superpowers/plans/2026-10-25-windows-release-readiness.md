@@ -24,22 +24,24 @@
 - Integration must preserve last successful specification data after failure and require explicit shared-machine opt-in.
 
 ### Task 1: Establish incident and integration baseline
-- [ ] Capture relevant Defender threat IDs, event timestamps and signature versions without command payloads.
-- [ ] Verify source and asset hashes against published release, separate binary/script observations.
-- [ ] Import latest machine-comparison branch; compare PR #82 discovery contract and restore any missing regressions.
-- [ ] Run existing JS/Rust baseline and native Windows fixtures; save logs privately.
+- [x] Capture relevant Defender threat IDs, event timestamps and signature versions without command payloads.
+- [x] Verify source and asset hashes against published release, separate binary/script observations.
+- [x] Import latest machine-comparison branch; compare PR #82 discovery contract and restore any missing regressions.
+- [x] Run existing JS/Rust baseline and native Windows fixtures; save logs privately.
 
 ### Task 2: Resolve Windows transport regressions
 **Files:** crates/tune-cli/src/windows_probe.rs; crates/tune-core/src/collect.rs; crates/tune-core/src/collect/windows.rs; related existing tests.
-- [ ] Integrate PR #81's dependency chain in the isolated branch; preserve its activation holds until verified.
-- [ ] Reproduce the nonzero native observation/benchmark exit-code failures and timed-out READY fixture.
-- [ ] Add focused regression assertions first; repair the identified cause without retries, skipped assertions, or unbounded waits.
-- [ ] Verify identity, timeout, stdout/stderr limits and descendant cleanup on native Windows.
+- [x] Integrate PR #81's dependency chain in the isolated branch; preserve its activation holds until verified.
+- [x] Reproduce the nonzero native observation/benchmark exit-code failures and timed-out READY fixture.
+- [x] Add focused regression assertions first; repair the identified cause without retries, skipped assertions, or unbounded waits.
+- [x] Verify identity, timeout, stdout/stderr limits and descendant cleanup on native Windows.
 
 ### Task 3: Validate release candidate
 **Files:** CHANGELOG.md; docs/acceptance/windows-release-readiness.md; release checks where evidence identifies a missing gate.
-- [ ] Run full JS/Rust checks, Electron compatibility where SQLite changed, version consistency, gitleaks and OSS history checks.
-- [ ] Build candidate from exact committed source; scan exact Windows binaries and fixed scripts with current Defender signatures before execution.
-- [ ] Exercise isolated Windows GUI, local/SSH collection, monitor shutdown, specs comparison, help and failed/cancelled actions; preserve existing apps/data.
-- [ ] Verify candidate packages and updater test contracts; record any remaining Microsoft review, signing or distribution gate explicitly.
-- [ ] Request independent whole-branch review, fix blocking findings with reproductions, create and attach the integration PR, and check its CI.
+- [x] Run full JS/Rust checks, Electron compatibility where SQLite changed, version consistency, gitleaks and OSS history checks.
+- [x] Build candidate from exact committed source; scan exact Windows binaries and fixed scripts with current Defender signatures before execution.
+- [x] Exercise isolated Windows GUI, local/SSH collection, monitor shutdown, specs comparison, help and failed/cancelled actions; preserve existing apps/data.
+- [x] Verify candidate packages and updater test contracts; record any remaining Microsoft review, signing or distribution gate explicitly.
+- [x] Request independent whole-branch review, fix blocking findings with reproductions, create and attach the integration PR, and check its CI.
+
+Execution evidence: [Windows release readiness](../../acceptance/windows-release-readiness.md). Source/fixture/integration tasks are verified for runtime ba01c81; public distribution, exact production signing/updater acceptance and ordinary fleet rollout remain explicit external gates, not completed release claims.
