@@ -449,7 +449,14 @@ fn environment(command: &std::process::Command, entries: &[(OsString, OsString)]
             return Err(invalid());
         }
         let units = wide(name)?;
-        if units.len() == 1 || units.contains(&u16::from(b'=')) {
+        // GetEnvironmentStringsW includes the documented per-drive current
+        // directory keys (=C:). Preserve that native state in a complete block;
+        // ordinary names containing '=' and malformed pseudo-keys stay invalid.
+        let drive_directory = units.len() == 4
+            && units[0] == u16::from(b'=')
+            && ((u16::from(b'A')..=u16::from(b'Z')).contains(&units[1]) || (u16::from(b'a')..=u16::from(b'z')).contains(&units[1]))
+            && units[2] == u16::from(b':');
+        if units.len() == 1 || (units.contains(&u16::from(b'=')) && !drive_directory) {
             return Err(invalid());
         }
         wide(value)?;

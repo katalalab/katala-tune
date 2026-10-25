@@ -23,6 +23,47 @@ function RNum($x, $d = 1) {
   return [math]::Round($v, $d)
 }
 # Short reason for a failed read. "no-permission" when the account may not read it (no admin rights are requested).
+# Read both pipes concurrently. A root exit without EOF, or either stream over
+# its limit, discards the capture. The outer native Job owns descendant cleanup.
+function Read-KtProcessOutput($Process, $Clock, [int]$DeadlineMs, [string]$InputText = '', $Encoding = [Text.Encoding]::UTF8, [int]$StdoutLimit = 1048576, [int]$StderrLimit = 65536) {
+  $ErrorActionPreference = 'Stop'
+  $stdout = New-Object IO.MemoryStream
+  $stderr = New-Object IO.MemoryStream
+  try {
+    $outBuffer = New-Object byte[] 4096; $errBuffer = New-Object byte[] 4096
+    $outRead = $Process.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length)
+    $errRead = $Process.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length)
+    $write = $Process.StandardInput.WriteAsync($InputText)
+    $left = [Math]::Max(0, $DeadlineMs - [int]$Clock.ElapsedMilliseconds)
+    if ($left -le 0 -or -not $write.Wait([Math]::Min(2000, $left))) { throw 'worker stdin timeout' }
+    $Process.StandardInput.Close()
+    $outDone = $false; $errDone = $false
+    while (-not ($outDone -and $errDone)) {
+      $left = [Math]::Max(0, $DeadlineMs - [int]$Clock.ElapsedMilliseconds)
+      if ($left -le 0) { throw 'worker output timeout or missing EOF' }
+      $pending = New-Object Collections.Generic.List[Threading.Tasks.Task]
+      if (-not $outDone) { $pending.Add($outRead) }
+      if (-not $errDone) { $pending.Add($errRead) }
+      if ([Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$pending.ToArray(), $left) -lt 0) { throw 'worker output timeout or missing EOF' }
+      if (-not $outDone -and $outRead.IsCompleted) {
+        $count = $outRead.Result
+        if ($count -eq 0) { $outDone = $true }
+        elseif ($stdout.Length + $count -gt $StdoutLimit) { throw 'worker stdout exceeded limit' }
+        else { $stdout.Write($outBuffer, 0, $count); $outRead = $Process.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length) }
+      }
+      if (-not $errDone -and $errRead.IsCompleted) {
+        $count = $errRead.Result
+        if ($count -eq 0) { $errDone = $true }
+        elseif ($stderr.Length + $count -gt $StderrLimit) { throw 'worker stderr exceeded limit' }
+        else { $stderr.Write($errBuffer, 0, $count); $errRead = $Process.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length) }
+      }
+    }
+    $left = [Math]::Max(0, $DeadlineMs - [int]$Clock.ElapsedMilliseconds)
+    if ($left -le 0 -or -not $Process.WaitForExit($left)) { throw 'worker root exit timeout' }
+    return [pscustomobject]@{ out = $Encoding.GetString($stdout.ToArray()); err = $Encoding.GetString($stderr.ToArray()); code = $Process.ExitCode }
+  } finally { $stdout.Dispose(); $stderr.Dispose() }
+}
+
 function NsErr($e) {
   $x = $e.Exception
   if ($x -is [System.UnauthorizedAccessException] -or $x.HResult -eq -2147024891 -or [string]$x.NativeErrorCode -eq 'AccessDenied') { return 'no-permission' }
@@ -393,9 +434,9 @@ if ($gpus.Count -eq 0) {
   $gpus = @([pscustomobject]@{ adapter_index = $null; name = "GPU"; source = "nvidia-smi"; available = $false; memory_kind = "unknown"; memory_unit = "MiB"; memory_status = $(if ($smi) { "unavailable" } else { "unsupported" }); memory_reason = $gpuReason; sampled_at = $gpuAt; mem_total_mb = $null; mem_used_mb = $null; mem_free_mb = $null; mem_used_pct = $null; util = $null; temp_c = $null; power_w = $null; power_limit_w = $null; process_memory_reason = "not collected" })
 }
 $gpuPids = @($gpuCompute.apps | ForEach-Object { [int]$_.pid })
-function Test-KtGpuRelated([int]$Pid, [int[]]$GpuPids, $Map) {
-  if ($GpuPids -contains $Pid) { return $true }
-  $ancestors = @{}; $cur = $Map[$Pid]
+function Test-KtGpuRelated([int]$TargetPid, [int[]]$GpuPids, $Map) {
+  if ($GpuPids -contains $TargetPid) { return $true }
+  $ancestors = @{}; $cur = $Map[$TargetPid]
   for ($i = 0; $i -lt 64 -and $cur -and $cur.pid -gt 0 -and -not $ancestors.ContainsKey($cur.pid); $i++) {
     $ancestors[$cur.pid] = $true
     $parent = $Map[$cur.ppid]
@@ -483,6 +524,7 @@ echo @@end
 function Test-KtWslInstalled { return (Test-Path (Join-Path $env:SystemRoot 'System32\wsl.exe')) }
 function Invoke-KtWsl([string[]]$WslArgs, [string]$InputText = $null, [int]$TimeoutMs = 8000, [bool]$Utf16 = $true) {
   $res = [pscustomobject]@{ ok = $false; code = $null; out = ''; err = $null }
+  $p = $null; $clock = [Diagnostics.Stopwatch]::StartNew()
   try {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = Join-Path $env:SystemRoot 'System32\wsl.exe'
@@ -493,25 +535,23 @@ function Invoke-KtWsl([string[]]$WslArgs, [string]$InputText = $null, [int]$Time
     $psi.RedirectStandardError = $true
     $psi.RedirectStandardInput = $true
     $enc = if ($Utf16) { [System.Text.Encoding]::Unicode } else { New-Object System.Text.UTF8Encoding($false) }
-    $psi.StandardOutputEncoding = $enc
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo = $psi
     [void]$p.Start()
-    $so = $p.StandardOutput.ReadToEndAsync()
-    $se = $p.StandardError.ReadToEndAsync()
-    if ($InputText) { $p.StandardInput.Write($InputText) }
-    $p.StandardInput.Close()
-    if (-not $p.WaitForExit($TimeoutMs)) {
-      try { $p.Kill() } catch { }
-      $res.err = 'timeout'
-      return $res
-    }
-    $res.code = $p.ExitCode
-    $res.out = [string]$so.Result
-    $res.ok = ($p.ExitCode -eq 0)
-    if (-not $res.ok) { $res.err = 'exit ' + $p.ExitCode }
+    $capture = Read-KtProcessOutput $p $clock $TimeoutMs $InputText $enc
+    $res.code = $capture.code
+    $res.out = $capture.out
+    $res.ok = ($capture.code -eq 0)
+    if (-not $res.ok) { $res.err = 'exit ' + $capture.code }
   } catch {
-    $res.err = 'failed'
+    $res.err = $(if ($_.Exception.Message -match 'timeout') { 'timeout' } elseif ($_.Exception.Message -match 'exceeded limit') { 'output-limit' } else { 'failed' })
+  } finally {
+    if ($p) {
+      try {
+        if (-not $p.HasExited) { $p.Kill(); if (-not $p.WaitForExit(1000)) { $res.ok = $false; $res.out = ''; $res.err = 'cleanup-unverified' } }
+      } catch { $res.ok = $false; $res.out = ''; $res.err = 'cleanup-unverified' }
+      $p.Dispose()
+    }
   }
   return $res
 }
@@ -858,20 +898,10 @@ if (-not $NoNetwork) {
     $child = New-Object Diagnostics.Process
     $child.StartInfo = $psi
     if (-not $child.Start()) { throw 'netsec worker did not start' }
-    $outTask = $child.StandardOutput.ReadToEndAsync()
-    $errTask = $child.StandardError.ReadToEndAsync()
-    $writeTask = $child.StandardInput.WriteAsync($wire)
-    if (-not $writeTask.Wait(2000)) { throw 'netsec worker stdin timeout' }
-    $child.StandardInput.Close()
-    $runLeft = [Math]::Max(0, 17000 - [int]$outerWatch.ElapsedMilliseconds)
-    $timedOut = -not $child.WaitForExit($runLeft)
-    if ($timedOut) {
-      $child.Kill()
-      $killLeft = [Math]::Max(0, 19500 - [int]$outerWatch.ElapsedMilliseconds)
-      if (-not $child.WaitForExit($killLeft)) { throw 'netsec worker did not exit after kill' }
-    }
-    $outText = $outTask.Result
-    $errText = $errTask.Result
+    $capture = Read-KtProcessOutput $child $outerWatch 17000 $wire ([Text.Encoding]::UTF8)
+    $timedOut = $false
+    $outText = $capture.out
+    $errText = $capture.err
     $workerFailed = $child.ExitCode -ne 0
     foreach ($line in @($outText -split "`r?`n")) {
       if (-not $line.Trim()) { continue }
