@@ -1159,7 +1159,12 @@ async fn run_inner(
             }
             receipt.owner_session = nonce()?;
             // SAFETY: current process pseudo-handle is borrowed for read-only identity, never closed.
-            receipt.owner = Some(identity_raw(unsafe { GetCurrentProcess() }, unsafe { GetCurrentProcessId() })?);
+            receipt.owner = Some(identity_raw(
+                unsafe { GetCurrentProcess() },
+                unsafe { GetCurrentProcessId() },
+                #[cfg(katala_private_diagnostics)]
+                None,
+            )?);
             let (input_pipe, stdout, stderr) = {
                 let security = pipe_security()?;
                 (
