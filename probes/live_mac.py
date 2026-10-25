@@ -278,16 +278,24 @@ class Disk:
         io.IOServiceGetMatchingServices.restype = C.c_int
         io.IOIteratorNext.argtypes = [C.c_uint32]
         io.IOIteratorNext.restype = C.c_uint32
+        io.IOIteratorIsValid.argtypes = [C.c_uint32]
+        io.IOIteratorIsValid.restype = C.c_uint32
         io.IOObjectRelease.argtypes = [C.c_uint32]
         io.IOObjectRelease.restype = C.c_int
         io.IORegistryEntryCreateCFProperty.argtypes = [C.c_uint32, C.c_void_p, C.c_void_p, C.c_uint32]
         io.IORegistryEntryCreateCFProperty.restype = C.c_void_p
+        io.IORegistryEntryGetRegistryEntryID.argtypes = [C.c_uint32, C.POINTER(C.c_uint64)]
+        io.IORegistryEntryGetRegistryEntryID.restype = C.c_int
         cf.CFStringCreateWithCString.argtypes = [C.c_void_p, C.c_char_p, C.c_uint32]
         cf.CFStringCreateWithCString.restype = C.c_void_p
         cf.CFDictionaryGetValue.argtypes = [C.c_void_p, C.c_void_p]
         cf.CFDictionaryGetValue.restype = C.c_void_p
         cf.CFNumberGetValue.argtypes = [C.c_void_p, C.c_int, C.c_void_p]
         cf.CFNumberGetValue.restype = C.c_bool
+        cf.CFGetTypeID.argtypes = [C.c_void_p]
+        cf.CFGetTypeID.restype = C.c_size_t
+        cf.CFDictionaryGetTypeID.restype = C.c_size_t
+        cf.CFNumberGetTypeID.restype = C.c_size_t
         cf.CFRelease.argtypes = [C.c_void_p]
         key = lambda s: cf.CFStringCreateWithCString(None, s, 0x08000100)  # UTF-8
         self.k_stats, self.k_read, self.k_write = key(b"Statistics"), key(b"Bytes (Read)"), key(b"Bytes (Write)")
@@ -299,34 +307,69 @@ class Disk:
         self.services = []
         it = C.c_uint32()
         if self.io.IOServiceGetMatchingServices(0, self.io.IOServiceMatching(b"IOBlockStorageDriver"), C.byref(it)) != 0:
-            return
+            return False
         while True:
             s = self.io.IOIteratorNext(it.value)
             if not s:
                 break
             self.services.append(s)
+        valid = bool(self.io.IOIteratorIsValid(it.value))
         self.io.IOObjectRelease(it.value)
+        return valid
 
     def _num(self, d, k):
         v = C.c_int64(0)
         p = self.cf.CFDictionaryGetValue(d, k)
-        return v.value if p and self.cf.CFNumberGetValue(p, 4, C.byref(v)) else 0  # kCFNumberSInt64Type
+        if p is None or self.cf.CFGetTypeID(p) != self.cf.CFNumberGetTypeID():
+            return None
+        return v.value if self.cf.CFNumberGetValue(p, 4, C.byref(v)) and v.value >= 0 else None  # kCFNumberSInt64Type
 
     def bytes(self, now):
-        if self.found_at is None or now - self.found_at > 30:  # 外付けの抜き差しに追従する
-            self._enumerate()
+        if self.found_at is None or now - self.found_at > 30:
+            valid = self._enumerate()
             self.found_at = now
-        r = w = 0
+            if not valid:
+                # An invalidated iterator must not leave a partial list cached.
+                for service in self.services:
+                    self.io.IOObjectRelease(service)
+                self.services = []
+                return {}
+        counters = {}
         for s in self.services:
+            identity = C.c_uint64()
+            if self.io.IORegistryEntryGetRegistryEntryID(s, C.byref(identity)) != 0 or identity.value in counters:
+                return {}
             st = self.io.IORegistryEntryCreateCFProperty(s, self.k_stats, None, 0)
             if not st:
+                counters[identity.value] = (None, None)
                 continue
             try:
-                r += self._num(st, self.k_read)
-                w += self._num(st, self.k_write)
+                counters[identity.value] = ((self._num(st, self.k_read), self._num(st, self.k_write))
+                                            if self.cf.CFGetTypeID(st) == self.cf.CFDictionaryGetTypeID() else (None, None))
             finally:
                 self.cf.CFRelease(st)
-        return r, w
+        return counters
+
+
+def disk_rate(prev, cur, dt):
+    """Only consecutive, complete observations of the same disks form a rate."""
+    result = {"read_bps": None, "write_bps": None}
+    if not prev or not cur or prev.keys() != cur.keys() or not math.isfinite(dt) or dt <= 0:
+        return result
+    for direction, key in enumerate(result):
+        delta = 0
+        for identity, values in cur.items():
+            before, after = prev[identity][direction], values[direction]
+            if before is None or after is None or before < 0 or after < before:
+                break
+            delta += after - before
+            if delta > 2**63 - 1:
+                break
+        else:
+            rate = delta / dt
+            if math.isfinite(rate) and rate < 2**63:
+                result[key] = round(rate)
+    return result
 
 
 # ---- プロセス ----
@@ -490,10 +533,10 @@ def main():
     t0 = time.monotonic()
     cpu_prev = init("cpu", cpu_ticks)
     net_prev = init("net", net_bytes)
-    disk_prev = init("disk", lambda: disk.bytes(t0)) if disk else None
+    disk_prev = (init("disk", lambda: disk.bytes(t0)) or {}) if disk else {}
     if procs:
         init("procs", lambda: procs.sample(t0))
-    has = {"cpu": cpu_prev is not None, "mem": True, "disk": disk_prev is not None, "net": net_prev is not None, "procs": procs is not None, "gpu": MONITOR is not None}
+    has = {"cpu": cpu_prev is not None, "mem": True, "disk": disk is not None, "net": net_prev is not None, "procs": procs is not None, "gpu": MONITOR is not None}
     hello = {"type": "hello", "v": V, "os": "macos", "cores": ncpu.value if ncpu else None, "interval": INTERVAL, "procs_every": PROCS_EVERY,
              "mem_total_gb": round(mem_total.value / 2**30, 1) if mem_total else None, "session_epoch_ms": time.time_ns() // 1_000_000, "has": has, "errors": ERRORS}
     if WATCH:
@@ -547,13 +590,13 @@ def main():
             s["mem"] = memory()
         except Exception:
             s["mem"] = None
-        if has["disk"]:
+        if disk is not None:
             try:
-                d = disk.bytes(now)
-                s["disk"] = {"read_bps": round(max(0, d[0] - disk_prev[0]) / dt), "write_bps": round(max(0, d[1] - disk_prev[1]) / dt)} if dt > 0 else None
-                disk_prev = d
+                cur_disk = disk.bytes(now)
             except Exception:
-                s["disk"] = None
+                cur_disk = {}
+            s["disk"] = disk_rate(disk_prev, cur_disk, dt)
+            disk_prev = cur_disk if math.isfinite(dt) and dt > 0 else {}
         if has["net"]:
             cur_net = net_bytes()
             s["net"] = net_rate(net_prev, cur_net, dt)

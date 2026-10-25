@@ -1740,6 +1740,27 @@ mod tests {
     }
 
     #[test]
+    fn disk_null_partial_and_legacy_samples_preserve_unknown_and_idle() {
+        for (disk, read, write) in [
+            (None, None, None),
+            (Some(Value::Null), None, None),
+            (Some(json!({"read_bps":null,"write_bps":120})), None, Some(120.0)),
+            (Some(json!({"read_bps":0,"write_bps":0})), Some(0.0), Some(0.0)),
+        ] {
+            let mut row = json!({"type":"s","t":1000,"cpu":10});
+            if let Some(disk) = disk {
+                row["disk"] = disk;
+            }
+            let Some(Msg::Sample(raw)) = parse_line(&row.to_string()) else { panic!("sample") };
+            let (sample, _, _) = Sample::from_raw(*raw, 1000);
+            let point = sample.point();
+            assert_eq!(point.get("dr").and_then(Value::as_f64), read);
+            assert_eq!(point.get("dw").and_then(Value::as_f64), write);
+            assert_eq!(point["cpu"], json!(10.0));
+        }
+    }
+
+    #[test]
     fn parses_lines_and_ignores_noise() {
         let Some(Msg::Hello(h)) = parse_line("\u{FEFF}{\"type\":\"hello\",\"v\":1,\"os\":\"windows\",\"cores\":8,\"errors\":\"x\",\"has\":{\"gpu\":true}}\r")
         else {

@@ -2,6 +2,7 @@
 
 ## 未リリース
 
+- macOS のディスク測定で、取得失敗を 0 B/s と扱わない。Python/Rust とも読取・書込を別々に欠測にし、復帰・ディスク交換・counter reset 後は基点を取り直す。欠測を除いた分集計と保存後の再読を合成試験で確認する。
 - macOS のネイティブのサンプラー（`tune-agent sample`）: live_mac.py と同じ行・同じ値を sysctl・mach・libproc・IOKit で直接読む。Python 版と同時に動かして行の形と値を突き合わせる試験（`crates/tune-agent/tests/live_mac_parity.rs`）と、計算部分を Python の関数と同じ入力で比べる試験を追加。アプリのライブ表示は引き続き live_mac.py を使い、切り替えは各 Mac へ置く手順と合わせて行う。
 
 ## 0.7.0-rc.1

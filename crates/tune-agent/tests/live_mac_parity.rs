@@ -27,9 +27,9 @@ fn run_both() -> (Vec<Value>, Vec<Value>) {
 }
 
 /// 欄の名前と型の形（数は数、文字列は文字列）。配列は最初の要素だけ見る。
-/// 任意のセンサー（power・gpu）の数は、そのときの読みで欠測（null）になりうるので区別しない
+/// センサーとdiskの数は、そのときの読みで欠測（null）になりうるので区別しない
 fn shape(v: &Value, path: &str, out: &mut BTreeSet<String>) {
-    let sensor = path.starts_with(".power") || path.starts_with(".gpu");
+    let sensor = path.starts_with(".power") || path.starts_with(".gpu") || path.starts_with(".disk.");
     let kind = match v {
         Value::Null | Value::Number(_) if sensor => "number|null",
         Value::Null => "null",
@@ -109,7 +109,7 @@ fn native_sampler_matches_live_mac_py() {
         assert_eq!(a["gpu"][0]["name"], b["gpu"][0]["name"]);
         assert_eq!(a["gpu"][0]["memory_kind"], b["gpu"][0]["memory_kind"]);
         for k in ["read_bps", "write_bps"] {
-            assert!(a["disk"][k].is_u64(), "{}", a["disk"]);
+            assert!(a["disk"][k].is_null() || a["disk"][k].is_u64(), "{}", a["disk"]);
         }
         for k in ["rx_bps", "tx_bps"] {
             assert!(a["net"][k].is_u64(), "{}", a["net"]);
