@@ -49,4 +49,6 @@ This is source/debug-build acceptance, not an installer, signing, notarization, 
 
 The native results above describe the original debug-build repair. Subsequent review changes use fresh, fallible configuration reads at both preparation and launch, and write a pending audit row before file creation or terminal launch. Completion updates that same row. Failed completion writes are reported as incomplete without retrying launch; cancellation audit errors are surfaced as well. Shared database signatures and schema are unchanged.
 
+The prepared protection list is retained with the prompt; a changed protection list requires a new preview. The page generation is checked after receiving preview acceptance and on both sides of native confirmation, so page replacement invalidates an already queued acceptance or a native approval in progress.
+
 Regression sources use synthetic configuration, a real temporary SQLite database and an injected terminal launcher. They cover malformed/missing/unreadable configuration, audit insert rejection, audit completion failure or zero updated rows, and interruption followed by database reopen. No real AI CLI is called by these regressions. Rust RED/GREEN and OS acceptance for these follow-up changes await the assigned validation slot; earlier native acceptance does not certify these new changes.

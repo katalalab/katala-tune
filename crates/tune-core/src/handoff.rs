@@ -201,6 +201,7 @@ pub fn terminal(windows: bool, dir: &Path, script: &str) -> (String, Vec<String>
 /// 渡す準備ができた所見（確認ダイアログの前に作る）
 pub struct Prepared {
     pub node: Node,
+    pub protect: Vec<String>,
     pub finding_id: String,
     pub title: String,
     pub prompt: String,
@@ -227,7 +228,7 @@ impl Engine {
         })?;
         let (result, finding) = find(&[result], node_id, finding_id)?;
         let prompt = prompt(&node, &cfg.protect, &result, &finding, now_ms());
-        Ok(Prepared { node, finding_id: finding_id.to_string(), title: js::string(finding.get("title")), prompt })
+        Ok(Prepared { node, protect: cfg.protect, finding_id: finding_id.to_string(), title: js::string(finding.get("title")), prompt })
     }
 
     /// 確認中の取消も、承認されたプロンプトと同じ識別情報で記録する。
@@ -271,6 +272,9 @@ impl Engine {
         }
         if (&node.alias, &node.os, node.local) != (&p.node.alias, &p.node.os, p.node.local) {
             return refused("確認のあいだに台帳の接続先（alias・OS・この機体かどうか）が変わった。もう一度押してください".into());
+        }
+        if cfg.protect != p.protect {
+            return refused("確認のあいだに台帳の保護対象が変わった。新しい全文を確認し直してください".into());
         }
         let dir = self.data_dir().join("handoff").join(format!("{}-{}-{}", now_ms(), safe(&p.node.id), agent.key()));
         // 未完了行を書けなければ、ファイル作成もターミナル要求も行わない。
@@ -436,6 +440,7 @@ mod tests {
         let e = Engine::open(config.clone(), dir.join("data"), Arc::new(NoHost)).unwrap();
         let p = Prepared {
             node: node(json!({"id":"a","alias":"a","os":"macos"})),
+            protect: Vec::new(),
             finding_id: "cpu-busy".into(),
             title: "CPU".into(),
             prompt: "Reviewed text".into(),

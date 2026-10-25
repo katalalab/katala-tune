@@ -39,8 +39,12 @@ impl Review {
         self.lifecycle.lock().ok().and_then(|state| state.ready.then_some(state.generation))
     }
 
-    pub async fn confirm<F: std::future::Future<Output = bool>>(&self, _generation: u64, confirm: impl FnOnce() -> F) -> bool {
-        confirm().await
+    pub async fn confirm<F: std::future::Future<Output = bool>>(&self, generation: u64, confirm: impl FnOnce() -> F) -> bool {
+        if self.generation() != Some(generation) {
+            return false;
+        }
+        let approved = confirm().await;
+        approved && self.generation() == Some(generation)
     }
 
     fn register(&self, generation: u64, id: String, tx: oneshot::Sender<bool>) -> bool {
@@ -70,7 +74,7 @@ impl Review {
         if let Ok(mut state) = self.lifecycle.lock() {
             state.pending.take();
         }
-        proceed
+        proceed && self.generation() == Some(generation)
     }
 }
 

@@ -154,7 +154,7 @@ pub async fn ai_handoff(
     let Ok(_guard) = review.gate.try_lock() else {
         return Ok(json!({ "ok": false, "refused": "別の所見を確認中です" }));
     };
-    let Some(generation) = review.generation().filter(|_| window.is_visible().is_ok()) else {
+    let Some(generation) = review.generation().filter(|_| window.is_visible().unwrap_or(false)) else {
         return Ok(json!({ "ok": false, "refused": "確認する画面が閉じられたか、読み込み中です。もう一度押してください" }));
     };
     let p = match e.handoff_prepare(&node_id, &finding_id) {
