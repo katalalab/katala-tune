@@ -45,9 +45,9 @@ use windows_sys::Win32::{
 };
 
 use super::windows_pin::PinnedWindowsExecutable;
+use super::windows_quiescence::{CLEANUP, Decision as QuiescenceDecision, Observation as QuiescenceObservation, Quiescence};
 use super::{BoundedResult, ProcessIdentity, ProcessReceipt, ProcessStop, WindowsMetadataExitPolicy};
 
-const CLEANUP: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(10);
 const MAX_ACTIVE: usize = 256;
 const MAX_OBSERVED: usize = 4096;
@@ -298,6 +298,7 @@ fn complete_pid_list(assigned: u32, count: u32, pids: &[usize]) -> io::Result<Ve
 struct Job {
     handle: OwnedHandle,
     processes: Vec<Process>,
+    root_exit_at: Option<std::time::Instant>,
     #[cfg(test)]
     after_first_accounting: Option<AccountingHook>,
     #[cfg(test)]
@@ -312,6 +313,7 @@ impl Job {
         let job = Self {
             handle,
             processes: Vec::new(),
+            root_exit_at: None,
             #[cfg(test)]
             after_first_accounting: None,
             #[cfg(test)]
@@ -414,8 +416,12 @@ impl Job {
             self.processes.push(Process { handle, identity });
         }
         let root = self.processes.first().ok_or_else(invalid)?;
+        let root_observed_at = Instant::now().into_std();
         receipt.root_exited = exited(&root.handle)?;
         if receipt.root_exited {
+            // Use the start of the successful zero-wait query conservatively:
+            // scheduling after it must not move either completion clock later.
+            self.root_exit_at.get_or_insert(root_observed_at);
             let mut code = 0;
             // SAFETY: retained root has signaled; 259 is a valid exit value, never a liveness test.
             check(unsafe { GetExitCodeProcess(root.handle.as_raw_handle(), &mut code) })?;
@@ -854,6 +860,8 @@ impl Drop for Tasks {
     }
 }
 
+// A diagnostic snapshot predicate, not an immediate lifecycle verdict.
+#[cfg(test)]
 fn lingering_descendants(receipt: &ProcessReceipt) -> bool {
     receipt.root_exited && !receipt.job_empty && !receipt.observed_exited
 }
@@ -1137,6 +1145,7 @@ async fn run_inner(
         stderr: Some(tokio::spawn(drain(stderr, stderr_limit, signal))),
     };
     let mut cleanup = CleanupState::default();
+    let mut quiescence = Quiescence::new(deadline.into_std());
     #[cfg(test)]
     let mut diagnostic = DiagnosticTrace::new();
     loop {
@@ -1190,23 +1199,30 @@ async fn run_inner(
                 receipt.stop = ProcessStop::IoFailure;
             }
         }
-        if lingering_descendants(&receipt) && receipt.stop == ProcessStop::Completed {
-            #[cfg(test)]
-            eprintln!(
-                "owned_lingering root_exited={} job_empty={} observed_exited={} observed={} total={}",
-                receipt.root_exited,
-                receipt.job_empty,
-                receipt.observed_exited,
-                receipt.observed.len(),
-                receipt.total_processes
-            );
-            receipt.stop = ProcessStop::LingeringDescendants;
-        }
         let now = Instant::now();
-        // All evidence must have been observed before the fixed execution deadline, even during pipe cleanup.
-        if now >= deadline && receipt.stop == ProcessStop::Completed {
-            answer.timed_out = true;
-            receipt.stop = ProcessStop::Timeout;
+        let decision = quiescence.observe(
+            QuiescenceObservation {
+                root_exit_at: job.root_exit_at,
+                process_quiet: receipt.root_exited && receipt.job_empty && receipt.observed_exited,
+                failed: receipt.stop != ProcessStop::Completed || cleanup.termination_requested,
+                cleanup_deadline: cleanup.deadline.map(Instant::into_std),
+            },
+            now.into_std(),
+        );
+        if let Some(end) = quiescence.cleanup_deadline().map(Instant::from_std) {
+            cleanup.deadline = Some(cleanup.deadline.map_or(end, |earlier| earlier.min(end)));
+        }
+        if receipt.stop == ProcessStop::Completed {
+            match decision {
+                QuiescenceDecision::Timeout => {
+                    answer.timed_out = true;
+                    receipt.stop = ProcessStop::Timeout;
+                }
+                QuiescenceDecision::Lingering => receipt.stop = ProcessStop::LingeringDescendants,
+                QuiescenceDecision::CleanupExpired => receipt.stop = ProcessStop::CleanupUnconfirmed,
+                QuiescenceDecision::Stopped => receipt.stop = ProcessStop::IoFailure,
+                QuiescenceDecision::Observe | QuiescenceDecision::Quiescent => {}
+            }
         }
         #[cfg(test)]
         diagnostic.record_stop(&job, &receipt, cleanup.termination_requested);

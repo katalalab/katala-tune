@@ -60,11 +60,14 @@ fn owned_fixture() {
         }
         "root-first" => {
             let directory = std::path::PathBuf::from(std::env::var_os("KATALA_GUARD_QUIET_DIR").unwrap());
-            let _child = fixture_command("root-first-child")
-                .env("KATALA_GUARD_QUIET_DIR", &directory)
-                .env("KATALA_GUARD_ROOT_PID", std::process::id().to_string())
-                .spawn()
-                .unwrap();
+            let mut child = fixture_command("root-first-child");
+            child.env("KATALA_GUARD_QUIET_DIR", &directory).env("KATALA_GUARD_ROOT_PID", std::process::id().to_string());
+            for key in ["KATALA_GUARD_QUIET_DELAY_MS", "KATALA_GUARD_QUIET_EARLY_EOF"] {
+                if let Some(value) = std::env::var_os(key) {
+                    child.env(key, value);
+                }
+            }
+            let _child = child.spawn().unwrap();
             let end = deadline(Duration::from_secs(5));
             while !directory.join("release-root").exists() {
                 assert!(Instant::now() < end, "fixture root release deadline");
@@ -77,10 +80,16 @@ fn owned_fixture() {
             // Our root remains alive until the test retains this child and releases
             // it. Retain that exact live root for observation only, never PID mutation.
             let root = retain_test_child(pid);
-            let mut ready = std::fs::OpenOptions::new().create_new(true).write(true).open(directory.join("child-ready")).unwrap();
-            writeln!(ready, "{}", std::process::id()).unwrap();
+            let pending = directory.join("child-ready.tmp");
+            let mut ready = std::fs::OpenOptions::new().create_new(true).write(true).open(&pending).unwrap();
+            writeln!(ready, "{pid} {}", std::process::id()).unwrap();
             ready.flush().unwrap();
             drop(ready);
+            std::fs::rename(pending, directory.join("child-ready")).unwrap();
+            let early_eof = std::env::var("KATALA_GUARD_QUIET_EARLY_EOF").as_deref() == Ok("1");
+            if early_eof {
+                close_fixture_outputs();
+            }
             let end = deadline(Duration::from_secs(5));
             while !signaled(&root) {
                 assert!(Instant::now() < end, "fixture retained root exit deadline");
@@ -88,12 +97,19 @@ fn owned_fixture() {
             }
             // This intentional post-root side effect characterizes the new lifetime
             // policy. It is not evidence that arbitrary descendants are read-only.
-            std::thread::sleep(Duration::from_millis(250));
+            let delay_ms = match std::env::var("KATALA_GUARD_QUIET_DELAY_MS").as_deref() {
+                Ok("250") => 250,
+                Ok("30000") => 30000,
+                _ => panic!("unknown private fixture delay"),
+            };
+            std::thread::sleep(Duration::from_millis(delay_ms));
             let mut marker = std::fs::OpenOptions::new().create_new(true).write(true).open(directory.join("after-root")).unwrap();
             marker.write_all(b"post-root fixture write\n").unwrap();
             drop(marker);
-            std::io::stdout().write_all(b"natural-child-exit\n").unwrap();
-            std::io::stdout().flush().unwrap();
+            if !early_eof {
+                std::io::stdout().write_all(b"natural-child-exit\n").unwrap();
+                std::io::stdout().flush().unwrap();
+            }
         }
         "close-exit" => close_fixture_outputs(),
         "early-eof" => {
@@ -246,21 +262,32 @@ fn observer_exit_code(handle: &std::os::windows::io::OwnedHandle) -> u32 {
     code
 }
 
-#[tokio::test]
-async fn root_first_child_naturally_exits_and_writes_only_its_private_marker() {
-    let _serial = SERIAL.lock().await;
-    let directory = QuiescenceDirectory::new();
+struct RootFirstInvocation {
+    task: tokio::task::JoinHandle<BoundedResult>,
+    root: std::os::windows::io::OwnedHandle,
+    child: std::os::windows::io::OwnedHandle,
+    end: Instant,
+}
+
+async fn start_root_first(directory: &QuiescenceDirectory, delay: &str, early_eof: bool) -> RootFirstInvocation {
     let mut environment = fixture_environment("root-first");
     environment.push(("KATALA_GUARD_QUIET_DIR".into(), directory.0.as_os_str().to_owned()));
+    environment.push(("KATALA_GUARD_QUIET_DELAY_MS".into(), delay.into()));
+    environment.push(("KATALA_GUARD_QUIET_EARLY_EOF".into(), if early_eof { "1" } else { "0" }.into()));
     let end = deadline(Duration::from_secs(5));
     let invocation = tokio::spawn(async move {
         run_standalone_windows_bounded(&fixture_invocation(), StandaloneWindowsEnvironment::new(&environment), b"", end, 65536, 65536).await
     });
-    let child = loop {
+    let (root, child) = loop {
         if let Ok(value) = std::fs::read_to_string(directory.0.join("child-ready"))
-            && let Ok(pid) = value.trim().parse::<u32>()
+            && let Some(frame) = value.strip_suffix('\n')
         {
-            break retain_test_child(pid);
+            let fields: Vec<_> = frame.split(' ').collect();
+            if fields.len() == 2
+                && let (Ok(root), Ok(child)) = (fields[0].parse::<u32>(), fields[1].parse::<u32>())
+            {
+                break (retain_test_child(root), retain_test_child(child));
+            }
         }
         if Instant::now() >= end || invocation.is_finished() {
             invocation.abort();
@@ -269,13 +296,25 @@ async fn root_first_child_naturally_exits_and_writes_only_its_private_marker() {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     };
+    RootFirstInvocation { task: invocation, root, child, end }
+}
+
+fn release_root(directory: &QuiescenceDirectory) {
+    std::fs::OpenOptions::new().create_new(true).write(true).open(directory.0.join("release-root")).unwrap();
+}
+
+#[tokio::test]
+async fn root_first_child_naturally_exits_and_writes_only_its_private_marker() {
+    let _serial = SERIAL.lock().await;
+    let directory = QuiescenceDirectory::new();
+    let run = start_root_first(&directory, "250", false).await;
     // The actual child observer is retained before its root can exit. Its own
     // retained-root wait gates the subsequent marker write and natural exit.
-    std::fs::OpenOptions::new().create_new(true).write(true).open(directory.0.join("release-root")).unwrap();
-    let result = invocation.await.unwrap();
+    release_root(&directory);
+    let result = run.task.await.unwrap();
     let receipt = result.process_receipt.as_ref().expect("actual guard receipt");
-    let child_signaled = signaled(&child);
-    let child_code = child_signaled.then(|| observer_exit_code(&child));
+    let child_signaled = signaled(&run.child);
+    let child_code = child_signaled.then(|| observer_exit_code(&run.child));
     eprintln!(
         "root_first_fixture stop={:?} root_code={:?} child_signaled={} child_code={:?} job_empty={} eof={} writer={} marker={}",
         receipt.stop,
@@ -294,7 +333,64 @@ async fn root_first_child_naturally_exits_and_writes_only_its_private_marker() {
     assert!(receipt.total_processes >= 2);
     assert!(result.stdout.ends_with(b"natural-child-exit\n"));
     assert!(std::fs::read(directory.0.join("after-root")).is_ok_and(|bytes| bytes == b"post-root fixture write\n"));
-    assert!(Instant::now() < end);
+    assert!(signaled(&run.root) && Instant::now() < run.end);
+}
+
+#[tokio::test]
+async fn root_first_live_child_is_rejected_even_after_output_eof() {
+    let _serial = SERIAL.lock().await;
+    let directory = QuiescenceDirectory::new();
+    let run = start_root_first(&directory, "30000", true).await;
+    release_root(&directory);
+    let result = run.task.await.unwrap();
+    let receipt = result.process_receipt.as_ref().unwrap();
+    assert_eq!(receipt.stop, ProcessStop::LingeringDescendants);
+    assert!(receipt.cleanup_confirmed());
+    assert_eq!(result.code, None);
+    assert!(result.stdout.is_empty() && result.stderr.is_empty());
+    assert!(signaled(&run.root) && signaled(&run.child));
+    assert_eq!(observer_exit_code(&run.child), 124);
+    assert!(!directory.0.join("after-root").exists());
+    assert!(Instant::now() < run.end);
+}
+
+#[tokio::test]
+async fn root_first_pending_child_cannot_extend_the_original_execution_deadline() {
+    let _serial = SERIAL.lock().await;
+    let directory = QuiescenceDirectory::new();
+    let run = start_root_first(&directory, "30000", false).await;
+    // Release near the original end rather than rebasing the request after setup.
+    tokio::time::sleep_until(tokio::time::Instant::from_std(run.end - Duration::from_millis(100))).await;
+    release_root(&directory);
+    let result = run.task.await.unwrap();
+    let receipt = result.process_receipt.as_ref().unwrap();
+    assert_eq!(receipt.stop, ProcessStop::Timeout);
+    assert!(result.timed_out && receipt.cleanup_confirmed());
+    assert_eq!(receipt.root_exit_code, Some(0));
+    assert!(signaled(&run.child));
+    assert_eq!(observer_exit_code(&run.child), 124);
+    assert!(result.code.is_none() && result.stdout.is_empty() && result.stderr.is_empty());
+    assert!(!directory.0.join("after-root").exists());
+}
+
+#[tokio::test]
+async fn cancelling_after_root_exit_still_terminates_the_owned_pending_child() {
+    let _serial = SERIAL.lock().await;
+    let directory = QuiescenceDirectory::new();
+    let run = start_root_first(&directory, "30000", false).await;
+    release_root(&directory);
+    while !signaled(&run.root) && Instant::now() < run.end {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(signaled(&run.root) && !signaled(&run.child));
+    run.task.abort();
+    assert!(run.task.await.unwrap_err().is_cancelled());
+    let end = deadline(Duration::from_secs(3));
+    while !signaled(&run.child) && Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(signaled(&run.child));
+    assert!(!directory.0.join("after-root").exists());
 }
 
 #[tokio::test]

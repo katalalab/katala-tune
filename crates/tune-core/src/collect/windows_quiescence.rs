@@ -26,13 +26,13 @@ pub(crate) struct Quiescence {
     root_exit_at: Option<Instant>,
     quiet_deadline: Option<Instant>,
     cleanup_deadline: Option<Instant>,
-    quiet_observed: bool,
+    quiet_observed_at: Option<Instant>,
     stopped: Option<Decision>,
 }
 
 impl Quiescence {
     pub(crate) fn new(execution_deadline: Instant) -> Self {
-        Self { execution_deadline, root_exit_at: None, quiet_deadline: None, cleanup_deadline: None, quiet_observed: false, stopped: None }
+        Self { execution_deadline, root_exit_at: None, quiet_deadline: None, cleanup_deadline: None, quiet_observed_at: None, stopped: None }
     }
 
     pub(crate) fn cleanup_deadline(&self) -> Option<Instant> {
@@ -68,13 +68,13 @@ impl Quiescence {
             Decision::CleanupExpired
         } else if self.root_exit_at.is_none() {
             Decision::Observe
-        } else if self.quiet_observed {
-            if observation.process_quiet { Decision::Quiescent } else { Decision::Lingering }
+        } else if let Some(proven) = self.quiet_observed_at {
+            if observation.process_quiet && self.quiet_deadline.is_some_and(|end| proven < end) { Decision::Quiescent } else { Decision::Lingering }
         } else if self.quiet_deadline.is_some_and(|end| now >= end) {
             // A first quiet sample at/after the cutoff cannot prove earlier exit.
             Decision::Lingering
         } else if observation.process_quiet {
-            self.quiet_observed = true;
+            self.quiet_observed_at = Some(now);
             Decision::Quiescent
         } else {
             Decision::Observe
@@ -160,6 +160,18 @@ mod tests {
         assert_eq!(state.quiet_deadline, Some(root + Duration::from_millis(500)));
         assert_eq!(state.observe(observation(root, false), root + Duration::from_millis(500)), Decision::Lingering);
         assert_eq!(state.cleanup_deadline(), Some(earlier));
+    }
+
+    #[test]
+    fn a_later_earlier_cap_cannot_retroactively_validate_a_quiet_sample() {
+        let root = Instant::now();
+        let mut state = Quiescence::new(root + Duration::from_secs(10));
+        assert_eq!(state.observe(observation(root, false), root), Decision::Observe);
+        assert_eq!(state.observe(observation(root, true), root + Duration::from_millis(800)), Decision::Quiescent);
+        let mut capped = observation(root, true);
+        capped.cleanup_deadline = Some(root + Duration::from_millis(2500));
+        assert_eq!(state.observe(capped, root + Duration::from_millis(900)), Decision::Lingering);
+        assert_eq!(state.cleanup_deadline(), Some(root + Duration::from_millis(2500)));
     }
 
     #[test]
