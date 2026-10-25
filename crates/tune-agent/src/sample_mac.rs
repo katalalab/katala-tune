@@ -20,6 +20,7 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,63 @@ pub struct Control {
 impl Control {
     fn stopped(&self) -> bool {
         self.gone.load(Ordering::SeqCst) || Instant::now() >= self.deadline
+    }
+}
+
+/// The owner must be able to clean up children even if a reader keeps a full pipe open.
+/// At most one row is in flight. Only this worker owns stdout, never sampler resources.
+/// It is deliberately not joined on cancellation: main returns after owned-child cleanup,
+/// and process exit also ends a blocked writer without altering shared stdout flags.
+struct Output {
+    requests: SyncSender<(Value, Sender<bool>)>,
+}
+
+impl Output {
+    fn open() -> Output {
+        let (requests, rows) = mpsc::sync_channel::<(Value, Sender<bool>)>(1);
+        std::thread::spawn(move || {
+            let mut out = std::io::stdout().lock();
+            while let Ok((value, ack)) = rows.recv() {
+                let ok = emit(&mut out, &value);
+                if ack.send(ok).is_err() || !ok {
+                    break;
+                }
+            }
+        });
+        Output { requests }
+    }
+
+    fn emit(&self, value: Value, control: &Control) -> bool {
+        if control.stopped() {
+            return false;
+        }
+        let (ack, result) = mpsc::channel();
+        if self.requests.try_send((value, ack)).is_err() {
+            return false;
+        }
+        loop {
+            if control.stopped() {
+                return false;
+            }
+            match result.recv_timeout(Duration::from_millis(20)) {
+                Ok(ok) => return ok,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+    }
+
+    fn end(&self, reason: &str, control: &Control) {
+        // Give a reading consumer the end row even after max expires. A full pipe must
+        // not extend the lifetime indefinitely just to deliver that final notification.
+        let final_write = Control { gone: control.gone.clone(), deadline: Instant::now() + Duration::from_millis(100) };
+        self.emit(json!({"type": "end", "reason": reason}), &final_write);
+    }
+
+    fn end_if_expired(&self, control: &Control) {
+        if Instant::now() >= control.deadline {
+            self.end("max_age", control);
+        }
     }
 }
 
@@ -851,7 +909,6 @@ impl Sampler {
 
 /// live_mac.py の main と同じ順: hello、以後 interval ごとに s。最初の上位プロセスは 1 点目に付ける
 pub fn run(a: &Args) -> Result<(), String> {
-    let mut out = std::io::stdout().lock();
     let t0 = Instant::now();
     let control = Control { gone: Arc::new(AtomicBool::new(false)), deadline: t0 + Duration::from_secs_f64(a.max_seconds) };
     if a.watch {
@@ -861,7 +918,9 @@ pub fn run(a: &Args) -> Result<(), String> {
     if control.gone.load(Ordering::SeqCst) {
         return Ok(());
     }
-    if !emit(&mut out, &s.hello()) {
+    let out = Output::open();
+    if !out.emit(s.hello(), &control) {
+        out.end_if_expired(&control);
         return Ok(());
     }
     let interval = Duration::from_secs_f64(a.interval);
@@ -888,7 +947,7 @@ pub fn run(a: &Args) -> Result<(), String> {
         }
         let now = Instant::now();
         if now - t0 >= max_age {
-            emit(&mut out, &json!({"type": "end", "reason": "max_age"}));
+            out.end("max_age", &control);
             return Ok(());
         }
         let dt = (now - last).as_secs_f64();
@@ -898,11 +957,12 @@ pub fn run(a: &Args) -> Result<(), String> {
         if procs {
             next_procs = now + procs_every;
         }
-        if !emit(&mut out, &s.sample(seq, now, dt, procs, &control)) {
+        if !out.emit(s.sample(seq, now, dt, procs, &control), &control) {
+            out.end_if_expired(&control);
             return Ok(());
         }
         if a.count > 0 && seq >= a.count {
-            emit(&mut out, &json!({"type": "end", "reason": "count"}));
+            out.end("count", &control);
             return Ok(());
         }
     }
@@ -911,6 +971,108 @@ pub fn run(a: &Args) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+
+    /// Subprocess entry: a real sampler owns real fixture macmon while stdout is full.
+    #[test]
+    #[ignore = "owned subprocess invoked by stdout cancellation tests"]
+    fn blocked_stdout_fixture() {
+        let dir = PathBuf::from(std::env::var_os("PR87_FIXTURE_DIR").unwrap());
+        let a = Args { interval: 0.2, procs_every: 1.0, max_seconds: std::env::var("PR87_FIXTURE_MAX").unwrap().parse().unwrap(), count: 0, watch: true };
+        let t0 = Instant::now();
+        let control = Control { gone: Arc::new(AtomicBool::new(false)), deadline: t0 + Duration::from_secs_f64(a.max_seconds) };
+        watch_stdin(control.gone.clone());
+        let sampler = Sampler::open(&a, t0, &control);
+        assert!(sampler.monitor.is_some());
+        std::fs::write(dir.join("ready"), b"ready").unwrap();
+        assert!(!Output::open().emit(json!({"payload": "x".repeat(1024 * 1024)}), &control));
+        drop(sampler);
+        // libtest would print its result to the deliberately full stdout pipe.
+        std::process::exit(0);
+    }
+
+    struct OutputFixture {
+        child: Child,
+        dir: PathBuf,
+        exited: bool,
+    }
+
+    impl Drop for OutputFixture {
+        fn drop(&mut self) {
+            if !self.exited {
+                // SAFETY: this unreaped child is the leader of a new group made only for
+                // this test. Kill that owned group before wait, including on RED/panic.
+                unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
+                let _ = self.child.wait();
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    impl OutputFixture {
+        fn open(max: u64, name: &str) -> OutputFixture {
+            let dir = std::env::temp_dir().join(format!("sampler-output-{}-{name}", std::process::id()));
+            let bin = dir.join(".katala-tune/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let script = bin.join("macmon");
+            std::fs::write(&script, "#!/usr/bin/python3\nimport os,signal,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nwith open(os.path.join(os.environ['HOME'],'macmon-pid'),'w') as f: f.write(str(os.getpid()))\nwhile True: time.sleep(1)\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "sample_mac::tests::blocked_stdout_fixture", "--ignored", "--nocapture"])
+                .env("HOME", &dir)
+                .env("PR87_FIXTURE_DIR", &dir)
+                .env("PR87_FIXTURE_MAX", max.to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let fixture = OutputFixture { child, dir, exited: false };
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut queued = 0;
+                // SAFETY: stdout read end stays owned by fixture. FIONREAD only reads its byte count.
+                let r = unsafe { libc::ioctl(fixture.child.stdout.as_ref().unwrap().as_raw_fd(), libc::FIONREAD, &mut queued) };
+                assert_eq!(r, 0);
+                if queued >= 8192 && fixture.dir.join("macmon-pid").exists() && fixture.dir.join("ready").exists() {
+                    break;
+                }
+                assert!(Instant::now() < until, "fixture did not reach a blocked stdout write");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            fixture
+        }
+
+        fn wait_and_check_cleanup(&mut self, timeout: Duration) {
+            let until = Instant::now() + timeout;
+            let status = loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    self.exited = true;
+                    break status;
+                }
+                assert!(Instant::now() < until, "sampler stayed blocked on stdout after cancellation/deadline");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert!(status.success(), "fixture failed: {status}");
+            let pid = std::fs::read_to_string(self.dir.join("macmon-pid")).unwrap();
+            assert!(!Command::new("/bin/kill").args(["-0", &pid]).stderr(Stdio::null()).status().unwrap().success(), "owned macmon was not reaped");
+        }
+    }
+
+    #[test]
+    fn stdout_backpressure_does_not_block_stdin_cleanup() {
+        let mut fixture = OutputFixture::open(30, "stdin");
+        drop(fixture.child.stdin.take());
+        fixture.wait_and_check_cleanup(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stdout_backpressure_does_not_block_max_cleanup() {
+        let mut fixture = OutputFixture::open(2, "max");
+        fixture.wait_and_check_cleanup(Duration::from_millis(3500));
+    }
 
     // Reverting the ps deadline/cancellation must leave this owned child alive long enough to fail.
     fn sleeping_ps() -> Command {
