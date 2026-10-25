@@ -16,9 +16,11 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::io::{BufRead, BufReader, Read};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,6 +31,130 @@ use crate::sample::{Args, emit, watch_stdin};
 const TOP: usize = 8;
 const GB: f64 = 1_073_741_824.0;
 const MB: f64 = 1_048_576.0;
+
+pub struct Control {
+    gone: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
+impl Control {
+    fn stopped(&self) -> bool {
+        self.gone.load(Ordering::SeqCst) || Instant::now() >= self.deadline
+    }
+}
+
+/// The owner must be able to clean up children even if a reader keeps a full pipe open.
+/// At most one row is in flight. Only this worker owns stdout, never sampler resources.
+/// It is deliberately not joined on cancellation: main returns after owned-child cleanup,
+/// and process exit also ends a blocked writer without altering shared stdout flags.
+struct Output {
+    requests: SyncSender<(Value, Sender<bool>)>,
+}
+
+impl Output {
+    fn open() -> Output {
+        let (requests, rows) = mpsc::sync_channel::<(Value, Sender<bool>)>(1);
+        std::thread::spawn(move || {
+            let mut out = std::io::stdout().lock();
+            while let Ok((value, ack)) = rows.recv() {
+                let ok = emit(&mut out, &value);
+                if ack.send(ok).is_err() || !ok {
+                    break;
+                }
+            }
+        });
+        Output { requests }
+    }
+
+    fn emit(&self, value: Value, control: &Control) -> bool {
+        if control.stopped() {
+            return false;
+        }
+        let (ack, result) = mpsc::channel();
+        if self.requests.try_send((value, ack)).is_err() {
+            return false;
+        }
+        loop {
+            if control.stopped() {
+                return false;
+            }
+            match result.recv_timeout(Duration::from_millis(20)) {
+                Ok(ok) => return ok,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+    }
+
+    fn end(&self, reason: &str, control: &Control) {
+        // Give a reading consumer the end row even after max expires. A full pipe must
+        // not extend the lifetime indefinitely just to deliver that final notification.
+        let final_write = Control { gone: control.gone.clone(), deadline: Instant::now() + Duration::from_millis(100) };
+        self.emit(json!({"type": "end", "reason": reason}), &final_write);
+    }
+
+    fn end_if_expired(&self, control: &Control) {
+        if Instant::now() >= control.deadline {
+            self.end("max_age", control);
+        }
+    }
+}
+
+/// Only the ps child belongs to this guard. Always reap it, including early returns.
+struct PsChild(Child);
+
+impl Drop for PsChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn ps_output(command: &mut Command, control: &Control, timeout: Duration) -> Option<Vec<u8>> {
+    if control.stopped() {
+        return None;
+    }
+    let mut child = PsChild(command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?);
+    let mut pipe = child.0.stdout.take()?;
+    let fd = pipe.as_raw_fd();
+    // SAFETY: fd is this child's private stdout read end, valid while pipe lives.
+    // Unlike changing our stdout flags, this does not change a caller's shared descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return None;
+    }
+    let deadline = control.deadline.min(Instant::now() + timeout);
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut eof = false;
+    loop {
+        if control.stopped() || Instant::now() >= deadline {
+            return None;
+        }
+        if !eof {
+            match pipe.read(&mut buf) {
+                Ok(0) => eof = true,
+                Ok(n) => {
+                    // A broken producer must not allocate indefinitely before its deadline.
+                    if bytes.len() + n > 16 * 1024 * 1024 {
+                        return None;
+                    }
+                    bytes.extend_from_slice(&buf[..n]);
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            }
+        }
+        // EOF alone does not prove the child exited; root exit alone does not prove EOF.
+        let exited = child.0.try_wait().ok()?.is_some();
+        if eof && exited {
+            return Some(bytes);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 /// Python の round(x, n)（正確な値を偶数丸め。Rust の書式化と同じ規則）
 pub fn py_round(x: f64, n: usize) -> Value {
@@ -434,19 +560,24 @@ impl Procs {
         if n > 0 { String::from_utf8_lossy(&buf[..n as usize]).into_owned() } else { pid.to_string() }
     }
 
-    fn ps() -> ProcSnap {
-        let out = Command::new("/bin/ps").args(["-axo", "pid=,time=,rss=,comm="]).stdin(Stdio::null()).stderr(Stdio::null()).output();
-        out.map(|o| parse_ps(&String::from_utf8_lossy(&o.stdout))).unwrap_or_default()
+    fn ps(control: &Control) -> Option<ProcSnap> {
+        ps_output(Command::new("/bin/ps").args(["-axo", "pid=,time=,rss=,comm="]), control, Duration::from_secs(10))
+            .map(|o| parse_ps(&String::from_utf8_lossy(&o)))
     }
 
-    fn sample(&mut self, now: Instant) -> Value {
+    fn sample(&mut self, now: Instant, control: &Control) -> Value {
         let cur = self.own();
         let mine = match self.own_t {
             Some(t) => rates(&cur, &self.own_prev, now.duration_since(t).as_secs_f64()),
             None => HashMap::new(),
         };
         if self.next_ps.is_none_or(|t| now >= t) {
-            let allp = Self::ps();
+            let Some(allp) = Self::ps(control) else {
+                self.own_prev = cur;
+                self.own_t = Some(now);
+                self.next_ps = Some(now + self.procs_every);
+                return Value::Null;
+            };
             if let Some(t) = self.ps_t {
                 self.others = rates(&allp, &self.ps_prev, now.duration_since(t).as_secs_f64()).into_iter().filter(|(pid, _)| !cur.contains_key(pid)).collect();
             }
@@ -544,6 +675,38 @@ fn macmon_path() -> PathBuf {
 /// 最新の行と、それを読んだ時刻。読み手のスレッドが書き、サンプラーが読む
 type Latest = Arc<Mutex<(Option<Map<String, Value>>, Option<Instant>)>>;
 
+fn read_macmon(out: impl Read, latest: &Latest) {
+    // 1 行は 256KiB まで。越えたら捨てて欠測にする
+    let mut r = BufReader::new(out);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match (&mut r).take(262_145).read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) if line.len() > 262_144 => {
+                *latest.lock().unwrap_or_else(|e| e.into_inner()) = (None, None);
+                // Drain only the rest of this frame, in bounded chunks. Its tail must
+                // never be parsed as a new frame, but the next valid line can recover.
+                while line.last() != Some(&b'\n') {
+                    line.clear();
+                    match (&mut r).take(8192).read_until(b'\n', &mut line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                }
+                continue;
+            }
+            Ok(_) => {}
+        }
+        let parsed = serde_json::from_slice::<Value>(&line).ok().and_then(|v| macmon_metrics(&v));
+        let mut g = latest.lock().unwrap_or_else(|e| e.into_inner());
+        *g = match parsed {
+            Some(m) => (Some(m), Some(Instant::now())),
+            None => (None, g.1),
+        };
+    }
+}
+
 struct Macmon {
     child: Child,
     latest: Latest,
@@ -570,23 +733,7 @@ impl Macmon {
         let alive = Arc::new(AtomicBool::new(true));
         let (l, a) = (latest.clone(), alive.clone());
         std::thread::spawn(move || {
-            // 1 行は 256KiB まで。越えたら捨てて欠測にする
-            let mut r = BufReader::new(out);
-            let mut line = Vec::new();
-            loop {
-                line.clear();
-                match (&mut r).take(262_145).read_until(b'\n', &mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) if line.len() > 262_144 => break,
-                    Ok(_) => {}
-                }
-                let parsed = serde_json::from_slice::<Value>(&line).ok().and_then(|v| macmon_metrics(&v));
-                let mut g = l.lock().unwrap_or_else(|e| e.into_inner());
-                *g = match parsed {
-                    Some(m) => (Some(m), Some(Instant::now())),
-                    None => (None, g.1),
-                };
-            }
+            read_macmon(out, &l);
             a.store(false, Ordering::SeqCst);
         });
         Ok(Macmon { child, latest, alive, ttl: Duration::from_secs_f64((interval * 3.0).max(3.0)) })
@@ -664,7 +811,7 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    pub fn open(a: &Args, t0: Instant) -> Sampler {
+    pub fn open(a: &Args, t0: Instant, control: &Control) -> Sampler {
         let mut errors = Vec::new();
         let mut init = |name: &str, r: Result<(), String>| {
             if let Err(e) = r {
@@ -700,7 +847,7 @@ impl Sampler {
             started_ms: tune_link::now_ms(),
         };
         if let Some(p) = s.procs.as_mut() {
-            p.sample(t0);
+            p.sample(t0, control);
         }
         s
     }
@@ -731,7 +878,7 @@ impl Sampler {
     }
 
     /// 1 点。dt は前回からの秒。procs のときだけ上位プロセスと自分の負荷も
-    pub fn sample(&mut self, seq: u64, now: Instant, dt: f64, procs: bool) -> Value {
+    pub fn sample(&mut self, seq: u64, now: Instant, dt: f64, procs: bool, control: &Control) -> Value {
         let t = tune_link::now_ms();
         let mut s = Map::new();
         s.insert("type".into(), json!("s"));
@@ -769,7 +916,7 @@ impl Sampler {
             }
         }
         if procs && let Some(p) = self.procs.as_mut() {
-            s.insert("procs".into(), p.sample(now));
+            s.insert("procs".into(), p.sample(now, control));
             s.insert("self".into(), self_usage());
         }
         Value::Object(s)
@@ -778,14 +925,24 @@ impl Sampler {
 
 /// live_mac.py の main と同じ順: hello、以後 interval ごとに s。最初の上位プロセスは 1 点目に付ける
 pub fn run(a: &Args) -> Result<(), String> {
-    let mut out = std::io::stdout().lock();
     let t0 = Instant::now();
-    let mut s = Sampler::open(a, t0);
-    let stdin_gone = Arc::new(AtomicBool::new(false));
+    let control = Control { gone: Arc::new(AtomicBool::new(false)), deadline: t0 + Duration::from_secs_f64(a.max_seconds) };
     if a.watch {
-        watch_stdin(stdin_gone.clone());
+        watch_stdin(control.gone.clone());
     }
-    if !emit(&mut out, &s.hello()) {
+    let mut s = Sampler::open(a, t0, &control);
+    if control.gone.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let out = Output::open();
+    // Initialization may have exhausted max while waiting for ps. Preserve hello-first
+    // for a writable consumer, with only the same bounded notification grace as end.
+    let hello_control = Control { gone: control.gone.clone(), deadline: control.deadline.max(Instant::now() + Duration::from_millis(100)) };
+    if !out.emit(s.hello(), &hello_control) {
+        return Ok(());
+    }
+    if control.stopped() {
+        out.end_if_expired(&control);
         return Ok(());
     }
     let interval = Duration::from_secs_f64(a.interval);
@@ -797,11 +954,11 @@ pub fn run(a: &Args) -> Result<(), String> {
         next += interval;
         // 標準入力が閉じたらすぐ終わるよう、細かく区切って待つ
         loop {
-            if stdin_gone.load(Ordering::SeqCst) {
+            if control.gone.load(Ordering::SeqCst) {
                 return Ok(());
             }
             let now = Instant::now();
-            if now >= next {
+            if now >= next || now >= control.deadline {
                 // スリープ明けなどで遅れたら、まとめて出さずに今から数え直す
                 if now - next > interval * 2 {
                     next = now;
@@ -812,7 +969,7 @@ pub fn run(a: &Args) -> Result<(), String> {
         }
         let now = Instant::now();
         if now - t0 >= max_age {
-            emit(&mut out, &json!({"type": "end", "reason": "max_age"}));
+            out.end("max_age", &control);
             return Ok(());
         }
         let dt = (now - last).as_secs_f64();
@@ -822,11 +979,12 @@ pub fn run(a: &Args) -> Result<(), String> {
         if procs {
             next_procs = now + procs_every;
         }
-        if !emit(&mut out, &s.sample(seq, now, dt, procs)) {
+        if !out.emit(s.sample(seq, now, dt, procs, &control), &control) {
+            out.end_if_expired(&control);
             return Ok(());
         }
         if a.count > 0 && seq >= a.count {
-            emit(&mut out, &json!({"type": "end", "reason": "count"}));
+            out.end("count", &control);
             return Ok(());
         }
     }
@@ -835,6 +993,228 @@ pub fn run(a: &Args) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+
+    #[test]
+    #[ignore = "owned subprocess invoked by expired startup test"]
+    fn expired_startup_fixture() {
+        let a = Args { interval: 0.2, procs_every: 1.0, max_seconds: 0.0, count: 0, watch: false };
+        run(&a).unwrap();
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn startup_deadline_preserves_hello_before_end() {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "sample_mac::tests::expired_startup_fixture", "--ignored", "--nocapture"])
+            .env("HOME", std::env::temp_dir().join(format!("sampler-expired-{}", std::process::id())))
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let rows: Vec<Value> = String::from_utf8_lossy(&out.stdout).lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0]["type"], "hello");
+        assert_eq!(rows[1], json!({"type": "end", "reason": "max_age"}));
+    }
+
+    #[test]
+    fn macmon_recovers_after_oversized_frames() {
+        for size in [262_144, 262_145, 524_288] {
+            let latest: Latest = Arc::new(Mutex::new((None, None)));
+            let mut input = vec![b'x'; size];
+            input.extend_from_slice(b"\n{\"all_power\":2.5}\n");
+            read_macmon(std::io::Cursor::new(input), &latest);
+            let g = latest.lock().unwrap();
+            assert_eq!(g.0.as_ref().map(|m| m["power"]["soc_w"].clone()), Some(json!(2.5)), "oversized frame length {size}");
+        }
+    }
+
+    #[test]
+    fn macmon_oversized_frame_clears_previous_metrics_even_at_eof() {
+        let latest: Latest = Arc::new(Mutex::new((macmon_metrics(&json!({"all_power": 1})), Some(Instant::now()))));
+        read_macmon(std::io::Cursor::new(vec![b'x'; 524_288]), &latest);
+        assert!(latest.lock().unwrap().0.is_none());
+    }
+
+    /// Subprocess entry: a real sampler owns real fixture macmon while stdout is full.
+    #[test]
+    #[ignore = "owned subprocess invoked by stdout cancellation tests"]
+    fn blocked_stdout_fixture() {
+        let dir = PathBuf::from(std::env::var_os("PR87_FIXTURE_DIR").unwrap());
+        let a = Args { interval: 0.2, procs_every: 1.0, max_seconds: std::env::var("PR87_FIXTURE_MAX").unwrap().parse().unwrap(), count: 0, watch: true };
+        let t0 = Instant::now();
+        let control = Control { gone: Arc::new(AtomicBool::new(false)), deadline: t0 + Duration::from_secs_f64(a.max_seconds) };
+        watch_stdin(control.gone.clone());
+        let sampler = Sampler::open(&a, t0, &control);
+        assert!(sampler.monitor.is_some());
+        std::fs::write(dir.join("ready"), b"ready").unwrap();
+        assert!(!Output::open().emit(json!({"payload": "x".repeat(1024 * 1024)}), &control));
+        drop(sampler);
+        // libtest would print its result to the deliberately full stdout pipe.
+        std::process::exit(0);
+    }
+
+    struct OutputFixture {
+        child: Child,
+        dir: PathBuf,
+        exited: bool,
+    }
+
+    impl Drop for OutputFixture {
+        fn drop(&mut self) {
+            if !self.exited {
+                // SAFETY: this unreaped child is the leader of a new group made only for
+                // this test. Kill that owned group before wait, including on RED/panic.
+                unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
+                let _ = self.child.wait();
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    impl OutputFixture {
+        fn open(max: u64, name: &str) -> OutputFixture {
+            let dir = std::env::temp_dir().join(format!("sampler-output-{}-{name}", std::process::id()));
+            let bin = dir.join(".katala-tune/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let script = bin.join("macmon");
+            std::fs::write(&script, "#!/usr/bin/python3\nimport os,signal,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nwith open(os.path.join(os.environ['HOME'],'macmon-pid'),'w') as f: f.write(str(os.getpid()))\nuntil=time.monotonic()+10\nwhile time.monotonic()<until: time.sleep(0.05)\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "sample_mac::tests::blocked_stdout_fixture", "--ignored", "--nocapture"])
+                .env("HOME", &dir)
+                .env("PR87_FIXTURE_DIR", &dir)
+                .env("PR87_FIXTURE_MAX", max.to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let fixture = OutputFixture { child, dir, exited: false };
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut queued = 0;
+                // SAFETY: stdout read end stays owned by fixture. FIONREAD only reads its byte count.
+                let r = unsafe { libc::ioctl(fixture.child.stdout.as_ref().unwrap().as_raw_fd(), libc::FIONREAD, &mut queued) };
+                assert_eq!(r, 0);
+                if queued >= 8192 && fixture.dir.join("macmon-pid").exists() && fixture.dir.join("ready").exists() {
+                    break;
+                }
+                assert!(Instant::now() < until, "fixture did not reach a blocked stdout write");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            fixture
+        }
+
+        fn wait_and_check_cleanup(&mut self, timeout: Duration) {
+            let until = Instant::now() + timeout;
+            let status = loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    self.exited = true;
+                    break status;
+                }
+                assert!(Instant::now() < until, "sampler stayed blocked on stdout after cancellation/deadline");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert!(status.success(), "fixture failed: {status}");
+            let pid = std::fs::read_to_string(self.dir.join("macmon-pid")).unwrap();
+            assert!(!Command::new("/bin/kill").args(["-0", &pid]).stderr(Stdio::null()).status().unwrap().success(), "owned macmon was not reaped");
+        }
+    }
+
+    #[test]
+    fn stdout_backpressure_does_not_block_stdin_cleanup() {
+        let mut fixture = OutputFixture::open(30, "stdin");
+        drop(fixture.child.stdin.take());
+        fixture.wait_and_check_cleanup(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stdout_backpressure_does_not_block_max_cleanup() {
+        let mut fixture = OutputFixture::open(2, "max");
+        fixture.wait_and_check_cleanup(Duration::from_millis(3500));
+    }
+
+    // Reverting the ps deadline/cancellation must leave this owned child alive long enough to fail.
+    fn sleeping_ps() -> Command {
+        let mut c = Command::new("/usr/bin/python3");
+        c.args(["-I", "-c", "import time; print('1 0:00.00 1 fixture', flush=True); time.sleep(1)"]);
+        c
+    }
+
+    #[test]
+    fn ps_deadline_interrupts_output_wait() {
+        let control = Control { gone: Arc::new(AtomicBool::new(false)), deadline: Instant::now() + Duration::from_millis(100) };
+        let started = Instant::now();
+        assert!(ps_output(&mut sleeping_ps(), &control, Duration::from_secs(10)).is_none());
+        assert!(started.elapsed() < Duration::from_millis(700));
+    }
+
+    #[test]
+    fn ps_stdin_cancellation_interrupts_output_wait() {
+        let control = Control { gone: Arc::new(AtomicBool::new(false)), deadline: Instant::now() + Duration::from_secs(10) };
+        let gone = control.gone.clone();
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            gone.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let out = ps_output(&mut sleeping_ps(), &control, Duration::from_secs(10));
+        cancel.join().unwrap();
+        assert!(out.is_none());
+        assert!(started.elapsed() < Duration::from_millis(700));
+    }
+
+    #[test]
+    fn ps_local_timeout_preserves_session() {
+        let control = Control { gone: Arc::new(AtomicBool::new(false)), deadline: Instant::now() + Duration::from_secs(10) };
+        assert!(ps_output(&mut sleeping_ps(), &control, Duration::from_millis(100)).is_none());
+        assert!(!control.stopped());
+        let mut fast = Command::new("/usr/bin/printf");
+        fast.arg("1 0:00.25 4 fixture\n");
+        assert_eq!(ps_output(&mut fast, &control, Duration::from_secs(1)).unwrap(), b"1 0:00.25 4 fixture\n");
+    }
+
+    #[test]
+    fn ps_eof_does_not_bypass_child_deadline() {
+        let control = Control { gone: Arc::new(AtomicBool::new(false)), deadline: Instant::now() + Duration::from_secs(10) };
+        let mut command = Command::new("/usr/bin/python3");
+        command.args(["-I", "-c", "import os,time; os.close(1); time.sleep(1)"]);
+        let started = Instant::now();
+        assert!(ps_output(&mut command, &control, Duration::from_millis(100)).is_none());
+        assert!(started.elapsed() < Duration::from_millis(700));
+    }
+
+    #[test]
+    fn ps_cancel_reaps_a_running_owned_child() {
+        let dir = std::env::temp_dir().join(format!("sampler-ps-{}-{}", std::process::id(), tune_link::now_ms()));
+        std::fs::create_dir(&dir).unwrap();
+        let marker = dir.join("pid");
+        let control = Control { gone: Arc::new(AtomicBool::new(false)), deadline: Instant::now() + Duration::from_secs(5) };
+        let gone = control.gone.clone();
+        let path = marker.clone();
+        let cancel = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(4);
+            while !path.exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let pid = std::fs::read_to_string(path).unwrap();
+            gone.store(true, Ordering::SeqCst);
+            pid
+        });
+        let mut command = Command::new("/usr/bin/python3");
+        command.args(["-I", "-c", "import os,sys,time; open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(1)"]).arg(&marker);
+        let out = ps_output(&mut command, &control, Duration::from_secs(5));
+        let pid = cancel.join().unwrap();
+        let alive = Command::new("/bin/kill").args(["-0", &pid]).stderr(Stdio::null()).status().unwrap().success();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(out.is_none());
+        assert!(!alive, "ps fixture must be reaped before cancellation returns");
+    }
 
     /// live_mac.py を import して（main は動かない）、同じ入力の結果を JSON で返す
     fn python(code: &str, input: &Value) -> Value {
@@ -960,9 +1340,10 @@ mod tests {
     fn sampler_reads_this_machine() {
         let a = Args { interval: 0.3, procs_every: 1.0, max_seconds: 10.0, count: 0, watch: false };
         let t0 = Instant::now();
-        let mut s = Sampler::open(&a, t0);
+        let control = Control { gone: Arc::new(AtomicBool::new(false)), deadline: t0 + Duration::from_secs(10) };
+        let mut s = Sampler::open(&a, t0, &control);
         std::thread::sleep(Duration::from_millis(300));
-        let v = s.sample(1, Instant::now(), 0.3, true);
+        let v = s.sample(1, Instant::now(), 0.3, true, &control);
         let h = s.hello();
         assert_eq!((h["os"].as_str(), h["impl"].as_str()), (Some("macos"), Some("rust")));
         assert!(h["cores"].as_u64().unwrap() > 0);

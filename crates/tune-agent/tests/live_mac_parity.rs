@@ -152,3 +152,26 @@ fn native_sampler_stops_when_stdin_closes() {
     assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
     drop(out);
 }
+
+#[test]
+fn native_sampler_max_expires_before_long_interval() {
+    let started = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_tune-agent"))
+        .args(["sample", "interval=5", "max=1"])
+        .env("HOME", std::env::temp_dir().join(format!("sampler-timer-{}", std::process::id())))
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+    assert!(out.status.success());
+    // Distinguish the old five-second interval wait while allowing scheduler/startup
+    // overhead on a loaded CI runner. Sensor cleanup has separate controlled fixtures.
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}", started.elapsed());
+    let rows = lines(&out.stdout);
+    assert_eq!(rows[0]["type"], "hello");
+    assert_eq!(rows.last().unwrap()["reason"], "max_age");
+    assert!(!rows.iter().any(|row| row["type"] == "s"));
+}
