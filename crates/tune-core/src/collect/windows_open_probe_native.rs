@@ -28,7 +28,8 @@ fn require<T, E>(result: Result<T, E>, step: Step) -> T {
     result.unwrap_or_else(|_| panic!("controlled_open_probe setup={step:?}"))
 }
 fn update(record: &Mutex<Record>, change: impl FnOnce(&mut Record)) {
-    change(&mut require(record.lock(), Step::State));
+    let mut state = require(record.lock(), Step::State);
+    change(&mut state);
 }
 fn capture<T>(record: &Mutex<Record>, step: Step, result: io::Result<T>) -> io::Result<T> {
     result.inspect_err(|error| {
@@ -74,7 +75,7 @@ fn resume(thread: &OwnedHandle, deadline: Instant) -> io::Result<()> {
     Ok(())
 }
 fn opened_identity_matches(handle: &OwnedHandle, expected: &ProcessIdentity) -> io::Result<bool> {
-    let (mut created, mut exit, mut kernel, mut user) = (Default::default(), Default::default(), Default::default());
+    let (mut created, mut exit, mut kernel, mut user) = (Default::default(), Default::default(), Default::default(), Default::default());
     // SAFETY: readonly query on the just-opened, retained fixture candidate.
     check(unsafe { GetProcessTimes(handle.as_raw_handle(), &mut created, &mut exit, &mut kernel, &mut user) })?;
     let created = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
