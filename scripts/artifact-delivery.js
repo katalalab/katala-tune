@@ -306,6 +306,7 @@ function inspectPE(buffer, gui) {
 }
 
 function inspectPayload(root, name, proof) {
+  const p = platform(name);
   validateProof(proof, name);
   const files = inventory(root);
   if (name === 'windows-x64') {
