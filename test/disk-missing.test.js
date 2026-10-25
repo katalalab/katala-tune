@@ -13,6 +13,23 @@ test('Disk missing counters, partial coverage and recovery keep Python rates unk
   assert.equal(result.status, 0, result.stdout + result.stderr);
 });
 
+test('Disk fixtures read the UTF-8 probe when the OS default encoding is cp1252', (t) => {
+  const python = [process.env.PYTHON, 'python3', 'python'].filter(Boolean)
+    .find(p => spawnSync(p, ['--version'], { encoding: 'utf8', timeout: 5000 }).status === 0);
+  if (!python) return t.skip('Python unavailable');
+  // Only replace the environment's default; an explicit file encoding still wins.
+  const boot = `import pathlib,runpy,sys
+read = pathlib.Path.read_text
+def legacy_default(self,*args,**kwargs):
+    if not args and kwargs.get('encoding') is None: kwargs['encoding']='cp1252'
+    return read(self,*args,**kwargs)
+pathlib.Path.read_text=legacy_default
+sys.argv=[sys.argv[1]]
+runpy.run_path(sys.argv[0],run_name='__main__')`;
+  const result = spawnSync(python, ['-I', '-c', boot, path.join(__dirname, 'fixtures/disk-missing.py')], { encoding: 'utf8', timeout: 10000 });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+});
+
 test('Disk missing display differs from an observed idle disk', () => {
   assert.equal(Live.rate(null), '–');
   assert.equal(Live.rate(undefined), '–');

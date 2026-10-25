@@ -7,7 +7,7 @@ from pathlib import Path
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-tree = ast.parse((ROOT / "probes/live_mac.py").read_text())
+tree = ast.parse((ROOT / "probes/live_mac.py").read_text(encoding="utf-8"))
 nodes = [n for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef)) and n.name in ("Disk", "disk_rate", "main", "init")]
 ns = {"C": C, "math": math}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "live_mac_disk", "exec"), ns)
@@ -118,7 +118,7 @@ class DiskMissing(unittest.TestCase):
             self.assertEqual(ns["disk_rate"]({1: (0, 0)}, {1: (1, 1)}, dt), {"read_bps": None, "write_bps": None})
 
     def test_golden_rates(self):
-        for case in json.loads((ROOT / "test/fixtures/disk-rates.json").read_text()):
+        for case in json.loads((ROOT / "test/fixtures/disk-rates.json").read_text(encoding="utf-8")):
             prev = {}
             for frame in case["frames"]:
                 cur = {int(k): v for k, v in frame["c"].items()}
