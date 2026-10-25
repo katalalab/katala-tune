@@ -1,5 +1,50 @@
 use super::*;
 
+// The stock JavaScript Objective-C bridge calls public IOKit APIs. Read only
+// these two properties; never enumerate or serialize a registry dictionary.
+#[cfg(target_os = "macos")]
+const PUBLIC_REGISTRY_SCRIPT: &str = r#"
+ObjC.import('Foundation');
+ObjC.import('IOKit');
+ObjC.bindFunction('IOServiceMatching', ['id', ['char *']]);
+ObjC.bindFunction('IOServiceGetMatchingService', ['unsigned int', ['unsigned int', 'id']]);
+ObjC.bindFunction('IOServiceGetMatchingServices', ['int', ['unsigned int', 'id', 'unsigned int *']]);
+ObjC.bindFunction('IOIteratorNext', ['unsigned int', ['unsigned int']]);
+ObjC.bindFunction('IORegistryEntryCreateCFProperty', ['id', ['unsigned int', 'id', 'void *', 'unsigned int']]);
+ObjC.bindFunction('IOObjectRelease', ['int', ['unsigned int']]);
+function property(service, key) {
+  var value = $.IORegistryEntryCreateCFProperty(service, $(key), null, 0);
+  if (!value || value.isNil()) return null;
+  if (value.isKindOfClass($.NSData)) {
+    if (value.length > 512) return null;
+    value = $.NSString.alloc.initWithDataEncoding(value, $.NSUTF8StringEncoding);
+  }
+  if (!value || value.isNil() || !value.isKindOfClass($.NSString)) return null;
+  var text = ObjC.unwrap(value).replace(/\x00+$/, '');
+  return text.length <= 512 && !/[\x00-\x1f\x7f]/.test(text) ? text : null;
+}
+var result = {gpu_driver_bundles:[]};
+var platform = $.IOServiceGetMatchingService(0, $.IOServiceMatching('IOPlatformExpertDevice'));
+if (platform) {
+  try { result.manufacturer = property(platform, 'manufacturer'); }
+  finally { $.IOObjectRelease(platform); }
+}
+var iterator = Ref();
+if ($.IOServiceGetMatchingServices(0, $.IOServiceMatching('AGXAccelerator'), iterator) === 0) {
+  try {
+    for (var i=0; i<8; i++) {
+      var service = $.IOIteratorNext(iterator[0]);
+      if (!service) break;
+      try {
+        var bundle = property(service, 'CFBundleIdentifier');
+        if (bundle && /^com\.apple\.AGX[A-Za-z0-9.]+$/.test(bundle) && result.gpu_driver_bundles.indexOf(bundle)<0) result.gpu_driver_bundles.push(bundle);
+      } finally { $.IOObjectRelease(service); }
+    }
+  } finally { $.IOObjectRelease(iterator[0]); }
+}
+JSON.stringify(result);
+"#;
+
 #[cfg(target_os = "macos")]
 pub async fn collect() -> Value {
     // One provider invocation per type isolates unsupported devices and timeouts.
@@ -32,6 +77,49 @@ pub async fn collect() -> Value {
                 errors.insert(kind.into(), json!(e));
             }
         }
+    }
+    let registry = collect::run_bounded(
+        "/usr/bin/osascript",
+        &["-l".into(), "JavaScript".into(), "-e".into(), PUBLIC_REGISTRY_SCRIPT.into()],
+        &[],
+        Duration::from_secs(8),
+        16384,
+        1024,
+    )
+    .await;
+    if registry.code == Some(0)
+        && let Ok(value) = serde_json::from_slice::<Value>(&registry.stdout)
+    {
+        let mut drivers = Map::new();
+        for bundle in value["gpu_driver_bundles"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|s| gpu_bundle(s)).take(8) {
+            // Query only the bundle attached to the active accelerator. Installed
+            // package metadata alone does not establish which driver is running.
+            let loaded = collect::run_bounded(
+                "/usr/bin/kmutil",
+                &["showloaded".into(), "--list-only".into(), "--bundle-identifier".into(), bundle.into()],
+                &[],
+                Duration::from_secs(5),
+                16384,
+                1024,
+            )
+            .await;
+            if loaded.code == Some(0) {
+                for line in String::from_utf8_lossy(&loaded.stdout).lines().take(32) {
+                    let mut words = line.split_whitespace().skip(5);
+                    if words.next() == Some(bundle)
+                        && let Some(version) = words.next().and_then(|v| v.strip_prefix('(')).and_then(|v| v.strip_suffix(')')).filter(|v| driver_version(v))
+                    {
+                        drivers.insert(bundle.into(), json!(version));
+                    }
+                }
+            } else {
+                errors.insert("gpu_loaded_drivers".into(), json!(if loaded.timed_out { "timeout" } else { "error" }));
+            }
+        }
+        raw.insert("gpu_loaded_drivers".into(), Value::Object(drivers));
+        raw.insert("ioreg_public".into(), value);
+    } else {
+        errors.insert("ioreg_public".into(), json!(if registry.timed_out { "timeout" } else { "error" }));
     }
     // Query only a finite, non-identifying set. Never persist complete command output.
     for key in [
@@ -200,8 +288,36 @@ fn public_wifi_ids(card: &str) -> Option<(String, String)> {
     (valid(vendor) && valid(device)).then(|| (vendor.into(), device.into()))
 }
 
+fn driver_version(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 64 && value.split('.').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn gpu_bundle(value: &str) -> bool {
+    value.starts_with("com.apple.AGX") && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
+}
+
+fn wifi_driver_version(value: &str) -> Option<String> {
+    let mut versions = value
+        .split_whitespace()
+        .filter_map(|word| word.trim_matches(['\'', '"']).strip_prefix("IO80211_driverkit-").filter(|v| v.contains('.') && driver_version(v)));
+    let version = versions.next()?;
+    versions.all(|v| v == version).then(|| version.to_string())
+}
+
+fn apple_gpu(value: &Value) -> bool {
+    value["sppci_model"].as_str().is_some_and(|s| s.starts_with("Apple ")) || value["spdisplays_vendor"] == "sppci_vendor_Apple"
+}
+
 pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
     let unified = raw["SPHardwareDataType"].as_array().into_iter().flatten().any(|v| v["chip_type"].as_str().is_some_and(|s| s.starts_with("Apple")));
+    let gpu_bundles: std::collections::BTreeSet<_> =
+        raw["ioreg_public"]["gpu_driver_bundles"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|s| gpu_bundle(s)).collect();
+    let gpu_driver = if gpu_bundles.len() == 1 && raw["SPDisplaysDataType"].as_array().into_iter().flatten().filter(|v| apple_gpu(v)).count() == 1 {
+        let bundle = gpu_bundles.first().copied().expect("one bundle");
+        raw["gpu_loaded_drivers"][bundle].as_str().filter(|v| driver_version(v)).map(|version| (bundle, version))
+    } else {
+        None
+    };
     for (kind, id) in TYPES {
         let source = format!("system_profiler {kind}");
         if let Some(error) = raw["errors"][*kind].as_str() {
@@ -307,6 +423,12 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
                 {
                     fields.insert("firmware_version".into(), firmware);
                 }
+                if v["_name"].as_str().and_then(|s| s.strip_prefix("en")).is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                    && let Some(version) = v["spairport_wireless_firmware_version"].as_str().and_then(wifi_driver_version)
+                {
+                    fields.insert("driver_name".into(), json!("IO80211_driverkit"));
+                    fields.insert("driver_version".into(), json!(version));
+                }
             }
             if *id == "thunderbolt" && fields.contains_key("port") {
                 let physical = fields["port"].as_str().is_some_and(|p| p.len() <= 3 && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
@@ -319,6 +441,17 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
                 if unified {
                     fields.remove("vram");
                 }
+                if apple_gpu(v)
+                    && let Some((bundle, version)) = gpu_driver
+                {
+                    fields.insert("driver_name".into(), json!(bundle));
+                    fields.insert("driver_version".into(), json!(version));
+                }
+            }
+            if *kind == "SPHardwareDataType"
+                && let Some(manufacturer) = scalar(&raw["ioreg_public"]["manufacturer"]).filter(Value::is_string)
+            {
+                fields.insert("manufacturer".into(), manufacturer);
             }
             // Power data is nested in dictionaries; read only known health fields.
             if *kind == "SPPowerDataType" {
@@ -373,8 +506,17 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
             } else {
                 fields.get("model").and_then(Value::as_str).unwrap_or(id).to_string()
             };
-            let component_source =
-                if *kind == "SPSoftwareDataType" && fields.contains_key("architecture") { format!("{source} / sysctl hw.machine") } else { source.clone() };
+            let component_source = if *kind == "SPHardwareDataType" && raw["ioreg_public"]["manufacturer"].is_string() {
+                format!("{source} / IOKit IOPlatformExpertDevice manufacturer")
+            } else if *id == "gpu" && fields.contains_key("driver_name") {
+                format!("{source} / IOKit AGXAccelerator CFBundleIdentifier / kmutil showloaded")
+            } else if *kind == "SPAirPortDataType" && fields.contains_key("driver_name") {
+                format!("{source} spairport_wireless_firmware_version: explicit IO80211_driverkit component")
+            } else if *kind == "SPSoftwareDataType" && fields.contains_key("architecture") {
+                format!("{source} / sysctl hw.machine")
+            } else {
+                source.clone()
+            };
             components.push(component(&name, &component_source, fields));
         }
         let status = if components.is_empty() {
@@ -385,6 +527,21 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
             "ok"
         };
         merge(sections, id, components, status, &source);
+    }
+    let registry_source = "IOKit IOPlatformExpertDevice manufacturer / AGXAccelerator CFBundleIdentifier";
+    if let Some(error) = raw["errors"]["ioreg_public"].as_str() {
+        let status = if ["timeout", "tool_missing", "output_limit", "permission_denied"].contains(&error) { error } else { "error" };
+        for id in ["system", "gpu"] {
+            merge(sections, id, vec![], status, registry_source);
+        }
+    } else if raw["ioreg_public"].is_object() {
+        let status = if raw["ioreg_public"]["manufacturer"].is_string() { "ok" } else { "empty" };
+        merge(sections, "system", vec![], status, registry_source);
+        let status = raw["errors"]["gpu_loaded_drivers"]
+            .as_str()
+            .filter(|s| ["timeout", "tool_missing", "output_limit", "permission_denied", "error"].contains(s))
+            .unwrap_or(if gpu_driver.is_some() { "ok" } else { "empty" });
+        merge(sections, "gpu", vec![], status, "IOKit AGXAccelerator CFBundleIdentifier / kmutil showloaded");
     }
     if let Some(hw) = raw["SPHardwareDataType"].as_array().and_then(|a| a.first()) {
         let mut cpu =

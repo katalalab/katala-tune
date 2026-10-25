@@ -37,6 +37,11 @@ fn full_body_evidence_is_auditable_and_distinct_from_indexed_excerpts() {
                 "manufacturer_page_full_body" => {
                     assert_eq!(evidence["coverage"], "full_page");
                 }
+                "manufacturer_driver_package_full_body" => {
+                    assert_eq!(evidence["coverage"], "full_archive");
+                    assert!(evidence["notes"].as_str().unwrap().contains("without"));
+                    assert!(evidence["notes"].as_str().unwrap().contains("SHA256"));
+                }
                 other => panic!("unrecognized full-body access: {other}"),
             }
         }
@@ -58,7 +63,7 @@ fn hardware_id_records_have_exact_unique_section_scoped_keys() {
         assert!(!ids.as_array().unwrap().is_empty());
         for id in ids.as_array().unwrap() {
             let section = id["section"].as_str().unwrap();
-            assert!(["pci", "usb", "network"].contains(&section));
+            assert!(["pci", "usb", "network", "audio"].contains(&section));
             let vendor = id["vendor_id"].as_str().unwrap();
             let device = id.get("device_id").or_else(|| id.get("product_id")).unwrap().as_str().unwrap();
             assert!(hex(vendor, 4) && hex(device, 4));
@@ -66,8 +71,11 @@ fn hardware_id_records_have_exact_unique_section_scoped_keys() {
             assert_eq!(device, device.to_ascii_uppercase());
             assert!(keys.insert((section.to_string(), vendor.to_string(), device.to_string())));
         }
-        assert!(product["scope"].as_str().unwrap().contains("stepping"));
         let specs = product["specifications"].as_object().unwrap();
+        assert!(
+            specs.keys().all(|key| ["silicon_family", "controller_function", "pci_device_function"].contains(&key.as_str())),
+            "ID records describe family/function only"
+        );
         for unsupported in ["stepping", "board_revision", "motherboard_sku", "negotiated_link_gbps"] {
             assert!(!specs.contains_key(unsupported), "function identity cannot prove {unsupported}");
         }

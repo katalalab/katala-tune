@@ -1,4 +1,5 @@
 //! Finite read-only machine inventory. Rust owns collection and the public report contract.
+mod gaps;
 mod macos;
 mod windows;
 
@@ -28,7 +29,7 @@ pub fn official(model: &str) -> Value {
 
 fn official_product(p: &Value, status: &str, match_kind: &str) -> Value {
     json!({"status":status,"match_kind":match_kind,"name":p["name"],"url":p["url"],"scope":p["scope"],
-        "source_access":p["source_access"],"source_evidence":p["source_evidence"],"specifications":p["specifications"],
+        "source_access":p["source_access"],"source_evidence":p["source_evidence"],"supporting_source_evidence":p["supporting_source_evidence"],"specifications":p["specifications"],
         "verified_at":p.get("verified_at").unwrap_or(&CATALOG["verified_at"]),"catalog_version":CATALOG["version"]})
 }
 
@@ -145,6 +146,7 @@ pub const FIELDS: &[&str] = &[
     "memory_kind",
     "dedicated_vram_bytes",
     "vram",
+    "driver_name",
     "driver_version",
     "driver_date",
     "firmware_version",
@@ -325,6 +327,7 @@ fn finalize_sections(platform: &str, sections: &mut Map<String, Value>) {
             _ => json!([]),
         };
         s["references"] = references;
+        let providers = s["providers"].clone();
         for c in s["components"].as_array_mut().into_iter().flatten() {
             let (kind, class) = record_kind(platform, id, c);
             c["fields"]["record_kind"] = json!(kind);
@@ -360,8 +363,14 @@ fn finalize_sections(platform: &str, sections: &mut Map<String, Value>) {
             } else {
                 c["official"] = official_for(id, c);
             }
+            c["gap_reasons"] = gaps::explain(platform, id, c, &providers);
         }
     }
+}
+
+/// Derive explanations for a normalized observation without changing its identity status.
+pub fn explain_gaps(platform: &str, section: &str, component: &Value, providers: &Value) -> Value {
+    gaps::explain(platform, section, component, providers)
 }
 
 pub fn normalize(platform: &str, raw: &Value) -> Value {
@@ -377,7 +386,7 @@ pub fn normalize(platform: &str, raw: &Value) -> Value {
     finalize_sections(platform, &mut sections);
     let collected =
         sections.values().any(|s| matches!(s["status"].as_str(), Some("ok" | "partial")) && s["components"].as_array().is_some_and(|c| !c.is_empty()));
-    json!({"schema":SCHEMA,"platform":platform,"at":now_ms(),"ok":collected,"collector_version":env!("CARGO_PKG_VERSION"),"catalog_version":CATALOG["version"],"sections":sections})
+    json!({"schema":SCHEMA,"platform":platform,"at":now_ms(),"ok":collected,"collector_version":env!("CARGO_PKG_VERSION"),"catalog_version":CATALOG["version"],"gap_summary":gaps::summary(&sections),"sections":sections})
 }
 
 pub fn validate_report(v: &Value, platform: &str) -> Result<Value, String> {
@@ -430,7 +439,7 @@ pub fn validate_report(v: &Value, platform: &str) -> Result<Value, String> {
     finalize_sections(platform, &mut sections);
     let ok = sections.values().any(|s| matches!(s["status"].as_str(), Some("ok" | "partial")) && s["components"].as_array().is_some_and(|c| !c.is_empty()));
     Ok(
-        json!({"schema":SCHEMA,"platform":platform,"at":at,"ok":ok,"collector_version":scalar(&v["collector_version"]),"catalog_version":CATALOG["version"],"sections":sections}),
+        json!({"schema":SCHEMA,"platform":platform,"at":at,"ok":ok,"collector_version":scalar(&v["collector_version"]),"catalog_version":CATALOG["version"],"gap_summary":gaps::summary(&sections),"sections":sections}),
     )
 }
 

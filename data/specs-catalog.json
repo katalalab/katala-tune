@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "verified_at": "2026-10-25",
   "products": [
     {
@@ -110,44 +110,141 @@
       "specifications": {"socket": "LGA1851", "chipset": "Intel B860", "memory_type": "DDR5", "memory_slots": 4, "m2_storage_slots": 3, "sata_ports": 4, "ethernet_max_gbps": 2.5, "supported_wifi": "Wi-Fi 6E", "supported_xmp": "3.0"}
     },
     {
-      "models": ["CT2000T500SSD8"],
+      "models": [
+        "CT2000T500SSD8"
+      ],
       "name": "Crucial T500 2TB (without heatsink)",
-      "url": "https://www.crucial.com/content/dam/crucial/ssd-products/t500/flyers/b2c/crucial-T500-b2c-product-flyer-en_combination.pdf",
-      "source_access": "manufacturer_document_indexed_excerpt",
-      "scope": "Exact SKU in manufacturer's flyer table; published capacity and up-to performance, not current link, benchmark or remaining endurance. Full PDF fetch was blocked at verification",
-      "specifications": {"capacity_tb": 2, "interface": "PCIe 4.0 NVMe", "sequential_read_up_to_mbs": 7400, "sequential_write_up_to_mbs": 7000, "rated_endurance_tbw": 1200, "heatsink_included": false}
+      "url": "https://assets.micron.com/adobe/assets/urn:aaid:aem:6b046d5a-4382-4018-b81e-28421f19b2cc/renditions/original/as/crucial-T500-b2c-product-flyer-en-combination.pdf",
+      "source_access": "manufacturer_document_full_body",
+      "source_evidence": {
+        "url": "https://assets.micron.com/adobe/assets/urn:aaid:aem:6b046d5a-4382-4018-b81e-28421f19b2cc/renditions/original/as/crucial-T500-b2c-product-flyer-en-combination.pdf",
+        "sha256": "29580af1815c5f254583596dde90338db8656325065ec0a6a764b54d381d3946",
+        "coverage": "full_document",
+        "material": "pdf_document",
+        "pages": [
+          2
+        ],
+        "verified_at": "2026-10-25",
+        "notes": "Complete two-page manufacturer PDF downloaded using the ordinary browser file-download path with TLS validation. Page 2 exact CT2000T500SSD8 row and merged interface cell visually confirm 2TB, PCIe 4.0 NVMe, up-to 7400/7000MB/s, 1200TBW and no heatsink. Hash is over original PDF bytes."
+      },
+      "scope": "Exact SKU in complete manufacturer's flyer table; published capacity and up-to performance, not current link, benchmark or remaining endurance",
+      "specifications": {
+        "capacity_tb": 2,
+        "interface": "PCIe 4.0 NVMe",
+        "sequential_read_up_to_mbs": 7400,
+        "sequential_write_up_to_mbs": 7000,
+        "rated_endurance_tbw": 1200,
+        "heatsink_included": false
+      }
     },
     {
-      "models": ["CT1000MX500SSD1"],
+      "models": [
+        "CT1000MX500SSD1"
+      ],
       "name": "Crucial MX500 1TB SATA SSD",
-      "url": "https://content.crucial.com/content/dam/crucial/ssd-products/mx500/flyer/crucial-mx500-ssd-productflyer-es_es.pdf",
-      "source_access": "manufacturer_document_indexed_excerpt",
-      "scope": "Exact SKU in manufacturer's flyer table; published specifications, not measured speed, firmware or remaining endurance. Full PDF fetch was unavailable at verification",
-      "specifications": {"capacity_tb": 1, "interface": "SATA 6Gb/s", "form_factor": "2.5-inch / 7mm", "sequential_read_up_to_mbs": 560, "sequential_write_up_to_mbs": 510, "rated_endurance_tbw": 360}
+      "url": "https://assets.micron.com/adobe/assets/urn:aaid:aem:3c743a1f-9319-4b34-9b20-15cdad1ee2ce/renditions/original/as/crucial-mx500-ssd-productflyer-en.pdf",
+      "source_access": "manufacturer_document_full_body",
+      "source_evidence": {
+        "url": "https://assets.micron.com/adobe/assets/urn:aaid:aem:3c743a1f-9319-4b34-9b20-15cdad1ee2ce/renditions/original/as/crucial-mx500-ssd-productflyer-en.pdf",
+        "sha256": "996cadebc7ef390ceccb9be7f7005ea3a6d10fb2bf25bc1e6100fe984c016802",
+        "coverage": "full_document",
+        "material": "pdf_document",
+        "pages": [
+          2
+        ],
+        "verified_at": "2026-10-25",
+        "notes": "Complete two-page manufacturer PDF downloaded using the ordinary browser file-download path with TLS validation. Page 2 exact CT1000MX500SSD1 row, merged performance/form-factor cells and 1TB endurance entry visually confirm all catalog values: 1TB, SATA 6Gb/s, 2.5-inch/7mm, up-to 560/510MB/s and 360TBW. Hash is over original PDF bytes."
+      },
+      "scope": "Exact SKU in complete manufacturer's flyer table; published specifications, not measured speed, firmware or remaining endurance",
+      "specifications": {
+        "capacity_tb": 1,
+        "interface": "SATA 6Gb/s",
+        "form_factor": "2.5-inch / 7mm",
+        "sequential_read_up_to_mbs": 560,
+        "sequential_write_up_to_mbs": 510,
+        "rated_endurance_tbw": 360
+      }
     },
     {
-      "models": ["CT4000MX500SSD1"],
+      "models": [
+        "CT4000MX500SSD1"
+      ],
       "name": "Crucial MX500 4TB SATA SSD",
-      "url": "https://content.crucial.com/content/dam/crucial/ssd-products/mx500/flyer/crucial-mx500-ssd-productflyer-es_es.pdf",
-      "source_access": "manufacturer_document_indexed_excerpt",
-      "scope": "Exact SKU in manufacturer's flyer table; published specifications, not measured speed, firmware or remaining endurance. Full PDF fetch was unavailable at verification",
-      "specifications": {"capacity_tb": 4, "interface": "SATA 6Gb/s", "form_factor": "2.5-inch / 7mm", "sequential_read_up_to_mbs": 560, "sequential_write_up_to_mbs": 510, "rated_endurance_tbw": 1000}
+      "url": "https://assets.micron.com/adobe/assets/urn:aaid:aem:3c743a1f-9319-4b34-9b20-15cdad1ee2ce/renditions/original/as/crucial-mx500-ssd-productflyer-en.pdf",
+      "source_access": "manufacturer_document_full_body",
+      "source_evidence": {
+        "url": "https://assets.micron.com/adobe/assets/urn:aaid:aem:3c743a1f-9319-4b34-9b20-15cdad1ee2ce/renditions/original/as/crucial-mx500-ssd-productflyer-en.pdf",
+        "sha256": "996cadebc7ef390ceccb9be7f7005ea3a6d10fb2bf25bc1e6100fe984c016802",
+        "coverage": "full_document",
+        "material": "pdf_document",
+        "pages": [
+          2
+        ],
+        "verified_at": "2026-10-25",
+        "notes": "Complete two-page manufacturer PDF downloaded using the ordinary browser file-download path with TLS validation. Page 2 exact CT4000MX500SSD1 row, merged performance/form-factor cells and 4TB endurance entry visually confirm all catalog values: 4TB, SATA 6Gb/s, 2.5-inch/7mm, up-to 560/510MB/s and 1000TBW. Hash is over original PDF bytes."
+      },
+      "scope": "Exact SKU in complete manufacturer's flyer table; published specifications, not measured speed, firmware or remaining endurance",
+      "specifications": {
+        "capacity_tb": 4,
+        "interface": "SATA 6Gb/s",
+        "form_factor": "2.5-inch / 7mm",
+        "sequential_read_up_to_mbs": 560,
+        "sequential_write_up_to_mbs": 510,
+        "rated_endurance_tbw": 1000
+      }
     },
     {
-      "models": ["CT2000BX500SSD1"],
+      "models": [
+        "CT2000BX500SSD1"
+      ],
       "name": "Crucial BX500 2TB SATA SSD",
-      "url": "https://www.crucial.com/content/dam/crucial/ssd-products/bx500/flyer/b2c/crucial-bx500-b2c-product-flyer-en.pdf",
-      "source_access": "manufacturer_document_indexed_excerpt",
-      "scope": "Exact SKU in manufacturer's flyer table; published specifications, not measured speed, controller revision or remaining endurance. Full PDF fetch was blocked at verification",
-      "specifications": {"capacity_tb": 2, "interface": "SATA 6Gb/s", "form_factor": "2.5-inch / 7mm", "sequential_read_up_to_mbs": 540, "sequential_write_up_to_mbs": 500, "rated_endurance_tbw": 720}
+      "url": "https://assets.micron.com/adobe/assets/urn:aaid:aem:89a539f7-d1ba-4202-ab4d-161406b8747f/renditions/original/as/crucial-bx500-ssd-productflyer.pdf",
+      "source_access": "manufacturer_document_full_body",
+      "source_evidence": {
+        "url": "https://assets.micron.com/adobe/assets/urn:aaid:aem:89a539f7-d1ba-4202-ab4d-161406b8747f/renditions/original/as/crucial-bx500-ssd-productflyer.pdf",
+        "sha256": "4b1bc09d4afcc512603f191606317a5571c98bf4048816d181122bb8a2333ed8",
+        "coverage": "full_document",
+        "material": "pdf_document",
+        "pages": [
+          2
+        ],
+        "verified_at": "2026-10-25",
+        "notes": "Complete two-page manufacturer PDF downloaded using the ordinary browser file-download path with TLS validation. Page 2 exact CT2000BX500SSD1 row, merged interface cell and product dimensions visually confirm 2TB, SATA 6Gb/s, 2.5-inch/7mm, up-to 540/500MB/s and 720TBW. Hash is over original PDF bytes."
+      },
+      "scope": "Exact SKU in complete manufacturer's flyer table; published specifications, not measured speed, controller revision or remaining endurance",
+      "specifications": {
+        "capacity_tb": 2,
+        "interface": "SATA 6Gb/s",
+        "form_factor": "2.5-inch / 7mm",
+        "sequential_read_up_to_mbs": 540,
+        "sequential_write_up_to_mbs": 500,
+        "rated_endurance_tbw": 720
+      }
     },
     {
-      "models": ["CT1000P3PSSD8"],
+      "models": [
+        "CT1000P3PSSD8"
+      ],
       "name": "Crucial P3 Plus 1TB NVMe SSD",
-      "url": "https://www.crucial.com/content/dam/crucial/ssd-products/p3-plus/flyers/b2c/crucial-p3plus-productflyer-consumer.pdf",
-      "source_access": "manufacturer_document_indexed_excerpt",
-      "scope": "Exact SKU in manufacturer's flyer table; published capacity and up-to performance, not current benchmark or link. Full PDF fetch was blocked at verification",
-      "specifications": {"capacity_tb": 1, "sequential_read_up_to_mbs": 5000, "sequential_write_up_to_mbs": 3600}
+      "url": "https://assets.micron.com/adobe/assets/urn:aaid:aem:ac83bf68-de9d-4725-a7c1-476ba03505b8/renditions/original/as/crucial-p3plus-productflyer-consumer.pdf",
+      "source_access": "manufacturer_document_full_body",
+      "source_evidence": {
+        "url": "https://assets.micron.com/adobe/assets/urn:aaid:aem:ac83bf68-de9d-4725-a7c1-476ba03505b8/renditions/original/as/crucial-p3plus-productflyer-consumer.pdf",
+        "sha256": "2289a44d69f23683c615d66b096452c3994456140ecba40e7fa2dca9cf418be1",
+        "coverage": "full_document",
+        "material": "pdf_document",
+        "pages": [
+          2
+        ],
+        "verified_at": "2026-10-25",
+        "notes": "Complete two-page manufacturer PDF downloaded using the browser's ordinary file-download path with TLS validation. Page 2 exact CT1000P3PSSD8 row confirms 1TB and up-to 5000/3600MB/s read/write; table and performance footnote visually checked. Hash is over the original PDF bytes."
+      },
+      "scope": "Exact SKU in complete manufacturer's flyer table; published capacity and up-to performance, not current benchmark or link",
+      "specifications": {
+        "capacity_tb": 1,
+        "sequential_read_up_to_mbs": 5000,
+        "sequential_write_up_to_mbs": 3600
+      }
     },
     {
       "models": ["INTEL SSDPEKKW010T8", "SSDPEKKW010T8"],
@@ -241,12 +338,46 @@
       "source_evidence": {"url": "https://archiv.rme-audio.de/en/products/babyface_pro.php", "sha256": "51fe808b303a7f76b88422bac4422bbf13bc066eb724d7b5d5e7bde178fb3cda", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete official archive page: Overview/Connectivity and title; compared with the complete Babyface Pro FS page. Only shared channel-count, sample-rate and USB-interface capabilities retained"}
     },
     {
-      "models": ["Razer Viper 8KHz"],
+      "models": [
+        "Razer Viper 8KHz"
+      ],
       "name": "Razer Viper 8KHz mouse",
       "url": "https://mysupport.razer.com/app/answers/detail/a_id/4007",
-      "source_access": "manufacturer_page_indexed_excerpt",
-      "scope": "Exact Viper 8KHz product specifications in manufacturer support table, RZ01-03580. Direct page retrieval returned a browser challenge, so source remains an indexed excerpt. Published polling/sensor limits are not current mouse settings or observed USB polling",
-      "specifications": {"polling_rate_up_to_hz": 8000, "sensor_resolution_up_to_dpi": 20000, "programmable_buttons": 8, "cable_length_m": 1.8}
+      "source_access": "manufacturer_page_full_body",
+      "source_evidence": {
+        "url": "https://mysupport.razer.com/app/answers/detail/a_id/4007",
+        "sha256": "aa9ebe3dbbcff439b9971f37e32efea053af986296bdc611d12bb554ea06f730",
+        "coverage": "full_page",
+        "material": "rendered_dom_text",
+        "verified_at": "2026-10-25",
+        "notes": "Ordinary browser rendering loaded the complete Specifications tab without solving a challenge. The saved full rendered body text, not the raw HTTP HTML response, is hashed. RZ01-03580 table confirms all catalog claims: 8000Hz, 20000DPI, eight programmable buttons and 1.8m cable; other support tabs and linked files are outside this page-text coverage."
+      },
+      "supporting_source_evidence": [
+        {
+          "url": "https://dl.razerzone.com/master-guides/RazerSynapse3/VIPER8KHZ-00000145-en.pdf",
+          "sha256": "703ed5298f92c1b12d77ddfff5959cd234042000967683d9d0f471979c450363",
+          "coverage": "full_document",
+          "material": "pdf_document",
+          "pages": [
+            7
+          ],
+          "verified_at": "2026-10-25",
+          "claim_scope": [
+            "polling_rate_up_to_hz",
+            "sensor_resolution_up_to_dpi",
+            "programmable_buttons",
+            "cable_length_m"
+          ],
+          "notes": "Complete 30-page official English user guide linked from manufacturer support page downloaded. Technical specifications on PDF page 7 (printed page 6) visually checked because extracted text has broken font mappings: true 8000Hz, true 20000DPI, 7+1 programmable buttons and 1.8m cable. Hash is over original PDF bytes."
+        }
+      ],
+      "scope": "Exact Viper 8KHz specifications in rendered manufacturer support table, RZ01-03580, independently confirmed in complete official user guide. Published polling/sensor limits are not current mouse settings or observed USB polling",
+      "specifications": {
+        "polling_rate_up_to_hz": 8000,
+        "sensor_resolution_up_to_dpi": 20000,
+        "programmable_buttons": 8,
+        "cable_length_m": 1.8
+      }
     },
     {
       "models": [],
@@ -537,6 +668,688 @@
       "scope": "Exact Intel vendor/device ID identifies a 800 Series PCH function from the manufacturer device-ID table. Family/function identity only; does not identify a motherboard SKU, installed chip stepping, board revision, enabled features, negotiated link or current power. The table revision columns are not applied to the observed device",
       "specifications": {"silicon_family": "Intel 800 Series PCH", "controller_function": "USB xHCI Host Controller", "pci_device_function": "D20:F0"},
       "source_evidence": {"url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/800-series-chipset-family-platform-controller-hub-pch-datasheet-volume/device-ids/", "sha256": "a8eec80fc6bc77ffb5d2959c1f9a7577791de2ccb5b661edbe9f3f4e60ca9e3e", "coverage": "full_page", "verified_at": "2026-10-25", "notes": "Complete Device IDs HTML page downloaded; exact 7F6E row (or explicit eSPI SKU note) in Device and Revision ID table checked. Function D20:F0; revision/stepping columns deliberately excluded"}
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "A700"
+        }
+      ],
+      "name": "Intel 13th/14th Generation processor Host bridge / DRAM registers (A700)",
+      "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_document_full_body",
+      "specifications": {
+        "silicon_family": "Intel processor functions documented in 743844",
+        "controller_function": "Host bridge / DRAM registers",
+        "pci_device_function": "0:0:0"
+      },
+      "source_evidence": {
+        "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+        "sha256": "30644ce0bf2fe4eed956162f0d8d4fce4402e6694f1ea09be2b154517412f31e",
+        "coverage": "full_document",
+        "verified_at": "2026-10-25",
+        "notes": "Complete 224-page manufacturer PDF 743844 Rev015 downloaded. Device IDs Table 103, exact A700 row checked; host-ID core-configuration columns and revision IDs are deliberately not applied to the observed device.",
+        "pages": [
+          221
+        ]
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "4640"
+        }
+      ],
+      "name": "Intel 13th/14th Generation processor Host bridge / DRAM registers (4640)",
+      "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_document_full_body",
+      "specifications": {
+        "silicon_family": "Intel processor functions documented in 743844",
+        "controller_function": "Host bridge / DRAM registers",
+        "pci_device_function": "0:0:0"
+      },
+      "source_evidence": {
+        "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+        "sha256": "30644ce0bf2fe4eed956162f0d8d4fce4402e6694f1ea09be2b154517412f31e",
+        "coverage": "full_document",
+        "verified_at": "2026-10-25",
+        "notes": "Complete 224-page manufacturer PDF 743844 Rev015 downloaded. Device IDs Table 103, exact 4640 row checked; host-ID core-configuration columns and revision IDs are deliberately not applied to the observed device.",
+        "pages": [
+          221
+        ]
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "A70D"
+        }
+      ],
+      "name": "Intel 13th/14th Generation processor PCIe RC 010 G5 (A70D)",
+      "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_document_full_body",
+      "specifications": {
+        "silicon_family": "Intel processor functions documented in 743844",
+        "controller_function": "PCIe RC 010 G5",
+        "pci_device_function": "0:1:0"
+      },
+      "source_evidence": {
+        "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+        "sha256": "30644ce0bf2fe4eed956162f0d8d4fce4402e6694f1ea09be2b154517412f31e",
+        "coverage": "full_document",
+        "verified_at": "2026-10-25",
+        "notes": "Complete 224-page manufacturer PDF 743844 Rev015 downloaded. Device IDs Table 105, exact A70D row checked; host-ID core-configuration columns and revision IDs are deliberately not applied to the observed device.",
+        "pages": [
+          223
+        ]
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "A74D"
+        }
+      ],
+      "name": "Intel 13th/14th Generation processor PCIe RC 060 (x4) G4 (A74D)",
+      "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_document_full_body",
+      "specifications": {
+        "silicon_family": "Intel processor functions documented in 743844",
+        "controller_function": "PCIe RC 060 (x4) G4",
+        "pci_device_function": "0:6:0"
+      },
+      "source_evidence": {
+        "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+        "sha256": "30644ce0bf2fe4eed956162f0d8d4fce4402e6694f1ea09be2b154517412f31e",
+        "coverage": "full_document",
+        "verified_at": "2026-10-25",
+        "notes": "Complete 224-page manufacturer PDF 743844 Rev015 downloaded. Device IDs Table 105, exact A74D row checked; host-ID core-configuration columns and revision IDs are deliberately not applied to the observed device.",
+        "pages": [
+          223
+        ]
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "A77D"
+        }
+      ],
+      "name": "Intel 13th/14th Generation processor Crash Log & Telemetry (A77D)",
+      "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_document_full_body",
+      "specifications": {
+        "silicon_family": "Intel processor functions documented in 743844",
+        "controller_function": "Crash Log & Telemetry",
+        "pci_device_function": "0:10:0"
+      },
+      "source_evidence": {
+        "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+        "sha256": "30644ce0bf2fe4eed956162f0d8d4fce4402e6694f1ea09be2b154517412f31e",
+        "coverage": "full_document",
+        "verified_at": "2026-10-25",
+        "notes": "Complete 224-page manufacturer PDF 743844 Rev015 downloaded. Device IDs Table 105, exact A77D row checked; host-ID core-configuration columns and revision IDs are deliberately not applied to the observed device.",
+        "pages": [
+          223
+        ]
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "A77F"
+        }
+      ],
+      "name": "Intel 13th/14th Generation processor Volume Management Device (VMD) (A77F)",
+      "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_document_full_body",
+      "specifications": {
+        "silicon_family": "Intel processor functions documented in 743844",
+        "controller_function": "Volume Management Device (VMD)",
+        "pci_device_function": "0:14:0"
+      },
+      "source_evidence": {
+        "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+        "sha256": "30644ce0bf2fe4eed956162f0d8d4fce4402e6694f1ea09be2b154517412f31e",
+        "coverage": "full_document",
+        "verified_at": "2026-10-25",
+        "notes": "Complete 224-page manufacturer PDF 743844 Rev015 downloaded. Device IDs Table 105, exact A77F row checked; host-ID core-configuration columns and revision IDs are deliberately not applied to the observed device.",
+        "pages": [
+          223
+        ]
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "460D"
+        }
+      ],
+      "name": "Intel 13th/14th Generation processor PCIe RC 010 G5 (460D)",
+      "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_document_full_body",
+      "specifications": {
+        "silicon_family": "Intel processor functions documented in 743844",
+        "controller_function": "PCIe RC 010 G5",
+        "pci_device_function": "0:1:0"
+      },
+      "source_evidence": {
+        "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+        "sha256": "30644ce0bf2fe4eed956162f0d8d4fce4402e6694f1ea09be2b154517412f31e",
+        "coverage": "full_document",
+        "verified_at": "2026-10-25",
+        "notes": "Complete 224-page manufacturer PDF 743844 Rev015 downloaded. Device IDs Table 106, exact 460D row checked; host-ID core-configuration columns and revision IDs are deliberately not applied to the observed device.",
+        "pages": [
+          223
+        ]
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "467F"
+        }
+      ],
+      "name": "Intel 13th/14th Generation processor Volume Management Device (VMD) (467F)",
+      "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_document_full_body",
+      "specifications": {
+        "silicon_family": "Intel processor functions documented in 743844",
+        "controller_function": "Volume Management Device (VMD)",
+        "pci_device_function": "0:14:0"
+      },
+      "source_evidence": {
+        "url": "https://cdrdv2-public.intel.com/743844/743844-015.pdf",
+        "sha256": "30644ce0bf2fe4eed956162f0d8d4fce4402e6694f1ea09be2b154517412f31e",
+        "coverage": "full_document",
+        "verified_at": "2026-10-25",
+        "notes": "Complete 224-page manufacturer PDF 743844 Rev015 downloaded. Device IDs Table 106 (continued on page224), exact 467F row checked; host-ID core-configuration columns and revision IDs are deliberately not applied to the observed device.",
+        "pages": [
+          224
+        ]
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "7D35"
+        }
+      ],
+      "name": "Intel Core Ultra 200S/200HX processor Host bridge / DRAM registers (7D35)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_page_full_body",
+      "specifications": {
+        "silicon_family": "Intel Core Ultra 200S/200HX processor family",
+        "controller_function": "Host bridge / DRAM registers",
+        "pci_device_function": "0:0:0"
+      },
+      "source_evidence": {
+        "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+        "sha256": "5a0351aa2dd79ccb0fd11ab293d6a1d908e4ccb595d983da097cdf9eb08e31b5",
+        "coverage": "full_page",
+        "verified_at": "2026-10-25",
+        "notes": "Complete Device IDs HTML page for 832586 Rev007 downloaded. Host Device ID table, exact 7D35 row checked. CPU/GPU core options and revision IDs are deliberately excluded. Full PDF download returned HTTP403; this evidence covers the complete HTML page only."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "7ECC"
+        }
+      ],
+      "name": "Intel Core Ultra 200S/200HX processor PCI Express Root Port #12 (7ECC)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_page_full_body",
+      "specifications": {
+        "silicon_family": "Intel Core Ultra 200S/200HX processor family",
+        "controller_function": "PCI Express Root Port #12",
+        "pci_device_function": "0:1:0"
+      },
+      "source_evidence": {
+        "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+        "sha256": "5a0351aa2dd79ccb0fd11ab293d6a1d908e4ccb595d983da097cdf9eb08e31b5",
+        "coverage": "full_page",
+        "verified_at": "2026-10-25",
+        "notes": "Complete Device IDs HTML page for 832586 Rev007 downloaded. Other Device ID table, exact 7ECC row checked. CPU/GPU core options and revision IDs are deliberately excluded. Full PDF download returned HTTP403; this evidence covers the complete HTML page only."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "AD03"
+        }
+      ],
+      "name": "Intel Core Ultra 200S/200HX processor Dynamic Tuning Technology (DTT) (AD03)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_page_full_body",
+      "specifications": {
+        "silicon_family": "Intel Core Ultra 200S/200HX processor family",
+        "controller_function": "Dynamic Tuning Technology (DTT)",
+        "pci_device_function": "0:4:0"
+      },
+      "source_evidence": {
+        "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+        "sha256": "5a0351aa2dd79ccb0fd11ab293d6a1d908e4ccb595d983da097cdf9eb08e31b5",
+        "coverage": "full_page",
+        "verified_at": "2026-10-25",
+        "notes": "Complete Device IDs HTML page for 832586 Rev007 downloaded. Other Device ID table, exact AD03 row checked. CPU/GPU core options and revision IDs are deliberately excluded. Full PDF download returned HTTP403; this evidence covers the complete HTML page only."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "AE4D"
+        }
+      ],
+      "name": "Intel Core Ultra 200S/200HX processor PCI Express Root Port #13 (AE4D)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_page_full_body",
+      "specifications": {
+        "silicon_family": "Intel Core Ultra 200S/200HX processor family",
+        "controller_function": "PCI Express Root Port #13",
+        "pci_device_function": "0:6:0"
+      },
+      "source_evidence": {
+        "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+        "sha256": "5a0351aa2dd79ccb0fd11ab293d6a1d908e4ccb595d983da097cdf9eb08e31b5",
+        "coverage": "full_page",
+        "verified_at": "2026-10-25",
+        "notes": "Complete Device IDs HTML page for 832586 Rev007 downloaded. Other Device ID table, exact AE4D row checked. CPU/GPU core options and revision IDs are deliberately excluded. Full PDF download returned HTTP403; this evidence covers the complete HTML page only."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "AE4C"
+        }
+      ],
+      "name": "Intel Core Ultra 200S/200HX processor Gauss Newton Algorithm (GNA) (AE4C)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_page_full_body",
+      "specifications": {
+        "silicon_family": "Intel Core Ultra 200S/200HX processor family",
+        "controller_function": "Gauss Newton Algorithm (GNA)",
+        "pci_device_function": "0:8:0"
+      },
+      "source_evidence": {
+        "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+        "sha256": "5a0351aa2dd79ccb0fd11ab293d6a1d908e4ccb595d983da097cdf9eb08e31b5",
+        "coverage": "full_page",
+        "verified_at": "2026-10-25",
+        "notes": "Complete Device IDs HTML page for 832586 Rev007 downloaded. Other Device ID table, exact AE4C row checked. CPU/GPU core options and revision IDs are deliberately excluded. Full PDF download returned HTTP403; this evidence covers the complete HTML page only."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "AD1D"
+        }
+      ],
+      "name": "Intel Core Ultra 200S/200HX processor Neural Processing Unit (NPU) (AD1D)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_page_full_body",
+      "specifications": {
+        "silicon_family": "Intel Core Ultra 200S/200HX processor family",
+        "controller_function": "Neural Processing Unit (NPU)",
+        "pci_device_function": "0:11:0"
+      },
+      "source_evidence": {
+        "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+        "sha256": "5a0351aa2dd79ccb0fd11ab293d6a1d908e4ccb595d983da097cdf9eb08e31b5",
+        "coverage": "full_page",
+        "verified_at": "2026-10-25",
+        "notes": "Complete Device IDs HTML page for 832586 Rev007 downloaded. Other Device ID table, exact AD1D row checked. CPU/GPU core options and revision IDs are deliberately excluded. Full PDF download returned HTTP403; this evidence covers the complete HTML page only."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "7EC0"
+        }
+      ],
+      "name": "Intel Core Ultra 200S/200HX processor USB xHCI (7EC0)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_page_full_body",
+      "specifications": {
+        "silicon_family": "Intel Core Ultra 200S/200HX processor family",
+        "controller_function": "USB xHCI",
+        "pci_device_function": "0:13:0"
+      },
+      "source_evidence": {
+        "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+        "sha256": "5a0351aa2dd79ccb0fd11ab293d6a1d908e4ccb595d983da097cdf9eb08e31b5",
+        "coverage": "full_page",
+        "verified_at": "2026-10-25",
+        "notes": "Complete Device IDs HTML page for 832586 Rev007 downloaded. Other Device ID table, exact 7EC0 row checked. CPU/GPU core options and revision IDs are deliberately excluded. Full PDF download returned HTTP403; this evidence covers the complete HTML page only."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "AD0B"
+        }
+      ],
+      "name": "Intel Core Ultra 200S/200HX processor Volume Management Device (VMD) (AD0B)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_page_full_body",
+      "specifications": {
+        "silicon_family": "Intel Core Ultra 200S/200HX processor family",
+        "controller_function": "Volume Management Device (VMD)",
+        "pci_device_function": "0:14:0"
+      },
+      "source_evidence": {
+        "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+        "sha256": "5a0351aa2dd79ccb0fd11ab293d6a1d908e4ccb595d983da097cdf9eb08e31b5",
+        "coverage": "full_page",
+        "verified_at": "2026-10-25",
+        "notes": "Complete Device IDs HTML page for 832586 Rev007 downloaded. Other Device ID table, exact AD0B row checked. CPU/GPU core options and revision IDs are deliberately excluded. Full PDF download returned HTTP403; this evidence covers the complete HTML page only."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "AE7F"
+        }
+      ],
+      "name": "Intel Core Ultra 200S/200HX processor Shared SRAM (SOC-S) (AE7F)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_page_full_body",
+      "specifications": {
+        "silicon_family": "Intel Core Ultra 200S/200HX processor family",
+        "controller_function": "Shared SRAM (SOC-S)",
+        "pci_device_function": "0:20:0"
+      },
+      "source_evidence": {
+        "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+        "sha256": "5a0351aa2dd79ccb0fd11ab293d6a1d908e4ccb595d983da097cdf9eb08e31b5",
+        "coverage": "full_page",
+        "verified_at": "2026-10-25",
+        "notes": "Complete Device IDs HTML page for 832586 Rev007 downloaded. Other Device ID table, exact AE7F row checked. CPU/GPU core options and revision IDs are deliberately excluded. Full PDF download returned HTTP403; this evidence covers the complete HTML page only."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "AE0D"
+        }
+      ],
+      "name": "Intel Core Ultra 200S/200HX processor Direct eSPI Controller (AE0D)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_page_full_body",
+      "specifications": {
+        "silicon_family": "Intel Core Ultra 200S/200HX processor family",
+        "controller_function": "Direct eSPI Controller",
+        "pci_device_function": "0:31:0"
+      },
+      "source_evidence": {
+        "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+        "sha256": "5a0351aa2dd79ccb0fd11ab293d6a1d908e4ccb595d983da097cdf9eb08e31b5",
+        "coverage": "full_page",
+        "verified_at": "2026-10-25",
+        "notes": "Complete Device IDs HTML page for 832586 Rev007 downloaded. Other Device ID table, explicit AE00h-AE1Fh Direct eSPI range checked. CPU/GPU core options and revision IDs are deliberately excluded. Full PDF download returned HTTP403; this evidence covers the complete HTML page only."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "AE23"
+        }
+      ],
+      "name": "Intel Core Ultra 200S/200HX processor SPI (flash) Controller (AE23)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_page_full_body",
+      "specifications": {
+        "silicon_family": "Intel Core Ultra 200S/200HX processor family",
+        "controller_function": "SPI (flash) Controller",
+        "pci_device_function": "0:31:5"
+      },
+      "source_evidence": {
+        "url": "https://edc.intel.com/content/www/us/en/design/products/platforms/details/arrow-lake-s/core-ultra-200s-series-processors-datasheet-volume-1-of-2/device-ids/",
+        "sha256": "5a0351aa2dd79ccb0fd11ab293d6a1d908e4ccb595d983da097cdf9eb08e31b5",
+        "coverage": "full_page",
+        "verified_at": "2026-10-25",
+        "notes": "Complete Device IDs HTML page for 832586 Rev007 downloaded. Other Device ID table, exact AE23 row checked. CPU/GPU core options and revision IDs are deliberately excluded. Full PDF download returned HTTP403; this evidence covers the complete HTML page only."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "7A50"
+        }
+      ],
+      "name": "Intel 700 Series PCH High Definition Audio (7A50)",
+      "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_page_full_body",
+      "specifications": {
+        "silicon_family": "Intel 700 Series PCH",
+        "controller_function": "High Definition Audio",
+        "pci_device_function": "D31:F3"
+      },
+      "source_evidence": {
+        "url": "https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/700-series-chipset-family-platform-controller-hub-datasheet-volume-1-of/device-and-revision-id/",
+        "sha256": "ba9d4658157fc2794f2eb82498b32471e206d67ee2abe0afbd008c6f66642fbb",
+        "coverage": "full_page",
+        "verified_at": "2026-10-25",
+        "notes": "Complete manufacturer Device IDs HTML already downloaded and rechecked. Explicit 7A50-7A57 range maps to D31:F3 High Definition Audio. Revision/stepping columns are not applied."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "8086",
+          "device_id": "09AB"
+        }
+      ],
+      "name": "Intel RST VMD managed function (09AB)",
+      "url": "https://www.intel.com/content/www/us/en/support/articles/000088762/technologies/intel-rapid-storage-technology-intel-rst.html",
+      "scope": "Exact Intel 09AB identifies the VMD-generated managed/dummy function family described by Intel article000088762; does not identify the backing storage controller/drive SKU or installed stepping / PCB revision, or prove a hardware fault. Official indexed text checked; US/JP/ES full HTML downloads returned HTTP403, so no full-body evidence is claimed.",
+      "source_access": "manufacturer_page_indexed_excerpt",
+      "specifications": {
+        "silicon_family": "Intel VMD managed function",
+        "controller_function": "VMD-generated managed/dummy function"
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "usb",
+          "vendor_id": "2357",
+          "product_id": "0106"
+        },
+        {
+          "section": "network",
+          "vendor_id": "2357",
+          "product_id": "0106"
+        }
+      ],
+      "name": "TP-Link Archer T9UH USB adapter family (2357:0106)",
+      "url": "https://static.tp-link.com/2018/201805/20180508/Archer%20T9UH_180428_Linux_beta.zip",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_driver_package_full_body",
+      "specifications": {
+        "silicon_family": "TP-Link Archer T9UH adapter family",
+        "controller_function": "USB wireless network adapter"
+      },
+      "source_evidence": {
+        "url": "https://static.tp-link.com/2018/201805/20180508/Archer%20T9UH_180428_Linux_beta.zip",
+        "sha256": "8ca6d03dc95496c2cb823160dc39b52c661fb86227378af10ae27a83357d632e",
+        "coverage": "full_archive",
+        "verified_at": "2026-10-25",
+        "notes": "Complete manufacturer Linux driver archive downloaded; nested T9UH_linux_v4.3.21.1_24835.20171031.zip extracted without running. os_dep/linux/usb_intf.c line213 exact USB_DEVICE(0x2357,0x0106), RTL8814A, Archer T9UH comment checked. Extracted source SHA256 877dc07c2dc54902e6b685d9e732eddcaf0b1c195534ca04551206e9fb0de785. Package is listed for T9UH V1/V2; no installed hardware revision inferred."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "usb",
+          "vendor_id": "2357",
+          "product_id": "0138"
+        },
+        {
+          "section": "network",
+          "vendor_id": "2357",
+          "product_id": "0138"
+        }
+      ],
+      "name": "TP-Link Archer T3U Plus USB adapter driver family (2357:0138)",
+      "url": "https://static.tp-link.com/2019/201912/20191223/Archer%20T3U%20Plus%28EUUS%29_V1_win10_191204.zip",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_driver_package_full_body",
+      "specifications": {
+        "silicon_family": "TP-Link Archer T3U Plus compatible driver family",
+        "controller_function": "USB wireless network adapter"
+      },
+      "source_evidence": {
+        "url": "https://static.tp-link.com/2019/201912/20191223/Archer%20T3U%20Plus%28EUUS%29_V1_win10_191204.zip",
+        "sha256": "b6ca737949fc38d498fa65d3c82522e8933ac6f724c07c7ca6d39adefcd6ad09",
+        "coverage": "full_archive",
+        "verified_at": "2026-10-25",
+        "notes": "Complete manufacturer Windows archive downloaded and extracted without running. Windows_10_64bit/netrtwlanu.inf line31 exact VID2357 PID0138 maps to tplink_RTL8812bu.ndi; line3424 device description checked. Extracted INF SHA256 0e8eb40cbc73c1b4d18a6b4fcc664a8a6fd6fa6e2040cc16a8529f48d2cf9769. Driver-family identity only; no installed retail revision, antennas, negotiated link or performance inferred."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "pci",
+          "vendor_id": "10EC",
+          "device_id": "8125"
+        },
+        {
+          "section": "network",
+          "vendor_id": "10EC",
+          "device_id": "8125"
+        }
+      ],
+      "name": "Realtek RTL8125 PCIe Ethernet controller family (10EC:8125)",
+      "url": "https://download.asrock.com/Drivers/All/LAN/Realtek_LAN(v10.079.0421.2026).zip",
+      "scope": "Exact public hardware ID identifies the documented family/function only; does not identify a retail CPU or motherboard SKU, installed stepping, PCB revision, enabled features, negotiated link or current state.",
+      "source_access": "manufacturer_driver_package_full_body",
+      "specifications": {
+        "silicon_family": "Realtek RTL8125 controller family",
+        "controller_function": "PCIe Ethernet controller"
+      },
+      "source_evidence": {
+        "url": "https://download.asrock.com/Drivers/All/LAN/Realtek_LAN(v10.079.0421.2026).zip",
+        "sha256": "3c81d1dd706b968c4e1bbb8fb6a6a8f7e7433a63574c098bce00ade18bb59943",
+        "coverage": "full_archive",
+        "verified_at": "2026-10-25",
+        "notes": "Complete ASRock OEM-hosted Realtek archive downloaded; embedded self-extracting archive opened using 7-Zip without execution. WIN10/64/rt640x64.inf lines12592/12651/12729 exact 10EC8125 revisions00/04/05 map to RTL8125 family sections; lines19777-19778 descriptors checked. INF SHA256 5bad798d052e072d958ca4db8921ee3435e6d6b0aace4420e68d0e2e481c6e9c. Multiple silicon revisions and OEM boards share this family; no revision or motherboard SKU inferred from the ID-only match."
+      }
+    },
+    {
+      "models": [],
+      "hardware_ids": [
+        {
+          "section": "usb",
+          "vendor_id": "046D",
+          "product_id": "0893"
+        },
+        {
+          "section": "audio",
+          "vendor_id": "046D",
+          "product_id": "0893"
+        }
+      ],
+      "name": "Logitech StreamCam USB function family (046D:0893)",
+      "url": "https://support.logi.com/hc/en-nz/articles/360042528854-StreamCam-Technical-Specifications",
+      "scope": "Exact USB VID/PID identifies the StreamCam family shared by its composite, HID, WinUSB and audio endpoint records. This does not identify a separate retail device for each endpoint, nor establish endpoint-specific resolution, sample rate, current USB speed or operating mode. Installed driver versions remain OS observations.",
+      "source_access": "manufacturer_page_full_body",
+      "specifications": {
+        "silicon_family": "Logitech StreamCam USB function family",
+        "controller_function": "StreamCam USB composite / audio function"
+      },
+      "source_evidence": {
+        "url": "https://support.logi.com/hc/en-nz/articles/360042528854-StreamCam-Technical-Specifications",
+        "sha256": "dc69ff850d9f65aa6bd6e8bd55c0cbd3ee7592a933d35325f20f7d6eddd1eb69",
+        "coverage": "full_page",
+        "verified_at": "2026-10-25",
+        "notes": "Complete manufacturer StreamCam Technical Specifications HTML downloaded (193917 bytes). Webcam and Security Specifications table: USB VID_PID explicitly VID046D, PID0893; microphone presence also checked. Applied only as shared device/function identity to USB and audio endpoint records, with no endpoint-specific performance or retail revision inferred."
+      }
     }
   ]
 }
