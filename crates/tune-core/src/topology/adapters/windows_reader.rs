@@ -875,6 +875,11 @@ mod native_diagnostics {
             // libtest/Git/PowerShell output, paths, process identities or source.
             let record: serde_json::Value = require(serde_json::from_str(records[0]), "structural record JSON");
             eprintln!("{RECORD}{record}");
+            let failures = crate::collect::windows_test_io::attempt_failures(&text).expect("closed first IO attempt records required");
+            for failure in failures {
+                // Typed enum/numeric/null data only; no arbitrary child text.
+                eprintln!("KATALA_LEGACY_FIRST_IO={}", serde_json::to_string(&failure).expect("closed first IO JSON"));
+            }
             assert!(status.success(), "actual legacy probe failed: code={:?}", status.code());
             return;
         }
@@ -885,7 +890,11 @@ mod native_diagnostics {
         original.roots[0] = fixture.original_root.clone();
         // When the actual temp spelling differs, retain the old approval as a
         // negative control. The canonical positive remains mandatory everywhere.
-        let original_output = fixture.original_lexical_differs.then(|| runtime.block_on(run_probe(&original, Instant::now() + Duration::from_millis(26500))));
+        let original_output = fixture.original_lexical_differs.then(|| {
+            println!("\nKATALA_LEGACY_ATTEMPT=alias");
+            runtime.block_on(run_probe(&original, Instant::now() + Duration::from_millis(26500)))
+        });
+        println!("\nKATALA_LEGACY_ATTEMPT=canonical");
         let output = runtime.block_on(run_probe(&fixture.request, Instant::now() + Duration::from_millis(26500)));
         drop(runtime);
         let output = match output {

@@ -58,6 +58,24 @@ const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000;
 #[cfg(test)]
 #[path = "windows_diagnostics.rs"]
 mod diagnostics;
+#[cfg(test)]
+#[path = "windows_io_diagnostic.rs"]
+pub(crate) mod windows_io_diagnostic;
+
+// Release builds expand to the original expression. The candidate is only
+// inspected synchronously after observe returns an error, before any await.
+#[cfg(test)]
+macro_rules! diagnostic_io {
+    ($stage:ident, $result:expr) => {
+        $result.inspect_err(|error| windows_io_diagnostic::note(windows_io_diagnostic::Stage::$stage, error))
+    };
+}
+#[cfg(not(test))]
+macro_rules! diagnostic_io {
+    ($stage:ident, $result:expr) => {
+        $result
+    };
+}
 
 fn os_error() -> io::Error {
     io::Error::last_os_error()
@@ -256,13 +274,13 @@ fn identity_raw(handle: HANDLE, pid: u32) -> io::Result<ProcessIdentity> {
     let mut kernel = Default::default();
     let mut user = Default::default();
     // SAFETY: retained handle has query rights; all FILETIME outputs are valid writable values.
-    check(unsafe { GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user) })?;
+    diagnostic_io!(IdentityTimes, check(unsafe { GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user) }))?;
     let created = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
     let mut session = 0;
     // SAFETY: retained process object and query rights preserve identity while session is queried.
-    check(unsafe { ProcessIdToSessionId(pid, &mut session) })?;
+    diagnostic_io!(IdentitySession, check(unsafe { ProcessIdToSessionId(pid, &mut session) }))?;
     if pid == 0 || created == 0 {
-        return Err(invalid());
+        return diagnostic_io!(IdentityValidation, Err(invalid()));
     }
     Ok(ProcessIdentity { pid, created_filetime: created.to_string(), os_session: session })
 }
@@ -341,15 +359,18 @@ impl Job {
     fn accounting(&self, receipt: &mut ProcessReceipt) -> io::Result<()> {
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         // SAFETY: explicit owned Job and correctly sized aligned output structure; never use null hJob.
-        check(unsafe {
-            QueryInformationJobObject(
-                self.handle.as_raw_handle(),
-                JobObjectBasicAccountingInformation,
-                std::ptr::from_mut(&mut accounting).cast(),
-                size_of_val(&accounting) as u32,
-                null_mut(),
-            )
-        })?;
+        diagnostic_io!(
+            JobAccounting,
+            check(unsafe {
+                QueryInformationJobObject(
+                    self.handle.as_raw_handle(),
+                    JobObjectBasicAccountingInformation,
+                    std::ptr::from_mut(&mut accounting).cast(),
+                    size_of_val(&accounting) as u32,
+                    null_mut(),
+                )
+            })
+        )?;
         receipt.total_processes = accounting.TotalProcesses;
         receipt.job_empty = accounting.ActiveProcesses == 0;
         Ok(())
@@ -363,36 +384,39 @@ impl Job {
         }
         let mut pids = Pids { assigned: 0, count: 0, pids: [0; MAX_ACTIVE] };
         // SAFETY: flexible-array output has a fixed cap with correct pointer-size alignment.
-        check(unsafe {
-            QueryInformationJobObject(
-                self.handle.as_raw_handle(),
-                JobObjectBasicProcessIdList,
-                std::ptr::from_mut(&mut pids).cast(),
-                size_of_val(&pids) as u32,
-                null_mut(),
-            )
-        })?;
-        complete_pid_list(pids.assigned, pids.count, &pids.pids)
+        diagnostic_io!(
+            JobPidQuery,
+            check(unsafe {
+                QueryInformationJobObject(
+                    self.handle.as_raw_handle(),
+                    JobObjectBasicProcessIdList,
+                    std::ptr::from_mut(&mut pids).cast(),
+                    size_of_val(&pids) as u32,
+                    null_mut(),
+                )
+            })
+        )?;
+        diagnostic_io!(JobPidValidation, complete_pid_list(pids.assigned, pids.count, &pids.pids))
     }
     fn observe(&mut self, receipt: &mut ProcessReceipt) -> io::Result<()> {
         self.accounting(receipt)?;
         #[cfg(test)]
         if let Some(hook) = self.after_first_accounting.take() {
-            hook(self, receipt)?;
+            diagnostic_io!(FixtureHook, hook(self, receipt))?;
         }
         let pids = self.process_ids()?;
         #[cfg(test)]
         if let Some(hook) = self.after_pid_list.take() {
-            hook(self, &pids)?;
+            diagnostic_io!(FixtureHook, hook(self, &pids))?;
         }
         for pid in pids {
             if self.processes.iter().any(|p| p.identity.pid == pid) {
                 continue;
             }
             if self.processes.len() >= MAX_OBSERVED {
-                return Err(invalid());
+                return diagnostic_io!(ObservedLimit, Err(invalid()));
             }
-            let handle = match self.open_candidate(pid) {
+            let handle = match diagnostic_io!(OpenProcess, self.open_candidate(pid)) {
                 Ok(handle) => handle,
                 Err(error) => {
                     // A snapshot PID can exit before OpenProcess. Only the specific
@@ -407,24 +431,24 @@ impl Job {
             };
             let mut member = 0;
             // SAFETY: recheck membership on the opened object, closing enumeration/PID reuse races.
-            check(unsafe { IsProcessInJob(handle.as_raw_handle(), self.handle.as_raw_handle(), &mut member) })?;
+            diagnostic_io!(MembershipQuery, check(unsafe { IsProcessInJob(handle.as_raw_handle(), self.handle.as_raw_handle(), &mut member) }))?;
             if member == 0 {
-                return Err(invalid());
+                return diagnostic_io!(MembershipValidation, Err(invalid()));
             }
             let identity = identity(&handle, pid)?;
             receipt.observed.push(identity.clone());
             self.processes.push(Process { handle, identity });
         }
-        let root = self.processes.first().ok_or_else(invalid)?;
+        let root = diagnostic_io!(ObserveUnknown, self.processes.first().ok_or_else(invalid))?;
         let root_observed_at = Instant::now().into_std();
-        receipt.root_exited = exited(&root.handle)?;
+        receipt.root_exited = diagnostic_io!(RootWait, exited(&root.handle))?;
         if receipt.root_exited {
             // Use the start of the successful zero-wait query conservatively:
             // scheduling after it must not move either completion clock later.
             self.root_exit_at.get_or_insert(root_observed_at);
             let mut code = 0;
             // SAFETY: retained root has signaled; 259 is a valid exit value, never a liveness test.
-            check(unsafe { GetExitCodeProcess(root.handle.as_raw_handle(), &mut code) })?;
+            diagnostic_io!(RootExitCode, check(unsafe { GetExitCodeProcess(root.handle.as_raw_handle(), &mut code) }))?;
             receipt.root_exit_code = Some(code as i32);
             // The initial accounting may predate root exit. Only a subsequent
             // sample can establish that descendants remain after that exit.
@@ -434,7 +458,7 @@ impl Job {
         // must not be mistaken for a descendant that remains after root exit.
         receipt.observed_exited = !self.processes.is_empty();
         for process in &self.processes {
-            receipt.observed_exited &= exited(&process.handle)?;
+            receipt.observed_exited &= diagnostic_io!(MemberWait, exited(&process.handle))?;
         }
         Ok(())
     }
@@ -505,6 +529,7 @@ struct DiagnosticTrace {
     started: Instant,
     invocation: u64,
     first_stop: bool,
+    first_io: windows_io_diagnostic::FirstFailure,
 }
 
 #[cfg(test)]
@@ -512,7 +537,22 @@ impl DiagnosticTrace {
     fn new() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        Self { started: Instant::now(), invocation: NEXT.fetch_add(1, Ordering::Relaxed), first_stop: false }
+        Self {
+            started: Instant::now(),
+            invocation: NEXT.fetch_add(1, Ordering::Relaxed),
+            first_stop: false,
+            first_io: windows_io_diagnostic::FirstFailure::default(),
+        }
+    }
+    fn adopt_io(&mut self, stage: windows_io_diagnostic::Stage, raw_os_error: Option<i32>) {
+        self.first_io.adopt(windows_io_diagnostic::Failure { stage, raw_os_error });
+    }
+    fn emit_io(&self) {
+        if let Some(failure) = self.first_io.0 {
+            let record = windows_io_diagnostic::Record { invocation: self.invocation, failure };
+            // Unit-test process stdout only, outside the owned probe's pipes.
+            println!("\n{}{}", windows_io_diagnostic::PREFIX, serde_json::to_string(&record).expect("closed diagnostic JSON"));
+        }
     }
     fn record_stop(&mut self, job: &Job, receipt: &ProcessReceipt, requested: bool) {
         if receipt.stop != ProcessStop::Completed && !self.first_stop {
@@ -815,6 +855,8 @@ struct PipeOutput {
     eof: bool,
     limited: bool,
     failed: bool,
+    #[cfg(test)]
+    raw_error: Option<i32>,
 }
 async fn drain(mut pipe: NamedPipeServer, limit: usize, signal: mpsc::Sender<()>) -> PipeOutput {
     let mut output = PipeOutput::default();
@@ -833,7 +875,11 @@ async fn drain(mut pipe: NamedPipeServer, limit: usize, signal: mpsc::Sender<()>
                     let _ = signal.try_send(());
                 }
             }
-            Err(_) => {
+            Err(_error) => {
+                #[cfg(test)]
+                {
+                    output.raw_error = _error.raw_os_error();
+                }
                 output.failed = true;
                 break;
             }
@@ -1159,6 +1205,12 @@ async fn run_inner(
             let result = tasks.writer.take().expect("present writer").await;
             receipt.writer_finished = true;
             if !matches!(result, Ok(Ok(()))) && receipt.stop == ProcessStop::Completed {
+                #[cfg(test)]
+                match &result {
+                    Ok(Err(error)) => diagnostic.adopt_io(windows_io_diagnostic::Stage::WriterIo, error.raw_os_error()),
+                    Err(_) => diagnostic.adopt_io(windows_io_diagnostic::Stage::WriterJoin, None),
+                    Ok(Ok(())) => unreachable!(),
+                }
                 receipt.stop = ProcessStop::IoFailure;
             }
         }
@@ -1172,6 +1224,11 @@ async fn run_inner(
                             receipt.stop = ProcessStop::OutputLimit;
                         }
                         if output.failed && receipt.stop == ProcessStop::Completed {
+                            #[cfg(test)]
+                            diagnostic.adopt_io(
+                                if error { windows_io_diagnostic::Stage::StderrRead } else { windows_io_diagnostic::Stage::StdoutRead },
+                                output.raw_error,
+                            );
                             receipt.stop = ProcessStop::IoFailure;
                         }
                         if error {
@@ -1184,18 +1241,28 @@ async fn run_inner(
                     }
                     Err(_) => {
                         if receipt.stop == ProcessStop::Completed {
+                            #[cfg(test)]
+                            diagnostic.adopt_io(if error { windows_io_diagnostic::Stage::StderrJoin } else { windows_io_diagnostic::Stage::StdoutJoin }, None);
                             receipt.stop = ProcessStop::IoFailure;
                         }
                     }
                 }
             }
         }
+        #[cfg(test)]
+        windows_io_diagnostic::clear_candidate();
         if let Err(_error) = job.observe(&mut receipt) {
             #[cfg(test)]
             eprintln!("owned_observe_error_code={}", _error.raw_os_error().unwrap_or(-1));
             receipt.job_empty = false;
             receipt.observed_exited = false;
             if receipt.stop == ProcessStop::Completed {
+                #[cfg(test)]
+                {
+                    let failure = windows_io_diagnostic::candidate()
+                        .unwrap_or(windows_io_diagnostic::Failure { stage: windows_io_diagnostic::Stage::ObserveUnknown, raw_os_error: _error.raw_os_error() });
+                    diagnostic.adopt_io(failure.stage, failure.raw_os_error);
+                }
                 receipt.stop = ProcessStop::IoFailure;
             }
         }
@@ -1220,7 +1287,11 @@ async fn run_inner(
                 }
                 QuiescenceDecision::Lingering => receipt.stop = ProcessStop::LingeringDescendants,
                 QuiescenceDecision::CleanupExpired => receipt.stop = ProcessStop::CleanupUnconfirmed,
-                QuiescenceDecision::Stopped => receipt.stop = ProcessStop::IoFailure,
+                QuiescenceDecision::Stopped => {
+                    #[cfg(test)]
+                    diagnostic.adopt_io(windows_io_diagnostic::Stage::QuiescenceStop, None);
+                    receipt.stop = ProcessStop::IoFailure;
+                }
                 QuiescenceDecision::Observe | QuiescenceDecision::Quiescent => {}
             }
         }
@@ -1246,6 +1317,8 @@ async fn run_inner(
         }
         tokio::time::sleep(POLL).await;
     }
+    #[cfg(test)]
+    diagnostic.emit_io();
     answer.code = receipt.root_exit_code;
     answer.process_receipt = Some(receipt);
     answer.seal_windows_payload(Instant::now() >= deadline);
