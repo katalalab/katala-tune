@@ -79,7 +79,7 @@
 
 ## 常時監視とハブ（画面が見ていなくても集める）
 
-ライブと同じサンプラー・同じ管理（`tune-core::live::Live`）を使い、`tune-core::monitor::run` が 15 秒ごとに合図を送って流れを保つ。終わった 1 分ぶんを `metrics_minute`（1 機体 1 分 1 行、項目ごとに [平均, 最大]、14 日）へ集計する。 古い分は削除と同じトランザクションで数値だけの時間集約（90日）・日集約（400日）へ移す。集約は指標ごとの有効minute数で重みを付け、欠測を0にしない。全体5万行または16MiBの論理payloadを上限に古いbucketから整理し、容量による欠落を件数で残す。共有DB/WALファイル全体のhard capではない。整理失敗は内部記録へ残して5分後、成功後は24時間後に試す。既存画面の推移範囲は引き続き最大24時間で、長期履歴のUI/CLI・baseline・イベント重畳は別工程。
+ライブと同じサンプラー・同じ管理（`tune-core::live::Live`）を使い、`tune-core::monitor::run` が 15 秒ごとに合図を送って流れを保つ。終わった 1 分ぶんを `metrics_minute`（1 機体 1 分 1 行、項目ごとに [平均, 最大]、14 日）へ集計する。 古い分は削除と同じトランザクションで数値だけの時間集約（90日）・日集約（400日）へ移す。集約は指標ごとの有効minute数で重みを付け、欠測を0にしない。全体5万行または16MiBの論理payloadを上限に古いbucketから整理し、容量による欠落を件数で残す。共有DB/WALファイル全体のhard capではない。整理失敗は内部記録へ残して5分後、成功後は24時間後に試す。既存画面の推移範囲は引き続き最大24時間で、長期履歴のUI/CLI・イベント重畳は別工程。保存数値のbaseline読み取りAPIは下記の範囲に限る。
 
 | 役割 | 動き |
 |---|---|
@@ -112,3 +112,10 @@
 - 調査は読み取り専用。変更する操作は許可リスト・確認ダイアログ・実行直前の台帳の読み直しを通す（docs/safety.md）
 - 外へ送るのは操作者が承認したときだけ。秘密・会話の本文・ツールの入出力・コマンドライン引数は取り出さない・保存しない。ただし topology の型付き宣言値は上記の private DB、cache、internal view の境界に従う
 - 個人・環境の情報をリポジトリに書かない（`npm run oss-check`）
+
+
+### 保存済み時系列のbaseline（読み取りAPI）
+
+`Store::metrics_baseline(node,metric,now)` / 互換版 `metricsBaseline` は、既存接続のSAVEPOINT内でseal・時間集約・未sealの分行を一貫して読む。schema作成・移行・pruneはしない（通常のStore/openDb初期化には別途write/migrationがある）。hour途中のsealではsum/有効minute数を結合し、rawのsample数を重みに使わない。SQLは選択した指標のJSONだけを射影し、他の機体・src・生ログは返さない。
+
+対象はcpu/mem/commit百分率のhourly means。過去28日の曜日×4時間帯基準と分離した直近24時間を比較し、未成熟/欠測は所見を出さず理由・coverageを返す。壊れた保存参照・時計rollback・行数超過は保留、I/O/busyはerrorとして伝える。日集約からhourを復元しない。UI/IPC/自動所見には未接続で、速度・リーク・変更因果・操作効果を示す機能ではない。検証範囲は [saved baseline受入記録](acceptance/saved-baseline.md)。

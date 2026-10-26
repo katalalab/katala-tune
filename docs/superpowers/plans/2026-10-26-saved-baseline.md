@@ -42,13 +42,13 @@
 **Files:** create crates/tune-core/src/hourly_baseline.rs,src/db/baseline.rs,tests/baseline.rs,tests/js/hourly_baseline.js,tests/fixtures/hourly-baseline.json; modify src/lib.rs and src/db/mod.rs registrations.
 **Interfaces:** pure analyze_hours(&Value,&str,i64)->Result<Value,...>; Store.metrics_baseline(&str,&str,i64)->rusqlite::Result<Value> consumes same stored rows/limits as Task1.
 
-- [ ] Write shared fixture driver and Rust tests with literal state/coverage/quantile/weighted-source expectations; stub then assigned focused cargo test: expected assertion failures.
-- [ ] Port pure algorithm/reader without host date calls or dependencies; run shared pure and saved tests: agreement and expected assertions pass.
-- [ ] Add Rust read-only/reopen/error/snapshot coverage at boundary, verify both readers preserve content.
-- [ ] Run assigned focused baseline+retention Rust/Node suites,fmt and focused clippy,diff/privacy/gitleaks. Full npm check/Electron/GUI/Windows/SSH are not allocated; request parent allocation before broader verification. Record failures by name; no unrelated repairs without coordination. Commit after checks.
+- [x] Write shared fixture driver and Rust tests with literal state/coverage/quantile/weighted-source expectations; stub then assigned focused cargo test: expected assertion failures.
+- [x] Port pure algorithm/reader without host date calls or dependencies; run shared pure and saved tests: agreement and expected assertions pass.
+- [x] Add Rust read-only/reopen/error/snapshot coverage at boundary, verify both readers preserve content.
+- [x] Run assigned focused baseline+retention Rust/Node suites,fmt and focused clippy,diff/privacy/gitleaks. Full npm check/Electron/GUI/Windows/SSH are not allocated; request parent allocation before broader verification. Record failures by name; no unrelated repairs without coordination. Commit after checks.
 
 ### Task 3: Review and parent handoff
 
-- [ ] Independent whole-branch read-only review against both specs/fixtures, fix required findings via RED→GREEN; record limits.
-- [ ] Write docs/acceptance receipt and update architecture for the Store read API. No Issue34 close reference.
+- [x] Independent whole-branch read-only review against both specs/fixtures, fix required findings via RED→GREEN; record limits.
+- [x] Write docs/acceptance receipt and update architecture for the Store read API. No Issue34 close reference.
 - [ ] Send parent concrete source/validation/residual scope. Prepare draft PR if parent coordination allows; attach created PR. Parent owns merge, full Issue34 stays OPEN.

@@ -121,3 +121,5 @@ Tauri 版のリリース（タグ `v*` で macOS / Windows をビルドして Gi
 MIT（[LICENSE](LICENSE)）
 
 Windows の 0.7 系候補では、通常収集にも承認済み helper の v2 record が必要です。初回導入・更新は [helper の承認とロールバック](docs/windows-helper-approval.md)、検証済みの範囲と公開前の条件は [Windows release readiness](docs/acceptance/windows-release-readiness.md) を参照してください。
+
+保存済み数値のbaseline読み取りAPIは、JS/Rustで同一の合成データを検証する開発中の基盤です。画面・自動所見への接続や操作効果の検証は含みません。対象指標・不足時の保留・検証範囲は [受入記録](docs/acceptance/saved-baseline.md) を参照してください。
