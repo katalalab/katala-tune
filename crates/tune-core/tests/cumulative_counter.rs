@@ -1,8 +1,10 @@
 #[path = "../src/cumulative_counter.rs"]
 mod cumulative_counter;
+#[path = "support/owned_node.rs"]
+mod owned_node;
 
 use serde_json::{Value, json};
-use std::process::Command;
+use std::time::Duration;
 
 fn fixture() -> Value {
     serde_json::from_str(include_str!("../../../test/fixtures/cumulative-counter.json")).unwrap()
@@ -37,9 +39,16 @@ fn literal_oracles_cover_precision_bounds_and_recovery() {
 #[test]
 fn shared_fixture_matches_node_including_baselines() {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/js/cumulative-counter.js");
-    let node = std::env::var_os("NODE").unwrap_or_else(|| "node".into());
-    let output = Command::new(node).arg(script).output().expect("Node must be available for parity");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let output = owned_node::capture_node(
+        &[script.into_os_string()],
+        owned_node::Limits {
+            execution: Duration::from_secs(15),
+            cleanup: Duration::from_secs(2),
+            stdout: 4 * 1024 * 1024,
+            stderr: 64 * 1024,
+        },
+    )
+    .expect("Node parity requires bounded capture with successful exit and complete pipes");
     let js: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(run_cases(), js);
 }
