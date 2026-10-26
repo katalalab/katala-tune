@@ -74,17 +74,20 @@ if(typeof window !== 'undefined') (()=>{
     const nodes = data?.nodes || state.nodes.map(n=>({node_id:n.id,os:n.os,eligible:!n.shared && (!n.status || n.status==='online')}));
     if(selected===null) selected=new Set(nodes.filter(eligible).map(n=>n.node_id));
     const chosen = nodes.filter(n=>selected.has(n.node_id));
-    const rows = SpecsModel.filter(SpecsModel.rows(chosen),query,differences);
+    const allRows = SpecsModel.rows(chosen);
+    const rows = SpecsModel.filter(allRows,query,differences);
     const busy = running || data?.running;
     const available = chosen.filter(eligible).map(n=>n.node_id);
     const head = UI.head({icon:'resources',title:'スペック比較',desc:'Mac / Windowsの構成・バージョン・設定を、取得元と公式仕様とともに比較します。',actions:`<button class="btn" id="specsReload">保存済みを再読込</button><button class="btn" id="specsCopy" ${!chosen.some(n=>n.report)?'disabled':''}>JSONをコピー</button><button class="btn primary" id="specsRun" ${!supported || busy || !available.length?'disabled':''}>${busy?'収集中…':'仕様を収集'}</button>`});
     const notices = !supported ? UI.callout({tone:'orange',title:'Rust版で利用できます',body:'Tauri版のKatala Tuneに切り替えてください。'}) : '';
-    page('<div class="specs-view">'+head+notices+`<div role="status" aria-live="polite" class="specs-notice">${error?SpecsModel.esc(error):busy?'選択した機体から読み取り中です。':''}</div><fieldset class="specs-selection"><legend>比較する機体</legend>${nodes.map(n=>`<label><input type="checkbox" data-spec-node="${SpecsModel.esc(n.node_id)}" ${selected.has(n.node_id)?'checked':''}>${SpecsModel.esc(n.node_id)} <small>${n.os==='macos'?'Mac':'Win'}${n.eligible===false?' · 収集対象外':''}</small></label>`).join('')}</fieldset><div class="specs-freshness">${chosen.map(n=>`<div><strong>${SpecsModel.esc(n.node_id)}</strong> ${n.report?`${n.stale?'前回値・要更新':'取得済み'} · ${SpecsModel.esc(new Date(n.report.at).toLocaleString('ja-JP'))}`:'未収集'}${n.last_attempt?.ok===false?`<span class="specs-error">最終試行失敗: ${SpecsModel.esc(n.last_attempt.error)}</span>`:''}</div>`).join('')}</div><div class="specs-toolbar">${UI.search({id:'specsSearch',value:query,label:'型番・項目を検索',placeholder:'型番・項目を検索'})}<label><input id="specsDiff" type="checkbox" ${differences?'checked':''}> 差分のみ</label><span class="muted">${rows.length} 項目</span></div><p class="muted">未取得は非搭載を意味しません。CPU/GPUの最大値は実効性能の順位ではありません。公式仕様は登録済み型番のみ照合し、設定値と区別します。</p>`+SpecsModel.table(chosen,rows)+SpecsModel.officialDetails(chosen)+'</div>');
+    page('<div class="specs-view">'+head+notices+`<div role="status" aria-live="polite" class="specs-notice">${error?SpecsModel.esc(error):busy?'選択した機体から読み取り中です。':''}</div><fieldset class="specs-selection"><legend>比較する機体</legend>${nodes.map(n=>`<label><input type="checkbox" data-spec-node="${SpecsModel.esc(n.node_id)}" ${selected.has(n.node_id)?'checked':''}>${SpecsModel.esc(n.node_id)} <small>${n.os==='macos'?'Mac':'Win'}${n.eligible===false?' · 収集対象外':''}</small></label>`).join('')}</fieldset><div class="specs-freshness">${chosen.map(n=>`<div><strong>${SpecsModel.esc(n.node_id)}</strong> ${n.report?`${n.stale?'前回値・要更新':'取得済み'} · ${SpecsModel.esc(new Date(n.report.at).toLocaleString('ja-JP'))}`:'未収集'}${n.last_attempt?.ok===false?`<span class="specs-error">最終試行失敗: ${SpecsModel.esc(n.last_attempt.error)}</span>`:''}</div>`).join('')}</div><div class="specs-toolbar">${UI.search({id:'specsSearch',value:query,label:'型番・項目を検索',placeholder:'型番・項目を検索'})}<label><input id="specsDiff" type="checkbox" ${differences?'checked':''}> 差分のみ</label><span class="muted" id="specsCount" role="status">${rows.length} 項目</span></div><p class="muted">未取得は非搭載を意味しません。CPU/GPUの最大値は実効性能の順位ではありません。公式仕様は登録済み型番のみ照合し、設定値と区別します。</p>`+'<div id="specsTable">'+SpecsModel.table(chosen,rows)+'</div>'+SpecsModel.officialDetails(chosen)+'</div>');
     document.querySelectorAll('[data-spec-node]').forEach(el=>el.onchange=()=>{if(el.checked)selected.add(el.dataset.specNode);else selected.delete(el.dataset.specNode);render();});
     $('#specsDiff').onchange=e=>{differences=e.target.checked;render();};
     $('#specsSearch').oninput=e=>{
-      query=e.target.value; const pos=e.target.selectionStart;
-      render().then(()=>{const input=$('#specsSearch');if(input && state.view==='specs'){input.focus();input.setSelectionRange(pos,pos);}});
+      query=e.target.value;
+      const filtered = SpecsModel.filter(allRows,query,differences);
+      $('#specsTable').innerHTML = SpecsModel.table(chosen,filtered);
+      $('#specsCount').textContent = `${filtered.length} 項目`;
     };
     $('#specsReload').onclick=async()=>{data=null;await render();};
     $('#specsCopy').onclick=()=>window.tune.copy(JSON.stringify({schema:'katala_specs_comparison.v1',nodes:chosen},null,2));

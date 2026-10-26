@@ -66,3 +66,35 @@ test('a cached running backend never disables manual reload',async()=>{
   await ctx.window.KT_VIEWS[0].render();
   assert(!/id="specsReload"[^>]*disabled/.test(html));
 });
+
+test('search updates results without rebuilding the page or changing focus', async () => {
+  let pageCount = 0, input, focusCount = 0;
+  const controls = {};
+  const ctx = {
+    window: {tune: {specsView: async () => ({nodes: [{node_id:'a', report:report({cores:8, threads:16})}]})}},
+    UI: require('../renderer/ui.js'), state: {view: 'specs', nodes: []},
+    setCrumbs: () => {}, console,
+    page: () => {
+      pageCount++;
+      input = {isConnected: true, value: '', focus() { focusCount++; }, setSelectionRange() {}};
+      controls['#specsSearch'] = input;
+      controls['#specsTable'] = {innerHTML:''};
+      controls['#specsCount'] = {textContent:''};
+    },
+    document: {querySelector: selector => controls[selector] || (controls[selector] = {}), querySelectorAll: () => []},
+  };
+  vm.runInNewContext(fs.readFileSync('renderer/specs.js', 'utf8'), ctx);
+  await ctx.window.KT_VIEWS[0].render();
+  ctx.document.activeElement = input;
+  for (const value of ['c', 'co', 'cores']) {
+    input.value = value;
+    input.oninput({target: input});
+  }
+  await Promise.resolve();
+  assert.equal(pageCount, 1, 'typing should not rebuild the page');
+  assert.equal(focusCount, 0, 'typing should not move focus');
+  assert.equal(ctx.document.activeElement, input);
+  assert.equal(controls['#specsCount'].textContent, '1 項目');
+  assert.match(controls['#specsTable'].innerHTML, /物理コア/);
+  assert.doesNotMatch(controls['#specsTable'].innerHTML, /論理スレッド/);
+});
