@@ -1994,6 +1994,21 @@ mod tests {
     }
 
     #[test]
+    fn fixture_root_only_result_after_the_original_deadline_is_rejected() {
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let mut queried = false;
+        let result = wait_fixture_root_only(17, deadline, || {
+            queried = true;
+            while Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(Some(vec![17]))
+        });
+        assert!(queried, "late-result fixture must actually issue its query");
+        assert_eq!(result.expect_err("late root-only result must not be admitted").kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
     fn incomplete_or_malformed_pid_lists_cannot_prove_absence() {
         assert_eq!(complete_pid_list(2, 2, &[17, 23]).unwrap(), vec![17, 23]);
         assert!(complete_pid_list(2, 1, &[17]).is_err(), "missing candidate in a partial list is not absence");
