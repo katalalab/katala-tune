@@ -158,6 +158,8 @@ mod windows_pin;
 mod windows_quiescence;
 #[cfg(windows)]
 pub use windows::OwnedWindowsCompletion;
+#[cfg(all(test, windows))]
+pub(crate) use windows::windows_io_diagnostic as windows_test_io;
 #[cfg(windows)]
 pub use windows_pin::PinnedWindowsExecutable;
 
