@@ -468,6 +468,23 @@ fn fixtures() -> Vec<(Value, Value)> {
             json!({}),
         ),
         (win_fixture(json!({ "wsl": { "config": false, "memory": null, "installed": true, "listed": true, "distros": [] } })), json!({})),
+        (win_fixture(json!({ "wsl": { "observation_enabled": true, "installed": true, "listed": false, "list_error": "timeout", "distros": [] } })), json!({})),
+        (win_fixture(json!({ "wsl": { "list_error": "exit 1", "distros": [] } })), json!({})),
+        (win_fixture(json!({ "wsl": { "list_error": "output-limit", "distros": [] } })), json!({})),
+        (
+            win_fixture(json!({ "wsl": { "distros": [
+            { "name": "dev-a", "state": "running", "observed": true, "inside": { "mem_total_mb": 24000, "mem_available_mb": 1000,
+                "errors": { "swap": "invalid-data", "psi": "missing-status", "load": "command-failed", "top": "command-failed", "disk": "invalid-data" } } },
+            { "name": "dev-b", "state": "running", "observed": true, "inside": { "mem_total_mb": 24000, "mem_available_mb": 20000, "errors": { "top": "future-reason" } } }
+        ] } })),
+            json!({}),
+        ),
+        (
+            win_fixture(json!({ "wsl": { "distros": [
+            { "name": "dev-a", "state": "running", "observed": true, "inside": { "mem_total_mb": 24000, "mem_available_mb": 20000, "errors": { "top": null, "unexpected": "ignored" } } }
+        ] } })),
+            json!({}),
+        ),
     ]
 }
 
@@ -552,6 +569,71 @@ fn rules_health_logs_actions_match_js() {
 
     // 判定（rules）
     let mut analyze_in: Vec<Value> = fixtures().into_iter().map(|(snap, node)| json!({ "snap": snap, "node": node })).collect();
+    // WSL advice must retain its GPU hold conditions even with configured memory.
+    let gpu_states = [
+        json!({"gpu_compute":{"availability":"available","apps":[{"pid":4242,"used_memory_mb":null}]},"gpus":[{"util":0}]}),
+        json!({"gpu_compute":{"availability":"available","apps":[]},"gpus":[{"util":5}]}),
+        json!({"gpu_compute":{"availability":"unavailable","apps":[],"reason":"query-failed"},"gpus":[{"util":null}]}),
+        json!({"gpu_compute":{"availability":"available","apps":[]},"gpus":[{"util":0}]}),
+        json!({}),
+    ];
+    for app in ["vmmem", "vmmemWSL"] {
+        for memory in [json!("16GB"), Value::Null] {
+            for mem_mb in [16000, 7000] {
+                for gpu in &gpu_states {
+                    for protect_gpu in [false, true] {
+                        let mut snap = win_fixture(json!({
+                            "host":{"cores":16},"memory":{"total_gb":32},"wsl":{"memory":memory},
+                            "processes":{"top_cpu":[{"pid":500,"name":app,"app":app,"cpu":8,"avg_core":80,"etime":"1:00:00"}],
+                                "apps":[{"app":app,"mem_mb":mem_mb,"count":1}],"apps_cpu":[]}
+                        }));
+                        merge(&mut snap, gpu.clone());
+                        let node = json!({"protect_gpu":protect_gpu});
+                        let findings = rules::analyze(&snap, &node);
+                        let mut ids = vec![format!("runaway-{app}-500"), format!("mem-hog-{app}")];
+                        if memory.is_null() {
+                            ids.push("wsl-limit".into());
+                        }
+                        for id in ids {
+                            let finding = findings.iter().find(|f| f["id"] == id).unwrap();
+                            let advice = finding["advice"].as_str().unwrap();
+                            for condition in ["GPU 計算 PID", "GPU 使用率", "GPU 状態を取得できない", "GPU 学習保護", "`wsl --shutdown` と上限変更の反映を保留"]
+                            {
+                                assert!(advice.contains(condition), "{id}: {advice}");
+                            }
+                            assert!(finding.get("action").is_none());
+                            assert!(
+                                finding
+                                    .get("commands")
+                                    .and_then(Value::as_array)
+                                    .is_none_or(|cs| cs.iter().all(|c| !c.as_str().unwrap().contains("wsl --shutdown")))
+                            );
+                        }
+                        let limit = findings.iter().find(|f| f["id"] == "wsl-limit");
+                        if memory.is_null() {
+                            assert_eq!(limit.unwrap()["severity"], if mem_mb >= 8192 { "warn" } else { "info" });
+                        } else {
+                            assert!(limit.is_none());
+                        }
+                        analyze_in.push(json!({"snap":snap,"node":node}));
+                    }
+                }
+            }
+        }
+    }
+    analyze_in.extend(["mac", "windows"].map(|probe| {
+        json!({
+            "snap": {
+                "probe": probe, "memory": { "total_gb": 64 }, "processes": {
+                    "apps": [{ "app": "Browser", "mem_mb": 38000, "count": 16 }],
+                    "trees": [
+                        { "root": "Browser", "pid": 4242, "owner": "user", "count": 9, "children": 3, "mem_mb": 20000 },
+                        { "root": "Browser", "pid": 4343, "owner": "user", "count": 7, "children": 2, "mem_mb": 18000 }
+                    ]
+                }
+            }, "node": {}
+        })
+    }));
     let cache_cases: Value = serde_json::from_str(include_str!("../../../test/fixtures/cache-accounting.json")).unwrap();
     analyze_in.extend(cache_cases.as_array().unwrap().iter().map(|c| json!({ "snap": c["snap"], "node": {} })));
     for gb in [Value::Null, json!("20"), json!(-1), json!(true), json!({}), json!([])] {

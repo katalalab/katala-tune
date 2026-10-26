@@ -295,7 +295,15 @@ const COMMANDS: &[Command] = &[
         summary: "画面なしで有限時間の常時監視を実行",
         format: "json",
         effects: ENGINE | CONNECT | DEPLOY,
-        notes: "既定180秒、15〜3600秒。Windowsでは同梱samplerを古い機体へ配布する可能性あり。",
+        notes: "既定180秒、15〜3600秒。同梱samplerを同じOSの古い機体へ配布する可能性あり。",
+    },
+    Command {
+        name: "agent-push",
+        arguments: &["<node>", "[--file <path>]"],
+        summary: "機体の ~/.katala-tune/bin へサンプラーを置く",
+        format: "json",
+        effects: CONFIG | CONNECT | DEPLOY,
+        notes: "既定はCLIの隣のtune-agent。OSの違う機体へは--fileでその OS 用を渡す。SHA-256確認後に入れ替え。除外・SSH禁止の機体へは送らない。",
     },
     Command {
         name: "live",

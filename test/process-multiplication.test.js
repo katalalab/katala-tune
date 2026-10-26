@@ -411,7 +411,7 @@ test('所見: プロセス木は群の合計・根・所有者・子の数を示
   ];
   const f = analyze(mac({ trees, apps: [{ app: 'Dup', mem_mb: 20 * 1024, count: 9, cpu: 1 }] }));
   const t = f.filter((x) => x.id.startsWith('mem-tree-'));
-  assert.deepEqual(t.map((x) => x.id), ['mem-tree-BigApp'], 'システム所有・2 プロセス・mem-hog と重なる根は出さない');
+  assert.deepEqual(t.map((x) => x.id), ['mem-tree-BigApp-4242', 'mem-tree-Dup-8'], 'システム所有・2 プロセスは除き、同名アプリの警告があっても根を残す');
   assert.match(t[0].title, /15\.0 GB.*23%.*40 プロセス/);
   assert.match(t[0].detail, /根: BigApp（PID 4242）.*直下の子 12 本.*所有者 ユーザー.*群の合計/);
   assert.match(t[0].advice, /単一プロセスの RSS だけで止める判断はしない/);
@@ -419,7 +419,50 @@ test('所見: プロセス木は群の合計・根・所有者・子の数を示
   assert.equal(f.some((x) => x.action && /^(proc-|mem-tree)/.test(x.id)), false, '終了の操作は付けない');
 });
 
+test('所見: 同名アプリの集計があっても、木ごとの合計・帰属と停止しない注意を残す', () => {
+  const cases = [
+    { name: '同じ合計', apps: [{ app: 'Browser', mem_mb: 20000, count: 9 }], hog: true },
+    { name: '名前別の合計は木より大きい', apps: [{ app: 'Browser', mem_mb: 40000, count: 18 }], hog: true },
+    { name: '同名アプリが所見の上位3件外', apps: ['First', 'Second', 'Third', 'Browser'].map((app) => ({ app, mem_mb: 20000, count: 9 })), hog: false },
+  ];
+  for (const [snapshot, metric] of [[mac, 'RSS'], [win, 'ワーキングセット']]) {
+    for (const c of cases) {
+      const findings = analyze(snapshot({ apps: c.apps, trees: [
+        { root: 'Browser', pid: 4242, owner: 'user', count: 9, children: 3, mem_mb: 20000 },
+      ] }));
+      assert.equal(findings.some((f) => f.id === 'mem-hog-Browser'), c.hog, c.name);
+      const tree = findings.find((f) => f.id === 'mem-tree-Browser-4242');
+      assert.ok(tree, c.name);
+      assert.equal(tree.title, 'Browser を根とするプロセス群が 19.5 GB（実メモリの 31%、9 プロセス）');
+      assert.match(tree.detail, /根: Browser（PID 4242）、直下の子 3 本、所有者 ユーザー、群の合計/);
+      assert.ok(tree.detail.includes(metric));
+      assert.match(tree.advice, /単一プロセスの RSS だけで止める判断はしない/);
+      assert.match(tree.advice, /依存先を確かめるまで止めない/);
+      assert.equal(tree.action, undefined);
+      assert.equal(tree.commands, undefined);
+    }
+  }
+});
+
 test('出力に本文・引数・環境変数・パスを持ち込まない: 所見は鍵・名前・数だけから作る', () => {
   const f = multi(analyze(mac({ groups: [grp('node:chrome-devtools-mcp', 13, 1424, { parent: 'claude' })] })));
   assert.doesNotMatch(JSON.stringify(f), /\/Users\/|--token|--password|API_KEY|=/);
+});
+
+test('所見: 同名の2つの根はPIDごとに一意なIDを持ち、2つ目の選択で帰属が入れ替わらない', () => {
+  for (const snapshot of [mac, win]) {
+    const trees = [
+      { root: 'Browser', pid: 4242, owner: 'user', count: 9, children: 3, mem_mb: 20000 },
+      { root: 'Browser', pid: 4343, owner: 'user', count: 7, children: 2, mem_mb: 18000 },
+    ];
+    for (const rows of [trees, [...trees].reverse()]) {
+      const findings = analyze(snapshot({ trees: rows, apps: [{ app: 'Browser', mem_mb: 38000, count: 16 }] }));
+      const ids = findings.filter((f) => f.id.startsWith('mem-tree-')).map((f) => f.id);
+      assert.deepEqual(ids.slice().sort(), ['mem-tree-Browser-4242', 'mem-tree-Browser-4343']);
+      const selected = findings.find((f) => f.id === 'mem-tree-Browser-4343');
+      assert.match(selected.detail, /根: Browser（PID 4343）、直下の子 2 本/);
+      assert.match(selected.title, /17\.6 GB.*7 プロセス/);
+      assert.equal(findings.some((f) => f.id === 'mem-tree-Browser'), false, '名前だけの旧IDへfallbackしない');
+    }
+  }
 });
