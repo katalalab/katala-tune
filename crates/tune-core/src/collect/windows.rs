@@ -1784,7 +1784,11 @@ mod tests {
         member
     }
 
-    fn fixture_job_pids(job: &Job) -> io::Result<Vec<u32>> {
+    fn fixture_pid_list(assigned: u32, count: u32, values: &[usize]) -> io::Result<Option<Vec<u32>>> {
+        complete_pid_list(assigned, count, values).map(Some)
+    }
+
+    fn fixture_job_pids(job: &Job) -> io::Result<Option<Vec<u32>>> {
         #[repr(C)]
         struct Pids {
             assigned: u32,
@@ -1802,18 +1806,51 @@ mod tests {
                 null_mut(),
             )
         })?;
-        if pids.assigned != pids.count || pids.count as usize > MAX_ACTIVE {
-            return Err(invalid());
-        }
-        pids.values[..pids.count as usize].iter().map(|pid| u32::try_from(*pid).map_err(|_| invalid())).collect()
+        fixture_pid_list(pids.assigned, pids.count, &pids.values)
     }
 
-    fn remove_fixture_member_after_snapshot(job: &mut Job, root_pid: u32, member: Process, member_thread: OwnedHandle, deadline: Instant) {
+    fn wait_fixture_root_only(root_pid: u32, deadline: Instant, mut query: impl FnMut() -> io::Result<Option<Vec<u32>>>) -> io::Result<()> {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            if query()?.is_some_and(|pids| pids == [root_pid]) {
+                return Ok(());
+            }
+            std::thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
+        }
+    }
+
+    fn remove_fixture_member_after_snapshot(
+        job: &mut Job,
+        root_pid: u32,
+        member: Process,
+        member_thread: OwnedHandle,
+        deadline: Instant,
+    ) -> Arc<std::sync::atomic::AtomicU8> {
+        remove_fixture_member_with_query(job, root_pid, member, member_thread, deadline, fixture_job_pids)
+    }
+
+    fn remove_fixture_member_with_query(
+        job: &mut Job,
+        root_pid: u32,
+        member: Process,
+        member_thread: OwnedHandle,
+        deadline: Instant,
+        mut query: impl FnMut(&Job) -> io::Result<Option<Vec<u32>>> + Send + 'static,
+    ) -> Arc<std::sync::atomic::AtomicU8> {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        // Closed test diagnostics: 0=not entered, 1=hook, 2=terminate,
+        // 3=retained member signaled/absence pending, 4=complete root-only.
+        let progress = Arc::new(AtomicU8::new(0));
+        let observed = Arc::clone(&progress);
         let member_pid = member.identity.pid;
         job.after_pid_list = Some(Box::new(move |job, snapshot| {
+            observed.store(1, Ordering::Relaxed);
             assert!(snapshot.contains(&root_pid) && snapshot.contains(&member_pid));
             // SAFETY: terminate only the exact suspended member owned by this fixture; never a PID lookup.
             check(unsafe { windows_sys::Win32::System::Threading::TerminateProcess(member.handle.as_raw_handle(), 0) })?;
+            observed.store(2, Ordering::Relaxed);
             let wait_ms = deadline.saturating_duration_since(Instant::now()).as_millis().min(u128::from(u32::MAX)) as u32;
             // SAFETY: retained handle of this fixture member; bounded by the original absolute deadline.
             if unsafe { WaitForSingleObject(member.handle.as_raw_handle(), wait_ms) } != WAIT_OBJECT_0 || Instant::now() >= deadline {
@@ -1821,14 +1858,12 @@ mod tests {
             }
             drop(member_thread);
             drop(member);
-            while fixture_job_pids(job)? != vec![root_pid] {
-                if Instant::now() >= deadline {
-                    return Err(io::Error::from(io::ErrorKind::TimedOut));
-                }
-                std::thread::sleep(POLL);
-            }
+            observed.store(3, Ordering::Relaxed);
+            wait_fixture_root_only(root_pid, deadline, || query(job))?;
+            observed.store(4, Ordering::Relaxed);
             Ok(())
         }));
+        progress
     }
 
     #[test]
@@ -1842,7 +1877,7 @@ mod tests {
         let mut receipt =
             ProcessReceipt { root: Some(root.identity.clone()), observed: vec![root.identity.clone()], stop: ProcessStop::Completed, ..Default::default() };
         job.processes.push(root);
-        remove_fixture_member_after_snapshot(&mut job, root_pid, member, member_thread, deadline);
+        let _progress = remove_fixture_member_after_snapshot(&mut job, root_pid, member, member_thread, deadline);
         // Fault injection is explicit: object lifetime/other observers can keep an exited PID openable.
         // Actual member exit and Job absence above are real, not mocked.
         job.injected_open_error = Some((member_pid, ERROR_INVALID_PARAMETER as i32));
@@ -1884,15 +1919,23 @@ mod tests {
             let mut receipt =
                 ProcessReceipt { root: Some(root.identity.clone()), observed: vec![root.identity.clone()], stop: ProcessStop::Completed, ..Default::default() };
             job.processes.push(root);
-            let retained = if disappear {
-                remove_fixture_member_after_snapshot(&mut job, root_pid, member, member_thread, deadline);
-                None
+            let (retained, progress) = if disappear {
+                let progress = remove_fixture_member_after_snapshot(&mut job, root_pid, member, member_thread, deadline);
+                (None, Some(progress))
             } else {
-                Some((member, member_thread))
+                (Some((member, member_thread)), None)
             };
             job.injected_open_error = Some((member_pid, error as i32));
             let failed = job.observe(&mut receipt).expect_err("only a confirmed-gone invalid-parameter candidate can be skipped");
-            assert_eq!(failed.raw_os_error(), Some(error as i32));
+            assert_eq!(
+                failed.raw_os_error(),
+                Some(error as i32),
+                "disappear={disappear} expected={error} kind={:?} injection_pending={} hook_pending={} hook_stage={}",
+                failed.kind(),
+                job.injected_open_error.is_some(),
+                job.after_pid_list.is_some(),
+                progress.as_ref().map_or(0, |value| value.load(std::sync::atomic::Ordering::Relaxed)),
+            );
             assert!(job.injected_open_error.is_none());
             assert!(!exited(&job.processes[0].handle).unwrap());
             assert_eq!(receipt.observed.len(), 1);
@@ -1907,6 +1950,47 @@ mod tests {
             assert!(Instant::now() < deadline);
             drop(root_thread);
         }
+    }
+
+    #[test]
+    fn fixture_partial_pid_snapshot_does_not_replace_an_injected_access_denial() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut job = Job::new().unwrap();
+        let (root, root_thread) = suspended_observation_member(&job, deadline);
+        let (member, member_thread) = suspended_observation_member(&job, deadline);
+        let root_pid = root.identity.pid;
+        let member_pid = member.identity.pid;
+        let mut receipt =
+            ProcessReceipt { root: Some(root.identity.clone()), observed: vec![root.identity.clone()], stop: ProcessStop::Completed, ..Default::default() };
+        job.processes.push(root);
+        let injected = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&injected);
+        let progress = remove_fixture_member_with_query(&mut job, root_pid, member, member_thread, deadline, move |job| {
+            if !seen.swap(true, Ordering::Relaxed) {
+                // The actual owned member has exited. One incomplete snapshot
+                // must remain unknown, not abort this fixture's precondition.
+                fixture_pid_list(2, 1, &[root_pid as usize])
+            } else {
+                fixture_job_pids(job)
+            }
+        });
+        job.injected_open_error = Some((member_pid, ERROR_ACCESS_DENIED as i32));
+        let failed = job.observe(&mut receipt).expect_err("access denial must still be rejected");
+        assert!(injected.load(Ordering::Relaxed), "controlled partial query must actually be reached");
+        assert_eq!(failed.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32), "partial fixture query must not replace injected denial");
+        assert_eq!(progress.load(Ordering::Relaxed), 4);
+        assert!(job.injected_open_error.is_none());
+        assert_eq!(job.processes.len(), 1);
+        assert_eq!(receipt.observed.len(), 1);
+        assert!(!exited(&job.processes[0].handle).unwrap());
+        assert!(!receipt.cleanup_confirmed());
+        job.terminate().unwrap();
+        let wait_ms = deadline.saturating_duration_since(Instant::now()).as_millis().min(u128::from(u32::MAX)) as u32;
+        // SAFETY: exact retained root owned by this fixture and original deadline.
+        assert_eq!(unsafe { WaitForSingleObject(job.processes[0].handle.as_raw_handle(), wait_ms) }, WAIT_OBJECT_0);
+        drop(root_thread);
     }
 
     #[test]
