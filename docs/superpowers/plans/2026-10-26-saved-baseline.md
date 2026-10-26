@@ -52,3 +52,10 @@
 - [x] Independent whole-branch read-only review against both specs/fixtures, fix required findings via RED→GREEN; record limits.
 - [x] Write docs/acceptance receipt and update architecture for the Store read API. No Issue34 close reference.
 - [ ] Send parent concrete source/validation/residual scope. Prepare draft PR if parent coordination allows; attach created PR. Parent owns merge, full Issue34 stays OPEN.
+
+## Parent-review correction
+
+- [x] Replace test child wait/join with shared test-only `support/owned_node.rs`; three expected stub failures plus runtime unwind800ms failure were RED before fixes.
+- [x] Observe root + natural EOF under original execution/cleanup deadlines, bound runtime shutdown even on panic, retain caller scratch on failure; no stdin scope needed.
+- [x] Focused final baseline10/10 +retention9/9, focusedclippy/fmt. Independent delta source review: original P2 resolved, no new blocker.
+- [ ] Parent delta review and integration approval; no push/PR/merge before that approval.

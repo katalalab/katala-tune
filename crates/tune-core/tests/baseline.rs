@@ -1,12 +1,7 @@
 //! Owned synthetic DBs and a finite, owned Node fixture child only; no host probes.
 use rusqlite::params;
 use serde_json::{Value, json};
-use std::{
-    io::Read,
-    path::PathBuf,
-    process::{Command, Stdio},
-    time::{Duration, Instant},
-};
+use std::{path::PathBuf, time::Duration};
 use tune_core::{db::Store, hourly_baseline::analyze_hours};
 const H: i64 = 3_600_000;
 const D: i64 = 24 * H;
@@ -187,15 +182,10 @@ impl Scratch {
 }
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-struct OwnedChild(std::process::Child);
-impl Drop for OwnedChild {
-    fn drop(&mut self) {
-        if !matches!(self.0.try_wait(), Ok(Some(_))) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+        if std::thread::panicking() {
+            eprintln!("retaining owned baseline scratch after failure: {}", self.0.display());
+        } else {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 }
@@ -204,36 +194,13 @@ fn node_reports(input: &Value) -> Value {
     let file = dir.0.join("input.json");
     std::fs::write(&file, input.to_string()).unwrap();
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/js/hourly_baseline.js");
-    let mut child = OwnedChild(Command::new("node").arg(script).arg(file).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
-    let stdout = child.0.stdout.take().unwrap();
-    let stderr = child.0.stderr.take().unwrap();
-    let out = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        stdout.take(4_194_305).read_to_end(&mut b).unwrap();
-        b
-    });
-    let err = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        stderr.take(65_537).read_to_end(&mut b).unwrap();
-        b
-    });
-    let start = Instant::now();
-    let status = loop {
-        if let Some(s) = child.0.try_wait().unwrap() {
-            break Some(s);
-        }
-        if start.elapsed() > Duration::from_secs(15) {
-            let _ = child.0.kill();
-            let _ = child.0.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let out = out.join().unwrap();
-    let err = err.join().unwrap();
-    assert!(status.is_some_and(|s| s.success()), "owned fixture child failed/timed out: {}", String::from_utf8_lossy(&err));
-    assert!(out.len() <= 4_194_304 && err.len() <= 65_536, "fixture output limit");
-    serde_json::from_slice(&out).unwrap()
+    let args = [script.into_os_string(), file.into_os_string()];
+    let limits = owned_node::Limits { execution: Duration::from_secs(15), cleanup: Duration::from_secs(2), stdout: 4_194_304, stderr: 65_536 };
+    let out = owned_node::capture_node(&args, limits)
+        .unwrap_or_else(|failure| panic!("Node fixture failed: {failure:?}; cleanup resolved={}", failure.cleanup_resolved()));
+    std::fs::write(dir.0.join("stdout.json"), &out.stdout).unwrap();
+    std::fs::write(dir.0.join("stderr.txt"), &out.stderr).unwrap();
+    serde_json::from_slice(&out.stdout).expect("complete fixture JSON required; owned scratch retained on failure")
 }
 #[test]
 fn pure_shared_fixtures_match_literal_contract_and_javascript() {
@@ -330,3 +297,6 @@ fn busy_read_errors_propagate_without_a_fabricated_baseline_and_can_retry() {
     writer.execute_batch("ROLLBACK").unwrap();
     assert_eq!(store.metrics_baseline("fixture", "mem", H).unwrap()["source"]["state"], "ready");
 }
+
+#[path = "support/owned_node.rs"]
+mod owned_node;
