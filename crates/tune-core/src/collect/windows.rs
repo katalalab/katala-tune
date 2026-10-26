@@ -1809,12 +1809,18 @@ mod tests {
         fixture_pid_list(pids.assigned, pids.count, &pids.values)
     }
 
+    fn fixture_root_only_ready(snapshot: Option<Vec<u32>>, root_pid: u32, _deadline: Instant, _completed: Instant) -> io::Result<bool> {
+        Ok(snapshot.is_some_and(|pids| pids == [root_pid]))
+    }
+
     fn wait_fixture_root_only(root_pid: u32, deadline: Instant, mut query: impl FnMut() -> io::Result<Option<Vec<u32>>>) -> io::Result<()> {
         loop {
             if Instant::now() >= deadline {
                 return Err(io::Error::from(io::ErrorKind::TimedOut));
             }
-            if query()?.is_some_and(|pids| pids == [root_pid]) {
+            let snapshot = query()?;
+            let completed = Instant::now();
+            if fixture_root_only_ready(snapshot, root_pid, deadline, completed)? {
                 return Ok(());
             }
             std::thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
@@ -1995,17 +2001,17 @@ mod tests {
 
     #[test]
     fn fixture_root_only_result_after_the_original_deadline_is_rejected() {
-        let deadline = Instant::now() + Duration::from_millis(20);
-        let mut queried = false;
-        let result = wait_fixture_root_only(17, deadline, || {
-            queried = true;
-            while Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(1));
+        // Explicit observation times avoid a small scheduling-dependent window.
+        let before = Instant::now();
+        let deadline = before + Duration::from_secs(1);
+        assert!(fixture_root_only_ready(Some(vec![17]), 17, deadline, before).unwrap());
+        assert!(!fixture_root_only_ready(None, 17, deadline, before).unwrap());
+        for completed in [deadline, deadline + Duration::from_nanos(1)] {
+            for snapshot in [Some(vec![17]), None, Some(vec![17, 23])] {
+                let result = fixture_root_only_ready(snapshot, 17, deadline, completed);
+                assert_eq!(result.expect_err("late root-only result must not be admitted").kind(), io::ErrorKind::TimedOut);
             }
-            Ok(Some(vec![17]))
-        });
-        assert!(queried, "late-result fixture must actually issue its query");
-        assert_eq!(result.expect_err("late root-only result must not be admitted").kind(), io::ErrorKind::TimedOut);
+        }
     }
 
     #[test]
