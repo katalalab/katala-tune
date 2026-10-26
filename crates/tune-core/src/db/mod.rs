@@ -11,6 +11,7 @@ mod actions;
 mod ai_limits;
 mod ai_sessions;
 mod ai_usage;
+mod baseline;
 mod checks;
 mod inventory;
 mod logs;
