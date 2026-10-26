@@ -1785,7 +1785,13 @@ mod tests {
     }
 
     fn fixture_pid_list(assigned: u32, count: u32, values: &[usize]) -> io::Result<Option<Vec<u32>>> {
-        complete_pid_list(assigned, count, values).map(Some)
+        if assigned as usize > MAX_ACTIVE || count > assigned {
+            return Err(invalid());
+        }
+        // Validate every returned PID even in an incomplete fixture snapshot.
+        // Incomplete is unknown, never proof that the exited member is absent.
+        let listed = complete_pid_list(count, count, values)?;
+        Ok((assigned == count).then_some(listed))
     }
 
     fn fixture_job_pids(job: &Job) -> io::Result<Option<Vec<u32>>> {
@@ -1809,7 +1815,10 @@ mod tests {
         fixture_pid_list(pids.assigned, pids.count, &pids.values)
     }
 
-    fn fixture_root_only_ready(snapshot: Option<Vec<u32>>, root_pid: u32, _deadline: Instant, _completed: Instant) -> io::Result<bool> {
+    fn fixture_root_only_ready(snapshot: Option<Vec<u32>>, root_pid: u32, deadline: Instant, completed: Instant) -> io::Result<bool> {
+        if completed >= deadline {
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
         Ok(snapshot.is_some_and(|pids| pids == [root_pid]))
     }
 
@@ -2012,6 +2021,51 @@ mod tests {
                 assert_eq!(result.expect_err("late root-only result must not be admitted").kind(), io::ErrorKind::TimedOut);
             }
         }
+    }
+
+    #[test]
+    fn fixture_pid_list_distinguishes_incomplete_from_malformed() {
+        assert_eq!(fixture_pid_list(2, 1, &[17]).unwrap(), None);
+        assert_eq!(fixture_pid_list(1, 1, &[17]).unwrap(), Some(vec![17]));
+        assert_eq!(fixture_pid_list(0, 0, &[]).unwrap(), Some(vec![]));
+        for (assigned, count, values) in [(1, 2, vec![17, 23]), (MAX_ACTIVE as u32 + 1, 0, vec![]), (2, 1, vec![0]), (3, 2, vec![17, 17]), (2, 2, vec![17])] {
+            assert_eq!(fixture_pid_list(assigned, count, &values).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn fixture_absence_wait_requires_complete_root_only_and_preserves_errors() {
+        // Synthetic queries test the fixture's precondition, not an OS witness.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut snapshots = [None, Some(vec![17, 23]), Some(vec![17])].into_iter();
+        let mut calls = 0;
+        wait_fixture_root_only(17, deadline, || {
+            calls += 1;
+            Ok(snapshots.next().expect("bounded fixture query sequence"))
+        })
+        .unwrap();
+        assert_eq!(calls, 3, "neither partial nor another listed member proves absence");
+
+        let mut calls = 0;
+        let denied = wait_fixture_root_only(17, deadline, || {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(5))
+        })
+        .unwrap_err();
+        assert_eq!(denied.raw_os_error(), Some(5));
+        assert_eq!(calls, 1, "OS errors must not be retried as incomplete snapshots");
+
+        let mut calls = 0;
+        let malformed = wait_fixture_root_only(17, deadline, || {
+            calls += 1;
+            fixture_pid_list(1, 2, &[17, 23])
+        })
+        .unwrap_err();
+        assert_eq!(malformed.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(calls, 1);
+
+        let expired = wait_fixture_root_only(17, Instant::now(), || panic!("expired fixture must not query"));
+        assert_eq!(expired.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]
