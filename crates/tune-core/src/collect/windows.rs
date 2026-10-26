@@ -58,6 +58,52 @@ const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000;
 #[cfg(test)]
 #[path = "windows_diagnostics.rs"]
 mod diagnostics;
+#[cfg(test)]
+#[path = "windows_io_diagnostic.rs"]
+pub(crate) mod windows_io_diagnostic;
+
+// Release builds expand to the original expression. The candidate is only
+// inspected synchronously after observe returns an error, before any await.
+#[cfg(test)]
+macro_rules! diagnostic_io {
+    ($stage:ident, $result:expr) => {
+        $result.inspect_err(|error| windows_io_diagnostic::note(windows_io_diagnostic::Stage::$stage, error))
+    };
+}
+#[cfg(not(test))]
+macro_rules! diagnostic_io {
+    ($stage:ident, $result:expr) => {
+        $result
+    };
+}
+
+#[cfg(test)]
+macro_rules! diagnostic_pid_error {
+    ($reason:expr, $assigned:expr, $count:expr) => {{
+        let error = invalid();
+        windows_io_diagnostic::note_pid_list($reason, $assigned, $count, &error);
+        error
+    }};
+}
+#[cfg(not(test))]
+macro_rules! diagnostic_pid_error {
+    ($reason:expr, $assigned:expr, $count:expr) => {
+        invalid()
+    };
+}
+#[cfg(test)]
+macro_rules! diagnostic_fresh_ids {
+    ($result:expr) => {{
+        windows_io_diagnostic::set_query_context(windows_io_diagnostic::QueryContext::AfterInvalidParameter);
+        $result
+    }};
+}
+#[cfg(not(test))]
+macro_rules! diagnostic_fresh_ids {
+    ($result:expr) => {
+        $result
+    };
+}
 
 fn os_error() -> io::Error {
     io::Error::last_os_error()
@@ -256,13 +302,13 @@ fn identity_raw(handle: HANDLE, pid: u32) -> io::Result<ProcessIdentity> {
     let mut kernel = Default::default();
     let mut user = Default::default();
     // SAFETY: retained handle has query rights; all FILETIME outputs are valid writable values.
-    check(unsafe { GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user) })?;
+    diagnostic_io!(IdentityTimes, check(unsafe { GetProcessTimes(handle, &mut created, &mut exit, &mut kernel, &mut user) }))?;
     let created = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
     let mut session = 0;
     // SAFETY: retained process object and query rights preserve identity while session is queried.
-    check(unsafe { ProcessIdToSessionId(pid, &mut session) })?;
+    diagnostic_io!(IdentitySession, check(unsafe { ProcessIdToSessionId(pid, &mut session) }))?;
     if pid == 0 || created == 0 {
-        return Err(invalid());
+        return diagnostic_io!(IdentityValidation, Err(invalid()));
     }
     Ok(ProcessIdentity { pid, created_filetime: created.to_string(), os_session: session })
 }
@@ -282,13 +328,25 @@ type PidListHook = Box<dyn FnOnce(&Job, &[u32]) -> io::Result<()> + Send>;
 
 fn complete_pid_list(assigned: u32, count: u32, pids: &[usize]) -> io::Result<Vec<u32>> {
     if assigned != count || count as usize > MAX_ACTIVE || count as usize > pids.len() {
-        return Err(invalid());
+        return Err(diagnostic_pid_error!(
+            if assigned != count {
+                windows_io_diagnostic::PidListReason::AssignedCountMismatch
+            } else {
+                windows_io_diagnostic::PidListReason::CountOutOfBounds
+            },
+            assigned,
+            count
+        ));
     }
     let mut result = Vec::with_capacity(count as usize);
     for value in &pids[..count as usize] {
-        let pid = u32::try_from(*value).map_err(|_| invalid())?;
+        let pid = u32::try_from(*value).map_err(|_| diagnostic_pid_error!(windows_io_diagnostic::PidListReason::IdentifierOutOfRange, assigned, count))?;
         if pid == 0 || result.contains(&pid) {
-            return Err(invalid());
+            return Err(diagnostic_pid_error!(
+                if pid == 0 { windows_io_diagnostic::PidListReason::ZeroIdentifier } else { windows_io_diagnostic::PidListReason::DuplicateIdentifier },
+                assigned,
+                count
+            ));
         }
         result.push(pid);
     }
@@ -341,15 +399,18 @@ impl Job {
     fn accounting(&self, receipt: &mut ProcessReceipt) -> io::Result<()> {
         let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         // SAFETY: explicit owned Job and correctly sized aligned output structure; never use null hJob.
-        check(unsafe {
-            QueryInformationJobObject(
-                self.handle.as_raw_handle(),
-                JobObjectBasicAccountingInformation,
-                std::ptr::from_mut(&mut accounting).cast(),
-                size_of_val(&accounting) as u32,
-                null_mut(),
-            )
-        })?;
+        diagnostic_io!(
+            JobAccounting,
+            check(unsafe {
+                QueryInformationJobObject(
+                    self.handle.as_raw_handle(),
+                    JobObjectBasicAccountingInformation,
+                    std::ptr::from_mut(&mut accounting).cast(),
+                    size_of_val(&accounting) as u32,
+                    null_mut(),
+                )
+            })
+        )?;
         receipt.total_processes = accounting.TotalProcesses;
         receipt.job_empty = accounting.ActiveProcesses == 0;
         Ok(())
@@ -363,43 +424,48 @@ impl Job {
         }
         let mut pids = Pids { assigned: 0, count: 0, pids: [0; MAX_ACTIVE] };
         // SAFETY: flexible-array output has a fixed cap with correct pointer-size alignment.
-        check(unsafe {
-            QueryInformationJobObject(
-                self.handle.as_raw_handle(),
-                JobObjectBasicProcessIdList,
-                std::ptr::from_mut(&mut pids).cast(),
-                size_of_val(&pids) as u32,
-                null_mut(),
-            )
-        })?;
+        diagnostic_io!(
+            JobPidQuery,
+            check(unsafe {
+                QueryInformationJobObject(
+                    self.handle.as_raw_handle(),
+                    JobObjectBasicProcessIdList,
+                    std::ptr::from_mut(&mut pids).cast(),
+                    size_of_val(&pids) as u32,
+                    null_mut(),
+                )
+            })
+        )?;
         complete_pid_list(pids.assigned, pids.count, &pids.pids)
     }
     fn observe(&mut self, receipt: &mut ProcessReceipt) -> io::Result<()> {
         self.accounting(receipt)?;
         #[cfg(test)]
         if let Some(hook) = self.after_first_accounting.take() {
-            hook(self, receipt)?;
+            diagnostic_io!(FixtureHook, hook(self, receipt))?;
         }
+        #[cfg(test)]
+        windows_io_diagnostic::set_query_context(windows_io_diagnostic::QueryContext::Initial);
         let pids = self.process_ids()?;
         #[cfg(test)]
         if let Some(hook) = self.after_pid_list.take() {
-            hook(self, &pids)?;
+            diagnostic_io!(FixtureHook, hook(self, &pids))?;
         }
         for pid in pids {
             if self.processes.iter().any(|p| p.identity.pid == pid) {
                 continue;
             }
             if self.processes.len() >= MAX_OBSERVED {
-                return Err(invalid());
+                return diagnostic_io!(ObservedLimit, Err(invalid()));
             }
-            let handle = match self.open_candidate(pid) {
+            let handle = match diagnostic_io!(OpenProcess, self.open_candidate(pid)) {
                 Ok(handle) => handle,
                 Err(error) => {
                     // A snapshot PID can exit before OpenProcess. Only the specific
                     // disappearance error plus a complete fresh query of this owned
                     // Job permits skipping it. No identity/exit is fabricated; actual
                     // Job emptiness and retained handles still gate completion later.
-                    if error.raw_os_error() != Some(ERROR_INVALID_PARAMETER as i32) || self.process_ids()?.contains(&pid) {
+                    if error.raw_os_error() != Some(ERROR_INVALID_PARAMETER as i32) || diagnostic_fresh_ids!(self.process_ids())?.contains(&pid) {
                         return Err(error);
                     }
                     continue;
@@ -407,24 +473,24 @@ impl Job {
             };
             let mut member = 0;
             // SAFETY: recheck membership on the opened object, closing enumeration/PID reuse races.
-            check(unsafe { IsProcessInJob(handle.as_raw_handle(), self.handle.as_raw_handle(), &mut member) })?;
+            diagnostic_io!(MembershipQuery, check(unsafe { IsProcessInJob(handle.as_raw_handle(), self.handle.as_raw_handle(), &mut member) }))?;
             if member == 0 {
-                return Err(invalid());
+                return diagnostic_io!(MembershipValidation, Err(invalid()));
             }
             let identity = identity(&handle, pid)?;
             receipt.observed.push(identity.clone());
             self.processes.push(Process { handle, identity });
         }
-        let root = self.processes.first().ok_or_else(invalid)?;
+        let root = diagnostic_io!(ObserveUnknown, self.processes.first().ok_or_else(invalid))?;
         let root_observed_at = Instant::now().into_std();
-        receipt.root_exited = exited(&root.handle)?;
+        receipt.root_exited = diagnostic_io!(RootWait, exited(&root.handle))?;
         if receipt.root_exited {
             // Use the start of the successful zero-wait query conservatively:
             // scheduling after it must not move either completion clock later.
             self.root_exit_at.get_or_insert(root_observed_at);
             let mut code = 0;
             // SAFETY: retained root has signaled; 259 is a valid exit value, never a liveness test.
-            check(unsafe { GetExitCodeProcess(root.handle.as_raw_handle(), &mut code) })?;
+            diagnostic_io!(RootExitCode, check(unsafe { GetExitCodeProcess(root.handle.as_raw_handle(), &mut code) }))?;
             receipt.root_exit_code = Some(code as i32);
             // The initial accounting may predate root exit. Only a subsequent
             // sample can establish that descendants remain after that exit.
@@ -434,7 +500,7 @@ impl Job {
         // must not be mistaken for a descendant that remains after root exit.
         receipt.observed_exited = !self.processes.is_empty();
         for process in &self.processes {
-            receipt.observed_exited &= exited(&process.handle)?;
+            receipt.observed_exited &= diagnostic_io!(MemberWait, exited(&process.handle))?;
         }
         Ok(())
     }
@@ -505,6 +571,7 @@ struct DiagnosticTrace {
     started: Instant,
     invocation: u64,
     first_stop: bool,
+    first_io: windows_io_diagnostic::FirstFailure,
 }
 
 #[cfg(test)]
@@ -512,7 +579,22 @@ impl DiagnosticTrace {
     fn new() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        Self { started: Instant::now(), invocation: NEXT.fetch_add(1, Ordering::Relaxed), first_stop: false }
+        Self {
+            started: Instant::now(),
+            invocation: NEXT.fetch_add(1, Ordering::Relaxed),
+            first_stop: false,
+            first_io: windows_io_diagnostic::FirstFailure::default(),
+        }
+    }
+    fn adopt_io(&mut self, stage: windows_io_diagnostic::Stage, raw_os_error: Option<i32>) {
+        self.first_io.adopt(windows_io_diagnostic::Failure { stage, raw_os_error, pid_list: None });
+    }
+    fn emit_io(&self) {
+        if let Some(failure) = self.first_io.0 {
+            let record = windows_io_diagnostic::Record { invocation: self.invocation, failure };
+            // Unit-test process stdout only, outside the owned probe's pipes.
+            println!("\n{}{}", windows_io_diagnostic::PREFIX, serde_json::to_string(&record).expect("closed diagnostic JSON"));
+        }
     }
     fn record_stop(&mut self, job: &Job, receipt: &ProcessReceipt, requested: bool) {
         if receipt.stop != ProcessStop::Completed && !self.first_stop {
@@ -815,6 +897,8 @@ struct PipeOutput {
     eof: bool,
     limited: bool,
     failed: bool,
+    #[cfg(test)]
+    raw_error: Option<i32>,
 }
 async fn drain(mut pipe: NamedPipeServer, limit: usize, signal: mpsc::Sender<()>) -> PipeOutput {
     let mut output = PipeOutput::default();
@@ -833,7 +917,11 @@ async fn drain(mut pipe: NamedPipeServer, limit: usize, signal: mpsc::Sender<()>
                     let _ = signal.try_send(());
                 }
             }
-            Err(_) => {
+            Err(_error) => {
+                #[cfg(test)]
+                {
+                    output.raw_error = _error.raw_os_error();
+                }
                 output.failed = true;
                 break;
             }
@@ -1159,6 +1247,12 @@ async fn run_inner(
             let result = tasks.writer.take().expect("present writer").await;
             receipt.writer_finished = true;
             if !matches!(result, Ok(Ok(()))) && receipt.stop == ProcessStop::Completed {
+                #[cfg(test)]
+                match &result {
+                    Ok(Err(error)) => diagnostic.adopt_io(windows_io_diagnostic::Stage::WriterIo, error.raw_os_error()),
+                    Err(_) => diagnostic.adopt_io(windows_io_diagnostic::Stage::WriterJoin, None),
+                    Ok(Ok(())) => unreachable!(),
+                }
                 receipt.stop = ProcessStop::IoFailure;
             }
         }
@@ -1172,6 +1266,11 @@ async fn run_inner(
                             receipt.stop = ProcessStop::OutputLimit;
                         }
                         if output.failed && receipt.stop == ProcessStop::Completed {
+                            #[cfg(test)]
+                            diagnostic.adopt_io(
+                                if error { windows_io_diagnostic::Stage::StderrRead } else { windows_io_diagnostic::Stage::StdoutRead },
+                                output.raw_error,
+                            );
                             receipt.stop = ProcessStop::IoFailure;
                         }
                         if error {
@@ -1184,18 +1283,31 @@ async fn run_inner(
                     }
                     Err(_) => {
                         if receipt.stop == ProcessStop::Completed {
+                            #[cfg(test)]
+                            diagnostic.adopt_io(if error { windows_io_diagnostic::Stage::StderrJoin } else { windows_io_diagnostic::Stage::StdoutJoin }, None);
                             receipt.stop = ProcessStop::IoFailure;
                         }
                     }
                 }
             }
         }
+        #[cfg(test)]
+        windows_io_diagnostic::clear_candidate();
         if let Err(_error) = job.observe(&mut receipt) {
             #[cfg(test)]
             eprintln!("owned_observe_error_code={}", _error.raw_os_error().unwrap_or(-1));
             receipt.job_empty = false;
             receipt.observed_exited = false;
             if receipt.stop == ProcessStop::Completed {
+                #[cfg(test)]
+                {
+                    let failure = windows_io_diagnostic::candidate().unwrap_or(windows_io_diagnostic::Failure {
+                        stage: windows_io_diagnostic::Stage::ObserveUnknown,
+                        raw_os_error: _error.raw_os_error(),
+                        pid_list: None,
+                    });
+                    diagnostic.first_io.adopt(failure);
+                }
                 receipt.stop = ProcessStop::IoFailure;
             }
         }
@@ -1220,7 +1332,11 @@ async fn run_inner(
                 }
                 QuiescenceDecision::Lingering => receipt.stop = ProcessStop::LingeringDescendants,
                 QuiescenceDecision::CleanupExpired => receipt.stop = ProcessStop::CleanupUnconfirmed,
-                QuiescenceDecision::Stopped => receipt.stop = ProcessStop::IoFailure,
+                QuiescenceDecision::Stopped => {
+                    #[cfg(test)]
+                    diagnostic.adopt_io(windows_io_diagnostic::Stage::QuiescenceStop, None);
+                    receipt.stop = ProcessStop::IoFailure;
+                }
                 QuiescenceDecision::Observe | QuiescenceDecision::Quiescent => {}
             }
         }
@@ -1246,6 +1362,8 @@ async fn run_inner(
         }
         tokio::time::sleep(POLL).await;
     }
+    #[cfg(test)]
+    diagnostic.emit_io();
     answer.code = receipt.root_exit_code;
     answer.process_receipt = Some(receipt);
     answer.seal_windows_payload(Instant::now() >= deadline);
@@ -1784,7 +1902,17 @@ mod tests {
         member
     }
 
-    fn fixture_job_pids(job: &Job) -> io::Result<Vec<u32>> {
+    fn fixture_pid_list(assigned: u32, count: u32, values: &[usize]) -> io::Result<Option<Vec<u32>>> {
+        if assigned as usize > MAX_ACTIVE || count > assigned {
+            return Err(invalid());
+        }
+        // Validate every returned PID even in an incomplete fixture snapshot.
+        // Incomplete is unknown, never proof that the exited member is absent.
+        let listed = complete_pid_list(count, count, values)?;
+        Ok((assigned == count).then_some(listed))
+    }
+
+    fn fixture_job_pids(job: &Job) -> io::Result<Option<Vec<u32>>> {
         #[repr(C)]
         struct Pids {
             assigned: u32,
@@ -1802,18 +1930,60 @@ mod tests {
                 null_mut(),
             )
         })?;
-        if pids.assigned != pids.count || pids.count as usize > MAX_ACTIVE {
-            return Err(invalid());
-        }
-        pids.values[..pids.count as usize].iter().map(|pid| u32::try_from(*pid).map_err(|_| invalid())).collect()
+        fixture_pid_list(pids.assigned, pids.count, &pids.values)
     }
 
-    fn remove_fixture_member_after_snapshot(job: &mut Job, root_pid: u32, member: Process, member_thread: OwnedHandle, deadline: Instant) {
+    fn fixture_root_only_ready(snapshot: Option<Vec<u32>>, root_pid: u32, deadline: Instant, completed: Instant) -> io::Result<bool> {
+        if completed >= deadline {
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
+        Ok(snapshot.is_some_and(|pids| pids == [root_pid]))
+    }
+
+    fn wait_fixture_root_only(root_pid: u32, deadline: Instant, mut query: impl FnMut() -> io::Result<Option<Vec<u32>>>) -> io::Result<()> {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            let snapshot = query()?;
+            let completed = Instant::now();
+            if fixture_root_only_ready(snapshot, root_pid, deadline, completed)? {
+                return Ok(());
+            }
+            std::thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
+        }
+    }
+
+    fn remove_fixture_member_after_snapshot(
+        job: &mut Job,
+        root_pid: u32,
+        member: Process,
+        member_thread: OwnedHandle,
+        deadline: Instant,
+    ) -> Arc<std::sync::atomic::AtomicU8> {
+        remove_fixture_member_with_query(job, root_pid, member, member_thread, deadline, fixture_job_pids)
+    }
+
+    fn remove_fixture_member_with_query(
+        job: &mut Job,
+        root_pid: u32,
+        member: Process,
+        member_thread: OwnedHandle,
+        deadline: Instant,
+        mut query: impl FnMut(&Job) -> io::Result<Option<Vec<u32>>> + Send + 'static,
+    ) -> Arc<std::sync::atomic::AtomicU8> {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        // Closed test diagnostics: 0=not entered, 1=hook, 2=terminate,
+        // 3=retained member signaled/absence pending, 4=complete root-only.
+        let progress = Arc::new(AtomicU8::new(0));
+        let observed = Arc::clone(&progress);
         let member_pid = member.identity.pid;
         job.after_pid_list = Some(Box::new(move |job, snapshot| {
+            observed.store(1, Ordering::Relaxed);
             assert!(snapshot.contains(&root_pid) && snapshot.contains(&member_pid));
             // SAFETY: terminate only the exact suspended member owned by this fixture; never a PID lookup.
             check(unsafe { windows_sys::Win32::System::Threading::TerminateProcess(member.handle.as_raw_handle(), 0) })?;
+            observed.store(2, Ordering::Relaxed);
             let wait_ms = deadline.saturating_duration_since(Instant::now()).as_millis().min(u128::from(u32::MAX)) as u32;
             // SAFETY: retained handle of this fixture member; bounded by the original absolute deadline.
             if unsafe { WaitForSingleObject(member.handle.as_raw_handle(), wait_ms) } != WAIT_OBJECT_0 || Instant::now() >= deadline {
@@ -1821,14 +1991,12 @@ mod tests {
             }
             drop(member_thread);
             drop(member);
-            while fixture_job_pids(job)? != vec![root_pid] {
-                if Instant::now() >= deadline {
-                    return Err(io::Error::from(io::ErrorKind::TimedOut));
-                }
-                std::thread::sleep(POLL);
-            }
+            observed.store(3, Ordering::Relaxed);
+            wait_fixture_root_only(root_pid, deadline, || query(job))?;
+            observed.store(4, Ordering::Relaxed);
             Ok(())
         }));
+        progress
     }
 
     #[test]
@@ -1842,7 +2010,7 @@ mod tests {
         let mut receipt =
             ProcessReceipt { root: Some(root.identity.clone()), observed: vec![root.identity.clone()], stop: ProcessStop::Completed, ..Default::default() };
         job.processes.push(root);
-        remove_fixture_member_after_snapshot(&mut job, root_pid, member, member_thread, deadline);
+        let _progress = remove_fixture_member_after_snapshot(&mut job, root_pid, member, member_thread, deadline);
         // Fault injection is explicit: object lifetime/other observers can keep an exited PID openable.
         // Actual member exit and Job absence above are real, not mocked.
         job.injected_open_error = Some((member_pid, ERROR_INVALID_PARAMETER as i32));
@@ -1884,15 +2052,23 @@ mod tests {
             let mut receipt =
                 ProcessReceipt { root: Some(root.identity.clone()), observed: vec![root.identity.clone()], stop: ProcessStop::Completed, ..Default::default() };
             job.processes.push(root);
-            let retained = if disappear {
-                remove_fixture_member_after_snapshot(&mut job, root_pid, member, member_thread, deadline);
-                None
+            let (retained, progress) = if disappear {
+                let progress = remove_fixture_member_after_snapshot(&mut job, root_pid, member, member_thread, deadline);
+                (None, Some(progress))
             } else {
-                Some((member, member_thread))
+                (Some((member, member_thread)), None)
             };
             job.injected_open_error = Some((member_pid, error as i32));
             let failed = job.observe(&mut receipt).expect_err("only a confirmed-gone invalid-parameter candidate can be skipped");
-            assert_eq!(failed.raw_os_error(), Some(error as i32));
+            assert_eq!(
+                failed.raw_os_error(),
+                Some(error as i32),
+                "disappear={disappear} expected={error} kind={:?} injection_pending={} hook_pending={} hook_stage={}",
+                failed.kind(),
+                job.injected_open_error.is_some(),
+                job.after_pid_list.is_some(),
+                progress.as_ref().map_or(0, |value| value.load(std::sync::atomic::Ordering::Relaxed)),
+            );
             assert!(job.injected_open_error.is_none());
             assert!(!exited(&job.processes[0].handle).unwrap());
             assert_eq!(receipt.observed.len(), 1);
@@ -1907,6 +2083,107 @@ mod tests {
             assert!(Instant::now() < deadline);
             drop(root_thread);
         }
+    }
+
+    #[test]
+    fn fixture_partial_pid_snapshot_does_not_replace_an_injected_access_denial() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut job = Job::new().unwrap();
+        let (root, root_thread) = suspended_observation_member(&job, deadline);
+        let (member, member_thread) = suspended_observation_member(&job, deadline);
+        let root_pid = root.identity.pid;
+        let member_pid = member.identity.pid;
+        let mut receipt =
+            ProcessReceipt { root: Some(root.identity.clone()), observed: vec![root.identity.clone()], stop: ProcessStop::Completed, ..Default::default() };
+        job.processes.push(root);
+        let injected = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&injected);
+        let progress = remove_fixture_member_with_query(&mut job, root_pid, member, member_thread, deadline, move |job| {
+            if !seen.swap(true, Ordering::Relaxed) {
+                // The actual owned member has exited. One incomplete snapshot
+                // must remain unknown, not abort this fixture's precondition.
+                fixture_pid_list(2, 1, &[root_pid as usize])
+            } else {
+                fixture_job_pids(job)
+            }
+        });
+        job.injected_open_error = Some((member_pid, ERROR_ACCESS_DENIED as i32));
+        let failed = job.observe(&mut receipt).expect_err("access denial must still be rejected");
+        assert!(injected.load(Ordering::Relaxed), "controlled partial query must actually be reached");
+        assert_eq!(failed.raw_os_error(), Some(ERROR_ACCESS_DENIED as i32), "partial fixture query must not replace injected denial");
+        assert_eq!(progress.load(Ordering::Relaxed), 4);
+        assert!(job.injected_open_error.is_none());
+        assert_eq!(job.processes.len(), 1);
+        assert_eq!(receipt.observed.len(), 1);
+        assert!(!exited(&job.processes[0].handle).unwrap());
+        assert!(!receipt.cleanup_confirmed());
+        job.terminate().unwrap();
+        let wait_ms = deadline.saturating_duration_since(Instant::now()).as_millis().min(u128::from(u32::MAX)) as u32;
+        // SAFETY: exact retained root owned by this fixture and original deadline.
+        assert_eq!(unsafe { WaitForSingleObject(job.processes[0].handle.as_raw_handle(), wait_ms) }, WAIT_OBJECT_0);
+        drop(root_thread);
+    }
+
+    #[test]
+    fn fixture_root_only_result_after_the_original_deadline_is_rejected() {
+        // Explicit observation times avoid a small scheduling-dependent window.
+        let before = Instant::now();
+        let deadline = before + Duration::from_secs(1);
+        assert!(fixture_root_only_ready(Some(vec![17]), 17, deadline, before).unwrap());
+        assert!(!fixture_root_only_ready(None, 17, deadline, before).unwrap());
+        for completed in [deadline, deadline + Duration::from_nanos(1)] {
+            for snapshot in [Some(vec![17]), None, Some(vec![17, 23])] {
+                let result = fixture_root_only_ready(snapshot, 17, deadline, completed);
+                assert_eq!(result.expect_err("late root-only result must not be admitted").kind(), io::ErrorKind::TimedOut);
+            }
+        }
+    }
+
+    #[test]
+    fn fixture_pid_list_distinguishes_incomplete_from_malformed() {
+        assert_eq!(fixture_pid_list(2, 1, &[17]).unwrap(), None);
+        assert_eq!(fixture_pid_list(1, 1, &[17]).unwrap(), Some(vec![17]));
+        assert_eq!(fixture_pid_list(0, 0, &[]).unwrap(), Some(vec![]));
+        for (assigned, count, values) in [(1, 2, vec![17, 23]), (MAX_ACTIVE as u32 + 1, 0, vec![]), (2, 1, vec![0]), (3, 2, vec![17, 17]), (2, 2, vec![17])] {
+            assert_eq!(fixture_pid_list(assigned, count, &values).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn fixture_absence_wait_requires_complete_root_only_and_preserves_errors() {
+        // Synthetic queries test the fixture's precondition, not an OS witness.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut snapshots = [None, Some(vec![17, 23]), Some(vec![17])].into_iter();
+        let mut calls = 0;
+        wait_fixture_root_only(17, deadline, || {
+            calls += 1;
+            Ok(snapshots.next().expect("bounded fixture query sequence"))
+        })
+        .unwrap();
+        assert_eq!(calls, 3, "neither partial nor another listed member proves absence");
+
+        let mut calls = 0;
+        let denied = wait_fixture_root_only(17, deadline, || {
+            calls += 1;
+            Err(io::Error::from_raw_os_error(5))
+        })
+        .unwrap_err();
+        assert_eq!(denied.raw_os_error(), Some(5));
+        assert_eq!(calls, 1, "OS errors must not be retried as incomplete snapshots");
+
+        let mut calls = 0;
+        let malformed = wait_fixture_root_only(17, deadline, || {
+            calls += 1;
+            fixture_pid_list(1, 2, &[17, 23])
+        })
+        .unwrap_err();
+        assert_eq!(malformed.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(calls, 1);
+
+        let expired = wait_fixture_root_only(17, Instant::now(), || panic!("expired fixture must not query"));
+        assert_eq!(expired.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]
