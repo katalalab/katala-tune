@@ -77,6 +77,34 @@ macro_rules! diagnostic_io {
     };
 }
 
+#[cfg(test)]
+macro_rules! diagnostic_pid_error {
+    ($reason:expr, $assigned:expr, $count:expr) => {{
+        let error = invalid();
+        windows_io_diagnostic::note_pid_list($reason, $assigned, $count, &error);
+        error
+    }};
+}
+#[cfg(not(test))]
+macro_rules! diagnostic_pid_error {
+    ($reason:expr, $assigned:expr, $count:expr) => {
+        invalid()
+    };
+}
+#[cfg(test)]
+macro_rules! diagnostic_fresh_ids {
+    ($result:expr) => {{
+        windows_io_diagnostic::set_query_context(windows_io_diagnostic::QueryContext::AfterInvalidParameter);
+        $result
+    }};
+}
+#[cfg(not(test))]
+macro_rules! diagnostic_fresh_ids {
+    ($result:expr) => {
+        $result
+    };
+}
+
 fn os_error() -> io::Error {
     io::Error::last_os_error()
 }
@@ -300,13 +328,25 @@ type PidListHook = Box<dyn FnOnce(&Job, &[u32]) -> io::Result<()> + Send>;
 
 fn complete_pid_list(assigned: u32, count: u32, pids: &[usize]) -> io::Result<Vec<u32>> {
     if assigned != count || count as usize > MAX_ACTIVE || count as usize > pids.len() {
-        return Err(invalid());
+        return Err(diagnostic_pid_error!(
+            if assigned != count {
+                windows_io_diagnostic::PidListReason::AssignedCountMismatch
+            } else {
+                windows_io_diagnostic::PidListReason::CountOutOfBounds
+            },
+            assigned,
+            count
+        ));
     }
     let mut result = Vec::with_capacity(count as usize);
     for value in &pids[..count as usize] {
-        let pid = u32::try_from(*value).map_err(|_| invalid())?;
+        let pid = u32::try_from(*value).map_err(|_| diagnostic_pid_error!(windows_io_diagnostic::PidListReason::IdentifierOutOfRange, assigned, count))?;
         if pid == 0 || result.contains(&pid) {
-            return Err(invalid());
+            return Err(diagnostic_pid_error!(
+                if pid == 0 { windows_io_diagnostic::PidListReason::ZeroIdentifier } else { windows_io_diagnostic::PidListReason::DuplicateIdentifier },
+                assigned,
+                count
+            ));
         }
         result.push(pid);
     }
@@ -396,7 +436,7 @@ impl Job {
                 )
             })
         )?;
-        diagnostic_io!(JobPidValidation, complete_pid_list(pids.assigned, pids.count, &pids.pids))
+        complete_pid_list(pids.assigned, pids.count, &pids.pids)
     }
     fn observe(&mut self, receipt: &mut ProcessReceipt) -> io::Result<()> {
         self.accounting(receipt)?;
@@ -404,6 +444,8 @@ impl Job {
         if let Some(hook) = self.after_first_accounting.take() {
             diagnostic_io!(FixtureHook, hook(self, receipt))?;
         }
+        #[cfg(test)]
+        windows_io_diagnostic::set_query_context(windows_io_diagnostic::QueryContext::Initial);
         let pids = self.process_ids()?;
         #[cfg(test)]
         if let Some(hook) = self.after_pid_list.take() {
@@ -423,7 +465,7 @@ impl Job {
                     // disappearance error plus a complete fresh query of this owned
                     // Job permits skipping it. No identity/exit is fabricated; actual
                     // Job emptiness and retained handles still gate completion later.
-                    if error.raw_os_error() != Some(ERROR_INVALID_PARAMETER as i32) || self.process_ids()?.contains(&pid) {
+                    if error.raw_os_error() != Some(ERROR_INVALID_PARAMETER as i32) || diagnostic_fresh_ids!(self.process_ids())?.contains(&pid) {
                         return Err(error);
                     }
                     continue;
@@ -545,7 +587,7 @@ impl DiagnosticTrace {
         }
     }
     fn adopt_io(&mut self, stage: windows_io_diagnostic::Stage, raw_os_error: Option<i32>) {
-        self.first_io.adopt(windows_io_diagnostic::Failure { stage, raw_os_error });
+        self.first_io.adopt(windows_io_diagnostic::Failure { stage, raw_os_error, pid_list: None });
     }
     fn emit_io(&self) {
         if let Some(failure) = self.first_io.0 {
@@ -1259,9 +1301,12 @@ async fn run_inner(
             if receipt.stop == ProcessStop::Completed {
                 #[cfg(test)]
                 {
-                    let failure = windows_io_diagnostic::candidate()
-                        .unwrap_or(windows_io_diagnostic::Failure { stage: windows_io_diagnostic::Stage::ObserveUnknown, raw_os_error: _error.raw_os_error() });
-                    diagnostic.adopt_io(failure.stage, failure.raw_os_error);
+                    let failure = windows_io_diagnostic::candidate().unwrap_or(windows_io_diagnostic::Failure {
+                        stage: windows_io_diagnostic::Stage::ObserveUnknown,
+                        raw_os_error: _error.raw_os_error(),
+                        pid_list: None,
+                    });
+                    diagnostic.first_io.adopt(failure);
                 }
                 receipt.stop = ProcessStop::IoFailure;
             }
