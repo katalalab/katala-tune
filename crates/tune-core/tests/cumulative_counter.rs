@@ -41,12 +41,7 @@ fn shared_fixture_matches_node_including_baselines() {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/js/cumulative-counter.js");
     let output = owned_node::capture_node(
         &[script.into_os_string()],
-        owned_node::Limits {
-            execution: Duration::from_secs(15),
-            cleanup: Duration::from_secs(2),
-            stdout: 4 * 1024 * 1024,
-            stderr: 64 * 1024,
-        },
+        owned_node::Limits { execution: Duration::from_secs(15), cleanup: Duration::from_secs(2), stdout: 4 * 1024 * 1024, stderr: 64 * 1024 },
     )
     .expect("Node parity requires bounded capture with successful exit and complete pipes");
     let js: Value = serde_json::from_slice(&output.stdout).unwrap();
