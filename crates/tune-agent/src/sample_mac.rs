@@ -1545,6 +1545,73 @@ mod tests {
         assert_eq!(s["gpu"][0]["memory_status"], "unsupported");
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    enum ProcessSample {
+        Present,
+        ExpiredMissing,
+    }
+
+    fn process_sample_contract(sample: &Value, expired: bool) -> Result<ProcessSample, &'static str> {
+        let procs = sample.get("procs").ok_or("missing process field")?;
+        // A post-deadline missing sample is permitted, without claiming why it is missing.
+        // Missing fields and malformed non-null values never take this branch.
+        if procs.is_null() {
+            return if expired { Ok(ProcessSample::ExpiredMissing) } else { Err("process sample missing before deadline") };
+        }
+        if !procs["count"].as_u64().is_some_and(|count| count > 10) {
+            return Err("process count must exceed ten");
+        }
+        if !procs["top_mem"][0]["name"].as_str().is_some_and(|name| !name.contains('/')) {
+            return Err("process basename required");
+        }
+        Ok(ProcessSample::Present)
+    }
+
+    #[test]
+    fn sampler_process_contract() {
+        assert_eq!(process_sample_contract(&json!({"procs": null}), true), Ok(ProcessSample::ExpiredMissing));
+        assert!(process_sample_contract(&json!({"procs": null}), false).is_err());
+        let present = json!({"procs": {"count": 11, "top_mem": [{"name": "fixture"}]}});
+        for expired in [false, true] {
+            assert_eq!(process_sample_contract(&present, expired), Ok(ProcessSample::Present));
+            for invalid in [
+                json!({}),
+                json!({"procs": {}}),
+                json!({"procs": []}),
+                json!({"procs": "malformed"}),
+                json!({"procs": {"count": "11", "top_mem": [{"name": "fixture"}]}}),
+                json!({"procs": {"count": 10, "top_mem": [{"name": "fixture"}]}}),
+                json!({"procs": {"count": 0, "top_mem": [{"name": "fixture"}]}}),
+                json!({"procs": {"count": 11, "top_mem": []}}),
+                json!({"procs": {"count": 11, "top_mem": [{"name": 7}]}}),
+                json!({"procs": {"count": 11, "top_mem": [{"name": "/fixture/path"}]}}),
+            ] {
+                assert!(process_sample_contract(&invalid, expired).is_err(), "invalid process sample must remain rejected");
+            }
+        }
+    }
+
+    #[test]
+    fn native_and_ps_process_sources_read_this_machine() {
+        let a = Args { interval: 0.3, procs_every: 1.0, max_seconds: 10.0, count: 0, watch: false };
+        let t0 = Instant::now();
+        let control = Control { gone: Arc::new(AtomicBool::new(false)), deadline: t0 + Duration::from_secs(10) };
+        let mut p = Procs::open(&a);
+        let own_pid = std::process::id() as i32;
+        assert!(p.own().contains_key(&own_pid), "native process snapshot must contain this test process");
+        p.sample(t0, &control);
+        eprintln!("sampler_process_sources stage=warmup ps_observed={} expired={}", p.ps_t.is_some(), Instant::now() >= control.deadline);
+        assert!(p.ps_t.is_some(), "real ps warmup must complete");
+        assert!(p.ps_prev.contains_key(&own_pid), "real ps snapshot must contain this test process");
+        std::thread::sleep(Duration::from_millis(300));
+        let procs = p.sample(Instant::now(), &control);
+        let expired = Instant::now() >= control.deadline;
+        let classification = process_sample_contract(&json!({"procs": procs}), false);
+        eprintln!("sampler_process_sources stage=sample classification={classification:?} expired={expired} elapsed_ms={}", t0.elapsed().as_millis());
+        assert!(!expired, "real process sources must finish before the shared deadline");
+        assert_eq!(classification, Ok(ProcessSample::Present), "real process sources must return a valid positive sample");
+    }
+
     #[test]
     fn sampler_reads_this_machine() {
         let a = Args { interval: 0.3, procs_every: 1.0, max_seconds: 10.0, count: 0, watch: false };
@@ -1553,15 +1620,17 @@ mod tests {
         let mut s = Sampler::open(&a, t0, &control);
         std::thread::sleep(Duration::from_millis(300));
         let v = s.sample(1, Instant::now(), 0.3, true, &control);
+        let expired = Instant::now() >= control.deadline;
+        let classification = process_sample_contract(&v, expired);
+        eprintln!("sampler_process_sample classification={classification:?} expired={expired} elapsed_ms={}", t0.elapsed().as_millis());
         let h = s.hello();
         assert_eq!((h["os"].as_str(), h["impl"].as_str()), (Some("macos"), Some("rust")));
         assert!(h["cores"].as_u64().unwrap() > 0);
-        assert_eq!(v["cores"].as_array().unwrap().len() as u64, h["cores"].as_u64().unwrap(), "{v}");
-        assert!(v["cpu"].as_f64().is_some_and(|x| (0.0..=100.0).contains(&x)), "{v}");
-        assert!(v["mem"]["used_pct"].as_f64().is_some_and(|x| x > 0.0 && x < 100.0), "{v}");
-        assert!(v["mem"]["pressure"].is_string(), "{v}");
-        assert!(v["procs"]["count"].as_u64().unwrap() > 10, "{v}");
-        assert!(v["procs"]["top_mem"][0]["name"].as_str().is_some_and(|n| !n.contains('/')), "{v}");
+        assert_eq!(v["cores"].as_array().unwrap().len() as u64, h["cores"].as_u64().unwrap(), "sampler field must satisfy its contract");
+        assert!(v["cpu"].as_f64().is_some_and(|x| (0.0..=100.0).contains(&x)), "sampler field must satisfy its contract");
+        assert!(v["mem"]["used_pct"].as_f64().is_some_and(|x| x > 0.0 && x < 100.0), "sampler field must satisfy its contract");
+        assert!(v["mem"]["pressure"].is_string(), "sampler field must satisfy its contract");
+        assert!(classification.is_ok(), "process sample must satisfy the present-or-expired-missing contract");
         assert!(v["self"]["rss_mb"].as_f64().is_some());
         assert!(v["gpu"][0]["memory_kind"].is_string());
     }
