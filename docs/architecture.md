@@ -118,4 +118,4 @@
 
 `Store::metrics_baseline(node,metric,now)` / 互換版 `metricsBaseline` は、既存接続のSAVEPOINT内でseal・時間集約・未sealの分行を一貫して読む。schema作成・移行・pruneはしない（通常のStore/openDb初期化には別途write/migrationがある）。hour途中のsealではsum/有効minute数を結合し、rawのsample数を重みに使わない。SQLは選択した指標のJSONだけを射影し、他の機体・src・生ログは返さない。
 
-対象はcpu/mem/commit百分率のhourly means。過去28日の曜日×4時間帯基準と分離した直近24時間を比較し、未成熟/欠測は所見を出さず理由・coverageを返す。壊れた保存参照・時計rollback・行数超過は保留、I/O/busyはerrorとして伝える。日集約からhourを復元しない。UI/IPC/自動所見には未接続で、速度・リーク・変更因果・操作効果を示す機能ではない。検証範囲は [saved baseline受入記録](acceptance/saved-baseline.md)。
+対象はcpu/mem/commit百分率のhourly means。過去28日を対象に、直近24時間を除いた27日からUTC曜日×4時間帯の基準を作り、直近24時間と比較する。未成熟/欠測は所見を出さず理由・coverageを返す。壊れた保存参照・時計rollback・行数超過は保留、I/O/busyはerrorとして伝える。日集約からhourを復元しない。UI/IPC/自動所見には未接続で、速度・リーク・変更因果・操作効果を示す機能ではない。検証範囲は [saved baseline受入記録](acceptance/saved-baseline.md)。

@@ -1,7 +1,11 @@
 //! Owned synthetic DBs and a finite, owned Node fixture child only; no host probes.
 use rusqlite::params;
 use serde_json::{Value, json};
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 use tune_core::{db::Store, hourly_baseline::analyze_hours};
 const H: i64 = 3_600_000;
 const D: i64 = 24 * H;
@@ -171,13 +175,24 @@ fn expected(r: &Value, s: &Value) {
         assert_eq!(r["observations"], json!([]), "{name}");
     }
 }
+static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
         let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let p = std::env::temp_dir().join(format!("baseline-fixture-{}-{n}", std::process::id()));
-        std::fs::create_dir(&p).unwrap();
-        Self(p)
+        Self::create_at(&std::env::temp_dir(), n, &SCRATCH_SEQUENCE).expect("create owned baseline scratch")
+    }
+    fn create_at(parent: &Path, stamp: u128, sequence: &AtomicU64) -> std::io::Result<Self> {
+        for _ in 0..32 {
+            let serial = sequence.fetch_add(1, Ordering::Relaxed);
+            let p = parent.join(format!("baseline-fixture-{}-{stamp}-{serial}", std::process::id()));
+            match std::fs::create_dir(&p) {
+                Ok(()) => return Ok(Self(p)), // Ownership begins only after exclusive creation.
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "baseline scratch candidates exhausted"))
     }
 }
 impl Drop for Scratch {
@@ -300,3 +315,67 @@ fn busy_read_errors_propagate_without_a_fabricated_baseline_and_can_retry() {
 
 #[path = "support/owned_node.rs"]
 mod owned_node;
+
+#[test]
+fn scratch_retries_a_controlled_collision_without_touching_an_existing_marker() {
+    let parent = Scratch::new();
+    let first = Scratch::create_at(&parent.0, 7, &AtomicU64::new(0)).unwrap();
+    std::fs::write(first.0.join("marker"), b"existing owner").unwrap();
+    let sequence = AtomicU64::new(0);
+    let result = Scratch::create_at(&parent.0, 7, &sequence);
+    assert!(result.is_ok(), "AlreadyExists must select another candidate");
+    let second = result.unwrap();
+    assert_ne!(first.0, second.0);
+    drop(second);
+    assert_eq!(std::fs::read(first.0.join("marker")).unwrap(), b"existing owner");
+    assert_eq!(sequence.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn scratch_fixed_clock_parallel_constructors_have_distinct_owned_directories() {
+    let parent = Scratch::new();
+    let sequence = AtomicU64::new(0);
+    let guards = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..16).map(|_| scope.spawn(|| Scratch::create_at(&parent.0, 7, &sequence).unwrap())).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>()
+    });
+    let paths: std::collections::BTreeSet<_> = guards.iter().map(|g| g.0.clone()).collect();
+    assert_eq!(paths.len(), 16);
+    assert!(paths.iter().all(|p| p.is_dir()));
+    assert_eq!(sequence.load(Ordering::Relaxed), 16);
+    drop(guards);
+    assert!(paths.iter().all(|p| !p.exists()));
+}
+
+#[test]
+fn scratch_collision_exhaustion_is_finite_and_preserves_every_existing_owner() {
+    let parent = Scratch::new();
+    let seed = AtomicU64::new(0);
+    let guards: Vec<_> = (0..32).map(|_| Scratch::create_at(&parent.0, 7, &seed).unwrap()).collect();
+    for g in &guards {
+        std::fs::write(g.0.join("marker"), b"owned").unwrap();
+    }
+    let sequence = AtomicU64::new(0);
+    let err = match Scratch::create_at(&parent.0, 7, &sequence) {
+        Ok(_) => panic!("exhausted collisions must fail"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(sequence.load(Ordering::Relaxed), 32);
+    assert!(guards.iter().all(|g| std::fs::read(g.0.join("marker")).unwrap() == b"owned"));
+}
+
+#[test]
+fn scratch_noncollision_error_does_not_retry_or_change_the_existing_file() {
+    let parent = Scratch::new();
+    let file = parent.0.join("file");
+    std::fs::write(&file, b"unchanged").unwrap();
+    let sequence = AtomicU64::new(0);
+    let err = match Scratch::create_at(&file, 7, &sequence) {
+        Ok(_) => panic!("file parent cannot own a directory"),
+        Err(err) => err,
+    };
+    assert_ne!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(sequence.load(Ordering::Relaxed), 1);
+    assert_eq!(std::fs::read(&file).unwrap(), b"unchanged");
+}

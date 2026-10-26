@@ -59,3 +59,9 @@
 - [x] Observe root + natural EOF under original execution/cleanup deadlines, bound runtime shutdown even on panic, retain caller scratch on failure; no stdin scope needed.
 - [x] Focused final baseline10/10 +retention9/9, focusedclippy/fmt. Independent delta source review: original P2 resolved, no new blocker.
 - [ ] Parent delta review and integration approval; no push/PR/merge before that approval.
+
+## CI-discovered Scratch correction
+
+- [x] Fixed-clock existing-candidate collision RED→AtomicU64 suffix +32 finite exclusive-create attempts GREEN; only AlreadyExists retries and existing paths remain untouched.
+- [x] Marker preservation,16same-clock parallel constructors,32collision exhaustion and noncollision errors; baseline14+retention9 pass with default parallelism, focusedclippy/fmt pass.
+- [ ] Parent delta review and final-head fullcheck/CI; old487full/Electron/Windows successes do not cancel CI3AlreadyExists failures.
