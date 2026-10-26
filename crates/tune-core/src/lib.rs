@@ -41,6 +41,7 @@ pub mod engine_topology;
 pub mod handoff;
 pub mod health;
 pub mod helpers;
+pub mod hourly_baseline;
 pub mod hygiene;
 pub mod inventory;
 pub mod js;

@@ -32,10 +32,10 @@
 **Files:** create lib/saved-baseline.js,test/saved-baseline.test.js; modify lib/db.js registration only.
 **Interfaces:** consumes analyzeHours(points,{metric,now}); produces readBaseline(db,node,metric,now) and Store.metricsBaseline(...), report+source per spec.
 
-- [ ] Write fixtures asserting a seal-hour sum1300/count50 =>mean26 (30minutes10 +20minutes50), frozen late raw excluded and raw sample counts do not weight; empty source gives insufficient. Stub then run focused test: intended assertions fail.
-- [ ] Implement snapshot reader, scalar normalization/counts and registered Store method. Run focused pure+saved tests: pass.
-- [ ] Add RED source/quality/row-limit/rollback/read-only/atomic-WAL fixtures; implement minimal guards and verify pass. No source mutation.
-- [ ] Candidate privacy/gitleaks and local commit after focused tests.
+- [x] Write fixtures asserting a seal-hour sum1300/count50 =>mean26 (30minutes10 +20minutes50), frozen late raw excluded and raw sample counts do not weight; empty source gives insufficient. Stub then run focused test: intended assertions fail.
+- [x] Implement snapshot reader, scalar normalization/counts and registered Store method. Run focused pure+saved tests: pass.
+- [x] Add RED source/quality/row-limit/rollback/read-only/atomic-WAL fixtures; implement minimal guards and verify pass. No source mutation.
+- [x] Candidate privacy/gitleaks and local commit after focused tests.
 
 ### Task 2: Rust reader and pure/shared parity
 
@@ -45,7 +45,7 @@
 - [ ] Write shared fixture driver and Rust tests with literal state/coverage/quantile/weighted-source expectations; stub then assigned focused cargo test: expected assertion failures.
 - [ ] Port pure algorithm/reader without host date calls or dependencies; run shared pure and saved tests: agreement and expected assertions pass.
 - [ ] Add Rust read-only/reopen/error/snapshot coverage at boundary, verify both readers preserve content.
-- [ ] Run assigned core/Node/Electron suites,fmt/clippy,diff/privacy/gitleaks. Record failures by name; no unrelated repairs without coordination. Commit after checks.
+- [ ] Run assigned focused baseline+retention Rust/Node suites,fmt and focused clippy,diff/privacy/gitleaks. Full npm check/Electron/GUI/Windows/SSH are not allocated; request parent allocation before broader verification. Record failures by name; no unrelated repairs without coordination. Commit after checks.
 
 ### Task 3: Review and parent handoff
 

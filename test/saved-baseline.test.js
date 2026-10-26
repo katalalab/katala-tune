@@ -199,3 +199,26 @@ test('registered saved Store entry reads a reopened synthetic database without m
     for (const bad of ['', 'x'.repeat(257), '\ud800']) assert.throws(()=>reopened.metricsBaseline(bad,'mem',NOW));
   } finally {reopened.db.close();fs.rmSync(dir,{recursive:true});}
 });
+
+test('oversized and malformed raw payloads are omitted; missing archives do not become zero', () => {
+  const db = fixture();
+  const put=db.prepare('INSERT INTO metrics_minute VALUES (?,?,60,?,NULL)');
+  put.run('fixture',END-H,'{broken');
+  put.run('fixture',END-H+M,JSON.stringify({mem:[20,20],pad:'x'.repeat(65536)}));
+  const r=readBaseline(db,'fixture','mem',NOW);
+  assert.equal(r.source.omitted_raw_rows,2);
+  assert.equal(r.coverage.accepted_hours,0);
+  db.close();
+});
+
+test('busy reads propagate an operational error and leave the connection reusable', () => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'baseline-busy-'));
+  const file=path.join(dir,'fixture.db');const db=fixture(file);const writer=new DatabaseSync(file);
+  try {
+    db.exec('PRAGMA journal_mode=DELETE');
+    writer.exec('BEGIN EXCLUSIVE');
+    assert.throws(()=>readBaseline(db,'fixture','mem',NOW),e=>e.errcode===5);
+    writer.exec('ROLLBACK');
+    assert.equal(readBaseline(db,'fixture','mem',NOW).source.state,'ready');
+  } finally {writer.close();db.close();fs.rmSync(dir,{recursive:true});}
+});
