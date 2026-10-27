@@ -145,10 +145,13 @@
     if (!a) return '';
     const u = a.update || {};
     const parts = [`${a.version}`, a.auto_update ? '自動更新オン' : '自動更新オフ'];
-    if (u.downloaded && u.downloaded !== a.version) parts.push(`${u.downloaded} を用意済み（ウィンドウを閉じると入れる）`);
-    else if (u.available && u.available !== a.version) parts.push(`${u.available} あり`);
-    else if (u.checked_at) parts.push(`最新（${ago(u.checked_at)}に確認）`);
-    if (u.error) parts.push(`確認できなかった: ${u.error}`);
+    // A persisted download is history, not proof that this process still has an update ready.
+    if (u.current && u.current !== a.version) parts.push('確認情報が古い');
+    else if (!u.current && (u.checked_at || u.available || u.downloaded || u.error)) parts.push('確認情報が不明');
+    else if (u.error) parts.push(`保存された更新エラー: ${u.error}`);
+    else if (u.available) parts.push(`保存された確認記録: ${u.available} あり${u.checked_at ? `（${ago(u.checked_at)}）` : ''}`);
+    else if (u.checked_at) parts.push(`保存された確認記録: 更新なし（${ago(u.checked_at)}）`);
+    else parts.push('確認記録なし');
     return parts.join('・');
   }
 
