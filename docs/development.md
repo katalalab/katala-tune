@@ -61,3 +61,9 @@ PR は3 OSのJS/Rustチェックを必須にし、チェック名を変えない
 レビュー画面は `task-completion.v1` の表示専用で、共通checkerやPRの現在headを照合しない。`config/review.example.json` は入力形の例であり、画面から保存・ネットワーク・承認操作は発生しない。coverageの3配列は合計10,000件までに拒否し、欠測は表示モデルでnull、画面では「未記載」と表示する。表示変更は `node --test test/review.test.js test/review-ui.test.js` で境界、表示、非同期読込を確認する。
 
 レビューした head SHA を固定し、CI・未解決会話・main の包含を再確認してマージする。配布は署名つき下書きから始める。署名・版の不一致、キャンセル、正常更新を確認し、公開後は実際の配布 URL と SHA256 を読み返す。[リリース手順](release.md) を参照。
+
+## Windows native CI 診断
+
+Windows の通常 workspace test は従来のバイナリと判定で実行する。その後、専用 target と `katala_ci_diagnostics` cfg で synthetic native 3役と Unicode linked-worktree fixture を別に各一回実行し、認証や Job の失敗を閉じた数値分類で観測する。通常テストの失敗後も診断を実行するが、これは別の試行であり、非再現なら元の失敗段階は不明のまま。正常な通常テストを診断結果で置き換えず、期限・identity・receipt・出力秘匿も変更しない。
+
+診断ログには `native_role` の固定名、経過時間、code、出力長だけを通す。数値の定義と予約コードは `crates/tune-core/src/topology/adapters/native_private_diagnostics.rs` にあり、0 は成功、2 は汎用拒否、124 は期限切れ。未知コードや証拠不足は診断上も汎用拒否として扱う。raw log は runner 上の一時ファイルに限定し、artifact に含めない。

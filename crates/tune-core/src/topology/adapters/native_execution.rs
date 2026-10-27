@@ -19,6 +19,46 @@ use std::{
 
 const CLEANUP_RESERVE: Duration = Duration::from_millis(3500);
 
+macro_rules! private_result {
+    ($stage:ident, $result:expr) => {{
+        let result = $result;
+        #[cfg(katala_ci_diagnostics)]
+        if result.is_err() {
+            super::native_private_diagnostics::record(super::native_private_diagnostics::Failure::Stage(super::native_private_diagnostics::Stage::$stage));
+        }
+        result
+    }};
+}
+
+#[cfg(katala_ci_diagnostics)]
+fn private_stop(result: &crate::collect::BoundedResult) -> super::native_private_diagnostics::Stop {
+    use super::native_private_diagnostics::Stop;
+    use crate::collect::ProcessStop;
+    match result.process_receipt.as_ref().map(|receipt| receipt.stop) {
+        None | Some(ProcessStop::SetupFailed) => Stop::SetupFailed,
+        Some(ProcessStop::SpawnFailed) => Stop::SpawnFailed,
+        Some(ProcessStop::Completed) => Stop::Completed,
+        Some(ProcessStop::Timeout) => Stop::Timeout,
+        Some(ProcessStop::OutputLimit) => Stop::OutputLimit,
+        Some(ProcessStop::LingeringDescendants) => Stop::LingeringDescendants,
+        Some(ProcessStop::IoFailure) => Stop::IoFailure,
+        Some(ProcessStop::CleanupUnconfirmed) => Stop::CleanupUnconfirmed,
+    }
+}
+
+#[cfg(katala_ci_diagnostics)]
+fn private_owned(role: super::native_private_diagnostics::Role, result: &crate::collect::BoundedResult) {
+    use super::native_private_diagnostics as diagnostic;
+    let receipt = result.process_receipt.as_ref();
+    diagnostic::record(diagnostic::child_failure(
+        role,
+        private_stop(result),
+        receipt.is_some_and(crate::collect::ProcessReceipt::cleanup_confirmed),
+        !result.timed_out && !result.output_limited && !result.spawn_failed,
+        receipt.and_then(|receipt| receipt.root_exit_code),
+    ));
+}
+
 fn validate_body(request: &ReaderRequest, exact_body: &[u8], deadline: Instant) -> Result<(), ReaderError> {
     if Instant::now() >= deadline || exact_body.len() > super::windows_reader::MAX_REQUEST_BYTES || exact_body.len() > request.limits.file_bytes {
         return Err(ReaderError);
@@ -44,6 +84,8 @@ impl GitRunner for FixedGitRunner {
         #[cfg(test)]
         let ordinal = diagnostics::begin_git(request.operation());
         if request.program() != self.approved_program {
+            #[cfg(katala_ci_diagnostics)]
+            super::native_private_diagnostics::record(super::native_private_diagnostics::Failure::Stage(super::native_private_diagnostics::Stage::GitProgram));
             return Err(NativeReaderError::Git);
         }
         // The same lease survives every metadata query and all final HEAD
@@ -65,6 +107,18 @@ impl GitRunner for FixedGitRunner {
                 policy,
             ))
             .map_err(|result| {
+                #[cfg(katala_ci_diagnostics)]
+                {
+                    use super::native_private_diagnostics as diagnostic;
+                    let operation = match request.operation() {
+                        GitOperation::GitDir => diagnostic::Operation::GitDir,
+                        GitOperation::CommonDir => diagnostic::Operation::CommonDir,
+                        GitOperation::Origin => diagnostic::Operation::Origin,
+                        GitOperation::Head => diagnostic::Operation::Head,
+                    };
+                    // Git exit codes are never decoded as helper diagnostics.
+                    diagnostic::record(diagnostic::Failure::Git(operation, private_stop(&result)));
+                }
                 #[cfg(test)]
                 diagnostics::git_result(ordinal, request.operation(), "execution_rejected", &result);
                 if result.timed_out {
@@ -80,6 +134,8 @@ impl GitRunner for FixedGitRunner {
         // The actual OS witness is consumed here. Public receipt fields never
         // authorize source admission, including the empty missing-origin case.
         let output = completion.into_verified_output(b"", self.pin.sha256()).map_err(|result| {
+            #[cfg(katala_ci_diagnostics)]
+            super::native_private_diagnostics::record(super::native_private_diagnostics::Failure::Stage(super::native_private_diagnostics::Stage::GitConsume));
             #[cfg(test)]
             diagnostics::git_result(ordinal, request.operation(), "consumption_rejected", &result);
             #[cfg(not(test))]
@@ -95,19 +151,34 @@ impl GitRunner for FixedGitRunner {
 pub fn execute_reader(request: &ReaderRequest, exact_body: &[u8], deadline: Instant) -> Result<Vec<u8>, ReaderError> {
     #[cfg(test)]
     diagnostics::stage("validate_body");
-    validate_body(request, exact_body, deadline)?;
+    private_result!(ReaderBody, validate_body(request, exact_body, deadline))?;
     #[cfg(test)]
     diagnostics::stage("pin_open");
-    let pin = PinnedWindowsExecutable::open(Path::new(&request.git_program), request.git_artifact_sha256.as_deref().ok_or(ReaderError)?, deadline)
-        .map_err(|_| ReaderError)?;
+    let artifact = private_result!(ReaderPin, request.git_artifact_sha256.as_deref().ok_or(ReaderError))?;
+    let pin = private_result!(ReaderPin, PinnedWindowsExecutable::open(Path::new(&request.git_program), artifact, deadline).map_err(|_| ReaderError))?;
     let source = native::windows::WindowsSourceIo::default();
     #[cfg(test)]
     diagnostics::stage("runtime_build");
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ReaderError)?;
+    let runtime = private_result!(ReaderRuntime, tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ReaderError))?;
     let git = FixedGitRunner { runtime, pin: Arc::new(pin), approved_program: request.git_program.clone() };
     #[cfg(test)]
     diagnostics::stage("collect");
     let capture = native::collect_with(&request.remote_request(), deadline, &source, &git).map_err(|error| {
+        #[cfg(katala_ci_diagnostics)]
+        {
+            use super::native_private_diagnostics as diagnostic;
+            let error = match error {
+                NativeReaderError::Unsupported => diagnostic::Source::Unsupported,
+                NativeReaderError::Policy => diagnostic::Source::Policy,
+                NativeReaderError::Limit => diagnostic::Source::Limit,
+                NativeReaderError::Timeout => diagnostic::Source::Timeout,
+                NativeReaderError::Source => diagnostic::Source::Source,
+                NativeReaderError::Utf8 => diagnostic::Source::Utf8,
+                NativeReaderError::Git => diagnostic::Source::Git,
+                NativeReaderError::Identity => diagnostic::Source::Identity,
+            };
+            diagnostic::record(diagnostic::Failure::Source(error));
+        }
         #[cfg(test)]
         diagnostics::source_failure(error);
         #[cfg(not(test))]
@@ -116,24 +187,25 @@ pub fn execute_reader(request: &ReaderRequest, exact_body: &[u8], deadline: Inst
     })?;
     #[cfg(test)]
     diagnostics::stage("capture_serialize");
-    let mut capture = serde_json::to_value(capture).map_err(|_| ReaderError)?;
-    capture.as_object_mut().ok_or(ReaderError)?.insert("runtime".into(), serde_json::json!({"kind":"native","platform":"windows","kernel_wsl":false}));
-    let bytes = serde_json::to_vec(&capture).map_err(|_| ReaderError)?;
+    let mut capture = private_result!(ReaderSerialize, serde_json::to_value(capture).map_err(|_| ReaderError))?;
+    private_result!(ReaderSerialize, capture.as_object_mut().ok_or(ReaderError))?
+        .insert("runtime".into(), serde_json::json!({"kind":"native","platform":"windows","kernel_wsl":false}));
+    let bytes = private_result!(ReaderSerialize, serde_json::to_vec(&capture).map_err(|_| ReaderError))?;
     #[cfg(test)]
     diagnostics::stage("capture_bounds");
     if bytes.len() > request.limits.stdout_bytes || Instant::now() >= deadline {
-        return Err(ReaderError);
+        return private_result!(ReaderBounds, Err(ReaderError));
     }
     #[cfg(test)]
     diagnostics::stage("reader_identity");
-    let identity = current_windows_process_identity().map_err(|_| ReaderError)?;
+    let identity = private_result!(ReaderIdentity, current_windows_process_identity().map_err(|_| ReaderError))?;
     #[cfg(test)]
     diagnostics::stage("processing_encode");
-    let result = protocol::encode_processing_response(request, exact_body, &identity, &bytes)?;
+    let result = private_result!(ReaderProtocol, protocol::encode_processing_response(request, exact_body, &identity, &bytes))?;
     #[cfg(test)]
     diagnostics::stage("response_deadline");
     if Instant::now() >= deadline {
-        return Err(ReaderError);
+        return private_result!(ReaderDeadline, Err(ReaderError));
     }
     Ok(result)
 }
@@ -159,16 +231,16 @@ fn pinned_self(program: &Path, artifact: &str, deadline: Instant) -> Result<Pinn
 
 /// Real inner observer. Its response describes inner exit; it cannot assert its own exit.
 pub fn supervise(request: &ReaderRequest, exact_body: &[u8], deadline: Instant, program: &Path, artifact: &str) -> Result<Vec<u8>, ReaderError> {
-    validate_body(request, exact_body, deadline)?;
-    let (work_end, budget) = child_budget(deadline)?;
-    let nonce = super::windows_reader::fresh_nonce()?;
-    let (derived, frame) = protocol::derive_inner(request, nonce, budget.min(request.budget_ms.saturating_sub(1)))?;
-    let pin = pinned_self(program, artifact, deadline)?;
+    private_result!(SuperviseBody, validate_body(request, exact_body, deadline))?;
+    let (work_end, budget) = private_result!(SuperviseBudget, child_budget(deadline))?;
+    let nonce = private_result!(SuperviseNonce, super::windows_reader::fresh_nonce())?;
+    let (derived, frame) = private_result!(SuperviseDerive, protocol::derive_inner(request, nonce, budget.min(request.budget_ms.saturating_sub(1))))?;
+    let pin = private_result!(SupervisePin, pinned_self(program, artifact, deadline))?;
     let mut command = Command::new(pin.executable());
     command.args(["topology-native-reader", "--budget-ms", &derived.budget_ms.to_string()]);
     let source = native::windows::WindowsSourceIo::default();
-    let environment = native::environment(&source).map_err(|_| ReaderError)?;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ReaderError)?;
+    let environment = private_result!(SuperviseEnvironment, native::environment(&source).map_err(|_| ReaderError))?;
+    let runtime = private_result!(SuperviseRuntime, tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ReaderError))?;
     let limit = request.limits.stdout_bytes.saturating_add(MAX_RESPONSE_HEADER_BYTES + 16);
     let completion = runtime
         .block_on(run_owned_standalone_windows_bounded(
@@ -180,14 +252,18 @@ pub fn supervise(request: &ReaderRequest, exact_body: &[u8], deadline: Instant, 
             limit,
             request.limits.stderr_bytes,
         ))
-        .map_err(|_| ReaderError)?;
-    let receipt = completion.diagnostic().process_receipt.clone().ok_or(ReaderError)?;
-    let inner = completion.into_verified_output(&frame, artifact).map_err(|_| ReaderError)?;
+        .map_err(|_result| {
+            #[cfg(katala_ci_diagnostics)]
+            private_owned(super::native_private_diagnostics::Role::Supervise, &_result);
+            ReaderError
+        })?;
+    let receipt = private_result!(SuperviseReceipt, completion.diagnostic().process_receipt.clone().ok_or(ReaderError))?;
+    let inner = private_result!(SuperviseConsume, completion.into_verified_output(&frame, artifact).map_err(|_| ReaderError))?;
     // Native code validates the exact original and derived request bindings;
     // ProcessReceipt here remains wire diagnostics, never a capability issuer.
-    let response = protocol::encode_outer_response(request, exact_body, &frame, &inner, &receipt, artifact)?;
+    let response = private_result!(SuperviseProtocol, protocol::encode_outer_response(request, exact_body, &frame, &inner, &receipt, artifact))?;
     if Instant::now() >= deadline {
-        return Err(ReaderError);
+        return private_result!(SuperviseDeadline, Err(ReaderError));
     }
     Ok(response)
 }
@@ -195,26 +271,27 @@ pub fn supervise(request: &ReaderRequest, exact_body: &[u8], deadline: Instant, 
 /// Independent actual outer observer for native acceptance. The opaque completion
 /// originates from this OS backend, then the wire codecs validate bound data.
 pub fn verify(request: &ReaderRequest, exact_body: &[u8], deadline: Instant, program: &Path, artifact: &str) -> Result<Vec<u8>, ReaderError> {
-    validate_body(request, exact_body, deadline)?;
-    let (work_end, budget) = child_budget(deadline)?;
+    private_result!(VerifyBody, validate_body(request, exact_body, deadline))?;
+    let (work_end, budget) = private_result!(VerifyBudget, child_budget(deadline))?;
     // The native acceptance observer derives its supervised attempt explicitly,
     // changing nonce/budget only. The outer OS deadline remains authoritative;
     // a child's startup-relative budget cannot extend it.
-    let (supervised, frame) = protocol::derive_inner(request, super::windows_reader::fresh_nonce()?, budget.min(request.budget_ms.saturating_sub(1)))?;
-    let pin = pinned_self(program, artifact, deadline)?;
+    let nonce = private_result!(VerifyDerive, super::windows_reader::fresh_nonce())?;
+    let (supervised, frame) = private_result!(VerifyDerive, protocol::derive_inner(request, nonce, budget.min(request.budget_ms.saturating_sub(1))))?;
+    let pin = private_result!(VerifyPin, pinned_self(program, artifact, deadline))?;
     let mut command = Command::new(pin.executable());
     command.args([
         "topology-supervise",
         "--budget-ms",
         &supervised.budget_ms.to_string(),
         "--reader-program",
-        program.to_str().ok_or(ReaderError)?,
+        private_result!(VerifyPin, program.to_str().ok_or(ReaderError))?,
         "--helper-sha256",
         artifact,
     ]);
     let source = native::windows::WindowsSourceIo::default();
-    let environment = native::environment(&source).map_err(|_| ReaderError)?;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ReaderError)?;
+    let environment = private_result!(VerifyEnvironment, native::environment(&source).map_err(|_| ReaderError))?;
+    let runtime = private_result!(VerifyRuntime, tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ReaderError))?;
     let limit = request.limits.stdout_bytes.saturating_add(2 * MAX_RESPONSE_HEADER_BYTES + 32);
     let completion = runtime
         .block_on(run_owned_standalone_windows_bounded(
@@ -226,12 +303,17 @@ pub fn verify(request: &ReaderRequest, exact_body: &[u8], deadline: Instant, pro
             limit,
             request.limits.stderr_bytes,
         ))
-        .map_err(|_| ReaderError)?;
-    let identity = completion.diagnostic().process_receipt.as_ref().and_then(|receipt| receipt.root.clone()).ok_or(ReaderError)?;
-    let bytes = completion.into_verified_output(&frame, artifact).map_err(|_| ReaderError)?;
-    let capture = protocol::decode_outer_response(&bytes, &supervised, &frame[16..], artifact, &identity)?.to_vec();
+        .map_err(|_result| {
+            #[cfg(katala_ci_diagnostics)]
+            private_owned(super::native_private_diagnostics::Role::Verify, &_result);
+            ReaderError
+        })?;
+    let identity =
+        private_result!(VerifyReceipt, completion.diagnostic().process_receipt.as_ref().and_then(|receipt| receipt.root.clone()).ok_or(ReaderError))?;
+    let bytes = private_result!(VerifyConsume, completion.into_verified_output(&frame, artifact).map_err(|_| ReaderError))?;
+    let capture = private_result!(VerifyProtocol, protocol::decode_outer_response(&bytes, &supervised, &frame[16..], artifact, &identity))?.to_vec();
     if Instant::now() >= deadline {
-        return Err(ReaderError);
+        return private_result!(VerifyDeadline, Err(ReaderError));
     }
     Ok(capture)
 }
