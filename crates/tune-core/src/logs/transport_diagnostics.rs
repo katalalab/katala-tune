@@ -121,7 +121,10 @@ async fn task_scopes_keep_different_exchanges_separate() {
 
 #[tokio::test]
 async fn controlled_spawn_and_stderr_encoding_are_closed_failures() {
-    let missing = crate::collect::command("katala-fixture-nonexistent-executable-9a7a94b1");
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let parent = std::env::temp_dir().join(format!("katala-absent-fixture-{}-{nonce}", std::process::id()));
+    assert!(!parent.exists(), "spawn fixture parent must not exist");
+    let missing = tokio::process::Command::new(parent.join("absent"));
     let (result, snapshot) = capture(super::transport::run(missing, b"synthetic", std::time::Duration::from_secs(5))).await;
     assert!(result.code.is_none() && result.out.is_empty());
     assert_eq!(result.err, "Windows log transport failed");
