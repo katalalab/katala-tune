@@ -5,7 +5,8 @@ function decode(buffer) {
   return buffer[0] === 0xff && buffer[1] === 0xfe ? buffer.subarray(2).toString('utf16le') : buffer.toString('utf8');
 }
 function report(text) {
-  return text.split(/\r?\n/).filter(line => observation.test(line)).slice(0, 3);
+  const prefix = 'test native_windows::native_three_entries_use_real_git_and_process_one_frame_without_eof ... ';
+  return text.split(/\r?\n/).map(line => line.startsWith(prefix) ? line.slice(prefix.length) : line).filter(line => observation.test(line)).slice(0, 3);
 }
 if (require.main === module) {
   try {

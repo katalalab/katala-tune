@@ -23,3 +23,9 @@ test('decodes Windows UTF-16 logs without exposing unrelated content', () => {
   const buffer = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(text, 'utf16le')]);
   assert.deepEqual(report(decode(buffer)), [text.split('\r\n')[0]]);
 });
+
+test('extracts the first observation when libtest prefixes its fixed test name', () => {
+  const line = 'native_role=topology-native-reader elapsed_ms=984 code=Some(0) stdout_len=1971 stderr_len=0';
+  assert.deepEqual(report(`test native_windows::native_three_entries_use_real_git_and_process_one_frame_without_eof ... ${line}`), [line]);
+  assert.deepEqual(report(`untrusted text ${line}`), []);
+});
