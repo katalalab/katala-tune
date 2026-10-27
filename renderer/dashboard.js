@@ -146,9 +146,11 @@
     const u = a.update || {};
     const parts = [`${a.version}`, a.auto_update ? '自動更新オン' : '自動更新オフ'];
     // A persisted download is history, not proof that this process still has an update ready.
-    if (u.error) parts.push(`確認できなかった: ${u.error}`);
-    else if (u.available && u.available !== a.version) parts.push(`${u.available} あり`);
-    else if (u.checked_at) parts.push(`最新（${ago(u.checked_at)}に確認）`);
+    if (u.current && u.current !== a.version) parts.push('確認情報が古い');
+    else if (!u.current && (u.checked_at || u.available || u.downloaded || u.error)) parts.push('確認情報が不明');
+    else if (u.error) parts.push(`更新エラー: ${u.error}`);
+    else if (u.available && u.available !== a.version) parts.push(`前回の確認記録: ${u.available} あり`);
+    else if (u.checked_at) parts.push(`前回の確認記録: 更新なし（${ago(u.checked_at)}）`);
     return parts.join('・');
   }
 

@@ -24,20 +24,33 @@ async function renderStatus(app) {
 }
 
 test('old downloaded version is not reported as a pending install after a no-update check', async () => {
-  const html = await renderStatus({version:'0.6.5-specs.8', auto_update:true, update:{available:null, downloaded:'0.6.4', checked_at:123}});
-  assert.match(html, /最新（直前に確認）/);
+  const html = await renderStatus({version:'0.6.5-specs.8', auto_update:true, update:{current:'0.6.5-specs.8', available:null, downloaded:'0.6.4', checked_at:123}});
+  assert.match(html, /前回の確認記録: 更新なし（直前）/);
   assert.doesNotMatch(html, /0\.6\.4 を用意済み|閉じると入れる/);
 });
 
 test('a previous download does not claim a pending install after auto update is switched off', async () => {
-  const html = await renderStatus({version:'0.6.4', auto_update:false, update:{available:'0.7.0', downloaded:'0.7.0', checked_at:123}});
+  const html = await renderStatus({version:'0.6.4', auto_update:false, update:{current:'0.6.4', available:'0.7.0', downloaded:'0.7.0', checked_at:123}});
   assert.match(html, /自動更新オフ/);
-  assert.match(html, /0\.7\.0 あり/);
+  assert.match(html, /前回の確認記録: 0\.7\.0 あり/);
   assert.doesNotMatch(html, /用意済み|閉じると入れる/);
 });
 
 test('a failed check does not report an earlier available version as current', async () => {
-  const html = await renderStatus({version:'0.6.4', auto_update:true, update:{available:'0.7.0', downloaded:'0.7.0', checked_at:123, error:'接続できません'}});
-  assert.match(html, /確認できなかった: 接続できません/);
+  const html = await renderStatus({version:'0.6.4', auto_update:true, update:{current:'0.6.4', available:'0.7.0', downloaded:'0.7.0', checked_at:123, error:'接続できません'}});
+  assert.match(html, /更新エラー: 接続できません/);
   assert.doesNotMatch(html, /0\.7\.0 あり|最新（/);
+});
+
+
+test('a previous version’s update result is not reported for the installed version', async () => {
+  const html = await renderStatus({version:'0.7.0', auto_update:true, update:{current:'0.6.4', available:'0.6.5', checked_at:123}});
+  assert.match(html, /確認情報が古い/);
+  assert.doesNotMatch(html, /0\.6\.5 あり|更新なし/);
+});
+
+test('a legacy update record without its originating version is not treated as current', async () => {
+  const html = await renderStatus({version:'0.7.0', auto_update:true, update:{available:null, checked_at:123}});
+  assert.match(html, /確認情報が不明/);
+  assert.doesNotMatch(html, /更新なし/);
 });
