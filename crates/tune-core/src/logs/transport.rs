@@ -13,6 +13,18 @@ const MAX_STDERR: usize = 64 * 1024;
 const FAILURE: &str = "Windows log transport failed";
 const INVALID: &str = "Invalid Windows log transport request";
 
+// In non-test builds this preserves the original result expression.
+macro_rules! diagnostic_result {
+    ($result:expr, $stage:ident) => {{
+        let result = $result;
+        #[cfg(test)]
+        if result.is_err() {
+            super::transport_diagnostics::fail(super::transport_diagnostics::Stage::$stage);
+        }
+        result
+    }};
+}
+
 #[derive(Debug, serde::Serialize, PartialEq, Eq)]
 pub(super) struct Transport {
     pub command: String,
@@ -58,30 +70,66 @@ async fn read_complete(pipe: impl AsyncRead + Unpin, limit: usize) -> std::io::R
 /// Release parser input only after stdin, both EOFs and exit 0 before deadline.
 pub(super) async fn run(mut command: Command, input: &[u8], timeout: Duration) -> RunResult {
     command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-    let Ok(mut child) = command.spawn() else { return failure() };
+    let Ok(mut child) = diagnostic_result!(command.spawn(), Spawn) else { return failure() };
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let deadline = tokio::time::Instant::now() + timeout;
     let exchange = async {
         let writer = async {
-            stdin.write_all(input).await?;
-            stdin.shutdown().await?;
+            diagnostic_result!(stdin.write_all(input).await, Write)?;
+            diagnostic_result!(stdin.shutdown().await, Shutdown)?;
             drop(stdin);
+            #[cfg(test)]
+            super::transport_diagnostics::completed(1);
             Ok::<_, std::io::Error>(())
         };
+        #[cfg(test)]
+        let read_out = async {
+            let result = diagnostic_result!(read_complete(stdout, MAX_STDOUT).await, StdoutRead)?;
+            #[cfg(test)]
+            super::transport_diagnostics::completed(2);
+            Ok::<_, std::io::Error>(result)
+        };
+        #[cfg(test)]
+        let read_err = async {
+            let result = diagnostic_result!(read_complete(stderr, MAX_STDERR).await, StderrRead)?;
+            #[cfg(test)]
+            super::transport_diagnostics::completed(4);
+            Ok::<_, std::io::Error>(result)
+        };
+        #[cfg(test)]
+        let wait = async {
+            let result = diagnostic_result!(child.wait().await, Wait)?;
+            #[cfg(test)]
+            super::transport_diagnostics::completed(8);
+            Ok::<_, std::io::Error>(result)
+        };
+        #[cfg(test)]
+        let (_, out, err, status) = tokio::try_join!(writer, read_out, read_err, wait)?;
+        #[cfg(not(test))]
         let (_, out, err, status) = tokio::try_join!(writer, read_complete(stdout, MAX_STDOUT), read_complete(stderr, MAX_STDERR), child.wait())?;
         if !status.success() {
+            #[cfg(test)]
+            super::transport_diagnostics::fail(super::transport_diagnostics::Stage::Exit);
             return Err(std::io::Error::other(FAILURE));
         }
-        let out = String::from_utf8(out).map_err(|_| std::io::Error::other(FAILURE))?;
-        let err = String::from_utf8(err).map_err(|_| std::io::Error::other(FAILURE))?;
+        let out = diagnostic_result!(String::from_utf8(out).map_err(|_| std::io::Error::other(FAILURE)), StdoutEncoding)?;
+        let err = diagnostic_result!(String::from_utf8(err).map_err(|_| std::io::Error::other(FAILURE)), StderrEncoding)?;
         Ok::<_, std::io::Error>(RunResult {
             code: Some(0),
             out: out.strip_prefix('\u{feff}').unwrap_or(&out).to_owned(),
             err: err.strip_prefix('\u{feff}').unwrap_or(&err).to_owned(),
         })
     };
+    #[cfg(test)]
+    match tokio::time::timeout_at(deadline, exchange).await {
+        Ok(Ok(result)) if tokio::time::Instant::now() <= deadline => return result,
+        Ok(Ok(_)) => super::transport_diagnostics::fail(super::transport_diagnostics::Stage::Late),
+        Err(_) => super::transport_diagnostics::fail(super::transport_diagnostics::Stage::Deadline),
+        _ => {}
+    }
+    #[cfg(not(test))]
     if let Ok(Ok(result)) = tokio::time::timeout_at(deadline, exchange).await
         && tokio::time::Instant::now() <= deadline
     {
@@ -197,7 +245,11 @@ mod tests {
         let script = "process.stdin.resume();let n=0;process.stdin.on('data',b=>n+=b.length);process.stdin.on('end',()=>process.stdout.write(JSON.stringify({bytes:n,text:'日本語'})));";
         let mut cmd = crate::collect::command("node");
         cmd.args(["-e", script]);
-        let result = run(cmd, &vec![b'x'; 20000], Duration::from_secs(5)).await;
+        let started = std::time::Instant::now();
+        let (result, snapshot) = super::super::transport_diagnostics::capture(run(cmd, &vec![b'x'; 20000], Duration::from_secs(5))).await;
+        if result.code.is_none() {
+            eprintln!("log_runner_stage={:?} completed={} elapsed_ms={}", snapshot.stage, snapshot.completed, started.elapsed().as_millis());
+        }
         assert_eq!(result.code, Some(0));
         assert_eq!(serde_json::from_str::<Value>(&result.out).unwrap(), json!({"bytes":20000,"text":"日本語"}));
         for script in [
