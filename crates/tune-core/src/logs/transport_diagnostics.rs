@@ -70,6 +70,7 @@ async fn controlled_nonzero_exit_is_reported_without_output() {
     cmd.args(["-e", "process.stdin.resume();process.stdin.on('end',()=>{process.stdout.write('{}');process.exitCode=7;});"]);
     let (result, snapshot) = capture(super::transport::run(cmd, b"synthetic", std::time::Duration::from_secs(5))).await;
     assert!(result.code.is_none() && result.out.is_empty());
+    assert_eq!(result.err, "Windows log transport failed");
     assert_eq!(snapshot.stage, Stage::Exit);
     assert_eq!(snapshot.completed, 15);
 }
@@ -116,4 +117,45 @@ async fn task_scopes_keep_different_exchanges_separate() {
     assert!(bad.0.code.is_none() && bad.0.out.is_empty());
     assert_eq!(bad.1.stage, Stage::Exit);
     assert_eq!(bad.1.completed, 15);
+}
+
+#[tokio::test]
+async fn controlled_spawn_and_stderr_encoding_are_closed_failures() {
+    let missing = crate::collect::command("katala-fixture-nonexistent-executable-9a7a94b1");
+    let (result, snapshot) = capture(super::transport::run(missing, b"synthetic", std::time::Duration::from_secs(5))).await;
+    assert!(result.code.is_none() && result.out.is_empty());
+    assert_eq!(result.err, "Windows log transport failed");
+    assert_eq!(snapshot.stage, Stage::Spawn);
+    let mut invalid = crate::collect::command("node");
+    invalid.args(["-e", "process.stdin.resume();process.stdin.on('end',()=>process.stderr.write(Buffer.from([255])));"]);
+    let (result, snapshot) = capture(super::transport::run(invalid, b"synthetic", std::time::Duration::from_secs(5))).await;
+    assert!(result.code.is_none() && result.out.is_empty());
+    assert_eq!(result.err, "Windows log transport failed");
+    assert_eq!(snapshot.stage, Stage::StderrEncoding);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_task_scopes_remain_separate() {
+    let make = |failed| {
+        tokio::spawn(async move {
+            let mut cmd = crate::collect::command("node");
+            let script = if failed {
+                "process.stdin.resume();process.stdin.on('end',()=>process.exitCode=7);"
+            } else {
+                "process.stdin.resume();process.stdin.on('end',()=>process.stdout.write('{}'));"
+            };
+            cmd.args(["-e", script]);
+            capture(super::transport::run(cmd, b"synthetic", std::time::Duration::from_secs(5))).await
+        })
+    };
+    let success = make(false);
+    let failure = make(true);
+    let (success, failure) = tokio::join!(success, failure);
+    let (success, good) = success.unwrap();
+    let (failure, bad) = failure.unwrap();
+    assert_eq!(success.code, Some(0));
+    assert_eq!(good.stage, Stage::Unknown);
+    assert!(failure.code.is_none() && failure.out.is_empty());
+    assert_eq!(failure.err, "Windows log transport failed");
+    assert_eq!(bad.stage, Stage::Exit);
 }
