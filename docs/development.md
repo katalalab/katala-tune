@@ -64,6 +64,6 @@ PR は3 OSのJS/Rustチェックを必須にし、チェック名を変えない
 
 ## Windows native CI 診断
 
-Windows の通常 workspace test は従来のバイナリと判定で実行する。その後、専用 target と `katala_ci_diagnostics` cfg で synthetic native 3役 fixture を別に一回実行し、認証や Job の失敗を閉じた数値分類で観測する。通常テストの失敗後も診断を実行するが、これは別の試行であり、非再現なら元の失敗段階は不明のまま。正常な通常テストを診断結果で置き換えず、期限・identity・receipt・出力秘匿も変更しない。
+Windows の通常 workspace test は従来のバイナリと判定で実行する。その後、専用 target と `katala_ci_diagnostics` cfg で synthetic native 3役と Unicode linked-worktree fixture を別に各一回実行し、認証や Job の失敗を閉じた数値分類で観測する。通常テストの失敗後も診断を実行するが、これは別の試行であり、非再現なら元の失敗段階は不明のまま。正常な通常テストを診断結果で置き換えず、期限・identity・receipt・出力秘匿も変更しない。
 
 診断ログには `native_role` の固定名、経過時間、code、出力長だけを通す。数値の定義と予約コードは `crates/tune-core/src/topology/adapters/native_private_diagnostics.rs` にあり、0 は成功、2 は汎用拒否、124 は期限切れ。未知コードや証拠不足は診断上も汎用拒否として扱う。raw log は runner 上の一時ファイルに限定し、artifact に含めない。

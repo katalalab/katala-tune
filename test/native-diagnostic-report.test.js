@@ -29,3 +29,8 @@ test('extracts the first observation when libtest prefixes its fixed test name',
   assert.deepEqual(report(`test native_windows::native_three_entries_use_real_git_and_process_one_frame_without_eof ... ${line}`), [line]);
   assert.deepEqual(report(`untrusted text ${line}`), []);
 });
+
+test('extracts the verifier observation from the fixed Unicode fixture prefix', () => {
+  const line = 'native_role=topology-verify elapsed_ms=3179 code=Some(206) stdout_len=0 stderr_len=0';
+  assert.deepEqual(report(`test native_windows::native_verify_preserves_real_unicode_linked_worktree_and_git_metadata ... ${line}`), [line]);
+});

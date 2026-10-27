@@ -110,17 +110,20 @@ jobs:
             local name="$1" status expected
             shift
             if "$@" > "$RUNNER_TEMP/native-diagnostic-$name.log" 2>&1; then status=0; else status=$?; fi
-            case "$name" in contracts) expected=7 ;; controlled) expected=2 ;; fixture) expected=1 ;; *) return 1 ;; esac
+            case "$name" in contracts) expected=7 ;; controlled) expected=3 ;; fixture|unicode) expected=1 ;; *) return 1 ;; esac
             if [ "$status" -eq 0 ] && ! grep -Eq "^test result: ok\. $expected passed; 0 failed;" "$RUNNER_TEMP/native-diagnostic-$name.log"; then status=1; fi
             printf 'native_diagnostic_case=%s exit=%s\n' "$name" "$status"
-            if [ "$name" = fixture ]; then
+            if [ "$name" = fixture ] || [ "$name" = unicode ]; then
               node scripts/native-diagnostic-report.js "$RUNNER_TEMP/native-diagnostic-$name.log" || return 1
             fi
             return "$status"
           }
           run_case contracts cargo test -p tune-core --lib --locked topology::adapters::native_private_diagnostics::tests -- --test-threads=1 || exit 1
           run_case controlled cargo test -p tune-cli --test topology_native --locked native_windows::ci_diagnostic_reports_ -- --test-threads=1 || exit 1
-          run_case fixture cargo test -p tune-cli --test topology_native --locked native_windows::native_three_entries_use_real_git_and_process_one_frame_without_eof -- --exact --nocapture
+          result=0
+          run_case fixture cargo test -p tune-cli --test topology_native --locked native_windows::native_three_entries_use_real_git_and_process_one_frame_without_eof -- --exact --nocapture || result=1
+          run_case unicode cargo test -p tune-cli --test topology_native --locked native_windows::native_verify_preserves_real_unicode_linked_worktree_and_git_metadata -- --exact --nocapture || result=1
+          exit "$result"
       - name: Tauri アプリのリンクを検証
         if: runner.os != 'Linux'
         run: cargo build --package katala-tune --locked
