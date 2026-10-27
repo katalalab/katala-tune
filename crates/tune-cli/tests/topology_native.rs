@@ -355,6 +355,22 @@ mod native_windows {
         fixture.assert_private_state_absent();
     }
 
+    #[cfg(katala_ci_diagnostics)]
+    #[test]
+    fn ci_diagnostic_reports_nested_reader_pin_rejection_without_output() {
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = Fixture::new(MANIFEST.to_vec());
+        let before = fixture.snapshot();
+        let mut request = fixture.request(30_000);
+        request.git_artifact_sha256 = Some("0".repeat(64));
+        let (_, digest) = artifact();
+        let (output, _, _) = run(&fixture, "topology-supervise", &request, false, &digest);
+        assert_eq!(output.status.code(), Some(51), "nested reader pin-stage rejection code");
+        assert!(output.stdout.is_empty() && output.stderr.is_empty(), "failure must withhold output");
+        assert!(fixture.snapshot() == before, "fixture must remain unchanged");
+        fixture.assert_private_state_absent();
+    }
+
     #[test]
     fn native_three_entries_use_real_git_and_process_one_frame_without_eof() {
         let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

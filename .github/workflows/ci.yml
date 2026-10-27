@@ -117,7 +117,7 @@ jobs:
             return "$status"
           }
           run_case contracts cargo test -p tune-core --lib --locked topology::adapters::native_private_diagnostics::tests -- --test-threads=1 || exit 1
-          run_case controlled cargo test -p tune-cli --test topology_native --locked native_windows::ci_diagnostic_reports_supervisor_pin_rejection_without_output -- --exact || exit 1
+          run_case controlled cargo test -p tune-cli --test topology_native --locked native_windows::ci_diagnostic_reports_ -- --test-threads=1 || exit 1
           run_case fixture cargo test -p tune-cli --test topology_native --locked native_windows::native_three_entries_use_real_git_and_process_one_frame_without_eof -- --exact --nocapture
       - name: Tauri アプリのリンクを検証
         if: runner.os != 'Linux'
