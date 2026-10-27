@@ -148,9 +148,10 @@
     // A persisted download is history, not proof that this process still has an update ready.
     if (u.current && u.current !== a.version) parts.push('確認情報が古い');
     else if (!u.current && (u.checked_at || u.available || u.downloaded || u.error)) parts.push('確認情報が不明');
-    else if (u.error) parts.push(`更新エラー: ${u.error}`);
-    else if (u.available && u.available !== a.version) parts.push(`前回の確認記録: ${u.available} あり`);
-    else if (u.checked_at) parts.push(`前回の確認記録: 更新なし（${ago(u.checked_at)}）`);
+    else if (u.error) parts.push(`保存された更新エラー: ${u.error}`);
+    else if (u.available) parts.push(`保存された確認記録: ${u.available} あり${u.checked_at ? `（${ago(u.checked_at)}）` : ''}`);
+    else if (u.checked_at) parts.push(`保存された確認記録: 更新なし（${ago(u.checked_at)}）`);
+    else parts.push('確認記録なし');
     return parts.join('・');
   }
 
