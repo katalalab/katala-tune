@@ -88,6 +88,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo test
+        id: workspace_test
         shell: bash
         run: |
           if [ "$RUNNER_OS" = Windows ]; then
@@ -97,6 +98,27 @@ jobs:
           else
             cargo test --workspace --locked --no-fail-fast
           fi
+      # Separate diagnostic attempt: it cannot classify a prior non-reproduced failure.
+      - name: Windows native diagnostic fixture
+        if: ${{ !cancelled() && runner.os == 'Windows' && (steps.workspace_test.outcome == 'success' || steps.workspace_test.outcome == 'failure') }}
+        shell: bash
+        env:
+          RUSTFLAGS: --cfg katala_ci_diagnostics
+          CARGO_TARGET_DIR: ${{ runner.temp }}/katala-native-diagnostic-target
+        run: |
+          run_case() {
+            local name="$1" status
+            shift
+            if "$@" > "$RUNNER_TEMP/native-diagnostic-$name.log" 2>&1; then status=0; else status=$?; fi
+            printf 'native_diagnostic_case=%s exit=%s\n' "$name" "$status"
+            if [ "$name" = fixture ]; then
+              node scripts/native-diagnostic-report.js "$RUNNER_TEMP/native-diagnostic-$name.log" || return 1
+            fi
+            return "$status"
+          }
+          run_case contracts cargo test -p tune-core --lib --locked topology::adapters::native_private_diagnostics::tests -- --test-threads=1 || exit 1
+          run_case controlled cargo test -p tune-cli --test topology_native --locked native_windows::ci_diagnostic_reports_supervisor_pin_rejection_without_output -- --exact || exit 1
+          run_case fixture cargo test -p tune-cli --test topology_native --locked native_windows::native_three_entries_use_real_git_and_process_one_frame_without_eof -- --exact --nocapture
       - name: Tauri アプリのリンクを検証
         if: runner.os != 'Linux'
         run: cargo build --package katala-tune --locked
