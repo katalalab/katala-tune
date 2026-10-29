@@ -952,9 +952,14 @@ async function renderActions() {
     ${log.length ? UI.table({
       cols: [{ label: '日時' }, { label: '機体' }, { label: '操作' }, { label: '', cls: 'acts' }],
       rows: log,
-      row: (a) => `<td class="muted nowrap">${esc(fmtTime(a.at))}</td><td class="nowrap"><b>${esc(a.node_id)}</b></td>`
-        + `<td><div class="act-title">${a.state === 'incomplete' ? UI.chip('未完了', 'orange', { dot: true }) : a.ok ? UI.chip('成功', 'green', { dot: true }) : UI.chip('失敗', 'red', { dot: true })}<span>${esc(a.label)}</span></div>${a.output ? `<div class="act-out">${esc(a.output)}</div>` : ''}</td>`
-        + `<td class="acts">${a.undo && !log.some((b) => b.undo_of === a.id && b.ok) ? `<button class="btn small" data-undo="${esc(a.id)}">元に戻す</button>` : a.undo ? UI.chip('戻し済み', 'gray') : a.undo_of ? UI.chip('戻し', 'default') : ''}</td>`,
+      row: (a) => {
+        const requested = a.type === 'ai-handoff' && a.state !== 'incomplete' && a.ok;
+        // 旧記録の本文は保存されたまま、画面では当時確認できた範囲に言い換える。
+        const output = requested ? (a.output || '').replace(/^(Codex|Claude Code) を新しいターミナルで開いた/, '$1 用のターミナルの起動を要求した。CLI の起動は未確認') : a.output;
+        return `<td class="muted nowrap">${esc(fmtTime(a.at))}</td><td class="nowrap"><b>${esc(a.node_id)}</b></td>`
+          + `<td><div class="act-title">${a.state === 'incomplete' ? UI.chip('未完了', 'orange', { dot: true }) : a.ok ? UI.chip(requested ? '起動要求済み' : '成功', 'green', { dot: true }) : UI.chip('失敗', 'red', { dot: true })}<span>${esc(a.label)}</span></div>${output ? `<div class="act-out">${esc(output)}</div>` : ''}</td>`
+          + `<td class="acts">${a.undo && !log.some((b) => b.undo_of === a.id && b.ok) ? `<button class="btn small" data-undo="${esc(a.id)}">元に戻す</button>` : a.undo ? UI.chip('戻し済み', 'gray') : a.undo_of ? UI.chip('戻し', 'default') : ''}</td>`;
+      },
     }) : UI.empty('まだ何も実行していません。所見の提案から実行すると、ここに残ります。')}`);
   $$('[data-undo]').forEach((b) => {
     b.onclick = async () => { const r = await window.tune.undo(b.dataset.undo); toast(r.ok ? '元に戻しました' : r.refused || (r.cancelled ? '取り消しました' : `失敗: ${r.output}`)); renderActions(); };
@@ -975,7 +980,7 @@ async function handoff(n, f, agent) {
   const audit = r.audit_error ? `（実行記録を書けませんでした: ${r.audit_error}）` : '';
   if (r.cancelled) return toast(`取り消しました${audit}`, r.audit_error ? 10000 : 3200);
   if (!r.ok) return toast(`開きませんでした: ${r.refused}${audit}`, 5000);
-  toast(`${agent === 'codex' ? 'Codex' : 'Claude Code'} を新しいターミナルで開きました（実行記録に残しました）`, 5000);
+  toast(`ターミナルの起動を要求しました。${agent === 'codex' ? 'Codex' : 'Claude Code'} の起動はターミナルで確認してください（実行記録に残しました）`, 10000);
 }
 
 // ---- 分析・同期 ----

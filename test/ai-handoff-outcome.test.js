@@ -44,6 +44,10 @@ test('cancellation shows audit write failure as well as the cancellation', async
   assert.match(message, /記録/);
 });
 
-test('a recorded success retains the normal handoff notification', async () => {
-  assert.match(await outcome({ ok: true }), /Codex.*ターミナル.*記録に残しました/);
+test('a successful terminal request asks the user to verify CLI startup', async () => {
+  const message = await outcome({ ok: true });
+  assert.match(message, /ターミナル.*起動.*要求/);
+  assert.match(message, /Codex.*起動.*確認/);
+  assert.match(message, /実行記録/);
+  assert.doesNotMatch(message, /Codex を新しいターミナルで開きました/);
 });
