@@ -285,7 +285,7 @@ impl Engine {
             Err(e) => return json!({"ok": false, "refused": format!("実行記録を書けないので開かない: {e}"), "launch_requested": false}),
         };
         let (ok, output) = match launch(&dir, &p.prompt, agent) {
-            Ok(()) => (true, format!("{} を新しいターミナルで開いた（{}）", agent.label(), dir.display())),
+            Ok(()) => (true, format!("{} 用のターミナルの起動を要求した。CLI の起動は未確認（{}）", agent.label(), dir.display())),
             Err(e) => (false, format!("開けなかった: {e}")),
         };
         let audit_error = match self.with_db(|d| d.finish_action(&id, ok, &output, None)) {
