@@ -1,8 +1,12 @@
 //! Finite Windows log exchange, independent of action/probe controllers.
+#[cfg(any(not(windows), test))]
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+#[cfg(not(windows))]
+use tokio::io::AsyncWriteExt;
+#[cfg(any(not(windows), test))]
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use crate::collect::RunResult;
@@ -46,6 +50,7 @@ pub(super) fn windows_script_transport(script: &[u8], kind: &str, cursors: [&str
     Ok(Transport { command, bootstrap, input })
 }
 
+#[cfg(any(not(windows), test))]
 async fn read_complete(pipe: impl AsyncRead + Unpin, limit: usize) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     pipe.take(limit as u64 + 1).read_to_end(&mut bytes).await?;
@@ -56,6 +61,7 @@ async fn read_complete(pipe: impl AsyncRead + Unpin, limit: usize) -> std::io::R
 }
 
 /// Release parser input only after stdin, both EOFs and exit 0 before deadline.
+#[cfg(not(windows))]
 pub(super) async fn run(mut command: Command, input: &[u8], timeout: Duration) -> RunResult {
     command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     let Ok(mut child) = command.spawn() else { return failure() };
@@ -90,6 +96,24 @@ pub(super) async fn run(mut command: Command, input: &[u8], timeout: Duration) -
     let _ = child.start_kill();
     let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
     failure()
+}
+
+/// On Windows, use cancellable pipe I/O and the existing owned-Job lifecycle.
+#[cfg(windows)]
+pub(super) async fn run(command: Command, input: &[u8], timeout: Duration) -> RunResult {
+    use crate::collect::ProcessStop;
+    let Some(deadline) = std::time::Instant::now().checked_add(timeout) else { return failure() };
+    let result = crate::collect::run_windows_log_bounded(command.into_std(), input, deadline, MAX_STDOUT, MAX_STDERR).await;
+    if result.code != Some(0)
+        || result.timed_out
+        || result.output_limited
+        || result.spawn_failed
+        || !result.process_receipt.as_ref().is_some_and(|receipt| receipt.stop == ProcessStop::Completed && receipt.cleanup_confirmed())
+    {
+        return failure();
+    }
+    let (Ok(out), Ok(err)) = (String::from_utf8(result.stdout), String::from_utf8(result.stderr)) else { return failure() };
+    RunResult { code: Some(0), out: out.strip_prefix('\u{feff}').unwrap_or(&out).to_owned(), err: err.strip_prefix('\u{feff}').unwrap_or(&err).to_owned() }
 }
 
 fn failure() -> RunResult {
@@ -213,6 +237,131 @@ mod tests {
             let result = run(cmd, &vec![b'x'; 20000], Duration::from_millis(500)).await;
             assert!(result.code.is_none() && result.out.is_empty());
             assert_eq!(result.err, FAILURE);
+        }
+    }
+
+    // A separate supervisor owns the whole fixture tree, including on RED.
+    // It uses the existing native guard only in a fresh single-spawner process.
+    #[cfg(windows)]
+    #[test]
+    fn windows_log_runner_returns_when_a_descendant_keeps_pipes_open() {
+        struct Fixture(std::process::Child);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let until = std::time::Instant::now() + Duration::from_secs(1);
+                while std::time::Instant::now() < until {
+                    if !matches!(self.0.try_wait(), Ok(None)) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+
+        let name = "logs::transport::tests::windows_log_supervisor_fixture";
+        let mut fixture = Fixture(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--test-threads=1", "--", "--log-supervisor"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(18);
+        loop {
+            if let Some(status) = fixture.0.try_wait().unwrap() {
+                assert!(status.success(), "isolated log transport fixture failed: {status}");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "isolated log transport fixture did not finish");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_log_supervisor_fixture() {
+        if !std::env::args().any(|arg| arg == "--log-supervisor") {
+            return;
+        }
+        use crate::collect::{ProcessStop, StandaloneWindowsEnvironment, run_standalone_windows_bounded};
+        let exe = std::env::current_exe().unwrap();
+        let mut command = std::process::Command::new(exe);
+        command.args(["--exact", "logs::transport::tests::windows_log_exchange_fixture", "--nocapture", "--test-threads=1", "--", "--log-exchange"]);
+        let environment: Vec<_> =
+            ["SystemRoot", "WINDIR"].into_iter().filter_map(|key| std::env::var_os(key).map(|value| (std::ffi::OsString::from(key), value))).collect();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let result = runtime.block_on(run_standalone_windows_bounded(
+            &command,
+            StandaloneWindowsEnvironment::new(&environment),
+            b"",
+            std::time::Instant::now() + Duration::from_secs(8),
+            65536,
+            65536,
+        ));
+        assert_eq!(result.code, Some(0), "transport fixture failed or did not complete");
+        assert!(result.process_receipt.is_some_and(|receipt| receipt.stop == ProcessStop::Completed && receipt.cleanup_confirmed()));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_log_exchange_fixture() {
+        if !std::env::args().any(|arg| arg == "--log-exchange") {
+            return;
+        }
+        // Prove the pipe-holding descendant starts before the deadline. The
+        // fixture-only listener binds to loopback and carries one synthetic byte.
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut bystander = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "logs::transport::tests::windows_log_descendant_fixture", "--nocapture", "--test-threads=1", "--", "--log-descendant-sleep"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "logs::transport::tests::windows_log_descendant_fixture", "--nocapture", "--test-threads=1", "--", "--log-spawn-descendant"]);
+        command.env("KATALA_LOG_FIXTURE_PORT", port.to_string());
+        let ready = async {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept()).await.unwrap().unwrap();
+            let mut marker = [0];
+            stream.read_exact(&mut marker).await.unwrap();
+            assert_eq!(marker, [1]);
+        };
+        let (result, ()) = tokio::join!(run(command, b"", Duration::from_secs(2)), ready);
+        let bystander_alive = bystander.try_wait().unwrap().is_none();
+        if bystander_alive {
+            let _ = bystander.kill();
+        }
+        let _ = bystander.wait();
+        assert!(bystander_alive, "the separate fixture process must not be terminated");
+        assert_eq!(result.code, None);
+        assert!(result.out.is_empty());
+        assert_eq!(result.err, FAILURE);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(clippy::zombie_processes)] // The supervisor's owned Job terminates the deliberate descendant on RED.
+    fn windows_log_descendant_fixture() {
+        if std::env::args().any(|arg| arg == "--log-descendant-sleep") {
+            if let Ok(port) = std::env::var("KATALA_LOG_FIXTURE_PORT") {
+                let port = port.parse::<u16>().unwrap();
+                std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap().write_all(&[1]).unwrap();
+            }
+            std::thread::sleep(Duration::from_secs(60));
+        } else if std::env::args().any(|arg| arg == "--log-spawn-descendant") {
+            let _descendant = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "logs::transport::tests::windows_log_descendant_fixture", "--nocapture", "--test-threads=1", "--", "--log-descendant-sleep"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            std::process::exit(0);
         }
     }
 

@@ -7,6 +7,7 @@ use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
@@ -18,7 +19,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use windows_sys::Win32::{
-    Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{
+        ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    },
     Globalization::{CSTR_EQUAL, CSTR_LESS_THAN, CompareStringOrdinal},
     Security::{
         Authorization::{ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
@@ -27,19 +30,21 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, GetFullPathNameW, OPEN_EXISTING},
     System::{
+        Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next},
         JobObjects::{
-            CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
-            SetInformationJobObject, TerminateJobObject,
+            AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
+            QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
         },
         Pipes::GetNamedPipeClientProcessId,
         RemoteDesktop::ProcessIdToSessionId,
         SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW},
         Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-            GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, GetProcessTimes, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-            OpenProcess, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,
-            ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+            GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, GetProcessIdOfThread, GetProcessTimes, InitializeProcThreadAttributeList,
+            LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenProcessToken, OpenThread, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+            PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, THREAD_QUERY_LIMITED_INFORMATION,
+            THREAD_SUSPEND_RESUME, UpdateProcThreadAttribute, WaitForSingleObject,
         },
     },
 };
@@ -197,7 +202,7 @@ struct Pipe {
     server: NamedPipeServer,
     client: OwnedHandle,
 }
-fn pipe(session: &str, label: &str, to_child: bool, security: &LocalAllocation) -> io::Result<Pipe> {
+fn pipe(session: &str, label: &str, to_child: bool, security: &LocalAllocation, inheritable: bool) -> io::Result<Pipe> {
     let name = OsString::from(format!(r"\\.\pipe\katala-tune-{session}-{label}"));
     let attrs = SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: security.0, bInheritHandle: 0 };
     let mut options = ServerOptions::new();
@@ -205,8 +210,8 @@ fn pipe(session: &str, label: &str, to_child: bool, security: &LocalAllocation) 
     // SAFETY: security descriptor and aligned attributes remain live throughout pipe creation. Parent server is non-inheritable.
     let server = unsafe { options.create_with_security_attributes_raw(&name, std::ptr::from_ref(&attrs).cast_mut().cast()) }?;
     let name = wide(&name)?;
-    let child_attrs = SECURITY_ATTRIBUTES { bInheritHandle: 1, ..attrs };
-    // SAFETY: our private, single-instance server already exists. Only this synchronous client endpoint is inheritable.
+    let child_attrs = SECURITY_ATTRIBUTES { bInheritHandle: i32::from(inheritable), ..attrs };
+    // SAFETY: our private, single-instance server already exists. Only standalone spawn uses an inheritable client.
     let raw = unsafe {
         CreateFileW(
             name.as_ptr(),
@@ -891,6 +896,77 @@ fn spawn_owned(context: SpawnContext<'_>, job: &Job, stdio: [&OwnedHandle; 3], s
     Ok((Process { handle, identity }, thread))
 }
 
+// EXPERIMENT ONLY: Rust's process-creation lock does not coordinate with native
+// libraries, and process assignment below is not atomic with creation. This
+// approach must not be integrated as an application-safe boundary.
+fn spawn_suspended(
+    mut command: std::process::Command,
+    job: &Job,
+    [stdin, stdout, stderr]: [OwnedHandle; 3],
+    deadline: Instant,
+    spawn_failed: &mut bool,
+) -> io::Result<(Process, OwnedHandle)> {
+    use std::process::Stdio;
+    command.stdin(Stdio::from(stdin)).stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr)).creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+    if Instant::now() >= deadline {
+        return Err(io::Error::from(io::ErrorKind::TimedOut));
+    }
+    let spawned = command.spawn();
+    // Command retains its configured client handles after spawn. They must be
+    // closed before awaiting EOF, whether spawn succeeds or fails.
+    drop(command);
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            *spawn_failed = true;
+            return Err(error);
+        }
+    };
+    let pid = child.id();
+    // SAFETY: the retained handle belongs to the newly created, suspended
+    // root; assign it only to this invocation's fresh Job, before resuming it.
+    if unsafe { AssignProcessToJobObject(job.handle.as_raw_handle(), child.as_raw_handle()) } == 0 {
+        let error = os_error();
+        let _ = child.kill(); // Only a request; exit is not confirmed here.
+        return Err(error);
+    }
+    let handle = OwnedHandle::from(child);
+    let identity = identity(&handle, pid)?;
+    let thread = only_suspended_thread(pid)?;
+    Ok((Process { handle, identity }, thread))
+}
+
+fn only_suspended_thread(pid: u32) -> io::Result<OwnedHandle> {
+    // SAFETY: snapshot handle is fresh and owned; it does not alter any process.
+    let snapshot = owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) })?;
+    let mut entry = THREADENTRY32 { dwSize: size_of::<THREADENTRY32>() as u32, ..Default::default() };
+    // SAFETY: the snapshot and correctly sized entry remain live during enumeration.
+    let mut found = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) };
+    let mut thread = None;
+    while found != 0 {
+        if entry.th32OwnerProcessID == pid {
+            if thread.is_some() {
+                return Err(invalid());
+            }
+            // SAFETY: this only opens an observed thread; the process identity is
+            // checked on the opened object before it can ever be resumed.
+            let candidate = owned(unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION, 0, entry.th32ThreadID) })?;
+            // SAFETY: candidate is retained; pid is the still-retained child.
+            if unsafe { GetProcessIdOfThread(candidate.as_raw_handle()) } != pid {
+                return Err(invalid());
+            }
+            thread = Some(candidate);
+        }
+        // SAFETY: same retained snapshot and initialized entry.
+        found = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) };
+    }
+    let error = os_error();
+    if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+        return Err(error);
+    }
+    thread.ok_or_else(invalid)
+}
+
 #[derive(Default)]
 struct PipeOutput {
     bytes: Vec<u8>,
@@ -984,6 +1060,11 @@ impl CleanupState {
     }
 }
 
+enum Spawn<'a> {
+    Standalone { command: &'a std::process::Command, environment: &'a [(OsString, OsString)], pin: Option<&'a PinnedWindowsExecutable> },
+    Concurrent(std::process::Command),
+}
+
 pub(super) async fn run(
     command: &std::process::Command,
     environment: &[(OsString, OsString)],
@@ -992,7 +1073,20 @@ pub(super) async fn run(
     stdout_limit: usize,
     stderr_limit: usize,
 ) -> BoundedResult {
-    run_inner(command, environment, input, deadline, stdout_limit, stderr_limit, None).await.0
+    run_inner(Spawn::Standalone { command, environment, pin: None }, input, deadline, stdout_limit, stderr_limit).await.0
+}
+
+/// Experimental transport; it does not meet the standalone guard's boundary.
+/// Startup, assignment, and thread enumeration are synchronous and cannot be
+/// preempted by the async deadline. Never treat this as a production fix.
+pub(crate) async fn run_log(
+    command: std::process::Command,
+    input: &[u8],
+    deadline: std::time::Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> BoundedResult {
+    run_inner(Spawn::Concurrent(command), input, deadline, stdout_limit, stderr_limit).await.0
 }
 
 // No constructor, serde, Clone or conversion from public diagnostic data exists.
@@ -1094,7 +1188,7 @@ pub(super) async fn run_owned_shared(
         // extend it between pinning and actual process creation.
         return Err(BoundedResult { process_receipt: Some(ProcessReceipt::default()), ..Default::default() });
     }
-    let (answer, job) = run_inner(command, environment, input, deadline, stdout_limit, stderr_limit, Some(&pin)).await;
+    let (answer, job) = run_inner(Spawn::Standalone { command, environment, pin: Some(&pin) }, input, deadline, stdout_limit, stderr_limit).await;
     #[cfg(test)]
     let missing_origin_policy = matches!(&exit_policy, WindowsMetadataExitPolicy::MissingOrigin);
     if !metadata_exit_allowed(&answer, exit_policy)
@@ -1132,15 +1226,7 @@ pub(super) async fn run_owned_shared(
     Ok(OwnedWindowsCompletion { answer, witness: WindowsOsExitWitness { _job: job, pin, input_sha256, stdout_sha256, artifact_sha256, deadline } })
 }
 
-async fn run_inner(
-    command: &std::process::Command,
-    environment: &[(OsString, OsString)],
-    input: &[u8],
-    deadline: std::time::Instant,
-    stdout_limit: usize,
-    stderr_limit: usize,
-    pin: Option<&PinnedWindowsExecutable>,
-) -> (BoundedResult, Option<Job>) {
+async fn run_inner(spawn: Spawn<'_>, input: &[u8], deadline: std::time::Instant, stdout_limit: usize, stderr_limit: usize) -> (BoundedResult, Option<Job>) {
     let mut answer = BoundedResult::default();
     let mut receipt = ProcessReceipt::default();
     let deadline = Instant::from_std(deadline);
@@ -1154,24 +1240,36 @@ async fn run_inner(
             receipt.owner_session = nonce()?;
             // SAFETY: current process pseudo-handle is borrowed for read-only identity, never closed.
             receipt.owner = Some(identity_raw(unsafe { GetCurrentProcess() }, unsafe { GetCurrentProcessId() })?);
+            let inheritable = matches!(&spawn, Spawn::Standalone { .. });
             let (input_pipe, stdout, stderr) = {
                 let security = pipe_security()?;
                 (
-                    pipe(&receipt.owner_session, "stdin", true, &security)?,
-                    pipe(&receipt.owner_session, "stdout", false, &security)?,
-                    pipe(&receipt.owner_session, "stderr", false, &security)?,
+                    pipe(&receipt.owner_session, "stdin", true, &security, inheritable)?,
+                    pipe(&receipt.owner_session, "stdout", false, &security, inheritable)?,
+                    pipe(&receipt.owner_session, "stderr", false, &security, inheritable)?,
                 )
             };
             input_pipe.server.connect().await?;
             stdout.server.connect().await?;
             stderr.server.connect().await?;
             let mut job = Job::new()?;
-            let spawn = spawn_owned(
-                SpawnContext { command, environment, deadline, pin },
-                &job,
-                [&input_pipe.client, &stdout.client, &stderr.client],
-                &mut answer.spawn_failed,
-            );
+            let Pipe { server: input_pipe, client: input_client } = input_pipe;
+            let Pipe { server: stdout, client: stdout_client } = stdout;
+            let Pipe { server: stderr, client: stderr_client } = stderr;
+            let spawn = match spawn {
+                Spawn::Standalone { command, environment, pin } => {
+                    let result = spawn_owned(
+                        SpawnContext { command, environment, deadline, pin },
+                        &job,
+                        [&input_client, &stdout_client, &stderr_client],
+                        &mut answer.spawn_failed,
+                    );
+                    // Close all child endpoints before the suspended root runs.
+                    drop((input_client, stdout_client, stderr_client));
+                    result
+                }
+                Spawn::Concurrent(command) => spawn_suspended(command, &job, [input_client, stdout_client, stderr_client], deadline, &mut answer.spawn_failed),
+            };
             if let Err(error) = &spawn {
                 answer.spawn_failed |= error.kind() == io::ErrorKind::NotFound;
                 if error.kind() == io::ErrorKind::TimedOut {
@@ -1183,19 +1281,12 @@ async fn run_inner(
             receipt.root = Some(root.identity.clone());
             receipt.observed.push(root.identity.clone());
             job.processes.push(root);
-            // Close every parent copy of child-side endpoints, before any user code can run.
-            let Pipe { server: input_pipe, client } = input_pipe;
-            drop(client);
-            let Pipe { server: stdout, client } = stdout;
-            drop(client);
-            let Pipe { server: stderr, client } = stderr;
-            drop(client);
             if Instant::now() >= deadline {
                 answer.timed_out = true;
                 receipt.stop = ProcessStop::Timeout;
                 return Err(io::Error::from(io::ErrorKind::TimedOut));
             }
-            // SAFETY: retained primary-thread handle belongs to our atomically Job-assigned suspended child.
+            // SAFETY: retained thread belongs to our Job-assigned suspended child.
             if unsafe { ResumeThread(thread.as_raw_handle()) } != 1 {
                 return Err(os_error());
             }
@@ -1429,7 +1520,8 @@ mod tests {
             let environment: Vec<_> =
                 ["SystemRoot", "WINDIR", "TEMP", "TMP"].into_iter().filter_map(|key| std::env::var_os(key).map(|value| (OsString::from(key), value))).collect();
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            let (answer, job) = runtime.block_on(run_inner(&command, &environment, b"", deadline, 65536, 65536, None));
+            let (answer, job) =
+                runtime.block_on(run_inner(Spawn::Standalone { command: &command, environment: &environment, pin: None }, b"", deadline, 65536, 65536));
             let receipt = answer.process_receipt.as_ref().expect("actual guard receipt");
             let job = job.as_ref().expect("actual guard owns its Job");
             let members = diagnostic_members(job);
@@ -1498,9 +1590,9 @@ mod tests {
         ) -> io::Result<()> {
             let session = nonce()?;
             let security = pipe_security()?;
-            let input = pipe(&session, "stdin", true, &security)?;
-            let stdout = pipe(&session, "stdout", false, &security)?;
-            let stderr = pipe(&session, "stderr", false, &security)?;
+            let input = pipe(&session, "stdin", true, &security, true)?;
+            let stdout = pipe(&session, "stdout", false, &security, true)?;
+            let stderr = pipe(&session, "stderr", false, &security, true)?;
             input.server.connect().await?;
             stdout.server.connect().await?;
             stderr.server.connect().await?;
