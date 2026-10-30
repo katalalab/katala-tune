@@ -2,6 +2,7 @@
 //! supplied by the node ledger and never become public defaults.
 
 pub mod adapters;
+pub mod candidates;
 pub mod config;
 pub mod export;
 pub mod model;

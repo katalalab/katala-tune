@@ -148,16 +148,25 @@ pub async fn run(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Dura
     RunResult { code: status.and_then(|s| s.code()), out: decode(&out), err: decode(&err) + &extra }
 }
 
-/// Bounded binary transport used by topology collection. It never formats raw
-/// output because manifests and command errors may contain private material.
-#[derive(Default)]
-pub struct BoundedResult {
-    pub code: Option<i32>,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub timed_out: bool,
-    pub output_limited: bool,
-    pub spawn_failed: bool,
+mod bounded;
+pub use bounded::{BoundedResult, ProcessIdentity, ProcessReceipt, ProcessStop};
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+mod windows_pin;
+#[cfg(windows)]
+mod windows_quiescence;
+#[cfg(windows)]
+pub use windows::OwnedWindowsCompletion;
+#[cfg(all(test, windows))]
+pub(crate) use windows::windows_io_diagnostic as windows_test_io;
+#[cfg(windows)]
+pub use windows_pin::PinnedWindowsExecutable;
+
+/// Read-only facts for this process; these diagnostics cannot issue an OS witness.
+#[cfg(windows)]
+pub fn current_windows_process_identity() -> std::io::Result<ProcessIdentity> {
+    windows::current_process_identity()
 }
 
 /// Explicit process environment for a bounded transport invocation.
@@ -199,6 +208,95 @@ pub async fn run_bounded_with_env_clean(
         command.env_remove(key);
     }
     command.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    run_bounded_portable(command, input, timeout, stdout_limit, stderr_limit).await
+}
+
+/// Complete child environment for the standalone Windows backend. Nothing is
+/// inherited implicitly; omit a key to remove it. Validation occurs before spawn.
+#[cfg(windows)]
+pub struct StandaloneWindowsEnvironment<'a> {
+    entries: &'a [(std::ffi::OsString, std::ffi::OsString)],
+}
+
+#[cfg(windows)]
+impl<'a> StandaloneWindowsEnvironment<'a> {
+    pub fn new(entries: &'a [(std::ffi::OsString, std::ffi::OsString)]) -> Self {
+        Self { entries }
+    }
+}
+
+/// Native Windows diagnostic backend for an isolated single-spawner helper.
+///
+/// The caller must run before GUI/background initialization in its own process,
+/// with no concurrent std/Tokio process launches. This function does not establish
+/// that isolation and returns no acceptance witness. A receipt is diagnostic data.
+/// The absolute deadline is preserved through setup and payload admission.
+/// Command supplies only program, regular arguments and current directory. Any
+/// Command environment set/remove entry is rejected; env_clear alone is allowed.
+/// The mandatory complete environment is authoritative even with env_clear.
+/// Stdio and process creation options belong to the backend.
+#[cfg(windows)]
+pub async fn run_standalone_windows_bounded(
+    command: &std::process::Command,
+    environment: StandaloneWindowsEnvironment<'_>,
+    input: &[u8],
+    deadline: Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> BoundedResult {
+    windows::run(command, environment.entries, input, deadline, stdout_limit, stderr_limit).await
+}
+
+/// Observe one pinned child tree from a dedicated single-spawner supervisor.
+///
+/// Command's program must exactly equal `pin.executable()`; the pin is the only
+/// executable authority. Success retains the lease and actual Job/process handles
+/// until its bound output is consumed. A serialized receipt cannot construct it.
+/// The absolute deadline may shorten the pin's original deadline, never extend it.
+/// This API does not establish caller isolation: use only before background/GUI
+/// initialization in an independent supervisor observing the reader as its root.
+/// Failure or cancellation requests owned-Job termination but cannot retain this
+/// lease beyond the future if exit is unconfirmed. The independent outer owner
+/// must retain its own lease through actual helper exit and its fixed deadline.
+#[cfg(windows)]
+#[allow(clippy::result_large_err)] // Preserve the complete diagnostic result on failure without an extra boxed transport type.
+pub async fn run_owned_standalone_windows_bounded(
+    pin: PinnedWindowsExecutable,
+    command: &std::process::Command,
+    environment: StandaloneWindowsEnvironment<'_>,
+    input: &[u8],
+    deadline: Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<OwnedWindowsCompletion, BoundedResult> {
+    windows::run_owned(pin, command, environment.entries, input, deadline, stdout_limit, stderr_limit).await
+}
+
+/// Metadata status policy, selected by the fixed Git operation rather than input.
+#[cfg(windows)]
+pub(crate) enum WindowsMetadataExitPolicy {
+    ZeroOnly,
+    MissingOrigin,
+}
+
+/// Reuse one retained artifact lease for all queries in an isolated native reader.
+/// Each invocation still verifies its actual suspended image and owns its Job.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments, clippy::result_large_err)] // Existing bounded arguments plus the narrow metadata exit policy; preserve full diagnostics.
+pub(crate) async fn run_shared_pinned_windows_metadata_bounded(
+    pin: std::sync::Arc<PinnedWindowsExecutable>,
+    command: &std::process::Command,
+    environment: StandaloneWindowsEnvironment<'_>,
+    input: &[u8],
+    deadline: Instant,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    exit_policy: WindowsMetadataExitPolicy,
+) -> Result<OwnedWindowsCompletion, BoundedResult> {
+    windows::run_owned_shared(pin, command, environment.entries, input, deadline, stdout_limit, stderr_limit, exit_policy).await
+}
+
+async fn run_bounded_portable(mut command: Command, input: &[u8], timeout: Duration, stdout_limit: usize, stderr_limit: usize) -> BoundedResult {
     let Ok(mut child) = command.spawn() else {
         return BoundedResult { spawn_failed: true, ..Default::default() };
     };
@@ -281,6 +379,13 @@ pub trait Runner: Send + Sync {
     fn local_python<'a>(&'a self, code: &'a str, timeout: Duration) -> RunFuture<'a> {
         Box::pin(async move { self.run("local:python", &[code.to_string()], None, timeout).await })
     }
+    fn action_exchange<'a>(&'a self, _node: &'a Node, _helper_sha256: &'a str, _body: &'a [u8], _timeout: Duration) -> RunFuture<'a> {
+        Box::pin(async { RunResult { code: Some(9), out: String::new(), err: "KT2 action exchange is unavailable; operation refused".into() } })
+    }
+    /// Windows probe は固定 helper 専用の有限 transport だけを通す。
+    fn probe_exchange<'a>(&'a self, _node: &'a Node, _helper_sha256: &'a str, _benchmark: bool, _network: bool, _observe_wsl: bool) -> RunFuture<'a> {
+        Box::pin(async { RunResult { code: Some(9), out: String::new(), err: "Windows probe exchange is unavailable; collection refused".into() } })
+    }
 }
 
 /// 本物の子プロセスを起こす
@@ -299,12 +404,405 @@ impl Runner for System {
     fn local_python<'a>(&'a self, code: &'a str, timeout: Duration) -> RunFuture<'a> {
         Box::pin(local::python(code, timeout))
     }
+    fn action_exchange<'a>(&'a self, node: &'a Node, helper_sha256: &'a str, body: &'a [u8], timeout: Duration) -> RunFuture<'a> {
+        Box::pin(action_exchange_system(node, helper_sha256, body, timeout))
+    }
+    fn probe_exchange<'a>(&'a self, node: &'a Node, helper_sha256: &'a str, benchmark: bool, network: bool, observe_wsl: bool) -> RunFuture<'a> {
+        Box::pin(probe_exchange_system(node, helper_sha256, benchmark, network, observe_wsl))
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_probe_args(helper_sha256: &str, benchmark: bool, network: bool, observe_wsl: bool) -> Vec<String> {
+    vec![
+        "windows-probe-v1".into(),
+        "--helper-sha256".into(),
+        helper_sha256.into(),
+        "--benchmark".into(),
+        u8::from(benchmark).to_string(),
+        "--network".into(),
+        u8::from(network).to_string(),
+        "--observe-wsl".into(),
+        u8::from(observe_wsl).to_string(),
+        "--budget-ms".into(),
+        "120000".into(),
+    ]
+}
+
+#[cfg(any(windows, test))]
+fn local_probe_path(bin: &std::path::Path) -> Result<PathBuf, &'static str> {
+    if !bin.is_absolute() || bin.components().any(|part| matches!(part, std::path::Component::CurDir | std::path::Component::ParentDir)) {
+        return Err("Windows probe helper path is invalid; collection refused");
+    }
+    Ok(bin.join("tune.exe"))
+}
+
+async fn probe_exchange_system(node: &Node, helper_sha256: &str, benchmark: bool, network: bool, observe_wsl: bool) -> RunResult {
+    if node.refusal().is_some() || !lower_hex(helper_sha256, 64) {
+        return RunResult { code: Some(9), out: String::new(), err: "Windows probe request is invalid; collection refused".into() };
+    }
+    if node.local {
+        #[cfg(windows)]
+        {
+            let args = windows_probe_args(helper_sha256, benchmark, network, observe_wsl);
+            let helper = match local_probe_path(&crate::helpers::bin_dir()) {
+                Ok(helper) => helper,
+                Err(error) => return RunResult { code: Some(9), out: String::new(), err: error.into() },
+            };
+            let Some(helper) = helper.to_str() else {
+                return RunResult { code: Some(9), out: String::new(), err: "Windows probe helper path is invalid; collection refused".into() };
+            };
+            return probe_exchange_command(command(helper), &args).await;
+        }
+        #[cfg(not(windows))]
+        return RunResult { code: Some(9), out: String::new(), err: "Windows probe is unavailable on this platform".into() };
+    }
+    let remote = format!(
+        r#"exec "$HOME/.katala-tune/bin/tune.exe" windows-probe-v1 --helper-sha256 {helper_sha256} --benchmark {} --network {} --observe-wsl {} --budget-ms 120000"#,
+        u8::from(benchmark),
+        u8::from(network),
+        u8::from(observe_wsl)
+    );
+    let mut command = command("ssh");
+    command.args(ssh_args(&node.alias, &remote));
+    probe_exchange_command(command, &[]).await
+}
+
+async fn probe_exchange_command(mut command: Command, args: &[String]) -> RunResult {
+    command.args(args);
+    probe_exchange_command_until(command, tokio::time::Instant::now() + Duration::from_secs(135)).await
+}
+
+/// Fixed Windows probe transport.  Unlike generic `run_bounded_portable`, a
+/// probe is successful only when its own child has exited zero *and* stdin,
+/// stdout and stderr have all completed before one monotonic deadline.
+async fn probe_exchange_command_until(mut command: Command, deadline: tokio::time::Instant) -> RunResult {
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    // Leave a bounded cleanup interval inside the one absolute deadline.  A
+    // failed root must be killed and reaped; expiry may never add grace after
+    // the 135-second contract.
+    let now = tokio::time::Instant::now();
+    let remaining = deadline.saturating_duration_since(now);
+    let cleanup = (remaining / 4).min(Duration::from_secs(1));
+    let work_deadline = deadline.checked_sub(cleanup).unwrap_or(deadline);
+    let Ok(mut child) = command.spawn() else {
+        return RunResult { code: Some(9), out: String::new(), err: "Windows probe transport outcome unverified".into() };
+    };
+    let stdin = child.stdin.take();
+    let stdin_ok = tokio::time::timeout_at(work_deadline, async move {
+        if let Some(mut pipe) = stdin {
+            pipe.shutdown().await.map_err(|_| ())?;
+        }
+        Ok::<(), ()>(())
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .is_some();
+    let mut stdout_task = tokio::spawn(read_probe_pipe(child.stdout.take(), 1_048_576));
+    let mut stderr_task = tokio::spawn(read_probe_pipe(child.stderr.take(), 65_536));
+    let waited = tokio::time::timeout_at(work_deadline, child.wait()).await;
+    let out_read = tokio::time::timeout_at(work_deadline, &mut stdout_task).await;
+    let err_read = tokio::time::timeout_at(work_deadline, &mut stderr_task).await;
+    let expired = waited.is_err() || out_read.is_err() || err_read.is_err();
+    let pipe_failed = matches!(&out_read, Ok(Err(_) | Ok(Err(())))) || matches!(&err_read, Ok(Err(_) | Ok(Err(()))));
+    let status = waited.ok().and_then(Result::ok);
+    let stdout = out_read.ok().and_then(Result::ok).and_then(Result::ok);
+    let stderr = err_read.ok().and_then(Result::ok).and_then(Result::ok);
+    if !stdin_ok || status.as_ref().and_then(|value| value.code()) != Some(0) || stdout.is_none() || stderr.is_none() {
+        stdout_task.abort();
+        stderr_task.abort();
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout_at(deadline, child.wait()).await;
+        // Classify only complete, bounded SSH diagnostics; raw host/user/path
+        // strings never leave this failure path.
+        let kind = if pipe_failed {
+            "error"
+        } else if expired {
+            "timeout"
+        } else if status.as_ref().and_then(|v| v.code()) == Some(255)
+            && stdout.is_some()
+            && let Some(stderr) = stderr.as_ref()
+        {
+            classify_failure(&RunResult { code: Some(255), out: String::new(), err: decode(stderr) })
+        } else {
+            "error"
+        };
+        return RunResult { code: Some(9), out: String::new(), err: format!("Windows probe failure={kind}") };
+    }
+    RunResult { code: Some(0), out: decode(&stdout.unwrap()), err: decode(&stderr.unwrap()) }
+}
+
+/// EOF is part of the proof: a missing pipe, I/O error, or `limit + 1` byte
+/// invalidates the entire exchange and callers discard even valid JSON prefixes.
+async fn read_probe_pipe<R: AsyncRead + Unpin>(pipe: Option<R>, limit: usize) -> Result<Vec<u8>, ()> {
+    let Some(mut pipe) = pipe else { return Err(()) };
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = pipe.read(&mut chunk).await.map_err(|_| ())?;
+        if count == 0 {
+            return Ok(output);
+        }
+        if output.len().checked_add(count).is_none_or(|size| size > limit) {
+            return Err(());
+        }
+        output.extend_from_slice(&chunk[..count]);
+    }
+}
+
+async fn action_exchange_system(node: &Node, helper_sha256: &str, body: &[u8], timeout: Duration) -> RunResult {
+    if let Some(err) = node.refusal() {
+        return RunResult { code: Some(9), out: String::new(), err };
+    }
+    if body.is_empty() || body.len() > 65_536 || helper_sha256.len() != 64 || !helper_sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return RunResult { code: Some(9), out: String::new(), err: "KT2 action request is invalid; operation refused".into() };
+    }
+    if node.local {
+        #[cfg(windows)]
+        {
+            let helper = match local_probe_path(&crate::helpers::bin_dir()) {
+                Ok(helper) => helper,
+                Err(error) => return RunResult { code: Some(9), out: String::new(), err: error.into() },
+            };
+            let Some(helper) = helper.to_str() else {
+                return RunResult { code: Some(9), out: String::new(), err: "Windows action helper path is invalid; operation refused".into() };
+            };
+            let mut c = command(helper);
+            c.args(["windows-action-receiver-v2", "--helper-sha256", helper_sha256, "--budget-ms", "25000"]);
+            return action_exchange_command(c, body, timeout).await;
+        }
+        #[cfg(not(windows))]
+        return RunResult { code: Some(9), out: String::new(), err: "Windows action receiver is unavailable on this platform".into() };
+    }
+    let remote_command = format!(r#"exec "$HOME/.katala-tune/bin/tune.exe" windows-action-receiver-v2 --helper-sha256 {helper_sha256} --budget-ms 25000"#);
+    let mut c = command("ssh");
+    c.args(ssh_args(&node.alias, &remote_command));
+    action_exchange_command(c, body, timeout).await
+}
+
+fn lower_hex(value: &str, size: usize) -> bool {
+    value.len() == size && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn canonical_usize(value: &str) -> Option<usize> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let parsed = value.parse::<usize>().ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActionStderrError {
+    Missing,
+    Io,
+    Limit,
+    Task,
+}
+
+/// Unlike the generic collector, KT2 requires a real EOF, not just a stopped
+/// reader. Keep this proof separate so other collection policies stay unchanged.
+struct ActionStderr {
+    task: Option<JoinHandle<Result<(), ActionStderrError>>>,
+    result: Option<Result<(), ActionStderrError>>,
+}
+
+impl ActionStderr {
+    fn new<R: AsyncRead + Unpin + Send + 'static>(pipe: Option<R>) -> Self {
+        let task = tokio::spawn(async move {
+            let Some(mut pipe) = pipe else { return Err(ActionStderrError::Missing) };
+            let mut count = 0usize;
+            let mut chunk = [0u8; 8192];
+            loop {
+                let size = pipe.read(&mut chunk).await.map_err(|_| ActionStderrError::Io)?;
+                if size == 0 {
+                    return Ok(());
+                }
+                count += size;
+                if count > 65_536 {
+                    return Err(ActionStderrError::Limit);
+                }
+            }
+        });
+        Self { task: Some(task), result: None }
+    }
+
+    /// Poll stderr failure before each protocol operation, including the first
+    /// REQUEST write. Successful EOF may arrive before READY and is retained.
+    async fn guard<F: std::future::Future>(&mut self, operation: F) -> Result<F::Output, ActionStderrError> {
+        tokio::pin!(operation);
+        if let Some(task) = self.task.as_mut() {
+            tokio::select! {
+                biased;
+                result = task => {
+                    self.task = None;
+                    self.result = Some(result.map_err(|_| ActionStderrError::Task).and_then(|result| result));
+                }
+                result = &mut operation => return Ok(result),
+            }
+        }
+        self.result.unwrap_or(Ok(()))?;
+        Ok(operation.await)
+    }
+
+    async fn finish(&mut self) -> Result<(), ActionStderrError> {
+        if let Some(task) = self.task.as_mut() {
+            let result = task.await;
+            self.task = None;
+            self.result = Some(result.map_err(|_| ActionStderrError::Task).and_then(|result| result));
+        }
+        self.result.unwrap_or(Err(ActionStderrError::Task))
+    }
+
+    async fn stop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for ActionStderr {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+async fn action_exchange_failure(child: &mut tokio::process::Child, read_err: &mut ActionStderr, committed: bool, message: &str) -> RunResult {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(PIPE_GRACE, child.wait()).await;
+    read_err.stop().await;
+    RunResult { code: Some(if committed { 7 } else { 9 }), out: String::new(), err: message.into() }
+}
+
+/// Finite KT2 controller exchange. This is intentionally separate from `run`:
+/// generic commands can write stdin eagerly, while this transport must wait for READY.
+async fn action_exchange_command(mut c: Command, body: &[u8], timeout: Duration) -> RunResult {
+    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let mut child = match c.spawn() {
+        Ok(v) => v,
+        Err(e) => return RunResult { code: Some(9), out: String::new(), err: format!("KT2 spawn failed: {e}") },
+    };
+    let start = tokio::time::Instant::now();
+    let end = start + timeout.min(Duration::from_secs(40));
+    let ready_end = (start + Duration::from_secs(15)).min(end);
+    let Some(mut stdin) = child.stdin.take() else {
+        return RunResult { code: Some(9), out: String::new(), err: "KT2 stdin unavailable; operation refused".into() };
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        return RunResult { code: Some(9), out: String::new(), err: "KT2 stdout unavailable; operation refused".into() };
+    };
+    let mut read_err = ActionStderr::new(child.stderr.take());
+    let mut header = Vec::new();
+    let mut one = [0u8; 1];
+    let ready = async {
+        while header.len() < 256 {
+            if stdout.read_exact(&mut one).await.is_err() {
+                return None;
+            }
+            if one[0] == b'\n' {
+                return std::str::from_utf8(&header).ok().map(str::to_owned);
+            }
+            if !one[0].is_ascii() || one[0] == b'\r' {
+                return None;
+            }
+            header.push(one[0]);
+        }
+        None
+    };
+    let ready = match tokio::time::timeout_at(ready_end, read_err.guard(ready)).await.ok().and_then(Result::ok).flatten() {
+        Some(v) => v,
+        None => {
+            return action_exchange_failure(&mut child, &mut read_err, false, "KT2 READY unavailable; operation refused").await;
+        }
+    };
+    let Some(nonce) = ready.strip_prefix("KT2 READY ").filter(|v| lower_hex(v, 64)) else {
+        return action_exchange_failure(&mut child, &mut read_err, false, "KT2 READY invalid; operation refused").await;
+    };
+    let hash = crate::db::sha256_hex(body);
+    let request = format!("KT2 REQUEST {nonce} {} {hash}\n", body.len());
+    // The remote receiver can observe any part of this frame. From this point on,
+    // a local transport failure cannot prove that the action did not run.
+    let mut committed = false;
+    if !matches!(
+        tokio::time::timeout_at(
+            end,
+            read_err.guard(async {
+                committed = true;
+                stdin.write_all(request.as_bytes()).await?;
+                stdin.write_all(body).await?;
+                stdin.shutdown().await
+            })
+        )
+        .await,
+        Ok(Ok(Ok(())))
+    ) {
+        return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 request outcome unverified").await;
+    }
+    drop(stdin);
+    let mut result_header = Vec::new();
+    let read_result_header = async {
+        while result_header.len() < 256 {
+            stdout.read_exact(&mut one).await?;
+            if one[0] == b'\n' {
+                return Ok::<(), std::io::Error>(());
+            }
+            if !one[0].is_ascii() || one[0] == b'\r' {
+                return Err(std::io::Error::other("bad header"));
+            }
+            result_header.push(one[0]);
+        }
+        Err(std::io::Error::other("long header"))
+    };
+    if !matches!(tokio::time::timeout_at(end, read_err.guard(read_result_header)).await, Ok(Ok(Ok(())))) {
+        return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 result outcome unverified").await;
+    }
+    let Ok(result_header) = std::str::from_utf8(&result_header) else {
+        return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 result invalid").await;
+    };
+    let fields: Vec<_> = result_header.split(' ').collect();
+    if fields.len() != 7 || fields[0] != "KT2" || fields[1] != "RESULT" || fields[2] != nonce || fields[3] != hash {
+        return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 result invalid").await;
+    }
+    let code = fields[4].parse::<i32>().ok().filter(|v| fields[4] == v.to_string() && matches!(*v, 0 | 3 | 4 | 5 | 6 | 7 | 8 | 9));
+    let a = canonical_usize(fields[5]);
+    let b = canonical_usize(fields[6]);
+    let (Some(code), Some(a), Some(b)) = (code, a, b) else { return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 result invalid").await };
+    if a > 65536 || b > 65536 {
+        return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 result invalid").await;
+    }
+    let mut payload = vec![0; a + b];
+    let mut trailing = [0u8; 1];
+    let complete = async {
+        stdout.read_exact(&mut payload).await?;
+        let n = stdout.read(&mut trailing).await?;
+        if n == 0 { Ok(()) } else { Err(std::io::Error::other("surplus")) }
+    };
+    if !matches!(tokio::time::timeout_at(end, read_err.guard(complete)).await, Ok(Ok(Ok(())))) {
+        return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 result outcome unverified").await;
+    }
+    let status = tokio::time::timeout_at(end, read_err.guard(child.wait())).await.ok().and_then(Result::ok).and_then(Result::ok);
+    let stderr_complete = matches!(tokio::time::timeout_at(end, read_err.finish()).await, Ok(Ok(())));
+    if !status.is_some_and(|s| s.code() == Some(0)) || !stderr_complete {
+        return action_exchange_failure(&mut child, &mut read_err, committed, "KT2 ssh closure unverified").await;
+    }
+    RunResult { code: Some(code), out: decode(&payload[..a]), err: decode(&payload[a..]) }
 }
 
 /// 失敗の理由を、画面と判定が使える種類に分ける（lib/collect.js の classifyFailure と同じ）。
 /// timeout: 接続はできたが、こちらの打ち切り（run が足す `timeout <ms>ms`）まで終わらなかった。
 /// unreachable: ssh が相手に届かない（名前が引けない・拒否・経路なし・接続の時間切れ）。auth: 鍵・ホスト鍵で入れない。error: それ以外
 pub fn classify_failure(res: &RunResult) -> &'static str {
+    match res.err.as_str() {
+        "Windows probe failure=timeout" => return "timeout",
+        "Windows probe failure=unreachable" => return "unreachable",
+        "Windows probe failure=auth" => return "auth",
+        "Windows probe failure=error" => return "error",
+        _ => {}
+    }
     static TIMEOUT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"timeout \d+ms\s*$").expect("TIMEOUT"));
     static AUTH: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?i)Permission denied|Host key verification failed|Authentication failed|Too many authentication failures").expect("AUTH")
@@ -459,28 +957,15 @@ fn mac_ssh_command(benchmark: bool, network: bool) -> String {
     format!("command -v python3 >/dev/null && exec python3 -{suffix} || exec /usr/bin/python3 -{suffix}")
 }
 
-fn windows_probe_flags(network: bool, observe_wsl: bool) -> Vec<&'static str> {
-    let mut flags = Vec::new();
-    if !network {
-        flags.push("-NoNetwork");
-    }
-    if observe_wsl {
-        flags.push("-ObserveWsl");
-    }
-    flags
-}
-
+#[cfg(test)]
 fn windows_ssh_command(benchmark: bool, network: bool, observe_wsl: bool) -> String {
-    let bench = BENCH_PY.replace('\'', "\"");
-    let flags = windows_probe_flags(network, observe_wsl).iter().map(|flag| format!(" {flag}")).collect::<String>();
-    let mut parts = vec![
-        "mkdir -p ~/.katala-tune && cat > ~/.katala-tune/probe.ps1 &&".to_string(),
-        format!("powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$(cygpath -w ~/.katala-tune/probe.ps1)\"{flags};"),
-    ];
-    if benchmark {
-        parts.extend([format!("echo {BENCH_MARK};"), format!("PY=$(command -v python3 || command -v python); [ -n \"$PY\" ] && \"$PY\" -c '{bench}'")]);
-    }
-    parts.join(" ")
+    let hash = "a".repeat(64);
+    format!(
+        r#"exec "$HOME/.katala-tune/bin/tune.exe" windows-probe-v1 --helper-sha256 {hash} --benchmark {} --network {} --observe-wsl {} --budget-ms 120000"#,
+        u8::from(benchmark),
+        u8::from(network),
+        u8::from(observe_wsl)
+    )
 }
 
 /// 1台を調べる。戻り値は `{ node_id, ok, data | error, wall_s, at }`（collect.js と同じ形）。失敗には reason・reason_text が付く
@@ -504,17 +989,11 @@ pub async fn probe_node_with(runner: &dyn Runner, node: &Node) -> Value {
         } else {
             runner.run("ssh", &ssh_args(&node.alias, &mac_ssh_command(benchmark, network)), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
         }
-    } else if node.local {
-        let params = windows_probe_flags(network, observe_wsl).join(" ");
-        let p = runner.local_powershell_file(WIN_PROBE, &params, Duration::from_secs(120)).await;
-        if benchmark {
-            let b = runner.local_python(BENCH_PY, Duration::from_secs(60)).await;
-            RunResult { out: format!("{}\n{BENCH_MARK}\n{}", p.out, b.out), ..p }
-        } else {
-            p
-        }
     } else {
-        runner.run("ssh", &ssh_args(&node.alias, &windows_ssh_command(benchmark, network, observe_wsl)), Some(WIN_PROBE), Duration::from_secs(120)).await
+        match crate::actions::action_helper(node) {
+            Ok(helper) => runner.probe_exchange(node, &helper, benchmark, network, observe_wsl).await,
+            Err(error) => RunResult { code: Some(9), out: String::new(), err: error },
+        }
     };
     let wall_s = started.elapsed().as_secs_f64();
     let (main, bench) = match res.out.split_once(BENCH_MARK) {
@@ -603,9 +1082,108 @@ pub async fn exec_on_with(runner: &dyn Runner, node: &Node, script: &str, timeou
     if node.local { runner.local_script(script, timeout).await } else { runner.run("ssh", &ssh_args(&node.alias, script), None, timeout).await }
 }
 
+/// `exec_on_with` の stdin 付き版。ローカル action が本文を黙って落とすことは許可しない。
+pub async fn exec_on_with_input(runner: &dyn Runner, node: &Node, script: &str, input: &[u8], timeout: Duration) -> RunResult {
+    if let Some(err) = node.refusal() {
+        return RunResult { code: None, out: String::new(), err };
+    }
+    if node.local {
+        return RunResult { code: None, out: String::new(), err: "ローカル action に stdin を渡す経路は未対応のため実行しない".into() };
+    }
+    runner.run("ssh", &ssh_args(&node.alias, script), Some(input), timeout).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // An OS read error / failed reader task without an OS child. The signal
+    // places failure on either side of the first REQUEST operation.
+    struct FailingActionStderr {
+        signal: tokio::sync::oneshot::Receiver<()>,
+        panic: bool,
+    }
+
+    impl AsyncRead for FailingActionStderr {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if std::future::Future::poll(std::pin::Pin::new(&mut self.signal), cx).is_pending() {
+                return std::task::Poll::Pending;
+            }
+            assert!(!self.panic, "synthetic stderr reader task failure");
+            std::task::Poll::Ready(Err(std::io::Error::other("synthetic stderr read failure")))
+        }
+    }
+
+    #[tokio::test]
+    async fn kt2_stderr_rejects_io_and_join_errors_before_request() {
+        for (panic, expected) in [(false, ActionStderrError::Io), (true, ActionStderrError::Task)] {
+            let (signal, receiver) = tokio::sync::oneshot::channel();
+            let mut stderr = ActionStderr::new(Some(FailingActionStderr { signal: receiver, panic }));
+            signal.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !stderr.task.as_ref().unwrap().is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut committed = false;
+            let result = stderr
+                .guard(async {
+                    committed = true;
+                })
+                .await;
+            assert_eq!(result, Err(expected));
+            assert!(!committed, "a failed reader cannot admit a REQUEST");
+            assert_eq!(stderr.finish().await, Err(expected), "failure must never become EOF on a later check");
+        }
+    }
+
+    #[tokio::test]
+    async fn kt2_stderr_rejects_io_and_join_errors_during_request() {
+        for (panic, expected) in [(false, ActionStderrError::Io), (true, ActionStderrError::Task)] {
+            let (signal, receiver) = tokio::sync::oneshot::channel();
+            let mut stderr = ActionStderr::new(Some(FailingActionStderr { signal: receiver, panic }));
+            let mut committed = false;
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                stderr.guard(async {
+                    committed = true;
+                    signal.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, Err(expected));
+            assert!(committed, "the REQUEST has already started when its stderr fails");
+            assert_eq!(stderr.finish().await, Err(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn kt2_stderr_requires_a_present_pipe_and_exact_cap_with_eof() {
+        let mut missing = ActionStderr::new(None::<&[u8]>);
+        assert_eq!(missing.finish().await, Err(ActionStderrError::Missing));
+        for (size, expected) in [(0, Ok(())), (65_536, Ok(())), (65_537, Err(ActionStderrError::Limit))] {
+            let mut stderr = ActionStderr::new(Some(std::io::Cursor::new(vec![b'z'; size])));
+            assert_eq!(stderr.finish().await, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn kt2_stderr_cannot_complete_until_its_real_eof() {
+        let (reader, writer) = tokio::io::duplex(64);
+        let mut stderr = ActionStderr::new(Some(reader));
+        assert!(tokio::time::timeout(Duration::from_millis(10), stderr.finish()).await.is_err());
+        drop(writer);
+        assert_eq!(stderr.finish().await, Ok(()));
+        assert_eq!(stderr.guard(async { "valid payload" }).await, Ok("valid payload"));
+    }
 
     #[derive(Default)]
     struct CaptureRunner {
@@ -621,6 +1199,13 @@ mod tests {
                 RunResult { code: Some(0), out: "{\"probe\":true}\n".into(), err: String::new() }
             })
         }
+        fn probe_exchange<'a>(&'a self, _node: &'a Node, helper: &'a str, benchmark: bool, network: bool, observe_wsl: bool) -> RunFuture<'a> {
+            let args = vec![helper.to_string(), benchmark.to_string(), network.to_string(), observe_wsl.to_string()];
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(("probe".into(), args));
+                RunResult { code: Some(0), out: "{\"probe\":true}\n".into(), err: String::new() }
+            })
+        }
     }
 
     #[tokio::test]
@@ -628,6 +1213,7 @@ mod tests {
         for local in [true, false] {
             for configured in [None, Some(false), Some(true)] {
                 let mut value = json!({ "id": "win", "alias": "win", "os": "windows", "benchmark": false });
+                value["action_helper"] = json!({ "schema": "katala-tune/action-helper/v2", "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "tune_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "run_id": 1, "attempt": 1 });
                 if let Some(enabled) = configured {
                     value["wsl"] = json!(enabled);
                     if enabled {
@@ -644,16 +1230,10 @@ mod tests {
                 let calls = runner.calls.lock().unwrap();
                 assert_eq!(calls.len(), 1);
                 let (cmd, args) = &calls[0];
-                let invocation = if local {
-                    assert_eq!(cmd, "local:powershell");
-                    args[0].as_str()
-                } else {
-                    assert_eq!(cmd, "ssh");
-                    args.last().unwrap().as_str()
-                };
-                assert_eq!(invocation.contains("-ObserveWsl"), configured == Some(true), "local={local}, configured={configured:?}, invocation={invocation}");
+                assert_eq!(cmd, "probe");
+                assert_eq!(args[3] == "true", configured == Some(true), "local={local}, configured={configured:?}, args={args:?}");
                 if configured == Some(true) {
-                    assert!(invocation.contains("-NoNetwork -ObserveWsl"), "local={local}, invocation={invocation}");
+                    assert_eq!(&args[1..], ["false", "false", "true"]);
                 }
             }
         }
@@ -705,10 +1285,11 @@ mod tests {
     #[test]
     fn disabled_benchmark_never_sends_fixed_computation() {
         let enabled = windows_ssh_command(true, true, false);
-        assert!(enabled.contains(BENCH_MARK));
-        assert!(enabled.contains("3000000"));
+        assert!(enabled.contains("windows-probe-v1"));
+        assert!(enabled.contains("--benchmark 1"));
         let disabled = windows_ssh_command(false, true, false);
-        assert!(disabled.contains("probe.ps1"));
+        assert!(disabled.contains("--benchmark 0"));
+        assert!(!disabled.contains("probe.ps1"));
         assert!(!disabled.contains(BENCH_MARK));
         assert!(!disabled.contains("3000000"));
         assert!(!disabled.contains("command -v python"));
@@ -723,9 +1304,9 @@ mod tests {
         assert_eq!(mac_probe_args(false, false), vec!["python3", "-", "--skip-benchmark", "nonet"]);
         assert_eq!(mac_ssh_command(false, false).matches(" --skip-benchmark nonet").count(), 2);
         assert!(!mac_ssh_command(true, true).contains("nonet"));
-        assert!(windows_ssh_command(true, false, false).contains("probe.ps1)\" -NoNetwork;"));
-        assert!(windows_ssh_command(true, false, false).contains(BENCH_MARK));
-        assert!(!windows_ssh_command(false, true, false).contains("-NoNetwork"));
+        assert!(windows_ssh_command(true, false, false).contains("--network 0"));
+        assert!(windows_ssh_command(true, false, false).contains("--benchmark 1"));
+        assert!(windows_ssh_command(false, true, false).contains("--network 1"));
     }
 
     #[test]
@@ -794,5 +1375,321 @@ mod tests {
         // Windows の cmd は改行が CRLF なので、前後の空白を除いて比べる
         assert_eq!((r.code, r.out.trim(), r.err.trim()), (Some(0), "first", "oops"), "それまでに読んだ分は捨てない");
         assert!(started.elapsed() < Duration::from_secs(4), "孫の終わりを待たない: {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn kt2_exchange_waits_for_ready_and_rejects_unverified_terminal_states() {
+        if cfg!(windows) {
+            return;
+        }
+        let nonce = "d".repeat(64);
+        let body = b"action body";
+        let hash = crate::db::sha256_hex(body);
+        let fixture = |result_hash: &str, exit: i32, hold_eof: bool, reject_early_stdin: bool| {
+            format!(
+                r#"import hashlib,select,sys,time
+if {reject_early_stdin}:
+ r,_,_=select.select([sys.stdin.buffer],[],[],.15)
+ if r: sys.exit(91)
+sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush()
+line=sys.stdin.buffer.readline().decode('ascii').strip().split(' ')
+body=sys.stdin.buffer.read()
+if len(line)!=5 or line[:3]!=['KT2','REQUEST','{nonce}'] or int(line[3])!=len(body) or line[4]!=hashlib.sha256(body).hexdigest(): sys.exit(92)
+sys.stdout.write('KT2 RESULT {nonce} {result_hash} 0 2 0\nok');sys.stdout.flush()
+if {hold_eof}: time.sleep(2)
+sys.exit({exit})"#,
+                hold_eof = if hold_eof { "True" } else { "False" },
+                reject_early_stdin = if reject_early_stdin { "True" } else { "False" },
+            )
+        };
+        let run_fixture = |script: String, timeout: Duration| async move {
+            let mut command = Command::new("/usr/bin/env");
+            command.args(["python3", "-c", &script]);
+            action_exchange_command(command, body, timeout).await
+        };
+
+        let valid = run_fixture(fixture(&hash, 0, false, true), Duration::from_secs(2)).await;
+        assert_eq!((valid.code, valid.out.as_str(), valid.err.as_str()), (Some(0), "ok", ""));
+        let wrong_hash = run_fixture(fixture(&"0".repeat(64), 0, false, true), Duration::from_secs(2)).await;
+        assert_eq!(wrong_hash.code, Some(7));
+        let ssh_nonzero = run_fixture(fixture(&hash, 255, false, true), Duration::from_secs(2)).await;
+        assert_eq!(ssh_nonzero.code, Some(7));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held_eof = format!(
+            r#"import hashlib,socket,sys,time
+sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush()
+line=sys.stdin.buffer.readline().decode('ascii').strip().split(' ')
+payload=sys.stdin.buffer.read()
+if len(line)!=5 or line[:3]!=['KT2','REQUEST','{nonce}'] or int(line[3])!=len(payload) or line[4]!=hashlib.sha256(payload).hexdigest(): sys.exit(92)
+s=socket.create_connection(('127.0.0.1',{port}));s.sendall(b'write-complete');s.close()
+sys.stdout.write('KT2 RESULT {nonce} {hash} 0 0 0\n');sys.stdout.flush();time.sleep(3)"#,
+        );
+        let mut command = Command::new("/usr/bin/env");
+        command.args(["python3", "-c", &held_eof]);
+        let exchange = tokio::spawn(async move { action_exchange_command(command, body, Duration::from_secs(2)).await });
+        let (mut confirmed, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await.unwrap().unwrap();
+        let mut signal = [0; 14];
+        confirmed.read_exact(&mut signal).await.unwrap();
+        assert_eq!(&signal, b"write-complete");
+        assert_eq!(exchange.await.unwrap().code, Some(7));
+    }
+
+    #[tokio::test]
+    async fn kt2_exchange_rejects_closed_stdin_and_noncanonical_result_boundaries() {
+        if cfg!(windows) {
+            return;
+        }
+        let nonce = "e".repeat(64);
+        let body = b"action body";
+        let hash = crate::db::sha256_hex(body);
+        let run_fixture = |script: String, timeout: Duration| async move {
+            let mut command = Command::new("/usr/bin/env");
+            command.args(["python3", "-c", &script]);
+            action_exchange_command(command, body, timeout).await
+        };
+        let fixture = |fields: String, out: usize, err: usize, exit: i32, hold: bool| {
+            format!(
+                r#"import hashlib,sys,time
+sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush()
+line=sys.stdin.buffer.readline().decode('ascii').strip().split(' ')
+payload=sys.stdin.buffer.read()
+if len(line)!=5 or line[:3]!=['KT2','REQUEST','{nonce}'] or int(line[3])!=len(payload) or line[4]!=hashlib.sha256(payload).hexdigest(): sys.exit(92)
+sys.stdout.write('KT2 RESULT {fields}\n');sys.stdout.write('o'*{out});sys.stdout.flush()
+sys.stderr.write('z'*{err});sys.stderr.flush()
+if {hold}: time.sleep(2)
+sys.exit({exit})"#,
+                hold = if hold { "True" } else { "False" },
+            )
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // The child confirms it actually closed FD 0 before it may emit READY.
+        // The controller only then performs its one real pipe write.
+        let closed_stdin = format!(
+            r#"import os,socket,sys,time
+os.close(0)
+s=socket.create_connection(('127.0.0.1',{port}));s.sendall(b'closed');s.recv(1);s.close()
+sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush();time.sleep(.05)
+sys.stdout.write('KT2 RESULT {nonce} {hash} 0 0 0\n');sys.stdout.flush()"#,
+        );
+        let mut command = Command::new("/usr/bin/env");
+        command.args(["python3", "-c", &closed_stdin]);
+        let exchange = tokio::spawn(async move { action_exchange_command(command, body, Duration::from_secs(2)).await });
+        let (mut confirmed, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await.unwrap().unwrap();
+        let mut signal = [0; 6];
+        confirmed.read_exact(&mut signal).await.unwrap();
+        assert_eq!(&signal, b"closed");
+        confirmed.write_all(b"go").await.unwrap();
+        assert_eq!(exchange.await.unwrap().code, Some(7));
+
+        for fields in [
+            format!("{nonce} {} 0 0 0", "0".repeat(64)),
+            format!("{} {hash} 0 0 0", "f".repeat(64)),
+            format!("{nonce} {hash} 0 00 0"),
+            format!("{nonce} {hash} 0 65537 0"),
+            format!("{nonce} {hash} 0 0 65537"),
+        ] {
+            assert_eq!(run_fixture(fixture(fields, 0, 0, 0, false), Duration::from_secs(2)).await.code, Some(7));
+        }
+        let duplicate = format!(
+            r#"import hashlib,sys
+sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush()
+line=sys.stdin.buffer.readline().decode('ascii').strip().split(' ');payload=sys.stdin.buffer.read()
+if len(line)!=5 or line[4]!=hashlib.sha256(payload).hexdigest(): sys.exit(92)
+sys.stdout.write('KT2 RESULT {nonce} {hash} 0 0 0\nKT2 RESULT {nonce} {hash} 0 0 0\n');sys.stdout.flush()"#,
+        );
+        assert_eq!(run_fixture(duplicate, Duration::from_secs(2)).await.code, Some(7));
+        let exact = run_fixture(fixture(format!("{nonce} {hash} 0 65536 65536"), 131_072, 65_536, 0, false), Duration::from_secs(3)).await;
+        assert_eq!(exact.code, Some(0));
+        assert_eq!((exact.out.len(), exact.err.len()), (65_536, 65_536));
+        assert_eq!(run_fixture(fixture(format!("{nonce} {hash} 0 0 0"), 0, 65_537, 0, false), Duration::from_secs(2)).await.code, Some(7));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held_stderr = format!(
+            r#"import hashlib,os,socket,sys,time
+sys.stdout.write('KT2 READY {nonce}\n');sys.stdout.flush()
+line=sys.stdin.buffer.readline().decode('ascii').strip().split(' ')
+payload=sys.stdin.buffer.read()
+if len(line)!=5 or line[:3]!=['KT2','REQUEST','{nonce}'] or int(line[3])!=len(payload) or line[4]!=hashlib.sha256(payload).hexdigest(): sys.exit(92)
+s=socket.create_connection(('127.0.0.1',{port}));s.sendall(b'write-complete');s.close()
+sys.stdout.write('KT2 RESULT {nonce} {hash} 0 0 0\n');sys.stdout.flush();os.close(1)
+sys.stderr.write('z');sys.stderr.flush();time.sleep(3)"#,
+        );
+        let mut command = Command::new("/usr/bin/env");
+        command.args(["python3", "-c", &held_stderr]);
+        let exchange = tokio::spawn(async move { action_exchange_command(command, body, Duration::from_secs(2)).await });
+        let (mut confirmed, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await.unwrap().unwrap();
+        let mut signal = [0; 14];
+        confirmed.read_exact(&mut signal).await.unwrap();
+        assert_eq!(&signal, b"write-complete");
+        assert_eq!(exchange.await.unwrap().code, Some(7));
+    }
+
+    #[test]
+    fn local_probe_uses_selected_helper_directory_and_rejects_relative_or_parent_paths() {
+        let root = std::env::temp_dir().join("katala-qa-fixture");
+        let bin = root.join("bin");
+        assert_eq!(local_probe_path(&bin).unwrap(), bin.join("tune.exe"));
+        assert!(local_probe_path(std::path::Path::new("relative/bin")).is_err());
+        assert!(local_probe_path(&root.join("..").join("live-bin")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fixed_windows_probe_launches_exact_arguments_with_empty_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = std::env::temp_dir().join(format!("kt-probe-argv-{}-{} 日本語", std::process::id(), crate::db::now_ms()));
+        std::fs::create_dir(&root).unwrap();
+        let fixture = Fixture(root.clone());
+        let helper = root.join("tune.exe");
+        std::fs::write(&helper, b"#!/bin/sh\nif IFS= read -r unexpected; then exit 8; fi\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let hash = "b".repeat(64);
+        for benchmark in [false, true] {
+            for network in [false, true] {
+                for observe_wsl in [false, true] {
+                    let args = windows_probe_args(&hash, benchmark, network, observe_wsl);
+                    let result = probe_exchange_command(command(helper.to_str().unwrap()), &args).await;
+                    assert_eq!(result.code, Some(0), "owned argv fixture must exit with stdin EOF");
+                    assert_eq!(
+                        result.out.lines().collect::<Vec<_>>(),
+                        [
+                            "windows-probe-v1",
+                            "--helper-sha256",
+                            hash.as_str(),
+                            "--benchmark",
+                            if benchmark { "1" } else { "0" },
+                            "--network",
+                            if network { "1" } else { "0" },
+                            "--observe-wsl",
+                            if observe_wsl { "1" } else { "0" },
+                            "--budget-ms",
+                            "120000",
+                        ],
+                        "the actual helper child must receive every closed argument in order"
+                    );
+                    assert!(result.err.is_empty());
+                }
+            }
+        }
+        drop(fixture);
+        assert!(!root.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn windows_probe_preserves_closed_ssh_failure_classification() {
+        for (diagnostic, expected) in [
+            ("fixture-private: Permission denied (publickey).", "auth"),
+            ("ssh: Could not resolve hostname fixture-private", "unreachable"),
+            ("helper rejected fixture-private", "error"),
+        ] {
+            let mut command = Command::new("/usr/bin/env");
+            command.args(["python3", "-c", "import sys; print('partial'); sys.stderr.write(sys.argv[1]); sys.exit(255)", diagnostic]);
+            let r = probe_exchange_command_until(command, tokio::time::Instant::now() + Duration::from_secs(5)).await;
+            assert_eq!(classify_failure(&r), expected);
+            assert_eq!(r.code, Some(9));
+            assert!(r.out.is_empty());
+            assert!(!r.err.contains("fixture-private"));
+        }
+        let mut command = Command::new("/usr/bin/env");
+        command.args(["python3", "-c", "import time; time.sleep(2)"]);
+        let r = probe_exchange_command_until(command, tokio::time::Instant::now() + Duration::from_millis(100)).await;
+        assert_eq!(classify_failure(&r), "timeout");
+        assert!(r.out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fixed_windows_probe_transport_requires_complete_eof_and_exact_caps() {
+        if cfg!(windows) {
+            return;
+        }
+        let run = |script: &str, deadline: Duration| {
+            let script = script.to_string();
+            async move {
+                let mut command = Command::new("/usr/bin/env");
+                command.args(["python3", "-c", &script]);
+                probe_exchange_command_until(command, tokio::time::Instant::now() + deadline).await
+            }
+        };
+        let stdout_exact = run("import sys;sys.stdout.write('x'*1048576)", Duration::from_secs(3)).await;
+        assert_eq!(stdout_exact.code, Some(0));
+        assert_eq!(stdout_exact.out.len(), 1_048_576);
+        let stdout_plus = run("import sys;sys.stdout.write('x'*1048577)", Duration::from_secs(3)).await;
+        assert_eq!((stdout_plus.code, stdout_plus.out.as_str()), (Some(9), ""));
+        let stderr_exact = run("import sys;sys.stderr.write('x'*65536)", Duration::from_secs(3)).await;
+        assert_eq!((stderr_exact.code, stderr_exact.err.len()), (Some(0), 65_536));
+        let stderr_plus = run("import sys;print('{\\\"probe\\\":true}');sys.stderr.write('x'*65537)", Duration::from_secs(3)).await;
+        assert_eq!((stderr_plus.code, stderr_plus.out.as_str()), (Some(9), ""));
+        let dual_plus = run("import sys;sys.stdout.write('x'*1048577);sys.stderr.write('z'*65537)", Duration::from_secs(3)).await;
+        assert_eq!((dual_plus.code, dual_plus.out.as_str()), (Some(9), ""));
+        let nonzero_json = run("import sys;print('{\\\"probe\\\":true}');sys.exit(3)", Duration::from_secs(3)).await;
+        assert_eq!((nonzero_json.code, nonzero_json.out.as_str()), (Some(9), ""));
+        let held_eof = run("import os,time;\nif os.fork()==0: time.sleep(.3);os._exit(0)\nprint('{\\\"probe\\\":true}')", Duration::from_millis(80)).await;
+        assert_eq!((held_eof.code, held_eof.out.as_str()), (Some(9), ""));
+        let missing = probe_exchange_command_until(Command::new("/definitely-not-katala-probe"), tokio::time::Instant::now() + Duration::from_secs(1)).await;
+        assert_eq!(missing.code, Some(9));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    #[ignore = "owned native child for the probe timeout integration test"]
+    fn probe_transport_ready_fixture() {
+        use std::io::Write;
+        let port: u16 = std::env::var("KATALA_TUNE_TEST_READY_PORT").unwrap().parse().unwrap();
+        let mut ready = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        write!(ready, "{}", std::process::id()).unwrap();
+        drop(ready);
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn fixed_windows_probe_transport_kills_and_reaps_its_ready_root_on_timeout() {
+        if cfg!(windows) {
+            return;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Test the actual owned native root, independently of Python/mise
+        // discovery and interpreter startup on an overloaded CI runner.
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        let fixture = format!("{}::probe_transport_ready_fixture", module_path!().split_once("::").unwrap().1);
+        command.args(["--ignored", "--exact", &fixture, "--nocapture"]).env("KATALA_TUNE_TEST_READY_PORT", port.to_string());
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_secs(8);
+        let exchange = tokio::spawn(async move { probe_exchange_command_until(command, deadline).await });
+        let (mut ready, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await.unwrap().unwrap();
+        let mut pid = Vec::new();
+        tokio::time::timeout(Duration::from_millis(100), ready.read_to_end(&mut pid)).await.unwrap().unwrap();
+        let pid = String::from_utf8(pid).unwrap().parse::<i32>().unwrap();
+        assert!(pid > 0);
+        let result = exchange.await.unwrap();
+        assert_eq!((result.code, result.out.as_str()), (Some(9), ""));
+        assert!(tokio::time::Instant::now() <= deadline + Duration::from_millis(250), "transport exceeded its fixed outer deadline");
+        let reaped = tokio::time::timeout(Duration::from_millis(150), async {
+            loop {
+                let gone = !std::process::Command::new("/bin/kill")
+                    .args(["-0", &pid.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if gone {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(reaped.is_ok(), "owned timeout fixture root {pid} was not reaped");
     }
 }

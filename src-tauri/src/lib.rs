@@ -16,9 +16,11 @@ mod accent;
 mod agent;
 mod commands;
 mod commands_netsec;
+mod commands_specs;
 mod commands_tools;
 mod commands_topology;
 mod confirm;
+mod handoff_review;
 mod live;
 mod monitor;
 mod tray;
@@ -130,6 +132,9 @@ pub fn run() {
             commands::logs_signatures,
             commands::logs_cursors,
             commands::copy,
+            commands::ai_handoff,
+            commands::ai_handoff_copy,
+            handoff_review::ai_handoff_review,
             commands::open_data_dir,
             commands::open_config,
             commands::status,
@@ -140,6 +145,8 @@ pub fn run() {
             commands_topology::topology_refresh,
             commands_topology::topology_export,
             commands_tools::inventory,
+            commands_specs::specs_view,
+            commands_specs::specs_refresh,
             commands_tools::inventory_run,
             commands_tools::dogu_refresh,
             commands_tools::dogu_exclude,
@@ -156,6 +163,7 @@ pub fn run() {
             live::power_session,
             monitor::dashboard,
             monitor::monitor_settings,
+            monitor::monitor_events,
             monitor::hub_pull,
             agent::agent_peers,
             agent::agent_pair,
@@ -165,6 +173,7 @@ pub fn run() {
             let engine = Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(TauriHost { app: handle.clone() }))?;
             app.manage(engine.clone());
             app.manage(window::Pending::default());
+            app.manage(handoff_review::Review::default());
             let live = live::create(&handle, engine.config().nodes.len());
             app.manage(live.clone());
             if let Some(v) = std::env::var("KATALA_TUNE_DEV_VIEW").ok().filter(|_| cfg!(debug_assertions)) {
@@ -187,7 +196,10 @@ pub fn run() {
             // ウィンドウを閉じても、自動スキャンのためにメニューバー（Windows は通知領域）に残る。終了はメニューから
             RunEvent::ExitRequested { code: None, api, .. } => api.prevent_exit(),
             // ライブ表示: ウィンドウを閉じたら止め、終了するときはサンプラーが終わるのを待つ
-            RunEvent::WindowEvent { event: tauri::WindowEvent::Destroyed, .. } => live::stop_all(handle),
+            RunEvent::WindowEvent { event: tauri::WindowEvent::Destroyed, .. } => {
+                handle.state::<handoff_review::Review>().cancel();
+                live::stop_all(handle);
+            }
             RunEvent::Exit => live::shutdown(handle),
             #[cfg(target_os = "macos")]
             RunEvent::Reopen { .. } => window::show(handle),

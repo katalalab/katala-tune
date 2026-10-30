@@ -3,8 +3,10 @@ use super::super::model::{CaptureCounters, RawCapture};
 use super::super::{Failure, FailureCode, TopologyLimits, normalize_git_origin};
 use super::{CommandRunner, SystemRunner, failure_from_process};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 pub const POSIX_PROBE: &str = include_str!("../../../../../probes/topology_posix.py");
 pub const WINDOWS_PROBE: &str = include_str!("../../../../../probes/topology_win.ps1");
@@ -24,11 +26,28 @@ pub enum RemotePlatform {
     Posix,
     Windows,
 }
-#[derive(Clone, Copy, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteRuntimeKind {
     Native,
     Wsl,
+}
+
+/// Private, explicit permission for one checkout and the exact manifest bytes.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSourceCheckout {
+    pub root_index: usize,
+    pub relative_path: String,
+    pub expected_head: String,
+    pub manifests: Vec<RemoteSourceManifest>,
+}
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSourceManifest {
+    pub relative_path: String,
+    pub bytes: usize,
+    pub sha256: String,
 }
 
 /// Private request: roots, aliases and selected configuration paths are never logged.
@@ -43,25 +62,142 @@ pub struct RemoteRequest {
     /// WSL surfaces must already have a direct SSH alias. No distro launcher exists here.
     pub roots: Vec<String>,
     pub configs: Vec<Value>,
+    pub source_allowlist: Option<Vec<RemoteSourceCheckout>>,
     pub python_program: String,
+    pub windows_reader_program: Option<String>,
     pub git_program: Option<String>,
     pub observed_at_ms: i64,
     pub limits: TopologyLimits,
 }
 
 pub fn identity_hash(hostname: &str) -> String {
-    format!("{:x}", Sha256::digest(hostname.trim().to_ascii_lowercase().trim_end_matches(".local").as_bytes()))
+    crate::db::sha256_hex(hostname.trim().to_ascii_lowercase().trim_end_matches(".local").as_bytes())
 }
 
-pub async fn collect_remote(request: &RemoteRequest) -> RawCapture {
-    collect_remote_with(&SystemRunner, request).await
+fn canonical_relative(value: &str, checkout: bool) -> bool {
+    (checkout && value == ".") || (safe_relative(value) && !value.split('/').any(|part| part == "."))
 }
 
-pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteRequest) -> RawCapture {
-    let mut failed = empty_capture(request);
-    let alias_ok =
-        !request.alias.is_empty() && !request.alias.starts_with('-') && request.alias.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
-    let python_ok = request.python_program.starts_with('/') && request.python_program.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b));
+/// Match the probe platform's lexical absolute-root normalization, without IO.
+pub fn source_root_fingerprint(root: &str, platform: RemotePlatform) -> String {
+    let path = if platform == RemotePlatform::Windows { root.replace('\\', "/").to_lowercase() } else { root.to_owned() };
+    let (prefix, rest) = if platform == RemotePlatform::Windows { (path.get(..2).unwrap_or(""), path.get(2..).unwrap_or("")) } else { ("", path.as_str()) };
+    let mut parts = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let normalized = format!("{prefix}/{}", parts.join("/"));
+    crate::db::sha256_hex(normalized.as_bytes())
+}
+fn source_kind(path: &str) -> Option<&'static str> {
+    if path.starts_with(".github/workflows/") && path.matches('/').count() == 2 && (path.ends_with(".yml") || path.ends_with(".yaml")) {
+        return Some("workflow");
+    }
+    match path.rsplit('/').next()? {
+        "Cargo.toml" => Some("cargo"),
+        "package.json" => Some("node"),
+        "pyproject.toml" => Some("python"),
+        "go.mod" => Some("go"),
+        _ => None,
+    }
+}
+fn canonical_root(root: &str, platform: RemotePlatform) -> bool {
+    let path = if platform == RemotePlatform::Windows { root.replace('\\', "/") } else { root.to_owned() };
+    let rest = if platform == RemotePlatform::Windows { path.get(3..).unwrap_or("") } else { path.get(1..).unwrap_or("") };
+    (rest.is_empty() || !rest.split('/').any(|part| matches!(part, "" | "." | ".."))) && (platform == RemotePlatform::Windows || !path.contains('\\'))
+}
+fn valid_source_allowlist(request: &RemoteRequest) -> bool {
+    let Some(policy) = &request.source_allowlist else { return false };
+    if policy.is_empty()
+        || policy.len() > request.limits.entries_per_environment
+        || !request.configs.is_empty()
+        || request.roots.iter().any(|root| !canonical_root(root, request.platform))
+    {
+        return false;
+    }
+    let mut total_files = 0usize;
+    let mut total_bytes = 0usize;
+    let mut checkouts = HashSet::new();
+    for checkout in policy {
+        if checkout.root_index >= request.roots.len()
+            || !canonical_relative(&checkout.relative_path, true)
+            || !oid(&checkout.expected_head)
+            || checkout.expected_head != checkout.expected_head.to_ascii_lowercase()
+            || !checkouts.insert((source_root_fingerprint(&request.roots[checkout.root_index], request.platform), checkout.relative_path.as_str()))
+        {
+            return false;
+        }
+        let mut files = HashSet::new();
+        for file in &checkout.manifests {
+            total_files = total_files.saturating_add(1);
+            total_bytes = total_bytes.saturating_add(file.bytes);
+            if total_files > request.limits.manifests_per_environment
+                || total_bytes > request.limits.total_bytes_per_environment
+                || !canonical_relative(&file.relative_path, false)
+                || source_kind(&file.relative_path).is_none()
+                || !files.insert(file.relative_path.as_str())
+                || !hash(&file.sha256)
+                || file.sha256 != file.sha256.to_ascii_lowercase()
+                || file.bytes > request.limits.file_bytes
+                || (source_kind(&file.relative_path) == Some("workflow") && file.bytes > request.limits.workflow_bytes)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// A subset may be returned for continuation, but cannot become a Complete scan.
+fn validate_sources(request: &RemoteRequest, capture: &mut RawCapture) -> Result<bool, ()> {
+    let policy = request.source_allowlist.as_ref().ok_or(())?;
+    let approved_checkouts = policy
+        .iter()
+        .enumerate()
+        .map(|(index, approved)| {
+            ((source_root_fingerprint(&request.roots[approved.root_index], request.platform), approved.relative_path.as_str()), (index, approved))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    let mut complete = true;
+    for repo in &mut capture.repositories {
+        let Some((index, approved)) = approved_checkouts.get(&(repo.root_fingerprint.clone(), repo.relative_path.as_str())) else {
+            return Err(());
+        };
+        if !seen.insert(*index) || repo.git.head.as_deref() != Some(approved.expected_head.as_str()) || repo.config_file_read || !repo.configs.is_empty() {
+            return Err(());
+        }
+        let allowed_files = approved.manifests.iter().map(|allowed| (allowed.relative_path.as_str(), allowed)).collect::<HashMap<_, _>>();
+        let mut files = HashSet::new();
+        for file in &repo.manifests {
+            let Some(allowed) = allowed_files.get(file.relative_path.as_str()) else { return Err(()) };
+            if !files.insert(file.relative_path.as_str())
+                || file.revision.as_deref() != Some(approved.expected_head.as_str())
+                || file.content.len() != allowed.bytes
+                || file.content_sha256 != allowed.sha256
+                || crate::db::sha256_hex(file.content.as_bytes()) != allowed.sha256
+                || source_kind(&file.relative_path) != Some(file.kind.as_str())
+            {
+                return Err(());
+            }
+        }
+        if files.len() != approved.manifests.len() {
+            complete = false;
+            if repo.failures.len() < 64 {
+                repo.failures.push(Failure::new(FailureCode::PermissionDenied, "source allowlist incomplete"));
+            }
+        }
+    }
+    Ok(complete && seen.len() == policy.len())
+}
+
+pub(super) fn validate_collection(request: &RemoteRequest) -> Result<(), Failure> {
     let distro_ok = request.expected_distro.as_deref().is_none_or(|value| {
         !value.is_empty() && value.len() <= 64 && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
     });
@@ -74,48 +210,72 @@ pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteReq
                 root.len() > 2 && root.as_bytes()[0].is_ascii_alphabetic() && root.as_bytes()[1] == b':' && matches!(root.as_bytes()[2], b'/' | b'\\')
             }
     });
-    if !distro_ok
-        || !runtime_ok
-        || !roots_ok
-        || request.limits.stdout_bytes < 2048
-        || !alias_ok
-        || (request.platform == RemotePlatform::Posix && !python_ok)
-        || request.roots.is_empty()
-    {
+    if !distro_ok || !runtime_ok || !roots_ok || request.limits.stdout_bytes < 2048 || request.roots.is_empty() {
+        return Err(Failure::new(FailureCode::Unsupported, "invalid existing SSH surface or roots"));
+    }
+    if !valid_source_allowlist(request) {
+        return Err(Failure::new(FailureCode::PermissionDenied, "explicit source allowlist required"));
+    }
+    if request.roots.len() > request.limits.roots_per_environment {
+        return Err(Failure::new(FailureCode::LimitReached, "root budget exceeded"));
+    }
+    if request.cursor.as_ref().is_some_and(|cursor| !valid_cursor(cursor, request.roots.len(), request.limits.depth)) {
+        return Err(Failure::new(FailureCode::PermissionDenied, "invalid continuation cursor"));
+    }
+    Ok(())
+}
+
+pub async fn collect_remote(request: &RemoteRequest) -> RawCapture {
+    collect_remote_with(&SystemRunner, request).await
+}
+
+pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteRequest) -> RawCapture {
+    let mut failed = empty_capture(request);
+    let alias_ok =
+        !request.alias.is_empty() && !request.alias.starts_with('-') && request.alias.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    let python_ok = request.python_program.starts_with('/') && request.python_program.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b));
+    if !alias_ok || (request.platform == RemotePlatform::Posix && !python_ok) {
         failed.failures.push(Failure::new(FailureCode::Unsupported, "invalid existing SSH surface or roots"));
         return failed;
     }
-    if request.roots.len() > request.limits.roots_per_environment {
-        failed.failures.push(Failure::new(FailureCode::LimitReached, "root budget exceeded"));
+    if let Err(failure) = validate_collection(request) {
+        failed.failures.push(failure);
         return failed;
     }
-    if request.cursor.as_ref().is_some_and(|cursor| !valid_cursor(cursor, request.roots.len(), request.limits.depth)) {
-        failed.failures.push(Failure::new(FailureCode::PermissionDenied, "invalid continuation cursor"));
-        return failed;
-    }
-    let config = json!({"scope_id":request.scope_id,"observed_at_ms":request.observed_at_ms,"roots":request.roots,"configs":request.configs,"git_program":request.git_program,"limits":request.limits,"work_timeout_ms":remote_work_timeout_ms(request.limits.remote_timeout_seconds),"cursor":request.cursor,"expected_runtime":request.expected_runtime,"expected_distro":request.expected_distro,"expected_identity_hash":request.expected_identity_hash});
+    let config = json!({"source_allowlist":request.source_allowlist,"scope_id":request.scope_id,"observed_at_ms":request.observed_at_ms,"roots":request.roots,"configs":request.configs,"git_program":request.git_program,"limits":request.limits,"work_timeout_ms":remote_work_timeout_ms(request.limits.remote_timeout_seconds),"cursor":request.cursor,"expected_runtime":request.expected_runtime,"expected_distro":request.expected_distro,"expected_identity_hash":request.expected_identity_hash});
     let serialized = serde_json::to_vec(&config).unwrap_or_default();
-    if serialized.len() > request.limits.file_bytes {
+    if serialized.len() > request.limits.file_bytes || serialized.len() > MAX_REMOTE_INPUT {
         failed.failures.push(Failure::new(FailureCode::LimitReached, "remote request byte budget exceeded"));
         return failed;
     }
-    let encoded_config = crate::logs::base64(&serialized);
+    let mut reader_binding = None;
     let (command, stdin) = if request.platform == RemotePlatform::Posix {
+        let encoded_config = crate::logs::base64(&serialized);
         (
             format!("exec {} -B -", request.python_program),
             format!("import base64,json\nCONFIG=json.loads(base64.b64decode(\"{encoded_config}\"))\n{POSIX_PROBE}").into_bytes(),
         )
     } else {
-        let script = format!(
-            "$TopologyRequest = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(\"{encoded_config}\")) | ConvertFrom-Json\n{}",
-            WINDOWS_PROBE.trim_start_matches('\u{feff}')
-        );
-        let stdin = script.into_bytes();
-        let loader = WINDOWS_STDIN_LOADER.replace("__BYTES__", &stdin.len().to_string());
-        let utf16: Vec<u8> = loader.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        (format!("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {}", crate::logs::base64(&utf16)), stdin)
+        use super::windows_reader::{ReaderRequest, encode_request, fresh_nonce, valid_program_path};
+        let Some(program) = request.windows_reader_program.as_deref().filter(|p| valid_program_path(p)) else {
+            failed.failures.push(Failure::new(FailureCode::Unsupported, "explicit Windows reader executable required"));
+            return failed;
+        };
+        let prepared = fresh_nonce()
+            .and_then(|nonce| ReaderRequest::from_remote(request, nonce, remote_work_timeout_ms(request.limits.remote_timeout_seconds)))
+            .and_then(|reader| encode_request(&reader).map(|frame| (reader, frame)));
+        let Ok((reader, frame)) = prepared else {
+            failed.failures.push(Failure::new(FailureCode::PermissionDenied, "remote reader request invalid"));
+            return failed;
+        };
+        let command = format!("exec '{program}' topology-reader --budget-ms {}", reader.budget_ms);
+        // The frame prefix is fixed at sixteen bytes; preserve the exact body
+        // sent to the remote helper, never a reserialized approximation.
+        reader_binding = Some((reader, frame[16..].to_vec()));
+        (command, frame)
     };
-    if stdin.len() > MAX_REMOTE_INPUT {
+    let stdin_limit = MAX_REMOTE_INPUT + if reader_binding.is_some() { 16 } else { 0 };
+    if stdin.len() > stdin_limit {
         failed.failures.push(Failure::new(FailureCode::LimitReached, "remote stdin byte budget exceeded"));
         return failed;
     }
@@ -136,21 +296,43 @@ pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteReq
         request.alias.clone(),
         command,
     ]);
-    let output = runner
-        .run("ssh", &args, &stdin, Duration::from_secs(request.limits.remote_timeout_seconds), request.limits.stdout_bytes, request.limits.stderr_bytes)
-        .await;
+    let stdout_limit = if reader_binding.is_some() {
+        request.limits.stdout_bytes.saturating_add(super::windows_reader::MAX_RESPONSE_HEADER_BYTES + 16)
+    } else {
+        request.limits.stdout_bytes
+    };
+    let output = runner.run("ssh", &args, &stdin, Duration::from_secs(request.limits.remote_timeout_seconds), stdout_limit, request.limits.stderr_bytes).await;
     if let Some(failure) = failure_from_process(&output) {
         failed.failures.push(failure);
         return failed;
     }
-    if output.stdout.contains(&0) {
-        failed.failures.push(Failure::new(FailureCode::ParseError, "transport contains invalid NUL"));
-        return failed;
+    let bytes = if let Some((reader, body)) = &reader_binding {
+        match super::windows_reader::decode_response(&output.stdout, reader, body) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                failed.failures.push(Failure::new(FailureCode::PermissionDenied, "remote reader acknowledgement invalid"));
+                return failed;
+            }
+        }
+    } else {
+        output.stdout.as_slice()
+    };
+    match validate_capture_bytes(request, bytes) {
+        Ok(capture) => capture,
+        Err(failure) => {
+            failed.failures.push(failure);
+            failed
+        }
     }
-    let raw = serde_json::from_slice::<Value>(&output.stdout);
+}
+
+pub(super) fn validate_capture_bytes(request: &RemoteRequest, bytes: &[u8]) -> Result<RawCapture, Failure> {
+    if bytes.contains(&0) {
+        return Err(Failure::new(FailureCode::ParseError, "transport contains invalid NUL"));
+    }
+    let raw = super::windows_reader::strict_json::<Value>(bytes);
     let Ok(raw) = raw else {
-        failed.failures.push(Failure::new(FailureCode::ParseError, "remote report invalid"));
-        return failed;
+        return Err(Failure::new(FailureCode::ParseError, "remote report invalid"));
     };
     let runtime = &raw["runtime"];
     let expected_kind = if request.expected_runtime == RemoteRuntimeKind::Wsl { "wsl" } else { "native" };
@@ -160,13 +342,11 @@ pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteReq
         || runtime["kernel_wsl"].as_bool() != Some(request.expected_runtime == RemoteRuntimeKind::Wsl)
         || (request.expected_runtime == RemoteRuntimeKind::Wsl && runtime["distro"].as_str() != request.expected_distro.as_deref())
     {
-        failed.failures.push(Failure::new(FailureCode::PermissionDenied, "remote runtime identity mismatch"));
-        return failed;
+        return Err(Failure::new(FailureCode::PermissionDenied, "remote runtime identity mismatch"));
     }
     let capture = serde_json::from_value::<RawCapture>(raw);
     let Ok(mut capture) = capture else {
-        failed.failures.push(Failure::new(FailureCode::ParseError, "remote report invalid"));
-        return failed;
+        return Err(Failure::new(FailureCode::ParseError, "remote report invalid"));
     };
     if capture.scope_id != request.scope_id
         || capture.adapter != "remote"
@@ -174,12 +354,18 @@ pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteReq
         || capture.limits != request.limits
         || request.expected_identity_hash.as_ref().is_some_and(|expected| capture.target_identity.as_ref() != Some(expected))
     {
-        failed.failures.push(Failure::new(FailureCode::PermissionDenied, "remote identity or request mismatch"));
-        return failed;
+        return Err(Failure::new(FailureCode::PermissionDenied, "remote identity or request mismatch"));
     }
     if !valid_capture(&capture) || capture.progress.as_ref().is_some_and(|cursor| !valid_cursor(cursor, request.roots.len(), request.limits.depth)) {
-        failed.failures.push(Failure::new(FailureCode::ParseError, "remote report violates bounded schema"));
-        return failed;
+        return Err(Failure::new(FailureCode::ParseError, "remote report violates bounded schema"));
+    }
+    match validate_sources(request, &mut capture) {
+        Err(()) => {
+            return Err(Failure::new(FailureCode::PermissionDenied, "remote source allowlist mismatch"));
+        }
+        Ok(false) if capture.failures.len() < 64 => capture.failures.push(Failure::new(FailureCode::PermissionDenied, "source allowlist incomplete")),
+        Ok(false) => {}
+        Ok(true) => {}
     }
     for failure in &mut capture.failures {
         failure.message = safe_failure_message(&failure.message, false);
@@ -190,7 +376,7 @@ pub async fn collect_remote_with(runner: &dyn CommandRunner, request: &RemoteReq
             failure.message = safe_failure_message(&failure.message, true);
         }
     }
-    capture
+    Ok(capture)
 }
 
 fn valid_capture(capture: &RawCapture) -> bool {
@@ -255,7 +441,7 @@ fn valid_capture(capture: &RawCapture) -> bool {
                 || !matches!(manifest.kind.as_str(), "cargo" | "node" | "python" | "go" | "workflow")
                 || manifest.content.len() > limit.file_bytes
                 || (manifest.kind == "workflow" && manifest.content.len() > limit.workflow_bytes)
-                || format!("{:x}", Sha256::digest(manifest.content.as_bytes())) != manifest.content_sha256
+                || crate::db::sha256_hex(manifest.content.as_bytes()) != manifest.content_sha256
             {
                 return false;
             }
@@ -305,6 +491,8 @@ fn empty_capture(request: &RemoteRequest) -> RawCapture {
 fn safe_failure_message(message: &str, repository: bool) -> String {
     if message.starts_with("stalled_directory:") {
         "stalled_directory: narrow root or raise limit".into()
+    } else if message == "source allowlist incomplete" {
+        message.into()
     } else if message == "continued-fragment" {
         "continued-fragment".into()
     } else if message == "continuation cursor invalidated" {
@@ -417,7 +605,7 @@ pub fn hash_json_typed_v1(value: &Value) -> Result<String, Failure> {
     }
     let mut bytes = Vec::new();
     encode(value, &mut bytes, 0)?;
-    Ok(format!("{:x}", Sha256::digest(&bytes)))
+    Ok(crate::db::sha256_hex(&bytes))
 }
 
 #[cfg(test)]

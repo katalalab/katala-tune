@@ -24,13 +24,9 @@ pub fn start(app: AppHandle, engine: Arc<Engine>, live: Arc<Live>) {
     ));
 }
 
-/// アプリに同梱したサンプラー（Windows だけ）。ほかの Windows の機体の古いサンプラーを入れ替えるのに使う
+/// アプリに同梱したサンプラー。ハブと同じ OS のほかの機体の古いサンプラーを入れ替えるのに使う
 pub fn bundled_agent() -> Option<Arc<Vec<u8>>> {
-    if !cfg!(windows) {
-        return None;
-    }
-    let p = std::env::current_exe().ok()?.parent()?.join("tune-agent.exe");
-    std::fs::read(p).ok().map(Arc::new)
+    tune_core::helpers::bundled_agent().map(Arc::new)
 }
 
 /// 起動のたびに、アプリの隣の道具（tune・tune-agent）を ~/.katala-tune/bin へ写す（版がそろうように）。結果は meta の helpers
@@ -66,4 +62,11 @@ pub async fn monitor_settings(e: State<'_, Arc<Engine>>, patch: Option<Value>) -
 #[tauri::command]
 pub async fn hub_pull(e: State<'_, Arc<Engine>>) -> Result<Value, String> {
     monitor::pull(&e).await
+}
+
+/// 接続・収集の保守記録。照会による書込み/通知はしない。
+#[tauri::command]
+pub async fn monitor_events(e: State<'_, Arc<Engine>>, filter: Option<Value>) -> Result<Value, String> {
+    let filter = serde_json::from_value(filter.unwrap_or_else(|| json!({}))).map_err(|_| "収集記録の絞り込みが不正です".to_string())?;
+    e.monitor_events(&filter)
 }

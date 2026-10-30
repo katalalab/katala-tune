@@ -8,6 +8,8 @@
 //!   tune last                        DB の前回の分析結果（所見・スコアつき）を JSON で
 //!   tune power                       電力・Clockと計算条件を JSON で（読み取り専用）
 //!   tune capabilities [機体 ...] firmware 読取（省略はこの機体、保存なし）
+//!   tune specs-local                 Rust による機体仕様の読取（台帳・DB不要）
+//!   tune specs [機体 ...]            仕様を収集・保存して比較用 JSON を表示
 //!   tune maintenance-plan [機体 ...] 読取更新と実行不可の保守計画
 //!   tune network [--probe] [機体 ...] 軽量な接続診断（省略はこの機体。--probeだけHTTPS到達性・時間も測る）
 //!   tune status [--recompute]        DB の状態（機能チェック）を JSON で。--recompute で計算し直して保存する
@@ -39,11 +41,19 @@
 //!   tune agent-peers                 ペア済みの tune-agent（公開鍵の指紋だけ）
 //!   tune agent-probe <名前|指紋|addr> ペア済みの tune-agent で調査を 1 回（SSH を使わない。src/agent.rs）
 //!   tune agent-unpair <名前|指紋>    ペア済みの tune-agent を台帳から消す
+//!   tune agent-push <機体> [--file PATH] その機体の ~/.katala-tune/bin へサンプラーを SSH で置く（既定は CLI の隣の tune-agent。
+//!                                    ハブと違う OS の機体へはその OS 用の物を --file で渡す。SHA-256 を確かめてから入れ替える）
 //!
 //! 台帳と DB は Electron 版と同じ場所（KATALA_TUNE_CONFIG・KATALA_TUNE_DATA_DIR で差し替えられる）。
 //! 変更操作（actions）はここからは実行しない（確認ダイアログを通すため、アプリからだけ）。
 
 mod agent;
+mod discovery;
+mod specs;
+mod topology_native;
+mod topology_reader;
+mod windows_action;
+mod windows_probe;
 
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -58,7 +68,7 @@ use tune_core::{
 
 fn usage() -> ExitCode {
     eprintln!(
-        "使い方: tune <paths|probe|hygiene|logs|ledger|last|power|network|capabilities|maintenance-plan|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
+        "使い方: tune <paths|probe|hygiene|logs|ledger|last|power|network|capabilities|specs-local|specs|maintenance-plan|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|agent-push|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
     );
     ExitCode::from(2)
 }
@@ -110,6 +120,27 @@ fn targets(ids: &[String]) -> Result<Vec<nodes::Node>, String> {
         );
     }
     Ok(targets)
+}
+
+/// 指定の機体（1 台）へサンプラーを置く。台帳の除外・SSH 禁止に従い、OS に合わない実行ファイルは送らない
+async fn agent_push(rest: &[String]) -> Result<Value, String> {
+    let usage = || "使い方: tune agent-push <機体> [--file PATH]".to_string();
+    let (mut ids, mut file, mut args) = (Vec::new(), None, rest.iter());
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--file" => file = Some(args.next().ok_or_else(usage)?.clone()),
+            x if x.starts_with('-') => return Err(usage()),
+            x => ids.push(x.to_string()),
+        }
+    }
+    let [id] = ids.as_slice() else { return Err(usage()) };
+    let node = targets(std::slice::from_ref(id))?.into_iter().next().ok_or_else(|| format!("{id}: 運用対象の機体ではない"))?;
+    let (bytes, from) = match &file {
+        Some(p) => (std::fs::read(p).map_err(|e| format!("{p}: {e}"))?, p.clone()),
+        None => (tune_core::helpers::bundled_agent().ok_or("CLI の隣に tune-agent が無い（--file で渡す）")?, "bundled".into()),
+    };
+    let sha256 = tune_core::helpers::push_agent(&node, &bytes).await.map_err(|e| format!("{id}: {e}"))?;
+    Ok(json!({ "node_id": id, "ok": true, "sha256": sha256, "bytes": bytes.len(), "from": from }))
 }
 
 /// 台帳と既存の観測だけ読む。初回閲覧でも見本・DB を作らない
@@ -297,12 +328,52 @@ async fn live(rest: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let started = std::time::Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = discovery::run(&args) {
+        return code;
+    }
+    if args.first().is_some_and(|cmd| cmd == "topology-reader") {
+        return topology_reader::main(&args[1..], started);
+    }
+    if let Some(entry) = args.first().filter(|entry| matches!(entry.as_str(), "topology-native-reader" | "topology-supervise" | "topology-verify")) {
+        return topology_native::main(entry, &args[1..], started);
+    }
+    if args.first().is_some_and(|entry| entry == "windows-action-receiver-v2") {
+        return windows_action::main(&args[1..], started);
+    }
+    if args.first().is_some_and(|entry| entry == "windows-probe-v1") {
+        return windows_probe::main(&args[1..], started);
+    }
+    match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(runtime) => runtime.block_on(async_main(args)),
+        Err(_) => ExitCode::from(1),
+    }
+}
+
+async fn async_main(args: Vec<String>) -> ExitCode {
     let Some(cmd) = args.first() else { return usage() };
     let rest = &args[1..];
+    if cmd == "specs-local" {
+        if !rest.is_empty() {
+            return usage();
+        }
+        let report = tune_core::specs::collect_local().await;
+        let ok = report["ok"] == true;
+        print(&report);
+        return if ok { ExitCode::SUCCESS } else { ExitCode::from(1) };
+    }
     let res: Result<(), String> = match cmd.as_str() {
+        "specs" => specs::run(rest).await.map(|v| print(&v)),
+        "versions" => match specs::audit_targets(rest) {
+            Ok(selected) => {
+                let report = tune_core::version_inventory::audit(selected).await;
+                print(&report);
+                if report["ok"] == true { Ok(()) } else { Err("CLI の版照合に不一致または取得失敗があります".into()) }
+            }
+            Err(error) => Err(error),
+        },
         "topology-refresh" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
             Ok(e) => match topology_node_ids(rest, false) {
                 Ok(ids) => {
@@ -334,7 +405,7 @@ async fn main() -> ExitCode {
         },
         "topology-export" => match Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(NoHost)) {
             Ok(e) => {
-                let view = match e.topology_view() {
+                let view = match e.topology_accepted_view() {
                     Ok(view) => view,
                     Err(error) => {
                         eprintln!("{error}");
@@ -385,6 +456,7 @@ async fn main() -> ExitCode {
             Ok(())
         }
         "hygiene" => hygiene(rest).await,
+        "agent-push" => agent_push(rest).await.map(|v| print(&v)),
         "probe" => match targets(rest) {
             Ok(t) => {
                 let rs = collect::probe_all(&t, |r| {
@@ -601,17 +673,20 @@ async fn main() -> ExitCode {
                 let live = Live::new(Arc::new(ProcessRoute), tune_core::monitor::live_opts(e.config().nodes.len()), Box::new(|_| {}));
                 tokio::spawn(live.clone().run_ticker());
                 let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
-                // 同梱のサンプラー（CLI の隣。Windows だけ）があれば、古い機体へ入れ替えを送る（アプリと同じ）
-                let agent = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.join("tune-agent.exe")))
-                    .filter(|_| cfg!(windows))
-                    .and_then(|p| std::fs::read(p).ok())
-                    .map(Arc::new);
+                // 同梱のサンプラー（CLI の隣）があれば、同じ OS の古い機体へ入れ替えを送る（アプリと同じ）
+                let agent = tune_core::helpers::bundled_agent().map(Arc::new);
                 tune_core::monitor::run(e.clone(), live.clone(), |ev| eprintln!("monitor: {ev}"), Some(until), agent).await;
                 let v = tune_core::monitor::dashboard(&e, Some(&live), 60);
-                live.shutdown(std::time::Duration::from_secs(3)).await;
-                v.map(|v| print(&v))
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                live.shutdown(deadline.saturating_duration_since(std::time::Instant::now())).await;
+                if !e.finish_monitor_journal(deadline.saturating_duration_since(std::time::Instant::now())).await {
+                    Err("収集記録の終了時保存を確認できません".into())
+                } else {
+                    v.map(|mut v| {
+                        v["journal"] = e.monitor_journal_health();
+                        print(&v)
+                    })
+                }
             }
             Err(e) => Err(e),
         },

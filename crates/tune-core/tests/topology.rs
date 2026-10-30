@@ -75,6 +75,52 @@ fn parsers_collect_declared_dependencies_without_self_edges() {
 }
 
 #[test]
+fn toml_11_manifest_facts_match_legacy_syntax_and_cached_json() {
+    use tune_core::topology::SourceFacts;
+
+    for (legacy, current, spec) in [
+        (
+            parse_cargo("[package]\nname='fixture'\n[dependencies]\nleft={version='1'}\n"),
+            parse_cargo(
+                r#"[package]
+name = "fixture"
+[dependencies]
+left = {
+    version = "\x31", # TOML 1.1 inline table and escape
+}
+"#,
+            ),
+            "1",
+        ),
+        (
+            parse_python("[project]\nname='fixture'\ndependencies=['left>=1']\n"),
+            parse_python(
+                r#"project = {
+    name = "fixture",
+    dependencies = ["left>=\x31"],
+}
+"#,
+            ),
+            "left>=1",
+        ),
+    ] {
+        // The existing cache stores typed JSON facts, not a toml::Value.
+        let cache_json = serde_json::json!({
+            "type": "package", "name": "fixture", "workspace_dependencies": [],
+            "dependencies": [{
+                "name": "left", "alias": null, "kind": "Normal", "local": false,
+                "source": "registry", "spec": spec, "resolved": null,
+                "extra": null, "origin": null, "target": null
+            }]
+        });
+        let cached: SourceFacts = serde_json::from_value(cache_json.clone()).unwrap();
+        assert_eq!(SourceFacts::from(legacy.unwrap()), cached);
+        assert_eq!(SourceFacts::from(current.unwrap()), cached);
+        assert_eq!(serde_json::to_value(cached).unwrap(), cache_json);
+    }
+}
+
+#[test]
 fn manifest_dependency_kinds_and_sources_are_typed() {
     use tune_core::topology::{DependencyKind, DependencySource};
     let cargo = parse_cargo("[package]\nname='member'\n[dependencies]\nrenamed = { package='actual', git='https://token@example.com/actual.git?secret=x' }\nlocal = { path='../local' }\n[build-dependencies]\nbuilder='1'\n[target.'cfg(unix)'.dependencies]\nplatform='1'\n").unwrap();

@@ -4,7 +4,7 @@
 use rusqlite::params;
 use serde_json::{Value, json};
 
-use super::{Result, Store};
+use super::{Result, Store, now_ms, retention};
 
 pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS metrics_minute (
@@ -83,9 +83,21 @@ impl Store {
         self.conn.query_row("SELECT max(at) FROM tune_snapshots", [], |r| r.get(0))
     }
 
-    /// 古い行を消す
+    /// Archive before deleting old minutes, in one transaction. No collector is started.
     pub fn prune_metrics(&self, before: i64) -> Result<usize> {
-        self.conn.execute("DELETE FROM metrics_minute WHERE minute < ?", [before])
+        let result = retention::compact(&self.conn, before, now_ms(), retention::Budget::default())?;
+        let deleted = result["deleted"].as_u64().ok_or(rusqlite::Error::InvalidQuery)?;
+        usize::try_from(deleted).map_err(|_| rusqlite::Error::InvalidQuery)
+    }
+
+    pub fn metrics_history(&self, node: &str, since: i64, until: i64, resolution: &str) -> Result<Value> {
+        retention::query(&self.conn, node, since, until, resolution)
+    }
+
+    pub fn metrics_retention(&self) -> Result<Value> {
+        let mut report = retention::status(&self.conn)?;
+        report["maintenance"] = self.get_meta("metricsRetentionMaintenance")?.unwrap_or(Value::Null);
+        Ok(report)
     }
 
     /// 写し（ハブとの同期）に使う: 新しい分析結果の行をそのまま（node_id, at, wall_s, score, findings, data, 要約）

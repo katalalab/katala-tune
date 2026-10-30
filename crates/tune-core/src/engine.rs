@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
@@ -57,12 +57,14 @@ pub const DEFAULT_INVENTORY_HOURS: i64 = 24;
 pub struct Engine {
     host: Arc<dyn Host>,
     pub db: Arc<Mutex<Store>>,
+    monitor_journal: OnceLock<crate::monitor_journal::Journal>,
     cfg: RwLock<(Config, Option<String>)>,
     config_path: PathBuf,
     data_dir: PathBuf,
     probing: AtomicBool,
     syncing: AtomicBool,
     pub(crate) topology_refreshing: AtomicBool,
+    pub(crate) specs_running: tokio::sync::Mutex<()>,
     last_probe_error: Mutex<HashMap<String, String>>,
     fleet: Mutex<(Option<Value>, Option<i64>)>,
     action_targets: Mutex<HashSet<String>>,
@@ -126,12 +128,14 @@ impl Engine {
         let e = Arc::new(Engine {
             host,
             db: Arc::new(Mutex::new(store)),
+            monitor_journal: OnceLock::new(),
             cfg: RwLock::new((Config::default(), None)),
             config_path,
             data_dir,
             probing: AtomicBool::new(false),
             syncing: AtomicBool::new(false),
             topology_refreshing: AtomicBool::new(false),
+            specs_running: tokio::sync::Mutex::new(()),
             last_probe_error: Mutex::new(HashMap::new()),
             fleet: Mutex::new((None, None)),
             action_targets: Mutex::new(HashSet::new()),
@@ -183,6 +187,31 @@ impl Engine {
     /// DB を短く借りる
     pub fn with_db<T>(&self, f: impl FnOnce(&Store) -> rusqlite::Result<T>) -> Result<T, String> {
         f(&lock(&self.db)).map_err(|e| e.to_string())
+    }
+
+    /// monitor::runのruntime内から1回。照会はwriterを開始しない。
+    pub fn start_monitor_journal(&self) -> crate::monitor_journal::Journal {
+        self.monitor_journal.get_or_init(|| crate::monitor_journal::Journal::start(self.db.clone())).clone()
+    }
+
+    pub fn monitor_journal_health(&self) -> Value {
+        self.monitor_journal.get().map_or_else(
+            || json!({ "status": "unknown", "running": false, "summary": "収集記録は開始していません", "dropped_total": null, "db_failures": null }),
+            |j| j.health(),
+        )
+    }
+
+    pub fn monitor_events(&self, filter: &crate::monitor_journal::Filter) -> Result<Value, String> {
+        let mut v = self.with_db(|d| d.monitor_events(filter)).map_err(|_| "収集記録を読み出せません".to_string())?;
+        v["health"] = self.monitor_journal_health();
+        Ok(v)
+    }
+
+    pub async fn finish_monitor_journal(&self, budget: Duration) -> bool {
+        match self.monitor_journal.get() {
+            Some(j) => j.shutdown(budget).await,
+            None => true,
+        }
     }
 
     /// 自動スキャンの設定（既定 → 台帳の schedule → 画面で変えた値 の順に上書き）
@@ -616,12 +645,22 @@ impl Engine {
                 Err(e) => return refused(format!("台帳を読めないので実行しない: {e}")),
             };
             let Some(node) = fresh.node(node_id) else { return refused("台帳に無い機体".into()) };
+            // Bind history to the configured route. This does not attest the
+            // remote host behind an unchanged SSH alias.
+            let target = json!([node.alias, node.os, node.local, actions::action_helper_fingerprint(node)]);
+            if let Some(original_id) = undo_of {
+                let history = self.with_db(|d| d.actions(1000))?;
+                let original = history.iter().find(|a| js::is_str(a.get("id"), original_id));
+                if original.and_then(|a| a.get("target")) != Some(&target) {
+                    return refused("元の操作の接続先情報と一致しないか、記録がないため、元に戻さない".into());
+                }
+            }
             let p = match actions::plan(node, action, Some(&fresh.protect)) {
                 Ok(p) => p,
                 Err(e) => return refused(e),
             };
             // 承認した接続先（どの機体に、どのシェルで送るか）。確認の後に台帳を読み直したとき、これが変わっていたら実行しない
-            let route = (node.alias.clone(), node.os.clone(), node.local);
+            let route = (node.alias.clone(), node.os.clone(), node.local, actions::action_helper_fingerprint(node));
             if !confirm(title.to_string(), format!("{}\n\n実行するコマンド:\n{}", p.describe, p.script)).await {
                 return Ok(json!({ "ok": false, "cancelled": true }));
             }
@@ -640,7 +679,7 @@ impl Engine {
                 Err(e) => return abort(format!("台帳を読めないので実行しない: {e}")),
             };
             let Some(node) = fresh.node(node_id) else { return abort("台帳に無い機体".into()) };
-            if (node.alias.clone(), node.os.clone(), node.local) != route {
+            if (node.alias.clone(), node.os.clone(), node.local, actions::action_helper_fingerprint(node)) != route {
                 return abort("確認のあいだに台帳の接続先（alias・OS・この機体かどうか）が変わったので実行しない。もう一度確認してください".into());
             }
             // 共用機・保護リスト・引数は、読み直した台帳でもう一度確かめる（実行するコマンドは接続先と操作で決まるので、承認したものと同じ）
@@ -653,6 +692,7 @@ impl Engine {
                 "id": id, "at": now_ms(), "node_id": node.id,
                 "type": action.get("type"), "params": action.get("params"), "label": title, "ok": null,
                 "output": PENDING_OUTPUT, "undo": null, "undo_of": undo_of,
+                "target": target,
             });
             if let Err(e) = self.with_db(|d| d.add_action(&entry)) {
                 return refused(format!("実行記録を書けないので実行しない: {e}"));

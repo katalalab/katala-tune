@@ -4,7 +4,6 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::db::now_ms;
 use crate::engine::Engine;
@@ -12,6 +11,7 @@ use crate::topology::{
     Failure, FailureCode, ScopeStatus, TopologySnapshot,
     adapters::{
         assemble_capture_cached, capture_local_with_progress, capture_source_cache_keys,
+        docker::{DockerRequest, collect_docker, engine_snapshots},
         github::{GithubRequest, collect_github},
         remote::{RemotePlatform, RemoteRequest, RemoteRuntimeKind, collect_remote},
     },
@@ -20,26 +20,25 @@ use crate::topology::{
 static NEXT_TOPOLOGY_RUN: AtomicU64 = AtomicU64::new(1);
 
 fn remote_generation(request: &RemoteRequest) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(
-            serde_json::to_vec(&json!({
-                "roots": request.roots,
-                "configs": request.configs,
-                "limits": request.limits,
-                "platform": match request.platform {
-                    RemotePlatform::Posix => "posix",
-                    RemotePlatform::Windows => "windows",
-                },
-                "runtime": request.expected_runtime,
-                "expected_distro": request.expected_distro,
-                "alias": request.alias,
-                "expected_identity_hash": request.expected_identity_hash,
-                "python_program": request.python_program,
-                "git_program": request.git_program,
-            }))
-            .unwrap_or_default(),
-        )
+    crate::db::sha256_hex(
+        &serde_json::to_vec(&json!({
+            "roots": request.roots,
+            "configs": request.configs,
+            "source_allowlist": request.source_allowlist,
+            "limits": request.limits,
+            "platform": match request.platform {
+                RemotePlatform::Posix => "posix",
+                RemotePlatform::Windows => "windows",
+            },
+            "runtime": request.expected_runtime,
+            "expected_distro": request.expected_distro,
+            "alias": request.alias,
+            "expected_identity_hash": request.expected_identity_hash,
+            "python_program": request.python_program,
+            "windows_reader_program": request.windows_reader_program,
+            "git_program": request.git_program,
+        }))
+        .unwrap_or_default(),
     )
 }
 
@@ -82,7 +81,7 @@ impl Engine {
             return json!({"schema":"katala_topology.v1","status":"already_running","trigger":trigger,"started_at":started_at,"ended_at":now_ms(),"scopes":[]});
         }
         let sequence = NEXT_TOPOLOGY_RUN.fetch_add(1, Ordering::Relaxed);
-        let run_id = format!("topology-{:x}", Sha256::digest(format!("{trigger}:{started_at}:{}:{sequence}", std::process::id()).as_bytes()));
+        let run_id = format!("topology-{}", crate::db::sha256_hex(format!("{trigger}:{started_at}:{}:{sequence}", std::process::id()).as_bytes()));
         let lease_ttl_ms = i64::try_from(config.topology.limits.local_timeout_seconds.max(config.topology.limits.remote_timeout_seconds))
             .unwrap_or(3_600)
             .saturating_mul(2_000);
@@ -123,7 +122,7 @@ impl Engine {
                 };
                 let mut progress_to_save = None;
                 let mut source_cache_saved = true;
-                let snapshots = if !enabled {
+                let mut snapshots = if !enabled {
                     vec![excluded("environment is disabled")]
                 } else if node.local && transport == "node" {
                     let progress = self.with_db(|db| db.topology_progress(&scope_id)).ok().flatten();
@@ -238,7 +237,9 @@ impl Engine {
                                 cursor: None,
                                 roots,
                                 configs: configs.clone(),
+                                source_allowlist: env.get("source_allowlist").cloned().and_then(|value| serde_json::from_value(value).ok()),
                                 python_program,
+                                windows_reader_program: env.get("windows_reader_program").and_then(Value::as_str).map(str::to_owned),
                                 git_program,
                                 observed_at_ms: now_ms(),
                                 limits: config.topology.limits.clone(),
@@ -325,6 +326,66 @@ impl Engine {
                 } else {
                     vec![excluded("transport is unsupported")]
                 };
+                let mut docker_batch_id = None;
+                let mut docker_admissions = HashMap::new();
+                let docker = env.get("docker").unwrap_or(&Value::Null);
+                if enabled && docker.get("enabled").and_then(Value::as_bool) == Some(true) {
+                    let docker_scope = format!("{scope_id}:docker");
+                    let mut docker_snapshots = if let Some(api) = docker.get("direct_api") {
+                        use crate::topology::adapters::docker_api;
+                        let batch_id = docker_api::batch_id();
+                        let attempt = self.with_db(|db| db.reserve_docker_attempt_fenced(&lease, &batch_id, now_ms()));
+                        docker_batch_id = Some(batch_id);
+                        if !node.local || transport != "node" || env.get("kind").is_some_and(|kind| kind.as_str() != Some("native")) {
+                            let mut snapshot = excluded("Docker direct API requires an explicit local native environment");
+                            snapshot.scope_id = docker_scope.clone();
+                            vec![snapshot]
+                        } else {
+                            let batch = match attempt {
+                                Ok(attempt) => docker_api::collect(api, &docker_scope, &config.topology.limits, attempt).await,
+                                Err(_) => docker_api::failed(&docker_scope, FailureCode::Internal),
+                            };
+                            docker_admissions = batch.admissions;
+                            batch.snapshots
+                        }
+                    } else {
+                        let snapshot = if node.local && transport == "node" {
+                            let contexts = docker
+                                .get("contexts")
+                                .and_then(Value::as_array)
+                                .and_then(|rows| rows.iter().map(|v| v.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>())
+                                .unwrap_or_default();
+                            let request = DockerRequest {
+                                scope_id: docker_scope.clone(),
+                                contexts,
+                                program: docker.get("program").map(|value| value.as_str().unwrap_or("").to_owned()),
+                                observed_at_ms: now_ms(),
+                                limits: config.topology.limits.clone(),
+                            };
+                            collect_docker(&request).await
+                        } else {
+                            let mut snapshot = excluded("Docker collection requires an explicit local native environment");
+                            snapshot.scope_id = docker_scope;
+                            snapshot
+                        };
+                        engine_snapshots(snapshot)
+                    };
+                    let prefix = format!("{scope_id}:docker:engine:");
+                    let observed = docker_snapshots.iter().map(|s| s.scope_id.clone()).collect::<HashSet<_>>();
+                    let previous = self.with_db(|db| db.topology_scope_ids_with_prefix(&prefix)).unwrap_or_default();
+                    for missing in previous.into_iter().filter(|s| !observed.contains(s)) {
+                        docker_snapshots.push(TopologySnapshot {
+                            scope_id: missing,
+                            status: ScopeStatus::Partial,
+                            entities: vec![],
+                            edges: vec![],
+                            failures: vec![Failure::new(FailureCode::Unsupported, "Docker engine was not observed in this collection")],
+                            counters: Default::default(),
+                            observed_at_ms: now_ms(),
+                        });
+                    }
+                    snapshots.extend(docker_snapshots);
+                }
                 let mut snapshots_saved = true;
                 for snapshot in snapshots {
                     entities += snapshot.entities.len();
@@ -340,12 +401,24 @@ impl Engine {
                         scopes.push(json!({"scope_id":snapshot.scope_id,"status":"failed","failure":"lease_lost"}));
                         continue;
                     }
-                    match self.with_db(|db| db.record_topology_fenced(&lease, &run_id, &snapshot, now_ms())) {
+                    let collection_id = docker_batch_id
+                        .as_deref()
+                        .filter(|_| snapshot.scope_id == format!("{scope_id}:docker") || snapshot.scope_id.starts_with(&format!("{scope_id}:docker:engine:")))
+                        .unwrap_or(&run_id);
+                    match self.with_db(|db| db.record_topology_fenced(&lease, collection_id, &snapshot, now_ms())) {
                         Ok(cs) => {
+                            // A source capability is saved only after this exact engine receipt commits.
+                            if let Some(admitted) = docker_admissions.remove(&snapshot.scope_id)
+                                && self.with_db(|db| db.record_docker_candidate_fenced(&lease, admitted, now_ms())).is_err()
+                            {
+                                snapshots_saved = false;
+                                scopes.push(json!({"scope_id":snapshot.scope_id,"status":"failed","failure":"docker_candidate_save_failed"}));
+                            }
                             changes += cs.len();
                             scopes.push(json!({"scope_id":snapshot.scope_id,"status":status,"changes":cs.len(),"counters":snapshot.counters,"failures":snapshot.failures.iter().map(|failure| failure.code).collect::<Vec<_>>() }));
                         }
                         Err(_) => {
+                            docker_admissions.remove(&snapshot.scope_id);
                             snapshots_saved = false;
                             scopes.push(json!({"scope_id":snapshot.scope_id,"status":"failed","failure":"internal"}));
                         }
@@ -364,7 +437,7 @@ impl Engine {
             let mut owner_key = config.topology.owners.iter().map(|owner| owner.to_ascii_lowercase()).collect::<Vec<_>>();
             owner_key.sort();
             owner_key.dedup();
-            let cache_key = format!("github.v1.{:x}", Sha256::digest(owner_key.join("\n").as_bytes()));
+            let cache_key = format!("github.v1.{}", crate::db::sha256_hex(owner_key.join("\n").as_bytes()));
             let cache = self.with_db(|db| db.github_cache(&cache_key)).ok().flatten().unwrap_or_default();
             let request = GithubRequest {
                 scope_id: "github".into(),
@@ -492,6 +565,16 @@ impl Engine {
     }
 }
 
+// Read-only graph surfaces are separate from collection and admission.
+impl Engine {
+    pub fn topology_accepted_view(&self) -> Result<Value, String> {
+        self.with_db(|db| db.topology_accepted_view())
+    }
+    pub fn topology_ui_view(&self, request: &crate::db::TopologyUiRequest) -> Result<Value, String> {
+        self.with_db(|db| db.topology_ui_view(request))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,12 +591,20 @@ mod tests {
             cursor: None,
             roots: vec!["/allowed".into()],
             configs: vec![json!({"path":"/selected.json","keys":[]})],
+            source_allowlist: None,
             python_program: python.into(),
+            windows_reader_program: None,
             git_program: Some(git.into()),
             observed_at_ms: 1,
             limits: crate::topology::TopologyLimits::default(),
         };
         let baseline = remote_generation(&request("direct-ssh", "identity", "/usr/bin/python3", "/usr/bin/git"));
+        let mut approved = request("direct-ssh", "identity", "/usr/bin/python3", "/usr/bin/git");
+        let mut changed_reader = request("direct-ssh", "identity", "/usr/bin/python3", "/usr/bin/git");
+        changed_reader.windows_reader_program = Some("C:/tools/tune.exe".into());
+        assert_ne!(baseline, remote_generation(&changed_reader));
+        approved.source_allowlist = Some(vec![]);
+        assert_ne!(baseline, remote_generation(&approved));
         for changed in [
             remote_generation(&request("other-ssh", "identity", "/usr/bin/python3", "/usr/bin/git")),
             remote_generation(&request("direct-ssh", "other", "/usr/bin/python3", "/usr/bin/git")),

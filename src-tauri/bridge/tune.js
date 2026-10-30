@@ -40,6 +40,12 @@
     logsSignatures: (filter) => invoke('logs_signatures', { filter: filter ?? null }),
     logsCursors: () => invoke('logs_cursors'),
     copy: (text) => invoke('copy', { text: String(text) }),
+    // 所見を AI エージェントへ渡す（Tauri 版だけ。Electron 版の preload.js には無いので、画面は有無で判定する）。
+    // agent は 'claude' | 'codex'。確認ダイアログと台帳の読み直しは Rust 側。aiHandoffCopy はプロンプトをクリップボードへ
+    aiHandoff: (nodeId, findingId, agent) => invoke('ai_handoff', { nodeId: String(nodeId), findingId: String(findingId), agent: String(agent) }),
+    aiHandoffCopy: (nodeId, findingId) => invoke('ai_handoff_copy', { nodeId: String(nodeId), findingId: String(findingId) }),
+    onHandoffReview: (fn) => listen('handoff-review', fn),
+    aiHandoffReview: (id, proceed) => invoke('ai_handoff_review', { id: String(id), proceed: proceed === true }),
     openDataDir: () => invoke('open_data_dir'),
     openConfig: () => invoke('open_config'),
     status: () => invoke('status'),
@@ -47,6 +53,8 @@
     setLogin: (on) => invoke('set_login', { on: !!on }),
     // 道具の棚卸し・Do-gu（preload.js と同じ。inventory の opts = { all: true } で依存も含める）
     inventory: (opts) => invoke('inventory', { opts: opts ?? null }),
+    specsView: () => invoke('specs_view'),
+    specsRefresh: (ids) => invoke('specs_refresh', { ids: Array.isArray(ids) ? ids.map(String) : [] }),
     inventoryRun: (ids) => invoke('inventory_run', { ids: ids ?? null }),
     doguRefresh: () => invoke('dogu_refresh'),
     doguExclude: (slugs) => invoke('dogu_exclude', { slugs: slugs ?? null }),
@@ -75,9 +83,10 @@
     // 常時監視・ハブとの同期・ダッシュボード（tune-core の monitor）
     dashboard: (minutes) => invoke('dashboard', { minutes: minutes ?? null }),
     monitorSettings: (patch) => invoke('monitor_settings', { patch: patch ?? null }),
+    monitorEvents: (filter) => invoke('monitor_events', { filter: filter ?? null }),
     hubPull: () => invoke('hub_pull'),
     onMonitor: (fn) => { listen('monitor', (p) => fn(p)); },
-    topologyView: () => invoke('topology_view'),
+    topologyView: (request) => invoke('topology_view', request ? { request } : {}),
     topologyRefresh: () => invoke('topology_refresh'),
     topologyExport: (view, format) => invoke('topology_export', { view: String(view || 'all'), format: String(format || 'json') }),
     onTopologyUpdated: (fn) => { listen('topology-updated', (p) => fn(p)); },

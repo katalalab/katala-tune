@@ -6,6 +6,11 @@ pub const PARSER_VERSION: &str = "katala-topology-parser.v2";
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {
+    DockerEngine,
+    DockerContainer,
+    DockerNetwork,
+    DockerVolume,
+    DockerMount,
     Host,
     ExecutionEnvironment,
     Repository,
@@ -24,6 +29,9 @@ pub enum EntityKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeKind {
+    DockerContains,
+    DockerNetworkMember,
+    DockerMounts,
     ContainsEnvironment,
     ContainsCheckout,
     CheckoutOf,
@@ -49,6 +57,9 @@ pub enum EdgeKind {
 impl EdgeKind {
     pub fn slug(self) -> &'static str {
         match self {
+            Self::DockerContains => "docker_contains",
+            Self::DockerNetworkMember => "docker_network_member",
+            Self::DockerMounts => "docker_mounts",
             Self::ContainsEnvironment => "contains_environment",
             Self::ContainsCheckout => "contains_checkout",
             Self::CheckoutOf => "checkout_of",
@@ -196,6 +207,11 @@ pub struct RawConfig {
 impl EntityKind {
     pub fn slug(self) -> &'static str {
         match self {
+            Self::DockerEngine => "docker_engine",
+            Self::DockerContainer => "docker_container",
+            Self::DockerNetwork => "docker_network",
+            Self::DockerVolume => "docker_volume",
+            Self::DockerMount => "docker_mount",
             Self::Host => "host",
             Self::ExecutionEnvironment => "environment",
             Self::Repository => "repository",
@@ -267,7 +283,7 @@ pub fn is_absolute_path_any_platform(path: &str) -> bool {
 pub fn sanitized_path_spec(path: &str) -> String {
     let windows = path.contains('\\') || (path.as_bytes().get(1) == Some(&b':'));
     let normalized = normalize_path(path, if windows { "windows" } else { "posix" });
-    if is_absolute_path_any_platform(path) { format!("path-sha256:{:x}", Sha256::digest(normalized.as_bytes())) } else { format!("path:{normalized}") }
+    if is_absolute_path_any_platform(path) { format!("path-sha256:{}", crate::db::sha256_hex(normalized.as_bytes())) } else { format!("path:{normalized}") }
 }
 
 pub fn normalize_path(path: &str, platform: &str) -> String {
@@ -406,6 +422,7 @@ pub struct Workflow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TopologyLimits {
     pub roots_per_environment: usize,
     pub depth: usize,

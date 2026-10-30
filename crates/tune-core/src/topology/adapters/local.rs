@@ -12,7 +12,6 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::fs::OpenOptionsExt;
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::topology::model::PARSER_VERSION;
 use crate::topology::{
@@ -27,7 +26,7 @@ fn now_ms() -> i64 {
 }
 
 fn sha256(value: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(value))
+    crate::db::sha256_hex(value)
 }
 
 fn failure(code: FailureCode, message: &'static str) -> Failure {

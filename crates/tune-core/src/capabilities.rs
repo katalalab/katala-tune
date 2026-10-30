@@ -396,9 +396,34 @@ function Get-CimInstance {
         assert_eq!(WIN.matches(MARKER).count(), 1);
         let script = WIN.trim_start_matches('\u{feff}').replace(MARKER, &format!("{MARKER}\n{prefix}"));
         let input = format!("{}\n", crate::logs::base64(script.as_bytes()));
+        let started = std::time::Instant::now();
         let result = collect::run_bounded(&cmd, &args, input.as_bytes(), TIMEOUT, OUT_LIMIT, ERR_LIMIT).await;
-        assert_eq!(result.code, Some(0));
-        assert!(!result.timed_out && !result.output_limited);
+        let value = serde_json::from_slice::<Value>(&result.stdout).ok();
+        let lifecycle = value
+            .as_ref()
+            .and_then(|v| v["lifecycle"].as_str())
+            .filter(|s| matches!(*s, "completed" | "worker_failed" | "timeout_cleanup_confirmed" | "cleanup_unconfirmed"));
+        let error = String::from_utf8_lossy(&result.stderr);
+        // Fixed metadata only: no provider message, argv, path or raw pipe content in CI output.
+        let evidence = json!({
+            "elapsed_ms": started.elapsed().as_millis(), "transport_deadline_ms": TIMEOUT.as_millis(), "code": result.code,
+            "timed_out": result.timed_out, "output_limited": result.output_limited, "spawn_failed": result.spawn_failed,
+            "stdout_bytes": result.stdout.len(), "stderr_bytes": result.stderr.len(),
+            "stdout_sha256": crate::db::sha256_hex(&result.stdout), "stderr_sha256": crate::db::sha256_hex(&result.stderr),
+            "script_sha256": crate::db::sha256_hex(script.as_bytes()),
+            "stdout_json": value.is_some(),
+            "envelope_schema": value.as_ref().is_some_and(|v| v["schema"] == "katala_capabilities_envelope.v1"),
+            "lifecycle": lifecycle,
+            "worker_exit_confirmed": value.as_ref().and_then(|v| v["worker_exit_confirmed"].as_bool()),
+            "pipes_completed": value.as_ref().and_then(|v| v["pipes_completed"].as_bool()),
+            "stderr_clixml": error.trim_start().starts_with("#< CLIXML"),
+            "stderr_parser_error": error.contains("ParserError"), "stderr_method_exception": error.contains("MethodInvocationException"),
+            "outer_reader_eof": result.process_receipt.as_ref().map(|r| r.stdout_eof && r.stderr_eof),
+            "process_receipt": result.process_receipt
+        });
+        eprintln!("worker transport evidence: {evidence}");
+        assert_eq!(result.code, Some(0), "worker transport evidence: {evidence}");
+        assert!(!result.timed_out && !result.output_limited, "worker transport evidence: {evidence}");
         serde_json::from_slice(&result.stdout).unwrap()
     }
     /// Mock native commands inside the actual owned worker, not the supervisor.

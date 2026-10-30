@@ -2,6 +2,8 @@
 
 Katala Tune が機体に変更を加えるのは `lib/actions.js` の許可リストにある操作だけ。調査（probe）とログ収集は読み取り専用。
 
+Windows の owned Job guard は、元の実行期限と既存3秒cleanup上限の中で、root終了から最大1秒だけ全Jobの自然終了を実観測する。この間は未知の子も実行・副作用を起こし得るため、全Job終了は読み取り専用の証明ではない。承認済み操作の範囲、固定metadataコマンド・実行ファイルのpin・source許可/内容検証は独立して維持する。完了には実Job empty、全保持handleの終了、実EOF/writer終了と元期限内の所有証拠が必要で、名前除外や終了コードからの推測はしない（[詳細](windows-reader-guard.md)）。
+
 ## NeonMonitor 1.1.x のレビューから取り入れたこと
 
 NeonMonitor（Windows のメモリ監視・自動強制終了ツール）の静的解析レビューで、「自動でプロセスを終了する道具」が踏みやすい失敗が具体的に見つかった。同じ型の失敗をしないよう、プロセス終了を次のように作っている。
@@ -20,6 +22,7 @@ NeonMonitor（Windows のメモリ監視・自動強制終了ツール）の静�
 - 台帳の `status` が `online` 以外（`retired`・`no-ssh`・`paused`・`out-of-scope`、読めない値）の機体には、SSH も probe も実行せず設定も変えない。入口（probe・ログ取り込み・棚卸し・AI・接続診断・ライブ・`execOn`/`exec_on`・`plan()`）でそれぞれ断るので、呼び出し側の絞り込みが漏れても接続しない。到達できないことから `status` を自動で変えない（台帳は操作者の明示編集でのみ変わる）。`test/ledger.test.js`・`crates/tune-core/tests/ledger.rs`（JS と Rust の一致は `parity_ledger.rs`）
 - WSL distro の一覧・内部観測（`probes/win_probe.ps1` の `wsl.distros`）は台帳の Windows 機で `"wsl": true` を明示したときだけ行う。省略時・`false` は WSL コマンドを呼ばない。opt-in 時は `wsl.exe -l` で動いている distro を確認し、直前に running と確認したものだけに `wsl.exe -d <名前> --exec /bin/sh -s` で固定の読み取りスクリプト（`/proc`・`ps`・`df`）を標準入力から1回流す。停止中と一覧を読めない場合は distro に入らない。確認直後に自然停止すると `wsl -d` が distro を起動しうる競合はOS側に残るため、自動起動を避ける必要がある機体では `wsl: true` を設定しない。変更系の `wsl.exe` の操作（`--shutdown`・`--terminate`・`--unregister` など）は行わない。起動の口は `Invoke-KtWsl` の1か所で、`test/win-wsl-regression.ps1`（Windows PowerShell 5.1。偽の `Invoke-KtWsl` が呼び出しを記録）と `test/wsl.test.js`（区間の構造）が守る。
 - OS の中核・セキュリティ・AI エージェント・python/node などの実行環境は、終了を提案しない（`NO_KILL`）。台帳の `protect` で足せる。
+- NVIDIA GPU では `--query-compute-apps` の PID と使用メモリを上限付きで読む。メモリが `N/A` でも PID があれば計算中とし、PID・開始時刻を確認できる親子には停止候補を作らない。GPU 使用率が 5% 以上、または GPU 状態・compute 一覧を取得できない場合も機体全体の停止を保留する。Windows の終了と GPU 電力上限変更は実行直前に再照会し、活動中・取得不能なら exit 9 で中止して実行記録に残す。台帳の任意属性 `protect_gpu: true` は学習専用機として同じ操作を入口で拒否する。詳細は [Issue #31](acceptance/issue-31.md)。
 - `shared: true` の機体（家族との共用機など）は提案だけで、実行ボタンを出さない。`plan()` も拒否する。
 - 引数はすべて検証してからコマンドに埋める（PID は整数、名前は英数と一部記号、GUID・起動時刻は形式を固定）。PowerShell 本体にはシングルクォートを含めない（ssh 越しの Git Bash で包むため）。
 - Windows の ssh 既定シェルが Git Bash の場合、`/setactive` のような引数がパスに書き換えられる。`powercfg -setactive` の形で渡す（実機で発見）。
@@ -35,7 +38,10 @@ CPU 使用率・実行ファイル名・同名プロセス数だけでは、不�
 - 承認が無ければ実行器を呼ばない。承認の後にもう一度台帳を読み直し、接続先（alias・OS・この機体か）が変わっている・共用機や保護対象になっている・台帳を読めないときは実行せず、理由（「中止（実行していない）: …」）を実行記録に残す。
 - 実行の直前に「未完了」の記録を書く（書けなければ実行しない）。実行が終わったら同じ記録に結果と戻し操作を書く。結果を書く前にアプリが止まった操作は、再起動後も「未完了」のままで、成功にも失敗にも数えない。戻す操作も出さない（状態が分からないものを戻さない）。
 - probe の失敗は `reason`（timeout・unreachable・auth・error）と画面用の `reason_text` に分ける。元のエラー文は残す。
+- 固定Windows probeの失敗は、完全に読み終えた上限内のSSH stderrを内部で分類してから破棄し、閉じた失敗種別だけを返す。SSH exit 255の認証/接続失敗とcontrollerの期限超過を区別し、helperの非0終了・不完全なpipe・上限超過は成功snapshotとして扱わない。この経路ではraw stderrを画面や記録へ渡さない。
 - 流れは `lib/runner.js`（Electron）と `Engine::confirm_and_run`（Rust）。どちらも子プロセスの実行口を差し替えられ、受入試験は偽の ssh と一時ディレクトリの偽の対象で行う（`test/acceptance-issue19.test.js`・`crates/tune-core/tests/acceptance_issue19.rs`、記録は `docs/acceptance/issue-19.md`）。
+- 戻し操作は、元操作のローカル監査記録に保存した route（SSH alias・OS・local・承認helperのartifact record）と現在の台帳が一致する場合だけ確認へ進む。記録のない旧履歴は自動で戻さない。この照合は台帳上のroute bindingであり、同じaliasのSSH設定変更や同一helperを持つ別機体を識別するhost identity証明ではない。台帳にはその証明に使えるpin済みhost key/machine identityの契約がないため、SSHの接続先変更は操作者の管理が必要。
+- Windowsタスクの有効/無効変更は、対象側で実行前の`Settings.Enabled`を読み、cmdletの非終端エラーも失敗にし、実行後の同じ値を読み戻す。閉じた前後状態の結果が一致して初めて成功とし、状態が変わった場合だけ元値への戻し操作を作る。既に要求状態なら変更もundo生成もしない。戻す直前の状態が元操作の適用後状態と違う場合は書き込まない。タスクの実行操作はStart要求の成功までを記録し、ジョブ本体の完了は保証しない。
 
 ## macOS のキャッシュ候補と保存領域
 
@@ -43,6 +49,16 @@ CPU 使用率・実行ファイル名・同名プロセス数だけでは、不�
 - 親ディレクトリを計測できた場合は、その子（Library/Caches/Homebrew）を合算しない。親が欠測なら計測できた子を採用する。同一pathも重複加算しない。macOSの `gb` はdu由来のGiBであり、候補の項目しきい値は2 GiB、合計しきい値は10 GiB。
 - CoreSimulator/Devices、Colima、Docker Dataはユーザーデータを含む保存領域。キャッシュ合計から除き、計測合計10 GiB以上なら「VM・シミュレータの保存領域（削除候補ではない）」として内訳と根拠のみを示す。commands/actionは付けず、保存領域やコンテナの存在だけでDocker pruneやCoreSimulator削除を提案しない。
 - 候補の容量は削除できる容量の保証ではない。低空きでも内容・利用状況・再生成可否の確認を先に案内する。既存snapshotにも同じrulesを使い、収集・DB・実行許可リストは変えない。回帰例は `test/fixtures/cache-accounting.json` をJS/Rustテストとparityで共有する。
+
+## AI エージェントへ渡す（Tauri 版）
+
+- 所見の「Claude Code で調べる」「Codex で調べる」は、操作卓（このアプリを動かしている機体）の新しいターミナルで CLI を対話として開くだけで、アプリ自身は機体に何も変更しない。止まらずに自動で直す実行（`claude -p`・`codex exec` など）はしない。
+- プロンプトは画面の文字列を使わず、台帳と DB の最新の分析結果を Rust 側で読み直して作る。最新の分析に無い所見（直った・分析に失敗した）は渡さない。
+- プロンプトは外部の AI サービス（Anthropic・OpenAI）に届くので、全文を高さを制限したスクロール可能な確認画面で見せる。「確認へ進む」はまだ承認ではない。その後のネイティブダイアログで送信先・権限・全文の SHA-256 を確認し、承認のボタン（「AI に渡す」）を押したときだけ開く。両方の確認で Enter の既定は取消。Rust は確認中の本文を保持し、画面から本文を受け取らない。共用機（`shared: true`）と運用対象でない機体（`status` が online 以外）は、開くことも、コピーすることも断る。
+- CLI は読み取り寄りの権限で開く（Claude Code は `--permission-mode plan`、Codex は `--sandbox read-only --ask-for-approval on-request`）。引数は固定の値だけで、所見の文字列は `<データ>/handoff/<時刻>-<機体>-<CLI>/PROMPT.md` に書き、CLI にはそれを読むよう固定の一文で伝える（引用符・改行・文字コードの崩れを避ける）。プロンプトには、変更は承認を得てから行うことと、台帳の保護対象を書く。
+- 準備時と承認後に台帳を直接読み、読めなければキャッシュ済みの許可状態を使わず拒否する。接続先（alias・OS・この機体か）や保護対象の一覧が変わっていれば開かず、新しい全文の確認を求める。全文確認後やネイティブ承認中に画面を閉じる・再読込すると、その依頼は取り消す。
+- 起動前に未完了の実行記録（種類 `ai-handoff`。CLI・所見 ID・プロンプトの SHA-256・フォルダ）を書き、書けなければファイルも作らず起動しない。起動要求後に同じ行へ結果を書く。結果の記録に失敗した場合は未完了として表示し、起動を再試行しない。アプリが要求の途中で止まっても未完了の行が残る。取消や台帳変更による中止も記録し、記録できなければ画面へ返す。戻す操作は無い。
+- 検証は `crates/tune-core/src/handoff.rs` のテスト（所見の探し方・断る条件・プロンプト・起動の引数）と `test/ai-handoff.test.js`（画面からの呼び方・権限の宣言）。
 
 ## 効果の確かめ方
 
@@ -64,6 +80,8 @@ CPU 使用率・実行ファイル名・同名プロセス数だけでは、不�
 
 - `probes/mac_probe.py`・`win_probe.ps1` の `processes.groups`（同じ種類の本数・合計・孤児・親・所有者）と `processes.trees`（根ごとの合計・子の数）は読み取り専用で、何も止めない・変えない。所見（`proc-multi-*`・`proc-orphan-*`・`mem-tree-*`）は提案だけで、操作（action）を付けない。`git config --global core.fsmonitor false` なども文面の提案で、実行は承認制の別経路。
 - 「同じ種類」の鍵は実行ファイル名で作る。node・python・git などのインタープリタだけは、種類（MCP サーバなど）を分けるために引数を**その場で一時的に読み**、安全な文字の短いスクリプト名（パス・ユーザー名の部分・引数・値は除く）だけを鍵に使う。コマンドラインはインタープリタの PID（Windows はインタープリタの実行ファイル名で絞った問い合わせ）に限って読む。スクリプト名が汎用（index.js など）なら node_modules 直下のパッケージ名だけを使い、任意の親ディレクトリ名（プロジェクト名など）は使わない。値を取るかもしれないオプションの後ろは読まない。引数・環境変数・パスは出力にも保存にも載せない（`test/process-multiplication.test.js`）。
+- 値なしオプションとランチャーの語（npmの `exec` など）は実行環境ごとに区別する（Python の `-I` と Ruby の `-I` は別）。ランチャーの接頭辞は一度だけ読み、`uv tool run` はその並びだけを認める。`--` の後ろをオプションとして読み直さない。macOS の `ps command=` は引数の区切りを保持しないため、スクリプト候補に後続トークンがある場合や、値付きオプションを越えるときは実行ファイル名へ戻す。通常のスクリプト引数付きMCPもこの場合は分類が粗くなる。Python の明示的な `-m` のモジュール名と、git の既知の `fsmonitor--daemon` は限定して識別する。インタープリタの大文字小文字は鍵だけで正規化し、表示名は保持する。
+- 少数群は原則3本から保存するが、MCPの孤児が2本以上なら群を保持して既存の孤児判定へ渡す。通常の2本群や単独MCPはこの例外に含めず、所見の本数・合計メモリ閾値は変更しない。
 - 孤児は親が居ない（PPID 1・親の PID が無い・親が子より後に起動した＝PID の再利用）プロセス。デーモン化した常駐（git fsmonitor など）は設計上 PPID 1 になるので、孤児数は所見の参考で、閾値は本数と合計メモリで決める。所有者は macOS が uid 500 未満、Windows がセッション 0（サービスと SSH ログオン）を system とする。
 - 木の根は、OS の起動役（launchd・explorer・services など）の直下まで辿って決める。単一プロセスの RSS だけで止める判断はしない。
 
@@ -126,3 +144,65 @@ CPU 使用率・実行ファイル名・同名プロセス数だけでは、不�
 - 共用機は、外向きの接続先（宛先）を既定で残さない。調査の結果を受け取った直後に宛先の一覧を落とし（`dropPeers`・`drop_peers`）、DB にも画面にも入れず、初めての接続先も覚えない。台帳の `"network_peers": true` で明示したときだけ残し、所見は提案だけにする
 - 共用機は、ログインのアカウント名と送り元も既定で集めない。台帳の `"network_logins": true` で明示したときだけ集める。既定値へ戻した後は、以前の接続先とログインの送り元を最新結果・状態・ログ検索・署名・セキュリティ画面へ返さない
 - 外向きの接続は分析のときの1回の標本。最初の 7 日は覚えるだけで、知らせない（学習の途中で全部が「初めて」になるのを避ける）。自分の待ち受けの番号で受けた接続（外から来た接続）は外向きに数えない（相手の番号が毎回変わり、誤検知になる）。
+
+### Docker topology
+
+Docker collection is opt-in per explicit local native topology environment. It
+uses no action API and exposes no mutating Docker verbs. Context endpoint
+inspection precedes daemon access; only local `unix:///...` and
+`npipe:////./pipe/...` are accepted. Subsequent reads pin that validated endpoint
+with `--host`, removing Docker host/context/TLS/API/header environment overrides.
+Remote SSH/TCP/cloud endpoints are excluded with unknown coverage. Nothing starts
+Docker Desktop, a daemon, WSL, containers, or another service.
+
+The adapter resolves an absolute Docker binary from known installation paths,
+checks its canonical destination (including the Homebrew Docker formula), and
+uses fixed argv without a shell. Each owned child has at most 5 seconds, bounded
+stdout/stderr, and kill/wait cleanup through the existing bounded collector.
+The cumulative collection deadline is at most 60 seconds, with at most 8
+explicit contexts, 512 objects per catalog, 128 mount/network/port entries per
+container, 1 MiB stdout per command and 8 MiB cumulative output. Configured
+smaller topology budgets apply. Output overflow and timeouts are failures, never
+empty-success inventories.
+
+Only projected fields are requested: IDs, state/optional health, resource limits,
+restart policy, log driver and only max-size/max-file, mount identities,
+network membership and published port numbers. IDs and paths become hashes.
+No raw inspect, Env, command, complete labels, log messages, authentication,
+TLS material or daemon configuration is persisted or printed. The public typed
+import boundary rejects unknown fields and validates sanitized policies/hashes.
+Network membership has its own edge and never asserts a dependency. Unavailable
+health stays unknown; stopped unhealthy containers are not current incidents.
+Only running json-file containers with missing max-size become log candidates;
+local driver defaults are bounded. Limits of zero remain zero, distinct from
+missing values, and do not themselves assert a problem.
+
+Coverage receipts are separate from engine snapshots. Engine IDs deduplicate
+aliases. An unknown context cannot erase another engine's successful graph;
+unobserved previous engines retain their graph with a partial receipt. Docker
+uses existing topology leases, fenced writes, retention, public anonymous export,
+and the existing refresh scheduler; it adds no background service or DB schema.
+
+Refresh `entities`/`edges` count observed candidate objects, not applied DB rows.
+An unresolved network membership remains partial even for an exited container;
+its observation receipt records candidate entity/edge counts, unresolved reference
+counts by fixed container state (unknown included), and `scope_graph_applied=false`.
+This applies only to that partial scope: other complete engines can still update.
+A fresh DB receives no graph from the partial scope; an existing complete graph
+is retained. Missing targets do not establish why or when a network disappeared.
+Diagnostics contain no network/container identities and public exports omit
+receipt failure text.
+
+A missing named-volume target or volume identity is a partial observation. The
+affected engine retains its previous complete graph, while other complete
+engines may update. Log size values accept bounded decimal/scientific numeric
+forms (including bounded hexadecimal literals and digit separators) and
+case-insensitive byte/k/m/g/t/p suffixes (including b/ib spellings),
+following go-units; a retained -1 sentinel does not claim a valid new setting.
+
+Image mounts use the existing sanitized mount DTO: source/target hashes only,
+with no volume reference inference or additional Docker operation.
+
+Observed nonnegative numeric log capacities preserve zero and fractional values
+that truncate to zero. These are policy facts; health remains independently
+observed, and log candidates still require running json-file with missing size.

@@ -165,19 +165,19 @@ test('台帳の "network": false で止める（ログインの記録も集め�
   assert.deepEqual(macProbeArgs(true, false), ['python3', '-', 'nonet']);
   assert.deepEqual(macProbeArgs(false, false), ['python3', '-', '--skip-benchmark', 'nonet']);
   assert.equal(macSshCommand(false, false).match(/ --skip-benchmark nonet/g).length, 2);
-  assert.match(windowsSshCommand(true, false), /probe\.ps1\)" -NoNetwork;/);
-  assert.doesNotMatch(windowsSshCommand(false, true), /NoNetwork/);
+  assert.match(windowsSshCommand(true, false), /--benchmark 1 --network 0 --observe-wsl 0 --budget-ms 120000$/);
+  assert.match(windowsSshCommand(false, true), /--benchmark 0 --network 1 --observe-wsl 0 --budget-ms 120000$/);
 });
 
-test('Windows のログオンの記録は別のスクリプトで、同じ運び方（8191 バイトまで）で送り、結果を1つにまとめる', () => {
+test('Windows のログオンの記録は別のstdinで送り、結果を1つにまとめる', () => {
   const script = fs.readFileSync(path.join(PROBES, 'win_logons.ps1'));
   const t = logs.windowsLogonsTransport({ win_security: '9007199254740991:1800000000000' }, script);
   assert.ok(Buffer.byteLength(t.command) < 8191);
-  assert.match(t.bootstrap, /\[ScriptBlock\]::Create\(\$s\)\) -SecCursor 9007199254740991 -SecTime 1800000000000$/);
-  assert.match(logs.windowsLogonsTransport({ win_security: '9007199254740993:9223372036854775807' }, script).bootstrap, /-SecCursor 9007199254740993 -SecTime 9223372036854775807$/);
-  assert.match(logs.windowsLogonsTransport({ win_security: '9223372036854775808:1' }, script).bootstrap, /-SecCursor 0 -SecTime 0$/);
-  assert.match(logs.windowsLogonsTransport({ win_security: '42;Write-Error bad:99' }, script).bootstrap, /-SecCursor 0 -SecTime 0$/);
-  assert.match(t.command, /^printf %s [A-Za-z0-9+/=]+ \| powershell\.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand [A-Za-z0-9+/=]+$/);
+  assert.deepEqual(t.input.split('\n').slice(0, 5), ['KTLOG1', 'logons', '9007199254740991', '1800000000000', '0']);
+  assert.match(logs.windowsLogonsTransport({ win_security: '9007199254740993:9223372036854775807' }, script).input, /\n9007199254740993\n9223372036854775807\n0\n/);
+  assert.match(logs.windowsLogonsTransport({ win_security: '9223372036854775808:1' }, script).input, /\n0\n0\n0\n/);
+  assert.match(logs.windowsLogonsTransport({ win_security: '42;Write-Error bad:99' }, script).input, /\n0\n0\n0\n/);
+  assert.match(t.command, /^powershell\.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand [A-Za-z0-9+/=]+$/);
   const main = { code: 0, out: JSON.stringify({ probe: 'win_logs', sources: { win_system: { cursor: '1', rows: [] } } }), err: '' };
   const merged = JSON.parse(logs.mergeLogons(main, { code: 0, out: `noise\n${JSON.stringify({ sources: { win_security: { cursor: '9', rows: [], note: 'no-permission' } } })}`, err: '' }).out);
   assert.deepEqual([merged.sources.win_system.cursor, merged.sources.win_security.note], ['1', 'no-permission']);
@@ -193,13 +193,15 @@ test('Windows のログオンの記録は別のスクリプトで、同じ運び
   assert.match(source, /\$batch\[-1\]\.RecordId \+ ':' \+ \[string\]\(EpochMs \$batch\[-1\]\.TimeCreated\)/);
 });
 
-test('Windows netsec は隔離した子だけを止め、完了済みの部分を20秒以内に残す', () => {
+test('Windows netsec は隔離した子だけを止め、期限内の両EOFと出力上限を要求する', () => {
   const source = fs.readFileSync(path.join(PROBES, 'win_probe.ps1')).subarray(3).toString('ascii');
   assert.doesNotMatch(source, /\[PowerShell\]::Create\(\)|\.Stop\(\)/);
   assert.match(source, /ProcessStartInfo/);
   assert.match(source, /RedirectStandardInput = \$true/);
   assert.match(source, /\$nsBudgetMs = 15000/);
-  assert.match(source, /17000 - \[int\]\$outerWatch\.ElapsedMilliseconds/);
+  assert.match(source, /Read-KtProcessOutput \$child \$outerWatch 17000/);
+  assert.match(source, /\$DeadlineMs - \[int\]\$Clock\.ElapsedMilliseconds/);
+  assert.doesNotMatch(source, /ReadToEndAsync/);
   assert.match(source, /19500 - \[int\]\$outerWatch\.ElapsedMilliseconds/);
   assert.match(source, /\.Kill\(\)/);
   assert.match(source, /\[Console\]::Out\.Flush\(\)/);

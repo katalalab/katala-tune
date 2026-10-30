@@ -13,15 +13,21 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
+hyper = { version = "=1.12.0", features = ["client", "http1"] }
+hyper-util = { version = "=0.1.21", features = ["tokio"] }
+http-body-util = "=0.1.5"
 regex = "1"
 encoding_rs = "0.8"
 sha1_smol = "1"
 # 出どころの台帳（区間の指紋・連鎖・調査スクリプトの指紋）。Tauri がすでに使っている版（Cargo.lock に既にある）
-sha2 = "0.10"
+sha2 = "0.11"
 dirs = "7"
 gethostname = "1"
-toml = "0.8"
+toml = "1.1"
 serde-saphyr = { version = "2.0", default-features = false, features = ["deserialize"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_RemoteDesktop", "Win32_System_SystemInformation"] }
 
 [lints]
 workspace = true

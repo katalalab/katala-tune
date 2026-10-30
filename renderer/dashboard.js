@@ -15,6 +15,7 @@
   const FRESH = 10e3; // ライブの点をこの時間まで「今」とみなす
   const REFRESH = 30e3; // 推移・表の読み直しとライブの合図
   const dash = { minutes: 60, data: null, refresh: 0, streaming: [], raf: 0, busy: false };
+  const journal = { open: false, busy: false, generation: 0, data: null, error: false, readAt: null };
   const esc = UI.esc;
   const num = (v) => v != null && v !== '' && Number.isFinite(+v);
   const r0 = (v) => Math.round(+v);
@@ -144,10 +145,13 @@
     if (!a) return '';
     const u = a.update || {};
     const parts = [`${a.version}`, a.auto_update ? '自動更新オン' : '自動更新オフ'];
-    if (u.downloaded && u.downloaded !== a.version) parts.push(`${u.downloaded} を用意済み（ウィンドウを閉じると入れる）`);
-    else if (u.available && u.available !== a.version) parts.push(`${u.available} あり`);
-    else if (u.checked_at) parts.push(`最新（${ago(u.checked_at)}に確認）`);
-    if (u.error) parts.push(`確認できなかった: ${u.error}`);
+    // A persisted download is history, not proof that this process still has an update ready.
+    if (u.current && u.current !== a.version) parts.push('確認情報が古い');
+    else if (!u.current && (u.checked_at || u.available || u.downloaded || u.error)) parts.push('確認情報が不明');
+    else if (u.error) parts.push(`保存された更新エラー: ${u.error}`);
+    else if (u.available) parts.push(`保存された確認記録: ${u.available} あり${u.checked_at ? `（${ago(u.checked_at)}）` : ''}`);
+    else if (u.checked_at) parts.push(`保存された確認記録: 更新なし（${ago(u.checked_at)}）`);
+    else parts.push('確認記録なし');
     return parts.join('・');
   }
 
@@ -188,9 +192,66 @@
     });
   }
 
+  // 保守記録は明示操作で最新50件だけ読む。既存の30秒描画では再照会しない。
+  const journalCount = v => typeof v === 'number' && Number.isFinite(v) && v >= 0 ? String(v) : '不明';
+  const journalTime = v => typeof v === 'number' && Number.isFinite(v) && v > 0 ? new Date(v).toLocaleString('ja-JP') : '未記録';
+  function journalBody() {
+    if (typeof T?.monitorEvents !== 'function') return '<p class="note-line">この版では収集記録を読めません。Rust版の対応アプリで確認してください。</p>';
+    const button = `<button class="btn small" id="dashJournalRead"${journal.busy ? ' disabled' : ''}>${journal.busy ? '読取中…' : journal.data || journal.error ? '読み直す' : '最新50件を読む'}</button>`;
+    const error = journal.error ? '<p class="err" role="alert">収集記録を読み出せません。読み直してください。</p>' : '';
+    if (!journal.data) return `${button}${error}<p class="note-line">収集記録はまだ読んでいません。読取操作では採取や設定を変更しません。</p>`;
+    const h = journal.data.health || {}, r = journal.data.retention || {};
+    const labels = { unknown: '保存状況不明', available: '保存確認済み', degraded: '欠落または保存失敗', stopped: '記録終了' };
+    const status = labels[h.status] || labels.unknown;
+    const events = Array.isArray(journal.data.events) ? journal.data.events.slice(0, 50) : [];
+    const categories = { open_failed: '接続できません', first_sample_timeout: '最初の測定が届きません', stall_timeout: '測定が途切れました', exit_nonzero: '終了コードに異常', status_without_code: '終了コード不明', wait_unknown: '終了待ち未確認', db_busy: '保存先が使用中', db_full: '保存先の容量不足', db_io: '保存先の入出力エラー', unknown: '原因区分不明' };
+    const table = UI.table({
+      cols: [{ label: '時刻' }, { label: '機体' }, { label: '記録' }], rows: events, cls: 'scroll-x', empty: '保存された記録はありません',
+      rowAttrs: () => 'data-monitor-event=""',
+      row: e => {
+        const d = e.data || {}, parts = [e.summary || '収集記録'];
+        if (typeof d.committed === 'boolean') parts.push(d.committed ? '保存成功' : '保存失敗');
+        if (d.reason === 'max_age' || d.policy === 'planned_recycle') parts.push('正常な定期交代');
+        if (d.category) parts.push(categories[d.category] || categories.unknown);
+        return `<td class="nowrap">${esc(journalTime(e.ts))}</td><td>${esc(e.node_id ?? '操作卓')}</td><td>${parts.map(esc).join(' · ')}</td>`;
+      },
+    });
+    return `${button}${error}<p class="note-line">${esc(status)} · ${esc(h.summary || '保存状況は不明です')} · 読取 ${esc(journalTime(journal.readAt))}</p>
+      <p class="note-line">現在の収集プロセス: 欠落 ${esc(journalCount(h.dropped_total))} · queue超過 ${esc(journalCount(h.overflow_total))} · 保存失敗 ${esc(journalCount(h.db_failures))} · 未確認ACK ${esc(journalCount(h.unconfirmed_acks))}</p>
+      <p class="note-line">全体の保持 ${esc(journalCount(r.rows))}件 · 最古 ${esc(journalTime(r.oldest_at))} · 最新 ${esc(journalTime(r.newest_at))}。最大14日または5万件のうち最新50件。保持範囲外や過去の欠測原因はこの一覧だけでは分かりません。</p>${table}`;
+  }
+  function bindJournalRead() {
+    const button = $('#dashJournalRead');
+    if (button) button.onclick = readJournal;
+  }
+  function paintJournal() {
+    if (!active()) return;
+    const body = $('#dashJournalBody');
+    if (body) { body.innerHTML = journalBody(); bindJournalRead(); }
+  }
+  async function readJournal() {
+    if (journal.busy || !journal.open || !active() || typeof T?.monitorEvents !== 'function') return;
+    journal.busy = true;
+    const generation = ++journal.generation;
+    const current = () => generation === journal.generation && journal.open && active();
+    paintJournal();
+    try {
+      const data = await T.monitorEvents({ limit: 50 });
+      if (!current()) return;
+      if (!data || !Array.isArray(data.events)) throw new Error('invalid journal response');
+      journal.data = data; journal.error = false; journal.readAt = Date.now();
+    } catch (_) {
+      if (current()) journal.error = true;
+    } finally {
+      journal.busy = false;
+      paintJournal();
+    }
+  }
+
   function draw() {
     const d = dash.data;
     page(`${head(d)}
+      ${UI.toggle({ summary: '収集の保守記録', open: journal.open, attrs: 'id="dashJournal"', body: `<div id="dashJournalBody">${journalBody()}</div>` })}
       ${UI.section('機体', '大きな数字は今（ライブ）、線は CPU（青）・メモリ（水色）・GPU（橙）の推移')}
       <div class="dgrid">${d.nodes.map(tile).join('')}</div>
       ${UI.section('対応が要るもの', '直近 6 分の集計（続いている高負荷・メモリ・温度・数字が届かない）と、最新の分析の重大な所見')}
@@ -228,6 +289,14 @@
     const pull = $('#dashPull');
     if (pull) pull.onclick = async () => { pull.disabled = true; await T.hubPull().catch((e) => toast(`写せなかった: ${e?.message || e}`)); load(); };
     bindGoto(root);
+    const details = $('#dashJournal');
+    if (details) details.ontoggle = () => {
+      if (!active() || $('#dashJournal') !== details) return;
+      if (journal.open === details.open) return;
+      journal.open = details.open;
+      if (!journal.open) journal.generation++;
+    };
+    bindJournalRead();
   }
 
   async function settings(patch) {
@@ -288,5 +357,5 @@
     document.addEventListener('visibilitychange', () => { if (state.view === 'dashboard') (active() ? load() : syncLive()); });
   }
 
-  (window.KT_VIEWS = window.KT_VIEWS || []).push({ key: 'dashboard', label: 'ダッシュボード', icon: 'dashboard', render, first: true, home: supported, leave: () => syncLive() });
+  (window.KT_VIEWS = window.KT_VIEWS || []).push({ key: 'dashboard', label: 'ダッシュボード', icon: 'dashboard', render, first: true, home: supported, leave: () => { journal.generation++; syncLive(); } });
 })();

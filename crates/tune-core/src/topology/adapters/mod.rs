@@ -1,6 +1,13 @@
+pub mod docker;
+pub(crate) mod docker_api;
+
 pub mod github;
 pub mod local;
+pub mod native_execution;
+pub mod native_protocol;
+pub mod native_reader;
 pub mod remote;
+pub mod windows_reader;
 
 pub use local::{assemble_capture, assemble_capture_cached, capture_local, capture_local_with_progress, capture_source_cache_keys};
 

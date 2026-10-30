@@ -25,12 +25,51 @@ static MAC_LSTART: LazyLock<Regex> =
 static WIN_START: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9]{17}$").expect("WIN_START"));
 static NVIDIA_UUID: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$").expect("NVIDIA_UUID"));
+static LOWER_HEX_40: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{40}$").expect("LOWER_HEX_40"));
+static LOWER_HEX_64: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{64}$").expect("LOWER_HEX_64"));
+const GPU_ACTIVE_UTIL: i64 = 5;
+fn gpu_smi_helper() -> String {
+    r#"function Stop-KatalaGpuSmiProcess { param($Process); if ($script:KatalaGpuSmiCleanupAttempted) { return $false }; $script:KatalaGpuSmiCleanupAttempted = $true; try { if ($Process.HasExited) { return $true }; $left = [Math]::Max(0, 9000 - [int]$script:KatalaGpuGuardClock.ElapsedMilliseconds); if ($left -le 0) { $script:KatalaGpuSmiTransportFailed = $true; return $false }; $Process.Kill(); $killAck = $Process.WaitForExit([Math]::Min(1000, $left)); if (-not $killAck -or -not $Process.HasExited) { $script:KatalaGpuSmiTransportFailed = $true; return $false }; return $true } catch { $script:KatalaGpuSmiTransportFailed = $true; return $false } }; function Fail-KatalaGpuSmi { param([bool]$TimedOut, [string]$Reason, [bool]$Permanent); $script:KatalaGpuSmiTimedOut = $TimedOut; $script:KatalaGpuSmiFailed = $true; $script:KatalaGpuSmiFailureReason = $Reason; if ($Permanent) { $script:KatalaGpuSmiTransportFailed = $true }; if ($script:KatalaGpuMutationStarted) { Write-Output "GPU power outcome unverified"; exit 7 }; return $null }; function Invoke-KatalaGpuSmi { param([string]$Arguments); $script:KatalaGpuSmiTimedOut = $false; $script:KatalaGpuSmiExitCode = $null; $script:KatalaGpuSmiFailed = $false; $script:KatalaGpuSmiFailureReason = "GPU activity unavailable; operation refused"; if ($script:KatalaGpuSmiTransportFailed) { return (Fail-KatalaGpuSmi $false "GPU SMI process lifetime unverified; operation refused" $true) }; $script:KatalaGpuSmiCleanupAttempted = $false; Test-KatalaGpuDeadline; if ($script:KatalaGpuSmiFunction) { $argv = @($Arguments.Split(" ")); $rows = @(& nvidia-smi.exe @argv); $script:KatalaGpuSmiExitCode = $LASTEXITCODE; if ($script:KatalaGpuSmiExitCode -ne 0) { return (Fail-KatalaGpuSmi $false "GPU SMI exited unsuccessfully; operation refused" $false) }; return $rows }; $p = $null; try { $si = New-Object Diagnostics.ProcessStartInfo; $si.FileName = $script:KatalaGpuSmiSource; $si.Arguments = $Arguments; $si.UseShellExecute = $false; $si.CreateNoWindow = $true; $si.RedirectStandardOutput = $true; $si.RedirectStandardError = $true; $p = New-Object Diagnostics.Process; $p.StartInfo = $si; $smiDeadline = [Math]::Min(9000, [int]$script:KatalaGpuGuardClock.ElapsedMilliseconds + 4000); [void]$p.Start(); $stdout = New-Object IO.MemoryStream(65536); $stderrCount = 0; $outBuffer = New-Object byte[] 4096; $errBuffer = New-Object byte[] 4096; $outRead = $p.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length); $errRead = $p.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length); $outDone = $false; $errDone = $false; $failed = $false; $timedOut = $false; $reason = "GPU SMI output exceeded limit; operation refused"; while (-not ($outDone -and $errDone)) { $left = [Math]::Max(0, $smiDeadline - [int]$script:KatalaGpuGuardClock.ElapsedMilliseconds); if ($left -le 0) { $timedOut = $true; $failed = $true; $reason = "GPU SMI timed out or held a pipe; operation refused"; break }; $pending = New-Object Collections.Generic.List[Threading.Tasks.Task]; if (-not $outDone) { $pending.Add($outRead) }; if (-not $errDone) { $pending.Add($errRead) }; if ([Threading.Tasks.Task]::WaitAny([Threading.Tasks.Task[]]$pending.ToArray(), $left) -lt 0) { $timedOut = $true; $failed = $true; $reason = "GPU SMI timed out or held a pipe; operation refused"; break }; if (-not $outDone -and $outRead.IsCompleted) { $outCount = $outRead.Result; if ($outCount -le 0) { $outDone = $true } elseif ($stdout.Length + $outCount -gt 65536) { $failed = $true; $reason = "GPU SMI stdout exceeded limit; operation refused"; break } else { $stdout.Write($outBuffer, 0, $outCount); $outRead = $p.StandardOutput.BaseStream.ReadAsync($outBuffer, 0, $outBuffer.Length) } }; if (-not $errDone -and $errRead.IsCompleted) { $errCount = $errRead.Result; if ($errCount -le 0) { $errDone = $true } elseif ($stderrCount + $errCount -gt 65536) { $failed = $true; $reason = "GPU SMI stderr exceeded limit; operation refused"; break } else { $stderrCount += $errCount; $errRead = $p.StandardError.BaseStream.ReadAsync($errBuffer, 0, $errBuffer.Length) } } }; if ($failed) { $script:KatalaGpuSmiTransportFailed = $true; [void](Stop-KatalaGpuSmiProcess $p); return (Fail-KatalaGpuSmi $timedOut $reason $true) }; $left = [Math]::Max(0, $smiDeadline - [int]$script:KatalaGpuGuardClock.ElapsedMilliseconds); if ($left -le 0 -or -not $p.WaitForExit($left)) { $script:KatalaGpuSmiTransportFailed = $true; [void](Stop-KatalaGpuSmiProcess $p); return (Fail-KatalaGpuSmi $true "GPU SMI timed out or held a pipe; operation refused" $true) }; $script:KatalaGpuSmiExitCode = $p.ExitCode; if ($script:KatalaGpuSmiExitCode -ne 0) { return (Fail-KatalaGpuSmi $false "GPU SMI exited unsuccessfully; operation refused" $false) }; return @([Text.Encoding]::UTF8.GetString($stdout.ToArray()) -split "`r?`n" | Where-Object { $_.Trim().Length -gt 0 }) } catch { if ($p) { $script:KatalaGpuSmiTransportFailed = $true; [void](Stop-KatalaGpuSmiProcess $p); return (Fail-KatalaGpuSmi $false "GPU SMI transport failed; operation refused" $true) }; return (Fail-KatalaGpuSmi $false "GPU SMI transport failed; operation refused" $true) } finally { if ($p) { try { if (-not $p.HasExited -and -not $script:KatalaGpuSmiCleanupAttempted) { $cleanupAck = Stop-KatalaGpuSmiProcess $p; if (-not $cleanupAck) { $script:KatalaGpuSmiTransportFailed = $true } } } catch { $script:KatalaGpuSmiTransportFailed = $true }; $p.Dispose() } } }"#.to_string()
+}
 static TASK_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\\([A-Za-z0-9_ .-]+\\)*$").expect("TASK_PATH"));
 static TASK_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_ .()+-]{1,120}$").expect("TASK_NAME"));
 static LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_.-]{1,150}$").expect("LABEL"));
 /// ユーザーの LaunchAgents の plist（rules の「登録し直す」コマンドでも使う）
 pub(crate) static LAUNCH_AGENTS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^/Users/[A-Za-z0-9_.-]+/Library/LaunchAgents/[A-Za-z0-9_.-]+\.plist$").expect("LAUNCH_AGENTS"));
+
+pub(crate) fn action_helper(node: &Node) -> Result<String, String> {
+    let Some(helper) = node.get("action_helper").and_then(Value::as_object) else {
+        return Err("approved action helper record が無いため実行しない".into());
+    };
+    let string = |key: &str| helper.get(key).and_then(Value::as_str);
+    let positive = |key: &str| helper.get(key).and_then(Value::as_i64).is_some_and(|v| v > 0 && v <= 9_007_199_254_740_991);
+    let valid = helper.len() == 6
+        && string("schema") == Some("katala-tune/action-helper/v2")
+        && string("source_sha").is_some_and(|v| LOWER_HEX_40.is_match(v))
+        && string("tune_sha256").is_some_and(|v| LOWER_HEX_64.is_match(v))
+        && string("manifest_sha256").is_some_and(|v| LOWER_HEX_64.is_match(v))
+        && positive("run_id")
+        && positive("attempt");
+    if !valid {
+        return Err("approved action helper record が無いため実行しない".into());
+    }
+    Ok(string("tune_sha256").unwrap().to_string())
+}
+
+pub(crate) fn action_helper_fingerprint(node: &Node) -> Option<String> {
+    action_helper(node).ok()?;
+    let helper = node.get("action_helper")?.as_object()?;
+    Some(format!(
+        "{}\0{}\0{}\0{}\0{}\0{}",
+        helper.get("schema")?.as_str()?,
+        helper.get("source_sha")?.as_str()?,
+        helper.get("tune_sha256")?.as_str()?,
+        helper.get("manifest_sha256")?.as_str()?,
+        helper.get("run_id")?.as_i64()?,
+        helper.get("attempt")?.as_i64()?,
+    ))
+}
 
 /// 終了スクリプトの結果コード
 pub fn exit_text(code: i32) -> Option<&'static str> {
@@ -40,8 +79,38 @@ pub fn exit_text(code: i32) -> Option<&'static str> {
         4 => "負荷が回復していたので中止した",
         5 => "終了を指示したが5秒以内に終了を確認できなかった（終了未確認）",
         6 => "終了の指示が失敗した",
+        9 => "GPU の活動を確認できた、または取得できないため中止した",
         _ => return None,
     })
+}
+
+// Keep this byte-for-byte aligned with lib/actions.js. It only reads NVIDIA's
+// bounded telemetry and refuses state that is active or cannot be observed.
+fn gpu_active_guard_ps(pid: Option<i64>) -> String {
+    let mut parts = vec![
+        "if (-not $script:KatalaGpuGuardClock) { $script:KatalaGpuGuardClock = [Diagnostics.Stopwatch]::StartNew(); $script:KatalaGpuMutationStarted = $false }".to_string(),
+        "function Test-KatalaGpuDeadline { if ($script:KatalaGpuGuardClock.ElapsedMilliseconds -gt 9000) { if ($script:KatalaGpuMutationStarted) { Write-Output \"GPU power outcome unverified\"; exit 7 }; Write-Output \"GPU guard timed out; operation refused\"; exit 9 } }".to_string(),
+        gpu_smi_helper(),
+        "$smi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue; $gpuGuardApplicable = $true; if (-not $smi) { try { $adapters = @(Get-CimInstance Win32_VideoController -Property Name,PNPDeviceID -OperationTimeoutSec 4 -ErrorAction Stop); Test-KatalaGpuDeadline; $nvidia = @($adapters | Where-Object { $_.Name -match \"(?i)NVIDIA\" -or $_.PNPDeviceID -match \"(?i)VEN_10DE\" }); if ($adapters.Count -gt 0 -and $adapters.Count -le 32 -and $nvidia.Count -eq 0) { $gpuGuardApplicable = $false } else { Write-Output \"GPU activity unavailable; operation refused\"; exit 9 } } catch { Write-Output \"GPU activity unavailable; operation refused\"; exit 9 } } else { $script:KatalaGpuSmiSource = $smi.Source; $script:KatalaGpuSmiFunction = $smi.CommandType -eq \"Function\" }; if ($gpuGuardApplicable) {".to_string(),
+        "$gpuRows = @(Invoke-KatalaGpuSmi \"--query-gpu=uuid,utilization.gpu --format=csv,noheader,nounits\"); if ($script:KatalaGpuSmiFailed) { Write-Output $script:KatalaGpuSmiFailureReason; exit 9 }; if ($null -eq $gpuRows[0] -or $gpuRows.Count -eq 0 -or $gpuRows.Count -gt 16) { Write-Output \"GPU activity unavailable; operation refused\"; exit 9 }".to_string(),
+        "$gpuBusy = $false; foreach ($line in $gpuRows) { $part = $line -split \",\"; if ($part.Count -ne 2) { Write-Output \"GPU activity unreadable; operation refused\"; exit 9 }; try { $util = [double]::Parse($part[1].Trim(), [Globalization.CultureInfo]::InvariantCulture) } catch { Write-Output \"GPU activity unreadable; operation refused\"; exit 9 }; if ([double]::IsNaN($util) -or [double]::IsInfinity($util) -or $util -lt 0 -or $util -gt 100) { Write-Output \"GPU activity unreadable; operation refused\"; exit 9 }; if ($util -ge %%UTIL%%) { $gpuBusy = $true } }".replace("%%UTIL%%", &GPU_ACTIVE_UTIL.to_string()),
+        "$computeResult = @(Invoke-KatalaGpuSmi \"--query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits\"); if ($script:KatalaGpuSmiFailed) { Write-Output $script:KatalaGpuSmiFailureReason; exit 9 }; $computeRows = @($computeResult | Where-Object { $_.Trim() -and $_.Trim() -ne \"No running processes found\" }); if ($computeRows.Count -gt 16) { Write-Output \"GPU compute process list unavailable; operation refused\"; exit 9 }".to_string(),
+        "$gpuPids = @(); foreach ($line in $computeRows) { $part = $line -split \",\"; [int]$gpuPid = 0; if ($part.Count -ne 2 -or -not [int]::TryParse($part[0].Trim(), [ref]$gpuPid) -or $gpuPid -le 0) { Write-Output \"GPU compute process list unreadable; operation refused\"; exit 9 }; $gpuPids += $gpuPid }".to_string(),
+        "if ($gpuBusy) { Write-Output \"GPU activity is active; operation refused\"; exit 9 }".to_string(),
+    ];
+    if let Some(pid) = pid {
+        parts.extend([
+            "$tree = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,CreationDate -OperationTimeoutSec 4 -ErrorAction SilentlyContinue); Test-KatalaGpuDeadline".to_string(),
+            "if ($tree.Count -eq 0 -or $tree.Count -gt 4096) { Write-Output \"GPU process tree unreadable; operation refused\"; exit 9 }".to_string(),
+            "$parents = @{}; foreach ($r in $tree) { if ($null -ne $r.ProcessId -and $null -ne $r.ParentProcessId) { $parents[[int]$r.ProcessId] = @{ pid = [int]$r.ParentProcessId; born = $r.CreationDate } } }".to_string(),
+            "$targetAncestors = @{}; $walk = %%PID%%; for ($i = 0; $i -lt 64 -and $walk -gt 0 -and -not $targetAncestors.ContainsKey($walk); $i++) { $targetAncestors[$walk] = $true; $child = $parents[$walk]; $parent = $(if ($child) { $parents[$child.pid] } else { $null }); if (-not $child -or -not $parent -or -not $child.born -or -not $parent.born -or $parent.born -gt $child.born) { break }; $walk = $child.pid }".replace("%%PID%%", &pid.to_string()),
+            "$related = $false; foreach ($gpuPid in $gpuPids) { $walk = $gpuPid; for ($i = 0; $i -lt 64 -and $walk -gt 0; $i++) { if ($targetAncestors.ContainsKey($walk)) { $related = $true; break }; $child = $parents[$walk]; $parent = $(if ($child) { $parents[$child.pid] } else { $null }); if (-not $child -or -not $parent -or -not $child.born -or -not $parent.born -or $parent.born -gt $child.born) { break }; $walk = $child.pid }; if ($related) { break } }".to_string(),
+            "if ($related) { Write-Output \"GPU compute process or its parent/child is active; operation refused\"; exit 9 }".to_string(),
+        ]);
+    }
+    parts
+        .push("if ($gpuPids.Count -gt 0) { Write-Output \"GPU compute process is active; operation refused\"; exit 9 }; Test-KatalaGpuDeadline; }".to_string());
+    parts.join("; ")
 }
 
 /// 実行の計画（確認ダイアログに出す説明と、実際に送るコマンド）
@@ -89,6 +158,7 @@ fn mac_kill_script(pid: i64, name: &str, start: Option<&str>, min_cpu: i64) -> S
 // PowerShell 本体。シングルクォートを含めない（ssh 越しに bash の '...' で包むため）
 fn win_kill_ps(pid: i64, name: &str, start: Option<&str>, min_cpu: i64) -> String {
     let mut parts = vec![
+        "if (-not (Get-Command Test-KatalaActionExpiry -ErrorAction SilentlyContinue)) { function Test-KatalaActionExpiry {} }".to_string(),
         format!("$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue"),
         format!("if (-not $p -or $p.ProcessName -ne \"{name}\") {{ Write-Output (\"PID {pid} is now \" + $p.ProcessName); exit 3 }}"),
     ];
@@ -98,10 +168,33 @@ fn win_kill_ps(pid: i64, name: &str, start: Option<&str>, min_cpu: i64) -> Strin
     parts.extend([
         "$c1 = $p.CPU; Start-Sleep -Milliseconds 1000; $p.Refresh(); $core = ($p.CPU - $c1) * 100".to_string(),
         format!("if ($core -lt {min_cpu}) {{ Write-Output (\"recovered: \" + [math]::Round($core) + \"% of one core\"); exit 4 }}"),
-        format!("try {{ Stop-Process -Id {pid} -Force -ErrorAction Stop }} catch {{ Write-Output $_.Exception.Message; exit 6 }}"),
+        gpu_active_guard_ps(Some(pid)),
+        win_kill_recheck_ps(pid, name, start, min_cpu),
+        format!("Test-KatalaActionExpiry; try {{ Stop-Process -Id {pid} -Force -ErrorAction Stop }} catch {{ Write-Output $_.Exception.Message; exit 6 }}"),
         format!("try {{ Wait-Process -Id {pid} -Timeout 5 -ErrorAction Stop }} catch {{ if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ Write-Output \"not confirmed within 5s\"; exit 5 }} }}"),
         "Write-Output \"terminated\"; exit 0".into(),
     ]);
+    parts.join("; ")
+}
+
+fn win_kill_recheck_ps(pid: i64, name: &str, start: Option<&str>, min_cpu: i64) -> String {
+    let mut parts = vec![
+        format!("$p = Get-Process -Id {pid} -ErrorAction SilentlyContinue"),
+        format!("if (-not $p -or $p.ProcessName -ne \"{name}\") {{ Write-Output (\"PID {pid} is now \" + $p.ProcessName); exit 3 }}"),
+    ];
+    if let Some(s) = start {
+        parts.push(format!("if ($p.StartTime.ToUniversalTime().ToString(\"yyyyMMddHHmmssfff\") -ne \"{s}\") {{ Write-Output \"PID {pid} has a different start time\"; exit 3 }}"));
+    }
+    parts.extend([
+        "$c2 = $p.CPU; Start-Sleep -Milliseconds 1000; $p.Refresh(); $core2 = ($p.CPU - $c2) * 100".to_string(),
+        format!("if ($p.ProcessName -ne \"{name}\") {{ Write-Output \"PID {pid} changed during CPU recheck\"; exit 3 }}"),
+    ]);
+    if let Some(s) = start {
+        parts.push(format!("if ($p.StartTime.ToUniversalTime().ToString(\"yyyyMMddHHmmssfff\") -ne \"{s}\") {{ Write-Output \"PID {pid} has a different start time\"; exit 3 }}"));
+    }
+    parts.push(format!(
+        "if ($core2 -lt {min_cpu}) {{ Write-Output (\"recovered: \" + [math]::Round($core2) + \"% of one core\"); exit 4 }}; Test-KatalaGpuDeadline"
+    ));
     parts.join("; ")
 }
 
@@ -141,15 +234,20 @@ fn power_plan_script(guid: &str, prev_guid: &str) -> String {
 
 fn gpu_power_script(uuid: &str, watts: f64, min: f64, max: f64, prev_w: f64) -> String {
     let body = [
-        format!("function Read-Power {{ $line = & nvidia-smi.exe --id={uuid} --query-gpu=power.min_limit,power.max_limit,power.limit --format=csv,noheader,nounits; if ($LASTEXITCODE -ne 0 -or -not $line) {{ return @() }}; try {{ $r = @(); foreach ($x in ($line -split \",\")) {{ $r += [double]::Parse($x.Trim(), [Globalization.CultureInfo]::InvariantCulture) }}; if ($r.Count -ne 3) {{ return @() }}; return $r }} catch {{ return @() }} }}"),
+        "if (-not (Get-Command Test-KatalaActionExpiry -ErrorAction SilentlyContinue)) { function Test-KatalaActionExpiry {} }".into(),
+        format!("function Read-Power {{ $line = @(Invoke-KatalaGpuSmi \"--id={uuid} --query-gpu=power.min_limit,power.max_limit,power.limit --format=csv,noheader,nounits\"); if (-not $line) {{ return @() }}; try {{ $r = @(); foreach ($x in ($line -split \",\")) {{ $r += [double]::Parse($x.Trim(), [Globalization.CultureInfo]::InvariantCulture) }}; if ($r.Count -ne 3) {{ return @() }}; return $r }} catch {{ return @() }} }}"),
         "function Read-Power-Retry { $v = @(Read-Power); if ($v.Count -ne 3) { Start-Sleep -Milliseconds 200; $v = @(Read-Power) }; return $v }".into(),
+        gpu_active_guard_ps(None),
         "$v = @(Read-Power-Retry); if ($v.Count -ne 3) { Write-Output \"GPU power unreadable\"; exit 6 }".into(),
         format!("if ($v[0] -ne {min} -or $v[1] -ne {max} -or $v[2] -ne {prev_w}) {{ Write-Output \"GPU power state changed\"; exit 3 }}"),
-        format!("& nvidia-smi.exe --id={uuid} -pl {watts}; $apply = $LASTEXITCODE"),
+        gpu_active_guard_ps(None),
+        "$beforeApply = @(Read-Power-Retry); if ($beforeApply.Count -ne 3) { Write-Output \"GPU power unreadable\"; exit 6 }".into(),
+        format!("if ($beforeApply[0] -ne {min} -or $beforeApply[1] -ne {max} -or $beforeApply[2] -ne {prev_w}) {{ Write-Output \"GPU power state changed\"; exit 3 }}; Test-KatalaGpuDeadline"),
+        format!("Test-KatalaActionExpiry; $script:KatalaGpuMutationStarted = $true; $applyRows = @(Invoke-KatalaGpuSmi \"--id={uuid} -pl {watts}\"); $apply = $script:KatalaGpuSmiExitCode; if ($script:KatalaGpuSmiTimedOut) {{ Write-Output \"GPU power apply outcome unverified\"; exit 7 }}"),
         "$after = @(Read-Power-Retry)".into(),
         format!("if ($apply -eq 0 -and $after.Count -eq 3 -and $after[2] -eq {watts}) {{ exit 0 }}"),
         format!("if ($after.Count -eq 3 -and $after[0] -eq {min} -and $after[1] -eq {max} -and $after[2] -eq {prev_w}) {{ Write-Output \"power limit was not changed\"; exit 6 }}"),
-        format!("if ($after.Count -eq 3 -and $after[2] -eq {watts} -and $after[0] -le {prev_w} -and $after[1] -ge {prev_w}) {{ & nvidia-smi.exe --id={uuid} -pl {prev_w}; if ($LASTEXITCODE -eq 0) {{ $rolled = @(Read-Power-Retry); if ($rolled.Count -eq 3 -and $rolled[2] -eq {prev_w}) {{ Write-Output \"power limit verification failed; restored\"; exit 6 }} }} }}"),
+        format!("if ($after.Count -eq 3 -and $after[2] -eq {watts} -and $after[0] -le {prev_w} -and $after[1] -ge {prev_w}) {{ Test-KatalaActionExpiry; Test-KatalaGpuDeadline; $rollbackRows = @(Invoke-KatalaGpuSmi \"--id={uuid} -pl {prev_w}\"); if ($script:KatalaGpuSmiTimedOut) {{ Write-Output \"GPU power rollback outcome unverified\"; exit 7 }}; if ($script:KatalaGpuSmiExitCode -eq 0) {{ $rolled = @(Read-Power-Retry); if ($rolled.Count -eq 3 -and $rolled[2] -eq {prev_w}) {{ Write-Output \"power limit verification failed; restored\"; exit 6 }} }} }}"),
         "Write-Output \"power limit verification or rollback unverified\"; exit 7".into(),
     ].join("; ");
     format!(
@@ -187,6 +285,30 @@ fn check_task(p: &Value) -> Result<(String, String), String> {
         return Err("Windows 標準のタスクは扱わない".into());
     }
     Ok((path.into(), name.into()))
+}
+
+fn task_script(path: &str, name: &str, p: &Value, enabled: bool) -> Result<String, String> {
+    let expected = match p.get("expected_enabled") {
+        None => None,
+        Some(Value::Bool(v)) => Some(*v),
+        Some(_) => return Err("タスクの期待状態が不正".into()),
+    };
+    let read = format!("(Get-ScheduledTask -TaskPath \"{path}\" -TaskName \"{name}\" -ErrorAction Stop).Settings.Enabled");
+    let desired = if enabled { "$true" } else { "$false" };
+    let mut parts = vec!["try {".to_string(), format!("$before = {read}"), "if ($before -isnot [bool]) { throw \"task state unavailable\" }".into()];
+    if let Some(expected) = expected {
+        parts.push(format!("if ($before -ne ${expected}) {{ throw \"task state changed; operation refused\" }}"));
+    }
+    let verb = if enabled { "Enable" } else { "Disable" };
+    parts.extend([
+        format!("if ($before -ne {desired}) {{ {verb}-ScheduledTask -TaskPath \"{path}\" -TaskName \"{name}\" -ErrorAction Stop | Out-Null }}"),
+        format!("$after = {read}"),
+        format!("if ($after -isnot [bool] -or $after -ne {desired}) {{ throw \"task readback mismatch\" }}"),
+        "Write-Output (\"KT_TASK_STATE \" + [int]$before + \" \" + [int]$after)".into(),
+        "exit 0".into(),
+        "} catch { Write-Output \"task outcome unverified\"; exit 7 }".into(),
+    ]);
+    Ok(parts.join("; "))
 }
 
 fn check_label(p: &Value) -> Result<(String, Option<String>), String> {
@@ -234,6 +356,9 @@ pub fn plan(node: &Node, action: &Value, protect: Option<&[String]>) -> Result<P
         return Err("macOS だけの操作".into());
     }
     let Some(protect) = protect else { return Err("保護リストを読めないので実行しない".into()) };
+    if node.get("protect_gpu") == Some(&Value::Bool(true)) && matches!(ty.as_str(), "kill-process" | "set-gpu-power-limit") {
+        return Err(format!("{} は GPU 学習保護のため、この操作を実行しない", node.id));
+    }
     let empty = Value::Object(Default::default());
     let p = action.get("params").filter(|v| js::truthy(Some(v))).unwrap_or(&empty);
     let id = &node.id;
@@ -313,21 +438,16 @@ pub fn plan(node: &Node, action: &Value, protect: Option<&[String]>) -> Result<P
         }
         "task-disable" | "task-enable" | "task-run" => {
             let (path, name) = check_task(p)?;
-            let state = format!("(Get-ScheduledTask -TaskPath \"{path}\" -TaskName \"{name}\").State");
             let (describe, script, undo) = match ty.as_str() {
-                "task-disable" => (
-                    format!("{id} のタスク「{path}{name}」を無効にする（予定どおりに動かなくなる）。元に戻せる。"),
-                    format!("Disable-ScheduledTask -TaskPath \"{path}\" -TaskName \"{name}\" | Out-Null; {state}"),
-                    Some(json!({ "type": "task-enable", "params": { "path": path, "name": name } })),
-                ),
-                "task-enable" => (
-                    format!("{id} のタスク「{path}{name}」を有効にする。元に戻せる。"),
-                    format!("Enable-ScheduledTask -TaskPath \"{path}\" -TaskName \"{name}\" | Out-Null; {state}"),
-                    Some(json!({ "type": "task-disable", "params": { "path": path, "name": name } })),
-                ),
+                "task-disable" => {
+                    (format!("{id} のタスク「{path}{name}」を無効にする（予定どおりに動かなくなる）。元に戻せる。"), task_script(&path, &name, p, false)?, None)
+                }
+                "task-enable" => (format!("{id} のタスク「{path}{name}」を有効にする。元に戻せる。"), task_script(&path, &name, p, true)?, None),
                 _ => (
                     format!("{id} のタスク「{path}{name}」を今すぐ1回実行する。中身（バックアップ・同期など）が実際に動く。元には戻せない。"),
-                    format!("Start-ScheduledTask -TaskPath \"{path}\" -TaskName \"{name}\"; Start-Sleep -Seconds 2; {state}"),
+                    format!(
+                        "try {{ Start-ScheduledTask -TaskPath \"{path}\" -TaskName \"{name}\" -ErrorAction Stop; Write-Output \"KT_TASK_RUN\"; exit 0 }} catch {{ Write-Output \"task outcome unverified\"; exit 7 }}"
+                    ),
                     None,
                 ),
             };
@@ -397,15 +517,57 @@ pub async fn execute(node: &Node, action: &Value, protect: Option<&[String]>) ->
 /// `execute` の子プロセスの実行口を差し替えられる版（テストは偽の実行器を渡す。承認なしで呼ばれていないことを数えるため）
 pub async fn execute_with(runner: &dyn Runner, node: &Node, action: &Value, protect: Option<&[String]>) -> Result<Outcome, String> {
     let p = plan(node, action, protect)?;
-    let cmd = wrap(node, &p)?;
-    let res = exec_on_with(runner, node, &cmd, Duration::from_secs(30)).await;
+    let stdin_transport = node.os == "windows" && matches!(action.get("type").and_then(Value::as_str), Some("kill-process" | "set-gpu-power-limit"));
+    let mut res = if stdin_transport {
+        match action_helper(node) {
+            Ok(helper) => {
+                let body = p.script.as_bytes();
+                if body.is_empty() || body.len() > 65_536 {
+                    crate::collect::RunResult { code: Some(9), out: String::new(), err: "action stdin 本文の長さが不正".into() }
+                } else {
+                    runner.action_exchange(node, &helper, body, Duration::from_secs(40)).await
+                }
+            }
+            Err(err) => crate::collect::RunResult { code: Some(9), out: String::new(), err },
+        }
+    } else {
+        let cmd = wrap(node, &p)?;
+        exec_on_with(runner, node, &cmd, Duration::from_secs(30)).await
+    };
+    let mut undo = p.undo.clone();
+    let ty = action.get("type").and_then(Value::as_str).unwrap_or("");
+    if matches!(ty, "task-enable" | "task-disable") {
+        let receipt = match res.out.trim() {
+            "KT_TASK_STATE 0 0" => Some((false, false)),
+            "KT_TASK_STATE 0 1" => Some((false, true)),
+            "KT_TASK_STATE 1 0" => Some((true, false)),
+            "KT_TASK_STATE 1 1" => Some((true, true)),
+            _ => None,
+        };
+        let desired = ty == "task-enable";
+        let params = &action["params"];
+        let valid = receipt.is_some_and(|(before, after)| after == desired && params.get("expected_enabled").is_none_or(|v| v.as_bool() == Some(before)));
+        if res.code == Some(0) && (!valid || !res.err.trim().is_empty()) {
+            res = crate::collect::RunResult { code: Some(7), out: "task outcome unverified".into(), err: String::new() };
+        }
+        if res.code == Some(0)
+            && let Some((before, after)) = receipt
+            && before != after
+        {
+            undo = Some(
+                json!({ "type": if desired { "task-disable" } else { "task-enable" }, "params": { "path": params["path"], "name": params["name"], "expected_enabled": desired } }),
+            );
+        }
+    } else if ty == "task-run" && res.code == Some(0) && (res.out.trim() != "KT_TASK_RUN" || !res.err.trim().is_empty()) {
+        res = crate::collect::RunResult { code: Some(7), out: "task outcome unverified".into(), err: String::new() };
+    }
     let ok = res.code == Some(0);
     let outcome = res
         .code
-        .filter(|_| p.has_exits)
+        .filter(|_| p.has_exits || res.code == Some(9))
         .and_then(exit_text)
         .map(str::to_string)
         .unwrap_or_else(|| if ok { "完了".into() } else { format!("失敗（exit {}）", res.code_str()) });
     let output = js::slice16_tail(js::trim(&(res.out.clone() + &res.err)), 1500);
-    Ok(Outcome { ok, code: res.code, outcome, output, undo: if ok || res.code == Some(7) { p.undo.clone() } else { None } })
+    Ok(Outcome { ok, code: res.code, outcome, output, undo: if ok || (res.code == Some(7) && ty != "set-gpu-power-limit") { undo } else { None } })
 }

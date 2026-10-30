@@ -81,8 +81,12 @@ async fn monitor_stops_streams_removed_or_excluded_from_the_current_ledger() {
         assert_eq!(live.status()["active-mac"]["reason"], "excluded");
     }
     live.shutdown(Duration::from_secs(1)).await;
+    // 一時DBを削除する前に、自分が開始したwriterも明示的に終了する。
+    assert!(e.finish_monitor_journal(Duration::from_secs(1)).await);
+    let journal_running = e.monitor_journal_health()["running"].as_bool();
     drop(e);
     std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(journal_running, Some(false), "live shutdown alone must not be mistaken for journal shutdown");
 }
 
 fn config() -> nodes::Config {
@@ -95,17 +99,23 @@ fn node(id: &str) -> Node {
 }
 
 /// 呼ばれた回数と宛先を記録する偽の実行口（ssh もローカル実行もここを通る）
+type ProbeCall = (String, String, bool, bool, bool);
+
 struct Mock {
     calls: Mutex<Vec<(String, Vec<String>)>>,
+    probe_calls: Mutex<Vec<ProbeCall>>,
     reply: RunResult,
 }
 
 impl Mock {
     fn new(reply: RunResult) -> Arc<Mock> {
-        Arc::new(Mock { calls: Mutex::new(Vec::new()), reply })
+        Arc::new(Mock { calls: Mutex::new(Vec::new()), probe_calls: Mutex::new(Vec::new()), reply })
     }
     fn count(&self) -> usize {
         self.calls.lock().unwrap().len()
+    }
+    fn probe_count(&self) -> usize {
+        self.probe_calls.lock().unwrap().len()
     }
 }
 
@@ -113,6 +123,13 @@ impl Runner for Mock {
     fn run<'a>(&'a self, cmd: &'a str, args: &'a [String], _input: Option<&'a [u8]>, _timeout: Duration) -> RunFuture<'a> {
         Box::pin(async move {
             self.calls.lock().unwrap().push((cmd.to_string(), args.to_vec()));
+            self.reply.clone()
+        })
+    }
+
+    fn probe_exchange<'a>(&'a self, node: &'a Node, helper_sha256: &'a str, benchmark: bool, network: bool, observe_wsl: bool) -> RunFuture<'a> {
+        Box::pin(async move {
+            self.probe_calls.lock().unwrap().push((node.alias.clone(), helper_sha256.to_string(), benchmark, network, observe_wsl));
             self.reply.clone()
         })
     }
@@ -168,17 +185,31 @@ fn status_values_are_normalised_and_unreadable_values_fail_safe() {
 
 #[tokio::test]
 async fn probe_runs_nothing_for_nodes_that_are_not_online() {
-    let all = config().nodes;
+    let mut all = config().nodes;
+    let helper_sha = "b".repeat(64);
+    for node in &mut all {
+        if node.id == "explicit-online" {
+            node.raw["action_helper"] = json!({
+                "schema": "katala-tune/action-helper/v2",
+                "source_sha": "a".repeat(40),
+                "tune_sha256": helper_sha,
+                "manifest_sha256": "c".repeat(64),
+                "run_id": 1,
+                "attempt": 1,
+            });
+        }
+    }
     let mock = Mock::new(ok_reply());
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
     let s2 = seen.clone();
     let results = probe_all_with(mock.clone(), &all, move |r| s2.lock().unwrap().push(r["node_id"].as_str().unwrap().to_string())).await;
     assert_eq!(results.iter().map(|r| r["node_id"].as_str().unwrap()).collect::<Vec<_>>(), ["active-mac", "explicit-online"]);
-    assert_eq!(mock.count(), 2);
-    for (cmd, args) in mock.calls.lock().unwrap().iter() {
-        assert_eq!(cmd, "ssh");
-        assert!(args.iter().any(|a| a == "active-mac" || a == "explicit-online"));
-    }
+    assert_eq!(mock.count(), 1, "only active Mac retains generic SSH");
+    let generic = mock.calls.lock().unwrap().clone();
+    assert_eq!(generic[0].0, "ssh");
+    assert!(generic[0].1.iter().any(|arg| arg == "active-mac"));
+    let probes = mock.probe_calls.lock().unwrap().clone();
+    assert_eq!(probes.as_slice(), [("explicit-online".into(), helper_sha, true, true, false)]);
 
     for id in EXCLUDED {
         let mock = Mock::new(ok_reply());
@@ -188,6 +219,7 @@ async fn probe_runs_nothing_for_nodes_that_are_not_online() {
             assert!(exec_on_with(mock.as_ref(), &n, "echo x", Duration::from_secs(1)).await.err.contains("接続も変更もしない"));
         }
         assert_eq!(mock.count(), 0, "{id} に接続した");
+        assert_eq!(mock.probe_count(), 0, "{id} に named probe を実行した");
     }
 }
 

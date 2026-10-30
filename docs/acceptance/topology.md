@@ -25,3 +25,30 @@ public JSON / Mermaid は既知の種別と出力内参照用の決定的な `en
 - `.branch-recovery` is excluded from active checkout discovery because it is a Git recovery object store; its absence is never interpreted as a checkout removal.
 - Public export の `observed_at_ms` は各 entity/edge に関係する scope の最終収集試行時刻の最大値であり、個別 fact を最後に再確認した時刻とは区別する。scope receipt が export 上限外・欠測・不正なら `currentness` は `unknown` とする。
 設定カウンタには二つの範囲がある。private な環境単位の attempt budget は選択 file を開く前に制限し、capture counter は保持した実体だけを数える。`config_files` は configuration pseudo-repository に対応する成功した bounded regular-file read、`config_keys` は保持した選択 hash の数である。読めない選択は `config_file_read=false`、hash なし、bounded failure receipt を持つ pseudo-repository として残す。
+
+## Opt-in local Docker
+
+A local native environment may add:
+
+```json
+{"id":"native","transport":"node","roots":[],"docker":{"enabled":true,"contexts":["default"],"program":"/usr/local/bin/docker"}}
+```
+
+`program` is optional (known native installation paths only). `contexts` is
+explicit and nonempty; it never enumerates or activates remote contexts. Docker
+is disabled by default. Put this only in the private node ledger, within an
+existing node's `topology.environments`. Existing CLI `topology-refresh` / `topology-export`
+and UI refresh use this configuration and the existing scheduler. No daemon is
+started and remote native/WSL collection is excluded in this adapter version.
+
+Verify offline tests for remote endpoint rejection, bounded transports, alias
+engine dedup, private field removal, missing health, stopped unhealthy state,
+null/zero limits, log policies, SQLite and public exports. The UI shows Docker
+state, unknown health, numeric limits and published port mappings. Public JSON
+and Mermaid deliberately retain anonymous graph kinds/relations and receipt
+currentness, not private attributes.
+
+Separately, an authorized native canary must demonstrate actual read-only
+collection, private database copy import, dedup/count/null comparison and
+rendered UI. Local/mock checks do not prove Windows/native canary, installation,
+distribution, normal database/config changes or production acceptance.

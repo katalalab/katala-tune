@@ -18,18 +18,23 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::collect;
 use crate::db::now_ms;
+use crate::monitor_journal::{
+    Category, CloseTrigger, Data, InputEnd, Journal, Kind, PipeEnd, Policy, Reason, StatePhase, StreamBoundary, StreamIo, WaitOrigin, elapsed_ms,
+};
 use crate::nodes::Node;
 
 pub const MAC_LIVE: &str = include_str!("../../../probes/live_mac.py");
@@ -560,6 +565,13 @@ pub fn downsample(points: &[Value], max: usize) -> Vec<Value> {
 pub struct Ended {
     pub code: Option<i32>,
     pub err: String,
+    pub wait_observed: Option<bool>,
+    pub stdout: PipeEnd,
+    pub stderr: PipeEnd,
+    pub stdin: InputEnd,
+    pub wait_origin: Option<WaitOrigin>,
+    pub kill_attempted: Option<bool>,
+    pub io: Option<StreamBoundary>,
 }
 
 impl Ended {
@@ -580,22 +592,44 @@ pub struct Source {
     pub lines: mpsc::Receiver<String>,
     stop: Option<oneshot::Sender<()>>,
     done: Option<oneshot::Receiver<Ended>>,
+    pub transport_pid: Option<u32>,
+    boundary: Option<Arc<Mutex<ReadBoundary>>>,
 }
 
 impl Source {
     pub fn new(lines: mpsc::Receiver<String>, stop: oneshot::Sender<()>, done: oneshot::Receiver<Ended>) -> Source {
-        Source { lines, stop: Some(stop), done: Some(done) }
+        Source { lines, stop: Some(stop), done: Some(done), transport_pid: None, boundary: None }
     }
 
     /// 止めて、終わるのを待つ
-    pub async fn close(mut self) -> Ended {
+    pub async fn close(self) -> Ended {
+        self.close_with(CloseTrigger::Stop, None).await
+    }
+
+    async fn close_with(mut self, trigger: CloseTrigger, sample_age: Option<Duration>) -> Ended {
+        // Snapshot before sending stop: EOF caused by closing stdin must not become pre-close EOF.
+        let mut io = self.boundary.as_ref().and_then(|b| b.lock().ok().map(|s| s.snapshot()));
+        if let Some(d) = io.as_mut() {
+            d.close_trigger = Some(trigger);
+            d.sample_age_ms = sample_age.and_then(|age| u32::try_from(age.as_millis()).ok());
+            d.overflow |= sample_age.is_some() && d.sample_age_ms.is_none();
+        }
+        let began = Instant::now();
         if let Some(s) = self.stop.take() {
             let _ = s.send(());
         }
-        match self.done.take() {
+        let mut ended = match self.done.take() {
             Some(d) => d.await.unwrap_or_default(),
             None => Ended::default(),
+        };
+        if let Some(d) = io.as_mut() {
+            d.close_ms = u32::try_from(began.elapsed().as_millis()).ok();
+            d.overflow |= d.close_ms.is_none();
+            d.wait_origin = ended.wait_origin;
+            d.kill_attempted = ended.kill_attempted;
         }
+        ended.io = io;
+        ended
     }
 }
 
@@ -655,8 +689,10 @@ fn windows_boot(n: usize, params: &str) -> String {
     )
 }
 
-/// 各機体に置くネイティブのサンプラー（`tune-agent sample`。Windows だけ。置き方は docs/architecture.md）
+/// 各機体に置くネイティブのサンプラー（`tune-agent sample`。置き方は docs/architecture.md）
 pub const NATIVE_REMOTE: &str = "~/.katala-tune/bin/tune-agent.exe";
+/// macOS の置き場所（名前に .exe が付かない）
+pub const NATIVE_REMOTE_MAC: &str = "~/.katala-tune/bin/tune-agent";
 
 fn native_args(o: &Opts) -> Vec<String> {
     [
@@ -672,8 +708,9 @@ fn native_args(o: &Opts) -> Vec<String> {
 /// この機体のネイティブのサンプラー: アプリの隣、無ければ helpers の namespace。
 /// `KATALA_TUNE_DATA_DIR` を明示した QA では `data/bin` に閉じ、通常は従来の HOME を使う。
 fn local_native() -> Option<PathBuf> {
-    let beside = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("tune-agent.exe")));
-    let managed = crate::helpers::bin_dir().join("tune-agent.exe");
+    let name = crate::helpers::exe("tune-agent");
+    let beside = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(&name)));
+    let managed = crate::helpers::bin_dir().join(&name);
     [beside, Some(managed)].into_iter().flatten().find(|p| p.is_file())
 }
 
@@ -687,12 +724,24 @@ pub fn launch(node: &Node, o: &Opts) -> Result<Launch, String> {
         let a = format!("interval={} procs={} max={} watch=1", secs(o.interval), secs(o.procs_every), secs(o.sampler_max_age));
         let boot = python_boot(MAC_LIVE.len());
         let stdin = MAC_LIVE.as_bytes().to_vec();
+        // ネイティブ（tune-agent sample）を先に使い、置いていない・起動できない（古い版・合わないアーキテクチャ）なら
+        // Python 版。ネイティブは起動に失敗するとき標準入力を読まずに終わるので、Python 版はそのままスクリプトを読める。
+        // ネイティブが動いたときは、標準入力のスクリプトを読み捨てる
+        let native = native_args(o).join(" ");
         if node.local {
+            if let Some(exe) = local_native() {
+                // パスは引数で渡す（空白を含む .app の中でも引用符を組み立てない）
+                let script = format!("\"$0\" {native} || exec /usr/bin/env python3 -c '{boot}' {a}");
+                let args = vec!["-c".to_string(), script, exe.to_string_lossy().into_owned()];
+                return Ok(Launch { program: "/bin/sh".into(), args, stdin, keep_stdin: true, cleanup: None });
+            }
             let mut args = vec!["python3".to_string(), "-c".to_string(), boot];
             args.extend(a.split(' ').map(str::to_string));
             return Ok(Launch { program: "/usr/bin/env".into(), args, stdin, keep_stdin: true, cleanup: None });
         }
-        let remote = format!("command -v python3 >/dev/null && exec python3 -c '{boot}' {a} || exec /usr/bin/python3 -c '{boot}' {a}");
+        let remote = format!(
+            "[ -x {NATIVE_REMOTE_MAC} ] && {NATIVE_REMOTE_MAC} {native} || {{ command -v python3 >/dev/null && exec python3 -c '{boot}' {a} || exec /usr/bin/python3 -c '{boot}' {a}; }}"
+        );
         return Ok(Launch { program: "ssh".into(), args: live_ssh_args(&node.alias, &remote), stdin, keep_stdin: true, cleanup: None });
     }
     if node.is_windows() {
@@ -735,105 +784,228 @@ pub fn spawn(l: Launch) -> Result<Source, String> {
             return Err(format!("{} を起動できない: {e}", l.program));
         }
     };
+    let transport_pid = child.id();
     let mut stdin = child.stdin.take();
     let input = l.stdin;
     let keep = l.keep_stdin;
     // keep のとき、標準入力は止めるとき（closed の送り手が無くなったとき）まで開いておく
     let (closed_tx, closed_rx) = oneshot::channel::<()>();
-    tokio::spawn(async move {
+    let stdin_task = tokio::spawn(async move {
+        let mut outcome = InputEnd::Unknown;
         if let Some(si) = stdin.as_mut() {
-            let _ = si.write_all(&input).await;
-            let _ = si.flush().await;
-            if !keep {
-                let _ = si.shutdown().await;
+            outcome = if si.write_all(&input).await.is_ok() && si.flush().await.is_ok() { InputEnd::Written } else { InputEnd::WriteError };
+            if !keep && si.shutdown().await.is_err() {
+                outcome = InputEnd::WriteError;
             }
         }
         if keep {
             let _ = closed_rx.await;
         }
         drop(stdin);
+        outcome
     });
     let (tx, rx) = mpsc::channel(256);
-    tokio::spawn(read_lines(child.stdout.take(), tx));
+    let boundary = Arc::new(Mutex::new(ReadBoundary::new()));
+    let out_task = tokio::spawn(read_lines(child.stdout.take(), tx, boundary.clone()));
     let err_task = tokio::spawn(read_tail(child.stderr.take(), 4096));
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let (done_tx, done_rx) = oneshot::channel();
     let cleanup = l.cleanup;
+    let wait_boundary = boundary.clone();
     tokio::spawn(async move {
         let mut closed_tx = Some(closed_tx);
         // stop_rx は止める指示か、Source が捨てられた（送り手が無くなった）ときに終わる
-        let status = tokio::select! {
-            st = child.wait() => st.ok(),
+        let mut kill_attempted = false;
+        let (status, wait_origin) = tokio::select! {
+            st = child.wait() => (st.ok(), WaitOrigin::Natural),
             _ = stop_rx => {
                 // まず標準入力を閉じる。サンプラーは自分で後始末して終わる（Windows は nvidia-smi も止める）。
                 // 終わらなければ（応答の無い機体など）強制的に止める
                 drop(closed_tx.take());
                 let grace = if keep { Duration::from_millis(2500) } else { Duration::ZERO };
-                match tokio::time::timeout(grace, child.wait()).await {
+                let status = match tokio::time::timeout(grace, child.wait()).await {
                     Ok(st) => st.ok(),
                     Err(_) => {
+                        // API attempt only; an error/already-exited race does not prove a kill.
+                        kill_attempted = true;
                         let _ = child.start_kill();
                         child.wait().await.ok()
                     }
-                }
+                };
+                (status, WaitOrigin::Close)
             }
         };
+        if let Ok(mut b) = wait_boundary.lock() {
+            b.wait_observed = status.as_ref().map(|_| true);
+        }
         drop(closed_tx);
         // 孫プロセスがパイプを持ち続けても止まらないよう、読み終わりを待つのは少しだけ
-        let err = tokio::time::timeout(Duration::from_secs(2), err_task).await.ok().and_then(Result::ok).unwrap_or_default();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let (stdout, tail, stdin) = tokio::join!(reader_result(out_task, deadline), reader_result(err_task, deadline), reader_result(stdin_task, deadline));
+        let (err, stderr) = tail.unwrap_or_else(|| (String::new(), PipeEnd::Cancelled));
         if let Some(f) = cleanup {
             let _ = std::fs::remove_file(f);
         }
-        let _ = done_tx.send(Ended { code: status.and_then(|s| s.code()), err });
+        let _ = done_tx.send(Ended {
+            code: status.as_ref().and_then(|s| s.code()),
+            wait_observed: Some(status.is_some()),
+            err,
+            stdout: stdout.unwrap_or(PipeEnd::Cancelled),
+            stderr,
+            stdin: stdin.unwrap_or(InputEnd::Cancelled),
+            wait_origin: Some(wait_origin),
+            kill_attempted: Some(kill_attempted),
+            io: None,
+        });
     });
-    Ok(Source::new(rx, stop_tx, done_rx))
+    let mut source = Source::new(rx, stop_tx, done_rx);
+    source.transport_pid = transport_pid;
+    source.boundary = Some(boundary);
+    Ok(source)
 }
 
-async fn read_lines(out: Option<tokio::process::ChildStdout>, tx: mpsc::Sender<String>) {
-    let Some(out) = out else { return };
-    let mut r = BufReader::new(out);
+async fn reader_result<T: Send + 'static>(mut task: JoinHandle<T>, deadline: tokio::time::Instant) -> Option<T> {
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(r) => r.ok(),
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            None
+        }
+    }
+}
+
+struct ReadBoundary {
+    began: Instant,
+    data: StreamBoundary,
+    wait_observed: Option<bool>,
+}
+impl ReadBoundary {
+    fn new() -> Self {
+        Self { began: Instant::now(), data: StreamBoundary::default(), wait_observed: Some(false) }
+    }
+    fn at_ms(&mut self) -> Option<u32> {
+        let ms = u32::try_from(self.began.elapsed().as_millis()).ok();
+        self.data.overflow |= ms.is_none();
+        ms
+    }
+    fn add(&mut self, bytes: usize) {
+        let n = u32::try_from(bytes).ok().and_then(|n| self.data.bytes.checked_add(n));
+        self.data.overflow |= n.is_none();
+        self.data.bytes = n.unwrap_or(u32::MAX);
+        self.data.last_byte_ms = self.at_ms();
+    }
+    fn snapshot(&self) -> StreamBoundary {
+        let mut data = self.data.clone();
+        data.snapshot_ms = u32::try_from(self.began.elapsed().as_millis()).ok();
+        data.overflow |= data.snapshot_ms.is_none();
+        data.wait_before_close = self.wait_observed;
+        data
+    }
+}
+
+// Observe actual pipe reads, including a partial line still held by read_until/BufReader.
+struct ObservedRead<R> {
+    inner: R,
+    boundary: Arc<Mutex<ReadBoundary>>,
+}
+impl<R: AsyncRead + Unpin> AsyncRead for ObservedRead<R> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Ok(mut b) = this.boundary.lock() {
+            match &result {
+                Poll::Ready(Ok(())) if buf.filled().len() > before => b.add(buf.filled().len() - before),
+                Poll::Ready(Ok(())) => b.data.pre_stdout = Some(PipeEnd::Eof),
+                Poll::Ready(Err(_)) => b.data.pre_stdout = Some(PipeEnd::ReadError),
+                Poll::Pending => {}
+            }
+        }
+        result
+    }
+}
+
+async fn read_lines(out: Option<tokio::process::ChildStdout>, tx: mpsc::Sender<String>, boundary: Arc<Mutex<ReadBoundary>>) -> PipeEnd {
+    let Some(out) = out else {
+        if let Ok(mut b) = boundary.lock() {
+            b.data.pre_stdout = Some(PipeEnd::Unknown);
+        }
+        return PipeEnd::Unknown;
+    };
+    read_lines_from(out, tx, boundary).await
+}
+
+async fn read_lines_from<R: AsyncRead + Unpin>(out: R, tx: mpsc::Sender<String>, boundary: Arc<Mutex<ReadBoundary>>) -> PipeEnd {
+    let mut r = BufReader::new(ObservedRead { inner: out, boundary: boundary.clone() });
     let mut buf = Vec::new();
     loop {
         buf.clear();
         let n = match (&mut r).take(MAX_LINE as u64).read_until(b'\n', &mut buf).await {
             Ok(n) => n,
-            Err(_) => return,
+            Err(_) => return PipeEnd::ReadError,
         };
         if n == 0 {
-            return;
+            return PipeEnd::Eof;
         }
         if buf.last() != Some(&b'\n') && n >= MAX_LINE {
-            // 長すぎる行は改行まで読み捨てる
+            if let Ok(mut b) = boundary.lock() {
+                b.data.overflow |= b.data.discarded == u32::MAX;
+                b.data.discarded = b.data.discarded.saturating_add(1);
+            }
             loop {
                 let mut skip = Vec::new();
                 match (&mut r).take(MAX_LINE as u64).read_until(b'\n', &mut skip).await {
-                    Ok(0) | Err(_) => return,
+                    Ok(0) => return PipeEnd::Eof,
+                    Err(_) => return PipeEnd::ReadError,
                     Ok(_) if skip.last() == Some(&b'\n') => break,
                     Ok(_) => {}
                 }
             }
             continue;
         }
-        if tx.send(collect::decode(&buf)).await.is_err() {
-            return;
+        let frame = collect::decode(&buf);
+        let Ok(permit) = tx.reserve().await else {
+            if let Ok(mut b) = boundary.lock() {
+                b.data.pre_stdout = Some(PipeEnd::Cancelled);
+            }
+            return PipeEnd::Cancelled;
+        };
+        // Commit metadata before publishing: the consumer may immediately snapshot and close.
+        match boundary.lock() {
+            Ok(mut b) => {
+                b.data.overflow |= b.data.forwarded == u32::MAX;
+                b.data.forwarded = b.data.forwarded.saturating_add(1);
+                if buf.last() == Some(&b'\n') {
+                    b.data.last_line_ms = b.at_ms();
+                }
+                // No await: snapshot and publication share the same linearization boundary.
+                permit.send(frame);
+            }
+            Err(_) => {
+                permit.send(frame);
+            } // Keep delivery; poisoned diagnostics stay unknown.
         }
     }
 }
 
-async fn read_tail(err: Option<tokio::process::ChildStderr>, keep: usize) -> String {
-    let Some(mut err) = err else { return String::new() };
-    let mut tail: Vec<u8> = Vec::new();
+async fn read_tail(err: Option<tokio::process::ChildStderr>, keep: usize) -> (String, PipeEnd) {
+    let Some(mut err) = err else { return (String::new(), PipeEnd::Unknown) };
+    let mut tail = Vec::new();
     let mut chunk = [0u8; 4096];
-    while let Ok(n) = err.read(&mut chunk).await {
-        if n == 0 {
-            break;
+    let end = loop {
+        match err.read(&mut chunk).await {
+            Ok(0) => break PipeEnd::Eof,
+            Err(_) => break PipeEnd::ReadError,
+            Ok(n) => {
+                tail.extend_from_slice(&chunk[..n]);
+                if tail.len() > keep {
+                    tail.drain(..tail.len() - keep);
+                }
+            }
         }
-        tail.extend_from_slice(&chunk[..n]);
-        if tail.len() > keep {
-            tail.drain(..tail.len() - keep);
-        }
-    }
-    collect::decode(&tail)
+    };
+    (collect::decode(&tail), end)
 }
 
 /// 今の経路: この機体はローカル実行、ほかは SSH（`launch`）
@@ -1039,11 +1211,39 @@ pub struct Live {
     opts: Opts,
     sink: Sink,
     st: Mutex<Shared>,
+    journal: OnceLock<Journal>,
 }
 
 impl Live {
     pub fn new(route: Arc<dyn Route>, opts: Opts, sink: Sink) -> Arc<Live> {
-        Arc::new(Live { route, opts, sink, st: Mutex::new(Shared::default()) })
+        Arc::new(Live { route, opts, sink, st: Mutex::new(Shared::default()), journal: OnceLock::new() })
+    }
+
+    pub fn bind_journal(&self, journal: Journal) {
+        let _ = self.journal.set(journal);
+    }
+
+    fn record(&self, id: &str, epoch: u64, attempt: u32, kind: Kind, mut data: Data) {
+        if self.journal.get().is_none() {
+            return;
+        }
+        {
+            let st = self.lock();
+            if Self::current(&st, id, epoch) {
+                data.phase = st.nodes.get(id).map(|n| match n.phase {
+                    Phase::Connecting => StatePhase::Connecting,
+                    Phase::Running => StatePhase::Running,
+                    Phase::Retrying => StatePhase::Retrying,
+                    Phase::Stopped => StatePhase::Stopped,
+                });
+            }
+        }
+        if kind == Kind::Stopped {
+            data.phase = Some(StatePhase::Stopped);
+        }
+        if let Some(j) = self.journal.get() {
+            j.record(Some(id), epoch, attempt, kind, data);
+        }
     }
 
     pub fn opts(&self) -> &Opts {
@@ -1328,21 +1528,57 @@ fn stop_requested(rx: &watch::Receiver<Option<Stop>>) -> Option<Stop> {
     rx.borrow().clone()
 }
 
+fn end_category(timed_out: bool, samples: u64, ended: &Ended) -> Option<Category> {
+    if timed_out {
+        Some(if samples == 0 { Category::FirstSampleTimeout } else { Category::StallTimeout })
+    } else if ended.code.is_some_and(|c| c != 0) {
+        Some(Category::ExitNonzero)
+    } else if ended.wait_observed != Some(true) {
+        Some(Category::WaitUnknown)
+    } else if ended.code.is_none() {
+        Some(Category::StatusWithoutCode)
+    } else {
+        None
+    }
+}
+
 /// 1 台の流れ: 開く → 読む → 切れたらつなぎ直す（続けての失敗が max_retries を超えたら止める）
 async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Receiver<Option<Stop>>) {
     let o = live.opts.clone();
     let mut failures = 0u32;
+    let mut attempt = 0u32;
     let why: Stop = 'outer: loop {
         if let Some(r) = stop_requested(&stop) {
             break r;
         }
+        attempt = attempt.saturating_add(1);
+        let opened_at = Instant::now();
+        live.record(&node.id, epoch, attempt, Kind::Open, Data { configured_local: Some(node.local), ..Data::default() });
         let mut err = String::new();
         match live.route.open(&node, &o) {
-            Err(e) => err = e,
+            Err(e) => {
+                err = e;
+                live.record(
+                    &node.id,
+                    epoch,
+                    attempt,
+                    Kind::End,
+                    Data { category: Some(Category::OpenFailed), duration_ms: Some(elapsed_ms(opened_at)), ..Data::default() },
+                );
+            }
             Ok(mut src) => {
                 let started = Instant::now();
                 let mut got = 0u64;
                 let mut planned = false;
+                let mut declared = None;
+                let mut last_seq = None;
+                let mut last_at = None;
+                let mut rejected = 0u64;
+                let mut timed_out = false;
+                let mut last_sample = None;
+                let mut timeout_sample_age = None;
+                let mut checkpoint = Instant::now();
+                let transport_pid = src.transport_pid;
                 let stopped: Option<Stop> = loop {
                     let wait = if got == 0 { o.first_line_timeout } else { o.stall_timeout };
                     tokio::select! {
@@ -1354,29 +1590,84 @@ async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Re
                         }
                         r = tokio::time::timeout(wait, src.lines.recv()) => match r {
                             Ok(Some(line)) => match parse_line(&line) {
-                                Some(Msg::Hello(h)) => live.on_hello(&node.id, epoch, h),
+                                Some(Msg::Hello(h)) => {
+                                    live.record(&node.id, epoch, attempt, Kind::Hello, Data { native_rust: match h.implementation.as_deref() { Some("rust") => Some(true), _ => None }, reported_version: crate::monitor_journal::reported_version(h.agent.as_deref()), ..Data::default() });
+                                    live.on_hello(&node.id, epoch, h);
+                                }
                                 Some(Msg::Sample(s)) => {
                                     got += 1;
+                                    last_sample = Some(Instant::now());
+                                    last_seq = s.seq; last_at = Some(now_ms());
                                     live.on_sample(&node.id, epoch, *s);
+                                    if got == 1 { live.record(&node.id, epoch, attempt, Kind::FirstSample, Data { seq: last_seq, last_sample_at: last_at, transport_pid, duration_ms: Some(elapsed_ms(opened_at)), ..Data::default() }); }
+                                    if checkpoint.elapsed() >= Duration::from_secs(60) {
+                                        live.record(&node.id, epoch, attempt, Kind::Checkpoint, Data { samples: Some(got), rejected: Some(rejected), seq: last_seq, last_sample_at: last_at, duration_ms: Some(elapsed_ms(opened_at)), ..Data::default() });
+                                        checkpoint = Instant::now();
+                                    }
                                 }
-                                Some(Msg::End(reason)) => planned = reason == "max_age",
-                                None => {}
+                                Some(Msg::End(reason)) => { planned = reason == "max_age"; declared = Some(Reason::end(&reason)); },
+                                None => { rejected += 1; }
                             },
                             Ok(None) => break None,
                             Err(_) => {
+                                timed_out = true;
+                                timeout_sample_age = last_sample.map(|at: Instant| at.elapsed());
                                 err = format!("{} 秒間データが来ない", secs(wait));
                                 break None;
                             }
                         }
                     }
                 };
-                let ended = src.close().await;
+                let trigger = if timed_out {
+                    CloseTrigger::Timeout
+                } else if stopped.is_some() {
+                    CloseTrigger::Stop
+                } else {
+                    CloseTrigger::ChannelEnd
+                };
+                let ended = src.close_with(trigger, timeout_sample_age).await;
+                let category = end_category(timed_out, got, &ended);
+                live.record(
+                    &node.id,
+                    epoch,
+                    attempt,
+                    Kind::End,
+                    Data {
+                        reason: declared,
+                        category,
+                        exit_code: ended.code,
+                        wait_observed: ended.wait_observed,
+                        stdout: Some(ended.stdout),
+                        stderr: Some(ended.stderr),
+                        stdin: Some(ended.stdin),
+                        transport_pid,
+                        duration_ms: Some(elapsed_ms(opened_at)),
+                        samples: Some(got),
+                        rejected: Some(rejected),
+                        seq: last_seq,
+                        last_sample_at: last_at,
+                        io: ended.io.clone().map(StreamIo::Observed),
+                        ..Data::default()
+                    },
+                );
                 if let Some(s) = stopped {
                     break 'outer s;
                 }
                 if planned {
                     // サンプラーが区切りで終わった。数えずに、少しだけ置いてつなぎ直す
                     failures = 0;
+                    live.record(
+                        &node.id,
+                        epoch,
+                        attempt,
+                        Kind::Retry,
+                        Data {
+                            reason: Some(Reason::MaxAge),
+                            policy: Some(Policy::PlannedRecycle),
+                            delay_ms: Some(o.backoff_for(1).min(Duration::from_millis(500)).as_millis() as u64),
+                            ..Data::default()
+                        },
+                    );
                     tokio::select! {
                         _ = tokio::time::sleep(o.backoff_for(1).min(Duration::from_millis(500))) => {}
                         r = stop.changed() => {
@@ -1403,6 +1694,13 @@ async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Re
         }
         live.set_phase(&node.id, epoch, Phase::Retrying, Some(err), failures);
         let wait = o.backoff_for(failures);
+        live.record(
+            &node.id,
+            epoch,
+            attempt,
+            Kind::Retry,
+            Data { policy: Some(Policy::StreamBackoff), delay_ms: Some(wait.as_millis() as u64), ..Data::default() },
+        );
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
             r = stop.changed() => {
@@ -1414,6 +1712,17 @@ async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Re
         }
         live.set_phase(&node.id, epoch, Phase::Connecting, None, failures);
     };
+    let reason = match &why {
+        Stop::User => Reason::User,
+        Stop::Idle => Reason::Idle,
+        Stop::Hidden => Reason::Hidden,
+        Stop::Disconnected(_) => Reason::Disconnected,
+        Stop::Limit => Reason::Limit,
+        Stop::AppExit => Reason::AppExit,
+        Stop::Restart => Reason::Restart,
+        Stop::Excluded => Reason::Excluded,
+    };
+    live.record(&node.id, epoch, attempt, Kind::Stopped, Data { reason: Some(reason), ..Data::default() });
     live.finish(&node.id, epoch, why);
 }
 
@@ -1443,6 +1752,27 @@ mod tests {
         assert_eq!(point["gpu_1_vram_used_mib"], Value::Null);
         assert_eq!(point["gmem"], json!(25.0), "available adapter percent, never dilute with unknown adapter");
         assert_eq!(serde_json::to_value(&s.gpu).unwrap()[0]["memory_status"], "available");
+    }
+
+    #[test]
+    fn disk_null_partial_and_legacy_samples_preserve_unknown_and_idle() {
+        for (disk, read, write) in [
+            (None, None, None),
+            (Some(Value::Null), None, None),
+            (Some(json!({"read_bps":null,"write_bps":120})), None, Some(120.0)),
+            (Some(json!({"read_bps":0,"write_bps":0})), Some(0.0), Some(0.0)),
+        ] {
+            let mut row = json!({"type":"s","t":1000,"cpu":10});
+            if let Some(disk) = disk {
+                row["disk"] = disk;
+            }
+            let Some(Msg::Sample(raw)) = parse_line(&row.to_string()) else { panic!("sample") };
+            let (sample, _, _) = Sample::from_raw(*raw, 1000);
+            let point = sample.point();
+            assert_eq!(point.get("dr").and_then(Value::as_f64), read);
+            assert_eq!(point.get("dw").and_then(Value::as_f64), write);
+            assert_eq!(point["cpu"], json!(10.0));
+        }
     }
 
     #[test]
@@ -1499,12 +1829,284 @@ mod tests {
         assert_eq!(downsample(&pts[..3], 4).len(), 3, "少なければそのまま");
     }
 
+    struct LaunchTestDir {
+        path: PathBuf,
+        cleanup: bool,
+    }
+
+    impl LaunchTestDir {
+        fn create(path: PathBuf) -> std::io::Result<Self> {
+            std::fs::create_dir(&path)?;
+            Ok(Self { path, cleanup: true })
+        }
+
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            Self::create(std::env::temp_dir().join(format!("kt-live-launch-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)))).unwrap()
+        }
+    }
+
+    impl Drop for LaunchTestDir {
+        fn drop(&mut self) {
+            if self.cleanup {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    struct ExactChildOutput {
+        status: Option<std::process::ExitStatus>,
+        reason: Option<&'static str>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    }
+
+    // Keep the exact Child handle; never rediscover or signal an arbitrary PID.
+    struct RetainedExactChild {
+        child: std::process::Child,
+        status: Option<std::process::ExitStatus>,
+        stopped: bool,
+    }
+
+    impl RetainedExactChild {
+        fn reap(&mut self) -> std::io::Result<bool> {
+            if self.status.is_none() {
+                self.status = self.child.try_wait()?;
+            }
+            Ok(self.status.is_some())
+        }
+
+        fn stop_and_reap(&mut self) {
+            if self.stopped || self.status.is_some() {
+                return;
+            }
+            self.stopped = true;
+            let _ = self.child.kill();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match self.reap() {
+                    Ok(true) | Err(_) => return,
+                    Ok(false) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        }
+    }
+
+    impl Drop for RetainedExactChild {
+        fn drop(&mut self) {
+            self.stop_and_reap();
+        }
+    }
+
+    fn capture_exact_child(command: &mut std::process::Command, dir: &mut LaunchTestDir, limit: Duration, cap: usize) -> ExactChildOutput {
+        use std::io::Read as _;
+        let deadline = Instant::now() + limit;
+        let out_path = dir.path.join("stdout");
+        let err_path = dir.path.join("stderr");
+        let out_file = std::fs::OpenOptions::new().write(true).create_new(true).open(&out_path).unwrap();
+        let err_file = std::fs::OpenOptions::new().write(true).create_new(true).open(&err_path).unwrap();
+        command.stdout(out_file.try_clone().unwrap()).stderr(err_file.try_clone().unwrap());
+        let mut child = RetainedExactChild { child: command.spawn().unwrap(), status: None, stopped: false };
+        // If anything fails before confirmed reap, leave the owned directory for
+        // diagnosis rather than removing files still used by a retained child.
+        dir.cleanup = false;
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let reason = loop {
+            if Instant::now() >= deadline {
+                break Some("deadline");
+            }
+            let reaped = child.reap().unwrap();
+            // Regular files avoid pipe-reader joins. Poll size and stop excess
+            // output; only cap bytes in total are ever loaded into diagnostics.
+            if out_file.metadata().unwrap().len().saturating_add(err_file.metadata().unwrap().len()) > cap as u64 {
+                break Some("output limit");
+            }
+            if reaped {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        child.stop_and_reap();
+        dir.cleanup = child.status.is_some();
+        let mut stdout = Vec::new();
+        std::fs::File::open(out_path).unwrap().take(cap as u64).read_to_end(&mut stdout).unwrap();
+        let mut stderr = Vec::new();
+        std::fs::File::open(err_path).unwrap().take((cap - stdout.len()) as u64).read_to_end(&mut stderr).unwrap();
+        ExactChildOutput { status: child.status, reason, stdout, stderr }
+    }
+
+    fn launch_test_command(dir: &std::path::Path, test: &str, case: &str) -> std::process::Command {
+        let app = dir.join("owned app");
+        let home = dir.join("synthetic-home");
+        std::fs::create_dir(&app).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let executable = app.join(crate::helpers::exe("live-test"));
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let mut child = std::process::Command::new(&executable);
+        child
+            .args(["--exact", test, "--nocapture", "--test-threads=1", "--format=terse"])
+            .env("KT_LIVE_LAUNCH_TEST_ROOT", dir)
+            .env("KT_LIVE_LAUNCH_TEST_CASE", case)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("KATALA_TUNE_DATA_DIR", home.join(".katala-tune"))
+            .stdin(Stdio::null());
+        #[cfg(target_os = "macos")]
+        child.env("PATH", "/usr/bin:/bin");
+        child
+    }
+
+    #[test]
+    fn launch_test_directory_rejects_collisions_and_cleans_only_owned_paths() {
+        let owner = LaunchTestDir::new();
+        let existing = owner.path.join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let canary = existing.join("canary");
+        std::fs::write(&canary, b"keep").unwrap();
+        let collision = LaunchTestDir::create(existing.clone());
+        assert!(matches!(collision, Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists));
+        drop(collision);
+        assert_eq!(std::fs::read(&canary).unwrap(), b"keep");
+        let path = owner.path.clone();
+        drop(owner);
+        assert!(!path.exists(), "successful exclusive owner cleans its own fixture");
+    }
+
+    // Invoked only as an exact child with the test-only case environment set.
+    #[test]
+    #[ignore]
+    fn launch_test_watchdog_fixture() {
+        println!("watchdog fixture ready");
+        match std::env::var("KT_LIVE_LAUNCH_TEST_CASE").unwrap().as_str() {
+            "hung" => loop {
+                std::thread::park();
+            },
+            "noisy" => {
+                use std::io::Write as _;
+                std::io::stdout().write_all(&vec![b'x'; 262144]).unwrap();
+                std::io::stderr().write_all(&vec![b'y'; 262144]).unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
+            "stderr" => {
+                use std::io::Write as _;
+                std::io::stderr().write_all(&vec![b'y'; 262144]).unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
+            "normal" => (),
+            other => panic!("unknown fixture case: {other}"),
+        }
+    }
+
+    fn watchdog_case(case: &str, expected: Option<&str>) {
+        let mut dir = LaunchTestDir::new();
+        let mut command = launch_test_command(&dir.path, "live::tests::launch_test_watchdog_fixture", case);
+        command.arg("--ignored");
+        let limit = if case == "hung" { Duration::from_secs(2) } else { Duration::from_secs(5) };
+        let began = Instant::now();
+        let output = capture_exact_child(&mut command, &mut dir, limit, 4096);
+        assert_eq!(output.reason, expected);
+        assert!(output.status.is_some(), "retained child must be reaped before cleanup");
+        assert!(began.elapsed() < limit + Duration::from_secs(3));
+        assert!(output.stdout.len() + output.stderr.len() <= 4096, "capture must be bounded");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("watchdog fixture ready"),
+            "child must reach the controlled fixture before watchdog termination"
+        );
+        if expected.is_none() {
+            assert!(output.status.unwrap().success());
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+        let path = dir.path.clone();
+        drop(dir);
+        assert!(!path.exists(), "reaped child fixture can be removed");
+    }
+
+    #[test]
+    fn launch_test_watchdog_stops_hung_exact_child() {
+        watchdog_case("hung", Some("deadline"));
+    }
+
+    #[test]
+    fn launch_test_watchdog_caps_noisy_exact_child() {
+        watchdog_case("noisy", Some("output limit"));
+        watchdog_case("stderr", Some("output limit"));
+    }
+
+    #[test]
+    fn launch_test_watchdog_accepts_normal_exact_child() {
+        watchdog_case("normal", None);
+    }
+
+    // Only child processes receive this HOME/data namespace. Copying the test
+    // executable also confines the beside-app search; no installed helper runs.
+    fn isolated_launch_child(test: &str, cases: &[&str]) -> Option<(PathBuf, String)> {
+        const ROOT: &str = "KT_LIVE_LAUNCH_TEST_ROOT";
+        const CASE: &str = "KT_LIVE_LAUNCH_TEST_CASE";
+        if let Some(dir) = std::env::var_os(ROOT) {
+            return Some((PathBuf::from(dir), std::env::var(CASE).unwrap()));
+        }
+        for case in cases {
+            let mut dir = LaunchTestDir::new();
+            let mut command = launch_test_command(&dir.path, test, case);
+            let output = capture_exact_child(&mut command, &mut dir, Duration::from_secs(45), 65536);
+            assert!(
+                output.reason.is_none() && output.status.is_some_and(|status| status.success()),
+                "{test} case={case}: {:?}, {:?}, fixture={}\nstdout: {}\nstderr: {}",
+                output.status,
+                output.reason,
+                dir.path.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "exact child must run one test");
+            eprintln!("{test} case={case}: passed");
+        }
+        None
+    }
+
+    fn install_launch_fixture(dir: &std::path::Path, case: &str, bytes: &[u8]) -> Option<PathBuf> {
+        let name = crate::helpers::exe("tune-agent");
+        let beside = dir.join("owned app").join(&name);
+        let managed = dir.join("synthetic-home").join(".katala-tune").join("bin").join(&name);
+        assert_eq!(std::env::current_exe().unwrap().parent().unwrap(), beside.parent().unwrap());
+        assert_eq!(crate::helpers::bin_dir(), managed.parent().unwrap());
+        #[cfg(not(windows))]
+        assert_eq!(crate::nodes::home(), dir.join("synthetic-home"));
+        assert!(!beside.exists() && !managed.exists());
+        if case == "absent" {
+            assert_eq!(local_native(), None);
+            return None;
+        }
+        assert!(case == "managed" || case == "bundled");
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        std::fs::write(&managed, bytes).unwrap();
+        if case == "bundled" {
+            std::fs::write(&beside, bytes).unwrap();
+            assert_eq!(local_native(), Some(beside.clone()), "beside-app wins when both exist");
+            Some(beside)
+        } else {
+            std::fs::create_dir(&beside).unwrap();
+            assert_eq!(local_native(), Some(managed.clone()));
+            Some(managed)
+        }
+    }
+
     #[test]
     fn launch_follows_the_probe_conventions() {
+        let Some((dir, case)) = isolated_launch_child("live::tests::launch_follows_the_probe_conventions", &["absent", "managed", "bundled"]) else { return };
+        let native = install_launch_fixture(&dir, &case, b"owned fixture - never execute");
         let o = Opts::default();
         let mac = launch(&node("m", "macos"), &o).unwrap();
         assert_eq!(mac.program, "ssh");
         let cmd = mac.args.last().unwrap();
+        assert!(
+            cmd.starts_with("[ -x ~/.katala-tune/bin/tune-agent ] && ~/.katala-tune/bin/tune-agent sample interval=1 procs=5 max=900 watch=1 || { "),
+            "ネイティブを先に使う: {cmd}"
+        );
         assert!(cmd.contains(&format!("exec python3 -c '{}' interval=1 procs=5 max=900 watch=1", python_boot(MAC_LIVE.len()))), "{cmd}");
         assert_eq!(cmd.matches('\'').count(), 4, "python3 -c の中身にシングルクォートを入れない");
         for opt in ["BatchMode=yes", "ControlMaster=no", "ControlPath=none"] {
@@ -1528,11 +2130,39 @@ mod tests {
         let mut local_node = node("local", "windows");
         local_node.local = true;
         let local = launch(&local_node, &o).unwrap();
-        if local.program == "powershell.exe" {
-            assert!(local.cleanup.is_none() && local.keep_stdin && local.stdin == WIN_LIVE[3..]);
-        } else {
-            assert!(local.program.ends_with("tune-agent.exe") && local.keep_stdin && local.stdin.is_empty());
+        assert!(local.cleanup.is_none() && local.keep_stdin);
+        if let Some(native) = native.as_ref() {
+            assert_eq!(local.program, native.to_str().unwrap());
+            #[cfg(windows)]
+            assert!(local.program.ends_with("tune-agent.exe"));
+            assert!(local.stdin.is_empty());
             assert_eq!(local.args, ["sample", "interval=1", "procs=5", "max=900", "watch=1"]);
+        } else {
+            assert_eq!(local.program, "powershell.exe");
+            assert_eq!(local.stdin, WIN_LIVE[3..]);
+            assert_eq!(local.args[..4], ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+            assert_eq!(local.args.len(), 5);
+        }
+        local_node.os = "macos".into();
+        let local = launch(&local_node, &o).unwrap();
+        assert!(local.keep_stdin && local.cleanup.is_none());
+        assert_eq!(local.stdin, MAC_LIVE.as_bytes());
+        if let Some(native) = native {
+            assert_eq!(local.program, "/bin/sh");
+            assert_eq!(
+                local.args,
+                [
+                    "-c",
+                    &format!(
+                        "\"$0\" sample interval=1 procs=5 max=900 watch=1 || exec /usr/bin/env python3 -c '{}' interval=1 procs=5 max=900 watch=1",
+                        python_boot(MAC_LIVE.len())
+                    ),
+                    native.to_str().unwrap()
+                ]
+            );
+        } else {
+            assert_eq!(local.program, "/usr/bin/env");
+            assert_eq!(local.args, ["python3", "-c", &python_boot(MAC_LIVE.len()), "interval=1", "procs=5", "max=900", "watch=1"]);
         }
         assert!(WIN_LIVE[3..].iter().all(|b| b.is_ascii()), "probes/live_win.ps1 は ASCII のみ");
         assert!(launch(&node("x", "linux"), &o).is_err());
@@ -1789,6 +2419,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// macOS の起動コマンドを実際のシェルで動かす: 置いたネイティブが動けばそれだけ、起動できなければ Python 版
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_launch_prefers_native_and_falls_back_to_python() {
+        use std::os::unix::fs::PermissionsExt;
+        let o = Opts { sampler_max_age: Duration::from_secs(1), ..Opts::default() };
+        // 古い版（macOS のサンプラーが無い）は標準入力を読まずに失敗する。動く版は hello を出して正常に終わる
+        for (native, want) in [
+            (
+                "#!/bin/sh
+exit 1
+",
+                None,
+            ),
+            (
+                "#!/bin/sh
+echo '{\"type\":\"hello\",\"os\":\"macos\",\"impl\":\"rust\"}'
+",
+                Some("rust"),
+            ),
+        ] {
+            let (_, dir) = fake("");
+            let bin = dir.join(".katala-tune/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("tune-agent"), native).unwrap();
+            std::fs::set_permissions(bin.join("tune-agent"), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let l = launch(&node("m", "macos"), &o).unwrap();
+            let remote = l.args.last().unwrap().clone();
+            let mut src = spawn(Launch {
+                program: "/usr/bin/env".into(),
+                args: vec![format!("HOME={}", dir.display()), "PATH=/usr/bin:/bin".into(), "/bin/sh".into(), "-c".into(), remote],
+                stdin: l.stdin,
+                keep_stdin: true,
+                cleanup: None,
+            })
+            .unwrap();
+            // Python 版は max=1 で自分から終わる
+            let mut msgs = Vec::new();
+            while let Ok(Some(line)) = tokio::time::timeout(Duration::from_secs(20), src.lines.recv()).await {
+                msgs.push(parse_line(&line).unwrap_or_else(|| panic!("読めない行: {line}")));
+            }
+            let ended = src.close().await;
+            assert_eq!(ended.code, Some(0), "{}", ended.err);
+            let Some(Msg::Hello(h)) = msgs.first() else { panic!("1 行目は hello") };
+            assert_eq!(h.implementation.as_deref(), want, "{native}");
+            assert_eq!(msgs.iter().filter(|m| matches!(m, Msg::Hello(_))).count(), 1, "動くのはどちらか一方");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     /// 必須のOS統計を保ち、任意センサーの有無を独立した環境で確かめる。
     #[cfg(target_os = "macos")]
     #[tokio::test]
@@ -1882,9 +2562,13 @@ for _ in range(400):
     #[tokio::test]
     async fn mac_sampler_ends_by_itself_when_stdin_closes() {
         let me = Node::from_value(&json!({ "id": "me", "alias": "me", "os": "macos", "local_hostname": "this-host" }), "this-host");
+        let Some((dir, case)) = isolated_launch_child("live::tests::mac_sampler_ends_by_itself_when_stdin_closes", &["absent"]) else { return };
+        assert_eq!(install_launch_fixture(&dir, &case, b""), None);
         let l = launch(&me, &Opts::default()).unwrap();
         assert!(l.keep_stdin && l.args[1] == "-c");
-        let mut src = spawn(l).unwrap();
+        assert_eq!(l.program, "/usr/bin/env");
+        assert_eq!(l.stdin, MAC_LIVE.as_bytes());
+        let mut src = spawn(with_isolated_mac_sensor_env(l, &dir)).unwrap();
         let mut got = 0;
         while got < 2 {
             let line = tokio::time::timeout(Duration::from_secs(20), src.lines.recv()).await.unwrap().expect("行が来る");
@@ -1897,5 +2581,260 @@ for _ in range(400):
         // 強制終了ならシグナルで終わり code は None。0 は標準入力が閉じたのを見て自分で終わったということ
         assert_eq!(ended.code, Some(0), "{}", ended.err);
         assert!(t0.elapsed() < Duration::from_millis(2500));
+    }
+
+    // collect::command enriches PATH. Set these again in the spawned process so
+    // the real Python script cannot discover a normal HOME/Homebrew macmon.
+    #[cfg(target_os = "macos")]
+    fn with_isolated_mac_sensor_env(mut launch: Launch, dir: &std::path::Path) -> Launch {
+        let mut args = vec![format!("HOME={}", dir.join("synthetic-home").display()), "PATH=/usr/bin:/bin".into(), launch.program];
+        args.extend(launch.args);
+        launch.program = "/usr/bin/env".into();
+        launch.args = args;
+        launch
+    }
+
+    /// Owned fake: this checks the native launcher's stdin/EOF contract only.
+    /// Actual native sampler EOF behavior stays covered by tune-agent tests.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_native_launcher_preserves_stdin_until_close() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Some((dir, case)) = isolated_launch_child("live::tests::mac_native_launcher_preserves_stdin_until_close", &["managed", "bundled"]) else { return };
+        let script = b"#!/bin/sh\nprintf '%s\\n' '{\"type\":\"hello\",\"impl\":\"rust\",\"os\":\"macos\"}' '{\"type\":\"s\",\"seq\":1}' '{\"type\":\"s\",\"seq\":2}'\nwhile IFS= read -r line; do :; done\n";
+        let native = install_launch_fixture(&dir, &case, script).unwrap();
+        std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut me = node("me", "macos");
+        me.local = true;
+        let l = launch(&me, &Opts::default()).unwrap();
+        assert_eq!(l.program, "/bin/sh");
+        assert_eq!(l.args[0], "-c");
+        assert_eq!(l.args[2], native.to_str().unwrap());
+        assert!(l.keep_stdin && l.cleanup.is_none());
+        assert_eq!(l.stdin, MAC_LIVE.as_bytes());
+        let mut src = spawn(with_isolated_mac_sensor_env(l, &dir)).unwrap();
+        for expected in ["hello", "s", "s"] {
+            let line = tokio::time::timeout(Duration::from_secs(20), src.lines.recv()).await.unwrap().expect("fixture frame");
+            let value: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(value["type"], expected);
+            if expected == "hello" {
+                assert_eq!(value["impl"], "rust");
+            }
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(100), src.lines.recv()).await.is_err(), "owned fake stays alive while stdin is open");
+        let t0 = Instant::now();
+        let ended = src.close().await;
+        assert_eq!(ended.code, Some(0), "{}", ended.err);
+        assert!(t0.elapsed() < Duration::from_millis(2500));
+    }
+    #[tokio::test]
+    async fn journal_planned_recycle_eof_and_privacy() {
+        if cfg!(windows) {
+            return;
+        }
+        let (route, dir) = fake(
+            r#"echo $$ >> "$KT_DIR/pids-$1"; echo '{"type":"hello","impl":"rust","agent":"0.6.4","errors":"dummy-private-canary"}'; echo '{"type":"s","seq":1}'; echo '{"type":"end","reason":"max_age"}'; echo dummy-private-canary >&2"#,
+        );
+        let db = Arc::new(Mutex::new(crate::db::Store::open_in_memory().unwrap()));
+        let journal = Journal::start(db.clone());
+        let live = Live::new(route.clone(), quick(), Box::new(|_| {}));
+        live.bind_journal(journal.clone());
+        live.start(&[node("fixture", "macos")], &[]);
+        until("3 open", || route.opened.load(Ordering::SeqCst) >= 3).await;
+        live.shutdown(Duration::from_secs(3)).await;
+        assert!(journal.flush(Duration::from_secs(2)).await);
+        let v = db.lock().unwrap().monitor_events(&crate::monitor_journal::Filter { limit: Some(500), ..Default::default() }).unwrap();
+        assert!(!v.to_string().contains("dummy-private-canary"));
+        let xs = v["events"].as_array().unwrap();
+        assert!(xs.iter().any(|e| e["kind"] == "first_sample" && e["data"]["transport_pid"].is_number()));
+        assert!(xs.iter().any(|e| e["kind"] == "retry" && e["data"]["policy"] == "planned_recycle"));
+        assert!(xs.iter().any(|e| e["kind"] == "end" && e["data"]["stdout"] == "eof" && e["data"]["exit_code"] == 0));
+        assert!(!xs.iter().any(|e| e["kind"] == "stopped" && e["data"]["reason"] == "disconnected"));
+        assert!(journal.shutdown(Duration::from_secs(2)).await);
+        assert!(pids(&dir, "fixture").iter().all(|p| !alive(*p)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn journal_distinguishes_first_sample_and_stall_timeout() {
+        // Classification must depend on whether a sample arrived, not whether
+        // the OS happened to start a shell within the 150 ms silence window.
+        // Native source termination remains covered by the adjacent tests.
+        struct SilentRoute(bool);
+        impl Route for SilentRoute {
+            fn open(&self, _: &Node, _: &Opts) -> Result<Source, String> {
+                let (lines, received) = mpsc::channel(2);
+                lines.try_send(r#"{"type":"hello"}"#.into()).unwrap();
+                if self.0 {
+                    lines.try_send(r#"{"type":"s","seq":1}"#.into()).unwrap();
+                }
+                let (stop, stopped) = oneshot::channel();
+                let (done, ended) = oneshot::channel();
+                tokio::spawn(async move {
+                    let _ = stopped.await;
+                    drop(lines);
+                    let _ = done.send(Ended { code: Some(0), wait_observed: Some(true), ..Ended::default() });
+                });
+                Ok(Source::new(received, stop, ended))
+            }
+        }
+        for (sample, category) in [(false, "first_sample_timeout"), (true, "stall_timeout")] {
+            let db = Arc::new(Mutex::new(crate::db::Store::open_in_memory().unwrap()));
+            let journal = Journal::start(db.clone());
+            let live = Live::new(
+                Arc::new(SilentRoute(sample)),
+                Opts { first_line_timeout: Duration::from_millis(150), stall_timeout: Duration::from_millis(150), max_retries: 0, ..quick() },
+                Box::new(|_| {}),
+            );
+            live.bind_journal(journal.clone());
+            live.start(&[node("fixture", "macos")], &[]);
+            until("disconnected", || state(&live, "fixture").1 == "disconnected").await;
+            assert!(journal.flush(Duration::from_secs(2)).await);
+            let v = db.lock().unwrap().monitor_events(&crate::monitor_journal::Filter::default()).unwrap();
+            let events = v["events"].as_array().unwrap();
+            assert!(events.iter().any(|e| e["kind"] == "hello"));
+            assert_eq!(events.iter().any(|e| e["kind"] == "first_sample"), sample);
+            assert!(events.iter().any(|e| e["kind"] == "end" && e["data"]["category"] == category && e["data"]["samples"] == u64::from(sample)));
+            live.shutdown(Duration::from_secs(3)).await;
+            assert!(journal.shutdown(Duration::from_secs(2)).await);
+        }
+    }
+
+    // No remote sampler: the owned local child exits zero only after Source closes stdin.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn journal_separates_timeout_cleanup_from_natural_zero_exit() {
+        struct StdinRoute(bool);
+        impl Route for StdinRoute {
+            fn open(&self, _: &Node, _: &Opts) -> Result<Source, String> {
+                let tail = if self.0 { "cat >/dev/null" } else { "exit 0" };
+                spawn(Launch {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), format!("echo '{{\"type\":\"s\",\"seq\":1}}'; {tail}")],
+                    keep_stdin: true,
+                    ..Launch::default()
+                })
+            }
+        }
+        for silent in [true, false] {
+            let db = Arc::new(Mutex::new(crate::db::Store::open_in_memory().unwrap()));
+            let journal = Journal::start(db.clone());
+            let live = Live::new(Arc::new(StdinRoute(silent)), Opts { stall_timeout: Duration::from_millis(150), max_retries: 0, ..quick() }, Box::new(|_| {}));
+            live.bind_journal(journal.clone());
+            live.start(&[node("fixture", "macos")], &[]);
+            until("disconnected", || state(&live, "fixture").1 == "disconnected").await;
+            assert!(journal.flush(Duration::from_secs(2)).await);
+            let rows = db.lock().unwrap().monitor_events(&crate::monitor_journal::Filter::default()).unwrap();
+            let end = rows["events"].as_array().unwrap().iter().find(|e| e["kind"] == "end").unwrap();
+            let d = &end["data"];
+            assert_eq!(d["exit_code"], 0);
+            assert_eq!(d["wait_observed"], true);
+            assert_eq!(d["category"], if silent { json!("stall_timeout") } else { Value::Null });
+            assert_eq!(d["io"]["close_trigger"], if silent { "timeout" } else { "channel_end" });
+            assert_eq!(d["io"]["kill_attempted"], false);
+            assert_eq!(d["io"]["forwarded"], 1);
+            if silent {
+                assert_eq!(d["io"]["wait_origin"], "close");
+                assert_eq!(d["io"]["wait_before_close"], false);
+                assert!(d["io"]["sample_age_ms"].as_u64().unwrap() >= 150);
+                assert_eq!(d["io"]["pre_stdout"], Value::Null);
+            } else {
+                assert_eq!(d["io"]["pre_stdout"], "eof");
+                assert_eq!(d["io"]["sample_age_ms"], Value::Null);
+            }
+            assert_eq!(d["producer_pid"], Value::Null);
+            assert_eq!(d["actual_source_sha256"], Value::Null);
+            live.shutdown(Duration::from_secs(2)).await;
+            assert!(journal.shutdown(Duration::from_secs(2)).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_boundary_retains_partial_discard_and_error_without_payload() {
+        let boundary = Arc::new(Mutex::new(ReadBoundary::new()));
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::channel(2);
+        let task = tokio::spawn(read_lines_from(reader, tx, boundary.clone()));
+        writer.write_all(b"partial-secret-canary").await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(30), rx.recv()).await.is_err());
+        let pre = boundary.lock().unwrap().snapshot();
+        assert_eq!(pre.bytes, 21);
+        assert_eq!(pre.forwarded, 0);
+        assert!(pre.last_byte_ms.is_some() && pre.last_line_ms.is_none());
+        assert!(pre.snapshot_ms >= pre.last_byte_ms);
+        assert_eq!(pre.pre_stdout, None);
+        writer.write_all(&vec![b'x'; MAX_LINE]).await.unwrap();
+        writer.write_all(b"\n{\"type\":\"s\",\"seq\":1}\n").await.unwrap();
+        assert!(rx.recv().await.unwrap().contains("\"seq\":1"));
+        drop(writer);
+        assert_eq!(task.await.unwrap(), PipeEnd::Eof);
+        let post = boundary.lock().unwrap().snapshot();
+        assert_eq!(post.discarded, 1);
+        assert_eq!(post.forwarded, 1);
+        assert_eq!(post.pre_stdout, Some(PipeEnd::Eof));
+        assert!(!serde_json::to_string(&post).unwrap().contains("secret-canary"));
+
+        struct Broken;
+        impl tokio::io::AsyncRead for Broken {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("secret-canary")))
+            }
+        }
+        let boundary = Arc::new(Mutex::new(ReadBoundary::new()));
+        let (tx, _) = mpsc::channel(1);
+        assert_eq!(read_lines_from(Broken, tx, boundary.clone()).await, PipeEnd::ReadError);
+        let d = boundary.lock().unwrap().snapshot();
+        assert_eq!(d.pre_stdout, Some(PipeEnd::ReadError));
+        assert_eq!(d.bytes, 0);
+        assert!(!serde_json::to_string(&d).unwrap().contains("secret-canary"));
+
+        // Keep the existing final unterminated-frame behavior, but do not call it a newline.
+        let boundary = Arc::new(Mutex::new(ReadBoundary::new()));
+        let (tx, mut rx) = mpsc::channel(1);
+        assert_eq!(read_lines_from(&b"{\"type\":\"s\",\"seq\":1}"[..], tx, boundary.clone()).await, PipeEnd::Eof);
+        assert!(matches!(parse_line(&rx.recv().await.unwrap()), Some(Msg::Sample(_))));
+        let partial = boundary.lock().unwrap().snapshot();
+        assert_eq!(partial.forwarded, 1);
+        assert_eq!(partial.last_line_ms, None);
+        assert_eq!(partial.pre_stdout, Some(PipeEnd::Eof));
+    }
+
+    #[tokio::test]
+    async fn missing_cleanup_report_retains_unknown_diagnostics() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(tx);
+        let (stop, _stopped) = oneshot::channel();
+        let (done, report) = oneshot::channel();
+        drop(done);
+        let ended = Source::new(rx, stop, report).close().await;
+        assert_eq!(ended.wait_observed, None);
+        assert_eq!(ended.code, None);
+        assert_eq!(ended.wait_origin, None);
+        assert_eq!(ended.kill_attempted, None);
+        assert_eq!(ended.io, None);
+        assert_eq!(end_category(false, 1, &ended), Some(Category::WaitUnknown));
+        assert_eq!(end_category(true, 1, &ended), Some(Category::StallTimeout));
+        let ended =
+            Ended { code: Some(0), wait_observed: Some(true), io: Some(StreamBoundary { overflow: true, ..StreamBoundary::default() }), ..Ended::default() };
+        assert_eq!(end_category(false, 1, &ended), None);
+        assert!(ended.io.as_ref().unwrap().overflow);
+        // Read errors remain explicit; diagnostics do not rewrite the pre-existing exit category.
+        let ended = Ended { code: Some(0), wait_observed: Some(true), stdout: PipeEnd::ReadError, ..Ended::default() };
+        assert_eq!(end_category(false, 1, &ended), None);
+        assert_eq!(ended.stdout, PipeEnd::ReadError);
+        assert!(ended.io.is_none());
+    }
+
+    #[test]
+    fn read_boundary_saturation_is_explicit_unknown() {
+        let mut b = ReadBoundary::new();
+        b.add(u32::MAX as usize);
+        b.add(1);
+        assert_eq!(b.snapshot().bytes, u32::MAX);
+        assert!(b.snapshot().overflow);
     }
 }

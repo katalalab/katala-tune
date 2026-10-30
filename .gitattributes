@@ -1,2 +1,10 @@
 # 署名の検証用 fixture は 1 バイトも変えない（Windows の autocrlf で LF が CRLF になると署名が合わない）
 test/fixtures/release/** -text
+# Native reader source digests are shared by Windows helpers and controllers.
+crates/tune-core/src/topology/adapters/native_reader.rs text eol=lf
+crates/tune-core/src/topology/adapters/native_reader/windows.rs text eol=lf
+# Direct IPC admission source generations are identical across platform checkouts.
+crates/tune-core/src/topology/adapters/docker_api.rs text eol=lf
+crates/tune-core/src/topology/adapters/docker_api/** text eol=lf
+crates/tune-core/src/topology/adapters/docker.rs text eol=lf
+crates/tune-core/src/topology/candidates.rs text eol=lf
