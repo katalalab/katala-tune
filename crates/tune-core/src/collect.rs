@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
@@ -91,6 +91,31 @@ pub struct RunResult {
     pub err: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompletionFailure {
+    Timeout,
+    Incomplete,
+    SpawnMissing,
+    SpawnFailed,
+}
+
+#[cfg(test)]
+impl CompletionFailure {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Incomplete => "incomplete",
+            Self::SpawnMissing => "spawn_missing",
+            Self::SpawnFailed => "spawn_failed",
+        }
+    }
+}
+
+pub(crate) struct StrictRunResult {
+    pub result: RunResult,
+    pub failure: Option<CompletionFailure>,
+}
+
 impl RunResult {
     pub fn code_str(&self) -> String {
         self.code.map_or_else(|| "null".into(), |c| c.to_string())
@@ -108,44 +133,52 @@ pub fn decode(buf: &[u8]) -> String {
 
 /// コマンドを実行し、標準入力に input を渡す。timeout を過ぎたら強制終了して `timeout <ms>ms` を err に足す
 pub async fn run(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Duration) -> RunResult {
+    run_with_completion(cmd, args, input, timeout, false).await.result
+}
+
+pub(crate) async fn run_strict(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Duration) -> StrictRunResult {
+    run_with_completion(cmd, args, input, timeout, true).await
+}
+
+async fn run_with_completion(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Duration, strict: bool) -> StrictRunResult {
     let mut c = command(cmd);
     c.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     let mut child = match c.spawn() {
         Ok(ch) => ch,
-        Err(e) => return RunResult { code: None, out: String::new(), err: format!("Error: spawn {cmd} {e}") },
-    };
-    let mut stdin = child.stdin.take();
-    let input = input.map(<[u8]>::to_vec).unwrap_or_default();
-    let writer = tokio::spawn(async move {
-        if let Some(si) = stdin.as_mut() {
-            let _ = si.write_all(&input).await;
-            let _ = si.shutdown().await;
+        Err(e) => {
+            return StrictRunResult {
+                result: RunResult { code: None, out: String::new(), err: format!("Error: spawn {cmd} {e}") },
+                failure: strict.then_some(spawn_failure(e.kind())),
+            };
         }
-        drop(stdin);
-    });
-    let (out, read_out) = read_into_buffer(child.stdout.take());
-    let (err, read_err) = read_into_buffer(child.stderr.take());
+    };
+    let stdin = child.stdin.take();
+    let input = input.map(<[u8]>::to_vec).unwrap_or_default();
+    let mut writer = tokio::spawn(async move { write_input_to_pipe(stdin, &input).await });
+    let (out, mut read_out) = read_into_buffer(child.stdout.take());
+    let (err, mut read_err) = read_into_buffer(child.stderr.take());
     let mut extra = String::new();
+    let mut timed_out = false;
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(st) => st.ok(),
         Err(_) => {
+            timed_out = true;
             let _ = child.start_kill();
             extra.push_str(&format!("\ntimeout {}ms", timeout.as_millis()));
-            child.wait().await.ok()
+            if strict { tokio::time::timeout(PIPE_GRACE, child.wait()).await.ok().and_then(Result::ok) } else { child.wait().await.ok() }
         }
     };
     // 孫プロセスがパイプを握り続けても止まらないよう、子が終わってから待つのは PIPE_GRACE まで。
     // 過ぎたら読み取り（と書き込み）を止め、それまでに読んだ分を返す
     let deadline = tokio::time::Instant::now() + PIPE_GRACE;
-    for mut task in [writer, read_out, read_err] {
-        if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
-            task.abort();
-            let _ = task.await;
-        }
-    }
+    let stdin_complete = finish_pipe_task(&mut writer, deadline).await;
+    let stdout_eof = finish_pipe_task(&mut read_out, deadline).await;
+    let stderr_eof = finish_pipe_task(&mut read_err, deadline).await;
     let out = std::mem::take(&mut *lock_buf(&out));
     let err = std::mem::take(&mut *lock_buf(&err));
-    RunResult { code: status.and_then(|s| s.code()), out: decode(&out), err: decode(&err) + &extra }
+    let code = status.and_then(|s| s.code());
+    let failure = if strict { strict_completion_failure(code, timed_out, stdin_complete, stdout_eof, stderr_eof) } else { None };
+    StrictRunResult { result: RunResult { code: if failure.is_some() { None } else { code }, out: decode(&out), err: decode(&err) + &extra }, failure }
 }
 
 mod bounded;
@@ -840,6 +873,39 @@ pub fn reason_text(kind: &str) -> &'static str {
 /// 子が書いた分はパイプに残っていて終了の直後に読み切れるので、ここで切れるのは孫が後から書く分だけ
 const PIPE_GRACE: Duration = Duration::from_millis(500);
 
+fn strict_completion_failure(code: Option<i32>, timed_out: bool, stdin_complete: bool, stdout_eof: bool, stderr_eof: bool) -> Option<CompletionFailure> {
+    if timed_out {
+        Some(CompletionFailure::Timeout)
+    } else if code.is_none() || !stdin_complete || !stdout_eof || !stderr_eof {
+        Some(CompletionFailure::Incomplete)
+    } else {
+        None
+    }
+}
+
+fn spawn_failure(kind: std::io::ErrorKind) -> CompletionFailure {
+    if kind == std::io::ErrorKind::NotFound { CompletionFailure::SpawnMissing } else { CompletionFailure::SpawnFailed }
+}
+
+async fn write_input_to_pipe<W: AsyncWrite + Unpin>(pipe: Option<W>, input: &[u8]) -> bool {
+    let Some(mut pipe) = pipe else { return false };
+    let written = pipe.write_all(input).await.is_ok();
+    let closed = pipe.shutdown().await.is_ok();
+    written && closed
+}
+
+async fn finish_pipe_task(task: &mut JoinHandle<bool>, deadline: tokio::time::Instant) -> bool {
+    match tokio::time::timeout_at(deadline, &mut *task).await {
+        Ok(Ok(done)) => done,
+        Ok(Err(_)) => false,
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            false
+        }
+    }
+}
+
 type SharedBuf = Arc<Mutex<Vec<u8>>>;
 
 fn lock_buf(b: &SharedBuf) -> std::sync::MutexGuard<'_, Vec<u8>> {
@@ -847,16 +913,18 @@ fn lock_buf(b: &SharedBuf) -> std::sync::MutexGuard<'_, Vec<u8>> {
 }
 
 /// パイプを読み終わるまで共有のバッファへ貯めるタスク。止めても、それまでに読んだ分はバッファに残る
-fn read_into_buffer<R: AsyncRead + Unpin + Send + 'static>(pipe: Option<R>) -> (SharedBuf, JoinHandle<()>) {
+fn read_into_buffer<R: AsyncRead + Unpin + Send + 'static>(pipe: Option<R>) -> (SharedBuf, JoinHandle<bool>) {
     let buf = SharedBuf::default();
     let b = buf.clone();
     let task = tokio::spawn(async move {
-        let Some(mut p) = pipe else { return };
+        let Some(mut p) = pipe else { return false };
         let mut chunk = vec![0u8; 16 * 1024];
-        while let Ok(n) = p.read(&mut chunk).await
-            && n > 0
-        {
-            lock_buf(&b).extend_from_slice(&chunk[..n]);
+        loop {
+            match p.read(&mut chunk).await {
+                Ok(0) => return true,
+                Ok(n) => lock_buf(&b).extend_from_slice(&chunk[..n]),
+                Err(_) => return false,
+            }
         }
     });
     (buf, task)
@@ -1096,6 +1164,77 @@ pub async fn exec_on_with_input(runner: &dyn Runner, node: &Node, script: &str, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_completion_fixtures_preserve_legacy_exit_codes() {
+        let data: Value = serde_json::from_str(include_str!("../../../test/fixtures/hygiene-process-result.json")).unwrap();
+        for case in data["completions"].as_array().unwrap() {
+            let code = case["code"].as_i64().map(|n| n as i32);
+            let failure = strict_completion_failure(
+                code,
+                case["timed_out"].as_bool().unwrap(),
+                case["stdin_complete"].as_bool().unwrap(),
+                case["stdout_eof"].as_bool().unwrap(),
+                case["stderr_eof"].as_bool().unwrap(),
+            );
+            let strict_code = if failure.is_some() { None } else { code };
+            assert_eq!(strict_code, case["strict"].as_i64().map(|n| n as i32), "{}", case["name"]);
+            assert_eq!(failure.map(CompletionFailure::as_str), case["failure"].as_str(), "{}", case["name"]);
+            assert_eq!(code, case["legacy"].as_i64().map(|n| n as i32), "{}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn strict_spawn_failure_uses_structured_error_kind() {
+        assert_eq!(spawn_failure(std::io::ErrorKind::NotFound), CompletionFailure::SpawnMissing);
+        assert_eq!(spawn_failure(std::io::ErrorKind::PermissionDenied), CompletionFailure::SpawnFailed);
+        assert_eq!(spawn_failure(std::io::ErrorKind::Other), CompletionFailure::SpawnFailed);
+    }
+
+    struct SyntheticReader;
+    impl AsyncRead for SyntheticReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("synthetic read failure")))
+        }
+    }
+
+    struct SyntheticWriter {
+        fail_write: bool,
+        fail_shutdown: bool,
+    }
+    impl tokio::io::AsyncWrite for SyntheticWriter {
+        fn poll_write(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+            if self.fail_write { std::task::Poll::Ready(Err(std::io::Error::other("synthetic write failure"))) } else { std::task::Poll::Ready(Ok(buf.len())) }
+        }
+        fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+            if self.fail_shutdown { std::task::Poll::Ready(Err(std::io::Error::other("synthetic shutdown failure"))) } else { std::task::Poll::Ready(Ok(())) }
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_io_helpers_distinguish_eof_write_and_shutdown_errors() {
+        let (buf, done) = read_into_buffer(Some(&b"fixture"[..]));
+        assert!(done.await.unwrap());
+        assert_eq!(&*lock_buf(&buf), b"fixture");
+        let (_, failed) = read_into_buffer(Some(SyntheticReader));
+        assert!(!failed.await.unwrap());
+        assert!(write_input_to_pipe(Some(SyntheticWriter { fail_write: false, fail_shutdown: false }), b"fixture").await);
+        assert!(!write_input_to_pipe(Some(SyntheticWriter { fail_write: true, fail_shutdown: false }), b"fixture").await);
+        assert!(!write_input_to_pipe(Some(SyntheticWriter { fail_write: false, fail_shutdown: true }), b"fixture").await);
+        assert!(!write_input_to_pipe::<SyntheticWriter>(None, b"fixture").await);
+        let mut pending = tokio::spawn(std::future::pending::<bool>());
+        assert!(!finish_pipe_task(&mut pending, tokio::time::Instant::now()).await);
+        let mut cancelled = tokio::spawn(std::future::pending::<bool>());
+        cancelled.abort();
+        assert!(!finish_pipe_task(&mut cancelled, tokio::time::Instant::now() + Duration::from_millis(100)).await);
+    }
 
     // An OS read error / failed reader task without an OS child. The signal
     // places failure on either side of the first REQUEST operation.

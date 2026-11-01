@@ -143,7 +143,7 @@ fn normalize_metadata_preserves_unknown() {
 #[test]
 fn unknown_error_is_redacted() {
     let marker = "fixture-only-sensitive-value";
-    for error in [json!(""), json!(format!("https://unit-user:{marker}@example.test/r?token={marker}")), json!({ "detail": marker })] {
+    for error in [json!(""), json!(format!("https://unit-user:{marker}@example.com/r?token={marker}")), json!({ "detail": marker })] {
         let raw =
             json!({ "roots": [{ "path": "~/fixture", "source": "opt" }], "repos": [], "enumerated": 0, "skipped": 0, "truncated": false, "error": error });
         let normalized = normalize(&raw);
@@ -154,7 +154,18 @@ fn unknown_error_is_redacted() {
         assert!(!json!(analyze(&raw)).to_string().contains(marker));
         assert!(!tune_core::hygiene::progress(&raw, 1).1.contains(marker));
     }
-    for error in ["git_missing", "walk_incomplete", "excluded", "no_python", "timeout_or_unreachable", "probe_failed", "internal", "unknown_error"] {
+    for error in [
+        "git_missing",
+        "walk_incomplete",
+        "excluded",
+        "no_python",
+        "timeout",
+        "incomplete",
+        "timeout_or_unreachable",
+        "probe_failed",
+        "internal",
+        "unknown_error",
+    ] {
         assert_eq!(normalize(&json!({ "error": error }))["error"], error);
     }
 }

@@ -69,6 +69,8 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 
 安全のための決めごとは [docs/safety.md](docs/safety.md)。NeonMonitor のレビューで見つかった自動終了ツールの失敗の型を、どう避けているかもここにある。
 
+Windows ローカルのリポジトリ衛生監査では、Python の候補が見つからず起動できなかった場合だけ次を試す。候補が起動後に 9009 などの非 0 で終わった場合は、別の Python が利用できても再試行せず未確認とする。macOS では起動用の env やリモートシェルが動いた後に Python 不在で失敗することがあり、標準エラーから推測しないため `probe_failed` となる場合がある。
+
 ## 機体台帳
 
 `~/.config/katala-tune/nodes.json`（初回起動で `config/nodes.example.json` が置かれる）。

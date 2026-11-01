@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
-use crate::collect::{self, RunResult, last_json_line, ssh_args};
+use crate::collect::{self, CompletionFailure, RunResult, StrictRunResult, last_json_line, ssh_args};
 use crate::js;
 use crate::nodes::Node;
 
@@ -178,26 +178,47 @@ fn mac_python(local: bool, alias: &str) -> (String, Vec<String>) {
 
 /// python の標準ライブラリだけのスクリプトを、機体で（この機体ならローカル、ほかは ssh で）標準入力に渡して動かす
 pub async fn run_python(node: &Node, src: &str, timeout: Duration) -> RunResult {
+    run_python_with_completion(node, src, timeout, false).await.result
+}
+
+pub(crate) async fn run_python_strict(node: &Node, src: &str, timeout: Duration) -> StrictRunResult {
+    run_python_with_completion(node, src, timeout, true).await
+}
+
+async fn run_python_command(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Duration, strict: bool) -> StrictRunResult {
+    if strict {
+        collect::run_strict(cmd, args, input, timeout).await
+    } else {
+        StrictRunResult { result: collect::run(cmd, args, input, timeout).await, failure: None }
+    }
+}
+
+fn retry_python(result: &StrictRunResult, strict: bool) -> bool {
+    if strict { result.failure == Some(CompletionFailure::SpawnMissing) } else { missing_python(&result.result) }
+}
+
+async fn run_python_with_completion(node: &Node, src: &str, timeout: Duration, strict: bool) -> StrictRunResult {
     if let Some(err) = node.refusal() {
-        return RunResult { code: None, out: String::new(), err };
+        return StrictRunResult { result: RunResult { code: None, out: String::new(), err }, failure: strict.then_some(CompletionFailure::Incomplete) };
     }
     let input = Some(src.as_bytes());
     if node.is_mac() {
         let (prog, args) = mac_python(node.local, &node.alias);
-        collect::run(&prog, &args, input, timeout).await
+        run_python_command(&prog, &args, input, timeout, strict).await
     } else if node.local {
-        let mut last = RunResult::default();
+        let mut last = StrictRunResult { result: RunResult::default(), failure: None };
         for py in ["python3", "python", "py"] {
-            let r = collect::run(py, &["-X".into(), "utf8".into(), "-".into()], input, timeout).await;
-            if !missing_python(&r) {
+            let r = run_python_command(py, &["-X".into(), "utf8".into(), "-".into()], input, timeout, strict).await;
+            let retry = retry_python(&r, strict);
+            if !retry {
                 last = r;
                 break;
             }
-            last = RunResult { out: NO_PYTHON.into(), ..r };
+            last = StrictRunResult { result: RunResult { out: NO_PYTHON.into(), ..r.result }, failure: r.failure };
         }
         last
     } else {
-        collect::run("ssh", &ssh_args(&node.alias, &windows_remote()), input, timeout).await
+        run_python_command("ssh", &ssh_args(&node.alias, &windows_remote()), input, timeout, strict).await
     }
 }
 
@@ -214,6 +235,21 @@ pub fn enabled(node: &Node) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_python_retry_uses_only_structured_spawn_missing() {
+        for (failure, expected) in [
+            (Some(CompletionFailure::SpawnMissing), true),
+            (Some(CompletionFailure::SpawnFailed), false),
+            (Some(CompletionFailure::Timeout), false),
+            (Some(CompletionFailure::Incomplete), false),
+            (None, false),
+        ] {
+            let r = StrictRunResult { result: RunResult { code: Some(9009), out: String::new(), err: "Python was not found".into() }, failure };
+            assert_eq!(retry_python(&r, true), expected);
+            assert!(retry_python(&r, false));
+        }
+    }
 
     #[test]
     fn shared_nodes_are_off_unless_opted_in() {

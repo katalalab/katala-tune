@@ -222,6 +222,8 @@ fn safe_error(error: Option<&str>) -> &'static str {
     match error {
         Some("timeout_or_unreachable") => "タイムアウトまたは接続不可",
         Some("timeout") => "タイムアウト",
+        Some("incomplete") => "監査の完了を確認できません",
+        Some("probe_failed") => "監査の実行に失敗",
         Some("no_python") => "Python を利用できません",
         Some("git_missing") => "Git を利用できません",
         Some("git_failed") => "Git の読み取りに失敗",
