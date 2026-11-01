@@ -189,7 +189,7 @@ impl ModelConfirmation {
 
     pub fn description(&self) -> String {
         format!(
-            "{} / {} / 平文 HTTP / {}。この起動中は更新時にもモデル一覧を取得します。許可はいつでも取り消せますが、開始確定後の通信は停止を保証できません。",
+            "{} / {} / 平文 HTTP / {}。この起動中は更新時にもモデル一覧を取得します。表示中の行から許可を取り消せます。隠れた場合は検索を解除してください。開始確定後の通信は停止を保証できません。",
             self.endpoint.address,
             self.endpoint.protocol.label(),
             self.endpoint.label
@@ -209,6 +209,12 @@ impl PartialEq for ModelGrant {
     }
 }
 impl Eq for ModelGrant {}
+
+impl ModelGrant {
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelRevocation {
@@ -257,6 +263,7 @@ pub struct ModelScope {
     duplicates: usize,
     confirmation: Option<ModelConfirmation>,
     confirmations_suspended: bool,
+    sample: bool,
 }
 
 struct PendingCancellation {
@@ -265,6 +272,16 @@ struct PendingCancellation {
 }
 
 impl ModelScope {
+    /// A demonstration scope that cannot dispatch any network query.
+    pub fn sample() -> Self {
+        let endpoint =
+            Endpoint { label: "サンプル追加先（通信なし）".into(), address: ([192, 0, 2, 1], 12345).into(), protocol: Protocol::OpenAi };
+        let mut scope = Self::default();
+        scope.sample = true;
+        scope.entries.push(ModelEntry { endpoint, authorized: false, observation: ModelObservation::default(), grant: None, pending: None });
+        scope
+    }
+
     pub fn entries(&self) -> &[ModelEntry] {
         &self.entries
     }
@@ -314,6 +331,11 @@ impl ModelScope {
     }
 
     pub fn refresh(&mut self, value: Option<&str>) -> Vec<ModelQuery> {
+        if self.sample {
+            self.invalidate_for_refresh();
+            self.confirmations_suspended = false;
+            return Vec::new();
+        }
         self.confirmation = None;
         let (endpoints, rejected) = candidates(value);
         self.rejected = rejected;
@@ -365,6 +387,9 @@ impl ModelScope {
 
     /// Mark a request for execution; every dispatched request must later be completed.
     pub fn dispatch(&mut self, query: &ModelQuery) -> bool {
+        if self.sample {
+            return false;
+        }
         let valid = self
             .entries
             .iter()

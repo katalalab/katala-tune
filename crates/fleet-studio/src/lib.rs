@@ -1,7 +1,9 @@
 //! Read-only presentation of existing Katala Tune observations.
 
 pub mod audit;
+pub mod confirmation_keys;
 pub mod llm;
+pub mod llm_keyboard;
 pub mod navigation;
 pub mod pointer_id;
 pub mod recent;

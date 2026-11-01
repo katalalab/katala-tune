@@ -5,7 +5,11 @@ use std::time::Duration;
 use crate::search_view::{SearchElement, SearchLayout};
 use fleet_studio::Observation;
 use fleet_studio::audit::{self, Audit, AuditIdentity, RepoAudit, Scope};
-use fleet_studio::llm::{self, Endpoint, ModelConfirmation, ModelError, ModelGrant, ModelObservation, ModelQuery, ModelRevocation, ModelScope, RefreshQueue};
+use fleet_studio::confirmation_keys::{ConfirmKeyGate, NavigationKeyGate};
+use fleet_studio::llm::{
+    self, Endpoint, ModelConfirmation, ModelEntry, ModelError, ModelGrant, ModelObservation, ModelQuery, ModelRevocation, ModelScope, RefreshQueue,
+};
+use fleet_studio::llm_keyboard::{self, ModelKey, ModelKeyboard, ModelViewGate};
 use fleet_studio::navigation::{self, OpenResult, OpenState, OpenTarget};
 use fleet_studio::pointer_id::PointerIds;
 use fleet_studio::recent::{self, RecentEntry, RecentGate, RecentSlot, RecentTicket, RecentWork, SyncStatus};
@@ -13,12 +17,18 @@ use fleet_studio::refresh::{self, FullRefresh};
 use fleet_studio::scope::{AuditGate, AuditTicket, Confirmation, Confirmations, Grants, Permit, RefreshGate};
 use fleet_studio::search_input::{KeyAction, KeyModifiers, SearchInput, search_key};
 use fleet_studio::source::{self, Coverage, Dashboard, NodeCard, Repository, SavedState};
-use gpui::{Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton, Render, SharedString, Window, div, prelude::*, rgb};
+use gpui::{Context, FocusHandle, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, Render, SharedString, Window, div, prelude::*, rgb};
 
 #[derive(Clone, Copy)]
 enum RecentOpen {
     Directory,
     PullRequest(usize),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum KeyboardConfirmation {
+    Machine(Confirmation),
+    Model(ModelConfirmation),
 }
 
 pub struct FleetView {
@@ -40,6 +50,12 @@ pub struct FleetView {
     access_notice: Option<&'static str>,
     model_scope: ModelScope,
     model_confirmation: Option<ModelConfirmation>,
+    model_keyboard: ModelKeyboard,
+    model_view: ModelViewGate,
+    confirmation_keys: ConfirmKeyGate<KeyboardConfirmation>,
+    navigation_keys: NavigationKeyGate,
+    model_notice: Option<&'static str>,
+    input_notice: Option<&'static str>,
     model_cancellation: Option<&'static str>,
     refresh_queue: RefreshQueue,
     sample_model: Option<ModelObservation>,
@@ -70,10 +86,12 @@ impl FleetView {
         let focus = cx.focus_handle();
         focus.focus(window);
         let focus_out = cx.on_focus_out(&focus, window, |view, _, _, cx| {
+            view.lose_keyboard_focus(cx);
             view.leave_search(cx);
         });
         let activation = cx.observe_window_activation(window, |view, window, cx| {
             if !window.is_window_active() {
+                view.lose_keyboard_focus(cx);
                 view.leave_search(cx);
             }
         });
@@ -96,6 +114,12 @@ impl FleetView {
             access_notice: None,
             model_scope: ModelScope::default(),
             model_confirmation: None,
+            model_keyboard: ModelKeyboard::default(),
+            model_view: ModelViewGate::default(),
+            confirmation_keys: ConfirmKeyGate::default(),
+            navigation_keys: NavigationKeyGate::default(),
+            model_notice: None,
+            input_notice: None,
             model_cancellation: None,
             refresh_queue: RefreshQueue::default(),
             sample_model: None,
@@ -137,6 +161,10 @@ impl FleetView {
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.selected.invalidate();
         self.machine_focus = None;
+        self.model_keyboard.exit();
+        self.model_view.invalidate();
+        self.confirmation_keys.clear();
+        self.model_notice = None;
         self.pointer_ids.borrow_mut().clear();
         let decision = refresh::begin(FullRefresh {
             sample: self.sample,
@@ -160,6 +188,7 @@ impl FleetView {
             None
         };
         if self.sample {
+            self.model_scope = ModelScope::sample();
             self.scope_check_pending = false;
             self.dashboard = Some(sample_dashboard(&self.grants));
             let mut observation = ModelObservation::default();
@@ -190,9 +219,13 @@ impl FleetView {
     }
 
     fn start_model_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.sample {
+            return;
+        }
         let configured = std::env::var("FLEET_STUDIO_LLM_ENDPOINTS").ok();
         self.model_confirmation = None;
         let requests = self.model_scope.refresh(configured.as_deref());
+        self.reconcile_model_controls();
         for request in requests {
             self.start_model_query(request, cx);
         }
@@ -200,7 +233,7 @@ impl FleetView {
     }
 
     fn start_model_query(&mut self, request: ModelQuery, cx: &mut Context<Self>) {
-        if !self.model_scope.dispatch(&request) {
+        if self.sample || !self.model_scope.dispatch(&request) {
             return;
         }
         let queued = request.clone();
@@ -213,6 +246,7 @@ impl FleetView {
                 let cancellation = view.model_scope.cancellation(&request);
                 let refresh_cancelled = view.model_scope.cancellation_for_refresh(&request);
                 view.model_scope.complete(&request, result, at);
+                view.reconcile_model_controls();
                 if let Some(cancellation) = cancellation.filter(|_| !refresh_cancelled) {
                     view.model_cancellation = Some(match cancellation {
                         ModelRevocation::Prevented => "取消した 1 件は未開始のまま完了しました。",
@@ -227,47 +261,135 @@ impl FleetView {
         .detach();
     }
 
+    fn model_status(&self, model: &ModelEntry) -> String {
+        if self.sample {
+            if model.authorized { "許可済み（サンプル・通信なし）" } else { "未照会（サンプル・通信なし）" }.into()
+        } else {
+            model_text(&model.observation, model.authorized, self.refresh_queue.pending())
+        }
+    }
+
+    fn visible_model_endpoints(&self) -> Vec<Endpoint> {
+        self.model_scope
+            .entries()
+            .iter()
+            .filter(|model| llm_keyboard::matches(self.search.filter_text(), &model.endpoint.label, &self.model_status(model)))
+            .map(|model| model.endpoint.clone())
+            .collect()
+    }
+
+    fn dismiss_model_confirmation(&mut self) {
+        llm_keyboard::dismiss(&mut self.model_scope, &mut self.model_confirmation);
+    }
+
+    fn leave_model_keyboard(&mut self) {
+        self.model_keyboard.exit();
+        self.model_view.invalidate();
+        self.dismiss_model_confirmation();
+        self.confirmation_keys.clear();
+        self.model_notice = None;
+    }
+
+    fn reconcile_model_controls(&mut self) {
+        let visible = self.visible_model_endpoints();
+        self.model_view.observe(&visible);
+        let selection_lost = self.model_keyboard.reconcile(&self.model_scope, &visible);
+        let confirmation_hidden = self.model_confirmation.as_ref().is_some_and(|confirmation| !visible.contains(confirmation.endpoint()));
+        if selection_lost || confirmation_hidden {
+            self.model_view.invalidate();
+            self.dismiss_model_confirmation();
+            self.confirmation_keys.clear();
+            self.pointer_ids.borrow_mut().clear();
+            if selection_lost {
+                self.model_notice = Some("選択先が非表示または変更されました。検索を解除し、対象を選び直してください。");
+            }
+        }
+    }
+
+    fn lose_keyboard_focus(&mut self, cx: &mut Context<Self>) {
+        llm_keyboard::focus_lost(&mut self.model_keyboard, &mut self.model_scope, &mut self.model_confirmation, &mut self.selected);
+        self.model_view.invalidate();
+        self.machine_focus = None;
+        self.confirmations.clear();
+        self.confirmation_keys.focus_lost();
+        self.navigation_keys.focus_lost();
+        self.model_notice = None;
+        self.input_notice = None;
+        self.pointer_ids.borrow_mut().clear();
+        cx.notify();
+    }
+
     fn prepare_model_confirmation(&mut self, endpoint: &Endpoint, cx: &mut Context<Self>) {
-        if !self.sample && !self.refresh_queue.pending() {
-            self.model_confirmation = self.model_scope.prepare_authorization(endpoint);
+        let visible = self.visible_model_endpoints();
+        if self.refresh_queue.pending() || !visible.contains(endpoint) {
+            return;
+        }
+        if self.model_keyboard.active() && self.model_keyboard.current(&self.model_scope, &visible) != Some(endpoint) {
+            self.model_keyboard.exit();
+        }
+        self.machine_focus = None;
+        self.confirmations.clear();
+        self.dismiss_model_confirmation();
+        self.confirmation_keys.clear();
+        if let Some(confirmation) = llm_keyboard::prepare(&mut self.model_scope, &visible, endpoint, self.refresh_queue.pending()) {
+            self.model_view.invalidate();
+            if self.model_keyboard.current(&self.model_scope, &visible) == Some(endpoint) {
+                self.confirmation_keys.arm(KeyboardConfirmation::Model(confirmation.clone()));
+            }
+            self.model_confirmation = Some(confirmation);
             self.model_cancellation = None;
+            self.model_notice = None;
             self.pointer_ids.borrow_mut().clear();
             cx.notify();
         }
     }
 
     fn confirm_model(&mut self, confirmation: &ModelConfirmation, cx: &mut Context<Self>) {
-        if self.sample || self.refresh_queue.pending() || self.model_confirmation.as_ref() != Some(confirmation) {
-            return;
-        }
-        self.model_confirmation = None;
-        self.pointer_ids.borrow_mut().clear();
-        if let Some(request) = self.model_scope.confirm(confirmation) {
+        let visible = self.visible_model_endpoints();
+        if let Some(request) =
+            llm_keyboard::confirm(&mut self.model_scope, &visible, self.model_confirmation.as_ref(), confirmation, self.refresh_queue.pending())
+        {
+            self.model_view.invalidate();
+            self.model_confirmation = None;
+            self.confirmation_keys.clear();
+            self.pointer_ids.borrow_mut().clear();
+            let visible = self.visible_model_endpoints();
+            self.model_keyboard.authorized(&self.model_scope, &visible, confirmation.endpoint());
+            if self.model_keyboard.active() && self.model_keyboard.current(&self.model_scope, &visible).is_none() {
+                self.model_notice = Some("選択先が非表示になりました。取消は検索を解除し、L と上下キーで対象を選び直して X を押してください。");
+            }
             self.start_model_query(request, cx);
         }
+        self.reconcile_model_controls();
         cx.notify();
     }
 
     fn cancel_model_confirmation(&mut self, confirmation: &ModelConfirmation, cx: &mut Context<Self>) {
-        if self.model_confirmation.as_ref() != Some(confirmation) {
-            return;
+        let visible = self.visible_model_endpoints();
+        if llm_keyboard::cancel(&mut self.model_scope, &visible, self.model_confirmation.as_ref(), confirmation) {
+            self.model_view.invalidate();
+            self.model_confirmation = None;
+            self.confirmation_keys.clear();
+            self.pointer_ids.borrow_mut().clear();
+            cx.notify();
         }
-        if let Some(confirmation) = self.model_confirmation.take() {
-            self.model_scope.cancel_confirmation(&confirmation);
-        }
-        self.pointer_ids.borrow_mut().clear();
-        cx.notify();
     }
 
     fn revoke_model(&mut self, grant: &ModelGrant, cx: &mut Context<Self>) {
-        if let Some(outcome) = self.model_scope.revoke(grant) {
+        let visible = self.visible_model_endpoints();
+        if let Some(outcome) = llm_keyboard::revoke(&mut self.model_scope, &visible, grant) {
+            self.model_view.invalidate();
+            self.machine_focus = None;
+            self.confirmations.clear();
             self.model_confirmation = None;
+            self.confirmation_keys.clear();
             self.model_cancellation = Some(match outcome {
                 ModelRevocation::Prevented => "許可を取り消し、未開始の通信を阻止しました。",
                 ModelRevocation::InProgress => "許可を取り消しました。通信の開始が確定しているため、停止は保証できません。",
                 ModelRevocation::Idle => "許可と前回の結果を取り消しました。",
             });
             self.pointer_ids.borrow_mut().clear();
+            self.reconcile_model_controls();
             self.resume_model_refresh(cx);
             cx.notify();
         }
@@ -366,9 +488,12 @@ impl FleetView {
             .as_ref()
             .is_some_and(|dashboard| dashboard.nodes.iter().any(|node| node.id == id && node.fingerprint.as_deref() == Some(fingerprint.as_str())));
         if still_shown {
+            self.leave_model_keyboard();
             self.machine_focus = Some((id.clone(), fingerprint.clone()));
             self.selected.invalidate();
-            if self.confirmations.begin(&id, &fingerprint).is_none() {
+            if let Some(confirmation) = self.confirmations.begin(&id, &fingerprint) {
+                self.confirmation_keys.arm(KeyboardConfirmation::Machine(confirmation));
+            } else {
                 self.access_notice = Some("確認を開始できません。");
             }
             cx.notify();
@@ -388,6 +513,7 @@ impl FleetView {
         if !still_shown || !self.confirmations.take_if(&confirmation) {
             return;
         }
+        self.confirmation_keys.clear();
         if !self.grants.authorize(id, fingerprint) {
             self.access_notice = Some("表示許可を開始できません。");
             cx.notify();
@@ -400,6 +526,7 @@ impl FleetView {
 
     fn cancel_machine_access(&mut self, confirmation: Confirmation, cx: &mut Context<Self>) {
         if self.confirmations.cancel_if(&confirmation) {
+            self.confirmation_keys.clear();
             cx.notify();
         }
     }
@@ -408,6 +535,7 @@ impl FleetView {
         if !self.grants.revoke_if_current(&id, &permit) {
             return;
         }
+        self.leave_model_keyboard();
         self.dashboard_gate.invalidate();
         self.confirmations.clear();
         self.machine_focus = None;
@@ -428,6 +556,7 @@ impl FleetView {
     }
 
     fn cycle_machine(&mut self, reverse: bool) {
+        self.leave_model_keyboard();
         let choices: Vec<(String, String)> = self.dashboard.as_ref().map_or_else(Vec::new, |dashboard| {
             dashboard
                 .nodes
@@ -456,6 +585,7 @@ impl FleetView {
         };
         self.machine_focus = Some(choices[index].clone());
         self.confirmations.clear();
+        self.confirmation_keys.clear();
         self.selected.invalidate();
         self.access_notice = None;
     }
@@ -463,7 +593,11 @@ impl FleetView {
     fn machine_banner(&self) -> Option<String> {
         let (id, fingerprint) = self.machine_focus.as_ref()?;
         if self.confirmations.current().is_some_and(|pending| pending.id == *id && pending.fingerprint == *fingerprint) {
-            Some(format!("台帳 ID {id}: {}", fleet_studio::scope::MACHINE_CONFIRMATION_KEYBOARD))
+            if !cfg!(target_os = "windows") {
+                Some(format!("台帳 ID {id}: キーボードでの最終許可は未対応です。確認後、画面のボタンを使用してください。"))
+            } else {
+                Some(format!("台帳 ID {id}: {}", fleet_studio::scope::MACHINE_CONFIRMATION_KEYBOARD))
+            }
         } else if self.grants.matching(id, fingerprint).is_some() {
             Some(format!("台帳 ID {id}: Enter で表示許可を取り消す。Esc で機体選択を終了。"))
         } else {
@@ -478,13 +612,106 @@ impl FleetView {
         }
         if let Some(permit) = self.grants.matching(&id, &fingerprint) {
             self.revoke_machine_access(id, permit, cx);
-        } else if let Some(confirmation) =
-            self.confirmations.current().filter(|confirmation| confirmation.id == id && confirmation.fingerprint == fingerprint).cloned()
-        {
-            self.confirm_machine_access(confirmation, cx);
+        } else if self.confirmations.current().is_some_and(|confirmation| confirmation.id == id && confirmation.fingerprint == fingerprint) {
+            // A separate Y press is required to confirm.
         } else {
             self.request_machine_access(id, fingerprint, cx);
         }
+    }
+
+    fn confirm_focused_machine(&mut self, cx: &mut Context<Self>) {
+        if !cfg!(target_os = "windows") {
+            self.access_notice = Some("この OS のキーボード最終許可は未対応です。画面のボタンを使用してください。");
+            return;
+        }
+        let Some((id, fingerprint)) = self.machine_focus.as_ref() else { return };
+        if let Some(confirmation) = self.confirmations.current().filter(|pending| pending.id == *id && pending.fingerprint == *fingerprint).cloned() {
+            self.confirm_machine_access(confirmation, cx);
+        }
+    }
+
+    fn select_model(&mut self) {
+        self.model_view.invalidate();
+        self.machine_focus = None;
+        self.confirmations.clear();
+        self.dismiss_model_confirmation();
+        self.confirmation_keys.clear();
+        self.selected.invalidate();
+        let visible = self.visible_model_endpoints();
+        self.model_keyboard.begin(&self.model_scope, &visible);
+        self.model_notice = if self.model_keyboard.current(&self.model_scope, &visible).is_none() {
+            Some("表示中の選択可能な追加先はありません。検索条件を確認してください。")
+        } else {
+            None
+        };
+        self.pointer_ids.borrow_mut().clear();
+    }
+
+    fn cycle_model(&mut self, reverse: bool) {
+        self.model_view.invalidate();
+        self.dismiss_model_confirmation();
+        self.confirmation_keys.clear();
+        let visible = self.visible_model_endpoints();
+        self.model_keyboard.cycle(&self.model_scope, &visible, reverse);
+        self.model_notice = if self.model_keyboard.current(&self.model_scope, &visible).is_none() {
+            Some("表示中の選択可能な追加先はありません。検索条件を確認してください。")
+        } else {
+            None
+        };
+        self.pointer_ids.borrow_mut().clear();
+    }
+
+    fn inspect_selected_model(&mut self, cx: &mut Context<Self>) {
+        let visible = self.visible_model_endpoints();
+        let Some(endpoint) = self.model_keyboard.current(&self.model_scope, &visible).cloned() else { return };
+        if self.model_confirmation.as_ref().is_some_and(|confirmation| confirmation.endpoint() == &endpoint) {
+            return;
+        }
+        if self.model_scope.entries().iter().any(|entry| entry.endpoint == endpoint && entry.authorized) {
+            self.model_notice = Some("許可済みです。取消は X を押してください。");
+            return;
+        }
+        if self.refresh_queue.pending() {
+            self.model_notice = Some("更新待ちの間は新たな許可を開始できません。既存の許可は取り消せます。");
+            return;
+        }
+        self.prepare_model_confirmation(&endpoint, cx);
+    }
+
+    fn revoke_selected_model(&mut self, cx: &mut Context<Self>) {
+        let visible = self.visible_model_endpoints();
+        let Some(endpoint) = self.model_keyboard.current(&self.model_scope, &visible) else { return };
+        if let Some(grant) = self.model_scope.entries().iter().find(|entry| &entry.endpoint == endpoint).and_then(|entry| entry.grant()).cloned() {
+            self.revoke_model(&grant, cx);
+        }
+    }
+
+    fn keyboard_confirmation(&self) -> Option<KeyboardConfirmation> {
+        if self.model_keyboard.active() {
+            let visible = self.visible_model_endpoints();
+            let endpoint = self.model_keyboard.current(&self.model_scope, &visible)?;
+            let confirmation = self.model_confirmation.as_ref().filter(|confirmation| confirmation.endpoint() == endpoint)?;
+            return Some(KeyboardConfirmation::Model(confirmation.clone()));
+        }
+        let (id, fingerprint) = self.machine_focus.as_ref()?;
+        let shown = self.dashboard.as_ref().is_some_and(|dashboard| {
+            dashboard.nodes.iter().any(|node| {
+                node.id == *id && node.fingerprint.as_ref() == Some(fingerprint) && self.matches(&format!("{} {} {}", node.id, node.role, node.operating_state))
+            })
+        });
+        shown.then_some(())?;
+        self.confirmations
+            .current()
+            .filter(|confirmation| confirmation.id == *id && confirmation.fingerprint == *fingerprint)
+            .cloned()
+            .map(KeyboardConfirmation::Machine)
+    }
+
+    fn model_banner(&self) -> Option<String> {
+        let visible = self.visible_model_endpoints();
+        let endpoint = self.model_keyboard.current(&self.model_scope, &visible);
+        let authorized = endpoint.is_some_and(|endpoint| self.model_scope.entries().iter().any(|entry| &entry.endpoint == endpoint && entry.authorized));
+        llm_keyboard::banner(self.model_keyboard.active(), endpoint, self.model_confirmation.as_ref(), authorized, self.model_notice)
     }
 
     fn start_recent(&mut self, generation: u64, cx: &mut Context<Self>) {
@@ -663,6 +890,7 @@ impl FleetView {
     }
 
     pub(crate) fn search_changed(&mut self, cx: &mut Context<Self>) {
+        self.leave_model_keyboard();
         self.selected.invalidate();
         cx.notify();
     }
@@ -680,6 +908,18 @@ impl FleetView {
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
+        let modifiers = event.keystroke.modifiers;
+        let modified = modifiers.control || modifiers.platform || modifiers.alt || modifiers.shift || modifiers.function;
+        let fresh = self.navigation_keys.down(key, event.is_held);
+        let blocked = event.is_held || modified || !fresh;
+        if !blocked {
+            self.input_notice = None;
+        }
+        if !self.searching {
+            self.reconcile_model_controls();
+        }
+        let current = if self.searching { None } else { self.keyboard_confirmation() };
+        let confirmed = if key == "y" { self.confirmation_keys.down(current.as_ref(), event.is_held, modified || self.searching) } else { false };
         if self.searching {
             let m = event.keystroke.modifiers;
             let action = search_key(
@@ -708,17 +948,59 @@ impl FleetView {
             cx.stop_propagation();
             return;
         } else {
-            let modifiers = event.keystroke.modifiers;
-            let blocked = event.is_held || modifiers.control || modifiers.platform || modifiers.alt || modifiers.shift || modifiers.function;
+            if llm_keyboard::consume_blocked_shortcut(key, false, blocked) {
+                if !fresh && !event.is_held && !modified {
+                    self.input_notice = Some("キーを一度離し、もう一度押してください。");
+                    cx.notify();
+                }
+                cx.stop_propagation();
+                return;
+            }
+            if let Some(action) = llm_keyboard::key(key, self.model_keyboard.active(), false, blocked, cfg!(target_os = "windows")) {
+                match action {
+                    ModelKey::Select => self.select_model(),
+                    ModelKey::Next => self.cycle_model(false),
+                    ModelKey::Previous => self.cycle_model(true),
+                    ModelKey::Inspect => self.inspect_selected_model(cx),
+                    ModelKey::Confirm => {
+                        if confirmed && let Some(KeyboardConfirmation::Model(confirmation)) = current.as_ref() {
+                            self.confirm_model(confirmation, cx);
+                        } else if matches!(current.as_ref(), Some(KeyboardConfirmation::Model(_))) {
+                            self.input_notice = Some("Y を一度離し、もう一度押してください。必要なら確認を開き直してください。");
+                        }
+                    }
+                    ModelKey::Revoke => self.revoke_selected_model(cx),
+                    ModelKey::Leave => self.leave_model_keyboard(),
+                    ModelKey::Consume => {}
+                    ModelKey::Unsupported => {
+                        self.model_notice = Some("この OS の LLM キーボード選択は未対応です。画面のボタンを使用してください。");
+                    }
+                }
+                self.focus.focus(window);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if key == "m" && !blocked {
+                self.leave_model_keyboard();
+            }
             if let Some(action) = fleet_studio::scope::machine_key(key, self.machine_focus.is_some(), false, blocked) {
                 use fleet_studio::scope::MachineKey;
                 match action {
                     MachineKey::Next => self.cycle_machine(false),
                     MachineKey::Previous => self.cycle_machine(true),
                     MachineKey::Activate => self.activate_machine(cx),
+                    MachineKey::Confirm => {
+                        if !cfg!(target_os = "windows") || confirmed {
+                            self.confirm_focused_machine(cx);
+                        } else if matches!(current.as_ref(), Some(KeyboardConfirmation::Machine(_))) {
+                            self.input_notice = Some("Y を一度離し、もう一度押してください。必要なら確認を開き直してください。");
+                        }
+                    }
                     MachineKey::Leave => {
                         self.machine_focus = None;
                         self.confirmations.clear();
+                        self.confirmation_keys.clear();
                     }
                     MachineKey::Consume => {}
                 }
@@ -730,6 +1012,7 @@ impl FleetView {
             match key {
                 "/" | "slash" => {
                     self.searching = true;
+                    self.leave_model_keyboard();
                     self.machine_focus = None;
                     self.confirmations.clear();
                     self.selected.invalidate();
@@ -757,6 +1040,7 @@ impl FleetView {
                     }
                 }
                 "escape" => {
+                    self.leave_model_keyboard();
                     self.search.clear();
                     self.selected.invalidate();
                     self.search_repositories(cx);
@@ -766,6 +1050,14 @@ impl FleetView {
         }
         self.focus.focus(window);
         cx.notify();
+    }
+
+    fn on_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        self.navigation_keys.up(key);
+        if key == "y" {
+            self.confirmation_keys.up();
+        }
     }
 
     fn matches(&self, value: &str) -> bool {
@@ -1092,6 +1384,9 @@ fn recent_status(status: &SyncStatus, now: i64, max_age_ms: Option<i64>) -> Stri
 
 impl Render for FleetView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.reconcile_model_controls();
+        let visible_models = self.visible_model_endpoints();
+        let model_ticket = self.model_view.ticket();
         let now = tune_core::db::now_ms();
         let mut pointer_ids = self.pointer_ids.borrow_mut();
         pointer_ids.begin_frame();
@@ -1399,8 +1694,8 @@ impl Render for FleetView {
             content = content.child(note(format!("重複した LLM 接続設定: {} 件（重複分は照会しません）", self.model_scope.duplicates()), 0xffb86c));
         }
         for model in self.model_scope.entries() {
-            let status = model_text(&model.observation, model.authorized, self.refresh_queue.pending());
-            if !self.matches(&model.endpoint.label) && !self.matches(&status) {
+            let status = self.model_status(model);
+            if !visible_models.contains(&model.endpoint) {
                 continue;
             }
             let endpoint = model.endpoint.clone();
@@ -1409,18 +1704,22 @@ impl Render for FleetView {
             let local = endpoint.address.ip().is_loopback();
             let mut item =
                 div().flex().flex_col().gap_2().child(row(endpoint.label.clone(), format!("{}  /  今回: {}", status, when(model.observation.checked_at))));
+            if self.model_keyboard.current(&self.model_scope, &visible_models) == Some(&endpoint) {
+                item = item.child(note("キーボードで選択中".into(), 0x8fc9ff));
+            }
             if !local {
                 item = item.child(note(format!("追加先: {address} / {protocol} / 平文 HTTP"), 0xffb86c));
                 if let Some(grant) = model.grant().cloned() {
                     item = item.child(note("取消前に開始・実行待ちの通信は、取り消せない場合があります。".into(), 0xffb86c));
                     let id = pointer_ids.get("llm-revoke", &[&address, protocol, &endpoint.label]);
-                    item = item.child(
-                        div()
-                            .id(SharedString::from(format!("click-{id}")))
-                            .cursor_pointer()
-                            .child("許可を取り消す")
-                            .on_click(cx.listener(move |view, _, _, cx| view.revoke_model(&grant, cx))),
-                    );
+                    let ticket = model_ticket.clone();
+                    item = item.child(div().id(SharedString::from(format!("click-{id}"))).cursor_pointer().child("許可を取り消す").on_click(cx.listener(
+                        move |view, _, _, cx| {
+                            if view.model_view.is_current(&ticket) {
+                                view.revoke_model(&grant, cx);
+                            }
+                        },
+                    )));
                 } else if self.refresh_queue.pending() {
                     item = item.child(note("更新待ちのため、接続内容の確認はできません。".into(), 0xffb86c));
                 } else if let Some(confirmation) = self.model_confirmation.as_ref().filter(|confirmation| confirmation.endpoint() == &endpoint) {
@@ -1429,35 +1728,38 @@ impl Render for FleetView {
                     let cancel_id = pointer_ids.get("llm-cancel-confirmation", &[&address, protocol, &endpoint.label]);
                     let selected = confirmation.clone();
                     let cancel = confirmation.clone();
+                    let confirm_ticket = model_ticket.clone();
+                    let cancel_ticket = model_ticket.clone();
                     item = item.child(
                         div()
                             .flex()
                             .gap_3()
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("click-{confirm_id}")))
-                                    .cursor_pointer()
-                                    .child("この接続を有効化")
-                                    .on_click(cx.listener(move |view, _, _, cx| view.confirm_model(&selected, cx))),
-                            )
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("click-{cancel_id}")))
-                                    .cursor_pointer()
-                                    .child("キャンセル")
-                                    .on_click(cx.listener(move |view, _, _, cx| view.cancel_model_confirmation(&cancel, cx))),
-                            ),
+                            .child(div().id(SharedString::from(format!("click-{confirm_id}"))).cursor_pointer().child("この接続を有効化").on_click(
+                                cx.listener(move |view, _, _, cx| {
+                                    if view.model_view.is_current(&confirm_ticket) {
+                                        view.confirm_model(&selected, cx);
+                                    }
+                                }),
+                            ))
+                            .child(div().id(SharedString::from(format!("click-{cancel_id}"))).cursor_pointer().child("キャンセル").on_click(cx.listener(
+                                move |view, _, _, cx| {
+                                    if view.model_view.is_current(&cancel_ticket) {
+                                        view.cancel_model_confirmation(&cancel, cx);
+                                    }
+                                },
+                            ))),
                     );
                 } else {
                     let id = pointer_ids.get("llm-prepare", &[&address, protocol, &endpoint.label]);
                     let selected = endpoint.clone();
-                    item = item.child(
-                        div()
-                            .id(SharedString::from(format!("click-{id}")))
-                            .cursor_pointer()
-                            .child("接続内容を確認")
-                            .on_click(cx.listener(move |view, _, _, cx| view.prepare_model_confirmation(&selected, cx))),
-                    );
+                    let ticket = model_ticket.clone();
+                    item = item.child(div().id(SharedString::from(format!("click-{id}"))).cursor_pointer().child("接続内容を確認").on_click(cx.listener(
+                        move |view, _, _, cx| {
+                            if view.model_view.is_current(&ticket) {
+                                view.prepare_model_confirmation(&selected, cx);
+                            }
+                        },
+                    )));
                 }
             }
             content = content.child(item);
@@ -1546,6 +1848,7 @@ impl Render for FleetView {
             .text_color(rgb(0xe7edf6))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
+            .on_key_up(cx.listener(Self::on_key_up))
             .child(
                 div()
                     .px_5()
@@ -1615,6 +1918,10 @@ impl Render for FleetView {
             .when_some(self.machine_banner(), |root, message| {
                 root.child(div().px_5().py_2().text_sm().text_color(rgb(0xffd9a1)).bg(rgb(0x192b42)).child(message))
             })
+            .when_some(self.model_banner(), |root, message| {
+                root.child(div().px_5().py_2().text_sm().text_color(rgb(0xffd9a1)).bg(rgb(0x192b42)).child(message))
+            })
+            .when_some(self.input_notice, |root, message| root.child(div().px_5().py_2().text_sm().text_color(rgb(0xffd9a1)).bg(rgb(0x192b42)).child(message)))
             .child(
                 div()
                     .id("search")
@@ -1632,6 +1939,7 @@ impl Render for FleetView {
                         MouseButton::Left,
                         cx.listener(|view, event: &gpui::MouseDownEvent, window, cx| {
                             view.searching = true;
+                            view.leave_model_keyboard();
                             view.machine_focus = None;
                             view.confirmations.clear();
                             view.focus.focus(window);
@@ -1655,25 +1963,36 @@ impl Render for FleetView {
             )
             .child(content)
             .child(
-                div().px_5().py_3().flex().justify_between().bg(rgb(0x132237)).child("/ 検索 · M 機体 · ↑↓ 選択 · Enter 操作 · Esc 戻る").child(
-                    div()
-                        .flex()
-                        .gap_4()
-                        .child(
-                            div()
-                                .id("documentation")
-                                .cursor_pointer()
-                                .child("説明")
-                                .on_click(cx.listener(|view, _, _, cx| view.open_github("https://github.com/katalalab/katala-tune", cx))),
-                        )
-                        .child(
-                            div()
-                                .id("issues")
-                                .cursor_pointer()
-                                .child("Issues")
-                                .on_click(cx.listener(|view, _, _, cx| view.open_github("https://github.com/katalalab/katala-tune/issues", cx))),
-                        ),
-                ),
+                div()
+                    .px_5()
+                    .py_3()
+                    .flex()
+                    .justify_between()
+                    .bg(rgb(0x132237))
+                    .child(if cfg!(target_os = "windows") {
+                        "/ 検索 · M 機体 · L 追加先 · ↑↓ 選択 · Enter 確認 · Y 許可 · X 取消 · Esc 戻る"
+                    } else {
+                        "/ 検索 · M 機体 · ↑↓ 選択 · Enter 確認 · 許可はマウス · Esc 戻る"
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .id("documentation")
+                                    .cursor_pointer()
+                                    .child("説明")
+                                    .on_click(cx.listener(|view, _, _, cx| view.open_github("https://github.com/katalalab/katala-tune", cx))),
+                            )
+                            .child(
+                                div()
+                                    .id("issues")
+                                    .cursor_pointer()
+                                    .child("Issues")
+                                    .on_click(cx.listener(|view, _, _, cx| view.open_github("https://github.com/katalalab/katala-tune/issues", cx))),
+                            ),
+                    ),
             )
     }
 }

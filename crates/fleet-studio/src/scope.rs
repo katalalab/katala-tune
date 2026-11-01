@@ -206,6 +206,7 @@ pub enum MachineKey {
     Next,
     Previous,
     Activate,
+    Confirm,
     Leave,
     Consume,
 }
@@ -216,13 +217,14 @@ pub fn machine_key(key: &str, active: bool, editing: bool, blocked: bool) -> Opt
         return None;
     }
     if blocked {
-        return (active && matches!(key, "enter" | "up" | "down" | "escape")).then_some(MachineKey::Consume);
+        return (active && matches!(key, "enter" | "y" | "up" | "down" | "escape")).then_some(MachineKey::Consume);
     }
     match key {
         "m" => Some(MachineKey::Next),
         "down" if active => Some(MachineKey::Next),
         "up" if active => Some(MachineKey::Previous),
         "enter" if active => Some(MachineKey::Activate),
+        "y" if active => Some(MachineKey::Confirm),
         "escape" if active => Some(MachineKey::Leave),
         _ => None,
     }
@@ -233,7 +235,7 @@ pub const MACHINE_CONFIRMATION: &str =
     "この台帳 ID に保存された過去の要約を読む権限と適用ルールを確認しました。許可中は更新時に再読取し、取消できます。保存元の実機は未確認です。";
 /// Fixed keyboard confirmation, shown beside the selected ID.
 pub const MACHINE_CONFIRMATION_KEYBOARD: &str =
-    "保存要約の閲覧権限と適用ルールを確認した場合のみ Enter で表示。許可中は更新時に再読取し、取消できます。保存元の実機は未確認。Esc で中止。";
+    "保存要約の閲覧権限と適用ルールを確認した場合のみ Y で表示。許可中は更新時に再読取し、取消できます。保存元の実機は未確認。Esc で中止。";
 
 #[derive(Clone, Debug)]
 pub struct AuditTicket {
