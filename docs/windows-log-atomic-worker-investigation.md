@@ -107,3 +107,45 @@ including a pipe-holding grandchild, parent death, independent bystanders,
 parallel native spawns, failure injection and actual EOF/exit observations.
 If containment or exit cannot be established, keep the transport unchanged and
 report failure rather than claiming successful cleanup.
+
+## Further uncommitted experiment, 2026-11-01
+
+The follow-up experiment is **not a product fix**. The first before-creation
+case failed twice because its outer guard reported two processes instead of the
+assumed one. The independent synthetic bystander was a different process.
+The unknown member's identity was not established before the controller
+terminated itself. The outer guard has an unconditional Job-wide termination
+fallback; its completion receipt did report an empty Job and exited retained
+members before that fallback, but this does not retrospectively identify the
+unknown member or prove the cause of its exit. The experimental crash case is
+now ignored and must not be run. The older `a80e33b` tests also include Job-wide
+termination, so do not run the full test suite as part of this investigation.
+
+A separate control used a new unnamed Job with **no kill-on-close limit and no
+Job termination**. In that control the exact live fixture and one additional
+process were members of the Job, each verified using a retained process handle,
+creation time, session, and `IsProcessInJob`. A separate read-only Windows
+process query showed that the additional member was `conhost.exe`, its parent
+was the live fixture, and its creation time exactly matched the retained handle.
+The fixture's retained handle signaled after approximately its configured
+30-second sleep; its exit code was not recorded, so normal exit is not proven.
+This observation does not identify the earlier, already-exited unknown member.
+A second, direct fixture control observed its own console host and confirmed
+that fixture's natural exit with code zero.
+
+Job membership enumeration is a snapshot, and enabling kill-on-close later is
+not conditional on that snapshot remaining complete. The documented
+`JOB_OBJECT_LIMIT_ACTIVE_PROCESS` is not a harmless exclusion mechanism: an
+attempt to associate a process over the limit [terminates that process](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information).
+Without a supported boundary that prevents unknown members being terminated,
+do not use the unsafe crash experiment or claim tree cleanup.
+
+An additional unexecuted fixture uses Jobs with no termination settings. It
+would request self-termination of a synthetic controller and check whether a
+worker observes the signaled handle for its exact parent and returns naturally.
+The independent bystander would also exit naturally. Independent review found
+that synchronous process creation and filesystem calls cannot be interrupted
+by its async deadlines. There is no independently enforced bound for those calls,
+so this case is ignored and must not be run in its current form. It cannot prove
+child-tree recovery, inner pipe EOF, an authenticated worker channel, real SSH
+behavior, or parent death during `CreateProcessW`.

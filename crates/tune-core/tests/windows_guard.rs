@@ -33,6 +33,7 @@ fn owned_fixture() {
             std::io::stdout().flush().unwrap();
             std::thread::sleep(Duration::from_secs(30));
         }
+        "diagnostic-sleep" => std::thread::sleep(Duration::from_secs(30)),
         "bystander" => {
             let expected = tune_core::collect::ProcessIdentity {
                 pid: std::env::var("KATALA_GUARD_PARENT_PID").unwrap().parse().unwrap(),
@@ -106,6 +107,11 @@ fn owned_fixture() {
             ));
             panic!("fixture owner unexpectedly completed before its forced exit");
         }
+        "worker-controller" => worker_boundary_controller(),
+        "worker-child" => worker_boundary_fixture(),
+        "observe-controller" => observation_controller(),
+        "observe-worker" => observation_worker(),
+        "observe-bystander" => observation_bystander(),
         "root-first" => {
             let directory = std::path::PathBuf::from(std::env::var_os("KATALA_GUARD_QUIET_DIR").unwrap());
             let mut child = fixture_command("root-first-child");
@@ -191,6 +197,352 @@ fn publish_fixture_marker(path: &std::path::Path, frame: &str) {
     file.sync_all().unwrap();
     drop(file);
     std::fs::rename(temporary, path).unwrap();
+}
+
+// Test-only controller: all handles belong to the fixture itself. Production
+// worker dispatch, IPC, peer authentication, and product transport are absent.
+struct FixtureWorkerJob(std::os::windows::io::OwnedHandle);
+
+#[allow(unsafe_code)]
+impl FixtureWorkerJob {
+    fn observation_only() -> Self {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        // SAFETY: a new unnamed Job with no kill-on-close or termination operation.
+        let raw = unsafe { windows_sys::Win32::System::JobObjects::CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(!raw.is_null());
+        // SAFETY: successful creation transferred ownership.
+        Self(unsafe { OwnedHandle::from_raw_handle(raw) })
+    }
+
+    fn new() -> Self {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        // SAFETY: a fresh unnamed Job, with default non-inheritable handle.
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(!raw.is_null());
+        // SAFETY: CreateJobObjectW transferred ownership of this handle.
+        let job = Self(unsafe { OwnedHandle::from_raw_handle(raw) });
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: the handle identifies only this newly created Job and the structure has the documented size.
+        let ok = unsafe {
+            SetInformationJobObject(job.0.as_raw_handle(), JobObjectExtendedLimitInformation, std::ptr::from_ref(&limits).cast(), size_of_val(&limits) as u32)
+        };
+        assert_ne!(ok, 0, "synthetic Job setup failed: {}", std::io::Error::last_os_error());
+        job
+    }
+
+    fn contains(&self, process: &std::os::windows::io::OwnedHandle) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        let mut belongs = 0;
+        // SAFETY: both handles are retained, and belongs is writable; this only queries Job membership.
+        let ok = unsafe { windows_sys::Win32::System::JobObjects::IsProcessInJob(process.as_raw_handle(), self.0.as_raw_handle(), &mut belongs) };
+        assert_ne!(ok, 0, "synthetic Job membership query failed: {}", std::io::Error::last_os_error());
+        belongs != 0
+    }
+
+    fn spawn_worker(&self, values: &[(OsString, OsString)]) -> std::os::windows::io::OwnedHandle {
+        use std::os::windows::{
+            ffi::OsStrExt,
+            io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        };
+        use windows_sys::Win32::{
+            Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE},
+            System::Threading::{
+                CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+                InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, STARTUPINFOEXW,
+                UpdateProcThreadAttribute,
+            },
+        };
+
+        struct Attributes {
+            storage: Vec<usize>,
+            initialized: bool,
+        }
+        impl Attributes {
+            fn raw(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+                self.storage.as_mut_ptr().cast()
+            }
+        }
+        impl Drop for Attributes {
+            fn drop(&mut self) {
+                if self.initialized {
+                    // SAFETY: initialized list and its backing aligned allocation remain live until this point.
+                    unsafe { DeleteProcThreadAttributeList(self.raw()) };
+                }
+            }
+        }
+
+        let mut bytes = 0;
+        // SAFETY: null list is the documented sizing call for exactly one attribute.
+        let first = unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut bytes) };
+        assert_eq!(first, 0);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(ERROR_INSUFFICIENT_BUFFER as i32));
+        assert!((1..=65536).contains(&bytes));
+        let jobs: [HANDLE; 1] = [self.0.as_raw_handle()];
+        let mut attributes = Attributes { storage: vec![0; bytes.div_ceil(size_of::<usize>())], initialized: false };
+        // SAFETY: aligned storage has at least the requested size and stays live with the value array.
+        let ok = unsafe { InitializeProcThreadAttributeList(attributes.raw(), 1, 0, &mut bytes) };
+        assert_ne!(ok, 0);
+        attributes.initialized = true;
+        // SAFETY: the single Job handle array outlives the attribute list and CreateProcessW.
+        let ok = unsafe {
+            UpdateProcThreadAttribute(
+                attributes.raw(),
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                jobs.as_ptr().cast(),
+                size_of_val(&jobs),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(ok, 0, "synthetic Job attribute setup failed: {}", std::io::Error::last_os_error());
+
+        let executable = std::env::current_exe().unwrap();
+        let units: Vec<u16> = executable.as_os_str().encode_wide().collect();
+        assert!(!units.contains(&0) && !units.contains(&u16::from(b'"')));
+        let mut application = units.clone();
+        application.push(0);
+        let mut command = vec![u16::from(b'"')];
+        command.extend(units);
+        command.extend("\" --exact owned_fixture --nocapture".encode_utf16());
+        command.push(0);
+        let mut values = values.to_vec();
+        values.sort_by_key(|(name, _)| name.to_ascii_lowercase());
+        let mut environment = Vec::new();
+        for (name, value) in values {
+            let name: Vec<_> = name.encode_wide().collect();
+            let value: Vec<_> = value.encode_wide().collect();
+            assert!(!name.contains(&0) && !name.contains(&u16::from(b'=')) && !value.contains(&0));
+            environment.extend(name);
+            environment.push(u16::from(b'='));
+            environment.extend(value);
+            environment.push(0);
+        }
+        environment.push(0);
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        startup.lpAttributeList = attributes.raw();
+        let mut process = PROCESS_INFORMATION::default();
+        // SAFETY: application and mutable command are terminated UTF-16, and the live attribute list assigns
+        // only the fresh Job. Inheritance is FALSE; the environment is explicitly limited to fixture values.
+        let ok = unsafe {
+            CreateProcessW(
+                application.as_ptr(),
+                command.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                environment.as_ptr().cast(),
+                std::ptr::null(),
+                &startup.StartupInfo,
+                &mut process,
+            )
+        };
+        assert_ne!(ok, 0, "synthetic worker creation failed: {}", std::io::Error::last_os_error());
+        // SAFETY: successful CreateProcessW transferred ownership of both handles.
+        let handle = unsafe { OwnedHandle::from_raw_handle(process.hProcess) };
+        // SAFETY: same successful creation, distinct returned thread handle.
+        let _thread = unsafe { OwnedHandle::from_raw_handle(process.hThread) };
+        assert!(self.contains(&handle), "worker must already belong to its creation-time Job");
+        handle
+    }
+}
+
+#[test]
+#[ignore = "diagnostic only; spawns a naturally exiting fixture for 30 seconds"]
+#[allow(unsafe_code)]
+fn job_membership_natural_exit_diagnostic() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::{JobObjectBasicProcessIdList, QueryInformationJobObject};
+    #[repr(C)]
+    struct Pids {
+        assigned: u32,
+        count: u32,
+        pids: [usize; 64],
+    }
+    let job = FixtureWorkerJob::observation_only();
+    let fixture = job.spawn_worker(&fixture_environment("diagnostic-sleep"));
+    let root = retained_fixture_identity(&fixture);
+    std::thread::sleep(Duration::from_millis(500));
+    let mut list = Pids { assigned: 0, count: 0, pids: [0; 64] };
+    // SAFETY: read-only query of this fresh observation-only Job with a suitably aligned output.
+    let ok = unsafe {
+        QueryInformationJobObject(
+            job.0.as_raw_handle(),
+            JobObjectBasicProcessIdList,
+            std::ptr::from_mut(&mut list).cast(),
+            size_of_val(&list) as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(ok, 0);
+    assert_eq!(list.assigned, list.count);
+    println!("diagnostic_fixture_root={} {} {}", root.pid, root.created_filetime, root.os_session);
+    let mut members = Vec::new();
+    for pid in &list.pids[..list.count as usize] {
+        let handle = retain_test_child(u32::try_from(*pid).unwrap());
+        assert!(job.contains(&handle) && !signaled(&handle));
+        let identity = retained_fixture_identity(&handle);
+        println!("diagnostic_job_member={} {} {}", identity.pid, identity.created_filetime, identity.os_session);
+        members.push(handle);
+    }
+    assert!(members.iter().any(|handle| retained_fixture_identity(handle) == root));
+    // SAFETY: wait only on the exact fixture process handle; never terminate it or the Job.
+    let wait = unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(fixture.as_raw_handle(), 35000) };
+    assert_eq!(wait, 0, "diagnostic fixture must exit naturally");
+}
+
+fn worker_boundary_fixture() {
+    let directory = std::path::PathBuf::from(std::env::var_os("KATALA_GUARD_OWNER_DIR").unwrap());
+    publish_fixture_marker(&directory.join("worker-ready"), &format!("{}\n", std::process::id()));
+    let end = deadline(Duration::from_secs(15));
+    while !directory.join("continue-tree").exists() {
+        assert!(Instant::now() < end, "worker release deadline");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut environment = fixture_environment("cancel-pipe");
+    environment.push(("KATALA_GUARD_READY".into(), directory.join("children-ready").into_os_string()));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let _ = runtime.block_on(run_standalone_windows_bounded(&fixture_invocation(), StandaloneWindowsEnvironment::new(&environment), b"", end, 65536, 65536));
+    panic!("synthetic worker unexpectedly completed before controller exit");
+}
+
+fn worker_boundary_controller() {
+    let directory = std::path::PathBuf::from(std::env::var_os("KATALA_GUARD_OWNER_DIR").unwrap());
+    let job = FixtureWorkerJob::new();
+    let expected_bystander = tune_core::collect::ProcessIdentity {
+        pid: std::env::var("KATALA_GUARD_BYSTANDER_PID").unwrap().parse().unwrap(),
+        created_filetime: std::env::var("KATALA_GUARD_BYSTANDER_CREATED").unwrap(),
+        os_session: std::env::var("KATALA_GUARD_BYSTANDER_SESSION").unwrap().parse().unwrap(),
+    };
+    let bystander = retain_test_child(expected_bystander.pid);
+    assert_eq!(retained_fixture_identity(&bystander), expected_bystander);
+    assert!(!signaled(&bystander) && !job.contains(&bystander), "the independent fixture is outside the worker Job");
+    let owner = format!("{}\n", std::process::id());
+    publish_fixture_marker(&directory.join("owner-ready"), &owner);
+    publish_fixture_marker(&directory.join("before-worker"), &owner);
+    let end = deadline(Duration::from_secs(15));
+    wait_for_fixture_release(&directory, "continue-worker", end);
+
+    let mut environment = fixture_environment("worker-child");
+    environment.push(("KATALA_GUARD_OWNER_DIR".into(), directory.as_os_str().to_owned()));
+    let worker = job.spawn_worker(&environment);
+    let worker_identity = retained_fixture_identity(&worker);
+    publish_fixture_marker(&directory.join("after-worker"), &identity_frame(&worker_identity));
+    wait_for_fixture_release(&directory, "continue-tree", end);
+    let (child, descendant) = loop {
+        if let Ok(frame) = std::fs::read_to_string(directory.join("children-ready"))
+            && let Some(body) = frame.strip_suffix('\n')
+        {
+            let fields: Vec<_> = body.split(' ').collect();
+            if fields.len() == 2
+                && let (Ok(child), Ok(descendant)) = (fields[0].parse(), fields[1].parse())
+            {
+                break (child, descendant);
+            }
+        }
+        assert!(Instant::now() < end && !signaled(&worker), "worker descendants did not become ready");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let child = retain_test_child(child);
+    let descendant = retain_test_child(descendant);
+    assert!(!signaled(&worker) && !signaled(&child) && !signaled(&descendant));
+    assert!(job.contains(&worker) && job.contains(&child) && job.contains(&descendant), "all exact processes must belong to the worker Job");
+    let tree = [worker_identity, retained_fixture_identity(&child), retained_fixture_identity(&descendant)];
+    let frame: String = tree.iter().map(identity_frame).collect();
+    publish_fixture_marker(&directory.join("tree-ready"), &frame);
+    wait_for_fixture_release(&directory, "never-release", end);
+    panic!("synthetic controller unexpectedly passed its final stop");
+}
+
+fn identity_frame(identity: &tune_core::collect::ProcessIdentity) -> String {
+    format!("{} {} {}\n", identity.pid, identity.created_filetime, identity.os_session)
+}
+
+// These observation fixtures use unnamed Jobs without termination limits.
+// A marker requests termination only of the controller's own pseudo-handle.
+fn observation_controller() {
+    let directory = std::path::PathBuf::from(std::env::var_os("KATALA_GUARD_OWNER_DIR").unwrap());
+    let owner = tune_core::collect::current_windows_process_identity().unwrap();
+    let worker_job = FixtureWorkerJob::observation_only();
+    publish_fixture_marker(&directory.join("observe-before"), &identity_frame(&owner));
+    let end = deadline(Duration::from_secs(20));
+    if !observation_control(&directory, Some("observe-continue"), end) {
+        return;
+    }
+    let mut environment = fixture_environment("observe-worker");
+    environment.push(("KATALA_GUARD_OWNER_DIR".into(), directory.as_os_str().to_owned()));
+    environment.push(("KATALA_OBSERVE_PARENT_PID".into(), owner.pid.to_string().into()));
+    environment.push(("KATALA_OBSERVE_PARENT_CREATED".into(), owner.created_filetime.into()));
+    environment.push(("KATALA_OBSERVE_PARENT_SESSION".into(), owner.os_session.to_string().into()));
+    let worker = worker_job.spawn_worker(&environment);
+    let identity = retained_fixture_identity(&worker);
+    assert!(!signaled(&worker) && worker_job.contains(&worker));
+    publish_fixture_marker(&directory.join("observe-after"), &identity_frame(&identity));
+    observation_control(&directory, None, end);
+}
+
+fn observation_control(directory: &std::path::Path, release: Option<&str>, end: Instant) -> bool {
+    loop {
+        if directory.join("observe-crash").exists() {
+            terminate_fixture_self();
+        }
+        if release.is_some_and(|name| directory.join(name).exists()) {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn observation_worker() {
+    let directory = std::path::PathBuf::from(std::env::var_os("KATALA_GUARD_OWNER_DIR").unwrap());
+    let expected = tune_core::collect::ProcessIdentity {
+        pid: std::env::var("KATALA_OBSERVE_PARENT_PID").unwrap().parse().unwrap(),
+        created_filetime: std::env::var("KATALA_OBSERVE_PARENT_CREATED").unwrap(),
+        os_session: std::env::var("KATALA_OBSERVE_PARENT_SESSION").unwrap().parse().unwrap(),
+    };
+    // Query/synchronize access only; retain the exact process object, never terminate a PID.
+    let parent = retain_test_child(expected.pid);
+    assert_eq!(retained_fixture_identity(&parent), expected);
+    assert!(!signaled(&parent));
+    publish_fixture_marker(&directory.join("observe-worker-ready"), &identity_frame(&expected));
+    let end = deadline(Duration::from_secs(25));
+    while !signaled(&parent) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if signaled(&parent) {
+        publish_fixture_marker(&directory.join("observe-parent-exited"), &identity_frame(&expected));
+    }
+}
+
+fn observation_bystander() {
+    let directory = std::path::PathBuf::from(std::env::var_os("KATALA_GUARD_OWNER_DIR").unwrap());
+    let end = deadline(Duration::from_secs(45));
+    while !directory.join("observe-bystander-release").exists() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_fixture_release(directory: &std::path::Path, release: &str, end: Instant) {
+    loop {
+        if directory.join("crash-owner").exists() {
+            terminate_fixture_self();
+        }
+        if directory.join(release).exists() {
+            return;
+        }
+        assert!(Instant::now() < end, "synthetic controller release deadline");
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[allow(unsafe_code)]
@@ -719,6 +1071,287 @@ async fn owner_abrupt_exit_closes_its_job_and_pipe_holding_descendants() {
         std::fs::remove_file(directory.join(marker)).unwrap();
     }
     std::fs::remove_dir(directory).unwrap();
+}
+
+struct WorkerBoundaryDirectory(std::path::PathBuf);
+
+impl WorkerBoundaryDirectory {
+    fn new() -> Self {
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let parent = workspace.join("target");
+        std::fs::create_dir_all(&parent).unwrap();
+        let path = parent.join(format!(
+            "fixture-worker-boundary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for WorkerBoundaryDirectory {
+    fn drop(&mut self) {
+        // Only fixed filenames inside our create-new directory; do not recursively delete.
+        for name in [
+            "owner-ready",
+            "before-worker",
+            "continue-worker",
+            "after-worker",
+            "worker-ready",
+            "continue-tree",
+            "children-ready",
+            "tree-ready",
+            "crash-owner",
+            "observe-before",
+            "observe-continue",
+            "observe-after",
+            "observe-worker-ready",
+            "observe-crash",
+            "observe-parent-exited",
+            "observe-bystander-release",
+        ] {
+            let path = self.0.join(name);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("pending"));
+        }
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+fn read_single_fixture_pid(path: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.strip_suffix('\n')?.parse().ok()
+}
+
+fn read_worker_identities(path: &std::path::Path, count: usize) -> Option<Vec<tune_core::collect::ProcessIdentity>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let body = text.strip_suffix('\n')?;
+    let mut result = Vec::new();
+    for row in body.split('\n') {
+        let fields: Vec<_> = row.split(' ').collect();
+        if fields.len() != 3 {
+            return None;
+        }
+        let pid = fields[0].parse().ok()?;
+        let created_filetime = fields[1].parse::<u64>().ok()?.to_string();
+        let os_session = fields[2].parse().ok()?;
+        result.push(tune_core::collect::ProcessIdentity { pid, created_filetime, os_session });
+    }
+    (result.len() == count).then_some(result)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerStop {
+    BeforeCreation,
+    AfterWorkerCreation,
+    AfterTreeCreation,
+}
+
+async fn worker_boundary_owner_exit(stop: WorkerStop) {
+    struct AbortOnDrop(tokio::task::JoinHandle<BoundedResult>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    let mut bystander = owned_bystander();
+    let bystander_observer = retain_test_child(bystander.0.id());
+    let bystander_identity = retained_fixture_identity(&bystander_observer);
+    assert!(!signaled(&bystander_observer));
+    let directory = WorkerBoundaryDirectory::new();
+    let mut environment = fixture_environment("worker-controller");
+    environment.push(("KATALA_GUARD_OWNER_DIR".into(), directory.0.as_os_str().to_owned()));
+    environment.push(("KATALA_GUARD_BYSTANDER_PID".into(), bystander_identity.pid.to_string().into()));
+    environment.push(("KATALA_GUARD_BYSTANDER_CREATED".into(), bystander_identity.created_filetime.clone().into()));
+    environment.push(("KATALA_GUARD_BYSTANDER_SESSION".into(), bystander_identity.os_session.to_string().into()));
+    let end = deadline(Duration::from_secs(15));
+    let mut task = AbortOnDrop(tokio::spawn(async move {
+        run_standalone_windows_bounded(&fixture_invocation(), StandaloneWindowsEnvironment::new(&environment), b"", end, 65536, 65536).await
+    }));
+    let owner_pid = loop {
+        let owner = read_single_fixture_pid(&directory.0.join("owner-ready"));
+        let before = read_single_fixture_pid(&directory.0.join("before-worker"));
+        if let (Some(owner), Some(before)) = (owner, before) {
+            assert_eq!(owner, before);
+            break owner;
+        }
+        assert!(Instant::now() < end && !task.0.is_finished(), "controller did not stop before worker creation");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let owner = retain_test_child(owner_pid);
+    let owner_identity = retained_fixture_identity(&owner);
+    assert!(!signaled(&owner));
+    let mut tree_observers = Vec::new();
+    let mut tree_identities = Vec::new();
+    if stop != WorkerStop::BeforeCreation {
+        std::fs::OpenOptions::new().create_new(true).write(true).open(directory.0.join("continue-worker")).unwrap();
+        let worker_identity = loop {
+            let worker = read_worker_identities(&directory.0.join("after-worker"), 1);
+            let ready = read_single_fixture_pid(&directory.0.join("worker-ready"));
+            if let (Some(mut worker), Some(ready)) = (worker, ready) {
+                let identity = worker.pop().unwrap();
+                assert_eq!(ready, identity.pid);
+                break identity;
+            }
+            assert!(Instant::now() < end && !task.0.is_finished(), "worker did not stop after creation");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let observer = retain_test_child(worker_identity.pid);
+        assert!(!signaled(&observer) && !signaled(&owner));
+        assert_eq!(retained_fixture_identity(&observer), worker_identity);
+        tree_observers.push(observer);
+        tree_identities.push(worker_identity.clone());
+        if stop == WorkerStop::AfterTreeCreation {
+            std::fs::OpenOptions::new().create_new(true).write(true).open(directory.0.join("continue-tree")).unwrap();
+            let tree = loop {
+                if let Some(tree) = read_worker_identities(&directory.0.join("tree-ready"), 3) {
+                    assert_eq!(worker_identity, tree[0]);
+                    break tree;
+                }
+                assert!(Instant::now() < end && !task.0.is_finished(), "worker tree did not stop after creation");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            assert!(tree.iter().all(|identity| identity.pid != owner_pid));
+            assert!(tree[0].pid != tree[1].pid && tree[0].pid != tree[2].pid && tree[1].pid != tree[2].pid);
+            for identity in tree.into_iter().skip(1) {
+                let observer = retain_test_child(identity.pid);
+                assert!(!signaled(&observer));
+                assert_eq!(retained_fixture_identity(&observer), identity);
+                tree_observers.push(observer);
+                tree_identities.push(identity);
+            }
+        }
+        // Allow the outer guard to observe the still-live members before owner exit.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!task.0.is_finished() && !signaled(&owner) && tree_observers.iter().all(|handle| !signaled(handle)));
+    }
+    std::fs::OpenOptions::new().create_new(true).write(true).open(directory.0.join("crash-owner")).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), &mut task.0).await.expect("outer owned guard must finish").unwrap();
+    assert!(signaled(&owner) && tree_observers.iter().all(signaled), "all retained owned processes must exit");
+    assert_eq!(result.code, Some(123));
+    assert_ack(&result, ProcessStop::Completed);
+    let receipt = result.process_receipt.as_ref().unwrap();
+    assert_eq!(receipt.root.as_ref(), Some(&owner_identity));
+    assert!(!receipt.observed.contains(&bystander_identity), "the independent fixture must not be in the outer Job receipt");
+    for identity in &tree_identities {
+        assert!(receipt.observed.contains(identity), "outer Job must have observed each exact tree member");
+    }
+    match stop {
+        WorkerStop::BeforeCreation => {
+            assert_eq!(receipt.total_processes, 1, "the before-creation stop must not create a worker: {receipt:?}");
+            assert!(!directory.0.join("after-worker").exists() && !directory.0.join("tree-ready").exists());
+        }
+        WorkerStop::AfterWorkerCreation => {
+            assert_eq!(receipt.total_processes, 2, "the worker must stop before creating descendants");
+            assert!(!directory.0.join("children-ready").exists() && !directory.0.join("tree-ready").exists());
+        }
+        WorkerStop::AfterTreeCreation => assert!(receipt.total_processes >= 4),
+    }
+    assert!(bystander.0.try_wait().unwrap().is_none() && !signaled(&bystander_observer), "independent owned fixture must still be live");
+    assert_eq!(retained_fixture_identity(&bystander_observer), bystander_identity);
+    assert!(!receipt.observed.contains(&bystander_identity));
+    bystander.0.kill().unwrap();
+    let cleanup_end = deadline(Duration::from_secs(2));
+    while bystander.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < cleanup_end, "owned bystander did not exit");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "unsafe experiment: an unverified Job member could be terminated; do not run"]
+async fn synthetic_worker_owner_crash_before_and_after_creation() {
+    let _serial = SERIAL.lock().await;
+    worker_boundary_owner_exit(WorkerStop::BeforeCreation).await;
+    worker_boundary_owner_exit(WorkerStop::AfterWorkerCreation).await;
+    worker_boundary_owner_exit(WorkerStop::AfterTreeCreation).await;
+}
+
+async fn observe_parent_exit_case(create_worker: bool) {
+    let directory = WorkerBoundaryDirectory::new();
+    let outer_job = FixtureWorkerJob::observation_only();
+    let mut bystander_command = fixture_command("observe-bystander");
+    bystander_command.env("KATALA_GUARD_OWNER_DIR", &directory.0).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut bystander = bystander_command.spawn().unwrap();
+    let bystander_observer = retain_test_child(bystander.id());
+    let bystander_identity = retained_fixture_identity(&bystander_observer);
+    assert!(!signaled(&bystander_observer) && !outer_job.contains(&bystander_observer));
+
+    let mut environment = fixture_environment("observe-controller");
+    environment.push(("KATALA_GUARD_OWNER_DIR".into(), directory.0.as_os_str().to_owned()));
+    let owner = outer_job.spawn_worker(&environment);
+    let owner_identity = retained_fixture_identity(&owner);
+    let end = deadline(Duration::from_secs(15));
+    loop {
+        if let Some(identity) = read_worker_identities(&directory.0.join("observe-before"), 1) {
+            assert_eq!(identity[0], owner_identity);
+            break;
+        }
+        assert!(Instant::now() < end && !signaled(&owner), "controller did not reach its before-creation stop");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let worker = if create_worker {
+        std::fs::OpenOptions::new().create_new(true).write(true).open(directory.0.join("observe-continue")).unwrap();
+        let identity = loop {
+            let created = read_worker_identities(&directory.0.join("observe-after"), 1);
+            let worker_parent = read_worker_identities(&directory.0.join("observe-worker-ready"), 1);
+            if let (Some(created), Some(worker_parent)) = (created, worker_parent) {
+                assert_eq!(worker_parent[0], owner_identity);
+                break created[0].clone();
+            }
+            assert!(Instant::now() < end && !signaled(&owner), "worker did not reach its after-creation stop");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let worker = retain_test_child(identity.pid);
+        assert!(!signaled(&worker) && outer_job.contains(&worker));
+        assert_eq!(retained_fixture_identity(&worker), identity);
+        Some(worker)
+    } else {
+        assert!(!directory.0.join("observe-after").exists());
+        None
+    };
+    assert!(!signaled(&owner) && !signaled(&bystander_observer));
+    // The controller responds only by terminating its own process pseudo-handle.
+    std::fs::OpenOptions::new().create_new(true).write(true).open(directory.0.join("observe-crash")).unwrap();
+    while !signaled(&owner) {
+        assert!(Instant::now() < end, "controller did not exit");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(observer_exit_code(&owner), 123);
+    if let Some(worker) = worker {
+        loop {
+            if signaled(&worker)
+                && let Some(parent) = read_worker_identities(&directory.0.join("observe-parent-exited"), 1)
+            {
+                assert_eq!(parent[0], owner_identity);
+                break;
+            }
+            assert!(Instant::now() < end, "worker did not observe the exact parent's exit and finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(observer_exit_code(&worker), 0);
+    }
+    assert!(bystander.try_wait().unwrap().is_none() && !signaled(&bystander_observer));
+    assert_eq!(retained_fixture_identity(&bystander_observer), bystander_identity);
+    assert!(!outer_job.contains(&bystander_observer));
+    std::fs::OpenOptions::new().create_new(true).write(true).open(directory.0.join("observe-bystander-release")).unwrap();
+    loop {
+        if let Some(status) = bystander.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(Instant::now() < end, "owned bystander did not exit naturally");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "unverified experiment: synchronous setup has no independently enforced wall-clock deadline"]
+async fn observation_only_job_reports_parent_exit_to_worker() {
+    let _serial = SERIAL.lock().await;
+    observe_parent_exit_case(false).await;
+    observe_parent_exit_case(true).await;
 }
 
 #[allow(unsafe_code)]
