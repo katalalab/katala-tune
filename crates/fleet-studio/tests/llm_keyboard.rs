@@ -108,6 +108,57 @@ fn navigation_repeat_without_held_flag_is_consumed_until_release() {
 }
 
 #[test]
+fn focus_recovery_accepts_first_search_shortcut_and_requires_release() {
+    for (key, alternate) in [("/", "slash"), ("slash", "/")] {
+        let mut gate = NavigationKeyGate::default();
+        gate.focus_lost();
+        assert!(gate.down(key, false));
+        assert!(!gate.down(alternate, false));
+        gate.up(alternate);
+        assert!(gate.down(key, false));
+        gate.focus_lost();
+        assert!(gate.down(key, false));
+    }
+}
+
+#[test]
+fn search_shortcut_keeps_held_and_modified_events_blocked() {
+    use fleet_studio::search_input::{KeyAction, KeyModifiers, search_key};
+    for key in ["/", "slash"] {
+        for (held, modified) in [(true, false), (false, true)] {
+            let mut gate = NavigationKeyGate::default();
+            gate.focus_lost();
+            let fresh = gate.down(key, held);
+            assert!(llm_keyboard::consume_blocked_shortcut(key, false, held || modified || !fresh));
+            assert!(!gate.down(key, false));
+            gate.up(key);
+            assert!(gate.down(key, false));
+        }
+        assert_eq!(search_key(key, KeyModifiers::default(), true, false), KeyAction::Ime);
+    }
+}
+
+#[test]
+fn search_recovery_keeps_action_keys_and_old_confirmation_blocked() {
+    let mut navigation = NavigationKeyGate::default();
+    let mut confirm = ConfirmKeyGate::<u64>::default();
+    confirm.arm(41);
+    navigation.focus_lost();
+    confirm.focus_lost();
+    assert!(navigation.down("/", false));
+    for key in ["up", "down", "enter", "x", "r", "a", "escape"] {
+        let blocked = !navigation.down(key, false);
+        assert!(blocked);
+        assert!(llm_keyboard::consume_blocked_shortcut(key, false, blocked));
+    }
+    assert!(!confirm.down(Some(&41), false, false));
+    for key in ["enter", "x", "y"] {
+        assert_eq!(llm_keyboard::key(key, true, true, false, true), None);
+        assert_eq!(fleet_studio::scope::machine_key(key, true, true, false), None);
+    }
+}
+
+#[test]
 fn focus_recovery_allows_only_l_and_m_to_start_selection_once() {
     let mut gate = NavigationKeyGate::default();
     gate.focus_lost();
@@ -118,7 +169,7 @@ fn focus_recovery_allows_only_l_and_m_to_start_selection_once() {
         assert!(!gate.down(key, true));
         gate.up(key);
     }
-    for key in ["up", "down", "enter", "x", "r", "a", "escape", "/", "slash"] {
+    for key in ["up", "down", "enter", "x", "r", "a", "escape"] {
         assert!(!gate.down(key, false));
     }
     let mut confirm = ConfirmKeyGate::<u64>::default();

@@ -133,6 +133,6 @@ impl NavigationKeyGate {
         self.audit = true;
         self.machine = false;
         self.escape = true;
-        self.search = true;
+        self.search = false;
     }
 }
