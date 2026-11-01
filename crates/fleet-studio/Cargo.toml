@@ -21,6 +21,7 @@ hyper-util = { version = "=0.1.21", features = ["tokio"] }
 http-body-util = "=0.1.5"
 tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time"] }
 url = "=2.5.8"
+unicode-segmentation = "=1.13.3"
 chrono = { version = "0.4", optional = true }
 gpui = { version = "=0.2.2", default-features = false, optional = true }
 

@@ -3,7 +3,9 @@
 pub mod audit;
 pub mod llm;
 pub mod navigation;
+pub mod pointer_id;
 pub mod recent;
+pub mod search_input;
 pub mod source;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

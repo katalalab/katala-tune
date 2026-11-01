@@ -1,12 +1,16 @@
+use std::cell::RefCell;
 use std::time::Duration;
 
+use crate::search_view::{SearchElement, SearchLayout};
 use fleet_studio::Observation;
 use fleet_studio::audit::{self, Audit, RepoAudit, Scope};
 use fleet_studio::llm::{self, Endpoint, ModelError, ModelObservation};
 use fleet_studio::navigation::{self, OpenResult, OpenState, OpenTarget};
+use fleet_studio::pointer_id::PointerIds;
 use fleet_studio::recent::{self, RecentEntry, RecentSlot, RecentWork, SyncStatus};
+use fleet_studio::search_input::{KeyAction, KeyModifiers, SearchInput, search_key};
 use fleet_studio::source::{self, Coverage, Dashboard, NodeCard, Repository};
-use gpui::{Context, FocusHandle, IntoElement, KeyDownEvent, Render, SharedString, Window, div, prelude::*, rgb};
+use gpui::{Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton, Render, SharedString, Window, div, prelude::*, rgb};
 
 #[derive(Clone)]
 struct ModelLine {
@@ -22,7 +26,9 @@ enum RecentOpen {
 }
 
 pub struct FleetView {
-    focus: FocusHandle,
+    pub(crate) focus: FocusHandle,
+    _focus_out: gpui::Subscription,
+    _activation: gpui::Subscription,
     sample: bool,
     recent_local: bool,
     generation: u64,
@@ -41,8 +47,12 @@ pub struct FleetView {
     topology_seq: u64,
     search_error: Option<String>,
     topology_filter: String,
-    search: String,
-    searching: bool,
+    pub(crate) search: SearchInput,
+    pub(crate) searching: bool,
+    pub(crate) search_layout: Option<SearchLayout>,
+    selecting: bool,
+    pub(crate) paste_status: Option<&'static str>,
+    pointer_ids: RefCell<PointerIds>,
     selected: navigation::Selection,
     open_state: OpenState,
 }
@@ -51,8 +61,18 @@ impl FleetView {
     pub fn new(sample: bool, recent_local: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window);
+        let focus_out = cx.on_focus_out(&focus, window, |view, _, _, cx| {
+            view.leave_search(cx);
+        });
+        let activation = cx.observe_window_activation(window, |view, window, cx| {
+            if !window.is_window_active() {
+                view.leave_search(cx);
+            }
+        });
         let mut view = Self {
             focus,
+            _focus_out: focus_out,
+            _activation: activation,
             sample,
             recent_local,
             generation: 0,
@@ -71,8 +91,12 @@ impl FleetView {
             topology_seq: 0,
             search_error: None,
             topology_filter: String::new(),
-            search: String::new(),
+            search: SearchInput::default(),
             searching: false,
+            search_layout: None,
+            selecting: false,
+            paste_status: None,
+            pointer_ids: RefCell::new(PointerIds::default()),
             selected: navigation::Selection::default(),
             open_state: OpenState::default(),
         };
@@ -92,6 +116,7 @@ impl FleetView {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.selected.invalidate();
+        self.pointer_ids.borrow_mut().clear();
         if !self.sample {
             if let Some(generation) = self.recent.request() {
                 self.start_recent(generation, cx);
@@ -154,6 +179,7 @@ impl FleetView {
             let mut data = task.await;
             let _ = view.update(cx, |view, cx| {
                 if view.generation == generation {
+                    view.pointer_ids.borrow_mut().clear();
                     if let Some(previous) = &view.dashboard {
                         source::preserve_previous(previous, &mut data);
                     }
@@ -163,7 +189,7 @@ impl FleetView {
                     view.loading = false;
                     view.data_inflight = false;
                     view.load_timeout = false;
-                    if !view.search.is_empty() {
+                    if !view.search.filter_text().is_empty() {
                         view.search_repositories(cx);
                     }
                     cx.notify();
@@ -225,6 +251,7 @@ impl FleetView {
         cx.spawn(async move |view, cx| {
             let data = task.await;
             let _ = view.update(cx, |view, cx| {
+                view.pointer_ids.borrow_mut().clear();
                 if let Some(next) = view.recent.complete(generation, data) {
                     view.start_recent(next, cx);
                 }
@@ -243,7 +270,7 @@ impl FleetView {
             self.topology_pending = true;
             return;
         }
-        let query = self.search.clone();
+        let query = self.search.filter_text().to_owned();
         let generation = self.generation;
         self.topology_searching = true;
         self.topology_seq = self.topology_seq.wrapping_add(1);
@@ -272,11 +299,12 @@ impl FleetView {
             let result = task.await;
             let _ = view.update(cx, |view, cx| {
                 view.topology_searching = false;
-                if view.generation == generation && view.search == query {
+                if view.generation == generation && view.search.filter_text() == query {
                     match result {
                         Ok(result) => {
                             if let Some(dashboard) = &mut view.dashboard {
                                 dashboard.repositories = result.repositories;
+                                view.pointer_ids.borrow_mut().clear();
                                 dashboard.topology_coverage = result.coverage;
                                 dashboard.topology_oldest_at = result.oldest_at;
                                 dashboard.topology_limited = result.limited;
@@ -318,6 +346,7 @@ impl FleetView {
             return;
         }
         if self.sample {
+            self.pointer_ids.borrow_mut().clear();
             self.audit = Some(Audit {
                 repos: vec![RepoAudit {
                     node: "fixture-node".into(),
@@ -364,6 +393,7 @@ impl FleetView {
                 } else {
                     match result {
                         Ok(mut audit) => {
+                            view.pointer_ids.borrow_mut().clear();
                             if let Some(previous) = &view.audit {
                                 audit::preserve_previous(previous, &mut audit);
                             }
@@ -390,35 +420,58 @@ impl FleetView {
         cx.notify();
     }
 
+    pub(crate) fn search_changed(&mut self, cx: &mut Context<Self>) {
+        self.selected.invalidate();
+        cx.notify();
+    }
+
+    fn leave_search(&mut self, cx: &mut Context<Self>) {
+        if self.searching {
+            self.search.cancel_composition();
+            self.searching = false;
+            self.selecting = false;
+            self.paste_status = None;
+            self.search_changed(cx);
+            self.search_repositories(cx);
+        }
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         if self.searching {
-            match key {
-                "escape" => {
-                    self.searching = false;
-                    self.search_repositories(cx);
+            let m = event.keystroke.modifiers;
+            let action = search_key(
+                key,
+                KeyModifiers { control: m.control, platform: m.platform, alt: m.alt, shift: m.shift, function: m.function },
+                self.search.is_composing(),
+                cfg!(target_os = "macos"),
+            );
+            match action {
+                KeyAction::Ime | KeyAction::Text => return,
+                KeyAction::Confirm | KeyAction::Leave => self.leave_search(cx),
+                KeyAction::Paste => self.paste_status = Some("貼り付けは未対応です。"),
+                KeyAction::SelectAll => self.search.select_all(),
+                KeyAction::Left(extend) => self.search.move_left(extend),
+                KeyAction::Right(extend) => self.search.move_right(extend),
+                KeyAction::Home(extend) => self.search.move_home(extend),
+                KeyAction::End(extend) => self.search.move_end(extend),
+                KeyAction::Backspace => {
+                    self.search.backspace();
                 }
-                "enter" => {
-                    self.searching = false;
-                    self.search_repositories(cx);
+                KeyAction::Delete => {
+                    self.search.delete();
                 }
-                "backspace" => {
-                    self.search.pop();
-                    self.selected.invalidate();
-                }
-                _ if !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform => {
-                    if let Some(text) = event.keystroke.key_char.as_deref().filter(|text| !text.chars().any(char::is_control)) {
-                        if self.search.len().saturating_add(text.len()) <= 256 {
-                            self.search.push_str(text);
-                        }
-                        self.selected.invalidate();
-                    }
-                }
-                _ => {}
             }
+            self.search_changed(cx);
+            cx.stop_propagation();
+            return;
         } else {
             match key {
-                "/" | "slash" => self.searching = true,
+                "/" | "slash" => {
+                    self.searching = true;
+                    self.selected.invalidate();
+                    cx.stop_propagation();
+                }
                 "r" => self.refresh(cx),
                 "a" => self.audit_repositories(Scope::Local, cx),
                 "down" => {
@@ -452,7 +505,7 @@ impl FleetView {
     }
 
     fn matches(&self, value: &str) -> bool {
-        self.search.is_empty() || value.to_lowercase().contains(&self.search.to_lowercase())
+        self.search.filter_text().is_empty() || value.to_lowercase().contains(&self.search.filter_text().to_lowercase())
     }
 
     fn matches_recent(&self, entry: &RecentEntry) -> bool {
@@ -734,6 +787,8 @@ fn recent_status(status: &SyncStatus, now: i64, max_age_ms: Option<i64>) -> Stri
 impl Render for FleetView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = tune_core::db::now_ms();
+        let mut pointer_ids = self.pointer_ids.borrow_mut();
+        pointer_ids.begin_frame();
         let mut content = div().id("content").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5();
         if self.load_timeout {
             content = content.child(note("保存データの読込が 5 秒を超過（終了待ち）。前回の結果は不明として表示します。".into(), 0xffb86c));
@@ -776,7 +831,7 @@ impl Render for FleetView {
             if dashboard.topology_limited {
                 content = content.child(note("構成情報には取得上限または未確定候補があります。保存 DB の構成情報の検索は未対応です。".into(), 0xffb86c));
             }
-            let search_unapplied = !self.sample && self.search != self.topology_filter;
+            let search_unapplied = !self.sample && self.search.filter_text() != self.topology_filter;
             if search_unapplied {
                 content = content.child(note("表示範囲を検索しています。保存 DB の構成情報の検索は未対応です。".into(), 0xffb86c));
             }
@@ -785,7 +840,7 @@ impl Render for FleetView {
                 shown += 1;
                 let url = repo.origin.as_deref().and_then(navigation::repository_url);
                 let mut item = div()
-                    .id(SharedString::from(format!("repo-{index}")))
+                    .id(SharedString::from(format!("click-{}", pointer_ids.get("repo", &[&repo.name, url.as_deref().unwrap_or("")]))))
                     .p_3()
                     .rounded_md()
                     .bg(rgb(if self.selected.index() == Some(index) { 0x233b56 } else { 0x182436 }))
@@ -874,7 +929,19 @@ impl Render for FleetView {
                     let selected_entry = entry.clone();
                     actions = actions.child(
                         div()
-                            .id(SharedString::from(format!("recent-dir-{index}")))
+                            .id(SharedString::from(format!(
+                                "click-{}",
+                                pointer_ids.get(
+                                    "recent-dir",
+                                    &[
+                                        &entry.node,
+                                        &entry.tool,
+                                        entry.cwd.as_deref().unwrap_or(""),
+                                        entry.directory_url.as_deref().unwrap_or(""),
+                                        if entry.local { "local" } else { "remote" }
+                                    ]
+                                )
+                            )))
                             .cursor_pointer()
                             .child("場所を表示")
                             .on_click(cx.listener(move |view, _, _, cx| view.open_recent(selected_entry.clone(), RecentOpen::Directory, cx))),
@@ -884,7 +951,19 @@ impl Render for FleetView {
                     let selected_entry = entry.clone();
                     actions = actions.child(
                         div()
-                            .id(SharedString::from(format!("recent-pr-{index}-{pr_index}")))
+                            .id(SharedString::from(format!(
+                                "click-{}",
+                                pointer_ids.get(
+                                    "recent-pr",
+                                    &[
+                                        &entry.node,
+                                        &entry.tool,
+                                        entry.cwd.as_deref().unwrap_or(""),
+                                        &entry.prs[pr_index],
+                                        if entry.local { "local" } else { "remote" }
+                                    ]
+                                )
+                            )))
                             .cursor_pointer()
                             .child(format!("PR {} を開く", pr_index + 1))
                             .on_click(cx.listener(move |view, _, _, cx| view.open_recent(selected_entry.clone(), RecentOpen::PullRequest(pr_index), cx))),
@@ -913,7 +992,7 @@ impl Render for FleetView {
                 content = content
                     .child(note(format!("{}: {}{} / {}", issue.node, if issue.previous { "前回: " } else { "" }, issue.reason, when(issue.at)), 0xffb86c));
             }
-            for (index, repo) in audit.repos.iter().filter(|repo| self.matches(&format!("{} {}", repo.node, repo.path))).take(200).enumerate() {
+            for repo in audit.repos.iter().filter(|repo| self.matches(&format!("{} {}", repo.node, repo.path))).take(200) {
                 let detail = format!(
                     "{}  /  変更・未追跡 {}  /  未 push {}  /  behind {}  /  remote に無い {}  /  {}  /  {}{}",
                     repo.branch.as_deref().unwrap_or("branch 不明"),
@@ -931,7 +1010,10 @@ impl Render for FleetView {
                 );
                 let local_path = repo.local.then(|| repo.path.clone());
                 let mut item = div()
-                    .id(SharedString::from(format!("audit-{index}")))
+                    .id(SharedString::from(format!(
+                        "click-{}",
+                        pointer_ids.get("audit", &[&repo.node, &repo.path, if repo.local { "local" } else { "remote" }])
+                    )))
                     .p_3()
                     .rounded_md()
                     .bg(rgb(0x182436))
@@ -960,6 +1042,8 @@ impl Render for FleetView {
             content = content.child(note("未実行。未確認のリポジトリは正常と数えません。".into(), 0x9baec4));
         }
 
+        pointer_ids.finish_frame();
+        drop(pointer_ids);
         div()
             .size_full()
             .flex()
@@ -1037,17 +1121,35 @@ impl Render for FleetView {
                     .px_5()
                     .py_3()
                     .bg(rgb(0x192b42))
-                    .cursor_pointer()
-                    .child(format!(
-                        "検索 / : {}{}",
-                        if self.search.is_empty() { "機体・リポジトリ・モデル" } else { &self.search },
-                        if self.searching { " ▏" } else { "" }
-                    ))
-                    .on_click(cx.listener(|view, _, window, cx| {
-                        view.searching = true;
-                        view.focus.focus(window);
-                        cx.notify();
-                    })),
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child("検索 / :")
+                    .child(div().flex_1().child(SearchElement { view: cx.entity() }))
+                    .when(self.search.is_composing(), |container| container.child(div().text_sm().child("変換中: 確定前の条件で表示")))
+                    .when_some(self.paste_status, |container, status| container.child(div().text_sm().child(status)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, event: &gpui::MouseDownEvent, window, cx| {
+                            view.searching = true;
+                            view.focus.focus(window);
+                            view.selecting = true;
+                            if let Some(byte) = view.search_layout.as_ref().and_then(|layout| layout.byte_for_point(view.search.text(), event.position)) {
+                                view.search.select_byte(byte, event.modifiers.shift);
+                            }
+                            view.search_changed(cx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|view, event: &gpui::MouseMoveEvent, _, cx| {
+                        if view.selecting
+                            && let Some(byte) = view.search_layout.as_ref().and_then(|layout| layout.byte_for_point(view.search.text(), event.position))
+                        {
+                            view.search.select_byte(byte, true);
+                            view.search_changed(cx);
+                        }
+                    }))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|view, _, _, _| view.selecting = false))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(|view, _, _, _| view.selecting = false)),
             )
             .child(content)
             .child(

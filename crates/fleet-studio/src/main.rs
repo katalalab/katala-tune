@@ -1,3 +1,4 @@
+mod search_view;
 mod view;
 
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
