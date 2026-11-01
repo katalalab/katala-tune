@@ -51,13 +51,24 @@ The Job's `total_processes` and the list of observed identities are separate
 measurements. Polling can miss short-lived descendants; the list is not an
 exhaustive process history. Zero Job membership is the descendant-exit evidence.
 After observing retained root exit and its exit code, accounting is refreshed
-and retained member signals are sampled afterwards. Lingering descendants
-require a nonsignaled observed member after root exit as well as nonzero Job
-accounting. If all retained members have exited but accounting is still nonzero,
-the backend continues actual observation within the unchanged execution deadline
-and existing cleanup window. It never synthesizes Job zero or assumes unknown
-active membership is harmless lag; errors, limits and missing cleanup remain
+and retained member signals are sampled afterwards. The first successful root
+zero-wait observation fixes a monotonic anchor R once, conservatively timestamped
+at the start of that query. Process quiescence means actual Job zero and all
+retained handles signaled. It must first be observed before Q, the earlier of
+R plus one second and the original execution deadline. A first quiet sample at
+or after Q is rejected; current emptiness never proves earlier completion.
+Unknown members and new descendants do not restart this clock or receive an
+image-name or exit-code exemption. Errors, limits and missing cleanup remain
 failures, and actual zero membership is mandatory for ACK.
+
+This is a whole-invocation lifetime policy: any owned descendant, including an
+unknown executable, may continue running after root exit within this bound.
+Such a child can have side effects before it exits; quiescence is not proof of
+read-only behavior or a filesystem sandbox. Pinned executables, fixed metadata
+commands, restricted configuration/environment, source allowlists/content hashes
+and final HEAD checks remain separate admission and read-only controls. An
+approved action does not acquire permission for an additional operation merely
+because its descendants have more time to finish.
 Exit code `259` alone is never used as a liveness test.
 
 A completed input writer is not a delivery acknowledgement. Tokio/mio may have
@@ -72,7 +83,15 @@ it does not rebase a remaining duration. That same execution deadline is checked
 before admitting completed evidence and again at payload release: a completion first observed after its deadline is a
 timeout even if subsequent cleanup is fully confirmed. After
 timeout/overflow/lingering, only the newly owned Job is terminated, and a
-separate three-second cleanup window gathers exit and pipe evidence. Output
+three-second cleanup window gathers exit and pipe evidence. On root exit this
+same end is anchored at R plus three seconds, leaving a nominal two seconds for
+termination/ACK after Q. Any already earlier cleanup end is retained and can
+only shorten observation. Scheduler/native-call delay can consume this reserve;
+it is not an OS termination guarantee and never permits extending the end.
+After process quiescence has been observed in time, output EOF and writer
+completion may still be observed within the earlier of the original execution
+deadline and that cleanup end. Delayed pipe draining alone is not a live-member
+failure, and EOF alone never acknowledges a live process. Output
 readers continue draining without increasing their saved byte budget. Cleanup
 that cannot be confirmed is recorded as incomplete. The cleanup deadline starts
 once and is never extended. All stop changes, including observation failure and
@@ -141,7 +160,7 @@ actual target acceptance.
 
 `tests/windows_guard.rs` is a dedicated process whose native invocations and
 standard-spawn controls share one serial lock. It exercises the explicit product
-backend with all twelve lifecycle cases, three startup/EOF smoke cases, and
+backend with lifecycle cases, startup/EOF smoke cases, and
 complete-environment admission and isolation regressions,
 including real PowerShell, native Rust stdio, and explicit child output-handle
 closure. Standard-spawn controls finish before native invocation. Cases cover
@@ -162,13 +181,53 @@ This controlled termination test establishes accounting order; it is not a
 natural-exit or pipe-EOF witness test. Those checks remain in the dedicated
 integration cases. Earlier real-resume fixture runs observed an unexplained
 additional Job member, including a nonsignaled member after root exit. Its origin
-and teardown remain unresolved; live descendants and unconfirmed cleanup stay
-failures, with no production grace period or member exclusion.
+and teardown remain unresolved. The bounded whole-invocation policy above now
+allows actual natural retirement to be observed; live descendants beyond Q and
+unconfirmed cleanup remain failures, with no member exclusion.
 
 Private decision-table tests use synthetic diagnostic state to check classification
 and cleanup-request policy, including one-shot requests after pending observation
 fails or expires. These policy values are not OS observations and do not mint an
 ownership witness or replace the actual Job, retained-handle and EOF tests.
+
+### Test-only lifecycle diagnostics
+
+Library unit tests emit `owned_job_diagnostic` events at the first selected stop,
+immediately before the one-shot termination request, and at actual cleanup ACK
+or cleanup expiry. The stop remains visible in the ACK: an ACK after termination
+does not establish natural exit or authorize payload release. Receipt flags are
+the values used by the loop; the separately queried handle/accounting fields are
+later, sequential observations and are not an atomic snapshot.
+
+The closed output contract contains only enums, booleans and numeric results.
+It samples the root and at most fifteen further retained process handles, using
+stable ordinals rather than PIDs or creation times; a larger set is marked
+truncated. It records zero-wait results, membership and exit-query results/errors,
+and actual active/total accounting from the same owned Job. An image query is
+reduced in memory to `SelfFixture`, `Git`, `PowerShell`, `Conhost`, `WerFault`,
+`Other` or `Unknown`. A basename match establishes neither file authenticity nor
+the cause of an additional member. Arbitrary names, paths, identities, command
+lines and source output never enter this diagnostic formatter. Elapsed time is
+measured from this invocation's observation-loop setup and never controls a
+deadline or extends the existing cleanup window.
+
+`real_resume_diagnostics_are_isolated_and_keep_the_strict_lifecycle` runs an
+exact-filter standalone libtest child. It resumes a real root that exits and a
+separate root that deliberately leaves an owned live descendant; both use the
+product guard and its fixed observation/cleanup policy. An unexplained additional
+member may still fail the normal-exit case if actual completion is not observed
+in time. No member exclusion or alternate completion witness is added.
+
+The public-guard root-first fixture retains real root/child observer handles
+before releasing the root. Its child waits for actual root signal, then250ms,
+writes only a create-new fixture-private marker and exits naturally. That marker
+deliberately characterizes permitted post-root side effects; it is not a
+read-only guarantee. Readiness is written, flushed, closed and renamed before
+the complete frame can be read. Long-lived/early-EOF, original-deadline and
+pending-cancellation negatives keep real owned-Job cleanup mandatory.
+`cfg(test)` library instrumentation is not present in normal library builds
+used by integration tests or the shipped CLI; those tests do not gain internal
+events merely by being integration tests.
 
 API references: [Rust temporary handle inheritance lock](https://github.com/rust-lang/rust/blob/1.99.0/library/std/src/sys/process/windows.rs#L314-L399),
 [Job assignment at creation](https://devblogs.microsoft.com/oldnewthing/20230209-00/?p=107812%2F),

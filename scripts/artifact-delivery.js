@@ -8,7 +8,7 @@ const { execFileSync, spawnSync } = require('node:child_process');
 const { isDeepStrictEqual } = require('node:util');
 
 const PLATFORMS = {
-  'macos-arm64': { target: 'aarch64-apple-darwin', os: 'macOS', arch: 'ARM64', runner: 'macos-15', bins: ['tune'] },
+  'macos-arm64': { target: 'aarch64-apple-darwin', os: 'macOS', arch: 'ARM64', runner: 'macos-15', bins: ['tune', 'tune-agent'] },
   'windows-x64': { target: 'x86_64-pc-windows-msvc', os: 'Windows', arch: 'X64', runner: 'windows-2025', bins: ['tune', 'tune-agent'] },
 };
 const APP = 'Katala Tune.app';
@@ -306,6 +306,7 @@ function inspectPE(buffer, gui) {
 }
 
 function inspectPayload(root, name, proof) {
+  const p = platform(name);
   validateProof(proof, name);
   const files = inventory(root);
   if (name === 'windows-x64') {
@@ -316,7 +317,7 @@ function inspectPayload(root, name, proof) {
     }
     return { files, binaries: files.map(f => ({ path: f.path, ...inspectPE(fs.readFileSync(path.join(root, f.path)), f.path === 'katala-tune.exe') })) };
   }
-  const required = ['Contents/Info.plist', 'Contents/MacOS/katala-tune', 'Contents/MacOS/tune', `Contents/Resources/${PROOF}`, 'Contents/_CodeSignature/CodeResources'];
+  const required = ['Contents/Info.plist', 'Contents/MacOS/katala-tune', 'Contents/MacOS/tune', 'Contents/MacOS/tune-agent', `Contents/Resources/${PROOF}`, 'Contents/_CodeSignature/CodeResources'];
   const allowed = new Set([...required, 'Contents/PkgInfo', 'Contents/Resources/icon.icns']);
   for (const f of files) need(f.path.startsWith(`${APP}/`) && allowed.has(f.path.slice(APP.length + 1)), 'unexpected macOS payload file');
   for (const f of required) need(files.some(entry => entry.path === `${APP}/${f}`), `missing ${f}`);
@@ -326,7 +327,7 @@ function inspectPayload(root, name, proof) {
   const plist = key => run('/usr/libexec/PlistBuddy', ['-c', `Print :${key}`, path.join(app, 'Contents/Info.plist')]);
   need(plist('CFBundleExecutable') === 'katala-tune' && plist('CFBundleIdentifier') === 'org.katala.tune.tauri', 'Info.plist identity mismatch');
   need(plist('CFBundleShortVersionString') === proof.build.appVersion, 'Info.plist version mismatch');
-  const binaries = ['katala-tune', 'tune'].map(bin => {
+  const binaries = ['katala-tune', ...p.bins].map(bin => {
     const file = `${APP}/Contents/MacOS/${bin}`;
     need(files.find(f => f.path === file).executable, 'Mac binary not executable');
     need(run('lipo', ['-archs', path.join(root, file)]) === 'arm64', 'Mach-O must be arm64 only');

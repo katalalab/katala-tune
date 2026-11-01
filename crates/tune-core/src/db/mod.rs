@@ -11,6 +11,7 @@ mod actions;
 mod ai_limits;
 mod ai_sessions;
 mod ai_usage;
+mod baseline;
 mod checks;
 mod inventory;
 mod logs;
@@ -18,6 +19,7 @@ pub mod metrics;
 mod monitor_events;
 mod netsec;
 pub mod provenance;
+pub mod retention;
 mod snapshots;
 mod topology;
 
@@ -59,6 +61,7 @@ const SCHEMA_PARTS: &[&str] = &[
     provenance::SCHEMA,
     ai_limits::SCHEMA,
     metrics::SCHEMA,
+    retention::SCHEMA,
     monitor_events::SCHEMA,
     topology::SCHEMA,
 ];
@@ -129,6 +132,7 @@ impl Store {
             ("logs", "occurrences", "INTEGER NOT NULL DEFAULT 1"),
             ("log_cursors", "fail_streak", "INTEGER NOT NULL DEFAULT 0"),
             ("log_cursors", "note", "TEXT"),
+            ("tune_actions", "target", "TEXT"),
             ("topology_refresh_lease", "generation", "INTEGER NOT NULL DEFAULT 1"),
         ] {
             let has: i64 = self.conn.query_row(&format!("SELECT count(*) FROM pragma_table_info('{table}') WHERE name = ?"), [name], |r| r.get(0))?;

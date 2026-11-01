@@ -169,15 +169,15 @@ test('台帳の "network": false で止める（ログインの記録も集め�
   assert.match(windowsSshCommand(false, true), /--benchmark 0 --network 1 --observe-wsl 0 --budget-ms 120000$/);
 });
 
-test('Windows のログオンの記録は別のスクリプトで、同じ運び方（8191 バイトまで）で送り、結果を1つにまとめる', () => {
+test('Windows のログオンの記録は別のstdinで送り、結果を1つにまとめる', () => {
   const script = fs.readFileSync(path.join(PROBES, 'win_logons.ps1'));
   const t = logs.windowsLogonsTransport({ win_security: '9007199254740991:1800000000000' }, script);
   assert.ok(Buffer.byteLength(t.command) < 8191);
-  assert.match(t.bootstrap, /\[ScriptBlock\]::Create\(\$s\)\) -SecCursor 9007199254740991 -SecTime 1800000000000$/);
-  assert.match(logs.windowsLogonsTransport({ win_security: '9007199254740993:9223372036854775807' }, script).bootstrap, /-SecCursor 9007199254740993 -SecTime 9223372036854775807$/);
-  assert.match(logs.windowsLogonsTransport({ win_security: '9223372036854775808:1' }, script).bootstrap, /-SecCursor 0 -SecTime 0$/);
-  assert.match(logs.windowsLogonsTransport({ win_security: '42;Write-Error bad:99' }, script).bootstrap, /-SecCursor 0 -SecTime 0$/);
-  assert.match(t.command, /^printf %s [A-Za-z0-9+/=]+ \| powershell\.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand [A-Za-z0-9+/=]+$/);
+  assert.deepEqual(t.input.split('\n').slice(0, 5), ['KTLOG1', 'logons', '9007199254740991', '1800000000000', '0']);
+  assert.match(logs.windowsLogonsTransport({ win_security: '9007199254740993:9223372036854775807' }, script).input, /\n9007199254740993\n9223372036854775807\n0\n/);
+  assert.match(logs.windowsLogonsTransport({ win_security: '9223372036854775808:1' }, script).input, /\n0\n0\n0\n/);
+  assert.match(logs.windowsLogonsTransport({ win_security: '42;Write-Error bad:99' }, script).input, /\n0\n0\n0\n/);
+  assert.match(t.command, /^powershell\.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand [A-Za-z0-9+/=]+$/);
   const main = { code: 0, out: JSON.stringify({ probe: 'win_logs', sources: { win_system: { cursor: '1', rows: [] } } }), err: '' };
   const merged = JSON.parse(logs.mergeLogons(main, { code: 0, out: `noise\n${JSON.stringify({ sources: { win_security: { cursor: '9', rows: [], note: 'no-permission' } } })}`, err: '' }).out);
   assert.deepEqual([merged.sources.win_system.cursor, merged.sources.win_security.note], ['1', 'no-permission']);

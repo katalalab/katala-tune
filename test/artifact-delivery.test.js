@@ -255,22 +255,60 @@ test('macOS real arm64 signed bundle survives archive/extraction and rejects cha
   const release = path.join(f.root, 'target', target, 'release'); fs.mkdirSync(release, { recursive: true });
   const tune = path.join(release, 'tune');
   execFileSync('cc', ['-arch', 'arm64', '-x', 'c', '-', '-o', tune], { input: 'int main(void) { return 0; }\n' });
-  fs.copyFileSync(tune, path.join(f.root, `src-tauri/binaries/tune-${target}`));
-  fs.writeFileSync(path.join(f.root, 'sidecars.json'), JSON.stringify({ bundle: { externalBin: ['binaries/tune'] } }));
+  fs.copyFileSync(tune, path.join(release, 'tune-agent'));
+  for (const bin of ['tune', 'tune-agent']) fs.copyFileSync(path.join(release, bin), path.join(f.root, `src-tauri/binaries/${bin}-${target}`));
+  fs.writeFileSync(path.join(f.root, 'sidecars.json'), JSON.stringify({ bundle: { externalBin: ['binaries/tune', 'binaries/tune-agent'] } }));
   const env = { ...f.env, RUNNER_OS: 'macOS', RUNNER_ARCH: 'ARM64', ImageOS: 'macos15' };
   const proof = sourceProof(f.root, 'macos-arm64', env, f.version);
   const payload = path.join(f.root, 'payload'), app = path.join(payload, 'Katala Tune.app');
   fs.mkdirSync(path.join(app, 'Contents/MacOS'), { recursive: true }); fs.mkdirSync(path.join(app, 'Contents/Resources'));
-  for (const bin of ['tune', 'katala-tune']) { fs.copyFileSync(tune, path.join(app, 'Contents/MacOS', bin)); fs.chmodSync(path.join(app, 'Contents/MacOS', bin), 0o755); }
+  for (const bin of ['tune', 'tune-agent', 'katala-tune']) { fs.copyFileSync(tune, path.join(app, 'Contents/MacOS', bin)); fs.chmodSync(path.join(app, 'Contents/MacOS', bin), 0o755); }
   fs.writeFileSync(path.join(app, 'Contents/Info.plist'), '<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>katala-tune</string><key>CFBundleIdentifier</key><string>org.katala.tune.tauri</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleShortVersionString</key><string>0.6.4</string></dict></plist>');
   const proofFile = path.join(f.root, 'proof.json'), bytes = JSON.stringify(proof, null, 2) + '\n';
   fs.writeFileSync(proofFile, bytes); fs.writeFileSync(path.join(app, 'Contents/Resources/katala-source.json'), bytes);
   execFileSync('codesign', ['--force', '--deep', '--sign', '-', app], { stdio: 'pipe' });
   const manifest = packageDelivery(f.root, 'macos-arm64', proofFile, payload, path.join(f.root, 'delivery'), env, f.version);
-  assert.equal(manifest.archive.sha256.length, 64); assert.equal(manifest.binaries.length, 2);
+  assert.equal(manifest.archive.sha256.length, 64); assert.equal(manifest.binaries.length, 3);
   assert.equal(manifest.bundle.signature, 'ad-hoc; codesign --verify --deep --strict');
   fs.writeFileSync(path.join(app, 'Contents/Resources/katala-source.json'), '{}');
   assert.throws(() => inspectPayload(payload, 'macos-arm64', proof), /proof mismatch/);
+});
+
+test('manual macOS sidecar recipe supplies both inputs required by source provenance', { skip: process.platform === 'win32' }, t => {
+  const f = fixture(t), target = 'aarch64-apple-darwin', tools = path.join(f.root, 'tools');
+  fs.mkdirSync(tools);
+  fs.rmSync(path.join(f.root, 'src-tauri/binaries'), { recursive: true });
+  // Only Cargo is simulated: run the actual workflow shell and real sourceProof
+  // consumer without compiling Rust or dispatching an artifact build.
+  fs.writeFileSync(path.join(tools, 'cargo'), `#!/bin/sh
+set -eu
+mkdir -p "target/$TARGET/release"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -p ]; then
+    shift
+    case "$1" in tune-cli) bin=tune ;; tune-agent) bin=tune-agent ;; *) exit 2 ;; esac
+    printf '%s' "$bin-fixture" > "target/$TARGET/release/$bin"
+  fi
+  shift
+done
+`, { mode: 0o755 });
+  const proofRunner = path.join(tools, 'proof.js');
+  fs.writeFileSync(proofRunner, `const fs = require('node:fs');
+const { sourceProof } = require(${JSON.stringify(path.resolve(__dirname, '../scripts/artifact-delivery'))});
+const [, , script, command, platform, output] = process.argv;
+if (script !== 'scripts/artifact-delivery.js' || command !== 'source') process.exit(2);
+fs.writeFileSync(output, JSON.stringify(sourceProof(process.cwd(), platform, process.env, ${f.version.toString()})));
+`);
+  fs.writeFileSync(path.join(tools, 'node'), '#!/bin/sh\nexec "$TEST_NODE" "$TEST_PROOF_RUNNER" "$@"\n', { mode: 0o755 });
+  const workflow = fs.readFileSync(path.join(__dirname, '../.github/workflows/artifact-delivery.yml'), 'utf8').replace(/\r\n/g, '\n');
+  const recipe = workflow.match(/- name: Build release sidecars\n        run: \|\n((?:          .*\n)+)/)[1].replace(/^          /gm, '');
+  const env = { ...process.env, ...f.env, RUNNER_OS: 'macOS', RUNNER_ARCH: 'ARM64', ImageOS: 'macos15',
+    PLATFORM: 'macos-arm64', TARGET: target, RUNNER_TEMP: tools, PATH: `${tools}${path.delimiter}${process.env.PATH}`,
+    TEST_NODE: process.execPath, TEST_PROOF_RUNNER: proofRunner };
+  execFileSync('/bin/bash', ['-euo', 'pipefail', '-c', recipe], { cwd: f.root, env, stdio: 'pipe' });
+  const proof = JSON.parse(fs.readFileSync(path.join(tools, 'katala-source.json')));
+  validateProof(proof, 'macos-arm64');
+  assert.deepEqual(proof.build.sidecars.map(v => v.path), ['tune', 'tune-agent']);
 });
 
 test('workflow is dispatch-only, permission-limited, SHA-pinned and uses real locked Tauri builds', () => {

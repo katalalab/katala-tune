@@ -108,7 +108,7 @@ test('macOS 低電力モード: 電源ドメインの旧値を再読し、検証
 test('タスク管理: Windows 標準のタスクと不正な名前は拒否し、無効化は有効化で戻せる', () => {
   const p = plan(win, { type: 'task-disable', params: { path: '\\', name: 'KatalaGitHubBackup' } }, ctx);
   assert.match(p.script, /Disable-ScheduledTask -TaskPath "\\" -TaskName "KatalaGitHubBackup"/);
-  assert.deepEqual(p.undo, { type: 'task-enable', params: { path: '\\', name: 'KatalaGitHubBackup' } });
+  assert.equal(p.undo, undefined); // Undo requires a verified execution receipt.
   assert.throws(() => plan(win, { type: 'task-disable', params: { path: '\\Microsoft\\Windows\\', name: 'Defrag' } }, ctx), /標準/);
   assert.throws(() => plan(win, { type: 'task-run', params: { path: '\\', name: 'x"; Remove-Item C:\\ -Recurse; "' } }, ctx), /タスク名/);
   assert.throws(() => plan(win, { type: 'task-run', params: { path: 'C:\\', name: 'x' } }, ctx), /パス/);

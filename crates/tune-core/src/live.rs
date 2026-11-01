@@ -689,8 +689,10 @@ fn windows_boot(n: usize, params: &str) -> String {
     )
 }
 
-/// 各機体に置くネイティブのサンプラー（`tune-agent sample`。Windows だけ。置き方は docs/architecture.md）
+/// 各機体に置くネイティブのサンプラー（`tune-agent sample`。置き方は docs/architecture.md）
 pub const NATIVE_REMOTE: &str = "~/.katala-tune/bin/tune-agent.exe";
+/// macOS の置き場所（名前に .exe が付かない）
+pub const NATIVE_REMOTE_MAC: &str = "~/.katala-tune/bin/tune-agent";
 
 fn native_args(o: &Opts) -> Vec<String> {
     [
@@ -706,8 +708,9 @@ fn native_args(o: &Opts) -> Vec<String> {
 /// この機体のネイティブのサンプラー: アプリの隣、無ければ helpers の namespace。
 /// `KATALA_TUNE_DATA_DIR` を明示した QA では `data/bin` に閉じ、通常は従来の HOME を使う。
 fn local_native() -> Option<PathBuf> {
-    let beside = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("tune-agent.exe")));
-    let managed = crate::helpers::bin_dir().join("tune-agent.exe");
+    let name = crate::helpers::exe("tune-agent");
+    let beside = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(&name)));
+    let managed = crate::helpers::bin_dir().join(&name);
     [beside, Some(managed)].into_iter().flatten().find(|p| p.is_file())
 }
 
@@ -721,12 +724,24 @@ pub fn launch(node: &Node, o: &Opts) -> Result<Launch, String> {
         let a = format!("interval={} procs={} max={} watch=1", secs(o.interval), secs(o.procs_every), secs(o.sampler_max_age));
         let boot = python_boot(MAC_LIVE.len());
         let stdin = MAC_LIVE.as_bytes().to_vec();
+        // ネイティブ（tune-agent sample）を先に使い、置いていない・起動できない（古い版・合わないアーキテクチャ）なら
+        // Python 版。ネイティブは起動に失敗するとき標準入力を読まずに終わるので、Python 版はそのままスクリプトを読める。
+        // ネイティブが動いたときは、標準入力のスクリプトを読み捨てる
+        let native = native_args(o).join(" ");
         if node.local {
+            if let Some(exe) = local_native() {
+                // パスは引数で渡す（空白を含む .app の中でも引用符を組み立てない）
+                let script = format!("\"$0\" {native} || exec /usr/bin/env python3 -c '{boot}' {a}");
+                let args = vec!["-c".to_string(), script, exe.to_string_lossy().into_owned()];
+                return Ok(Launch { program: "/bin/sh".into(), args, stdin, keep_stdin: true, cleanup: None });
+            }
             let mut args = vec!["python3".to_string(), "-c".to_string(), boot];
             args.extend(a.split(' ').map(str::to_string));
             return Ok(Launch { program: "/usr/bin/env".into(), args, stdin, keep_stdin: true, cleanup: None });
         }
-        let remote = format!("command -v python3 >/dev/null && exec python3 -c '{boot}' {a} || exec /usr/bin/python3 -c '{boot}' {a}");
+        let remote = format!(
+            "[ -x {NATIVE_REMOTE_MAC} ] && {NATIVE_REMOTE_MAC} {native} || {{ command -v python3 >/dev/null && exec python3 -c '{boot}' {a} || exec /usr/bin/python3 -c '{boot}' {a}; }}"
+        );
         return Ok(Launch { program: "ssh".into(), args: live_ssh_args(&node.alias, &remote), stdin, keep_stdin: true, cleanup: None });
     }
     if node.is_windows() {
@@ -1740,6 +1755,27 @@ mod tests {
     }
 
     #[test]
+    fn disk_null_partial_and_legacy_samples_preserve_unknown_and_idle() {
+        for (disk, read, write) in [
+            (None, None, None),
+            (Some(Value::Null), None, None),
+            (Some(json!({"read_bps":null,"write_bps":120})), None, Some(120.0)),
+            (Some(json!({"read_bps":0,"write_bps":0})), Some(0.0), Some(0.0)),
+        ] {
+            let mut row = json!({"type":"s","t":1000,"cpu":10});
+            if let Some(disk) = disk {
+                row["disk"] = disk;
+            }
+            let Some(Msg::Sample(raw)) = parse_line(&row.to_string()) else { panic!("sample") };
+            let (sample, _, _) = Sample::from_raw(*raw, 1000);
+            let point = sample.point();
+            assert_eq!(point.get("dr").and_then(Value::as_f64), read);
+            assert_eq!(point.get("dw").and_then(Value::as_f64), write);
+            assert_eq!(point["cpu"], json!(10.0));
+        }
+    }
+
+    #[test]
     fn parses_lines_and_ignores_noise() {
         let Some(Msg::Hello(h)) = parse_line("\u{FEFF}{\"type\":\"hello\",\"v\":1,\"os\":\"windows\",\"cores\":8,\"errors\":\"x\",\"has\":{\"gpu\":true}}\r")
         else {
@@ -1793,12 +1829,284 @@ mod tests {
         assert_eq!(downsample(&pts[..3], 4).len(), 3, "少なければそのまま");
     }
 
+    struct LaunchTestDir {
+        path: PathBuf,
+        cleanup: bool,
+    }
+
+    impl LaunchTestDir {
+        fn create(path: PathBuf) -> std::io::Result<Self> {
+            std::fs::create_dir(&path)?;
+            Ok(Self { path, cleanup: true })
+        }
+
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            Self::create(std::env::temp_dir().join(format!("kt-live-launch-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)))).unwrap()
+        }
+    }
+
+    impl Drop for LaunchTestDir {
+        fn drop(&mut self) {
+            if self.cleanup {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    struct ExactChildOutput {
+        status: Option<std::process::ExitStatus>,
+        reason: Option<&'static str>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    }
+
+    // Keep the exact Child handle; never rediscover or signal an arbitrary PID.
+    struct RetainedExactChild {
+        child: std::process::Child,
+        status: Option<std::process::ExitStatus>,
+        stopped: bool,
+    }
+
+    impl RetainedExactChild {
+        fn reap(&mut self) -> std::io::Result<bool> {
+            if self.status.is_none() {
+                self.status = self.child.try_wait()?;
+            }
+            Ok(self.status.is_some())
+        }
+
+        fn stop_and_reap(&mut self) {
+            if self.stopped || self.status.is_some() {
+                return;
+            }
+            self.stopped = true;
+            let _ = self.child.kill();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match self.reap() {
+                    Ok(true) | Err(_) => return,
+                    Ok(false) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        }
+    }
+
+    impl Drop for RetainedExactChild {
+        fn drop(&mut self) {
+            self.stop_and_reap();
+        }
+    }
+
+    fn capture_exact_child(command: &mut std::process::Command, dir: &mut LaunchTestDir, limit: Duration, cap: usize) -> ExactChildOutput {
+        use std::io::Read as _;
+        let deadline = Instant::now() + limit;
+        let out_path = dir.path.join("stdout");
+        let err_path = dir.path.join("stderr");
+        let out_file = std::fs::OpenOptions::new().write(true).create_new(true).open(&out_path).unwrap();
+        let err_file = std::fs::OpenOptions::new().write(true).create_new(true).open(&err_path).unwrap();
+        command.stdout(out_file.try_clone().unwrap()).stderr(err_file.try_clone().unwrap());
+        let mut child = RetainedExactChild { child: command.spawn().unwrap(), status: None, stopped: false };
+        // If anything fails before confirmed reap, leave the owned directory for
+        // diagnosis rather than removing files still used by a retained child.
+        dir.cleanup = false;
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let reason = loop {
+            if Instant::now() >= deadline {
+                break Some("deadline");
+            }
+            let reaped = child.reap().unwrap();
+            // Regular files avoid pipe-reader joins. Poll size and stop excess
+            // output; only cap bytes in total are ever loaded into diagnostics.
+            if out_file.metadata().unwrap().len().saturating_add(err_file.metadata().unwrap().len()) > cap as u64 {
+                break Some("output limit");
+            }
+            if reaped {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        child.stop_and_reap();
+        dir.cleanup = child.status.is_some();
+        let mut stdout = Vec::new();
+        std::fs::File::open(out_path).unwrap().take(cap as u64).read_to_end(&mut stdout).unwrap();
+        let mut stderr = Vec::new();
+        std::fs::File::open(err_path).unwrap().take((cap - stdout.len()) as u64).read_to_end(&mut stderr).unwrap();
+        ExactChildOutput { status: child.status, reason, stdout, stderr }
+    }
+
+    fn launch_test_command(dir: &std::path::Path, test: &str, case: &str) -> std::process::Command {
+        let app = dir.join("owned app");
+        let home = dir.join("synthetic-home");
+        std::fs::create_dir(&app).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let executable = app.join(crate::helpers::exe("live-test"));
+        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let mut child = std::process::Command::new(&executable);
+        child
+            .args(["--exact", test, "--nocapture", "--test-threads=1", "--format=terse"])
+            .env("KT_LIVE_LAUNCH_TEST_ROOT", dir)
+            .env("KT_LIVE_LAUNCH_TEST_CASE", case)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("KATALA_TUNE_DATA_DIR", home.join(".katala-tune"))
+            .stdin(Stdio::null());
+        #[cfg(target_os = "macos")]
+        child.env("PATH", "/usr/bin:/bin");
+        child
+    }
+
+    #[test]
+    fn launch_test_directory_rejects_collisions_and_cleans_only_owned_paths() {
+        let owner = LaunchTestDir::new();
+        let existing = owner.path.join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let canary = existing.join("canary");
+        std::fs::write(&canary, b"keep").unwrap();
+        let collision = LaunchTestDir::create(existing.clone());
+        assert!(matches!(collision, Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists));
+        drop(collision);
+        assert_eq!(std::fs::read(&canary).unwrap(), b"keep");
+        let path = owner.path.clone();
+        drop(owner);
+        assert!(!path.exists(), "successful exclusive owner cleans its own fixture");
+    }
+
+    // Invoked only as an exact child with the test-only case environment set.
+    #[test]
+    #[ignore]
+    fn launch_test_watchdog_fixture() {
+        println!("watchdog fixture ready");
+        match std::env::var("KT_LIVE_LAUNCH_TEST_CASE").unwrap().as_str() {
+            "hung" => loop {
+                std::thread::park();
+            },
+            "noisy" => {
+                use std::io::Write as _;
+                std::io::stdout().write_all(&vec![b'x'; 262144]).unwrap();
+                std::io::stderr().write_all(&vec![b'y'; 262144]).unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
+            "stderr" => {
+                use std::io::Write as _;
+                std::io::stderr().write_all(&vec![b'y'; 262144]).unwrap();
+                loop {
+                    std::thread::park();
+                }
+            }
+            "normal" => (),
+            other => panic!("unknown fixture case: {other}"),
+        }
+    }
+
+    fn watchdog_case(case: &str, expected: Option<&str>) {
+        let mut dir = LaunchTestDir::new();
+        let mut command = launch_test_command(&dir.path, "live::tests::launch_test_watchdog_fixture", case);
+        command.arg("--ignored");
+        let limit = if case == "hung" { Duration::from_secs(2) } else { Duration::from_secs(5) };
+        let began = Instant::now();
+        let output = capture_exact_child(&mut command, &mut dir, limit, 4096);
+        assert_eq!(output.reason, expected);
+        assert!(output.status.is_some(), "retained child must be reaped before cleanup");
+        assert!(began.elapsed() < limit + Duration::from_secs(3));
+        assert!(output.stdout.len() + output.stderr.len() <= 4096, "capture must be bounded");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("watchdog fixture ready"),
+            "child must reach the controlled fixture before watchdog termination"
+        );
+        if expected.is_none() {
+            assert!(output.status.unwrap().success());
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+        let path = dir.path.clone();
+        drop(dir);
+        assert!(!path.exists(), "reaped child fixture can be removed");
+    }
+
+    #[test]
+    fn launch_test_watchdog_stops_hung_exact_child() {
+        watchdog_case("hung", Some("deadline"));
+    }
+
+    #[test]
+    fn launch_test_watchdog_caps_noisy_exact_child() {
+        watchdog_case("noisy", Some("output limit"));
+        watchdog_case("stderr", Some("output limit"));
+    }
+
+    #[test]
+    fn launch_test_watchdog_accepts_normal_exact_child() {
+        watchdog_case("normal", None);
+    }
+
+    // Only child processes receive this HOME/data namespace. Copying the test
+    // executable also confines the beside-app search; no installed helper runs.
+    fn isolated_launch_child(test: &str, cases: &[&str]) -> Option<(PathBuf, String)> {
+        const ROOT: &str = "KT_LIVE_LAUNCH_TEST_ROOT";
+        const CASE: &str = "KT_LIVE_LAUNCH_TEST_CASE";
+        if let Some(dir) = std::env::var_os(ROOT) {
+            return Some((PathBuf::from(dir), std::env::var(CASE).unwrap()));
+        }
+        for case in cases {
+            let mut dir = LaunchTestDir::new();
+            let mut command = launch_test_command(&dir.path, test, case);
+            let output = capture_exact_child(&mut command, &mut dir, Duration::from_secs(45), 65536);
+            assert!(
+                output.reason.is_none() && output.status.is_some_and(|status| status.success()),
+                "{test} case={case}: {:?}, {:?}, fixture={}\nstdout: {}\nstderr: {}",
+                output.status,
+                output.reason,
+                dir.path.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "exact child must run one test");
+            eprintln!("{test} case={case}: passed");
+        }
+        None
+    }
+
+    fn install_launch_fixture(dir: &std::path::Path, case: &str, bytes: &[u8]) -> Option<PathBuf> {
+        let name = crate::helpers::exe("tune-agent");
+        let beside = dir.join("owned app").join(&name);
+        let managed = dir.join("synthetic-home").join(".katala-tune").join("bin").join(&name);
+        assert_eq!(std::env::current_exe().unwrap().parent().unwrap(), beside.parent().unwrap());
+        assert_eq!(crate::helpers::bin_dir(), managed.parent().unwrap());
+        #[cfg(not(windows))]
+        assert_eq!(crate::nodes::home(), dir.join("synthetic-home"));
+        assert!(!beside.exists() && !managed.exists());
+        if case == "absent" {
+            assert_eq!(local_native(), None);
+            return None;
+        }
+        assert!(case == "managed" || case == "bundled");
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        std::fs::write(&managed, bytes).unwrap();
+        if case == "bundled" {
+            std::fs::write(&beside, bytes).unwrap();
+            assert_eq!(local_native(), Some(beside.clone()), "beside-app wins when both exist");
+            Some(beside)
+        } else {
+            std::fs::create_dir(&beside).unwrap();
+            assert_eq!(local_native(), Some(managed.clone()));
+            Some(managed)
+        }
+    }
+
     #[test]
     fn launch_follows_the_probe_conventions() {
+        let Some((dir, case)) = isolated_launch_child("live::tests::launch_follows_the_probe_conventions", &["absent", "managed", "bundled"]) else { return };
+        let native = install_launch_fixture(&dir, &case, b"owned fixture - never execute");
         let o = Opts::default();
         let mac = launch(&node("m", "macos"), &o).unwrap();
         assert_eq!(mac.program, "ssh");
         let cmd = mac.args.last().unwrap();
+        assert!(
+            cmd.starts_with("[ -x ~/.katala-tune/bin/tune-agent ] && ~/.katala-tune/bin/tune-agent sample interval=1 procs=5 max=900 watch=1 || { "),
+            "ネイティブを先に使う: {cmd}"
+        );
         assert!(cmd.contains(&format!("exec python3 -c '{}' interval=1 procs=5 max=900 watch=1", python_boot(MAC_LIVE.len()))), "{cmd}");
         assert_eq!(cmd.matches('\'').count(), 4, "python3 -c の中身にシングルクォートを入れない");
         for opt in ["BatchMode=yes", "ControlMaster=no", "ControlPath=none"] {
@@ -1822,11 +2130,39 @@ mod tests {
         let mut local_node = node("local", "windows");
         local_node.local = true;
         let local = launch(&local_node, &o).unwrap();
-        if local.program == "powershell.exe" {
-            assert!(local.cleanup.is_none() && local.keep_stdin && local.stdin == WIN_LIVE[3..]);
-        } else {
-            assert!(local.program.ends_with("tune-agent.exe") && local.keep_stdin && local.stdin.is_empty());
+        assert!(local.cleanup.is_none() && local.keep_stdin);
+        if let Some(native) = native.as_ref() {
+            assert_eq!(local.program, native.to_str().unwrap());
+            #[cfg(windows)]
+            assert!(local.program.ends_with("tune-agent.exe"));
+            assert!(local.stdin.is_empty());
             assert_eq!(local.args, ["sample", "interval=1", "procs=5", "max=900", "watch=1"]);
+        } else {
+            assert_eq!(local.program, "powershell.exe");
+            assert_eq!(local.stdin, WIN_LIVE[3..]);
+            assert_eq!(local.args[..4], ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+            assert_eq!(local.args.len(), 5);
+        }
+        local_node.os = "macos".into();
+        let local = launch(&local_node, &o).unwrap();
+        assert!(local.keep_stdin && local.cleanup.is_none());
+        assert_eq!(local.stdin, MAC_LIVE.as_bytes());
+        if let Some(native) = native {
+            assert_eq!(local.program, "/bin/sh");
+            assert_eq!(
+                local.args,
+                [
+                    "-c",
+                    &format!(
+                        "\"$0\" sample interval=1 procs=5 max=900 watch=1 || exec /usr/bin/env python3 -c '{}' interval=1 procs=5 max=900 watch=1",
+                        python_boot(MAC_LIVE.len())
+                    ),
+                    native.to_str().unwrap()
+                ]
+            );
+        } else {
+            assert_eq!(local.program, "/usr/bin/env");
+            assert_eq!(local.args, ["python3", "-c", &python_boot(MAC_LIVE.len()), "interval=1", "procs=5", "max=900", "watch=1"]);
         }
         assert!(WIN_LIVE[3..].iter().all(|b| b.is_ascii()), "probes/live_win.ps1 は ASCII のみ");
         assert!(launch(&node("x", "linux"), &o).is_err());
@@ -2083,6 +2419,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// macOS の起動コマンドを実際のシェルで動かす: 置いたネイティブが動けばそれだけ、起動できなければ Python 版
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_launch_prefers_native_and_falls_back_to_python() {
+        use std::os::unix::fs::PermissionsExt;
+        let o = Opts { sampler_max_age: Duration::from_secs(1), ..Opts::default() };
+        // 古い版（macOS のサンプラーが無い）は標準入力を読まずに失敗する。動く版は hello を出して正常に終わる
+        for (native, want) in [
+            (
+                "#!/bin/sh
+exit 1
+",
+                None,
+            ),
+            (
+                "#!/bin/sh
+echo '{\"type\":\"hello\",\"os\":\"macos\",\"impl\":\"rust\"}'
+",
+                Some("rust"),
+            ),
+        ] {
+            let (_, dir) = fake("");
+            let bin = dir.join(".katala-tune/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("tune-agent"), native).unwrap();
+            std::fs::set_permissions(bin.join("tune-agent"), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let l = launch(&node("m", "macos"), &o).unwrap();
+            let remote = l.args.last().unwrap().clone();
+            let mut src = spawn(Launch {
+                program: "/usr/bin/env".into(),
+                args: vec![format!("HOME={}", dir.display()), "PATH=/usr/bin:/bin".into(), "/bin/sh".into(), "-c".into(), remote],
+                stdin: l.stdin,
+                keep_stdin: true,
+                cleanup: None,
+            })
+            .unwrap();
+            // Python 版は max=1 で自分から終わる
+            let mut msgs = Vec::new();
+            while let Ok(Some(line)) = tokio::time::timeout(Duration::from_secs(20), src.lines.recv()).await {
+                msgs.push(parse_line(&line).unwrap_or_else(|| panic!("読めない行: {line}")));
+            }
+            let ended = src.close().await;
+            assert_eq!(ended.code, Some(0), "{}", ended.err);
+            let Some(Msg::Hello(h)) = msgs.first() else { panic!("1 行目は hello") };
+            assert_eq!(h.implementation.as_deref(), want, "{native}");
+            assert_eq!(msgs.iter().filter(|m| matches!(m, Msg::Hello(_))).count(), 1, "動くのはどちらか一方");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     /// 必須のOS統計を保ち、任意センサーの有無を独立した環境で確かめる。
     #[cfg(target_os = "macos")]
     #[tokio::test]
@@ -2176,9 +2562,13 @@ for _ in range(400):
     #[tokio::test]
     async fn mac_sampler_ends_by_itself_when_stdin_closes() {
         let me = Node::from_value(&json!({ "id": "me", "alias": "me", "os": "macos", "local_hostname": "this-host" }), "this-host");
+        let Some((dir, case)) = isolated_launch_child("live::tests::mac_sampler_ends_by_itself_when_stdin_closes", &["absent"]) else { return };
+        assert_eq!(install_launch_fixture(&dir, &case, b""), None);
         let l = launch(&me, &Opts::default()).unwrap();
         assert!(l.keep_stdin && l.args[1] == "-c");
-        let mut src = spawn(l).unwrap();
+        assert_eq!(l.program, "/usr/bin/env");
+        assert_eq!(l.stdin, MAC_LIVE.as_bytes());
+        let mut src = spawn(with_isolated_mac_sensor_env(l, &dir)).unwrap();
         let mut got = 0;
         while got < 2 {
             let line = tokio::time::timeout(Duration::from_secs(20), src.lines.recv()).await.unwrap().expect("行が来る");
@@ -2189,6 +2579,51 @@ for _ in range(400):
         let t0 = Instant::now();
         let ended = src.close().await;
         // 強制終了ならシグナルで終わり code は None。0 は標準入力が閉じたのを見て自分で終わったということ
+        assert_eq!(ended.code, Some(0), "{}", ended.err);
+        assert!(t0.elapsed() < Duration::from_millis(2500));
+    }
+
+    // collect::command enriches PATH. Set these again in the spawned process so
+    // the real Python script cannot discover a normal HOME/Homebrew macmon.
+    #[cfg(target_os = "macos")]
+    fn with_isolated_mac_sensor_env(mut launch: Launch, dir: &std::path::Path) -> Launch {
+        let mut args = vec![format!("HOME={}", dir.join("synthetic-home").display()), "PATH=/usr/bin:/bin".into(), launch.program];
+        args.extend(launch.args);
+        launch.program = "/usr/bin/env".into();
+        launch.args = args;
+        launch
+    }
+
+    /// Owned fake: this checks the native launcher's stdin/EOF contract only.
+    /// Actual native sampler EOF behavior stays covered by tune-agent tests.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_native_launcher_preserves_stdin_until_close() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Some((dir, case)) = isolated_launch_child("live::tests::mac_native_launcher_preserves_stdin_until_close", &["managed", "bundled"]) else { return };
+        let script = b"#!/bin/sh\nprintf '%s\\n' '{\"type\":\"hello\",\"impl\":\"rust\",\"os\":\"macos\"}' '{\"type\":\"s\",\"seq\":1}' '{\"type\":\"s\",\"seq\":2}'\nwhile IFS= read -r line; do :; done\n";
+        let native = install_launch_fixture(&dir, &case, script).unwrap();
+        std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut me = node("me", "macos");
+        me.local = true;
+        let l = launch(&me, &Opts::default()).unwrap();
+        assert_eq!(l.program, "/bin/sh");
+        assert_eq!(l.args[0], "-c");
+        assert_eq!(l.args[2], native.to_str().unwrap());
+        assert!(l.keep_stdin && l.cleanup.is_none());
+        assert_eq!(l.stdin, MAC_LIVE.as_bytes());
+        let mut src = spawn(with_isolated_mac_sensor_env(l, &dir)).unwrap();
+        for expected in ["hello", "s", "s"] {
+            let line = tokio::time::timeout(Duration::from_secs(20), src.lines.recv()).await.unwrap().expect("fixture frame");
+            let value: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(value["type"], expected);
+            if expected == "hello" {
+                assert_eq!(value["impl"], "rust");
+            }
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(100), src.lines.recv()).await.is_err(), "owned fake stays alive while stdin is open");
+        let t0 = Instant::now();
+        let ended = src.close().await;
         assert_eq!(ended.code, Some(0), "{}", ended.err);
         assert!(t0.elapsed() < Duration::from_millis(2500));
     }

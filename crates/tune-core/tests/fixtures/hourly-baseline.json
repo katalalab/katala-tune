@@ -1,0 +1,968 @@
+{
+  "end": 1793016000000,
+  "pure": [
+    {
+      "name": "weekly",
+      "pattern": "weekly",
+      "expect": {
+        "state": "within_baseline",
+        "history_hours": 648,
+        "matched_hours": 24
+      }
+    },
+    {
+      "name": "step",
+      "recent": [
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        50,
+        50,
+        50,
+        50,
+        50,
+        50
+      ],
+      "expect": {
+        "state": "elevated",
+        "elevated_hours": 6,
+        "slope": 0
+      }
+    },
+    {
+      "name": "rising",
+      "recent": [
+        20.0,
+        20.5,
+        21.0,
+        21.5,
+        22.0,
+        22.5,
+        23.0,
+        23.5,
+        24.0,
+        24.5,
+        25.0,
+        25.5,
+        26.0,
+        26.5,
+        27.0,
+        27.5,
+        28.0,
+        28.5,
+        29.0,
+        29.5,
+        30.0,
+        30.5,
+        31.0,
+        31.5
+      ],
+      "expect": {
+        "state": "rising",
+        "slope": 0.5,
+        "change": 9
+      }
+    },
+    {
+      "name": "both",
+      "recent": [
+        20.0,
+        20.5,
+        21.0,
+        21.5,
+        22.0,
+        22.5,
+        23.0,
+        23.5,
+        24.0,
+        24.5,
+        25.0,
+        25.5,
+        26.0,
+        26.5,
+        27.0,
+        27.5,
+        28.0,
+        28.5,
+        54.0,
+        54.5,
+        55.0,
+        55.5,
+        56.0,
+        56.5
+      ],
+      "expect": {
+        "state": "elevated_and_rising"
+      }
+    },
+    {
+      "name": "cpu",
+      "metric": "cpu",
+      "recent": [
+        20.0,
+        20.5,
+        21.0,
+        21.5,
+        22.0,
+        22.5,
+        23.0,
+        23.5,
+        24.0,
+        24.5,
+        25.0,
+        25.5,
+        26.0,
+        26.5,
+        27.0,
+        27.5,
+        28.0,
+        28.5,
+        29.0,
+        29.5,
+        30.0,
+        30.5,
+        31.0,
+        31.5
+      ],
+      "expect": {
+        "state": "within_baseline",
+        "trend_assessed": false
+      }
+    },
+    {
+      "name": "sparse_profiles",
+      "days": 20,
+      "expect": {
+        "state": "insufficient",
+        "reason": "profile_coverage"
+      }
+    },
+    {
+      "name": "empty",
+      "days": 0,
+      "expect": {
+        "state": "insufficient",
+        "reason": "history_hours"
+      }
+    },
+    {
+      "name": "zero",
+      "base": 0,
+      "expect": {
+        "state": "within_baseline"
+      }
+    },
+    {
+      "name": "unknown",
+      "recent": [
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "expect": {
+        "state": "insufficient",
+        "recent_hours": 0
+      }
+    },
+    {
+      "name": "gaps",
+      "recent": [
+        20.0,
+        20.5,
+        21.0,
+        21.5,
+        22.0,
+        22.5,
+        23.0,
+        23.5,
+        24.0,
+        24.5,
+        25.0,
+        25.5,
+        26.0,
+        26.5,
+        27.0,
+        27.5,
+        28.0,
+        28.5,
+        29.0,
+        29.5,
+        30.0,
+        30.5,
+        31.0,
+        31.5
+      ],
+      "drop_recent": [
+        3,
+        7,
+        11,
+        15,
+        19,
+        23
+      ],
+      "expect": {
+        "state": "rising",
+        "slope": 0.5,
+        "change": 9.25,
+        "matched_hours": 18
+      }
+    },
+    {
+      "name": "endpoints",
+      "drop_recent": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "expect": {
+        "state": "insufficient",
+        "reason": "endpoint_coverage"
+      }
+    },
+    {
+      "name": "conflict",
+      "conflict": true,
+      "reverse": true,
+      "expect": {
+        "state": "within_baseline",
+        "conflicting_hours": 1,
+        "matched_hours": 23
+      }
+    },
+    {
+      "name": "duplicate",
+      "duplicate": true,
+      "expect": {
+        "state": "within_baseline",
+        "duplicate_points": 1
+      }
+    },
+    {
+      "name": "daily",
+      "resolution": "day",
+      "expect": {
+        "state": "insufficient",
+        "reason": "hourly_data_required"
+      }
+    },
+    {
+      "name": "future",
+      "future": true,
+      "expect": {
+        "state": "within_baseline",
+        "ignored_points": 2
+      }
+    },
+    {
+      "name": "input_cap",
+      "repeat": 4097,
+      "expect": {
+        "state": "insufficient",
+        "reason": "input_limit"
+      }
+    },
+    {
+      "name": "quantiles",
+      "quantiles": true,
+      "recent": [
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        24.8,
+        24.8,
+        24.8,
+        24.8
+      ],
+      "metric": "cpu",
+      "expect": {
+        "state": "within_baseline",
+        "profile": [
+          1,
+          2,
+          1.1,
+          5.5,
+          9.9
+        ]
+      }
+    },
+    {
+      "name": "p90",
+      "quantiles": true,
+      "recent": [
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        25,
+        25,
+        25,
+        25
+      ],
+      "metric": "cpu",
+      "expect": {
+        "state": "elevated",
+        "elevated_hours": 4
+      }
+    },
+    {
+      "name": "strict_margin",
+      "recent": [
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        20,
+        35,
+        35,
+        35,
+        35,
+        35,
+        35
+      ],
+      "metric": "cpu",
+      "expect": {
+        "state": "within_baseline"
+      }
+    },
+    {
+      "name": "exact_trend",
+      "recent": [
+        20.0,
+        20.25,
+        20.5,
+        20.75,
+        21.0,
+        21.25,
+        21.5,
+        21.75,
+        22.0,
+        22.25,
+        22.5,
+        22.75,
+        23.0,
+        23.25,
+        23.5,
+        23.75,
+        24.0,
+        24.25,
+        28.0,
+        28.25,
+        28.5,
+        28.75,
+        29.0,
+        29.25
+      ],
+      "expect": {
+        "state": "rising",
+        "slope": 0.25,
+        "change": 8
+      }
+    },
+    {
+      "name": "poor_minutes",
+      "recent_minutes": 29,
+      "expect": {
+        "state": "insufficient",
+        "recent_hours": 0
+      }
+    }
+  ],
+  "saved": [
+    {
+      "name": "weighted",
+      "operations": [
+        {
+          "type": "state",
+          "seal": 1791793800000,
+          "last": 1793017800000
+        },
+        {
+          "type": "hour",
+          "at": 1791187200000,
+          "value": [
+            0,
+            30,
+            0
+          ]
+        },
+        {
+          "type": "hour",
+          "at": 1791190800000,
+          "value": [
+            300,
+            30,
+            10
+          ]
+        },
+        {
+          "type": "hour",
+          "at": 1791194400000,
+          "value": [
+            600,
+            30,
+            20
+          ]
+        },
+        {
+          "type": "hour",
+          "at": 1791198000000,
+          "value": [
+            660,
+            30,
+            22
+          ]
+        },
+        {
+          "type": "hour",
+          "at": 1791792000000,
+          "value": [
+            300,
+            30,
+            10
+          ]
+        },
+        {
+          "type": "minutes",
+          "at": 1791793800000,
+          "count": 20,
+          "value": [
+            50,
+            50
+          ],
+          "n": 9999
+        },
+        {
+          "type": "minutes",
+          "at": 1791792000000,
+          "count": 1,
+          "value": [
+            100,
+            100
+          ]
+        },
+        {
+          "type": "minutes",
+          "at": 1791795600000,
+          "count": 30,
+          "value": [
+            24,
+            24
+          ]
+        },
+        {
+          "type": "minutes",
+          "at": 1791799200000,
+          "count": 30,
+          "value": [
+            28,
+            28
+          ]
+        },
+        {
+          "type": "minutes",
+          "at": 1791802800000,
+          "count": 30,
+          "value": [
+            30,
+            30
+          ]
+        },
+        {
+          "type": "minutes",
+          "at": 1792396800000,
+          "count": 30,
+          "value": [
+            40,
+            40
+          ]
+        },
+        {
+          "type": "minutes",
+          "at": 1792400400000,
+          "count": 30,
+          "value": [
+            50,
+            50
+          ]
+        },
+        {
+          "type": "minutes",
+          "at": 1792404000000,
+          "count": 30,
+          "value": [
+            60,
+            60
+          ]
+        },
+        {
+          "type": "minutes",
+          "at": 1792407600000,
+          "count": 30,
+          "value": [
+            70,
+            70
+          ]
+        }
+      ],
+      "expect": {
+        "state": "insufficient",
+        "profile": [
+          1,
+          2,
+          11,
+          27,
+          59
+        ],
+        "raw_rows": 230,
+        "history_rows": 5
+      }
+    },
+    {
+      "name": "empty",
+      "operations": [],
+      "expect": {
+        "state": "insufficient",
+        "raw_rows": 0
+      }
+    },
+    {
+      "name": "zero_raw",
+      "operations": [
+        {
+          "type": "minutes",
+          "at": 1793012400000,
+          "count": 30,
+          "value": [
+            0,
+            0
+          ]
+        },
+        {
+          "type": "minutes",
+          "at": 1793012400000,
+          "count": 30,
+          "node": "other",
+          "value": [
+            90,
+            90
+          ]
+        }
+      ],
+      "expect": {
+        "state": "insufficient",
+        "accepted_hours": 1,
+        "raw_rows": 30
+      }
+    },
+    {
+      "name": "rollback",
+      "operations": [
+        {
+          "type": "state",
+          "seal": 0,
+          "last": 1793019600000
+        }
+      ],
+      "expect": {
+        "state": "insufficient",
+        "reason": "clock_rollback"
+      }
+    },
+    {
+      "name": "corrupt_count",
+      "operations": [
+        {
+          "type": "state",
+          "seal": 1792929600000,
+          "last": 1793016000000
+        },
+        {
+          "type": "hour",
+          "at": 1792843200000,
+          "value": [
+            300,
+            0,
+            10
+          ]
+        }
+      ],
+      "expect": {
+        "state": "insufficient",
+        "reason": "source_invalid"
+      }
+    },
+    {
+      "name": "missing_state",
+      "operations": [
+        {
+          "type": "missing_state"
+        }
+      ],
+      "expect": {
+        "state": "insufficient",
+        "reason": "storage_unavailable"
+      }
+    },
+    {
+      "name": "daily_only",
+      "operations": [
+        {
+          "type": "hour",
+          "at": 1792843200000,
+          "value": [
+            300,
+            30,
+            10
+          ],
+          "resolution": "day"
+        }
+      ],
+      "expect": {
+        "state": "insufficient",
+        "accepted_hours": 0
+      }
+    },
+    {
+      "name": "raw_limit",
+      "operations": [
+        {
+          "type": "minutes",
+          "at": 1792929600000,
+          "count": 40321,
+          "step": 1,
+          "value": [
+            0,
+            0
+          ]
+        }
+      ],
+      "expect": {
+        "state": "insufficient",
+        "reason": "source_limit"
+      }
+    },
+    {
+      "name": "raw_exact_limit",
+      "operations": [
+        {
+          "type": "minutes",
+          "at": 1790596800000,
+          "count": 40320,
+          "value": [
+            20,
+            20
+          ]
+        }
+      ],
+      "expect": {
+        "state": "within_baseline",
+        "raw_rows": 40320,
+        "accepted_hours": 672
+      }
+    },
+    {
+      "name": "bad_raw",
+      "operations": [
+        {
+          "type": "minutes",
+          "at": 1793012400000,
+          "count": 30,
+          "value": [
+            null,
+            0
+          ]
+        },
+        {
+          "type": "minutes",
+          "at": 1793008800000,
+          "count": 30,
+          "value": [
+            false,
+            0
+          ]
+        },
+        {
+          "type": "minutes",
+          "at": 1793005200000,
+          "count": 30,
+          "value": [
+            "0",
+            0
+          ]
+        },
+        {
+          "type": "minutes",
+          "at": 1793001600000,
+          "count": 30,
+          "value": [
+            0,
+            0
+          ],
+          "n": "9007199254740992"
+        },
+        {
+          "type": "minutes",
+          "at": 1792998000000,
+          "count": 30,
+          "value": [
+            0,
+            0
+          ],
+          "blob": true
+        }
+      ],
+      "expect": {
+        "state": "insufficient",
+        "accepted_hours": 0,
+        "raw_rows": 150,
+        "omitted_raw_rows": 150
+      }
+    },
+    {
+      "name": "capacity_gap",
+      "operations": [
+        {
+          "type": "state",
+          "seal": 1791806400000,
+          "last": 1793016000000
+        }
+      ],
+      "expect": {
+        "state": "insufficient",
+        "accepted_hours": 0
+      }
+    },
+    {
+      "name": "mature_mixed",
+      "operations": [
+        {
+          "type": "state",
+          "seal": 1791806400000,
+          "last": 1793016000000
+        },
+        {
+          "type": "grid",
+          "at": 1790596800000,
+          "hours": 336,
+          "archived": true,
+          "value": 20
+        },
+        {
+          "type": "grid",
+          "at": 1791806400000,
+          "hours": 336,
+          "value": 20
+        }
+      ],
+      "expect": {
+        "state": "within_baseline",
+        "accepted_hours": 672,
+        "history_hours": 648,
+        "matched_hours": 24,
+        "history_rows": 336,
+        "raw_rows": 10080
+      }
+    },
+    {
+      "name": "fractional_archive",
+      "operations": [
+        {
+          "type": "state",
+          "seal": 1792929600000,
+          "last": 1793016000000
+        },
+        {
+          "type": "hour",
+          "at": 1792843200000.5,
+          "value": [
+            300,
+            30,
+            10
+          ]
+        }
+      ],
+      "expect": {
+        "state": "insufficient",
+        "reason": "source_invalid"
+      }
+    },
+    {
+      "name": "fractional_raw",
+      "operations": [
+        {
+          "type": "minutes",
+          "at": 1793012400000.5,
+          "count": 30,
+          "value": [
+            20,
+            20
+          ]
+        }
+      ],
+      "expect": {
+        "state": "insufficient",
+        "accepted_hours": 0,
+        "omitted_raw_rows": 30
+      }
+    },
+    {
+      "name": "invalid_state",
+      "operations": [
+        {
+          "type": "state",
+          "seal": 0.5,
+          "last": 1793016000000
+        }
+      ],
+      "expect": {
+        "state": "insufficient",
+        "reason": "source_invalid"
+      }
+    },
+    {
+      "name": "unsealed_archive",
+      "operations": [
+        {
+          "type": "hour",
+          "at": 1792929600000,
+          "value": [
+            300,
+            30,
+            10
+          ]
+        }
+      ],
+      "expect": {
+        "state": "insufficient",
+        "reason": "source_invalid"
+      }
+    },
+    {
+      "name": "unrelated_json_numbers_and_depth",
+      "operations": [
+        {
+          "type": "payload",
+          "at": 1793012400000,
+          "count": 30,
+          "text": "{\"mem\":[20,20],\"unrelated\":1e999}"
+        },
+        {
+          "type": "payload",
+          "at": 1793008800000,
+          "count": 30,
+          "text": "{\"mem\":[20,20],\"unrelated\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}"
+        }
+      ],
+      "expect": {
+        "state": "insufficient",
+        "accepted_hours": 2,
+        "raw_rows": 60,
+        "omitted_raw_rows": 0
+      }
+    },
+    {
+      "name": "nonfinite_archive_sum",
+      "operations": [
+        {
+          "type": "state",
+          "seal": 1792929600000,
+          "last": 1793016000000
+        },
+        {
+          "type": "archive_payload",
+          "at": 1792843200000,
+          "text": "{\"mem\":[1e999,30,20]}"
+        }
+      ],
+      "expect": {
+        "state": "insufficient",
+        "reason": "source_invalid"
+      }
+    }
+  ]
+}

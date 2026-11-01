@@ -468,6 +468,23 @@ fn fixtures() -> Vec<(Value, Value)> {
             json!({}),
         ),
         (win_fixture(json!({ "wsl": { "config": false, "memory": null, "installed": true, "listed": true, "distros": [] } })), json!({})),
+        (win_fixture(json!({ "wsl": { "observation_enabled": true, "installed": true, "listed": false, "list_error": "timeout", "distros": [] } })), json!({})),
+        (win_fixture(json!({ "wsl": { "list_error": "exit 1", "distros": [] } })), json!({})),
+        (win_fixture(json!({ "wsl": { "list_error": "output-limit", "distros": [] } })), json!({})),
+        (
+            win_fixture(json!({ "wsl": { "distros": [
+            { "name": "dev-a", "state": "running", "observed": true, "inside": { "mem_total_mb": 24000, "mem_available_mb": 1000,
+                "errors": { "swap": "invalid-data", "psi": "missing-status", "load": "command-failed", "top": "command-failed", "disk": "invalid-data" } } },
+            { "name": "dev-b", "state": "running", "observed": true, "inside": { "mem_total_mb": 24000, "mem_available_mb": 20000, "errors": { "top": "future-reason" } } }
+        ] } })),
+            json!({}),
+        ),
+        (
+            win_fixture(json!({ "wsl": { "distros": [
+            { "name": "dev-a", "state": "running", "observed": true, "inside": { "mem_total_mb": 24000, "mem_available_mb": 20000, "errors": { "top": null, "unexpected": "ignored" } } }
+        ] } })),
+            json!({}),
+        ),
     ]
 }
 
@@ -552,6 +569,71 @@ fn rules_health_logs_actions_match_js() {
 
     // 判定（rules）
     let mut analyze_in: Vec<Value> = fixtures().into_iter().map(|(snap, node)| json!({ "snap": snap, "node": node })).collect();
+    // WSL advice must retain its GPU hold conditions even with configured memory.
+    let gpu_states = [
+        json!({"gpu_compute":{"availability":"available","apps":[{"pid":4242,"used_memory_mb":null}]},"gpus":[{"util":0}]}),
+        json!({"gpu_compute":{"availability":"available","apps":[]},"gpus":[{"util":5}]}),
+        json!({"gpu_compute":{"availability":"unavailable","apps":[],"reason":"query-failed"},"gpus":[{"util":null}]}),
+        json!({"gpu_compute":{"availability":"available","apps":[]},"gpus":[{"util":0}]}),
+        json!({}),
+    ];
+    for app in ["vmmem", "vmmemWSL"] {
+        for memory in [json!("16GB"), Value::Null] {
+            for mem_mb in [16000, 7000] {
+                for gpu in &gpu_states {
+                    for protect_gpu in [false, true] {
+                        let mut snap = win_fixture(json!({
+                            "host":{"cores":16},"memory":{"total_gb":32},"wsl":{"memory":memory},
+                            "processes":{"top_cpu":[{"pid":500,"name":app,"app":app,"cpu":8,"avg_core":80,"etime":"1:00:00"}],
+                                "apps":[{"app":app,"mem_mb":mem_mb,"count":1}],"apps_cpu":[]}
+                        }));
+                        merge(&mut snap, gpu.clone());
+                        let node = json!({"protect_gpu":protect_gpu});
+                        let findings = rules::analyze(&snap, &node);
+                        let mut ids = vec![format!("runaway-{app}-500"), format!("mem-hog-{app}")];
+                        if memory.is_null() {
+                            ids.push("wsl-limit".into());
+                        }
+                        for id in ids {
+                            let finding = findings.iter().find(|f| f["id"] == id).unwrap();
+                            let advice = finding["advice"].as_str().unwrap();
+                            for condition in ["GPU 計算 PID", "GPU 使用率", "GPU 状態を取得できない", "GPU 学習保護", "`wsl --shutdown` と上限変更の反映を保留"]
+                            {
+                                assert!(advice.contains(condition), "{id}: {advice}");
+                            }
+                            assert!(finding.get("action").is_none());
+                            assert!(
+                                finding
+                                    .get("commands")
+                                    .and_then(Value::as_array)
+                                    .is_none_or(|cs| cs.iter().all(|c| !c.as_str().unwrap().contains("wsl --shutdown")))
+                            );
+                        }
+                        let limit = findings.iter().find(|f| f["id"] == "wsl-limit");
+                        if memory.is_null() {
+                            assert_eq!(limit.unwrap()["severity"], if mem_mb >= 8192 { "warn" } else { "info" });
+                        } else {
+                            assert!(limit.is_none());
+                        }
+                        analyze_in.push(json!({"snap":snap,"node":node}));
+                    }
+                }
+            }
+        }
+    }
+    analyze_in.extend(["mac", "windows"].map(|probe| {
+        json!({
+            "snap": {
+                "probe": probe, "memory": { "total_gb": 64 }, "processes": {
+                    "apps": [{ "app": "Browser", "mem_mb": 38000, "count": 16 }],
+                    "trees": [
+                        { "root": "Browser", "pid": 4242, "owner": "user", "count": 9, "children": 3, "mem_mb": 20000 },
+                        { "root": "Browser", "pid": 4343, "owner": "user", "count": 7, "children": 2, "mem_mb": 18000 }
+                    ]
+                }
+            }, "node": {}
+        })
+    }));
     let cache_cases: Value = serde_json::from_str(include_str!("../../../test/fixtures/cache-accounting.json")).unwrap();
     analyze_in.extend(cache_cases.as_array().unwrap().iter().map(|c| json!({ "snap": c["snap"], "node": {} })));
     for gb in [Value::Null, json!("20"), json!(-1), json!(true), json!({}), json!([])] {
@@ -823,6 +905,10 @@ fn rules_health_logs_actions_match_js() {
         json!({ "type": "set-low-power-mode", "params": { "source": "usb", "enabled": true, "prev": false } }),
         json!({ "type": "task-disable", "params": { "path": "\\", "name": "KatalaGitHubBackup" } }),
         json!({ "type": "task-enable", "params": { "path": "\\Sub\\", "name": "Job (1)" } }),
+        json!({ "type": "task-enable", "params": { "path": "\\Sub\\", "name": "Job (1)", "expected_enabled": false } }),
+        json!({ "type": "task-disable", "params": { "path": "\\", "name": "Fixture", "expected_enabled": true } }),
+        json!({ "type": "task-enable", "params": { "path": "\\", "name": "Fixture", "expected_enabled": "false" } }),
+        json!({ "type": "task-enable", "params": { "path": "\\", "name": "Fixture", "expected_enabled": null } }),
         json!({ "type": "task-disable", "params": { "path": "\\Microsoft\\Windows\\", "name": "Defrag" } }),
         json!({ "type": "task-run", "params": { "path": "\\", "name": "x\"; Remove-Item C:\\ -Recurse; \"" } }),
         json!({ "type": "task-run", "params": { "path": "C:\\", "name": "x" } }),
@@ -996,7 +1082,7 @@ fn write_spec(now: i64) -> Value {
         .collect();
     let actions = json!([
         { "id": "1-a", "at": now - 5000, "node_id": "n1", "type": "kill-process", "params": { "pid": 500, "name": "Google Drive" }, "label": "n1: 終了", "ok": true, "output": "終了を確認した", "undo": null, "undo_of": null },
-        { "id": "2-b", "at": now - 4000, "node_id": "n2", "type": "set-power-plan", "params": { "guid": rules::HIGH_PERF_GUID }, "label": "n2: 高パフォーマンス", "ok": true, "output": "完了", "undo": { "type": "set-power-plan", "params": { "guid": rules::BALANCED_GUID } }, "undo_of": null },
+        { "id": "2-b", "at": now - 4000, "node_id": "n2", "target": ["mock-power", "windows", false, null], "type": "set-power-plan", "params": { "guid": rules::HIGH_PERF_GUID }, "label": "n2: 高パフォーマンス", "ok": true, "output": "完了", "undo": { "type": "set-power-plan", "params": { "guid": rules::BALANCED_GUID } }, "undo_of": null },
         { "id": "3-c", "at": now - 3000, "node_id": "n2", "type": "set-power-plan", "params": { "guid": rules::BALANCED_GUID }, "label": "n2: 元に戻す", "ok": false, "output": "失敗（exit 1）", "undo_of": "2-b" }
     ]);
     let logs: Vec<Value> = (0..6)
@@ -1173,6 +1259,8 @@ fn db_files_are_interchangeable_with_electron() {
         "同じ操作で書いた DB の中身が違う（左: Rust が書いた、右: JS が書いた）\n{}",
         diff(&stable(rust_written.clone()), &stable(js_written_by_rust.clone()))
     );
+    let saved_target = rust_written["actions"].as_array().unwrap().iter().find(|a| a["id"] == "2-b").unwrap();
+    assert_eq!(saved_target["target"], json!(["mock-power", "windows", false, null]));
     // 4) 伏せ字が効いていて、全文検索も通る
     let q = rust_written["query:1"].as_array().unwrap();
     assert!(!q.is_empty() && q.iter().all(|r| !r["message"].as_str().unwrap().contains("ghp_aaa")));

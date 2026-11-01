@@ -55,3 +55,17 @@
 - 「状態」画面の分析チェックは従来どおり生のエラー文の末尾 1 行を出す（`reason_text` は分析画面に出る）。
 - Tauri の画面（WebView）での表示（未完了の印・失敗の理由の文言）は、画面の目視確認をしていない。コードの経路とデータの形だけ確認した。
 - Windows の PowerShell で実行するスクリプト自体の動作（Disable-ScheduledTask など）は、この機体（macOS）では動かせず未確認。
+
+## 2026-10-26 修正の検証範囲
+
+上の0.4.1の記録は当時のmock結果であり、現在版の受入済みを意味しない。タスクの前状態を取得せず常に逆操作を作っていた経路、非終端エラーの後のGet成功による偽成功、元のnode_idを別routeへ割り当てた後のundoを回帰対象に追加する。
+
+実行記録の既存pending/finalize APIは維持し、nullableな`target`列に元操作のroute配列をJSONで保存する。JS/Rustの既存列追加migrationで過去DBを開ける。旧履歴のtargetはNULLとなり、その履歴の自動undoは拒否する。タスクの前後のEnabled bitは成功結果内に残し、undoには期待する適用後のbitを含める。targetはローカル私有DB内で扱う。
+
+routeの一致は実hostのidentity証明ではない。同じSSH aliasの設定先変更、同一helper artifactを持つ別機体は識別できない。この修正は新しいremote identity protocolを導入しない。
+
+新しい検査もmock transport・一時DB・偽cmdletだけを使う。隔離hostでの実操作・rollback、実WebViewの理由/未完了表示と再起動受入はこの修正から完了扱いにしない。最終の実行結果はPRの検証欄に記録する。
+
+source検証（base `a635400`、PR #81のstderr EOF follow-upを含む）では、`CARGO_BUILD_JOBS=4 RUST_TEST_THREADS=4 npm run check`が成功した。Nodeは481 pass / 23 skip、Rust workspaceは618 pass / 5 ignored、fmt/clippyとOSSチェックが成功。P1のRust受入17件・タスク結果4件、JS/Rust action/SQLite parity 2件、KT2 stderr 4件が含まれる。新規PowerShell偽cmdletの2ケースはMacではskipし、Windows CIでの確認と実host受入を区別する。
+
+Windows probeは上限内で完全なSSH stderrを内部分類してから破棄し、認証・接続不能・controller期限超過をJS/Rustで区別する。既存の公開helperは内部deadlineも他の失敗もexit 9へまとめるため、その内訳は復元できずunknown errorとして扱う。probe専用のtimeout終了コードを追加する契約変更は別follow-upとし、本変更から旧helperのtimeoutが判別可能になったとは主張しない。

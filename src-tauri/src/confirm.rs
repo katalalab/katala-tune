@@ -15,6 +15,9 @@ pub const SUPPORTED: bool = cfg!(any(target_os = "macos", windows));
 /// 変更操作の承認ボタン
 pub const RUN: &str = "実行する";
 
+/// 所見を AI に渡すときの承認ボタン
+pub const HANDOFF: &str = "AI に渡す";
+
 /// リリースビルドでは常に本物のダイアログ
 #[cfg(not(debug_assertions))]
 fn dev_answer(_title: &str, _detail: &str) -> Option<bool> {
@@ -81,7 +84,7 @@ mod native {
 
         #[test]
         fn only_the_approve_button_approves() {
-            for ok in [super::super::RUN, crate::update::INSTALL] {
+            for ok in [super::super::RUN, super::super::HANDOFF, crate::update::INSTALL] {
                 assert!(approved(&R::Custom(ok.into()), ok));
                 for r in [R::Custom(CANCEL.into()), R::Cancel, R::Ok, R::Yes, R::No, R::Custom(String::new())] {
                     assert!(!approved(&r, ok), "{r:?} で進んではいけない");
