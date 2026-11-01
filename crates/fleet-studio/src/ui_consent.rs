@@ -2,10 +2,8 @@ use crate::llm::{Endpoint, ModelConfirmation, ModelQuery, ModelScope};
 use crate::llm_keyboard;
 use crate::scope::{Confirmation, Confirmations, Grants};
 
-pub const MACHINE_UNAVAILABLE: &str =
-    "確認内容の全体表示を保証できないため、この版では保存要約の新規許可を一時停止しています。";
-pub const MODEL_UNAVAILABLE: &str =
-    "確認内容の全体表示を保証できないため、この版では非ループバック LLM の新規許可を一時停止しています。";
+pub const MACHINE_UNAVAILABLE: &str = "確認内容の全体表示を保証できないため、この版では保存要約の新規許可を一時停止しています。";
+pub const MODEL_UNAVAILABLE: &str = "確認内容の全体表示を保証できないため、この版では非ループバック LLM の新規許可を一時停止しています。";
 
 pub fn footer_notice(sample: bool, windows: bool) -> &'static str {
     match (sample, windows) {
@@ -36,27 +34,14 @@ pub fn preparation_available(sample: bool) -> bool {
 
 /// UI approval is temporarily restricted to sample mode until full disclosure
 /// visibility can be established. A stale callback must not clear newer state.
-pub fn confirm_machine(
-    sample: bool,
-    confirmations: &mut Confirmations,
-    grants: &mut Grants,
-    confirmation: &Confirmation,
-) -> MachineConfirmationResult {
+pub fn confirm_machine(sample: bool, confirmations: &mut Confirmations, grants: &mut Grants, confirmation: &Confirmation) -> MachineConfirmationResult {
     if !preparation_available(sample) {
-        return if confirmations.cancel_if(confirmation) {
-            MachineConfirmationResult::Unavailable
-        } else {
-            MachineConfirmationResult::Stale
-        };
+        return if confirmations.cancel_if(confirmation) { MachineConfirmationResult::Unavailable } else { MachineConfirmationResult::Stale };
     }
     if !confirmations.take_if(confirmation) {
         return MachineConfirmationResult::Stale;
     }
-    if grants.authorize(&confirmation.id, &confirmation.fingerprint) {
-        MachineConfirmationResult::Authorized
-    } else {
-        MachineConfirmationResult::Failed
-    }
+    if grants.authorize(&confirmation.id, &confirmation.fingerprint) { MachineConfirmationResult::Authorized } else { MachineConfirmationResult::Failed }
 }
 
 pub fn confirm_model(

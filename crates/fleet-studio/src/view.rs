@@ -352,14 +352,8 @@ impl FleetView {
 
     fn confirm_model(&mut self, confirmation: &ModelConfirmation, cx: &mut Context<Self>) {
         let visible = self.visible_model_endpoints();
-        match ui_consent::confirm_model(
-            self.sample,
-            &mut self.model_scope,
-            &visible,
-            &mut self.model_confirmation,
-            confirmation,
-            self.refresh_queue.pending(),
-        ) {
+        match ui_consent::confirm_model(self.sample, &mut self.model_scope, &visible, &mut self.model_confirmation, confirmation, self.refresh_queue.pending())
+        {
             ModelConfirmationResult::Authorized(request) => {
                 self.model_view.invalidate();
                 self.model_confirmation = None;
@@ -753,13 +747,7 @@ impl FleetView {
             && !authorized
             && let Some(endpoint) = endpoint
         {
-            return Some(format!(
-                "{} / {} / {} / 平文 HTTP: {}",
-                endpoint.label,
-                endpoint.address,
-                endpoint.protocol.label(),
-                ui_consent::MODEL_UNAVAILABLE
-            ));
+            return Some(format!("{} / {} / {} / 平文 HTTP: {}", endpoint.label, endpoint.address, endpoint.protocol.label(), ui_consent::MODEL_UNAVAILABLE));
         }
         llm_keyboard::banner(self.model_keyboard.active(), endpoint, self.model_confirmation.as_ref(), authorized, self.model_notice)
     }
@@ -2065,9 +2053,7 @@ impl Render for FleetView {
                     .gap_2()
                     .justify_between()
                     .bg(rgb(0x132237))
-                    .child(
-                        div().flex_1().min_w(px(0.0)).child(ui_consent::footer_notice(self.sample, cfg!(target_os = "windows"))),
-                    )
+                    .child(div().flex_1().min_w(px(0.0)).child(ui_consent::footer_notice(self.sample, cfg!(target_os = "windows"))))
                     .child(
                         div()
                             .flex()

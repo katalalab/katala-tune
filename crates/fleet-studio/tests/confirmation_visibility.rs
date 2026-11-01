@@ -61,9 +61,7 @@ fn sample_model_confirmation_remains_simulated_and_cannot_dispatch() {
     let confirmation = llm_keyboard::prepare(&mut scope, &visible, &endpoint, false).unwrap();
     let mut current = Some(confirmation.clone());
 
-    let ModelConfirmationResult::Authorized(query) =
-        ui_consent::confirm_model(true, &mut scope, &visible, &mut current, &confirmation, false)
-    else {
+    let ModelConfirmationResult::Authorized(query) = ui_consent::confirm_model(true, &mut scope, &visible, &mut current, &confirmation, false) else {
         panic!("sample confirmation should produce a simulated query");
     };
     let mut called = false;
