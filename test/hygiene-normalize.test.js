@@ -10,7 +10,7 @@ const observed = () => ({
   origin: null, origin_host: null, origin_path: null, has_origin: null,
 });
 
-const audit = () => ({ roots: [], repos: [], enumerated: 0, skipped: 0, truncated: false });
+const audit = () => ({ roots: [{ path: '~/fixture', source: 'opt' }], repos: [], enumerated: 0, skipped: 0, truncated: false });
 
 test('集計の欠損・不正値は null と未観測の所見として残す', () => {
   for (const field of ['enumerated', 'skipped', 'truncated']) {
@@ -82,6 +82,22 @@ test('集計不明でも既存 error と部分結果を保持する', () => {
   assert.ok(ids.includes('repo-dirty'));
 });
 
+test('探索先が空なら既知のゼロを保持しつつ未確認にする', () => {
+  const normalized = hygiene.normalize({ ...audit(), roots: [] });
+  assert.deepEqual(normalized.roots, []);
+  assert.equal(normalized.enumerated, 0);
+  const finding = hygiene.analyze(normalized).find((f) => f.id === 'repo-unobserved');
+  assert.ok(finding);
+  assert.match(finding.detail, /探索先/);
+  const result = hygiene.progress({ ...normalized, node_id: 'node-a', wall_s: 1 }, 1);
+  assert.match(result.line, /見つけた 0 件・未観測 件数不明/);
+  const knownRoot = hygiene.normalize(audit());
+  assert.deepEqual(hygiene.analyze(knownRoot), []);
+  const missingGit = hygiene.analyze({ ...audit(), roots: [], error: 'git_missing' });
+  assert.match(missingGit[0].detail, /git_missing/);
+  assert.doesNotMatch(missingGit[0].detail, /探索先がない/);
+});
+
 test('error が不正型なら不完全とし、文字列・null は保つ', () => {
   for (const error of [false, true, 0, {}, []]) {
     const normalized = hygiene.normalize({ ...audit(), error });
@@ -122,10 +138,31 @@ test('進捗は既知のゼロと件数不明を区別する', () => {
   assert.match(inconsistent.line, /見つけた 件数不明/);
 });
 
+test('所要時間が欠損・不正なら 0 秒とせず時間不明を表示する', () => {
+  const base = { ...audit(), node_id: 'node-a' };
+  for (const value of [undefined, null, '1', false, -1, NaN, Infinity, {}, []]) {
+    const input = { ...base, wall_s: value };
+    if (value === undefined) delete input.wall_s;
+    const result = hygiene.progress(input, 0);
+    assert.match(result.line, /時間不明/);
+    assert.doesNotMatch(result.line, /0\.0s/);
+  }
+  assert.match(hygiene.progress({ ...base, wall_s: 0 }, 0).line, /0\.0s/);
+  assert.match(hygiene.progress({ ...base, wall_s: 1.25 }, 0).line, /1\.3s/);
+});
+
+test('進捗へ直接渡した不正な error も未確認として扱う', () => {
+  for (const error of [false, true, 0, {}, []]) {
+    const result = hygiene.progress({ ...audit(), node_id: 'node-a', wall_s: 1.25, error }, 1);
+    assert.match(result.line, /^node-a: .*未観測 件数不明・1\.3s/);
+    assert.equal(result.observed, 0);
+  }
+});
+
 test('必須項目の欠損・不正値は正常ではなく git_failed として扱う', () => {
   const counts = [undefined, null, '0', false, -1, -0.5, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, {}, []];
   const flags = [undefined, null, 0, 1, 'false', {}, []];
-  for (const [fields, values] of [[['tracked', 'untracked', 'conflicted'], counts], [['upstream', 'detached'], flags]]) {
+  for (const [fields, values] of [[['tracked', 'untracked', 'conflicted'], counts], [['upstream', 'detached', 'linked'], flags]]) {
     for (const field of fields) {
       for (const value of values) {
         const raw = { ...observed(), [field]: value, reason: 'timeout' };
@@ -155,7 +192,7 @@ test('対象 path の欠損・空文字は未観測とし、非空の空白パ�
 test('正常なゼロ・真偽値と任意項目の null は保つ', () => {
   const raw = observed();
   assert.deepEqual(hygiene.normalize({ repos: [raw] }).repos[0], { ...raw, reason: null });
-  const other = { ...raw, detached: true, upstream: true, tracked: 1, untracked: 2, conflicted: 1 };
+  const other = { ...raw, linked: true, detached: true, upstream: true, tracked: 1, untracked: 2, conflicted: 1 };
   assert.deepEqual(hygiene.normalize({ repos: [other] }).repos[0], { ...other, reason: null });
   const largest = { ...raw, tracked: Number.MAX_SAFE_INTEGER };
   assert.equal(hygiene.normalize({ repos: [largest] }).repos[0].tracked, Number.MAX_SAFE_INTEGER);

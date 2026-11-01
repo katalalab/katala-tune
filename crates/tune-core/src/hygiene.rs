@@ -156,6 +156,7 @@ fn normalize_repo(r: &Value) -> Value {
     let is_count = |k: &str| g(k).and_then(Value::as_f64).is_some_and(|n| n.is_finite() && (0.0..=9_007_199_254_740_991.0).contains(&n) && n.fract() == 0.0);
     let ok = state_ok
         && text(g("path")).is_some_and(|p| !p.is_empty())
+        && g("linked").is_some_and(Value::is_boolean)
         && ["tracked", "untracked", "conflicted"].iter().all(|k| is_count(k))
         && ["ahead", "behind", "local_only", "stash"].iter().all(|k| g(k).is_none_or(Value::is_null) || is_count(k))
         && g("conflicted").and_then(Value::as_f64).zip(g("tracked").and_then(Value::as_f64)).is_some_and(|(c, t)| c <= t)
@@ -327,6 +328,9 @@ pub fn analyze(input: &Value) -> Vec<Value> {
     if ["enumerated", "skipped", "truncated"].iter().any(|k| audit.get(*k) == Some(&Value::Null)) || !js::arr(audit.get("incomplete_fields")).is_empty() {
         miss.push("探索結果の集計または一覧が不明".into());
     }
+    if text(audit.get("error")).is_none_or(str::is_empty) && js::arr(audit.get("incomplete_fields")).is_empty() && js::arr(audit.get("roots")).is_empty() {
+        miss.push("探索先がない".into());
+    }
     if !gone.is_empty() {
         let mut by: std::collections::BTreeMap<String, usize> = Default::default();
         for r in &gone {
@@ -459,7 +463,9 @@ pub fn analyze(input: &Value) -> Vec<Value> {
 }
 
 /// CLI の観測数と進捗。探索が不完全なら未観測の総数を 0 と表示しない。
-pub fn progress(audit: &Value, finding_count: usize) -> (Option<usize>, String) {
+pub fn progress(input: &Value, finding_count: usize) -> (Option<usize>, String) {
+    let normalized = normalize(input);
+    let audit = &normalized;
     let repos = js::arr(audit.get("repos"));
     let fields = js::arr(audit.get("incomplete_fields"));
     let observed = repos.iter().filter(|r| text(r.get("state")) == Some("ok")).count();
@@ -471,8 +477,7 @@ pub fn progress(audit: &Value, finding_count: usize) -> (Option<usize>, String) 
         || skipped.is_none()
         || audit.get("truncated") != Some(&Value::Bool(false))
         || !fields.is_empty()
-        || !audit.get("roots").is_some_and(Value::is_array)
-        || !audit.get("repos").is_some_and(Value::is_array);
+        || js::arr(audit.get("roots")).is_empty();
     let found = if fields.iter().any(|v| v.as_str() == Some("counts")) {
         "見つけた 件数不明".to_string()
     } else {
@@ -483,9 +488,13 @@ pub fn progress(audit: &Value, finding_count: usize) -> (Option<usize>, String) 
     } else {
         format!("未観測 {} 件", (repos.len() - observed) as u128 + skipped.unwrap_or(0) as u128)
     };
-    let wall = audit.get("wall_s").and_then(Value::as_f64).filter(|n| n.is_finite()).unwrap_or(0.0);
-    let id = text(audit.get("node_id")).unwrap_or("?");
-    (repos_known.then_some(observed), format!("{id}: {found}・{unseen}・{}s・所見 {finding_count}", js::to_fixed(wall, 1)))
+    let wall = input
+        .get("wall_s")
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map_or_else(|| "時間不明".to_string(), |n| format!("{}s", js::to_fixed(n, 1)));
+    let id = text(input.get("node_id")).unwrap_or("?");
+    (repos_known.then_some(observed), format!("{id}: {found}・{unseen}・{wall}・所見 {finding_count}"))
 }
 
 /// 機体×リポジトリの表（matrix）。キーは origin から導いた <host>/<owner>/<repo>（小文字）。リンク worktree と origin の無いものは含めない

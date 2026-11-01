@@ -142,8 +142,9 @@ fn normalize_metadata_preserves_unknown() {
 
 #[test]
 fn metadata_and_progress_match_js() {
-    let base = json!({ "roots": [], "repos": [], "enumerated": 0, "skipped": 0, "truncated": false });
-    let row = json!({ "state": "ok", "path": "~/fixture", "tracked": 1, "untracked": 0, "conflicted": 0, "detached": false, "upstream": false });
+    let base = json!({ "roots": [{ "path": "~/fixture", "source": "opt" }], "repos": [], "enumerated": 0, "skipped": 0, "truncated": false });
+    let row =
+        json!({ "state": "ok", "path": "~/fixture", "linked": false, "tracked": 1, "untracked": 0, "conflicted": 0, "detached": false, "upstream": false });
     let mut cases = vec![base.clone()];
     for field in ["enumerated", "skipped", "truncated", "roots", "repos"] {
         let mut missing = base.clone();
@@ -202,6 +203,11 @@ fn metadata_and_progress_match_js() {
         raw["roots"] = json!([root]);
         cases.push(raw);
     }
+    let mut no_roots = base.clone();
+    no_roots["roots"] = json!([]);
+    cases.push(no_roots.clone());
+    no_roots["error"] = json!("git_missing");
+    cases.push(no_roots);
 
     let js_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("lib").join("hygiene.js");
     let mut child = Command::new("node")
@@ -243,6 +249,62 @@ fn metadata_and_progress_match_js() {
 }
 
 #[test]
+fn progress_raw_inputs_match_js() {
+    let base = json!({
+        "roots": [{ "path": "~/fixture", "source": "opt" }], "repos": [], "enumerated": 0, "skipped": 0, "truncated": false,
+        "node_id": "node-a", "wall_s": 1.25,
+    });
+    let mut missing = base.clone();
+    missing.as_object_mut().unwrap().remove("wall_s");
+    let mut cases = vec![("valid", base.clone()), ("time_missing", missing)];
+    for value in [json!(null), json!("1"), json!(false), json!(-1), json!({}), json!([])] {
+        let mut raw = base.clone();
+        raw["wall_s"] = value;
+        cases.push(("time_invalid", raw));
+    }
+    let mut zero = base.clone();
+    zero["wall_s"] = json!(0);
+    cases.push(("time_zero", zero));
+    for value in [json!(false), json!(true), json!(0), json!({}), json!([])] {
+        let mut raw = base.clone();
+        raw["error"] = value;
+        cases.push(("error_invalid", raw));
+    }
+    let mut no_roots = base.clone();
+    no_roots["roots"] = json!([]);
+    cases.push(("no_roots", no_roots));
+    let raw: Vec<&Value> = cases.iter().map(|(_, v)| v).collect();
+    let js_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("lib").join("hygiene.js");
+    let mut child = Command::new("node")
+        .arg("--no-warnings")
+        .arg("-e")
+        .arg("const h=require(process.argv[1]);const fs=require('node:fs');const a=JSON.parse(fs.readFileSync(0,'utf8'));console.log(JSON.stringify(a.map(x=>h.progress(x,0))))")
+        .arg(js_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("node が必要");
+    child.stdin.take().unwrap().write_all(serde_json::to_string(&raw).unwrap().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "JS 評価が失敗");
+    let js: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(js.len(), cases.len());
+    for ((kind, raw), j) in cases.iter().zip(js) {
+        let (observed, line) = tune_core::hygiene::progress(raw, 0);
+        assert!(same(&j, &json!({ "observed": observed, "line": &line })), "{kind} の JS と Rust が不一致");
+        assert!(line.starts_with("node-a:"));
+        match *kind {
+            "valid" => assert!(line.contains("未観測 0 件・1.3s")),
+            "time_zero" => assert!(line.contains("0.0s")),
+            "time_missing" | "time_invalid" => assert!(line.contains("時間不明")),
+            "error_invalid" | "no_roots" => assert!(line.contains("未観測 件数不明・1.3s")),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
 fn normalize_observation_matches_js() {
     let valid = json!({
         "path": "~/fixture", "rel": "example.com/acme/fixture", "linked": false, "state": "ok",
@@ -254,6 +316,7 @@ fn normalize_observation_matches_js() {
     second["tracked"] = json!(1.0);
     second["untracked"] = json!(2);
     second["conflicted"] = json!(1);
+    second["linked"] = json!(true);
     second["detached"] = json!(true);
     second["upstream"] = json!(true);
     let mut boundary = valid.clone();
@@ -279,7 +342,7 @@ fn normalize_observation_matches_js() {
     ];
     let counts = vec![json!(null), json!("0"), json!(false), json!(-1), json!(-0.5), json!(1.5), json!(9_007_199_254_740_992_u64), json!({}), json!([])];
     let flags = vec![json!(null), json!("false"), json!(0), json!(1), json!({}), json!([])];
-    for (fields, values) in [(&["tracked", "untracked", "conflicted"][..], &counts), (&["upstream", "detached"][..], &flags)] {
+    for (fields, values) in [(&["tracked", "untracked", "conflicted"][..], &counts), (&["upstream", "detached", "linked"][..], &flags)] {
         for field in fields {
             for value in std::iter::once(None).chain(values.iter().cloned().map(Some)) {
                 let mut row = valid.clone();

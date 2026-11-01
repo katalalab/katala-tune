@@ -237,7 +237,7 @@ test('差分本文・ファイル内容・認証情報入りの URL を出力に
   assert.equal(hygiene.stripUrl('https://user:tok@example.com/o/r.git?x=1#f'), 'https://example.com/o/r.git');
   assert.equal(hygiene.stripUrl('user:tok@example.com:o/r.git'), 'example.com:o/r.git');
   assert.equal(hygiene.stripUrl('git@example.com:o/r.git'), 'example.com:o/r.git');
-  const n = hygiene.normalize({ probe: 'repo_hygiene', content: 'SECRET-BODY-MARKER', repos: [{ state: 'ok', path: '~/x', detached: false, upstream: false, tracked: 0, untracked: 0, conflicted: 0, origin: 'https://a:b@example.com/o/r.git', diff: 'SECRET-BODY-MARKER' }] });
+  const n = hygiene.normalize({ probe: 'repo_hygiene', content: 'SECRET-BODY-MARKER', repos: [{ state: 'ok', path: '~/x', linked: false, detached: false, upstream: false, tracked: 0, untracked: 0, conflicted: 0, origin: 'https://a:b@example.com/o/r.git', diff: 'SECRET-BODY-MARKER' }] });
   assert.equal(n.repos[0].state, 'ok');
   assert.ok(!JSON.stringify(n).includes('SECRET-BODY-MARKER'));
   assert.ok(!JSON.stringify(n).includes('a:b'));
@@ -291,7 +291,7 @@ test('台帳: 運用対象でない機体は対象外で、接続せずに断る
 });
 
 const row = (o = {}) => ({ path: '~/ghq/example.com/o/r', rel: 'example.com/o/r', linked: false, state: 'ok', reason: null, branch: 'main', detached: false, upstream: true, ahead: 0, behind: 0, local_only: null, tracked: 0, untracked: 0, conflicted: 0, dirty_age_s: null, head_age_s: 5, stash: 0, origin: 'https://example.com/o/r.git', origin_host: 'example.com', origin_path: 'o/r', has_origin: true, ...o });
-const completeAudit = (repos, opts = {}) => ({ roots: [], repos, enumerated: repos.length + (opts.skipped ?? 0), skipped: 0, truncated: false, ...opts });
+const completeAudit = (repos, opts = {}) => ({ roots: [{ path: '~/fixture', source: 'opt' }], repos, enumerated: repos.length + (opts.skipped ?? 0), skipped: 0, truncated: false, ...opts });
 
 test('所見: dirty は古さで重大度を分け、上位だけを並べる', () => {
   const young = hygiene.analyze(completeAudit([row({ path: '~/a', tracked: 1, dirty_age_s: 3600 })]));
