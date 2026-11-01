@@ -126,13 +126,18 @@ def cpu_time_seconds(text):
 
 # 同一コマンドの多重起動・孤児・プロセス木（#38・#30）。
 # 引数はキー（実行ファイル[:スクリプト名]）を作るために一時的に読むだけで、出力に載せるのは安全な短い名前だけ（パス・引数は出さない）
-INTERPRETERS = re.compile(r"^(node|nodejs|bun|deno|python3?(\.\d+)?|uv|uvx|npx|bunx|npm|pnpm|ruby|java|git)$")
+INTERPRETERS = re.compile(r"^(node|nodejs|bun|deno|python3?(\.\d+)?|uv|uvx|npx|bunx|npm|pnpm|ruby|java|git)$", re.I)
 LAUNCHERS = {"launchd", "login", "sshd", "sshd-session"}
 GENERIC_LABELS = {"index", "main", "cli", "server", "bin", "run", "app", "start", "dist", "build", "lib", "src", "out", "node_modules", "__main__"}
-SKIP_WORDS = {"exec", "run", "x", "dlx", "tool", "start"}
-# 値を取らないと分かっているオプション。ほかの「-」で始まる引数は次が値（トークンなど）かもしれないので、そこで読むのをやめる
-VALUELESS = {"-y", "--yes", "-q", "--quiet", "--silent", "-u", "-B", "-E", "-s", "-S", "-I", "-O", "-OO", "-i",
-             "--no-warnings", "--no-deprecation", "--trace-warnings", "--enable-source-maps", "--inspect", "--"}
+SKIP_WORDS = {"npm": {"exec", "run", "x"}, "pnpm": {"exec", "run", "dlx"}, "uv": {"tool", "run"}, "bun": {"run", "x"}}
+# 同じオプションでも実行環境で意味が違う（例: Python -I は値なし、Ruby -I はパス付き）。未知なら読むのをやめる。
+VALUELESS = {
+    "python": {"-q", "-u", "-B", "-E", "-s", "-S", "-I", "-O", "-OO", "-i"},
+    "node": {"--no-warnings", "--no-deprecation", "--trace-warnings", "--enable-source-maps", "--inspect", "-i"},
+    "npx": {"-y", "--yes", "-q", "--quiet", "--silent"},
+    "bunx": {"-y", "--yes"}, "npm": {"-y", "--yes", "-q", "--quiet", "--silent", "-s"},
+    "pnpm": {"--silent", "-s"}, "uv": {"-q", "--quiet"}, "uvx": {"-q", "--quiet"},
+}
 LABEL_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@+-]{0,47}$")
 GROUP_MIN_COUNT = 3
 
@@ -155,30 +160,54 @@ def script_label(path):
     return None
 
 
-def proc_key(exe, tokens):
+def proc_key(exe, tokens, flat=False):
     """実行ファイル名と引数（呼び出し側が捨てる）から、同じ種類かを決める鍵を作る。"""
     if not INTERPRETERS.match(exe):
         return exe[:48]
+    exe = exe.lower()  # 判定用の鍵だけを正規化し、プロセスの表示名は変えない。
+    family = "python" if exe.startswith("python") else "node" if exe == "nodejs" else exe
     label = None
     i = 0
+    options = True
+    launcher = True
     while i < len(tokens):
         t = tokens[i]
-        if t == "-m" and i + 1 < len(tokens):
-            label = script_label(tokens[i + 1].split(".")[0])
+        if options and t == "--":
+            options = False
+            i += 1
+            continue
+        if options and t == "-m" and family == "python" and i + 1 < len(tokens):
+            module = tokens[i + 1]
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*", module):
+                label = script_label(module.split(".")[0])
             break
-        if t == "-c" and exe.startswith("python"):
+        if options and t == "-c" and exe.startswith("python"):
             break
-        if t in ("-c", "-C", "-r", "--require") and exe in ("git", "node"):
+        if options and ((exe == "git" and t in ("-c", "-C")) or (family == "node" and t in ("-r", "--require"))):
+            if flat and exe != "git":
+                break  # ps では値自体に含まれる空白を区別できない。
             i += 2
             continue
-        if t.startswith("-"):
-            if "=" in t or t in VALUELESS:
+        if options and t.startswith("-"):
+            if flat and "=" in t:
+                break
+            if "=" in t or t in VALUELESS.get(family, set()):
                 i += 1
                 continue
             break
-        if t in SKIP_WORDS:
+        if options and launcher and t in SKIP_WORDS.get(exe, set()):
+            if exe == "uv" and t == "tool":
+                if tokens[i + 1:i + 2] != ["run"]:
+                    break
+                i += 1
             i += 1
+            launcher = False
             continue
+        # ps command= は argv の区切りを失う。後続があれば、空白入りパスの断片かもしれない。
+        if flat and i != len(tokens) - 1 and not (exe == "git" and t == "fsmonitor--daemon"):
+            break
+        if exe == "git" and t != "fsmonitor--daemon":
+            break
         label = script_label(re.sub(r"(?<=.)@[^@/\\]*$", "", t))
         break
     return "%s:%s" % (exe, label) if label else exe
@@ -222,7 +251,7 @@ def multiplication(rows, group_cap=20, tree_cap=10):
             g["parents"][r["_parent"]] = g["parents"].get(r["_parent"], 0) + 1
     out = []
     for g in groups.values():
-        if g["count"] < GROUP_MIN_COUNT:
+        if g["count"] < GROUP_MIN_COUNT and not (g["orphans"] >= 2 and "mcp" in g["key"].lower()):
             continue
         top = sorted(g["parents"].items(), key=lambda kv: (-kv[1], kv[0]))
         out.append({"key": g["key"], "count": g["count"], "mem_mb": round(g["kb"] / 1024), "orphans": g["orphans"],
@@ -293,7 +322,9 @@ def processes():
             if len(f) == 2 and f[0].isdigit():
                 argv[int(f[0])] = f[1]
     for r in rows:
-        r["key"] = proc_key(r["name"], argv.get(r["pid"], "").split()[1:] if INTERPRETERS.match(r["name"]) else [])
+        command = argv.get(r["pid"], "").split()
+        tokens = command[1:] if command and os.path.basename(command[0]).lower() == r["name"].lower() else []
+        r["key"] = proc_key(r["name"], tokens, flat=True)
     argv.clear()
     pgroups, ptrees = multiplication(rows)
     return {

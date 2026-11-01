@@ -10,7 +10,7 @@
 //!   tune-agent unpair <指紋|名前> [--dir D]
 //!       ペア済みの相手を台帳から消す
 //!   tune-agent sample [interval=1] [procs=5] [max=900] [count=0] [watch=1]
-//!       ライブ表示のサンプラー（Windows。probes/live_win.ps1 と同じ行を標準出力へ。sample.rs）
+//!       ライブ表示のサンプラー（Windows は probes/live_win.ps1、macOS は probes/live_mac.py と同じ行を標準出力へ。sample.rs）
 //!
 //! 待ち受けは既定で 127.0.0.1 と Tailscale のアドレスだけ。0.0.0.0・:: では待ち受けない。
 //! 置き場所（--dir）の既定は `~/.katala-tune/agent`（`KATALA_TUNE_AGENT_DIR` で差し替えられる）。
@@ -20,6 +20,8 @@ mod listen;
 mod otlp;
 mod probe;
 mod sample;
+#[cfg(target_os = "macos")]
+mod sample_mac;
 #[cfg(windows)]
 mod sample_win;
 mod server;

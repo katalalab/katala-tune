@@ -373,6 +373,9 @@ async function renderNode(id) {
     $$('[data-copy]', el).forEach((b) => { b.onclick = async () => { await window.tune.copy(f.commands[+b.dataset.copy]); b.textContent = 'コピー済み'; }; });
     const a = $('[data-act]', el);
     if (a) a.onclick = () => runAction(n, f);
+    $$('[data-ai]', el).forEach((b) => { b.onclick = () => handoff(n, f, b.dataset.ai); });
+    const ac = $('[data-ai-copy]', el);
+    if (ac) ac.onclick = async () => { const res = await window.tune.aiHandoffCopy(n.id, f.id); if (res.ok) ac.textContent = 'コピー済み'; else toast(`コピーしませんでした: ${res.refused}`, 5000); };
     const lq = $('[data-logq]', el);
     if (lq) lq.onclick = () => { state.logFilter = { ...state.logFilter, q: f.log_query?.q || '', node_id: n.id, level: f.log_query?.level || '' }; go('logs'); };
   });
@@ -396,6 +399,8 @@ function findingHtml(f) {
       : `<div class="act"><button class="btn ${f.action.type === 'kill-process' ? 'danger' : 'primary'}" data-act="1">${esc(f.action.label)}</button><span>実行前に確認します。直前に状態を確かめ直し、変わっていれば中止します</span></div>`;
   }
   if (f.log_query) act += `<div class="act"><button class="btn small" data-logq="1">${icon('logs')}関連するログを見る</button></div>`;
+  // AI エージェントへ渡す（Tauri 版だけ）。開く前に、渡す全文を確認ダイアログで見せる
+  if (window.tune.aiHandoff) act += `<div class="act"><button class="btn small" data-ai="claude">${icon('bulb')}Claude Code で調べる</button><button class="btn small" data-ai="codex">${icon('bulb')}Codex で調べる</button><button class="btn small" data-ai-copy="1">${icon('copy')}AI 用にコピー</button></div>`;
   return UI.toggle({
     cls: `f sev-${f.severity}`, attrs: `data-fid="${esc(f.id)}"`, open: f.severity !== 'info',
     summary: `<span class="f-title">${esc(f.title)}</span>${f.category ? `<span class="f-cat">${esc(CAT_LABEL[f.category] || f.category)}</span>` : ''}`,
@@ -406,6 +411,8 @@ function findingHtml(f) {
 // WSL の中の観測。停止中は起動せず「未観測」（正常でも空でもない）。中を観測できたのは動いている distro だけ
 const WSL_STATE = { running: ['動いている', 'green'], stopped_unobserved: ['停止中（未観測）', 'gray'], unknown: ['状態を読めない', 'orange'] };
 const WSL_REASON = { 'not-running': '起動しないので観測していない', 'running-list-failed': '動いているかを読めなかった', 'internal-distro-skipped': 'Docker Desktop の内部 distro', 'observation-limit': '観測数の上限', timeout: '時間切れ', failed: '実行できなかった', 'no-data': '内側から値を読めなかった' };
+const WSL_SECTION = { swap: 'スワップ', psi: 'PSI', load: '負荷', top: '上位プロセス', disk: 'ディスク' };
+const WSL_SECTION_REASON = { 'command-failed': '取得コマンドが失敗', 'invalid-data': '値を読めなかった', 'missing-status': '取得結果を確認できなかった' };
 function wslHtml(d) {
   const w = d.wsl;
   const list = Array.isArray(w?.distros) ? w.distros : [];
@@ -416,7 +423,9 @@ function wslHtml(d) {
     if (!i) return `<span class="muted">${esc(WSL_REASON[x.reason] || x.reason || '')}</span>`;
     const used = Math.max(0, i.mem_total_mb - i.mem_available_mb);
     const top = (i.top || []).slice(0, 3).map((p) => `${esc(p.name)} ${esc(p.mem_mb)} MB`).join('、');
-    return `メモリ ${gbOf(used)} / ${gbOf(i.mem_total_mb)}${i.psi_some_avg10 != null ? `（PSI ${esc(i.psi_some_avg10)}%）` : ''}${top ? `<div class="muted">上位: ${top}</div>` : ''}`;
+    const missing = Object.entries(WSL_SECTION).filter(([key]) => i.errors && Object.hasOwn(i.errors, key) && i.errors[key] != null)
+      .map(([key, label]) => `${label}（${Object.hasOwn(WSL_SECTION_REASON, i.errors[key]) ? WSL_SECTION_REASON[i.errors[key]] : '不明'}）`).join('、');
+    return `メモリ ${gbOf(used)} / ${gbOf(i.mem_total_mb)}${i.psi_some_avg10 != null ? `（PSI ${esc(i.psi_some_avg10)}%）` : ''}${top ? `<div class="muted">上位: ${top}</div>` : ''}${missing ? `<div class="note-line">未取得: ${esc(missing)}</div>` : ''}`;
   };
   return `${UI.section('WSL の中', '停止中の distro は起動せず観測しません。メモリは WSL の VM 全体（distro は共有）')}
     ${UI.table({
@@ -943,9 +952,14 @@ async function renderActions() {
     ${log.length ? UI.table({
       cols: [{ label: '日時' }, { label: '機体' }, { label: '操作' }, { label: '', cls: 'acts' }],
       rows: log,
-      row: (a) => `<td class="muted nowrap">${esc(fmtTime(a.at))}</td><td class="nowrap"><b>${esc(a.node_id)}</b></td>`
-        + `<td><div class="act-title">${a.state === 'incomplete' ? UI.chip('未完了', 'orange', { dot: true }) : a.ok ? UI.chip('成功', 'green', { dot: true }) : UI.chip('失敗', 'red', { dot: true })}<span>${esc(a.label)}</span></div>${a.output ? `<div class="act-out">${esc(a.output)}</div>` : ''}</td>`
-        + `<td class="acts">${a.undo && !log.some((b) => b.undo_of === a.id && b.ok) ? `<button class="btn small" data-undo="${esc(a.id)}">元に戻す</button>` : a.undo ? UI.chip('戻し済み', 'gray') : a.undo_of ? UI.chip('戻し', 'default') : ''}</td>`,
+      row: (a) => {
+        const requested = a.type === 'ai-handoff' && a.state !== 'incomplete' && a.ok;
+        // 旧記録の本文は保存されたまま、画面では当時確認できた範囲に言い換える。
+        const output = requested ? (a.output || '').replace(/^(Codex|Claude Code) を新しいターミナルで開いた/, '$1 用のターミナルの起動を要求した。CLI の起動は未確認') : a.output;
+        return `<td class="muted nowrap">${esc(fmtTime(a.at))}</td><td class="nowrap"><b>${esc(a.node_id)}</b></td>`
+          + `<td><div class="act-title">${a.state === 'incomplete' ? UI.chip('未完了', 'orange', { dot: true }) : a.ok ? UI.chip(requested ? '起動要求済み' : '成功', 'green', { dot: true }) : UI.chip('失敗', 'red', { dot: true })}<span>${esc(a.label)}</span></div>${output ? `<div class="act-out">${esc(output)}</div>` : ''}</td>`
+          + `<td class="acts">${a.undo && !log.some((b) => b.undo_of === a.id && b.ok) ? `<button class="btn small" data-undo="${esc(a.id)}">元に戻す</button>` : a.undo ? UI.chip('戻し済み', 'gray') : a.undo_of ? UI.chip('戻し', 'default') : ''}</td>`;
+      },
     }) : UI.empty('まだ何も実行していません。所見の提案から実行すると、ここに残ります。')}`);
   $$('[data-undo]').forEach((b) => {
     b.onclick = async () => { const r = await window.tune.undo(b.dataset.undo); toast(r.ok ? '元に戻しました' : r.refused || (r.cancelled ? '取り消しました' : `失敗: ${r.output}`)); renderActions(); };
@@ -958,6 +972,15 @@ async function runAction(n, f) {
   if (r.refused) return toast(`実行しませんでした: ${r.refused}`, 5000);
   toast(`${n.id}: ${r.outcome}`, 5000);
   await probe([n.id]);
+}
+
+async function handoff(n, f, agent) {
+  const r = await window.tune.aiHandoff(n.id, f.id, agent);
+  if (r.audit_incomplete) return toast(`起動を試みましたが、結果の記録が未完了です: ${r.error}。再実行せず、ターミナルと実行記録を確認してください`, 10000);
+  const audit = r.audit_error ? `（実行記録を書けませんでした: ${r.audit_error}）` : '';
+  if (r.cancelled) return toast(`取り消しました${audit}`, r.audit_error ? 10000 : 3200);
+  if (!r.ok) return toast(`開きませんでした: ${r.refused}${audit}`, 5000);
+  toast(`ターミナルの起動を要求しました。${agent === 'codex' ? 'Codex' : 'Claude Code'} の起動はターミナルで確認してください（実行記録に残しました）`, 10000);
 }
 
 // ---- 分析・同期 ----

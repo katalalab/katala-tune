@@ -46,24 +46,20 @@ test('同種ログは取得上限500件を守り、次ページで残りを取�
   assert.deepEqual(db.signatures({ limit: 1000, offset: 500 }).map(r => r.fingerprint), ['500']);
 });
 
-test('Windows リモートログは固定ファイルを使わず Base64 stdin から実行する', () => {
+test('Windows リモートログは固定bootstrapと検証付きstdinで実行する', () => {
   const script = Buffer.from('\uFEFFparam([long]$SysCursor)\n[Console]::OutputEncoding = [Text.Encoding]::UTF8\n', 'utf8');
   const transport = windowsRemoteTransport({ win_system: '42; Write-Error bad', win_application: ' 7tail', neonmonitor: 'not-a-number' }, script);
-  assert.doesNotMatch(transport.command, /katala-tune|logs\.ps1|-File|cygpath/);
-  assert.match(transport.command, /^printf %s [A-Za-z0-9+/=]+ \| powershell\.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand [A-Za-z0-9+/=]+$/);
+  assert.match(transport.command, /^powershell\.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand [A-Za-z0-9+/=]+$/);
   assert.ok(Buffer.byteLength(transport.command) < 8191);
-  assert.match(transport.bootstrap, /FromBase64String\(\[Console\]::In\.ReadToEnd\(\)\)/);
-  assert.match(transport.bootstrap, /\[ScriptBlock\]::Create\(\$s\)/);
-  assert.match(transport.bootstrap, /-SysCursor 42 -AppCursor 7 -NeonCursor 0$/);
-  assert.equal(transport.input, undefined);
+  assert.deepEqual(transport.input.split('\n').slice(0, 5), ['KTLOG1', 'events', '42', '7', '0']);
+  assert.match(transport.bootstrap, /UTF8Encoding\(\$false\)/);
   const fullScript = fs.readFileSync(path.join(__dirname, '..', 'probes', 'win_logs.ps1'));
   const maxCursors = { win_system: '9007199254740991', win_application: '9007199254740991', neonmonitor: '9007199254740991' };
-  assert.ok(Buffer.byteLength(windowsRemoteTransport(maxCursors, fullScript).command) < 8191);
-  // Windows の checkout（autocrlf で CRLF）でも LF と同じコマンドになる（改行は LF にそろえて送る）
+  assert.equal(windowsRemoteTransport(maxCursors, fullScript).command, transport.command);
   const lf = Buffer.from(fullScript.toString('latin1').replace(/\r\n/g, '\n'), 'latin1');
   const crlf = Buffer.from(lf.toString('latin1').replace(/\n/g, '\r\n'), 'latin1');
-  assert.equal(windowsRemoteTransport(maxCursors, crlf).command, windowsRemoteTransport(maxCursors, lf).command);
-  assert.throws(() => windowsRemoteTransport({}, Buffer.alloc(6000)), /8191/);
+  assert.deepEqual(windowsRemoteTransport(maxCursors, crlf), windowsRemoteTransport(maxCursors, lf));
+  assert.equal(windowsRemoteTransport({}, Buffer.alloc(16384, 35)).command, transport.command);
 });
 
 test('秘密らしい値を伏せる', () => {

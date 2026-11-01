@@ -54,9 +54,35 @@ fn seen(d: &Value) -> bool {
     matches!(d.get("observed"), Some(Value::Bool(true))) && used_mb(d.get("inside")).is_some()
 }
 
+fn partial_text(d: &Value) -> String {
+    let errors = get(d.get("inside"), "errors");
+    [("swap", "スワップ"), ("psi", "PSI"), ("load", "負荷"), ("top", "上位プロセス"), ("disk", "ディスク")]
+        .into_iter()
+        .filter_map(|(key, label)| {
+            let reason = get(errors, key).filter(|r| !r.is_null())?;
+            let text = match reason.as_str() {
+                Some("command-failed") => "取得コマンドが失敗",
+                Some("invalid-data") => "値を読めなかった",
+                Some("missing-status") => "取得結果を確認できなかった",
+                _ => "不明",
+            };
+            Some(format!("{label}（{text}）"))
+        })
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
 /// vm_mb: Windows 側の vmmem の実メモリ MB（無ければ None）、total_mb: Windows の物理メモリ MB
 pub fn findings(snap: &Value, vm_mb: Option<f64>, total_mb: f64) -> Vec<Value> {
     let mut out = Vec::new();
+    if let Some(reason) = get(get(Some(snap), "wsl"), "list_error").and_then(Value::as_str).filter(|r| !r.is_empty()) {
+        out.push(json!({
+            "id": "wsl-list-failed", "severity": "info", "category": "memory",
+            "title": "WSL の distro の一覧を読めなかった",
+            "detail": format!("一覧の取得失敗: {}（distro が無いと確認できたわけではない）", reason_text(Some(&json!(reason)))),
+            "advice": "一覧を取得できないため、WSL の中は未観測。調査のために distro を起動しない。",
+        }));
+    }
     let all = distros(snap);
     if all.is_empty() {
         return out;
@@ -118,6 +144,21 @@ pub fn findings(snap: &Value, vm_mb: Option<f64>, total_mb: f64) -> Vec<Value> {
             "advice": "停止中の distro は「正常」でも「空」でもなく、観測していないだけ。調べるために起動はしない。中を見たいときは、その distro を自分で起動してから分析する。",
         }));
     }
+    let partial: Vec<String> = observed
+        .iter()
+        .filter_map(|d| {
+            let text = partial_text(d);
+            (!text.is_empty()).then(|| format!("{}: {}", name(d), text))
+        })
+        .collect();
+    if !partial.is_empty() {
+        out.push(json!({
+            "id": "wsl-partial", "severity": "info", "category": "memory",
+            "title": format!("WSL の distro {} 件で一部を取得できなかった", partial.len()),
+            "detail": partial.join(" / "),
+            "advice": "取得できたメモリは表示している。欠測項目は空や正常と判断せず、機体の詳細で理由を確認する。",
+        }));
+    }
     out
 }
 
@@ -159,5 +200,35 @@ mod tests {
         let f = findings(&json!({ "wsl": { "distros": [running("a", 20000), missed] } }), Some(20000.0), 65536.0);
         assert_eq!(ids(&f), ["wsl-unobserved"]);
         assert!(f[0]["detail"].as_str().unwrap().contains("b（時間切れ）"));
+    }
+
+    #[test]
+    fn list_failure_is_distinct_from_an_empty_or_legacy_inventory() {
+        for reason in ["timeout", "exit 1", "output-limit"] {
+            let f = findings(
+                &json!({ "wsl": { "observation_enabled": true, "installed": true, "listed": false, "list_error": reason, "distros": [] } }),
+                None,
+                0.0,
+            );
+            assert_eq!(ids(&f), ["wsl-list-failed"]);
+            assert!(f[0]["title"].as_str().unwrap().contains("一覧を読めなかった"));
+        }
+        for wsl in [json!({}), json!({"observation_enabled": false}), json!({"installed": false}), json!({"installed": true, "listed": true, "distros": []})] {
+            assert!(findings(&json!({ "wsl": wsl }), None, 0.0).is_empty());
+        }
+    }
+
+    #[test]
+    fn partial_observation_preserves_memory_and_reports_section_reasons() {
+        let mut d = running("dev-a", 1000);
+        d["inside"]["errors"] = json!({"top": "command-failed", "disk": "invalid-data", "psi": "missing-status"});
+        let f = findings(&json!({ "wsl": { "distros": [d] } }), None, 0.0);
+        assert_eq!(ids(&f), ["wsl-inside-memory", "wsl-partial"]);
+        assert_eq!(f[1]["detail"], "dev-a: PSI（取得結果を確認できなかった）、上位プロセス（取得コマンドが失敗）、ディスク（値を読めなかった）");
+        for errors in [Value::Null, json!({}), json!({"top": null}), json!({"unexpected": "secret"})] {
+            let mut d = running("dev-a", 20000);
+            d["inside"]["errors"] = errors;
+            assert!(findings(&json!({ "wsl": { "distros": [d] } }), None, 0.0).is_empty());
+        }
     }
 }

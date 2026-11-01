@@ -129,7 +129,7 @@ test('Windows artifact steps append to existing checks and upload exactly the ve
     assert.match(tail, /timeout-minutes: 20/);
     assert.equal((tail.match(/if: runner.os == 'Windows'/g) || []).length, 3);
     assert.match(tail, /run: node scripts\/ci-cli-artifact.js/);
-    assert.match(tail, /uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/);
+    assert.match(tail, /uses: actions\/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9/);
     assert.match(tail, /name: tune-cli-windows-x64-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}/);
     assert.match(tail, /path: \|\n            dist\/ci-cli\/tune.exe\n            dist\/ci-cli\/manifest.json\n/);
     assert.match(tail, /if-no-files-found: error/);
