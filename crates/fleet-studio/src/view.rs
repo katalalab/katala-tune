@@ -5,21 +5,15 @@ use std::time::Duration;
 use crate::search_view::{SearchElement, SearchLayout};
 use fleet_studio::Observation;
 use fleet_studio::audit::{self, Audit, AuditIdentity, RepoAudit, Scope};
-use fleet_studio::llm::{self, Endpoint, ModelError, ModelObservation};
+use fleet_studio::llm::{self, Endpoint, ModelConfirmation, ModelError, ModelGrant, ModelObservation, ModelQuery, ModelRevocation, ModelScope, RefreshQueue};
 use fleet_studio::navigation::{self, OpenResult, OpenState, OpenTarget};
 use fleet_studio::pointer_id::PointerIds;
-use fleet_studio::recent::{self, RecentEntry, RecentSlot, RecentWork, SyncStatus};
+use fleet_studio::recent::{self, RecentEntry, RecentGate, RecentSlot, RecentTicket, RecentWork, SyncStatus};
+use fleet_studio::refresh::{self, FullRefresh};
 use fleet_studio::scope::{AuditGate, AuditTicket, Confirmation, Confirmations, Grants, Permit, RefreshGate};
 use fleet_studio::search_input::{KeyAction, KeyModifiers, SearchInput, search_key};
 use fleet_studio::source::{self, Coverage, Dashboard, NodeCard, Repository, SavedState};
 use gpui::{Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton, Render, SharedString, Window, div, prelude::*, rgb};
-
-#[derive(Clone)]
-struct ModelLine {
-    label: String,
-    endpoint: Option<Endpoint>,
-    observation: ModelObservation,
-}
 
 #[derive(Clone, Copy)]
 enum RecentOpen {
@@ -44,8 +38,13 @@ pub struct FleetView {
     dashboard_gate: RefreshGate,
     scope_check_pending: bool,
     access_notice: Option<&'static str>,
-    models: Vec<ModelLine>,
+    model_scope: ModelScope,
+    model_confirmation: Option<ModelConfirmation>,
+    model_cancellation: Option<&'static str>,
+    refresh_queue: RefreshQueue,
+    sample_model: Option<ModelObservation>,
     recent: RecentSlot,
+    recent_gate: RecentGate,
     audit: Option<Audit>,
     audit_gate: AuditGate,
     audit_error: Option<String>,
@@ -95,8 +94,13 @@ impl FleetView {
             dashboard_gate: RefreshGate::default(),
             scope_check_pending: false,
             access_notice: None,
-            models: Vec::new(),
+            model_scope: ModelScope::default(),
+            model_confirmation: None,
+            model_cancellation: None,
+            refresh_queue: RefreshQueue::default(),
+            sample_model: None,
             recent: RecentSlot::default(),
+            recent_gate: RecentGate::default(),
             audit: None,
             audit_gate: AuditGate::default(),
             audit_error: None,
@@ -133,26 +137,43 @@ impl FleetView {
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.selected.invalidate();
         self.machine_focus = None;
-        self.confirmations.clear();
         self.pointer_ids.borrow_mut().clear();
-        let had_audit = self.audit.is_some();
-        self.audit_gate.invalidate_and_clear(&mut self.audit);
+        let decision = refresh::begin(FullRefresh {
+            sample: self.sample,
+            machine_confirmations: &mut self.confirmations,
+            dashboard_gate: &mut self.dashboard_gate,
+            scope_check_pending: &mut self.scope_check_pending,
+            generation: &mut self.generation,
+            audit_gate: &mut self.audit_gate,
+            audit: &mut self.audit,
+            recent: &mut self.recent,
+            recent_gate: &mut self.recent_gate,
+            models: &mut self.model_scope,
+            model_confirmation: &mut self.model_confirmation,
+            model_queue: &mut self.refresh_queue,
+        });
         self.audit_error = if self.auditing {
             Some("更新により監査結果を非表示にしました。進行中の監査は終了待ちです。".into())
-        } else if had_audit {
+        } else if decision.had_audit {
             Some("更新により前回の監査結果を破棄しました。再監査は未実行です。".into())
         } else {
             None
         };
-        if !self.sample {
-            if let Some(generation) = self.recent.request() {
-                self.start_recent(generation, cx);
-            }
+        if self.sample {
+            self.scope_check_pending = false;
+            self.dashboard = Some(sample_dashboard(&self.grants));
+            let mut observation = ModelObservation::default();
+            observation.record(Ok(vec!["fixture-model".into()]), tune_core::db::now_ms());
+            self.sample_model = Some(observation);
+            self.recent.data = Some(sample_recent());
+            self.loading = false;
             cx.notify();
+            return;
         }
-        if !self.sample
-            && let Some(dashboard) = &mut self.dashboard
-        {
+        if let Some(generation) = decision.recent {
+            self.start_recent(generation, cx);
+        }
+        if let Some(dashboard) = &mut self.dashboard {
             for node in &mut dashboard.nodes {
                 if node.permit.is_some() {
                     node.observation = Observation::Unknown;
@@ -160,67 +181,102 @@ impl FleetView {
                 }
             }
         }
-        if self.dashboard_gate.is_active() {
-            self.scope_check_pending = true;
-            self.dashboard_gate.invalidate();
-            let _ = self.dashboard_gate.request();
-            self.loading = true;
-            cx.notify();
-            return;
-        }
-        if self.models.iter().any(|line| line.endpoint.is_some() && line.observation.latest.is_none()) {
-            self.start_dashboard(cx);
-            cx.notify();
-            return;
-        }
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
-        if self.sample {
-            self.dashboard = Some(sample_dashboard(&self.grants));
-            let mut observation = ModelObservation::default();
-            observation.record(Ok(vec!["fixture-model".into()]), tune_core::db::now_ms());
-            self.models = vec![ModelLine { label: "サンプル LLM".into(), endpoint: None, observation }];
-            self.recent.data = Some(sample_recent());
-            self.loading = false;
-            cx.notify();
-            return;
-        }
+        self.loading = true;
         self.start_dashboard(cx);
-        let configured = std::env::var("FLEET_STUDIO_LLM_ENDPOINTS").ok();
-        let (endpoints, rejected) = llm::configured(configured.as_deref());
-        let previous = std::mem::take(&mut self.models);
-        self.models = endpoints
-            .iter()
-            .map(|endpoint| {
-                let mut observation =
-                    previous.iter().find(|line| line.endpoint.as_ref() == Some(endpoint)).map(|line| line.observation.clone()).unwrap_or_default();
-                observation.begin_refresh();
-                ModelLine { label: endpoint.label.clone(), endpoint: Some(endpoint.clone()), observation }
-            })
-            .collect();
-        if rejected > 0 {
-            let mut observation = ModelObservation::default();
-            observation.record(Err(ModelError::InvalidResponse), tune_core::db::now_ms());
-            self.models.push(ModelLine { label: format!("LLM 接続設定 ({rejected} 件)"), endpoint: None, observation });
-        }
-        for (index, endpoint) in endpoints.into_iter().enumerate() {
-            let task = cx
-                .background_executor()
-                .spawn(async move { (llm::models(endpoint.address, endpoint.protocol, Duration::from_secs(2)), tune_core::db::now_ms()) });
-            cx.spawn(async move |view, cx| {
-                let (result, at) = task.await;
-                let _ = view.update(cx, |view, cx| {
-                    if view.generation == generation {
-                        if let Some(line) = view.models.get_mut(index) {
-                            line.observation.record(result, at);
-                        }
-                        cx.notify();
-                    }
-                });
-            })
-            .detach();
+        if decision.models_now {
+            self.start_model_refresh(cx);
         }
         cx.notify();
+    }
+
+    fn start_model_refresh(&mut self, cx: &mut Context<Self>) {
+        let configured = std::env::var("FLEET_STUDIO_LLM_ENDPOINTS").ok();
+        self.model_confirmation = None;
+        let requests = self.model_scope.refresh(configured.as_deref());
+        for request in requests {
+            self.start_model_query(request, cx);
+        }
+        cx.notify();
+    }
+
+    fn start_model_query(&mut self, request: ModelQuery, cx: &mut Context<Self>) {
+        if !self.model_scope.dispatch(&request) {
+            return;
+        }
+        let queued = request.clone();
+        let task =
+            cx.background_executor().spawn(async move { queued.start(|endpoint| llm::models(endpoint.address, endpoint.protocol, Duration::from_secs(2))) });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let at = tune_core::db::now_ms();
+            let _ = view.update(cx, |view, cx| {
+                let cancellation = view.model_scope.cancellation(&request);
+                let refresh_cancelled = view.model_scope.cancellation_for_refresh(&request);
+                view.model_scope.complete(&request, result, at);
+                if let Some(cancellation) = cancellation.filter(|_| !refresh_cancelled) {
+                    view.model_cancellation = Some(match cancellation {
+                        ModelRevocation::Prevented => "取消した 1 件は未開始のまま完了しました。",
+                        ModelRevocation::InProgress => "取消した 1 件が完了し、結果を破棄しました。",
+                        ModelRevocation::Idle => "許可の取消が完了しました。",
+                    });
+                }
+                view.resume_model_refresh(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn prepare_model_confirmation(&mut self, endpoint: &Endpoint, cx: &mut Context<Self>) {
+        if !self.sample && !self.refresh_queue.pending() {
+            self.model_confirmation = self.model_scope.prepare_authorization(endpoint);
+            self.model_cancellation = None;
+            self.pointer_ids.borrow_mut().clear();
+            cx.notify();
+        }
+    }
+
+    fn confirm_model(&mut self, confirmation: &ModelConfirmation, cx: &mut Context<Self>) {
+        if self.sample || self.refresh_queue.pending() || self.model_confirmation.as_ref() != Some(confirmation) {
+            return;
+        }
+        self.model_confirmation = None;
+        self.pointer_ids.borrow_mut().clear();
+        if let Some(request) = self.model_scope.confirm(confirmation) {
+            self.start_model_query(request, cx);
+        }
+        cx.notify();
+    }
+
+    fn cancel_model_confirmation(&mut self, confirmation: &ModelConfirmation, cx: &mut Context<Self>) {
+        if self.model_confirmation.as_ref() != Some(confirmation) {
+            return;
+        }
+        if let Some(confirmation) = self.model_confirmation.take() {
+            self.model_scope.cancel_confirmation(&confirmation);
+        }
+        self.pointer_ids.borrow_mut().clear();
+        cx.notify();
+    }
+
+    fn revoke_model(&mut self, grant: &ModelGrant, cx: &mut Context<Self>) {
+        if let Some(outcome) = self.model_scope.revoke(grant) {
+            self.model_confirmation = None;
+            self.model_cancellation = Some(match outcome {
+                ModelRevocation::Prevented => "許可を取り消し、未開始の通信を阻止しました。",
+                ModelRevocation::InProgress => "許可を取り消しました。通信の開始が確定しているため、停止は保証できません。",
+                ModelRevocation::Idle => "許可と前回の結果を取り消しました。",
+            });
+            self.pointer_ids.borrow_mut().clear();
+            self.resume_model_refresh(cx);
+            cx.notify();
+        }
+    }
+
+    fn resume_model_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.refresh_queue.ready(self.model_scope.querying()) {
+            self.start_model_refresh(cx);
+        }
     }
 
     /// Machine selection refreshes only saved summaries, never recent work or LLM endpoints.
@@ -694,7 +750,8 @@ impl FleetView {
                 "enter" => {
                     if let Some(entry) = self.selected_recent() {
                         let kind = if entry.local && entry.directory_url.is_some() { RecentOpen::Directory } else { RecentOpen::PullRequest(0) };
-                        self.open_recent(entry, kind, cx);
+                        let ticket = self.recent_gate.ticket();
+                        self.open_recent(entry, kind, ticket, cx);
                     } else if let Some(url) = self.selected_url() {
                         self.open_repository(&url, cx);
                     }
@@ -770,7 +827,11 @@ impl FleetView {
         }
     }
 
-    fn open_recent(&mut self, entry: RecentEntry, kind: RecentOpen, cx: &mut Context<Self>) {
+    fn open_recent(&mut self, entry: RecentEntry, kind: RecentOpen, ticket: RecentTicket, cx: &mut Context<Self>) {
+        if !ticket.is_current() {
+            self.open_failure(OpenResult::SelectionChanged, cx);
+            return;
+        }
         let Some(data) = self.recent.data.as_ref() else {
             self.open_failure(OpenResult::SelectionChanged, cx);
             return;
@@ -786,7 +847,7 @@ impl FleetView {
         let permit = if self.sample {
             None
         } else if let Some(fingerprint) = &data.selection_fingerprint {
-            Some((entry.node.clone(), fingerprint.clone()))
+            Some((entry.node.clone(), fingerprint.clone(), ticket))
         } else {
             self.open_failure(OpenResult::SelectionChanged, cx);
             return;
@@ -803,7 +864,7 @@ impl FleetView {
         }
     }
 
-    fn open_target(&mut self, target: OpenTarget, permit: Option<(String, String)>, cx: &mut Context<Self>) {
+    fn open_target(&mut self, target: OpenTarget, permit: Option<(String, String, RecentTicket)>, cx: &mut Context<Self>) {
         self.open_target_checked(target, permit, None, cx);
     }
 
@@ -814,7 +875,7 @@ impl FleetView {
     fn open_target_checked(
         &mut self,
         target: OpenTarget,
-        permit: Option<(String, String)>,
+        permit: Option<(String, String, RecentTicket)>,
         audit_permit: Option<(AuditTicket, AuditIdentity)>,
         cx: &mut Context<Self>,
     ) {
@@ -828,8 +889,9 @@ impl FleetView {
                         ticket.is_current()
                             && audit::revalidate_identity(&tune_core::nodes::user_config_path(), &tune_core::nodes::local_host(), identity)
                             && ticket.is_current()
-                    }) && permit.as_ref().is_none_or(|(node, fingerprint)| {
-                        recent::revalidate_local(&tune_core::nodes::user_config_path(), &tune_core::nodes::local_host(), node, fingerprint)
+                    }) && permit.as_ref().is_none_or(|(node, fingerprint, ticket)| {
+                        ticket
+                            .revalidate(|| recent::revalidate_local(&tune_core::nodes::user_config_path(), &tune_core::nodes::local_host(), node, fingerprint))
                     })
                 };
                 let result = target.open_guarded(allowed);
@@ -963,8 +1025,12 @@ fn coverage_text(value: Coverage) -> &'static str {
     }
 }
 
-fn model_text(line: &ModelLine) -> String {
-    let text: String = match &line.observation.latest {
+fn model_text(observation: &ModelObservation, authorized: bool, refresh_pending: bool) -> String {
+    if !authorized {
+        return "未照会".into();
+    }
+    let text: String = match &observation.latest {
+        None if refresh_pending => "更新待ち".into(),
         None => "取得中".into(),
         Some(Ok(models)) if models.is_empty() => "応答あり・モデル一覧は空".into(),
         Some(Ok(models)) => models.join(", "),
@@ -973,18 +1039,18 @@ fn model_text(line: &ModelLine) -> String {
         Some(Err(ModelError::InvalidResponse)) => "応答を解釈できません".into(),
         Some(Err(ModelError::Http(code))) => format!("HTTP {code}"),
     };
-    if !matches!(&line.observation.latest, Some(Ok(_)))
-        && let Some((models, at)) = &line.observation.last_good
+    if !matches!(&observation.latest, Some(Ok(_)))
+        && let Some((models, at)) = &observation.last_good
     {
-        let age = match line.observation.last_good_freshness(tune_core::db::now_ms()) {
+        let age = match observation.last_good_freshness(tune_core::db::now_ms()) {
             Observation::Stale => "（古い）",
             Observation::Unknown => "（時刻不明）",
             _ => "",
         };
         return format!("{text} / 前回{age}: {} ({})", if models.is_empty() { "一覧は空".into() } else { models.join(", ") }, when(Some(*at)));
     }
-    if matches!(&line.observation.latest, Some(Ok(_))) {
-        match fleet_studio::observation(line.observation.checked_at, false, true, tune_core::db::now_ms(), llm::MODEL_MAX_AGE_MS) {
+    if matches!(&observation.latest, Some(Ok(_))) {
+        match fleet_studio::observation(observation.checked_at, false, true, tune_core::db::now_ms(), llm::MODEL_MAX_AGE_MS) {
             Observation::Stale => return format!("古い / {text}"),
             Observation::Unknown => return format!("時刻不明 / {text}"),
             _ => {}
@@ -1259,6 +1325,7 @@ impl Render for FleetView {
                 let mut actions = div().flex().gap_4().text_sm();
                 if entry.local && entry.directory_url.is_some() {
                     let selected_entry = entry.clone();
+                    let ticket = self.recent_gate.ticket();
                     actions = actions.child(
                         div()
                             .id(SharedString::from(format!(
@@ -1276,11 +1343,12 @@ impl Render for FleetView {
                             )))
                             .cursor_pointer()
                             .child("場所を表示")
-                            .on_click(cx.listener(move |view, _, _, cx| view.open_recent(selected_entry.clone(), RecentOpen::Directory, cx))),
+                            .on_click(cx.listener(move |view, _, _, cx| view.open_recent(selected_entry.clone(), RecentOpen::Directory, ticket.clone(), cx))),
                     );
                 }
                 for pr_index in 0..entry.prs.len() {
                     let selected_entry = entry.clone();
+                    let ticket = self.recent_gate.ticket();
                     actions = actions.child(
                         div()
                             .id(SharedString::from(format!(
@@ -1298,7 +1366,9 @@ impl Render for FleetView {
                             )))
                             .cursor_pointer()
                             .child(format!("PR {} を開く", pr_index + 1))
-                            .on_click(cx.listener(move |view, _, _, cx| view.open_recent(selected_entry.clone(), RecentOpen::PullRequest(pr_index), cx))),
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.open_recent(selected_entry.clone(), RecentOpen::PullRequest(pr_index), ticket.clone(), cx)
+                            })),
                     );
                 }
                 item = item.child(actions);
@@ -1309,9 +1379,88 @@ impl Render for FleetView {
             }
         }
 
-        content = content.child(section("ローカル LLM", "モデル一覧のみ取得・推論なし"));
-        for model in self.models.iter().filter(|model| self.matches(&model.label) || self.matches(&model_text(model))) {
-            content = content.child(row(model.label.clone(), format!("{}  /  今回: {}", model_text(model), when(model.observation.checked_at))));
+        content = content.child(section("LLM 接続先", "モデル一覧のみ取得・推論なし"));
+        if self.refresh_queue.pending() {
+            content = content.child(note("更新を予約しました。実行中の読み込みと照会の完了後に再実行します。".into(), 0xffb86c));
+        }
+        if let Some(message) = self.model_cancellation {
+            content = content.child(note(message.into(), 0xffb86c));
+        }
+        if self.model_scope.pending_cancellations() > 0 {
+            content = content.child(note(format!("旧照会の完了待ち: {} 件。結果は表示しません。", self.model_scope.pending_cancellations()), 0xffb86c));
+        }
+        if let Some(observation) = &self.sample_model {
+            content = content.child(row("サンプル LLM".into(), model_text(observation, true, false)));
+        }
+        if self.model_scope.rejected() > 0 {
+            content = content.child(note(format!("不正な LLM 接続設定: {} 件", self.model_scope.rejected()), 0xffb86c));
+        }
+        if self.model_scope.duplicates() > 0 {
+            content = content.child(note(format!("重複した LLM 接続設定: {} 件（重複分は照会しません）", self.model_scope.duplicates()), 0xffb86c));
+        }
+        for model in self.model_scope.entries() {
+            let status = model_text(&model.observation, model.authorized, self.refresh_queue.pending());
+            if !self.matches(&model.endpoint.label) && !self.matches(&status) {
+                continue;
+            }
+            let endpoint = model.endpoint.clone();
+            let address = endpoint.address.to_string();
+            let protocol = endpoint.protocol.label();
+            let local = endpoint.address.ip().is_loopback();
+            let mut item =
+                div().flex().flex_col().gap_2().child(row(endpoint.label.clone(), format!("{}  /  今回: {}", status, when(model.observation.checked_at))));
+            if !local {
+                item = item.child(note(format!("追加先: {address} / {protocol} / 平文 HTTP"), 0xffb86c));
+                if let Some(grant) = model.grant().cloned() {
+                    item = item.child(note("取消前に開始・実行待ちの通信は、取り消せない場合があります。".into(), 0xffb86c));
+                    let id = pointer_ids.get("llm-revoke", &[&address, protocol, &endpoint.label]);
+                    item = item.child(
+                        div()
+                            .id(SharedString::from(format!("click-{id}")))
+                            .cursor_pointer()
+                            .child("許可を取り消す")
+                            .on_click(cx.listener(move |view, _, _, cx| view.revoke_model(&grant, cx))),
+                    );
+                } else if self.refresh_queue.pending() {
+                    item = item.child(note("更新待ちのため、接続内容の確認はできません。".into(), 0xffb86c));
+                } else if let Some(confirmation) = self.model_confirmation.as_ref().filter(|confirmation| confirmation.endpoint() == &endpoint) {
+                    item = item.child(note(format!("接続内容を確認: {}", confirmation.description()), 0xffb86c));
+                    let confirm_id = pointer_ids.get("llm-confirm", &[&address, protocol, &endpoint.label]);
+                    let cancel_id = pointer_ids.get("llm-cancel-confirmation", &[&address, protocol, &endpoint.label]);
+                    let selected = confirmation.clone();
+                    let cancel = confirmation.clone();
+                    item = item.child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("click-{confirm_id}")))
+                                    .cursor_pointer()
+                                    .child("この接続を有効化")
+                                    .on_click(cx.listener(move |view, _, _, cx| view.confirm_model(&selected, cx))),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("click-{cancel_id}")))
+                                    .cursor_pointer()
+                                    .child("キャンセル")
+                                    .on_click(cx.listener(move |view, _, _, cx| view.cancel_model_confirmation(&cancel, cx))),
+                            ),
+                    );
+                } else {
+                    let id = pointer_ids.get("llm-prepare", &[&address, protocol, &endpoint.label]);
+                    let selected = endpoint.clone();
+                    item = item.child(
+                        div()
+                            .id(SharedString::from(format!("click-{id}")))
+                            .cursor_pointer()
+                            .child("接続内容を確認")
+                            .on_click(cx.listener(move |view, _, _, cx| view.prepare_model_confirmation(&selected, cx))),
+                    );
+                }
+            }
+            content = content.child(item);
         }
         content = content.child(section("リポジトリ衛生", if self.auditing { "取得中…" } else { "この機体のみ A / 遠隔は権限・接続先未確認のため未対応" }));
         content =

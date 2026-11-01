@@ -5,6 +5,7 @@ pub mod llm;
 pub mod navigation;
 pub mod pointer_id;
 pub mod recent;
+pub mod refresh;
 pub mod scope;
 pub mod search_input;
 pub mod source;

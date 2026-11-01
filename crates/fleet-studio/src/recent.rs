@@ -1,5 +1,9 @@
 //! Privacy-preserving projection of saved AI session metadata. No collection runs here.
 use std::path::Path;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use serde_json::Value;
 use tune_core::{
@@ -13,6 +17,49 @@ const MAX_NODES: usize = 32;
 const PER_NODE: usize = 20;
 const MAX_ENTRIES: usize = 50;
 const MAX_PRS: usize = 3;
+
+#[derive(Clone, Debug)]
+pub struct RecentTicket {
+    active: Arc<AtomicBool>,
+}
+
+impl RecentTicket {
+    pub fn is_current(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    /// Recheck the generation on both sides of the caller's identity check.
+    pub fn revalidate(&self, check: impl FnOnce() -> bool) -> bool {
+        self.is_current() && check() && self.is_current()
+    }
+}
+
+pub struct RecentGate {
+    current: Arc<AtomicBool>,
+}
+
+impl Default for RecentGate {
+    fn default() -> Self {
+        Self { current: Arc::new(AtomicBool::new(true)) }
+    }
+}
+
+impl RecentGate {
+    pub fn ticket(&self) -> RecentTicket {
+        RecentTicket { active: Arc::clone(&self.current) }
+    }
+
+    pub fn invalidate(&mut self) {
+        self.current.store(false, Ordering::SeqCst);
+        self.current = Arc::new(AtomicBool::new(true));
+    }
+}
+
+impl Drop for RecentGate {
+    fn drop(&mut self) {
+        self.current.store(false, Ordering::SeqCst);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollectionState {
