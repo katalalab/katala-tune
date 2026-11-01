@@ -38,13 +38,57 @@ pub enum Scope {
 }
 
 pub fn targets(nodes: &[tune_core::nodes::Node], scope: Scope) -> Vec<tune_core::nodes::Node> {
+    if scope == Scope::Fleet {
+        return Vec::new();
+    }
+    let ambiguous = crate::recent::local_ambiguous(nodes);
+    let mut counts = std::collections::HashMap::new();
+    for node in nodes {
+        *counts.entry(node.id.as_str()).or_insert(0usize) += 1;
+    }
     nodes
         .iter()
         .filter(|node| {
-            tune_core::hygiene::enabled(node) && !node.shared && (node.local || (scope == Scope::Fleet && node.get("repo_hygiene") == Some(&Value::Bool(true))))
+            let valid_id = node
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.trim().is_empty() && id.len() <= 256 && !id.chars().any(char::is_control) && counts.get(id) == Some(&1));
+            let valid_host = node.get("local_hostname").and_then(Value::as_str).and_then(crate::recent::normalized_hostname).is_some();
+            let valid_setting = matches!(node.get("repo_hygiene"), None | Some(Value::Bool(_)));
+            valid_id
+                && valid_host
+                && valid_setting
+                && matches!(node.get("shared"), None | Some(Value::Bool(false)))
+                && (node.is_mac() || node.is_windows())
+                && tune_core::hygiene::enabled(node)
+                && node.local
+                && !ambiguous
         })
         .cloned()
         .collect()
+}
+
+pub fn targets_for_host(nodes: &[tune_core::nodes::Node], scope: Scope, host: &str) -> Vec<tune_core::nodes::Node> {
+    if crate::recent::normalized_hostname(host).is_none() { Vec::new() } else { targets(&crate::recent::resolved_nodes(nodes, host), scope) }
+}
+
+pub fn selection_warnings(selected: &[tune_core::nodes::Node], resolved: &[tune_core::nodes::Node], at: i64) -> Vec<AuditIssue> {
+    let mut issues = Vec::new();
+    if selected.iter().any(|node| node.get("shared").is_none()) {
+        issues.push(AuditIssue {
+            node: "この機体".into(), at: Some(at), reason: "共有設定は未記入（明示操作でこの機体のみ監査）", previous: false
+        });
+    }
+    if crate::recent::local_ambiguous(resolved)
+        || resolved.iter().any(|node| {
+            !matches!(node.get("shared"), None | Some(Value::Bool(_)))
+                || !matches!(node.get("repo_hygiene"), None | Some(Value::Bool(_)))
+                || node.get("local_hostname").and_then(Value::as_str).and_then(crate::recent::normalized_hostname).is_none()
+        })
+    {
+        issues.push(AuditIssue { node: "台帳".into(), at: Some(at), reason: "対象不明の機体を除外", previous: false });
+    }
+    issues
 }
 
 /// Preserve unknown repositories and incomplete node results.
@@ -160,18 +204,24 @@ fn safe_error(error: Option<&str>) -> &'static str {
 
 /// Run the existing bounded, read-only hygiene probe only when explicitly requested.
 pub fn collect(config_path: &std::path::Path, scope: Scope) -> Result<Audit, &'static str> {
-    let config = tune_core::nodes::load_config(config_path).map_err(|_| "台帳を読み取れません")?;
-    let nodes = targets(&config.nodes, scope);
-    if nodes.is_empty() {
-        return Err("監査対象の機体がありません");
+    if scope == Scope::Fleet {
+        return Err("遠隔監査は機体ごとの権限と接続先が未確認のため未対応です");
     }
-    if scope == Scope::Fleet && !nodes.iter().any(|node| !node.local) {
-        return Err("台帳に明示された非共有の遠隔対象がありません");
+    let config = tune_core::nodes::load_config(config_path).map_err(|_| "台帳を読み取れません")?;
+    let host = tune_core::nodes::local_host();
+    if crate::recent::normalized_hostname(&host).is_none() {
+        return Err("この機体の識別が不明なため監査できません");
+    }
+    let resolved = crate::recent::resolved_nodes(&config.nodes, &host);
+    let nodes = targets(&resolved, scope);
+    if nodes.is_empty() {
+        return Err("監査対象の機体がありません。共有設定と hostname を確認してください");
     }
     let local: Vec<_> = nodes.iter().filter(|node| node.local).map(|node| node.id.clone()).collect();
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(|_| "監査を開始できません")?;
     let results = runtime.block_on(tune_core::hygiene::audit_all(&nodes, &serde_json::json!({"budget_s":20,"cmd_s":5,"max_repos":1000})));
     let mut audit = project(&results);
+    audit.issues.extend(selection_warnings(&nodes, &resolved, tune_core::db::now_ms()));
     for repo in &mut audit.repos {
         repo.local = local.contains(&repo.node);
     }

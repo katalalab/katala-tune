@@ -42,14 +42,62 @@ fn local_audit_never_selects_other_active_machines() {
     use fleet_studio::audit::{Scope, targets};
     use tune_core::nodes::Node;
     let nodes = vec![
-        Node::from_value(&json!({"id":"fixture-local","os":"windows","local_hostname":"fixture-host"}), "fixture-host"),
-        Node::from_value(&json!({"id":"fixture-remote","os":"macos","local_hostname":"fixture-other"}), "fixture-host"),
-        Node::from_value(&json!({"id":"fixture-opted-in","os":"macos","repo_hygiene":true,"local_hostname":"fixture-other"}), "fixture-host"),
-        Node::from_value(&json!({"id":"fixture-shared","os":"windows","shared":true,"repo_hygiene":true,"local_hostname":"fixture-other"}), "fixture-host"),
-        Node::from_value(&json!({"id":"fixture-retired","os":"windows","status":"retired","local_hostname":"fixture-host"}), "fixture-host"),
+        Node::from_value(&json!({"id":"fixture-local","alias":"fixture-local","os":"windows","shared":false,"local_hostname":"fixture-host"}), "fixture-host"),
+        Node::from_value(&json!({"id":"fixture-remote","alias":"fixture-remote","os":"macos","shared":false,"local_hostname":"fixture-other"}), "fixture-host"),
+        Node::from_value(
+            &json!({"id":"fixture-opted-in","alias":"fixture-opted-in","os":"macos","shared":false,"repo_hygiene":true,"local_hostname":"fixture-other"}),
+            "fixture-host",
+        ),
+        Node::from_value(
+            &json!({"id":"fixture-shared","alias":"fixture-shared","os":"windows","shared":true,"repo_hygiene":true,"local_hostname":"fixture-other"}),
+            "fixture-host",
+        ),
+        Node::from_value(
+            &json!({"id":"fixture-retired","alias":"fixture-retired","os":"windows","shared":false,"status":"retired","local_hostname":"fixture-other"}),
+            "fixture-host",
+        ),
     ];
     assert_eq!(targets(&nodes, Scope::Local).iter().map(|node| node.id.as_str()).collect::<Vec<_>>(), vec!["fixture-local"]);
-    assert_eq!(targets(&nodes, Scope::Fleet).iter().map(|node| node.id.as_str()).collect::<Vec<_>>(), vec!["fixture-local", "fixture-opted-in"]);
+    assert!(targets(&nodes, Scope::Fleet).is_empty());
+}
+
+#[test]
+fn audit_rejects_ambiguous_local_and_unknown_or_invalid_remote_targets() {
+    use fleet_studio::audit::{Scope, targets_for_host};
+    use tune_core::nodes::Node;
+    let n = |v| Node::from_value(&v, "fixture-host");
+    let nodes = vec![
+        n(json!({"id":"local","alias":"fixture-local","os":"windows","shared":false,"local_hostname":"fixture-host"})),
+        n(json!({"id":"shared-local","alias":"fixture-shared","os":"windows","shared":true,"local_hostname":"FIXTURE-HOST.local"})),
+        n(json!({"id":"missing-shared","alias":"fixture-missing","os":"macos","repo_hygiene":true,"local_hostname":"fixture-other"})),
+        n(json!({"id":"null-shared","alias":"fixture-null","os":"macos","shared":null,"repo_hygiene":true,"local_hostname":"fixture-other"})),
+        n(json!({"id":"bad-alias","alias":"-fixture","os":"macos","shared":false,"repo_hygiene":true,"local_hostname":"fixture-other"})),
+        n(json!({"id":"good-remote","alias":"fixture-remote","os":"macos","shared":false,"repo_hygiene":true,"local_hostname":"fixture-other"})),
+    ];
+    assert!(targets_for_host(&nodes, Scope::Local, "fixture-host").is_empty());
+    assert!(targets_for_host(&nodes, Scope::Fleet, "fixture-host").is_empty());
+    assert!(targets_for_host(&nodes, Scope::Fleet, "").is_empty());
+}
+
+#[test]
+fn remote_audit_is_refused_before_any_ledger_or_transport_access() {
+    let result = fleet_studio::audit::collect(std::path::Path::new("fixture-nonexistent-ledger"), fleet_studio::audit::Scope::Fleet);
+    assert_eq!(result.unwrap_err(), "遠隔監査は機体ごとの権限と接続先が未確認のため未対応です");
+}
+
+#[test]
+fn explicitly_requested_local_audit_allows_missing_shared_but_rejects_invalid_shared() {
+    use fleet_studio::audit::{Scope, targets_for_host};
+    use tune_core::nodes::Node;
+    let n = |v| Node::from_value(&v, "fixture-host");
+    let missing = vec![n(json!({"id":"fixture-local","os":"windows","local_hostname":"fixture-host"}))];
+    assert_eq!(targets_for_host(&missing, Scope::Local, "fixture-host").len(), 1);
+    let warnings = fleet_studio::audit::selection_warnings(&missing, &missing, 100);
+    assert!(warnings.iter().any(|warning| warning.reason.contains("未記入")));
+    for value in [json!(null), json!(0), json!("false"), json!(true)] {
+        let invalid = vec![n(json!({"id":"fixture-local","os":"windows","local_hostname":"fixture-host","shared":value}))];
+        assert!(targets_for_host(&invalid, Scope::Local, "fixture-host").is_empty());
+    }
 }
 
 #[test]

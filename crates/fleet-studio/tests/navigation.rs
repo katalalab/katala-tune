@@ -1,6 +1,19 @@
 use fleet_studio::navigation::repository_url;
 
 #[test]
+fn replacement_invalidates_selection_before_a_changed_list_can_open() {
+    let mut selected = fleet_studio::navigation::Selection::default();
+    selected.next(3);
+    selected.next(3);
+    selected.next(3);
+    assert_eq!(selected.index(), Some(2));
+    selected.invalidate();
+    assert_eq!(selected.index(), None);
+    selected.next(4);
+    assert_eq!(selected.index(), Some(0));
+}
+
+#[test]
 fn github_ssh_origin_can_be_opened_in_the_browser() {
     assert_eq!(repository_url(concat!("git", "@", "github.com:fixture-owner/fixture-repo.git")), Some("https://github.com/fixture-owner/fixture-repo".into()));
 }

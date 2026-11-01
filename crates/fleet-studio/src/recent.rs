@@ -1,0 +1,449 @@
+//! Privacy-preserving projection of saved AI session metadata. No collection runs here.
+use std::path::Path;
+
+use serde_json::Value;
+use tune_core::{
+    db::Store,
+    nodes::{self, Node},
+};
+
+use crate::{Observation, observation};
+
+const MAX_NODES: usize = 32;
+const PER_NODE: usize = 20;
+const MAX_ENTRIES: usize = 50;
+const MAX_PRS: usize = 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectionState {
+    Unknown,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+pub struct SyncStatus {
+    pub node: String,
+    pub attempt_at: Option<i64>,
+    pub last_ok_at: Option<i64>,
+    pub failure: Option<bool>,
+    pub pending: Option<bool>,
+    pub file_errors: Option<u64>,
+    pub session_error: bool,
+}
+
+impl SyncStatus {
+    pub fn collection_state(&self) -> CollectionState {
+        match (self.failure, self.attempt_at, self.last_ok_at) {
+            (Some(true), _, _) => CollectionState::Failed,
+            (Some(false), Some(at), Some(ok)) if at == ok => CollectionState::Succeeded,
+            _ => CollectionState::Unknown,
+        }
+    }
+
+    pub fn freshness(&self, now: i64, max_age_ms: i64) -> Observation {
+        observation(self.last_ok_at, false, true, now, max_age_ms)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RecentEntry {
+    pub node: String,
+    pub local: bool,
+    pub tool: String,
+    pub cwd: Option<String>,
+    pub activity_at: Option<i64>,
+    pub directory_url: Option<String>,
+    pub prs: Vec<String>,
+    pub pr_state: PrState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrState {
+    Unknown,
+    Empty,
+    Complete,
+    Partial,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RecentWork {
+    pub nodes: Vec<SyncStatus>,
+    pub entries: Vec<RecentEntry>,
+    pub error: Option<&'static str>,
+    pub node_limited: bool,
+    pub entries_limited: bool,
+    pub selection_incomplete: bool,
+    pub local_ambiguous: bool,
+    pub max_age_ms: Option<i64>,
+    pub validated_at: Option<i64>,
+}
+
+/// A refresh invalidates private rows immediately and never overlaps database reads.
+#[derive(Default)]
+pub struct RecentSlot {
+    pub data: Option<RecentWork>,
+    pub timed_out: bool,
+    pub in_flight: Option<u64>,
+    generation: u64,
+    pending: bool,
+}
+
+impl RecentSlot {
+    pub fn request(&mut self) -> Option<u64> {
+        self.generation = self.generation.wrapping_add(1);
+        self.data = None;
+        if self.in_flight.is_some() {
+            self.pending = true;
+            None
+        } else {
+            self.timed_out = false;
+            self.in_flight = Some(self.generation);
+            Some(self.generation)
+        }
+    }
+
+    pub fn timeout(&mut self, generation: u64) {
+        if self.in_flight == Some(generation) {
+            self.timed_out = true;
+        }
+    }
+
+    pub fn complete(&mut self, generation: u64, data: RecentWork) -> Option<u64> {
+        if self.in_flight != Some(generation) {
+            return None;
+        }
+        self.in_flight = None;
+        self.timed_out = false;
+        if generation == self.generation {
+            self.data = Some(data);
+        }
+        if std::mem::take(&mut self.pending) {
+            self.in_flight = Some(self.generation);
+            Some(self.generation)
+        } else {
+            None
+        }
+    }
+}
+
+/// Only unambiguous active, non-shared, explicitly allowed nodes may be read.
+pub fn targets(nodes: &[Node]) -> Vec<Node> {
+    let local_ambiguous = local_ambiguous(nodes);
+    let counts = id_counts(nodes);
+    nodes
+        .iter()
+        .filter(|node| {
+            let valid_id = node
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.trim().is_empty() && id.len() <= 256 && !id.chars().any(char::is_control) && counts.get(id) == Some(&1));
+            let config_valid = matches!(node.get("ai_sessions"), None | Some(Value::Bool(_)));
+            valid_id
+                && config_valid
+                && matches!(node.get("shared"), None | Some(Value::Bool(false)))
+                && !(node.local && local_ambiguous)
+                && tune_core::ai_sessions::enabled(node)
+                && node.local
+        })
+        .cloned()
+        .collect()
+}
+
+fn id_counts(nodes: &[Node]) -> std::collections::HashMap<&str, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for node in nodes {
+        *counts.entry(node.id.as_str()).or_insert(0) += 1;
+    }
+    counts
+}
+
+pub(crate) fn normalized_hostname(value: &str) -> Option<String> {
+    let name = value.trim().trim_end_matches('.').to_lowercase();
+    let name = name.strip_suffix(".local").unwrap_or(&name);
+    (!name.is_empty()
+        && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+        && name.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        && !name.starts_with('.')
+        && !name.ends_with('.'))
+    .then(|| name.to_owned())
+}
+
+pub(crate) fn resolved_nodes(nodes: &[Node], host: &str) -> Vec<Node> {
+    let host = normalized_hostname(host);
+    nodes
+        .iter()
+        .cloned()
+        .map(|mut node| {
+            node.local = host.is_some() && node.get("local_hostname").and_then(Value::as_str).and_then(normalized_hostname) == host;
+            node
+        })
+        .collect()
+}
+
+pub fn targets_for_host(nodes: &[Node], host: &str) -> Vec<Node> {
+    if normalized_hostname(host).is_none() { Vec::new() } else { targets(&resolved_nodes(nodes, host)) }
+}
+
+pub fn local_ambiguous_for_host(nodes: &[Node], host: &str) -> bool {
+    local_ambiguous(&resolved_nodes(nodes, host))
+}
+
+pub fn selection_incomplete_for_host(nodes: &[Node], host: &str) -> bool {
+    normalized_hostname(host).is_none() || selection_incomplete(&resolved_nodes(nodes, host))
+}
+
+/// Count every matching ledger row, including shared or inactive rows.
+pub fn local_ambiguous(nodes: &[Node]) -> bool {
+    nodes.iter().filter(|node| node.local).take(2).count() > 1
+}
+
+pub fn selection_incomplete(nodes: &[Node]) -> bool {
+    let counts = id_counts(nodes);
+    local_ambiguous(nodes)
+        || nodes.iter().any(|node| {
+            node.get("id").and_then(Value::as_str).is_none_or(|id| id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control))
+                || !matches!(node.get("ai_sessions"), None | Some(Value::Bool(_)))
+                || !matches!(node.get("shared"), Some(Value::Bool(_)))
+                || counts.get(node.id.as_str()).is_some_and(|count| *count > 1)
+        })
+}
+
+/// A changed permission or local identity invalidates the entire in-flight read.
+pub fn same_selection(before: &[Node], after: &[Node]) -> bool {
+    let keys = |nodes: &[Node]| targets(nodes).into_iter().map(|node| (node.id, node.local)).collect::<Vec<_>>();
+    before.len() == after.len()
+        && before.iter().zip(after).all(|(a, b)| a.raw == b.raw && a.local == b.local)
+        && keys(before) == keys(after)
+        && selection_incomplete(before) == selection_incomplete(after)
+        && local_ambiguous(before) == local_ambiguous(after)
+}
+
+fn flag(value: Option<&Value>) -> Option<bool> {
+    match value.and_then(Value::as_i64) {
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        _ => None,
+    }
+}
+
+fn time(value: Option<&Value>, now: i64) -> Option<i64> {
+    value.and_then(Value::as_i64).filter(|at| *at >= 0 && *at <= now)
+}
+
+pub fn project_cursor(node: &str, row: Option<&Value>, now: i64, _max_age_ms: i64) -> SyncStatus {
+    let get = |key: &str| row.and_then(|row| row.get(key));
+    let error = flag(get("has_error"));
+    let python = flag(get("no_python"));
+    let failure = match (error, python) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    };
+    SyncStatus {
+        node: node.to_owned(),
+        attempt_at: time(get("updated_at"), now),
+        last_ok_at: time(get("last_ok_at"), now),
+        failure,
+        pending: flag(get("truncated")),
+        file_errors: get("file_error_count").and_then(Value::as_u64),
+        session_error: false,
+    }
+}
+
+/// Require the canonical, credential-free public GitHub PR URL shape.
+pub fn github_pr_url(value: &str) -> Option<String> {
+    let rest = value.strip_prefix("https://github.com/")?;
+    if value.len() > 2048 || value.chars().any(char::is_control) {
+        return None;
+    }
+    let parts: Vec<_> = rest.split('/').collect();
+    if parts.len() != 4 || parts[2] != "pull" {
+        return None;
+    }
+    let owner = parts[0];
+    let repo = parts[1];
+    let number = parts[3].parse::<u64>().ok()?;
+    if owner.is_empty()
+        || owner.len() > 39
+        || owner.starts_with('-')
+        || owner.ends_with('-')
+        || !owner.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        || repo.is_empty()
+        || repo.len() > 100
+        || matches!(repo, "." | "..")
+        || !repo.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+        || number == 0
+        || number.to_string() != parts[3]
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+pub fn project_prs(text: Option<&str>) -> (Vec<String>, PrState) {
+    let parsed = text.and_then(|value| serde_json::from_str::<Value>(value).ok());
+    let Some(values) = parsed.as_ref().and_then(Value::as_array) else { return (Vec::new(), PrState::Unknown) };
+    if values.is_empty() {
+        return (Vec::new(), PrState::Empty);
+    }
+    let valid: Vec<_> = values.iter().filter_map(Value::as_str).filter_map(github_pr_url).collect();
+    let incomplete = valid.len() != values.len() || valid.len() > MAX_PRS;
+    (valid.into_iter().take(MAX_PRS).collect(), if incomplete { PrState::Partial } else { PrState::Complete })
+}
+
+/// A remote path or UNC path is never converted to a local file URL.
+pub fn local_cwd_url(local: bool, cwd: &str) -> Option<String> {
+    local_cwd_url_with_home(local, cwd, &nodes::home())
+}
+
+pub fn local_cwd_url_with_home(local: bool, cwd: &str, home: &Path) -> Option<String> {
+    if !local || cwd.len() > 2048 || cwd.chars().any(char::is_control) {
+        return None;
+    }
+    let path = if cwd == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = cwd.strip_prefix("~/").or_else(|| cwd.strip_prefix("~\\")) {
+        home.join(rest)
+    } else {
+        std::path::PathBuf::from(cwd)
+    };
+    let text = path.to_string_lossy();
+    if !path.is_absolute() || text.starts_with("\\\\") || text.starts_with("//") {
+        return None;
+    }
+    let url = url::Url::from_directory_path(path).ok()?;
+    if url.host_str().is_some() { None } else { Some(url.into()) }
+}
+
+pub fn file_error_count_text(count: Option<u64>) -> String {
+    match count {
+        None => "不明".into(),
+        Some(count) if count >= 5 => format!("{count}件以上"),
+        Some(count) => format!("{count}件"),
+    }
+}
+
+fn max_age(db: &Store, schedule: Option<&Value>) -> Option<i64> {
+    let stored = db.get_meta_strict("schedule").ok()?;
+    if stored.as_ref().is_some_and(|value| !value.is_object()) {
+        return None;
+    }
+    let value = match stored.as_ref().and_then(|v| v.get("ai_minutes")) {
+        Some(value) => Some(value),
+        None => match schedule {
+            None => None,
+            Some(Value::Object(object)) => object.get("ai_minutes"),
+            _ => return None,
+        },
+    };
+    let minutes = match value {
+        None => tune_core::ai_sessions::DEFAULT_AI_MINUTES,
+        Some(value) => value.as_i64().filter(|minutes| (5..=1440).contains(minutes))?,
+    };
+    minutes.checked_mul(3 * 60 * 1_000)
+}
+
+fn entry(node: &Node, row: &Value, now: i64) -> RecentEntry {
+    let text = |key: &str, max: usize| {
+        row.get(key).and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= max && !s.chars().any(char::is_control)).map(str::to_owned)
+    };
+    let cwd = text("cwd", 2048);
+    let directory_url = cwd.as_deref().and_then(|cwd| local_cwd_url(node.local, cwd));
+    let (prs, pr_state) = project_prs(row.get("prs").and_then(Value::as_str));
+    RecentEntry {
+        node: node.id.clone(),
+        local: node.local,
+        tool: text("tool", 64).unwrap_or_else(|| "不明".into()),
+        cwd,
+        activity_at: time(row.get("last_ts"), now),
+        directory_url,
+        prs,
+        pr_state,
+    }
+}
+
+/// Read saved summaries only; this never contacts a machine or opens a session file.
+pub fn load(config_path: &Path, data_dir: &Path, now: i64, local_opt_in: bool) -> RecentWork {
+    load_for_host(config_path, data_dir, now, &nodes::local_host(), local_opt_in)
+}
+
+pub fn load_for_host(config_path: &Path, data_dir: &Path, now: i64, host: &str, local_opt_in: bool) -> RecentWork {
+    if !local_opt_in {
+        return RecentWork {
+            error: Some("最近の作業は既定で非表示です。対象を確認した後に明示して起動してください。"), ..Default::default()
+        };
+    }
+    let config = match nodes::load_config(config_path) {
+        Ok(config) => config,
+        Err(_) => return RecentWork { error: Some("台帳を読み取れないため最近の作業は非表示"), ..Default::default() },
+    };
+    if normalized_hostname(host).is_none() {
+        return RecentWork {
+            error: Some("この機体の識別が不明なため最近の作業は非表示"), selection_incomplete: true, ..Default::default()
+        };
+    }
+    let initial_nodes = resolved_nodes(&config.nodes, host);
+    if !initial_nodes.iter().any(|node| node.local) {
+        return RecentWork {
+            error: Some("機体照合不明：この機体に一致する台帳行がありません"), selection_incomplete: true, ..Default::default()
+        };
+    }
+    let selected = targets(&initial_nodes);
+    let node_limited = selected.len() > MAX_NODES;
+    let selection_incomplete = selection_incomplete(&initial_nodes);
+    let local_ambiguous = local_ambiguous(&initial_nodes);
+    let selected: Vec<_> = selected.into_iter().take(MAX_NODES).collect();
+    let mut result = RecentWork { node_limited, selection_incomplete, local_ambiguous, validated_at: Some(now), ..Default::default() };
+    if selected.is_empty() {
+        return result;
+    }
+    let db = match Store::open_read_only(data_dir) {
+        Ok(db) => db,
+        Err(_) => {
+            result.nodes = selected.iter().map(|node| project_cursor(&node.id, None, now, -1)).collect();
+            result.error = Some("保存済み AI 情報を読み取れません");
+            return result;
+        }
+    };
+    if db.conn().execute_batch("BEGIN").is_err() {
+        result.error = Some("保存済み AI 情報を一貫して読み取れません");
+        return result;
+    }
+    result.max_age_ms = max_age(&db, config.schedule.as_ref());
+    let ids: Vec<_> = selected.iter().map(|node| node.id.clone()).collect();
+    let cursors = match db.ai_cursor_summaries(&ids) {
+        Ok(cursors) => cursors,
+        Err(_) => {
+            result.error = Some("収集状態を読み取れません");
+            Vec::new()
+        }
+    };
+    for node in &selected {
+        let cursor = cursors.iter().find(|row| row.get("node_id").and_then(Value::as_str) == Some(node.id.as_str()));
+        let mut status = project_cursor(&node.id, cursor, now, result.max_age_ms.unwrap_or(-1));
+        match db.ai_recent_work_list(&node.id, PER_NODE + 1) {
+            Ok(rows) => {
+                result.entries_limited |= rows.len() > PER_NODE;
+                result.entries.extend(rows.iter().take(PER_NODE).map(|row| entry(node, row, now)));
+            }
+            Err(_) => status.session_error = true,
+        }
+        result.nodes.push(status);
+    }
+    result.entries.sort_by(|a, b| b.activity_at.cmp(&a.activity_at).then_with(|| a.node.cmp(&b.node)));
+    if result.entries.len() > MAX_ENTRIES {
+        result.entries_limited = true;
+        result.entries.truncate(MAX_ENTRIES);
+    }
+    let current = nodes::load_config(config_path).ok();
+    if !current.as_ref().is_some_and(|current| same_selection(&initial_nodes, &resolved_nodes(&current.nodes, host))) {
+        return RecentWork { error: Some("台帳の対象が変わったため最近の作業は非表示"), ..Default::default() };
+    }
+    result.max_age_ms = max_age(&db, current.as_ref().and_then(|current| current.schedule.as_ref()));
+    if db.conn().execute_batch("COMMIT").is_err() {
+        return RecentWork { error: Some("保存済み AI 情報を一貫して読み取れません"), ..Default::default() };
+    }
+    result.validated_at = Some(tune_core::db::now_ms());
+    result
+}

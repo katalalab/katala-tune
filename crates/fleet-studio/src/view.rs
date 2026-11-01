@@ -4,6 +4,7 @@ use fleet_studio::Observation;
 use fleet_studio::audit::{self, Audit, RepoAudit, Scope};
 use fleet_studio::llm::{self, Endpoint, ModelError, ModelObservation};
 use fleet_studio::navigation;
+use fleet_studio::recent::{self, RecentEntry, RecentSlot, RecentWork, SyncStatus};
 use fleet_studio::source::{self, Coverage, Dashboard, NodeCard, Repository};
 use gpui::{Context, FocusHandle, IntoElement, KeyDownEvent, Render, SharedString, Window, div, prelude::*, rgb};
 
@@ -17,12 +18,15 @@ struct ModelLine {
 pub struct FleetView {
     focus: FocusHandle,
     sample: bool,
+    recent_local: bool,
     generation: u64,
     loading: bool,
     data_inflight: bool,
     load_timeout: bool,
     dashboard: Option<Dashboard>,
     models: Vec<ModelLine>,
+    recent: RecentSlot,
+    recent_open_error: Option<&'static str>,
     audit: Option<Audit>,
     audit_error: Option<String>,
     auditing: bool,
@@ -34,22 +38,25 @@ pub struct FleetView {
     topology_filter: String,
     search: String,
     searching: bool,
-    selected: usize,
+    selected: navigation::Selection,
 }
 
 impl FleetView {
-    pub fn new(sample: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(sample: bool, recent_local: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window);
         let mut view = Self {
             focus,
             sample,
+            recent_local,
             generation: 0,
             loading: false,
             data_inflight: false,
             load_timeout: false,
             dashboard: None,
             models: Vec::new(),
+            recent: RecentSlot::default(),
+            recent_open_error: None,
             audit: None,
             audit_error: None,
             auditing: false,
@@ -61,7 +68,7 @@ impl FleetView {
             topology_filter: String::new(),
             search: String::new(),
             searching: false,
-            selected: 0,
+            selected: navigation::Selection::default(),
         };
         let executor = cx.background_executor().clone();
         cx.spawn(async move |view, cx| {
@@ -78,6 +85,14 @@ impl FleetView {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.selected.invalidate();
+        self.recent_open_error = None;
+        if !self.sample {
+            if let Some(generation) = self.recent.request() {
+                self.start_recent(generation, cx);
+            }
+            cx.notify();
+        }
         if self.data_inflight || self.models.iter().any(|line| line.endpoint.is_some() && line.observation.latest.is_none()) {
             return;
         }
@@ -96,6 +111,7 @@ impl FleetView {
             let mut observation = ModelObservation::default();
             observation.record(Ok(vec!["fixture-model".into()]), tune_core::db::now_ms());
             self.models = vec![ModelLine { label: "サンプル LLM".into(), endpoint: None, observation }];
+            self.recent.data = Some(sample_recent());
             self.loading = false;
             cx.notify();
             return;
@@ -137,6 +153,7 @@ impl FleetView {
                         source::preserve_previous(previous, &mut data);
                     }
                     view.dashboard = Some(data);
+                    view.selected.invalidate();
                     view.topology_filter.clear();
                     view.loading = false;
                     view.data_inflight = false;
@@ -184,6 +201,33 @@ impl FleetView {
             .detach();
         }
         cx.notify();
+    }
+
+    fn start_recent(&mut self, generation: u64, cx: &mut Context<Self>) {
+        let timer = cx.background_executor().timer(Duration::from_secs(5));
+        cx.spawn(async move |view, cx| {
+            timer.await;
+            let _ = view.update(cx, |view, cx| {
+                view.recent.timeout(generation);
+                cx.notify();
+            });
+        })
+        .detach();
+        let local_opt_in = self.recent_local;
+        let task = cx
+            .background_executor()
+            .spawn(async move { recent::load(&tune_core::nodes::user_config_path(), &tune_core::nodes::data_dir(), tune_core::db::now_ms(), local_opt_in) });
+        cx.spawn(async move |view, cx| {
+            let data = task.await;
+            let _ = view.update(cx, |view, cx| {
+                if let Some(next) = view.recent.complete(generation, data) {
+                    view.start_recent(next, cx);
+                }
+                view.selected.invalidate();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn search_repositories(&mut self, cx: &mut Context<Self>) {
@@ -234,7 +278,7 @@ impl FleetView {
                                 dashboard.topology_error = None;
                                 view.search_error = None;
                                 view.topology_filter = query.clone();
-                                view.selected = 0;
+                                view.selected.invalidate();
                             }
                         }
                         Err(error) => {
@@ -350,14 +394,14 @@ impl FleetView {
                 }
                 "backspace" => {
                     self.search.pop();
-                    self.selected = 0;
+                    self.selected.invalidate();
                 }
                 _ if !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform => {
                     if let Some(text) = event.keystroke.key_char.as_deref().filter(|text| !text.chars().any(char::is_control)) {
                         if self.search.len().saturating_add(text.len()) <= 256 {
                             self.search.push_str(text);
                         }
-                        self.selected = 0;
+                        self.selected.invalidate();
                     }
                 }
                 _ => {}
@@ -368,19 +412,25 @@ impl FleetView {
                 "r" => self.refresh(cx),
                 "a" => self.audit_repositories(Scope::Local, cx),
                 "down" => {
-                    let count =
-                        self.dashboard.as_ref().map_or(0, |dashboard| dashboard.repositories.iter().filter(|repo| self.matches(&repo.name)).take(200).count());
-                    self.selected = self.selected.saturating_add(1).min(count.saturating_sub(1));
+                    let count = self.repository_count()
+                        + self.recent.data.as_ref().map_or(0, |data| data.entries.iter().filter(|entry| self.matches_recent(entry)).count());
+                    self.selected.next(count);
                 }
-                "up" => self.selected = self.selected.saturating_sub(1),
+                "up" => {
+                    let count = self.repository_count()
+                        + self.recent.data.as_ref().map_or(0, |data| data.entries.iter().filter(|entry| self.matches_recent(entry)).count());
+                    self.selected.previous(count);
+                }
                 "enter" => {
-                    if let Some(url) = self.selected_url() {
+                    if self.selected.index().is_some_and(|index| index >= self.repository_count()) {
+                        self.recent_open_error = Some("最近の作業の安全なリンク起動は未対応です。");
+                    } else if let Some(url) = self.selected_url() {
                         cx.open_url(&url);
                     }
                 }
                 "escape" => {
                     self.search.clear();
-                    self.selected = 0;
+                    self.selected.invalidate();
                     self.search_repositories(cx);
                 }
                 _ => {}
@@ -394,17 +444,59 @@ impl FleetView {
         self.search.is_empty() || value.to_lowercase().contains(&self.search.to_lowercase())
     }
 
+    fn matches_recent(&self, entry: &RecentEntry) -> bool {
+        self.matches(&format!("{} {} {}", entry.node, entry.tool, entry.cwd.as_deref().unwrap_or("")))
+    }
+
+    fn repository_count(&self) -> usize {
+        self.dashboard.as_ref().map_or(0, |dashboard| dashboard.repositories.iter().filter(|repo| self.matches(&repo.name)).take(200).count())
+    }
+
     fn selected_url(&self) -> Option<String> {
-        self.dashboard
-            .as_ref()?
-            .repositories
-            .iter()
-            .filter(|repo| self.matches(&repo.name))
-            .take(200)
-            .nth(self.selected)?
-            .origin
-            .as_deref()
-            .and_then(navigation::repository_url)
+        let selected = self.selected.index()?;
+        let repo_count = self.repository_count();
+        if selected < repo_count {
+            return self
+                .dashboard
+                .as_ref()?
+                .repositories
+                .iter()
+                .filter(|repo| self.matches(&repo.name))
+                .take(200)
+                .nth(selected)?
+                .origin
+                .as_deref()
+                .and_then(navigation::repository_url);
+        }
+        None
+    }
+}
+
+fn sample_recent() -> RecentWork {
+    let now = tune_core::db::now_ms();
+    RecentWork {
+        nodes: vec![SyncStatus {
+            node: "fixture-node".into(),
+            attempt_at: Some(now),
+            last_ok_at: Some(now),
+            failure: Some(false),
+            pending: Some(false),
+            file_errors: Some(0),
+            session_error: false,
+        }],
+        entries: vec![RecentEntry {
+            node: "fixture-node".into(),
+            local: true,
+            tool: "fixture-agent".into(),
+            cwd: Some("fixture/project".into()),
+            activity_at: Some(now),
+            directory_url: None,
+            prs: vec!["https://github.com/example/fixture/pull/1".into()],
+            pr_state: recent::PrState::Complete,
+        }],
+        max_age_ms: Some(90 * 60 * 1_000),
+        validated_at: Some(now),
+        ..Default::default()
     }
 }
 
@@ -415,7 +507,7 @@ fn sample_dashboard() -> Dashboard {
             id: "fixture-node".into(),
             role: "research".into(),
             operating_state: "online".into(),
-            local: true,
+            local: Some(true),
             last_at: Some(now),
             observation: Observation::Current,
             failure_reason: None,
@@ -499,6 +591,33 @@ fn number(value: Option<u64>) -> String {
     value.map_or_else(|| "不明".into(), |value| value.to_string())
 }
 
+fn recent_status(status: &SyncStatus, now: i64, max_age_ms: Option<i64>) -> String {
+    let latest = match status.collection_state() {
+        recent::CollectionState::Failed => "失敗",
+        recent::CollectionState::Succeeded => "保存上は成功",
+        recent::CollectionState::Unknown => "不明",
+    };
+    let (pending, partial) = if status.last_ok_at.is_some() {
+        (
+            match status.pending {
+                Some(true) => "あり",
+                Some(false) => "なし",
+                None => "不明",
+            },
+            recent::file_error_count_text(status.file_errors),
+        )
+    } else {
+        ("不明", "不明".into())
+    };
+    format!(
+        "最新取込の記録: {latest} {} / 最終成功の記録: {}（{}） / 続き・再読込: {pending} / 一部失敗: {partial}{}",
+        when(status.attempt_at),
+        when(status.last_ok_at),
+        observation_text(status.freshness(now, max_age_ms.unwrap_or(-1))),
+        if status.session_error { " / 作業一覧の読取失敗" } else { "" },
+    )
+}
+
 impl Render for FleetView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = tune_core::db::now_ms();
@@ -515,13 +634,7 @@ impl Render for FleetView {
             }
             content = content.child(section("機体", if self.loading { "読み込み中" } else { "保存済み分析（現在の接続状態ではありません）" }));
             for node in dashboard.nodes.iter().filter(|node| self.matches(&format!("{} {} {}", node.id, node.role, node.operating_state))) {
-                let identity = if node.local {
-                    "この機体"
-                } else if node.role.contains("この機体") {
-                    "台帳の『この機体』表記は現在ホストと不一致"
-                } else {
-                    "別の機体"
-                };
+                let identity = node.identity_text();
                 content = content.child(row(
                     format!("{}  ·  {}", node.id, node.role),
                     format!(
@@ -548,11 +661,11 @@ impl Render for FleetView {
                 content = content.child(note("保存済みの構成情報を検索中…".into(), 0x9baec4));
             }
             if dashboard.topology_limited {
-                content = content.child(note("構成情報には取得上限または未確定候補があります。検索語の入力後 Enter で保存 DB も検索します。".into(), 0xffb86c));
+                content = content.child(note("構成情報には取得上限または未確定候補があります。保存 DB の構成情報の検索は未対応です。".into(), 0xffb86c));
             }
             let search_unapplied = !self.sample && self.search != self.topology_filter;
             if search_unapplied {
-                content = content.child(note("検索語は未確定です。Enter で保存 DB の該当範囲を検索します。".into(), 0xffb86c));
+                content = content.child(note("表示範囲を検索しています。保存 DB の構成情報の検索は未対応です。".into(), 0xffb86c));
             }
             let mut shown = 0;
             for (index, repo) in dashboard.repositories.iter().filter(|repo| self.matches(&repo.name)).take(200).enumerate() {
@@ -562,10 +675,10 @@ impl Render for FleetView {
                     .id(SharedString::from(format!("repo-{index}")))
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(if self.selected == index { 0x233b56 } else { 0x182436 }))
+                    .bg(rgb(if self.selected.index() == Some(index) { 0x233b56 } else { 0x182436 }))
                     .flex()
                     .flex_col()
-                    .child(format!("{}{}", if self.selected == index { "› " } else { "  " }, repo.name))
+                    .child(format!("{}{}", if self.selected.index() == Some(index) { "› " } else { "  " }, repo.name))
                     .child(div().text_sm().text_color(rgb(0x9baec4)).child(format!(
                         "{} / 取得: {}",
                         if repo.previous { "前回（取得失敗・未確認）" } else { observation_text(repo.freshness(now)) },
@@ -581,24 +694,89 @@ impl Render for FleetView {
                 content = content.child(note(format!("{total} 件中 {shown} 件を表示。検索で絞り込めます。"), 0x9baec4));
             }
             if shown == 0 {
-                content = content.child(note(
-                    if search_unapplied {
-                        "検索を確定してから結果を確認してください。".into()
-                    } else {
-                        "表示範囲に該当する保存済みリポジトリはありません。取得状況は上を確認してください。".into()
-                    },
-                    0x9baec4,
-                ));
+                let has_error = dashboard.topology_error.is_some() || self.search_error.is_some();
+                content = content.child(note(source::empty_repository_text(dashboard.current_coverage(now), has_error).into(), 0x9baec4));
             }
         } else {
             content = content.child(note("保存済みデータを読み込み中…".into(), 0x9baec4));
+        }
+
+        content = content.child(section("最近の作業", "保存済み・現在の稼働状態ではありません"));
+        content = content
+            .child(note("保存された取込上の記録です。収集の正常完了や網羅性は保証できず、台帳の機体 ID は接続先の本人確認ではありません。".into(), 0x9baec4));
+        content = content.child(note(
+            "既定は非表示。明示して起動した場合だけこの機体の親セッションを最大 20 件表示します。遠隔機は対象外です。検索は表示範囲の機体・ツール・作業場所です。".into(),
+            0x9baec4,
+        ));
+        if self.recent.timed_out {
+            content = content.child(note("最近の作業の読込が 5 秒を超過（終了待ち）。以前の内容は非表示です。".into(), 0xffb86c));
+        } else if self.recent.in_flight.is_some() {
+            content = content.child(note("最近の作業を読み込み中…".into(), 0x9baec4));
+        }
+        if let Some(recent) = &self.recent.data {
+            content = content.child(note(format!("台帳照合: {}。以降の変更は自動反映されません。R で更新してください。", when(recent.validated_at)), 0x9baec4));
+            if let Some(error) = recent.error {
+                content = content.child(note(error.into(), 0xffb86c));
+            }
+            if let Some(error) = self.recent_open_error {
+                content = content.child(note(error.into(), 0xffb86c));
+            }
+            if recent.node_limited || recent.entries_limited || recent.selection_incomplete {
+                content = content.child(note("対象または表示範囲に上限・未確認があります。表示外は未確認です。".into(), 0xffb86c));
+            }
+            if recent.local_ambiguous {
+                content = content.child(note("この機体の照合が複数一致したため不明です。一致した機体の作業は表示しません。".into(), 0xffb86c));
+            }
+            for status in recent.nodes.iter().filter(|status| self.matches(&status.node)) {
+                content = content.child(row(status.node.clone(), recent_status(status, now, recent.max_age_ms)));
+            }
+            let repo_count = self.repository_count();
+            for (index, entry) in recent.entries.iter().filter(|entry| self.matches_recent(entry)).enumerate() {
+                let collection = recent
+                    .nodes
+                    .iter()
+                    .find(|status| status.node == entry.node)
+                    .map(|status| recent_status(status, now, recent.max_age_ms))
+                    .unwrap_or_else(|| "収集状態: 不明".into());
+                let prs = match entry.pr_state {
+                    recent::PrState::Unknown => "PR: 不明".to_owned(),
+                    recent::PrState::Empty => "PR: なし".to_owned(),
+                    recent::PrState::Complete => format!("PR: {} 件（安全な起動は未対応）", entry.prs.len()),
+                    recent::PrState::Partial => "PR: 一部未確認または上限（安全な起動は未対応）".to_owned(),
+                };
+                content = content.child(
+                    div()
+                        .p_3()
+                        .rounded_md()
+                        .bg(rgb(if self.selected.index() == Some(repo_count + index) { 0x233b56 } else { 0x182436 }))
+                        .flex()
+                        .flex_col()
+                        .child(format!("{}{} · {}", if self.selected.index() == Some(repo_count + index) { "› " } else { "  " }, entry.node, entry.tool))
+                        .child(div().text_sm().text_color(rgb(0x9baec4)).child(format!(
+                            "作業場所: {}{} / 最終活動: {}",
+                            entry.cwd.as_deref().unwrap_or("不明"),
+                            if entry.local { "" } else { "（遠隔・ローカルでは開けません）" },
+                            when(entry.activity_at)
+                        )))
+                        .child(div().text_sm().text_color(rgb(0x9baec4)).child(collection))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0x9baec4))
+                                .child(format!("{prs}{}", if entry.directory_url.is_some() { " / 作業場所の安全な起動は未対応" } else { "" })),
+                        ),
+                );
+            }
+            if recent.entries.is_empty() && recent.error.is_none() {
+                content = content.child(note("許可された機体に表示できる保存済み作業はありません。取得状態は上を確認してください。".into(), 0x9baec4));
+            }
         }
 
         content = content.child(section("ローカル LLM", "モデル一覧のみ取得・推論なし"));
         for model in self.models.iter().filter(|model| self.matches(&model.label) || self.matches(&model_text(model))) {
             content = content.child(row(model.label.clone(), format!("{}  /  今回: {}", model_text(model), when(model.observation.checked_at))));
         }
-        content = content.child(section("リポジトリ衛生", if self.auditing { "取得中…" } else { "ローカル A / 遠隔は台帳で明示した非共有機へ SSH" }));
+        content = content.child(section("リポジトリ衛生", if self.auditing { "取得中…" } else { "この機体のみ A / 遠隔は権限・接続先未確認のため未対応" }));
         content =
             content.child(note("最後に fetch した追跡参照との差です。探索先の一部欠落やアクセス拒否は元ツールで判別できない場合があります。".into(), 0x9baec4));
         if let Some(error) = &self.audit_error {
@@ -705,7 +883,7 @@ impl Render for FleetView {
                                     .rounded_md()
                                     .bg(rgb(0x29486b))
                                     .cursor_pointer()
-                                    .child("明示対象を監査（SSH）")
+                                    .child("遠隔監査（未対応）")
                                     .on_click(cx.listener(|view, _, _, cx| view.audit_repositories(Scope::Fleet, cx))),
                             ),
                     ),
@@ -730,25 +908,32 @@ impl Render for FleetView {
             )
             .child(content)
             .child(
-                div().px_5().py_3().flex().justify_between().bg(rgb(0x132237)).child("/ 検索（Enter で確定） · ↑↓ 選択 · Enter 開く · Esc 解除").child(
-                    div()
-                        .flex()
-                        .gap_4()
-                        .child(
-                            div()
-                                .id("documentation")
-                                .cursor_pointer()
-                                .child("説明")
-                                .on_click(|_, _, cx| cx.open_url("https://github.com/katalalab/katala-tune#readme")),
-                        )
-                        .child(
-                            div()
-                                .id("issues")
-                                .cursor_pointer()
-                                .child("Issues")
-                                .on_click(|_, _, cx| cx.open_url("https://github.com/katalalab/katala-tune/issues")),
-                        ),
-                ),
+                div()
+                    .px_5()
+                    .py_3()
+                    .flex()
+                    .justify_between()
+                    .bg(rgb(0x132237))
+                    .child("/ 検索（Enter で確定） · ↑↓ 選択 · Enter で開く · 最近の作業の起動は未対応")
+                    .child(
+                        div()
+                            .flex()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .id("documentation")
+                                    .cursor_pointer()
+                                    .child("説明")
+                                    .on_click(|_, _, cx| cx.open_url("https://github.com/katalalab/katala-tune#readme")),
+                            )
+                            .child(
+                                div()
+                                    .id("issues")
+                                    .cursor_pointer()
+                                    .child("Issues")
+                                    .on_click(|_, _, cx| cx.open_url("https://github.com/katalalab/katala-tune/issues")),
+                            ),
+                    ),
             )
     }
 }

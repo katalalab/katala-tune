@@ -80,8 +80,39 @@ fn local_identity_comes_from_the_actual_hostname_not_the_role_label() {
     ]});
     std::fs::write(&config, data.to_string()).unwrap();
     let dashboard = source::load(&config, &dir.join("missing"), 10_000);
-    assert!(dashboard.nodes[0].local);
-    assert!(!dashboard.nodes[1].local);
+    assert_eq!(dashboard.nodes[0].local, Some(true));
+    assert_eq!(dashboard.nodes[1].local, Some(false));
+}
+
+#[test]
+fn machine_cards_do_not_claim_ambiguous_or_invalid_local_identity() {
+    let dir = fixture_dir();
+    let config = dir.join("nodes.json");
+    std::fs::write(
+        &config,
+        json!({"nodes":[
+            {"id":"fixture-a","local_hostname":"fixture-host"},
+            {"id":"fixture-b","local_hostname":"FIXTURE-HOST.local","shared":true},
+            {"id":"fixture-other","local_hostname":"fixture-other"},
+            {"id":"fixture-unknown","local_hostname":null}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let dashboard = source::load_for_host(&config, &dir.join("missing"), 10_000, "fixture-host");
+    assert_eq!(dashboard.nodes.iter().map(|node| node.local).collect::<Vec<_>>(), [None, None, Some(false), None]);
+    assert_eq!(dashboard.nodes[0].identity_text(), "同一性不明");
+    assert!(source::load_for_host(&config, &dir.join("missing"), 10_000, "").nodes.iter().all(|node| node.local.is_none()));
+    std::fs::write(&config, json!({"nodes":[{"id":"fixture-a","local_hostname":"FIXTURE-HOST.local"}]}).to_string()).unwrap();
+    assert_eq!(source::load_for_host(&config, &dir.join("missing"), 10_000, "fixture-host").nodes[0].local, Some(true));
+}
+
+#[test]
+fn unavailable_repository_coverage_is_not_reported_as_an_empty_result() {
+    use source::Coverage;
+    assert_eq!(source::empty_repository_text(Coverage::Unknown, false), "保存済みリポジトリの有無は未確認です。");
+    assert_eq!(source::empty_repository_text(Coverage::Complete, true), "保存済みリポジトリの有無は未確認です。");
+    assert_eq!(source::empty_repository_text(Coverage::Complete, false), "表示範囲に該当するリポジトリはありません。");
 }
 
 #[test]
@@ -91,7 +122,7 @@ fn failed_refresh_keeps_previous_data_but_changes_its_status_to_unknown() {
             id: "fixture-node".into(),
             role: "test".into(),
             operating_state: "online".into(),
-            local: true,
+            local: Some(true),
             last_at: Some(100),
             observation: Observation::Current,
             failure_reason: None,
@@ -121,10 +152,12 @@ fn failed_refresh_keeps_previous_data_but_changes_its_status_to_unknown() {
     source::preserve_previous(&previous, &mut next);
     assert_eq!(next.nodes[0].last_at, Some(100));
     assert_eq!(next.nodes[0].observation, Observation::Unknown);
-    assert_eq!(next.repositories[0].name, "fixture-repo");
-    assert!(next.repositories[0].previous);
+    assert!(next.repositories.is_empty());
     assert_eq!(next.topology_coverage, source::Coverage::Unknown);
     assert!(next.database_error.is_some());
+    let mut missing_config = source::Dashboard { nodes: Vec::new(), config_error: Some("unavailable".into()), ..next };
+    source::preserve_previous(&previous, &mut missing_config);
+    assert_eq!(missing_config.nodes[0].identity_text(), "同一性不明");
 }
 
 #[test]
@@ -151,12 +184,39 @@ fn freshness_uses_ledger_interval_then_database_override() {
 }
 
 #[test]
+fn corrupted_saved_schedule_keeps_machine_freshness_unknown() {
+    let dir = fixture_dir();
+    let config = config(&dir);
+    let data = dir.join("data");
+    let db = Store::open(&data).unwrap();
+    assert!(db.get_meta_strict("schedule").unwrap().is_none());
+    db.add_snapshot("fixture-node", 9_000, None, None, &json!([]), &json!({}), &json!({})).unwrap();
+    db.conn().execute_batch("INSERT INTO meta(k,v,updated_at) VALUES ('schedule','not-json',1)").unwrap();
+    assert!(db.get_meta_strict("schedule").is_err());
+    drop(db);
+    let dashboard = source::load(&config, &data, 10_000);
+    assert_eq!(dashboard.nodes[0].observation, Observation::Unknown);
+}
+
+#[test]
+fn non_object_saved_schedule_does_not_become_a_default_interval() {
+    let dir = fixture_dir();
+    let config = config(&dir);
+    let data = dir.join("data");
+    let db = Store::open(&data).unwrap();
+    db.add_snapshot("fixture-node", 9_000, None, None, &json!([]), &json!({}), &json!({})).unwrap();
+    db.set_meta("schedule", &json!(null)).unwrap();
+    drop(db);
+    assert_eq!(source::load(&config, &data, 10_000).nodes[0].observation, Observation::Unknown);
+}
+
+#[test]
 fn displayed_snapshot_becomes_stale_after_its_deadline() {
     let card = source::NodeCard {
         id: "fixture".into(),
         role: "test".into(),
         operating_state: "online".into(),
-        local: true,
+        local: Some(true),
         last_at: Some(9_000),
         observation: Observation::Current,
         failure_reason: None,
@@ -188,4 +248,34 @@ fn topology_search_does_not_create_missing_database_or_accept_unbounded_input() 
     assert!(source::search_topology(&data, "fixture", 10_000).is_err());
     assert!(!data.exists());
     assert!(source::search_topology(&data, &"x".repeat(257), 10_000).is_err());
+}
+
+#[test]
+fn unscoped_topology_is_hidden_and_cannot_be_searched() {
+    let dir = fixture_dir();
+    let config = config(&dir);
+    let data = dir.join("data");
+    let db = Store::open(&data).unwrap();
+    drop(db);
+    let dashboard = source::load(&config, &data, 10_000);
+    assert!(dashboard.repositories.is_empty());
+    assert_eq!(dashboard.topology_coverage, source::Coverage::Unknown);
+    assert_eq!(dashboard.topology_error.as_deref(), Some(source::TOPOLOGY_SCOPE_UNAVAILABLE));
+    assert_eq!(source::search_topology(&data, "fixture", 10_000).unwrap_err(), source::TOPOLOGY_SCOPE_UNAVAILABLE);
+}
+
+#[test]
+fn disabled_topology_does_not_restore_previously_cached_repository_names() {
+    let mut previous = source::load(&fixture_dir().join("missing"), &fixture_dir().join("missing"), 10_000);
+    previous.repositories = vec![source::Repository { name: "fixture-private".into(), origin: None, observed_at: Some(9_000), previous: false }];
+    let mut next = previous.clone();
+    next.repositories.clear();
+    next.topology_error = Some(source::TOPOLOGY_SCOPE_UNAVAILABLE.into());
+    source::preserve_previous(&previous, &mut next);
+    assert!(next.repositories.is_empty());
+    let mut config_failure = next.clone();
+    config_failure.topology_error = None;
+    config_failure.config_error = Some("fixture".into());
+    source::preserve_previous(&previous, &mut config_failure);
+    assert!(config_failure.repositories.is_empty());
 }

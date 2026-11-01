@@ -674,6 +674,55 @@ impl Store {
             .collect())
     }
 
+    /// Read a bounded selection of cursor status without returning errors or file names.
+    pub fn ai_cursor_summaries(&self, node_ids: &[String]) -> Result<Vec<Value>> {
+        const MAX_NODES: usize = 32;
+        if node_ids.len() > MAX_NODES || node_ids.iter().any(|id| id.is_empty() || id.len() > 256 || id.chars().any(char::is_control)) {
+            return Err(rusqlite::Error::InvalidParameterName("invalid node selection".into()));
+        }
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", node_ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT node_id, updated_at, last_ok_at,\n\
+                    CASE WHEN last_error IS NULL OR last_error = '' THEN 0 ELSE 1 END AS has_error,\n\
+                    no_python, truncated,\n\
+                    CASE WHEN typeof(file_errors) = 'text' AND octet_length(file_errors) <= 16384 THEN\n\
+                           CASE WHEN json_valid(file_errors) THEN\n\
+                             CASE WHEN json_type(file_errors) = 'array' THEN json_array_length(file_errors) ELSE NULL END\n\
+                           ELSE NULL END\n\
+                         ELSE NULL END AS file_error_count\n\
+             FROM ai_cursors WHERE node_id IN ({placeholders}) ORDER BY node_id"
+        );
+        self.conn.prepare(&sql)?.query_map(rusqlite::params_from_iter(node_ids.iter()), row_json)?.collect()
+    }
+
+    /// Bound the saved main-session projection before returning text to a caller.
+    /// The extra row (at most 21) lets a caller detect a partial page without COUNT.
+    pub fn ai_recent_work_list(&self, node_id: &str, limit: usize) -> Result<Vec<Value>> {
+        if node_id.trim().is_empty() || node_id.len() > 256 || node_id.chars().any(char::is_control) || !(1..=21).contains(&limit) {
+            return Err(rusqlite::Error::InvalidParameterName("invalid recent-work selection".into()));
+        }
+        self.conn
+            .prepare(
+                "SELECT CASE WHEN typeof(tool) = 'text' AND octet_length(tool) <= 64 THEN tool ELSE NULL END AS tool,\n\
+                        CASE WHEN typeof(cwd) = 'text' AND octet_length(cwd) <= 2048 THEN cwd ELSE NULL END AS cwd,\n\
+                        last_ts,\n\
+                        CASE WHEN typeof(prs) = 'text' AND octet_length(prs) <= 8192 THEN prs ELSE NULL END AS prs\n\
+                 FROM ai_sessions WHERE node_id = ?1 AND parent_id IS NULL ORDER BY last_ts DESC, file LIMIT ?2",
+            )?
+            .query_map(params![node_id, limit as i64], |row| {
+                Ok(json!({
+                    "tool": row.get::<_, Option<String>>(0)?,
+                    "cwd": row.get::<_, Option<String>>(1)?,
+                    "last_ts": row.get::<_, Option<i64>>(2)?,
+                    "prs": row.get::<_, Option<String>>(3)?,
+                }))
+            })?
+            .collect()
+    }
+
     /// 続きの残っている機体があるか（取り込み中・続きあり）
     pub fn ai_pending(&self, enabled: &[String]) -> Result<bool> {
         if enabled.is_empty() {

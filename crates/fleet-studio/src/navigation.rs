@@ -42,3 +42,24 @@ pub fn local_directory(path: &str) -> Option<String> {
     }
     url::Url::from_directory_path(path).ok().map(String::from)
 }
+/// An asynchronous list replacement must not silently select a different link.
+#[derive(Default)]
+pub struct Selection(Option<usize>);
+
+impl Selection {
+    pub fn index(&self) -> Option<usize> {
+        self.0
+    }
+
+    pub fn invalidate(&mut self) {
+        self.0 = None;
+    }
+
+    pub fn next(&mut self, count: usize) {
+        self.0 = if count == 0 { None } else { Some(self.0.map_or(0, |index| index.saturating_add(1).min(count - 1))) };
+    }
+
+    pub fn previous(&mut self, count: usize) {
+        self.0 = if count == 0 { None } else { Some(self.0.map_or(0, |index| index.saturating_sub(1).min(count - 1))) };
+    }
+}

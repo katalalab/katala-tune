@@ -4,12 +4,14 @@ use tune_core::{db::Store, nodes};
 
 use crate::{Observation, observation};
 
+pub const TOPOLOGY_SCOPE_UNAVAILABLE: &str = "構成情報は機体・権限の対象を確認できないため非表示です";
+
 #[derive(Clone, Debug)]
 pub struct NodeCard {
     pub id: String,
     pub role: String,
     pub operating_state: String,
-    pub local: bool,
+    pub local: Option<bool>,
     pub last_at: Option<i64>,
     pub observation: Observation,
     pub failure_reason: Option<&'static str>,
@@ -20,6 +22,15 @@ pub struct NodeCard {
 }
 
 impl NodeCard {
+    pub fn identity_text(&self) -> &'static str {
+        match self.local {
+            Some(true) => "この機体",
+            Some(false) if self.role.contains("この機体") => "台帳の『この機体』表記は現在ホストと不一致",
+            Some(false) => "別の機体",
+            None => "同一性不明",
+        }
+    }
+
     pub fn current_observation(&self, now: i64) -> Observation {
         match self.observation {
             Observation::Current | Observation::Stale => observation(self.last_at, false, true, now, self.max_age_ms.unwrap_or(-1)),
@@ -47,6 +58,7 @@ pub fn preserve_previous(previous: &Dashboard, next: &mut Dashboard) {
     if next.config_error.is_some() && next.nodes.is_empty() {
         next.nodes = previous.nodes.clone();
         for node in &mut next.nodes {
+            node.local = None;
             if node.observation != Observation::Excluded {
                 node.observation = Observation::Unknown;
                 node.failure_reason = None;
@@ -64,15 +76,6 @@ pub fn preserve_previous(previous: &Dashboard, next: &mut Dashboard) {
                 node.warnings = old.warnings;
             }
         }
-    }
-    if next.repositories.is_empty() && (next.topology_error.is_some() || next.config_error.is_some() || next.database_error.is_some()) {
-        next.repositories = previous.repositories.clone();
-        for repo in &mut next.repositories {
-            repo.previous = true;
-        }
-        next.topology_coverage = Coverage::Unknown;
-        next.topology_oldest_at = previous.topology_oldest_at;
-        next.topology_limited = previous.topology_limited;
     }
 }
 
@@ -103,6 +106,14 @@ pub enum Coverage {
     Partial,
     Stale,
     Unknown,
+}
+
+pub fn empty_repository_text(coverage: Coverage, has_error: bool) -> &'static str {
+    if coverage == Coverage::Unknown || has_error {
+        "保存済みリポジトリの有無は未確認です。"
+    } else {
+        "表示範囲に該当するリポジトリはありません。"
+    }
 }
 
 impl Dashboard {
@@ -197,6 +208,11 @@ pub fn repositories(view: &serde_json::Value, now: i64, max_age_ms: i64) -> Resu
 
 /// Read only existing Katala Tune data; never create or migrate it.
 pub fn load(config: &Path, data_dir: &Path, now: i64) -> Dashboard {
+    load_for_host(config, data_dir, now, &nodes::local_host())
+}
+
+/// The explicit hostname also supports testing unknown and ambiguous identities.
+pub fn load_for_host(config: &Path, data_dir: &Path, now: i64, host: &str) -> Dashboard {
     let config = match nodes::load_config(config) {
         Ok(config) => config,
         Err(_) => {
@@ -215,8 +231,10 @@ pub fn load(config: &Path, data_dir: &Path, now: i64) -> Dashboard {
     let database = Store::open_read_only(data_dir);
     let database_error = database.as_ref().err().map(|_| "保存済みデータベースを読み取れません".to_owned());
     let age = database.as_ref().ok().and_then(|db| max_age(db, config.schedule.as_ref()));
-    let nodes = config
-        .nodes
+    let host_known = crate::recent::normalized_hostname(host).is_some();
+    let resolved = crate::recent::resolved_nodes(&config.nodes, host);
+    let local_ambiguous = crate::recent::local_ambiguous(&resolved);
+    let nodes = resolved
         .iter()
         .map(|node| {
             let op = node.op_state();
@@ -258,7 +276,14 @@ pub fn load(config: &Path, data_dir: &Path, now: i64) -> Dashboard {
                 id: node.id.clone(),
                 role: node.get("role").and_then(|v| v.as_str()).unwrap_or("不明").to_owned(),
                 operating_state: op.state,
-                local: node.local,
+                local: if !host_known
+                    || node.get("local_hostname").and_then(serde_json::Value::as_str).and_then(crate::recent::normalized_hostname).is_none()
+                    || (node.local && local_ambiguous)
+                {
+                    None
+                } else {
+                    Some(node.local)
+                },
                 last_at,
                 observation: status,
                 failure_reason: reason,
@@ -269,18 +294,15 @@ pub fn load(config: &Path, data_dir: &Path, now: i64) -> Dashboard {
             }
         })
         .collect();
-    let topology = database.as_ref().ok().and_then(|db| topology_from(db, "", now).ok());
-    let topology_error = topology.is_none().then(|| "保存済みの構成情報を読み取れません".to_owned());
-    let topology = topology.unwrap_or(TopologyResult { repositories: Vec::new(), coverage: Coverage::Unknown, oldest_at: None, limited: false });
     Dashboard {
         nodes,
         config_error: None,
         database_error,
-        repositories: topology.repositories,
-        topology_coverage: topology.coverage,
-        topology_error,
-        topology_oldest_at: topology.oldest_at,
-        topology_limited: topology.limited,
+        repositories: Vec::new(),
+        topology_coverage: Coverage::Unknown,
+        topology_error: Some(TOPOLOGY_SCOPE_UNAVAILABLE.into()),
+        topology_oldest_at: None,
+        topology_limited: false,
     }
 }
 
@@ -292,35 +314,24 @@ pub struct TopologyResult {
     pub limited: bool,
 }
 
-/// Search the bounded existing topology projection without collecting or changing data.
-pub fn search_topology(data_dir: &Path, filter: &str, now: i64) -> Result<TopologyResult, &'static str> {
-    if filter.len() > 256 || filter.chars().any(char::is_control) {
-        return Err("検索語が長すぎるか不正です");
-    }
-    let database = Store::open_read_only(data_dir).map_err(|_| "保存済みデータベースを読み取れません")?;
-    topology_from(&database, filter, now)
-}
-
-fn topology_from(db: &Store, filter: &str, now: i64) -> Result<TopologyResult, &'static str> {
-    let view = db
-        .topology_ui_view(&tune_core::db::TopologyUiRequest { kind: "repository".into(), filter: filter.into(), ..Default::default() })
-        .map_err(|_| "保存済みの構成情報を読み取れません")?;
-    let (repositories, coverage) = repositories(&view, now, 24 * 60 * 60 * 1_000)?;
-    let limited = view.pointer("/window/filtered_stored_totals/accepted_entities").and_then(|v| v.as_u64()).is_some_and(|n| n > repositories.len() as u64)
-        || view.get("candidates").and_then(|v| v.as_array()).is_some_and(|rows| !rows.is_empty());
-    let oldest_at = view.get("scopes").and_then(|v| v.as_array()).and_then(|scopes| {
-        scopes.iter().filter_map(|v| v.get("observed_at").and_then(|v| v.as_i64())).chain(repositories.iter().filter_map(|repo| repo.observed_at)).min()
-    });
-    Ok(TopologyResult { repositories, coverage, oldest_at, limited })
+/// Refuse topology search until the requested machine and scope can be authorized.
+pub fn search_topology(_data_dir: &Path, _filter: &str, _now: i64) -> Result<TopologyResult, &'static str> {
+    Err(TOPOLOGY_SCOPE_UNAVAILABLE)
 }
 
 fn max_age(db: &Store, configured: Option<&serde_json::Value>) -> Option<i64> {
-    let schedule = db.get_meta("schedule").ok()?;
-    let value = schedule
-        .as_ref()
-        .and_then(|v| v.as_object())
-        .and_then(|v| v.get("probe_minutes"))
-        .or_else(|| configured.and_then(|v| v.as_object()).and_then(|v| v.get("probe_minutes")));
+    let schedule = db.get_meta_strict("schedule").ok()?;
+    let stored = match schedule.as_ref() {
+        None => None,
+        Some(serde_json::Value::Object(object)) => object.get("probe_minutes"),
+        _ => return None,
+    };
+    let value = match (stored, configured) {
+        (Some(value), _) => Some(value),
+        (None, None) => None,
+        (None, Some(serde_json::Value::Object(object))) => object.get("probe_minutes"),
+        _ => return None,
+    };
     let minutes = match value {
         None => 60,
         Some(value) => value.as_i64().filter(|minutes| (5..=1440).contains(minutes))?,

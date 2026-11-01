@@ -167,6 +167,16 @@ impl Store {
         Ok(v.flatten().and_then(|s| serde_json::from_str(&s).ok()))
     }
 
+    /// Distinguish an absent key from a present but unreadable or invalid JSON value.
+    pub fn get_meta_strict(&self, k: &str) -> Result<Option<Value>> {
+        let value: Option<Option<String>> = self.conn.query_row("SELECT v FROM meta WHERE k = ?", [k], |r| r.get(0)).optional()?;
+        match value {
+            None => Ok(None),
+            Some(Some(text)) => serde_json::from_str(&text).map(Some).map_err(|_| rusqlite::Error::InvalidQuery),
+            Some(None) => Err(rusqlite::Error::InvalidQuery),
+        }
+    }
+
     pub fn set_meta(&self, k: &str, v: &Value) -> Result<()> {
         self.conn.execute("INSERT OR REPLACE INTO meta (k, v, updated_at) VALUES (?, ?, ?)", params![k, v.to_string(), now_ms()])?;
         Ok(())
