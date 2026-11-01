@@ -104,8 +104,10 @@ pub fn project(results: &[Value]) -> Audit {
             incomplete = true;
         }
         if incomplete && !audit.incomplete_nodes.contains(&node) {
-            let reason = if result.get("ok").and_then(Value::as_bool) != Some(true) {
-                safe_error(result.get("error").and_then(Value::as_str))
+            let reason = if let Some(error) = result.get("error").and_then(Value::as_str).filter(|error| !error.is_empty()) {
+                safe_error(Some(error))
+            } else if result.get("ok").and_then(Value::as_bool) != Some(true) {
+                safe_error(None)
             } else if no_roots {
                 "探索先を確認できません"
             } else if result.get("truncated").and_then(Value::as_bool) == Some(true) {
@@ -148,6 +150,7 @@ fn safe_error(error: Option<&str>) -> &'static str {
         Some("timeout_or_unreachable") => "タイムアウトまたは接続不可",
         Some("timeout") => "タイムアウト",
         Some("no_python") => "Python を利用できません",
+        Some("git_missing") => "Git を利用できません",
         Some("git_failed") => "Git の読み取りに失敗",
         Some("over_limit") => "時間・件数の上限に到達",
         Some("excluded") => "運用対象外",

@@ -478,10 +478,15 @@ fn model_text(line: &ModelLine) -> String {
     if !matches!(&line.observation.latest, Some(Ok(_)))
         && let Some((models, at)) = &line.observation.last_good
     {
-        return format!("{text} / 前回: {} ({})", if models.is_empty() { "一覧は空".into() } else { models.join(", ") }, when(Some(*at)));
+        let age = match line.observation.last_good_freshness(tune_core::db::now_ms()) {
+            Observation::Stale => "（古い）",
+            Observation::Unknown => "（時刻不明）",
+            _ => "",
+        };
+        return format!("{text} / 前回{age}: {} ({})", if models.is_empty() { "一覧は空".into() } else { models.join(", ") }, when(Some(*at)));
     }
     if matches!(&line.observation.latest, Some(Ok(_))) {
-        match fleet_studio::observation(line.observation.checked_at, false, true, tune_core::db::now_ms(), 5 * 60 * 1_000) {
+        match fleet_studio::observation(line.observation.checked_at, false, true, tune_core::db::now_ms(), llm::MODEL_MAX_AGE_MS) {
             Observation::Stale => return format!("古い / {text}"),
             Observation::Unknown => return format!("時刻不明 / {text}"),
             _ => {}

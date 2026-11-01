@@ -5,6 +5,8 @@ use http_body_util::{BodyExt, Empty, Limited};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 
+pub const MODEL_MAX_AGE_MS: i64 = 5 * 60 * 1_000;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Protocol {
     OpenAi,
@@ -30,6 +32,10 @@ impl ModelObservation {
     pub fn begin_refresh(&mut self) {
         self.latest = None;
         self.checked_at = None;
+    }
+
+    pub fn last_good_freshness(&self, now: i64) -> crate::Observation {
+        crate::observation(self.last_good.as_ref().map(|(_, at)| *at), false, true, now, MODEL_MAX_AGE_MS)
     }
 
     pub fn record(&mut self, result: Result<Vec<String>, ModelError>, at: i64) {

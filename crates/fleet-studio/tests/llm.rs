@@ -82,3 +82,11 @@ fn starting_a_refresh_does_not_label_the_previous_check_as_the_current_attempt()
     assert_eq!(observation.latest, None);
     assert_eq!(observation.last_good, Some((vec!["fixture-model".into()], 100)));
 }
+
+#[test]
+fn retained_model_list_reports_its_own_age_after_a_failure() {
+    let mut observation = fleet_studio::llm::ModelObservation::default();
+    observation.record(Ok(vec!["fixture-model".into()]), 100);
+    observation.record(Err(ModelError::TimedOut), 600_000);
+    assert_eq!(observation.last_good_freshness(600_000), fleet_studio::Observation::Stale);
+}

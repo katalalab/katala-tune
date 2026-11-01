@@ -89,3 +89,9 @@ fn unrequested_failed_machine_keeps_its_previous_failure() {
     assert_eq!(next.issues[0].at, Some(100));
     assert!(next.issues[0].previous);
 }
+
+#[test]
+fn explicit_missing_git_is_not_misreported_as_missing_roots() {
+    let audit = project(&[json!({"node_id":"fixture-node","ok":true,"error":"git_missing","roots":[],"repos":[]})]);
+    assert_eq!(audit.issues[0].reason, "Git を利用できません");
+}
