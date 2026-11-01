@@ -105,6 +105,31 @@ fn normalized_missing_total_keeps_current_row_and_safe_error() {
 }
 
 #[test]
+fn incomplete_completion_preserves_failure_time_and_previous_observation() {
+    use fleet_studio::audit::preserve_previous;
+    let base = json!({
+        "roots":[{"path":"fixture", "source":"opt"}], "enumerated":1, "skipped":0, "truncated":false,
+        "repos":[{"path":"fixture/repo", "state":"ok", "linked":false, "tracked":2, "untracked":1, "conflicted":0, "upstream":false, "detached":false}]
+    });
+    let previous = project(&[normalized_audit(&base, 100)]);
+    let mut failed = tune_core::hygiene::normalize(&json!({"error":"incomplete"}));
+    assert_eq!(failed["error"], "incomplete");
+    failed["node_id"] = json!("fixture-node");
+    failed["ok"] = json!(false);
+    failed["at"] = json!(200);
+    let mut current = project(&[failed]);
+    assert_eq!(current.incomplete_nodes, vec!["fixture-node"]);
+    assert_eq!(current.issues[0].reason, "監査の完了を確認できません");
+    assert_eq!(current.issues[0].at, Some(200));
+    assert!(!current.issues[0].previous);
+    preserve_previous(&previous, &mut current);
+    let old = current.repos.iter().find(|row| row.path == "fixture/repo").unwrap();
+    assert_eq!(old.dirty, Some(3));
+    assert_eq!(old.at, Some(100));
+    assert!(old.previous);
+}
+
+#[test]
 fn normalized_invalid_row_keeps_previous_value_as_previous() {
     use fleet_studio::audit::preserve_previous;
     let base = json!({
