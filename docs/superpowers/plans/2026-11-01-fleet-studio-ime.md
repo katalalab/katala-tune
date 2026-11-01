@@ -44,7 +44,7 @@
 - [x] Register GPUI's input handler only while editing; let the platform deliver text and IME events.
 - [x] Render selection, composition underline, horizontally scrolled caret and hit testing from the same shaped line; handle invalid geometry.
 - [x] Route Ctrl on Windows and Command on macOS; explicitly report paste unavailable without reading the clipboard.
-- [x] Run the Fleet Studio regression tests, including sample/live boundaries; actual OS click and IME event ordering remain unverified.
+- [x] Run the Fleet Studio regression tests, including sample/live boundaries; Windows IME basic conversion, confirmation and cancellation were checked on sample data. Focus loss, input limits, mouse down/up across redraw, and complete OS event ordering remain unverified.
 
 ### Task 3: Verify and review
 
@@ -53,5 +53,5 @@
 - [x] Document input, actual platform limitations, build and verification without private data.
 - [x] Run formatting, Fleet Studio tests, GUI Clippy, Windows GUI build, and public-data checks on the change and history. Recheck after committing.
 - [x] Request independent review; fix actionable findings and rerun affected checks.
-- [x] Hand the built sample to the parent: ASCII search, selection, cursor edits, confirmation and sample links were checked. Real IME, Japanese input and macOS remain unverified.
+- [x] Hand the built sample to the parent: ASCII search, selection, cursor edits, confirmation, sample links, and basic Japanese IME conversion, confirmation and cancellation were checked on Windows. macOS remains unverified.
 - [x] Prepare the change for a local-only commit; do not push, create a PR, or merge.
