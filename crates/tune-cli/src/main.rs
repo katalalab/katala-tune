@@ -238,16 +238,8 @@ async fn hygiene(rest: &[String]) -> Result<(), String> {
             continue;
         }
         let findings = hygiene::analyze(r);
-        let repos = r["repos"].as_array().map_or(&[][..], Vec::as_slice);
-        let observed = repos.iter().filter(|x| x["state"] == "ok").count();
-        let unobserved = repos.len() - observed + r["skipped"].as_u64().unwrap_or(0) as usize;
-        eprintln!(
-            "{id}: 見つけた {} 件・未観測 {unobserved} 件{}・{:.1}s・所見 {}",
-            r["enumerated"],
-            hygiene::walk_coverage_note(r),
-            r["wall_s"].as_f64().unwrap_or(0.0),
-            findings.len()
-        );
+        let (observed, line) = hygiene::progress(r, findings.len());
+        eprintln!("{line}");
         let mut o = r.clone();
         if !with_repos {
             o.as_object_mut().map(|m| m.remove("repos"));

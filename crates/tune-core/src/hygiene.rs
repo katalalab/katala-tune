@@ -28,6 +28,9 @@ const DEFAULT_CMD_S: i64 = 12;
 fn int(v: Option<&Value>) -> Option<i64> {
     v.and_then(Value::as_f64).filter(|x| x.is_finite()).map(|x| x.trunc() as i64)
 }
+fn count(v: Option<&Value>) -> Option<i64> {
+    v.and_then(Value::as_f64).filter(|n| n.is_finite() && (0.0..=9_007_199_254_740_991.0).contains(n) && n.fract() == 0.0).map(|n| n as i64)
+}
 fn text(v: Option<&Value>) -> Option<&str> {
     v.and_then(Value::as_str)
 }
@@ -158,12 +161,22 @@ pub fn strip_url(s: Option<&str>) -> Option<String> {
 fn normalize_repo(r: &Value) -> Value {
     let x = Some(r);
     let g = |k: &str| js::get(x, k);
-    let ok = text(g("state")) == Some("ok");
+    let state_ok = text(g("state")) == Some("ok");
+    // JS で正確に表せる非負整数だけを受け入れ、表記上の 1.0 も 1 と同じように扱う。
+    let is_count = |k: &str| g(k).and_then(Value::as_f64).is_some_and(|n| n.is_finite() && (0.0..=9_007_199_254_740_991.0).contains(&n) && n.fract() == 0.0);
+    let ok = state_ok
+        && text(g("path")).is_some_and(|p| !p.is_empty())
+        && g("linked").is_some_and(Value::is_boolean)
+        && ["tracked", "untracked", "conflicted"].iter().all(|k| is_count(k))
+        && ["ahead", "behind", "local_only", "stash"].iter().all(|k| g(k).is_none_or(Value::is_null) || is_count(k))
+        && g("conflicted").and_then(Value::as_f64).zip(g("tracked").and_then(Value::as_f64)).is_some_and(|(c, t)| c <= t)
+        && g("detached").is_some_and(Value::is_boolean)
+        && g("upstream").is_some_and(Value::is_boolean);
     let reason = if ok {
         Value::Null
     } else {
         let t = text(g("reason")).unwrap_or("");
-        json!(if matches!(t, "timeout" | "git_failed" | "over_limit") { t } else { "git_failed" })
+        json!(if !state_ok && matches!(t, "timeout" | "git_failed" | "over_limit") { t } else { "git_failed" })
     };
     let base = Obj::new()
         .set("path", text(g("path")).unwrap_or(""))
@@ -202,18 +215,51 @@ fn normalize_repo(r: &Value) -> Value {
 /// 調査の出力を、知っている項目だけの形に揃える（余分な項目は捨てる）
 pub fn normalize(data: &Value) -> Value {
     let g = |k: &str| js::get(Some(data), k);
+    let enumerated = count(g("enumerated"));
+    let skipped = count(g("skipped"));
+    let old_incomplete = js::arr(g("incomplete_fields"));
+    let old_has = |field: &str| old_incomplete.iter().any(|v| v.as_str() == Some(field));
+    let labels = ["roots", "repos", "counts", "error", "metadata"];
+    let bad_metadata =
+        g("incomplete_fields").is_some_and(|v| v.as_array().is_none_or(|fields| fields.iter().any(|v| v.as_str().is_none_or(|s| !labels.contains(&s)))));
+    let bad_roots = g("roots").and_then(Value::as_array).is_none_or(|roots| {
+        roots.iter().any(|r| text(js::get(Some(r), "path")).is_none_or(str::is_empty) || text(js::get(Some(r), "source")).is_none_or(str::is_empty))
+    });
+    let bad_repos = g("repos").and_then(Value::as_array).is_none();
+    let bad_error = g("error").is_some_and(|v| {
+        !v.is_null()
+            && !matches!(
+                v.as_str(),
+                Some("git_missing" | "walk_incomplete" | "excluded" | "no_python" | "timeout_or_unreachable" | "probe_failed" | "internal" | "unknown_error")
+            )
+    });
+    let bad_counts = enumerated.is_some_and(|n| {
+        g("repos").and_then(Value::as_array).is_some_and(|repos| {
+            let n = n as u128;
+            let len = repos.len() as u128;
+            n < len || skipped.is_some_and(|s| n != len + s as u128)
+        })
+    });
+    let incomplete: Vec<&str> = [("roots", bad_roots), ("repos", bad_repos), ("counts", bad_counts), ("error", bad_error), ("metadata", bad_metadata)]
+        .into_iter()
+        .filter_map(|(field, bad)| (bad || old_has(field)).then_some(field))
+        .collect();
     let roots: Vec<Value> = js::arr(g("roots"))
         .iter()
         .map(|r| json!({ "path": text(js::get(Some(r), "path")).unwrap_or(""), "source": text(js::get(Some(r), "source")).unwrap_or("") }))
         .collect();
-    json!({
+    let mut result = json!({
         "version": opt_s(g("version")), "os": opt_s(g("os")), "roots": roots,
-        "enumerated": int(g("enumerated")).unwrap_or(0), "skipped": int(g("skipped")).unwrap_or(0),
-        "truncated": g("truncated") == Some(&Value::Bool(true)),
+        "enumerated": enumerated, "skipped": skipped,
+        "truncated": g("truncated").filter(|v| v.is_boolean()).cloned().unwrap_or(Value::Null),
         "elapsed_s": g("elapsed_s").filter(|v| v.is_number()).cloned().unwrap_or(Value::Null),
-        "error": opt_s(g("error")),
+        "error": if bad_error { json!("unknown_error") } else { opt_s(g("error")) },
         "repos": js::arr(g("repos")).iter().map(normalize_repo).collect::<Vec<_>>(),
-    })
+    });
+    if !incomplete.is_empty() {
+        result["incomplete_fields"] = json!(incomplete);
+    }
+    result
 }
 
 /// ghq の期待パス（<host>/<owner>/<repo>、小文字）。origin から導けなければ None
@@ -281,8 +327,10 @@ fn finding(out: &mut Vec<Value>, id: &str, severity: &str, title: String, detail
     out.push(json!({ "category": "repo", "id": id, "severity": severity, "title": title, "detail": detail, "advice": advice }));
 }
 
-/// 所見（rules の finding と同じ形）。audit は [`normalize`] の出力
-pub fn analyze(audit: &Value) -> Vec<Value> {
+/// 所見（rules の finding と同じ形）。欠損を正しく扱うため、直接渡された入力も整形する。
+pub fn analyze(input: &Value) -> Vec<Value> {
+    let normalized = normalize(input);
+    let audit = &normalized;
     let repos: Vec<&Value> = js::arr(audit.get("repos")).iter().collect();
     let mut out = Vec::new();
     let is_ok = |r: &&Value| text(r.get("state")) == Some("ok");
@@ -292,6 +340,12 @@ pub fn analyze(audit: &Value) -> Vec<Value> {
     let mut miss: Vec<String> = Vec::new();
     if let Some(e) = text(audit.get("error")).filter(|e| !e.is_empty()) {
         miss.push(if e == "walk_incomplete" { "探索先の一部を確認できない".into() } else { format!("調査が失敗した（{e}）") });
+    }
+    if ["enumerated", "skipped", "truncated"].iter().any(|k| audit.get(*k) == Some(&Value::Null)) || !js::arr(audit.get("incomplete_fields")).is_empty() {
+        miss.push("探索結果の集計または一覧が不明".into());
+    }
+    if text(audit.get("error")).is_none_or(str::is_empty) && js::arr(audit.get("incomplete_fields")).is_empty() && js::arr(audit.get("roots")).is_empty() {
+        miss.push("探索先がない".into());
     }
     if !gone.is_empty() {
         let mut by: std::collections::BTreeMap<String, usize> = Default::default();
@@ -428,6 +482,51 @@ pub fn analyze(audit: &Value) -> Vec<Value> {
     out
 }
 
+/// CLI の観測数と進捗。探索が不完全なら未観測の総数を 0 と表示しない。
+pub fn progress(input: &Value, finding_count: usize) -> (Option<usize>, String) {
+    let normalized = normalize(input);
+    let audit = &normalized;
+    let repos = js::arr(audit.get("repos"));
+    let fields = js::arr(audit.get("incomplete_fields"));
+    let observed = repos.iter().filter(|r| text(r.get("state")) == Some("ok")).count();
+    let repos_known = audit.get("repos").is_some_and(Value::is_array) && !fields.iter().any(|v| v.as_str() == Some("repos"));
+    let enumerated = count(audit.get("enumerated"));
+    let skipped = count(audit.get("skipped"));
+    let incomplete = text(audit.get("error")).is_some_and(|e| !e.is_empty())
+        || enumerated.is_none()
+        || skipped.is_none()
+        || audit.get("truncated") != Some(&Value::Bool(false))
+        || !fields.is_empty()
+        || js::arr(audit.get("roots")).is_empty();
+    let found = if fields.iter().any(|v| v.as_str() == Some("counts")) {
+        "見つけた 件数不明".to_string()
+    } else {
+        enumerated.map_or_else(|| "見つけた 件数不明".to_string(), |n| format!("見つけた {n} 件"))
+    };
+    let coverage = walk_coverage_note(audit);
+    let known = enumerated.is_some()
+        && skipped.is_some()
+        && fields.is_empty()
+        && !js::arr(audit.get("roots")).is_empty()
+        && audit.get("truncated").is_some_and(Value::is_boolean)
+        && matches!(text(audit.get("error")), None | Some("walk_incomplete"));
+    let known_unseen = (repos.len() - observed) as u128 + skipped.unwrap_or(0) as u128;
+    let unseen = if !incomplete {
+        format!("未観測 {known_unseen} 件")
+    } else if known {
+        format!("未観測 既知 {known_unseen} 件{}", if coverage.is_empty() { "・ほか件数不明" } else { coverage })
+    } else {
+        format!("未観測 件数不明{coverage}")
+    };
+    let wall = input
+        .get("wall_s")
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map_or_else(|| "時間不明".to_string(), |n| format!("{}s", js::to_fixed(n, 1)));
+    let id = text(input.get("node_id")).unwrap_or("?");
+    (repos_known.then_some(observed), format!("{id}: {found}・{unseen}・{wall}・所見 {finding_count}"))
+}
+
 /// 機体×リポジトリの表（matrix）。キーは origin から導いた <host>/<owner>/<repo>（小文字）。リンク worktree と origin の無いものは含めない
 pub fn matrix(audits: &[Value]) -> Vec<Value> {
     let mut rows: Vec<(String, Map<String, Value>)> = Vec::new();
@@ -491,8 +590,9 @@ mod tests {
     fn incomplete_walk_is_distinct_from_truncation_and_keeps_observed_results() {
         for truncated in [false, true] {
             let input = json!({
-                "probe": "repo_hygiene", "error": "walk_incomplete", "truncated": truncated,
-                "repos": [{"state": "ok", "path": "fixture/project", "tracked": 1, "untracked": 0, "conflicted": 0, "upstream": false, "detached": false}]
+                "probe": "repo_hygiene", "error": "walk_incomplete", "truncated": truncated, "enumerated": 1, "skipped": 0,
+                "roots": [{"path": "fixture", "source": "opt"}],
+                "repos": [{"state": "ok", "path": "fixture/project", "linked": false, "tracked": 1, "untracked": 0, "conflicted": 0, "upstream": false, "detached": false}]
             });
             let data = normalize(&input);
             let findings = analyze(&data);
