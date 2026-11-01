@@ -291,23 +291,24 @@ test('台帳: 運用対象でない機体は対象外で、接続せずに断る
 });
 
 const row = (o = {}) => ({ path: '~/ghq/example.com/o/r', rel: 'example.com/o/r', linked: false, state: 'ok', reason: null, branch: 'main', detached: false, upstream: true, ahead: 0, behind: 0, local_only: null, tracked: 0, untracked: 0, conflicted: 0, dirty_age_s: null, head_age_s: 5, stash: 0, origin: 'https://example.com/o/r.git', origin_host: 'example.com', origin_path: 'o/r', has_origin: true, ...o });
+const completeAudit = (repos, opts = {}) => ({ roots: [], repos, enumerated: repos.length + (opts.skipped ?? 0), skipped: 0, truncated: false, ...opts });
 
 test('所見: dirty は古さで重大度を分け、上位だけを並べる', () => {
-  const young = hygiene.analyze({ repos: [row({ path: '~/a', tracked: 1, dirty_age_s: 3600 })] });
+  const young = hygiene.analyze(completeAudit([row({ path: '~/a', tracked: 1, dirty_age_s: 3600 })]));
   assert.equal(young.length, 1);
   assert.deepEqual([young[0].id, young[0].severity, young[0].category], ['repo-dirty', 'info', 'repo']);
   assert.match(young[0].detail, /変更 1・未追跡 0・1 時間/);
-  const old = hygiene.analyze({ repos: [row({ path: '~/a', untracked: 2, dirty_age_s: 9 * 86400 }), ...[1, 2, 3, 4, 5, 6].map((i) => row({ path: `~/b${i}`, tracked: 1, dirty_age_s: i * 60 }))] });
+  const old = hygiene.analyze(completeAudit([row({ path: '~/a', untracked: 2, dirty_age_s: 9 * 86400 }), ...[1, 2, 3, 4, 5, 6].map((i) => row({ path: `~/b${i}`, tracked: 1, dirty_age_s: i * 60 }))]));
   assert.equal(old[0].severity, 'warn');
   assert.match(old[0].title, /7 件（7 日以上前からが 1 件）/);
   assert.match(old[0].detail, /^~\/a（変更 0・未追跡 2・9 日）/);
   assert.match(old[0].detail, /ほか 2 件$/);
-  assert.deepEqual(hygiene.analyze({ repos: [row()] }), []);
-  assert.deepEqual(hygiene.analyze({ repos: [] }), []);
+  assert.deepEqual(hygiene.analyze(completeAudit([row()])), []);
+  assert.deepEqual(hygiene.analyze(completeAudit([])), []);
 });
 
 test('所見: 観測できなかった分はきれいとして数えない', () => {
-  const f = hygiene.analyze({ repos: [row(), { path: '~/x', rel: null, linked: false, state: 'unobserved', reason: 'timeout' }], skipped: 3, truncated: true });
+  const f = hygiene.analyze(completeAudit([row(), { path: '~/x', rel: null, linked: false, state: 'unobserved', reason: 'timeout' }], { skipped: 3, truncated: true }));
   assert.equal(f.length, 1);
   assert.equal(f[0].id, 'repo-unobserved');
   assert.match(f[0].detail, /git を読めなかった 1 件（timeout 1）、件数の上限で見ていない 3 件、探索を時間または件数で打ち切った。確認できた 1 件だけで判定/);

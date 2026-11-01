@@ -53,10 +53,10 @@ function parse(argv) {
       continue;
     }
     const findings = hygiene.analyze(r);
-    const unobserved = r.repos.filter((x) => x.state !== 'ok').length + r.skipped;
-    process.stderr.write(`${r.node_id}: 見つけた ${r.enumerated} 件・未観測 ${unobserved} 件・${r.wall_s.toFixed(1)}s・所見 ${findings.length}\n`);
+    const { observed, line } = hygiene.progress(r, findings.length);
+    process.stderr.write(`${line}\n`);
     const { repos, ...rest } = r;
-    out.nodes.push({ ...rest, observed: repos.length - repos.filter((x) => x.state !== 'ok').length, findings, ...(o.repos ? { repos } : {}) });
+    out.nodes.push({ ...rest, observed, findings, ...(o.repos ? { repos } : {}) });
   }
   out.matrix = hygiene.matrix(results.filter((r) => r.ok));
   process.stdout.write(JSON.stringify(out) + '\n');

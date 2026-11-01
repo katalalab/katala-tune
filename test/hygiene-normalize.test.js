@@ -10,6 +10,118 @@ const observed = () => ({
   origin: null, origin_host: null, origin_path: null, has_origin: null,
 });
 
+const audit = () => ({ roots: [], repos: [], enumerated: 0, skipped: 0, truncated: false });
+
+test('集計の欠損・不正値は null と未観測の所見として残す', () => {
+  for (const field of ['enumerated', 'skipped', 'truncated']) {
+    const invalid = field === 'truncated' ? [undefined, null, 0, 'false', {}] : [undefined, null, '0', false, -1, 0.5, Number.MAX_SAFE_INTEGER + 1, {}];
+    for (const value of invalid) {
+      const raw = { ...audit(), [field]: value };
+      if (value === undefined) delete raw[field];
+      const normalized = hygiene.normalize(raw);
+      assert.equal(normalized[field], null, field);
+      assert.ok(hygiene.analyze(normalized).some((finding) => finding.id === 'repo-unobserved'), field);
+    }
+  }
+  const good = hygiene.normalize(audit());
+  assert.deepEqual([good.enumerated, good.skipped, good.truncated], [0, 0, false]);
+  assert.deepEqual(hygiene.analyze(good), []);
+  for (const field of ['enumerated', 'skipped']) {
+    const n = hygiene.normalize({ ...audit(), [field]: Number.MAX_SAFE_INTEGER });
+    assert.equal(n[field], Number.MAX_SAFE_INTEGER);
+  }
+});
+
+test('所見 API へ直接渡した入力も、欠損した集計情報を未観測にする', () => {
+  for (const input of [{}, { repos: [] }, { repos: [observed()] }]) {
+    assert.ok(hygiene.analyze(input).some((finding) => finding.id === 'repo-unobserved'));
+  }
+  assert.deepEqual(hygiene.analyze(audit()), []);
+});
+
+test('一覧の欠損・不正は配列の互換性を保ちつつ不明として残す', () => {
+  for (const field of ['roots', 'repos']) {
+    for (const value of [undefined, null, 'x', {}]) {
+      const raw = { ...audit(), [field]: value };
+      if (value === undefined) delete raw[field];
+      const normalized = hygiene.normalize(raw);
+      assert.deepEqual(normalized[field], []);
+      assert.ok(normalized.incomplete_fields.includes(field));
+      assert.ok(hygiene.analyze(normalized).some((finding) => finding.id === 'repo-unobserved'));
+      assert.ok(hygiene.normalize(normalized).incomplete_fields.includes(field));
+    }
+  }
+  const partial = hygiene.normalize({ ...audit(), roots: [{ path: '~/fixture', source: 'opt' }, null] });
+  assert.ok(partial.incomplete_fields.includes('roots'));
+  assert.equal(partial.roots[0].source, 'opt');
+  for (const root of [{ path: '', source: 'opt' }, { path: '~/fixture', source: '' }]) {
+    const normalized = hygiene.normalize({ ...audit(), roots: [root] });
+    assert.ok(normalized.incomplete_fields?.includes('roots'));
+  }
+  assert.ok(!hygiene.normalize({ ...audit(), roots: [{ path: ' ', source: 'opt' }] }).incomplete_fields);
+});
+
+test('不正な不完全ラベルは生値を残さず固定ラベルに畳む', () => {
+  for (const value of [null, 'roots', false, {}, ['unknown-marker'], ['roots', 'unknown-marker']]) {
+    const normalized = hygiene.normalize({ ...audit(), incomplete_fields: value });
+    assert.ok(normalized.incomplete_fields?.includes('metadata'));
+    assert.ok(!JSON.stringify(normalized).includes('unknown-marker'));
+    assert.ok(hygiene.analyze(normalized).some((finding) => finding.id === 'repo-unobserved'));
+    assert.ok(hygiene.normalize(normalized).incomplete_fields.includes('metadata'));
+  }
+  assert.ok(!hygiene.normalize({ ...audit(), incomplete_fields: [] }).incomplete_fields);
+});
+
+test('集計不明でも既存 error と部分結果を保持する', () => {
+  const raw = { ...audit(), enumerated: null, error: 'walk_incomplete', repos: [{ ...observed(), tracked: 1 }] };
+  const normalized = hygiene.normalize(raw);
+  assert.equal(normalized.error, 'walk_incomplete');
+  assert.equal(normalized.repos[0].tracked, 1);
+  const ids = hygiene.analyze(normalized).map((finding) => finding.id);
+  assert.ok(ids.includes('repo-unobserved'));
+  assert.ok(ids.includes('repo-dirty'));
+});
+
+test('error が不正型なら不完全とし、文字列・null は保つ', () => {
+  for (const error of [false, true, 0, {}, []]) {
+    const normalized = hygiene.normalize({ ...audit(), error });
+    assert.equal(normalized.error, null);
+    assert.ok(normalized.incomplete_fields?.includes('error'));
+    assert.ok(hygiene.analyze(normalized).some((finding) => finding.id === 'repo-unobserved'));
+  }
+  for (const error of [undefined, null, 'git_missing', 'walk_incomplete']) {
+    const normalized = hygiene.normalize({ ...audit(), error });
+    assert.equal(normalized.error, error ?? null);
+    assert.ok(!normalized.incomplete_fields?.includes('error'));
+  }
+});
+
+test('探索件数と結果・未観測件数が矛盾する場合は既知値を保って未観測にする', () => {
+  for (const [enumerated, skipped] of [[0, 0], [3, 1], [1, 2], [0, null]]) {
+    const normalized = hygiene.normalize({ ...audit(), repos: [observed()], enumerated, skipped });
+    assert.equal(normalized.enumerated, enumerated);
+    assert.equal(normalized.skipped, skipped);
+    assert.ok(normalized.incomplete_fields.includes('counts'));
+    assert.ok(hygiene.analyze(normalized).some((finding) => finding.id === 'repo-unobserved'));
+  }
+  const valid = hygiene.normalize({ ...audit(), repos: [observed()], enumerated: 2, skipped: 1 });
+  assert.ok(!valid.incomplete_fields?.includes('counts'));
+});
+
+test('進捗は既知のゼロと件数不明を区別する', () => {
+  assert.equal(typeof hygiene.progress, 'function');
+  const complete = { ...hygiene.normalize(audit()), node_id: 'node-a', wall_s: 1 };
+  assert.match(hygiene.progress(complete, 0).line, /見つけた 0 件・未観測 0 件/);
+  for (const patch of [{ enumerated: null }, { skipped: null }, { truncated: null }, { truncated: true }, { error: 'git_missing' }, { incomplete_fields: ['roots'] }]) {
+    const value = hygiene.progress({ ...complete, ...patch }, 1);
+    assert.match(value.line, /未観測 件数不明/);
+  }
+  const noRepos = hygiene.progress({ ...complete, incomplete_fields: ['repos'] }, 1);
+  assert.equal(noRepos.observed, null);
+  const inconsistent = hygiene.progress({ ...complete, incomplete_fields: ['counts'] }, 1);
+  assert.match(inconsistent.line, /見つけた 件数不明/);
+});
+
 test('必須項目の欠損・不正値は正常ではなく git_failed として扱う', () => {
   const counts = [undefined, null, '0', false, -1, -0.5, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, {}, []];
   const flags = [undefined, null, 0, 1, 'false', {}, []];
@@ -25,6 +137,19 @@ test('必須項目の欠損・不正値は正常ではなく git_failed とし�
       }
     }
   }
+});
+
+test('対象 path の欠損・空文字は未観測とし、非空の空白パスは残す', () => {
+  for (const value of [undefined, null, '', 0, {}]) {
+    const raw = { ...observed(), path: value };
+    if (value === undefined) delete raw.path;
+    const [row] = hygiene.normalize({ ...audit(), enumerated: 1, repos: [raw] }).repos;
+    assert.equal(row.state, 'unobserved');
+    assert.equal(row.reason, 'git_failed');
+  }
+  const [row] = hygiene.normalize({ ...audit(), enumerated: 1, repos: [{ ...observed(), path: ' ' }] }).repos;
+  assert.equal(row.state, 'ok');
+  assert.equal(row.path, ' ');
 });
 
 test('正常なゼロ・真偽値と任意項目の null は保つ', () => {

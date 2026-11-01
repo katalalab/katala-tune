@@ -130,6 +130,119 @@ fn check(kind: &str, inputs: &[Value], js: &Value, rust: &[Value]) {
 }
 
 #[test]
+fn normalize_metadata_preserves_unknown() {
+    assert!(analyze(&json!({ "repos": [] })).iter().any(|finding| finding["id"] == "repo-unobserved"));
+    let raw = json!({ "roots": [], "repos": [], "enumerated": null, "skipped": null, "truncated": null });
+    let normalized = normalize(&raw);
+    assert!(normalized["enumerated"].is_null());
+    assert!(normalized["skipped"].is_null());
+    assert!(normalized["truncated"].is_null());
+    assert!(analyze(&normalized).iter().any(|finding| finding["id"] == "repo-unobserved"));
+}
+
+#[test]
+fn metadata_and_progress_match_js() {
+    let base = json!({ "roots": [], "repos": [], "enumerated": 0, "skipped": 0, "truncated": false });
+    let row = json!({ "state": "ok", "path": "~/fixture", "tracked": 1, "untracked": 0, "conflicted": 0, "detached": false, "upstream": false });
+    let mut cases = vec![base.clone()];
+    for field in ["enumerated", "skipped", "truncated", "roots", "repos"] {
+        let mut missing = base.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        cases.push(missing);
+        for value in [json!(null), json!("bad"), json!({})] {
+            let mut raw = base.clone();
+            raw[field] = value;
+            cases.push(raw);
+        }
+    }
+    for field in ["enumerated", "skipped"] {
+        for value in [json!(-1), json!(0.5), json!(9_007_199_254_740_992_u64)] {
+            let mut raw = base.clone();
+            raw[field] = value;
+            cases.push(raw);
+        }
+    }
+    let mut boundary = base.clone();
+    boundary["enumerated"] = json!(9_007_199_254_740_991_u64);
+    boundary["skipped"] = json!(9_007_199_254_740_991_u64);
+    cases.push(boundary);
+    let mut roots_partial = base.clone();
+    roots_partial["roots"] = json!([{ "path": "~/fixture", "source": "opt" }, null]);
+    cases.push(roots_partial);
+    let mut partial = base.clone();
+    partial["enumerated"] = json!(1.0);
+    partial["repos"] = json!([row.clone()]);
+    partial["error"] = json!("walk_incomplete");
+    cases.push(partial.clone());
+    let mut missing_git = base.clone();
+    missing_git["error"] = json!("git_missing");
+    cases.push(missing_git);
+    let mut truncated = base.clone();
+    truncated["truncated"] = json!(true);
+    cases.push(truncated);
+    for (n, s) in [(json!(0), json!(0)), (json!(3), json!(1)), (json!(1), json!(2)), (json!(0), json!(null))] {
+        let mut raw = base.clone();
+        raw["enumerated"] = n;
+        raw["skipped"] = s;
+        raw["repos"] = json!([row.clone()]);
+        cases.push(raw);
+    }
+    for value in [json!(false), json!(true), json!(0), json!({}), json!([])] {
+        let mut raw = base.clone();
+        raw["error"] = value;
+        cases.push(raw);
+    }
+    for value in [json!(null), json!("roots"), json!(false), json!({}), json!(["unknown-marker"]), json!(["roots", "unknown-marker"])] {
+        let mut raw = base.clone();
+        raw["incomplete_fields"] = value;
+        cases.push(raw);
+    }
+    for root in [json!({ "path": "", "source": "opt" }), json!({ "path": "~/fixture", "source": "" })] {
+        let mut raw = base.clone();
+        raw["roots"] = json!([root]);
+        cases.push(raw);
+    }
+
+    let js_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("lib").join("hygiene.js");
+    let mut child = Command::new("node")
+        .arg("--no-warnings")
+        .arg("-e")
+        .arg("const h=require(process.argv[1]);const fs=require('node:fs');const a=JSON.parse(fs.readFileSync(0,'utf8'));console.log(JSON.stringify(a.map(x=>{const n=h.normalize(x);const f=h.analyze(n);return {normalized:n,findings:f,progress:h.progress({...n,node_id:'node-a',wall_s:1.25},f.length)}})))")
+        .arg(js_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("node が必要");
+    child.stdin.take().unwrap().write_all(serde_json::to_string(&cases).unwrap().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "JS 評価が失敗");
+    let js: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(js.len(), cases.len());
+    for (i, (raw, j)) in cases.iter().zip(&js).enumerate() {
+        let normalized = normalize(raw);
+        let findings = analyze(&normalized);
+        let mut audit = normalized.clone();
+        audit["node_id"] = json!("node-a");
+        audit["wall_s"] = json!(1.25);
+        let (observed, line) = tune_core::hygiene::progress(&audit, findings.len());
+        let rust = json!({ "normalized": normalized, "findings": findings, "progress": { "observed": observed, "line": &line } });
+        assert!(same(j, &rust), "合成入力 #{i} の JS と Rust が不一致");
+        if i == 0 {
+            assert!(line.contains("見つけた 0 件・未観測 0 件"));
+        } else if i != 27 {
+            assert!(line.contains("未観測 件数不明"), "合成入力 #{i} の進捗が不明を示さない");
+        }
+    }
+    let normalized = normalize(&partial);
+    assert_eq!(normalized["error"], "walk_incomplete");
+    assert_eq!(normalized["repos"][0]["tracked"], 1);
+    let findings = analyze(&normalized);
+    assert!(findings.iter().any(|v| v["id"] == "repo-unobserved"));
+    assert!(findings.iter().any(|v| v["id"] == "repo-dirty"));
+}
+
+#[test]
 fn normalize_observation_matches_js() {
     let valid = json!({
         "path": "~/fixture", "rel": "example.com/acme/fixture", "linked": false, "state": "ok",
@@ -154,12 +267,15 @@ fn normalize_observation_matches_js() {
     let mut optional_boundary = valid.clone();
     optional_boundary["ahead"] = json!(9_007_199_254_740_991_u64);
     optional_boundary["behind"] = json!(1.0);
+    let mut whitespace_path = valid.clone();
+    whitespace_path["path"] = json!(" ");
     let mut cases = vec![
         json!({ "repos": [valid.clone()] }),
         json!({ "repos": [second] }),
         json!({ "repos": [boundary] }),
         json!({ "repos": [missing_optional] }),
         json!({ "repos": [optional_boundary] }),
+        json!({ "repos": [whitespace_path] }),
     ];
     let counts = vec![json!(null), json!("0"), json!(false), json!(-1), json!(-0.5), json!(1.5), json!(9_007_199_254_740_992_u64), json!({}), json!([])];
     let flags = vec![json!(null), json!("false"), json!(0), json!(1), json!({}), json!([])];
@@ -187,6 +303,15 @@ fn normalize_observation_matches_js() {
             row[field] = value.clone();
             cases.push(json!({ "repos": [row] }));
         }
+    }
+    for value in [None, Some(json!(null)), Some(json!("")), Some(json!(0)), Some(json!({}))] {
+        let mut row = valid.clone();
+        if let Some(value) = value {
+            row["path"] = value;
+        } else {
+            row.as_object_mut().unwrap().remove("path");
+        }
+        cases.push(json!({ "repos": [row] }));
     }
 
     // stdin を使い、実リポジトリの調査や一時ファイルの作成を行わない。
@@ -219,7 +344,7 @@ fn normalize_observation_matches_js() {
     for (i, (j, r)) in js.iter().zip(&rust).enumerate() {
         assert!(same(j, r), "合成入力 #{i} の JS と Rust が不一致");
         let row = &r["normalized"]["repos"][0];
-        if i < 5 {
+        if i < 6 {
             assert_eq!(row["state"], "ok");
             for key in ["branch", "local_only", "stash", "origin"] {
                 assert!(row[key].is_null(), "任意項目 {key} の null が失われた");
