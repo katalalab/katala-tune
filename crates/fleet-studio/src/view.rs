@@ -1,15 +1,17 @@
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::search_view::{SearchElement, SearchLayout};
 use fleet_studio::Observation;
-use fleet_studio::audit::{self, Audit, RepoAudit, Scope};
+use fleet_studio::audit::{self, Audit, AuditIdentity, RepoAudit, Scope};
 use fleet_studio::llm::{self, Endpoint, ModelError, ModelObservation};
 use fleet_studio::navigation::{self, OpenResult, OpenState, OpenTarget};
 use fleet_studio::pointer_id::PointerIds;
 use fleet_studio::recent::{self, RecentEntry, RecentSlot, RecentWork, SyncStatus};
+use fleet_studio::scope::{AuditGate, AuditTicket, Confirmation, Confirmations, Grants, Permit, RefreshGate};
 use fleet_studio::search_input::{KeyAction, KeyModifiers, SearchInput, search_key};
-use fleet_studio::source::{self, Coverage, Dashboard, NodeCard, Repository};
+use fleet_studio::source::{self, Coverage, Dashboard, NodeCard, Repository, SavedState};
 use gpui::{Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton, Render, SharedString, Window, div, prelude::*, rgb};
 
 #[derive(Clone)]
@@ -33,12 +35,19 @@ pub struct FleetView {
     recent_local: bool,
     generation: u64,
     loading: bool,
-    data_inflight: bool,
     load_timeout: bool,
     dashboard: Option<Dashboard>,
+    grants: Grants,
+    confirmations: Confirmations,
+    machine_focus: Option<(String, String)>,
+    revoking: HashSet<String>,
+    dashboard_gate: RefreshGate,
+    scope_check_pending: bool,
+    access_notice: Option<&'static str>,
     models: Vec<ModelLine>,
     recent: RecentSlot,
     audit: Option<Audit>,
+    audit_gate: AuditGate,
     audit_error: Option<String>,
     auditing: bool,
     audit_seq: u64,
@@ -77,12 +86,19 @@ impl FleetView {
             recent_local,
             generation: 0,
             loading: false,
-            data_inflight: false,
             load_timeout: false,
             dashboard: None,
+            grants: Grants::default(),
+            confirmations: Confirmations::default(),
+            machine_focus: None,
+            revoking: HashSet::new(),
+            dashboard_gate: RefreshGate::default(),
+            scope_check_pending: false,
+            access_notice: None,
             models: Vec::new(),
             recent: RecentSlot::default(),
             audit: None,
+            audit_gate: AuditGate::default(),
             audit_error: None,
             auditing: false,
             audit_seq: 0,
@@ -116,28 +132,51 @@ impl FleetView {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.selected.invalidate();
+        self.machine_focus = None;
+        self.confirmations.clear();
         self.pointer_ids.borrow_mut().clear();
+        let had_audit = self.audit.is_some();
+        self.audit_gate.invalidate_and_clear(&mut self.audit);
+        self.audit_error = if self.auditing {
+            Some("更新により監査結果を非表示にしました。進行中の監査は終了待ちです。".into())
+        } else if had_audit {
+            Some("更新により前回の監査結果を破棄しました。再監査は未実行です。".into())
+        } else {
+            None
+        };
         if !self.sample {
             if let Some(generation) = self.recent.request() {
                 self.start_recent(generation, cx);
             }
             cx.notify();
         }
-        if self.data_inflight || self.models.iter().any(|line| line.endpoint.is_some() && line.observation.latest.is_none()) {
+        if !self.sample
+            && let Some(dashboard) = &mut self.dashboard
+        {
+            for node in &mut dashboard.nodes {
+                if node.permit.is_some() {
+                    node.observation = Observation::Unknown;
+                    node.previous = node.last_at.is_some();
+                }
+            }
+        }
+        if self.dashboard_gate.is_active() {
+            self.scope_check_pending = true;
+            self.dashboard_gate.invalidate();
+            let _ = self.dashboard_gate.request();
+            self.loading = true;
+            cx.notify();
             return;
         }
-        if let Some(audit) = &mut self.audit {
-            for repo in &mut audit.repos {
-                repo.previous = true;
-            }
-            for issue in &mut audit.issues {
-                issue.previous = true;
-            }
+        if self.models.iter().any(|line| line.endpoint.is_some() && line.observation.latest.is_none()) {
+            self.start_dashboard(cx);
+            cx.notify();
+            return;
         }
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         if self.sample {
-            self.dashboard = Some(sample_dashboard());
+            self.dashboard = Some(sample_dashboard(&self.grants));
             let mut observation = ModelObservation::default();
             observation.record(Ok(vec!["fixture-model".into()]), tune_core::db::now_ms());
             self.models = vec![ModelLine { label: "サンプル LLM".into(), endpoint: None, observation }];
@@ -146,57 +185,7 @@ impl FleetView {
             cx.notify();
             return;
         }
-        self.loading = true;
-        self.data_inflight = true;
-        self.load_timeout = false;
-        let timer = cx.background_executor().timer(Duration::from_secs(5));
-        cx.spawn(async move |view, cx| {
-            timer.await;
-            let _ = view.update(cx, |view, cx| {
-                if view.generation == generation && view.data_inflight {
-                    view.loading = false;
-                    view.load_timeout = true;
-                    if let Some(data) = &mut view.dashboard {
-                        for node in &mut data.nodes {
-                            if matches!(node.observation, Observation::Current | Observation::Stale) {
-                                node.observation = Observation::Unknown;
-                            }
-                        }
-                        data.topology_coverage = Coverage::Unknown;
-                        for repo in &mut data.repositories {
-                            repo.previous = true;
-                        }
-                    }
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-        let task = cx
-            .background_executor()
-            .spawn(async move { source::load(&tune_core::nodes::user_config_path(), &tune_core::nodes::data_dir(), tune_core::db::now_ms()) });
-        cx.spawn(async move |view, cx| {
-            let mut data = task.await;
-            let _ = view.update(cx, |view, cx| {
-                if view.generation == generation {
-                    view.pointer_ids.borrow_mut().clear();
-                    if let Some(previous) = &view.dashboard {
-                        source::preserve_previous(previous, &mut data);
-                    }
-                    view.dashboard = Some(data);
-                    view.selected.invalidate();
-                    view.topology_filter.clear();
-                    view.loading = false;
-                    view.data_inflight = false;
-                    view.load_timeout = false;
-                    if !view.search.filter_text().is_empty() {
-                        view.search_repositories(cx);
-                    }
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        self.start_dashboard(cx);
         let configured = std::env::var("FLEET_STUDIO_LLM_ENDPOINTS").ok();
         let (endpoints, rejected) = llm::configured(configured.as_deref());
         let previous = std::mem::take(&mut self.models);
@@ -232,6 +221,214 @@ impl FleetView {
             .detach();
         }
         cx.notify();
+    }
+
+    /// Machine selection refreshes only saved summaries, never recent work or LLM endpoints.
+    fn start_dashboard(&mut self, cx: &mut Context<Self>) {
+        if self.sample {
+            self.scope_check_pending = false;
+            self.dashboard = Some(sample_dashboard(&self.grants));
+            cx.notify();
+            return;
+        }
+        self.scope_check_pending = true;
+        let Some(ticket) = self.dashboard_gate.request() else { return };
+        self.loading = true;
+        self.load_timeout = false;
+        let grants = self.grants.clone();
+        let timer = cx.background_executor().timer(Duration::from_secs(5));
+        cx.spawn(async move |view, cx| {
+            timer.await;
+            let _ = view.update(cx, |view, cx| {
+                if view.dashboard_gate.is_current(ticket) {
+                    view.loading = false;
+                    view.load_timeout = true;
+                    if let Some(data) = &mut view.dashboard {
+                        for node in &mut data.nodes {
+                            if matches!(node.observation, Observation::Current | Observation::Stale) {
+                                node.observation = Observation::Unknown;
+                            }
+                        }
+                        data.topology_coverage = Coverage::Unknown;
+                        for repo in &mut data.repositories {
+                            repo.previous = true;
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        let task = cx
+            .background_executor()
+            .spawn(async move { source::load_scoped(&tune_core::nodes::user_config_path(), &tune_core::nodes::data_dir(), tune_core::db::now_ms(), &grants) });
+        cx.spawn(async move |view, cx| {
+            let mut data = task.await;
+            let _ = view.update(cx, |view, cx| {
+                let Some(finished) = view.dashboard_gate.finish(ticket) else { return };
+                if finished.accept {
+                    view.scope_check_pending = false;
+                    if data.config_error.is_some() {
+                        view.grants.clear();
+                    } else {
+                        let fingerprints =
+                            data.nodes.iter().filter_map(|node| node.fingerprint.as_ref().map(|fingerprint| (node.id.clone(), fingerprint.clone()))).collect();
+                        view.grants.reconcile(&fingerprints);
+                    }
+                    source::discard_revoked(&mut data, &view.grants);
+                    view.pointer_ids.borrow_mut().clear();
+                    if let Some(previous) = &view.dashboard {
+                        source::preserve_previous(previous, &mut data);
+                    }
+                    view.dashboard = Some(data);
+                    view.confirmations.clear();
+                    view.machine_focus = None;
+                    view.selected.invalidate();
+                    view.topology_filter.clear();
+                    if !view.search.filter_text().is_empty() {
+                        view.search_repositories(cx);
+                    }
+                }
+                view.loading = false;
+                view.load_timeout = false;
+                view.revoking.clear();
+                if finished.restart {
+                    view.start_dashboard(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn request_machine_access(&mut self, id: String, fingerprint: String, cx: &mut Context<Self>) {
+        if self.scope_check_pending || self.revoking.contains(&id) || self.grants.matching(&id, &fingerprint).is_some() {
+            return;
+        }
+        let still_shown = self
+            .dashboard
+            .as_ref()
+            .is_some_and(|dashboard| dashboard.nodes.iter().any(|node| node.id == id && node.fingerprint.as_deref() == Some(fingerprint.as_str())));
+        if still_shown {
+            self.machine_focus = Some((id.clone(), fingerprint.clone()));
+            self.selected.invalidate();
+            if self.confirmations.begin(&id, &fingerprint).is_none() {
+                self.access_notice = Some("確認を開始できません。");
+            }
+            cx.notify();
+        }
+    }
+
+    fn confirm_machine_access(&mut self, confirmation: Confirmation, cx: &mut Context<Self>) {
+        let id = &confirmation.id;
+        let fingerprint = &confirmation.fingerprint;
+        if self.scope_check_pending || self.revoking.contains(id) || self.grants.matching(id, fingerprint).is_some() {
+            return;
+        }
+        let still_shown = self
+            .dashboard
+            .as_ref()
+            .is_some_and(|dashboard| dashboard.nodes.iter().any(|node| node.id == *id && node.fingerprint.as_deref() == Some(fingerprint.as_str())));
+        if !still_shown || !self.confirmations.take_if(&confirmation) {
+            return;
+        }
+        if !self.grants.authorize(id, fingerprint) {
+            self.access_notice = Some("表示許可を開始できません。");
+            cx.notify();
+            return;
+        }
+        self.dashboard_gate.invalidate();
+        self.start_dashboard(cx);
+        cx.notify();
+    }
+
+    fn cancel_machine_access(&mut self, confirmation: Confirmation, cx: &mut Context<Self>) {
+        if self.confirmations.cancel_if(&confirmation) {
+            cx.notify();
+        }
+    }
+
+    fn revoke_machine_access(&mut self, id: String, permit: Permit, cx: &mut Context<Self>) {
+        if !self.grants.revoke_if_current(&id, &permit) {
+            return;
+        }
+        self.dashboard_gate.invalidate();
+        self.confirmations.clear();
+        self.machine_focus = None;
+        self.selected.invalidate();
+        self.pointer_ids.borrow_mut().clear();
+        if let Some(dashboard) = &mut self.dashboard {
+            for node in dashboard.nodes.iter_mut().filter(|node| node.id == id) {
+                node.clear_saved();
+            }
+        }
+        if self.sample {
+            self.dashboard = Some(sample_dashboard(&self.grants));
+        } else if self.dashboard_gate.is_active() {
+            self.revoking.insert(id);
+            let _ = self.dashboard_gate.request();
+        }
+        cx.notify();
+    }
+
+    fn cycle_machine(&mut self, reverse: bool) {
+        let choices: Vec<(String, String)> = self.dashboard.as_ref().map_or_else(Vec::new, |dashboard| {
+            dashboard
+                .nodes
+                .iter()
+                .filter(|node| self.matches(&format!("{} {} {}", node.id, node.role, node.operating_state)))
+                .filter_map(|node| {
+                    let fingerprint = node.fingerprint.as_ref()?;
+                    if self.revoking.contains(&node.id) || (self.scope_check_pending && self.grants.matching(&node.id, fingerprint).is_none()) {
+                        return None;
+                    }
+                    Some((node.id.clone(), fingerprint.clone()))
+                })
+                .collect()
+        });
+        if choices.is_empty() {
+            self.machine_focus = None;
+            self.access_notice = Some("選択できる機体がありません。");
+            return;
+        }
+        let current = self.machine_focus.as_ref().and_then(|focused| choices.iter().position(|choice| choice == focused));
+        let index = match (current, reverse) {
+            (Some(0), true) | (None, true) => choices.len() - 1,
+            (Some(index), true) => index - 1,
+            (Some(index), false) => (index + 1) % choices.len(),
+            (None, false) => 0,
+        };
+        self.machine_focus = Some(choices[index].clone());
+        self.confirmations.clear();
+        self.selected.invalidate();
+        self.access_notice = None;
+    }
+
+    fn machine_banner(&self) -> Option<String> {
+        let (id, fingerprint) = self.machine_focus.as_ref()?;
+        if self.confirmations.current().is_some_and(|pending| pending.id == *id && pending.fingerprint == *fingerprint) {
+            Some(format!("台帳 ID {id}: {}", fleet_studio::scope::MACHINE_CONFIRMATION_KEYBOARD))
+        } else if self.grants.matching(id, fingerprint).is_some() {
+            Some(format!("台帳 ID {id}: Enter で表示許可を取り消す。Esc で機体選択を終了。"))
+        } else {
+            Some(format!("台帳 ID {id}: Enter で権限確認へ。Esc で機体選択を終了。"))
+        }
+    }
+
+    fn activate_machine(&mut self, cx: &mut Context<Self>) {
+        let Some((id, fingerprint)) = self.machine_focus.clone() else { return };
+        if self.revoking.contains(&id) {
+            return;
+        }
+        if let Some(permit) = self.grants.matching(&id, &fingerprint) {
+            self.revoke_machine_access(id, permit, cx);
+        } else if let Some(confirmation) =
+            self.confirmations.current().filter(|confirmation| confirmation.id == id && confirmation.fingerprint == fingerprint).cloned()
+        {
+            self.confirm_machine_access(confirmation, cx);
+        } else {
+            self.request_machine_access(id, fingerprint, cx);
+        }
     }
 
     fn start_recent(&mut self, generation: u64, cx: &mut Context<Self>) {
@@ -345,8 +542,9 @@ impl FleetView {
             cx.notify();
             return;
         }
+        self.audit_gate.invalidate_and_clear(&mut self.audit);
+        self.pointer_ids.borrow_mut().clear();
         if self.sample {
-            self.pointer_ids.borrow_mut().clear();
             self.audit = Some(Audit {
                 repos: vec![RepoAudit {
                     node: "fixture-node".into(),
@@ -364,6 +562,7 @@ impl FleetView {
                 incomplete_nodes: Vec::new(),
                 issues: Vec::new(),
                 observed_nodes: vec!["fixture-node".into()],
+                identity: None,
             });
             cx.notify();
             return;
@@ -371,7 +570,7 @@ impl FleetView {
         self.auditing = true;
         self.audit_seq = self.audit_seq.wrapping_add(1);
         let seq = self.audit_seq;
-        let generation = self.generation;
+        let ticket = self.audit_gate.ticket();
         let timer = cx.background_executor().timer(Duration::from_secs(65));
         cx.spawn(async move |view, cx| {
             timer.await;
@@ -388,29 +587,16 @@ impl FleetView {
             let result = task.await;
             let _ = view.update(cx, |view, cx| {
                 view.auditing = false;
-                if view.generation != generation {
-                    view.audit_error = Some("台帳を再読込したため、進行中だった監査結果を破棄しました".into());
+                if !ticket.is_current() {
+                    view.audit_error = Some("更新により進行中だった監査結果を破棄しました。再監査は未実行です。".into());
                 } else {
                     match result {
-                        Ok(mut audit) => {
+                        Ok(audit) => {
                             view.pointer_ids.borrow_mut().clear();
-                            if let Some(previous) = &view.audit {
-                                audit::preserve_previous(previous, &mut audit);
-                            }
                             view.audit = Some(audit);
                             view.audit_error = None;
                         }
-                        Err(error) => {
-                            if let Some(previous) = &mut view.audit {
-                                for repo in &mut previous.repos {
-                                    repo.previous = true;
-                                }
-                                for issue in &mut previous.issues {
-                                    issue.previous = true;
-                                }
-                            }
-                            view.audit_error = Some(error.into());
-                        }
+                        Err(error) => view.audit_error = Some(error.into()),
                     }
                 }
                 cx.notify();
@@ -466,9 +652,30 @@ impl FleetView {
             cx.stop_propagation();
             return;
         } else {
+            let modifiers = event.keystroke.modifiers;
+            let blocked = event.is_held || modifiers.control || modifiers.platform || modifiers.alt || modifiers.shift || modifiers.function;
+            if let Some(action) = fleet_studio::scope::machine_key(key, self.machine_focus.is_some(), false, blocked) {
+                use fleet_studio::scope::MachineKey;
+                match action {
+                    MachineKey::Next => self.cycle_machine(false),
+                    MachineKey::Previous => self.cycle_machine(true),
+                    MachineKey::Activate => self.activate_machine(cx),
+                    MachineKey::Leave => {
+                        self.machine_focus = None;
+                        self.confirmations.clear();
+                    }
+                    MachineKey::Consume => {}
+                }
+                self.focus.focus(window);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
             match key {
                 "/" | "slash" => {
                     self.searching = true;
+                    self.machine_focus = None;
+                    self.confirmations.clear();
                     self.selected.invalidate();
                     cx.stop_propagation();
                 }
@@ -597,13 +804,31 @@ impl FleetView {
     }
 
     fn open_target(&mut self, target: OpenTarget, permit: Option<(String, String)>, cx: &mut Context<Self>) {
+        self.open_target_checked(target, permit, None, cx);
+    }
+
+    fn open_audit_target(&mut self, target: OpenTarget, ticket: AuditTicket, identity: AuditIdentity, cx: &mut Context<Self>) {
+        self.open_target_checked(target, None, Some((ticket, identity)), cx);
+    }
+
+    fn open_target_checked(
+        &mut self,
+        target: OpenTarget,
+        permit: Option<(String, String)>,
+        audit_permit: Option<(AuditTicket, AuditIdentity)>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(id) = self.open_state.start() else { return };
         let (sender, receiver) = tokio::sync::oneshot::channel();
         if std::thread::Builder::new()
             .name("fleet-studio-open".into())
             .spawn(move || {
                 let allowed = || {
-                    permit.as_ref().is_none_or(|(node, fingerprint)| {
+                    audit_permit.as_ref().is_none_or(|(ticket, identity)| {
+                        ticket.is_current()
+                            && audit::revalidate_identity(&tune_core::nodes::user_config_path(), &tune_core::nodes::local_host(), identity)
+                            && ticket.is_current()
+                    }) && permit.as_ref().is_none_or(|(node, fingerprint)| {
                         recent::revalidate_local(&tune_core::nodes::user_config_path(), &tune_core::nodes::local_host(), node, fingerprint)
                     })
                 };
@@ -637,6 +862,13 @@ impl FleetView {
     }
 }
 
+impl Drop for FleetView {
+    fn drop(&mut self) {
+        self.grants.clear();
+        self.audit_gate.close();
+    }
+}
+
 fn sample_recent() -> RecentWork {
     let now = tune_core::db::now_ms();
     let cwd = if cfg!(windows) { r"C:\fixture\project" } else { "/fixture/project" };
@@ -666,21 +898,29 @@ fn sample_recent() -> RecentWork {
     }
 }
 
-fn sample_dashboard() -> Dashboard {
+fn sample_dashboard(grants: &Grants) -> Dashboard {
     let now = tune_core::db::now_ms();
+    let fingerprint = "synthetic-fingerprint";
+    let permit = grants.matching("fixture-node", fingerprint);
+    let approved = permit.is_some();
     Dashboard {
         nodes: vec![NodeCard {
             id: "fixture-node".into(),
+            fingerprint: Some(fingerprint.into()),
+            permit,
+            saved_state: if approved { SavedState::Available } else { SavedState::Unapproved },
+            previous: false,
             role: "research".into(),
             operating_state: "online".into(),
             local: Some(true),
-            last_at: Some(now),
-            observation: Observation::Current,
+            last_at: approved.then_some(now),
+            observation: if approved { Observation::Current } else { Observation::Unknown },
             failure_reason: None,
-            max_age_ms: Some(180 * 60 * 1_000),
-            score: Some(90),
-            critical: Some(0),
-            warnings: Some(1),
+            failure_at: None,
+            max_age_ms: approved.then_some(180 * 60 * 1_000),
+            score: approved.then_some(90),
+            critical: approved.then_some(0),
+            warnings: approved.then_some(1),
         }],
         config_error: None,
         database_error: None,
@@ -800,23 +1040,115 @@ impl Render for FleetView {
             if let Some(error) = &dashboard.database_error {
                 content = content.child(note(error.clone(), 0xffb86c));
             }
-            content = content.child(section("機体", if self.loading { "読み込み中" } else { "保存済み分析（現在の接続状態ではありません）" }));
+
+            if let Some(message) = self.access_notice {
+                content = content.child(note(message.into(), 0xffb86c));
+            }
+            content = content.child(section("機体", if self.loading { "読み込み中" } else { "台帳と、個別に許可した保存要約" }));
+            content =
+                content.child(note("保存情報は台帳 ID に紐づく過去の要約です。保存元の実機・本文の完全性・現在の接続や正常性は未確認です。".into(), 0x9baec4));
+            content = content.child(note("台帳の照合は更新時点のものです。取消中は開始済みの読み取りを待ちます。".into(), 0x9baec4));
             for node in dashboard.nodes.iter().filter(|node| self.matches(&format!("{} {} {}", node.id, node.role, node.operating_state))) {
+                let id = node.id.clone();
+                let fingerprint = node.fingerprint.clone();
                 let identity = node.identity_text();
-                content = content.child(row(
-                    format!("{}  ·  {}", node.id, node.role),
+                let focused = self
+                    .machine_focus
+                    .as_ref()
+                    .is_some_and(|(focused_id, focused_fingerprint)| focused_id == &id && fingerprint.as_ref() == Some(focused_fingerprint));
+                let current_permit = fingerprint.as_deref().and_then(|value| self.grants.matching(&id, value));
+                let is_revoking = self.revoking.contains(&id);
+                let show_saved = fleet_studio::scope::may_show_saved(&self.grants, &id, node.permit.as_ref(), self.scope_check_pending);
+                let status = node.visible_status(now, show_saved, self.scope_check_pending && current_permit.is_some());
+                let detail = if !show_saved {
+                    format!("{status}  /  台帳: {}  /  {}", node.operating_state, identity)
+                } else {
                     format!(
-                        "{}  /  台帳: {}  /  {}  /  重大 {}・注意 {}・score {}  /  最終成功: {}{}",
-                        observation_text(node.current_observation(now)),
+                        "{}{}  /  台帳: {}  /  {}  /  重大 {}・注意 {}・score {}  /  {}: {}{}{}",
+                        status,
+                        if node.previous { "（前回値・最新の読取は未確認）" } else { "" },
                         node.operating_state,
                         identity,
                         number(node.critical),
                         number(node.warnings),
                         node.score.map_or_else(|| "不明".into(), |value| value.to_string()),
+                        if node.failure_at.is_some() { "前回保存要約の記録時刻" } else { "保存要約の記録時刻" },
                         when(node.last_at),
-                        node.failure_reason.map_or(String::new(), |reason| format!("  /  理由: {reason}"))
-                    ),
-                ));
+                        node.failure_at.map_or(String::new(), |at| format!("  /  保存上の失敗時刻: {}", when(Some(at)))),
+                        node.failure_reason.map_or(String::new(), |reason| format!("  /  理由: {reason}")),
+                    )
+                };
+                let mut item = div()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(if focused { 0x233b56 } else { 0x182436 }))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(format!("{}  ·  {}", node.id, node.role))
+                    .child(div().text_sm().text_color(rgb(0x9baec4)).child(detail));
+                if is_revoking {
+                    item = item.child(div().text_sm().text_color(rgb(0xffb86c)).child("取消処理中：開始済みの読み取りが終わるまで再許可できません。"));
+                } else if let Some(permit) = current_permit {
+                    let serial = permit.serial().to_string();
+                    let button_id = pointer_ids.get("machine-revoke", &[&id, fingerprint.as_deref().unwrap_or(""), &serial]);
+                    item = item.child(
+                        div()
+                            .id(SharedString::from(format!("machine-revoke-{button_id}")))
+                            .cursor_pointer()
+                            .text_sm()
+                            .text_color(rgb(0x8fc9ff))
+                            .child("この台帳 ID の表示許可を取り消す")
+                            .on_click(cx.listener(move |view, _, _, cx| view.revoke_machine_access(id.clone(), permit.clone(), cx))),
+                    );
+                } else if self.scope_check_pending {
+                    item = item.child(div().text_sm().child("台帳の再照合が終わるまで待機中です。"));
+                } else if let Some(fingerprint) = fingerprint {
+                    let pending = self.confirmations.current().filter(|pending| pending.id == id && pending.fingerprint == fingerprint).cloned();
+                    if let Some(confirmation) = pending {
+                        item = item.child(div().text_sm().text_color(rgb(0xffd9a1)).child(fleet_studio::scope::MACHINE_CONFIRMATION));
+                        let nonce = confirmation.nonce.to_string();
+                        let yes_id = pointer_ids.get("machine-confirm", &[&id, &fingerprint, &nonce]);
+                        let cancel_id = pointer_ids.get("machine-cancel", &[&id, &fingerprint, &nonce]);
+                        let cancel_confirmation = confirmation.clone();
+                        item = item.child(
+                            div()
+                                .flex()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("machine-confirm-{yes_id}")))
+                                        .cursor_pointer()
+                                        .text_sm()
+                                        .text_color(rgb(0x8fc9ff))
+                                        .child("確認して表示")
+                                        .on_click(cx.listener(move |view, _, _, cx| view.confirm_machine_access(confirmation.clone(), cx))),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("machine-cancel-{cancel_id}")))
+                                        .cursor_pointer()
+                                        .text_sm()
+                                        .child("やめる")
+                                        .on_click(cx.listener(move |view, _, _, cx| view.cancel_machine_access(cancel_confirmation.clone(), cx))),
+                                ),
+                        );
+                    } else {
+                        let button_id = pointer_ids.get("machine-request", &[&id, &fingerprint]);
+                        item = item.child(
+                            div()
+                                .id(SharedString::from(format!("machine-request-{button_id}")))
+                                .cursor_pointer()
+                                .text_sm()
+                                .text_color(rgb(0x8fc9ff))
+                                .child("権限を確認して保存要約を表示")
+                                .on_click(cx.listener(move |view, _, _, cx| view.request_machine_access(id.clone(), fingerprint.clone(), cx))),
+                        );
+                    }
+                } else {
+                    item = item.child(div().text_sm().text_color(rgb(0xffb86c)).child("台帳 ID の照合が不明なため選択できません。"));
+                }
+                content = content.child(item);
             }
             content = content.child(section("リポジトリ", &format!("構成情報: {}", coverage_text(dashboard.current_coverage(now)))));
             if let Some(error) = &dashboard.topology_error {
@@ -1022,13 +1354,21 @@ impl Render for FleetView {
                     .child(format!("{}{} · {}", repo.node, if repo.local { "（この機体）" } else { "（台帳名・接続先 hostname 未照合）" }, repo.path))
                     .child(div().text_sm().text_color(rgb(0x9baec4)).child(detail));
                 if let Some(path) = local_path {
+                    let ticket = self.audit_gate.ticket();
+                    let identity = audit.identity.clone().filter(|identity| identity.node == repo.node);
                     item = item.cursor_pointer().on_click(cx.listener(move |view, _, _, cx| {
-                        if let Some(result) = navigation::sample_target_result(view.sample) {
+                        if !ticket.is_current() {
+                            view.open_failure(OpenResult::SelectionChanged, cx);
+                        } else if let Some(result) = navigation::sample_target_result(view.sample) {
                             view.open_failure(result, cx);
-                        } else if let Some(target) = OpenTarget::directory(&path) {
-                            view.open_target(target, None, cx);
+                        } else if let Some(identity) = &identity {
+                            if let Some(target) = OpenTarget::directory(&path) {
+                                view.open_audit_target(target, ticket.clone(), identity.clone(), cx);
+                            } else {
+                                view.open_failure(OpenResult::Failed, cx);
+                            }
                         } else {
-                            view.open_failure(OpenResult::Failed, cx);
+                            view.open_failure(OpenResult::SelectionChanged, cx);
                         }
                     }));
                 }
@@ -1039,7 +1379,12 @@ impl Render for FleetView {
                 content = content.child(note(format!("{total} 件中 200 件を表示。検索で絞り込めます。"), 0x9baec4));
             }
         } else if !self.auditing {
-            content = content.child(note("未実行。未確認のリポジトリは正常と数えません。".into(), 0x9baec4));
+            let message = if self.audit_error.is_some() {
+                "監査結果は未確認です。未確認のリポジトリは正常と数えません。"
+            } else {
+                "未実行。未確認のリポジトリは正常と数えません。"
+            };
+            content = content.child(note(message.into(), 0x9baec4));
         }
 
         pointer_ids.finish_frame();
@@ -1115,6 +1460,12 @@ impl Render for FleetView {
                     .text_sm()
                     .child(navigation::open_status_text(self.open_state.status()).unwrap_or("リンク操作の結果をここに表示します。")),
             )
+            .when(!self.revoking.is_empty(), |root| {
+                root.child(div().px_5().py_2().text_sm().text_color(rgb(0xffb86c)).child("保存情報の取消処理中：開始済みの読み取りを待っています。"))
+            })
+            .when_some(self.machine_banner(), |root, message| {
+                root.child(div().px_5().py_2().text_sm().text_color(rgb(0xffd9a1)).bg(rgb(0x192b42)).child(message))
+            })
             .child(
                 div()
                     .id("search")
@@ -1132,6 +1483,8 @@ impl Render for FleetView {
                         MouseButton::Left,
                         cx.listener(|view, event: &gpui::MouseDownEvent, window, cx| {
                             view.searching = true;
+                            view.machine_focus = None;
+                            view.confirmations.clear();
                             view.focus.focus(window);
                             view.selecting = true;
                             if let Some(byte) = view.search_layout.as_ref().and_then(|layout| layout.byte_for_point(view.search.text(), event.position)) {
@@ -1153,7 +1506,7 @@ impl Render for FleetView {
             )
             .child(content)
             .child(
-                div().px_5().py_3().flex().justify_between().bg(rgb(0x132237)).child("/ 検索 · ↑↓ 選択 · Enter で開く · Esc 解除").child(
+                div().px_5().py_3().flex().justify_between().bg(rgb(0x132237)).child("/ 検索 · M 機体 · ↑↓ 選択 · Enter 操作 · Esc 戻る").child(
                     div()
                         .flex()
                         .gap_4()

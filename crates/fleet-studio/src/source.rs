@@ -2,19 +2,29 @@ use std::path::Path;
 
 use tune_core::{db::Store, nodes};
 
-use crate::{Observation, observation};
+use crate::{
+    Observation, observation,
+    scope::{Grants, Permit},
+};
+use tune_core::db::StoredSchedule;
+pub use tune_core::db::{MachineReading, ProbeFailure};
 
 pub const TOPOLOGY_SCOPE_UNAVAILABLE: &str = "構成情報は機体・権限の対象を確認できないため非表示です";
 
 #[derive(Clone, Debug)]
 pub struct NodeCard {
     pub id: String,
+    pub fingerprint: Option<String>,
+    pub permit: Option<Permit>,
+    pub saved_state: SavedState,
+    pub previous: bool,
     pub role: String,
     pub operating_state: String,
     pub local: Option<bool>,
     pub last_at: Option<i64>,
     pub observation: Observation,
     pub failure_reason: Option<&'static str>,
+    pub failure_at: Option<i64>,
     pub max_age_ms: Option<i64>,
     pub score: Option<i64>,
     pub critical: Option<u64>,
@@ -37,6 +47,52 @@ impl NodeCard {
             other => other,
         }
     }
+    /// Never reveal saved status unless the exact grant is currently usable.
+    pub fn visible_status(&self, now: i64, authorized: bool, rechecking: bool) -> &'static str {
+        if rechecking {
+            return "台帳を再照合中：保存要約は非表示";
+        }
+        if !authorized {
+            return "保存情報: 未確認／表示対象外";
+        }
+        match self.saved_state {
+            SavedState::Unapproved => "保存情報: 未確認／表示対象外",
+            SavedState::NoData => "保存要約なし（機体の状態は不明）",
+            SavedState::Unavailable => "保存要約を読み取れません",
+            SavedState::Invalid => "記録が不正、または時刻不明",
+            SavedState::Available => match self.current_observation(now) {
+                Observation::Current => "保存要約の記録時刻が新しい",
+                Observation::Stale => "保存要約の記録が古い",
+                Observation::Failed => "保存された取得失敗の記録",
+                Observation::Unknown | Observation::Excluded => "保存要約の鮮度不明",
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SavedState {
+    Unapproved,
+    NoData,
+    Available,
+    Unavailable,
+    Invalid,
+}
+
+impl NodeCard {
+    pub fn clear_saved(&mut self) {
+        self.permit = None;
+        self.saved_state = SavedState::Unapproved;
+        self.previous = false;
+        self.last_at = None;
+        self.observation = Observation::Unknown;
+        self.failure_reason = None;
+        self.failure_at = None;
+        self.max_age_ms = None;
+        self.score = None;
+        self.critical = None;
+        self.warnings = None;
+    }
 }
 
 /// Return a safe error category without exposing raw command output.
@@ -53,28 +109,42 @@ pub fn failure_reason(error: &str) -> &'static str {
     }
 }
 
-/// Keep prior values visible when a new read fails, but never mark them current.
+/// Keep a previous value only after a read failure under the same active grant.
 pub fn preserve_previous(previous: &Dashboard, next: &mut Dashboard) {
-    if next.config_error.is_some() && next.nodes.is_empty() {
-        next.nodes = previous.nodes.clone();
-        for node in &mut next.nodes {
-            node.local = None;
-            if node.observation != Observation::Excluded {
-                node.observation = Observation::Unknown;
-                node.failure_reason = None;
-            }
+    if next.config_error.is_some() {
+        return;
+    }
+    for node in &mut next.nodes {
+        if node.saved_state != SavedState::Unavailable {
+            continue;
         }
-    } else {
-        for node in &mut next.nodes {
-            if node.last_at.is_none()
-                && matches!(node.observation, Observation::Unknown | Observation::Failed | Observation::Excluded)
-                && let Some(old) = previous.nodes.iter().find(|old| old.id == node.id)
-            {
-                node.last_at = old.last_at;
-                node.score = old.score;
-                node.critical = old.critical;
-                node.warnings = old.warnings;
-            }
+        let Some(permit) = &node.permit else { continue };
+        let Some(old) = previous
+            .nodes
+            .iter()
+            .find(|old| old.id == node.id && old.fingerprint == node.fingerprint && old.permit.as_ref().is_some_and(|previous| permit.same_as(previous)))
+        else {
+            continue;
+        };
+        if old.last_at.is_some() {
+            node.last_at = old.last_at;
+            node.score = old.score;
+            node.critical = old.critical;
+            node.warnings = old.warnings;
+            node.max_age_ms = old.max_age_ms;
+            node.failure_at = old.failure_at;
+            node.failure_reason = old.failure_reason;
+            node.previous = true;
+            node.observation = Observation::Unknown;
+        }
+    }
+}
+
+/// Drop results whose grant was revoked or replaced while the read ran.
+pub fn discard_revoked(dashboard: &mut Dashboard, grants: &crate::scope::Grants) {
+    for node in &mut dashboard.nodes {
+        if node.permit.as_ref().is_none_or(|permit| !grants.contains(&node.id, permit)) {
+            node.clear_saved();
         }
     }
 }
@@ -206,96 +276,192 @@ pub fn repositories(view: &serde_json::Value, now: i64, max_age_ms: i64) -> Resu
     Ok((repos, coverage))
 }
 
-/// Read only existing Katala Tune data; never create or migrate it.
-pub fn load(config: &Path, data_dir: &Path, now: i64) -> Dashboard {
-    load_for_host(config, data_dir, now, &nodes::local_host())
+/// Fixed category; raw DB errors are never exposed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SavedReadError;
+
+/// Abstraction permits synthetic-only verification without opening any file.
+pub trait SavedReader {
+    fn read_machine(&self, node_id: &str) -> Result<MachineReading, SavedReadError>;
 }
 
-/// The explicit hostname also supports testing unknown and ambiguous identities.
-pub fn load_for_host(config: &Path, data_dir: &Path, now: i64, host: &str) -> Dashboard {
-    let config = match nodes::load_config(config) {
-        Ok(config) => config,
-        Err(_) => {
-            return Dashboard {
-                nodes: Vec::new(),
-                config_error: Some("台帳を読み取れません".into()),
-                database_error: None,
-                repositories: Vec::new(),
-                topology_coverage: Coverage::Unknown,
-                topology_error: None,
-                topology_oldest_at: None,
-                topology_limited: false,
-            };
-        }
-    };
-    let database = Store::open_read_only(data_dir);
-    let database_error = database.as_ref().err().map(|_| "保存済みデータベースを読み取れません".to_owned());
-    let age = database.as_ref().ok().and_then(|db| max_age(db, config.schedule.as_ref()));
-    let host_known = crate::recent::normalized_hostname(host).is_some();
-    let resolved = crate::recent::resolved_nodes(&config.nodes, host);
-    let local_ambiguous = crate::recent::local_ambiguous(&resolved);
-    let nodes = resolved
+impl SavedReader for Store {
+    fn read_machine(&self, node_id: &str) -> Result<MachineReading, SavedReadError> {
+        self.saved_machine_reading(node_id).map_err(|_| SavedReadError)
+    }
+}
+
+fn fingerprints_for_nodes(nodes: &[nodes::Node], host: &str) -> std::collections::HashMap<String, String> {
+    let Some(host) = crate::recent::normalized_hostname(host) else { return Default::default() };
+    let resolved = crate::recent::resolved_nodes(nodes, &host);
+    let ambiguous = crate::recent::local_ambiguous(&resolved);
+    let mut counts = std::collections::HashMap::new();
+    for node in &resolved {
+        *counts.entry(node.id.as_str()).or_insert(0_usize) += 1;
+    }
+    resolved
         .iter()
-        .map(|node| {
-            let op = node.op_state();
-            let mut reason = None;
-            let (last_at, status) = if !op.active {
-                let last_at = database
-                    .as_ref()
-                    .ok()
-                    .and_then(|db| db.last_snapshots(&node.id, 1).ok())
-                    .and_then(|snapshots| snapshots.first().map(|snapshot| snapshot.at));
-                (last_at, Observation::Excluded)
-            } else if let Ok(db) = &database {
-                match db.last_snapshots(&node.id, 1) {
-                    Ok(snapshots) => {
-                        let last_at = snapshots.first().map(|snapshot| snapshot.at);
-                        match (db.probe_error(&node.id, last_at), age) {
-                            (Ok(error), Some(max_age)) => {
-                                reason = error.as_deref().map(failure_reason);
-                                (last_at, observation(last_at, error.is_some(), true, now, max_age))
-                            }
-                            (Ok(Some(error)), None) => {
-                                reason = Some(failure_reason(&error));
-                                (last_at, Observation::Failed)
-                            }
-                            _ => (last_at, Observation::Unknown),
-                        }
-                    }
-                    Err(_) => (None, Observation::Unknown),
-                }
-            } else {
-                (None, Observation::Unknown)
-            };
-            let history = database
-                .as_ref()
-                .ok()
-                .and_then(|db| db.history(&node.id, 1).ok())
-                .and_then(|rows| rows.into_iter().find(|row| row.get("at").and_then(|v| v.as_i64()) == last_at));
-            NodeCard {
-                id: node.id.clone(),
-                role: node.get("role").and_then(|v| v.as_str()).unwrap_or("不明").to_owned(),
-                operating_state: op.state,
-                local: if !host_known
-                    || node.get("local_hostname").and_then(serde_json::Value::as_str).and_then(crate::recent::normalized_hostname).is_none()
-                    || (node.local && local_ambiguous)
-                {
-                    None
-                } else {
-                    Some(node.local)
-                },
-                last_at,
-                observation: status,
-                failure_reason: reason,
-                max_age_ms: age,
-                score: history.as_ref().and_then(|v| v.get("score")).and_then(|v| v.as_i64()),
-                critical: history.as_ref().and_then(|v| v.get("critical")).and_then(|v| v.as_u64()),
-                warnings: history.as_ref().and_then(|v| v.get("warn")).and_then(|v| v.as_u64()),
+        .filter_map(|node| {
+            let id = node.get("id")?.as_str()?;
+            if id != node.id
+                || id.trim() != id
+                || id.is_empty()
+                || id.len() > 256
+                || id.chars().any(char::is_control)
+                || counts.get(id) != Some(&1)
+                || (node.local && ambiguous)
+            {
+                return None;
             }
+            if node.get("local_hostname").is_some_and(|value| !value.is_null() && value.as_str().and_then(crate::recent::normalized_hostname).is_none()) {
+                return None;
+            }
+            let bytes = serde_json::to_vec(&(&node.raw, &host, node.local)).ok()?;
+            Some((id.to_owned(), tune_core::db::sha256_hex(&bytes)))
         })
-        .collect();
+        .collect()
+}
+
+/// Fingerprint only the uniquely identified current ledger row; the digest is
+/// not evidence of the physical origin of an older saved record.
+pub fn fingerprint_for_node(nodes: &[nodes::Node], host: &str, id: &str) -> Option<String> {
+    fingerprints_for_nodes(nodes, host).remove(id)
+}
+
+fn summary_max_age(stored: StoredSchedule, configured: Option<&serde_json::Value>) -> Option<i64> {
+    let value = match stored {
+        StoredSchedule::Minutes(minutes) => Some(minutes),
+        StoredSchedule::Invalid => return None,
+        StoredSchedule::Missing => match configured {
+            None => None,
+            Some(serde_json::Value::Object(object)) => match object.get("probe_minutes") {
+                None => None,
+                Some(value) => Some(value.as_i64()?),
+            },
+            _ => return None,
+        },
+    };
+    let minutes = value.unwrap_or(60);
+    if !(5..=1440).contains(&minutes) {
+        return None;
+    }
+    minutes.checked_mul(3 * 60 * 1_000)
+}
+
+fn apply_reading(card: &mut NodeCard, reading: MachineReading, schedule: Option<&serde_json::Value>, now: i64) {
+    let invalid_time = reading.last_at.is_some_and(|at| at < 0 || at > now) || matches!(reading.failure, ProbeFailure::At(at) if at < 0 || at > now);
+    if invalid_time || reading.failure == ProbeFailure::Invalid || reading.score.is_some_and(|score| !(0..=100).contains(&score)) {
+        card.saved_state = SavedState::Invalid;
+        card.observation = Observation::Unknown;
+        return;
+    }
+    card.max_age_ms = summary_max_age(reading.schedule, schedule);
+    card.last_at = reading.last_at;
+    card.score = reading.score;
+    card.critical = reading.critical;
+    card.warnings = reading.warnings;
+    let failed = match reading.failure {
+        ProbeFailure::At(at) => reading.last_at.is_none_or(|last| at >= last),
+        ProbeFailure::None => false,
+        ProbeFailure::Invalid => unreachable!(),
+    };
+    if failed {
+        card.saved_state = SavedState::Available;
+        card.failure_at = match reading.failure {
+            ProbeFailure::At(at) => Some(at),
+            _ => None,
+        };
+        card.observation = Observation::Failed;
+        card.failure_reason = Some("保存された失敗記録（詳細未確認）");
+    } else if reading.last_at.is_none() {
+        card.saved_state = SavedState::NoData;
+        card.observation = Observation::Unknown;
+    } else {
+        card.saved_state = SavedState::Available;
+        card.observation = observation(reading.last_at, false, true, now, card.max_age_ms.unwrap_or(-1));
+    }
+}
+
+/// Project ledger cards first; open the observation source lazily and only for
+/// matching, still-active grants. This function is also exercised with fakes.
+pub fn project_nodes<R: SavedReader>(
+    nodes: &[nodes::Node],
+    schedule: Option<&serde_json::Value>,
+    host: &str,
+    now: i64,
+    grants: &Grants,
+    open: impl FnOnce() -> Result<R, SavedReadError>,
+) -> Dashboard {
+    let fingerprints = fingerprints_for_nodes(nodes, host);
+    let host_known = crate::recent::normalized_hostname(host).is_some();
+    let resolved = crate::recent::resolved_nodes(nodes, host);
+    let local_ambiguous = crate::recent::local_ambiguous(&resolved);
+    let mut database_error = None;
+    let mut opener = Some(open);
+    let mut reader: Option<Result<R, SavedReadError>> = None;
+    let mut cards = Vec::with_capacity(resolved.len());
+
+    for node in &resolved {
+        let fingerprint = fingerprints.get(&node.id).cloned();
+        let permit = fingerprint.as_deref().and_then(|fingerprint| grants.matching(&node.id, fingerprint));
+        let mut card = NodeCard {
+            id: node.id.clone(),
+            fingerprint,
+            permit: permit.clone(),
+            saved_state: SavedState::Unapproved,
+            previous: false,
+            role: node.get("role").and_then(|v| v.as_str()).unwrap_or("不明").to_owned(),
+            operating_state: node.op_state().state,
+            local: if !host_known
+                || node.get("local_hostname").and_then(serde_json::Value::as_str).and_then(crate::recent::normalized_hostname).is_none()
+                || (node.local && local_ambiguous)
+            {
+                None
+            } else {
+                Some(node.local)
+            },
+            last_at: None,
+            observation: Observation::Unknown,
+            failure_reason: None,
+            failure_at: None,
+            max_age_ms: None,
+            score: None,
+            critical: None,
+            warnings: None,
+        };
+        if let Some(permit) = &permit {
+            let result = permit
+                .read(|| {
+                    if reader.is_none() {
+                        let open = opener.take()?;
+                        reader = Some(open());
+                    }
+                    if !permit.is_active() {
+                        return None;
+                    }
+                    Some(match reader.as_ref() {
+                        Some(Ok(reader)) => reader.read_machine(&node.id),
+                        Some(Err(_)) => {
+                            database_error = Some("保存済みデータベースを読み取れません".to_owned());
+                            Err(SavedReadError)
+                        }
+                        None => Err(SavedReadError),
+                    })
+                })
+                .flatten();
+            match result {
+                Some(Ok(reading)) => apply_reading(&mut card, reading, schedule, now),
+                Some(Err(_)) => {
+                    card.saved_state = SavedState::Unavailable;
+                    card.observation = Observation::Unknown;
+                }
+                None => card.clear_saved(),
+            }
+        }
+        cards.push(card);
+    }
     Dashboard {
-        nodes,
+        nodes: cards,
         config_error: None,
         database_error,
         repositories: Vec::new(),
@@ -304,6 +470,79 @@ pub fn load_for_host(config: &Path, data_dir: &Path, now: i64, host: &str) -> Da
         topology_oldest_at: None,
         topology_limited: false,
     }
+}
+
+/// Recheck the selected ledger rows after the read. A failed recheck or any
+/// selected-row/schedule change revokes all results from this read.
+pub fn revalidate_dashboard(
+    dashboard: &mut Dashboard,
+    current_nodes: Option<&[nodes::Node]>,
+    previous_schedule: Option<&serde_json::Value>,
+    current_schedule: Option<&serde_json::Value>,
+    host: &str,
+) {
+    let invalid = match current_nodes {
+        None => true,
+        Some(nodes) => {
+            let fingerprints = fingerprints_for_nodes(nodes, host);
+            previous_schedule != current_schedule
+                || dashboard.nodes.iter().filter(|node| node.permit.is_some()).any(|node| fingerprints.get(&node.id) != node.fingerprint.as_ref())
+        }
+    };
+    if invalid {
+        for node in &mut dashboard.nodes {
+            if let Some(permit) = &node.permit {
+                permit.cancel();
+            }
+            node.clear_saved();
+            node.fingerprint = None;
+        }
+        dashboard.config_error = Some("台帳を再照合できないか変更があったため、保存情報は非表示です。更新してください。".into());
+    }
+}
+
+/// Read the ledger but no saved machine observations without session grants.
+pub fn load(config: &Path, data_dir: &Path, now: i64) -> Dashboard {
+    load_for_host_scoped(config, data_dir, now, &nodes::local_host(), &Grants::default())
+}
+
+pub fn load_for_host(config: &Path, data_dir: &Path, now: i64, host: &str) -> Dashboard {
+    load_for_host_scoped(config, data_dir, now, host, &Grants::default())
+}
+
+pub fn load_scoped(config: &Path, data_dir: &Path, now: i64, grants: &Grants) -> Dashboard {
+    load_for_host_scoped(config, data_dir, now, &nodes::local_host(), grants)
+}
+
+pub fn load_for_host_scoped(config_path: &Path, data_dir: &Path, now: i64, host: &str, grants: &Grants) -> Dashboard {
+    let config = match nodes::load_config(config_path) {
+        Ok(config) => config,
+        Err(_) => {
+            return Dashboard {
+                nodes: Vec::new(),
+                config_error: Some("台帳を読み取れません".into()),
+                database_error: None,
+                repositories: Vec::new(),
+                topology_coverage: Coverage::Unknown,
+                topology_error: Some(TOPOLOGY_SCOPE_UNAVAILABLE.into()),
+                topology_oldest_at: None,
+                topology_limited: false,
+            };
+        }
+    };
+    let mut dashboard =
+        project_nodes(&config.nodes, config.schedule.as_ref(), host, now, grants, || Store::open_read_only(data_dir).map_err(|_| SavedReadError));
+    if dashboard.nodes.iter().any(|node| node.permit.is_some()) {
+        let current = nodes::load_config(config_path).ok();
+        revalidate_dashboard(
+            &mut dashboard,
+            current.as_ref().map(|config| config.nodes.as_slice()),
+            config.schedule.as_ref(),
+            current.as_ref().and_then(|config| config.schedule.as_ref()),
+            host,
+        );
+    }
+    dashboard
 }
 
 #[derive(Clone, Debug)]
@@ -317,24 +556,4 @@ pub struct TopologyResult {
 /// Refuse topology search until the requested machine and scope can be authorized.
 pub fn search_topology(_data_dir: &Path, _filter: &str, _now: i64) -> Result<TopologyResult, &'static str> {
     Err(TOPOLOGY_SCOPE_UNAVAILABLE)
-}
-
-fn max_age(db: &Store, configured: Option<&serde_json::Value>) -> Option<i64> {
-    let schedule = db.get_meta_strict("schedule").ok()?;
-    let stored = match schedule.as_ref() {
-        None => None,
-        Some(serde_json::Value::Object(object)) => object.get("probe_minutes"),
-        _ => return None,
-    };
-    let value = match (stored, configured) {
-        (Some(value), _) => Some(value),
-        (None, None) => None,
-        (None, Some(serde_json::Value::Object(object))) => object.get("probe_minutes"),
-        _ => return None,
-    };
-    let minutes = match value {
-        None => 60,
-        Some(value) => value.as_i64().filter(|minutes| (5..=1440).contains(minutes))?,
-    };
-    minutes.checked_mul(3 * 60 * 1_000)
 }

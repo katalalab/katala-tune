@@ -18,6 +18,18 @@ fn config(dir: &std::path::Path) -> PathBuf {
     path
 }
 
+fn scoped_load(config: &std::path::Path, data: &std::path::Path, now: i64) -> source::Dashboard {
+    let ledger = tune_core::nodes::load_config(config).unwrap();
+    let host = tune_core::nodes::local_host();
+    let mut grants = fleet_studio::scope::Grants::default();
+    for node in &ledger.nodes {
+        if let Some(fingerprint) = source::fingerprint_for_node(&ledger.nodes, &host, &node.id) {
+            grants.authorize(&node.id, &fingerprint);
+        }
+    }
+    source::load_for_host_scoped(config, data, now, &host, &grants)
+}
+
 #[test]
 fn missing_database_keeps_ledger_nodes_unknown_without_creating_a_database() {
     let dir = fixture_dir();
@@ -26,7 +38,8 @@ fn missing_database_keeps_ledger_nodes_unknown_without_creating_a_database() {
     let dashboard = source::load(&config, &data, 10_000);
     assert_eq!(dashboard.nodes.len(), 1);
     assert_eq!(dashboard.nodes[0].observation, Observation::Unknown);
-    assert!(dashboard.database_error.is_some());
+    assert!(dashboard.database_error.is_none());
+    assert_eq!(dashboard.nodes[0].saved_state, source::SavedState::Unapproved);
     assert!(!data.exists());
 }
 
@@ -40,10 +53,10 @@ fn newer_saved_failure_is_visible_but_retains_last_success_time() {
     db.save_probe_failure("fixture-node", 9_500, "fixture failure").unwrap();
     drop(db);
     let before = std::fs::read(data.join(DB_FILE)).unwrap();
-    let dashboard = source::load(&config, &data, 10_000);
+    let dashboard = scoped_load(&config, &data, 10_000);
     assert_eq!(dashboard.nodes[0].observation, Observation::Failed);
     assert_eq!(dashboard.nodes[0].last_at, Some(9_000));
-    assert_eq!(dashboard.nodes[0].failure_reason, Some("詳細不明（Katala Tune で確認）"));
+    assert_eq!(dashboard.nodes[0].failure_reason, Some("保存された失敗記録（詳細未確認）"));
     assert_eq!(std::fs::read(data.join(DB_FILE)).unwrap(), before);
 }
 
@@ -64,8 +77,9 @@ fn excluded_machine_keeps_its_last_observation_without_becoming_online() {
     let db = Store::open(&data).unwrap();
     db.add_snapshot("fixture-node", 9_000, None, None, &json!([]), &json!({}), &json!({})).unwrap();
     drop(db);
-    let dashboard = source::load(&config, &data, 10_000);
-    assert_eq!(dashboard.nodes[0].observation, Observation::Excluded);
+    let dashboard = scoped_load(&config, &data, 10_000);
+    assert_eq!(dashboard.nodes[0].observation, Observation::Current);
+    assert_eq!(dashboard.nodes[0].operating_state, "retired");
     assert_eq!(dashboard.nodes[0].last_at, Some(9_000));
 }
 
@@ -117,15 +131,23 @@ fn unavailable_repository_coverage_is_not_reported_as_an_empty_result() {
 
 #[test]
 fn failed_refresh_keeps_previous_data_but_changes_its_status_to_unknown() {
+    let mut grants = fleet_studio::scope::Grants::default();
+    grants.authorize("fixture-node", "synthetic-fingerprint");
+    let permit = grants.matching("fixture-node", "synthetic-fingerprint").unwrap();
     let previous = source::Dashboard {
         nodes: vec![source::NodeCard {
             id: "fixture-node".into(),
+            fingerprint: Some("synthetic-fingerprint".into()),
+            permit: Some(permit),
+            saved_state: source::SavedState::Available,
+            previous: false,
             role: "test".into(),
             operating_state: "online".into(),
             local: Some(true),
             last_at: Some(100),
             observation: Observation::Current,
             failure_reason: None,
+            failure_at: None,
             max_age_ms: Some(1_000),
             score: None,
             critical: None,
@@ -140,7 +162,12 @@ fn failed_refresh_keeps_previous_data_but_changes_its_status_to_unknown() {
         topology_limited: false,
     };
     let mut next = source::Dashboard {
-        nodes: vec![source::NodeCard { last_at: None, observation: Observation::Unknown, ..previous.nodes[0].clone() }],
+        nodes: vec![source::NodeCard {
+            last_at: None,
+            observation: Observation::Unknown,
+            saved_state: source::SavedState::Unavailable,
+            ..previous.nodes[0].clone()
+        }],
         config_error: None,
         database_error: Some("unavailable".into()),
         repositories: vec![],
@@ -157,7 +184,7 @@ fn failed_refresh_keeps_previous_data_but_changes_its_status_to_unknown() {
     assert!(next.database_error.is_some());
     let mut missing_config = source::Dashboard { nodes: Vec::new(), config_error: Some("unavailable".into()), ..next };
     source::preserve_previous(&previous, &mut missing_config);
-    assert_eq!(missing_config.nodes[0].identity_text(), "同一性不明");
+    assert!(missing_config.nodes.is_empty());
 }
 
 #[test]
@@ -176,11 +203,11 @@ fn freshness_uses_ledger_interval_then_database_override() {
     let db = Store::open(&data).unwrap();
     db.add_snapshot("fixture-node", 1_000_000, None, None, &json!([]), &json!({}), &json!({})).unwrap();
     drop(db);
-    assert_eq!(source::load(&config, &data, 2_200_000).nodes[0].observation, Observation::Stale);
+    assert_eq!(scoped_load(&config, &data, 2_200_000).nodes[0].observation, Observation::Stale);
     let db = Store::open(&data).unwrap();
     db.set_meta("schedule", &json!({"probe_minutes":60})).unwrap();
     drop(db);
-    assert_eq!(source::load(&config, &data, 2_200_000).nodes[0].observation, Observation::Current);
+    assert_eq!(scoped_load(&config, &data, 2_200_000).nodes[0].observation, Observation::Current);
 }
 
 #[test]
@@ -194,7 +221,7 @@ fn corrupted_saved_schedule_keeps_machine_freshness_unknown() {
     db.conn().execute_batch("INSERT INTO meta(k,v,updated_at) VALUES ('schedule','not-json',1)").unwrap();
     assert!(db.get_meta_strict("schedule").is_err());
     drop(db);
-    let dashboard = source::load(&config, &data, 10_000);
+    let dashboard = scoped_load(&config, &data, 10_000);
     assert_eq!(dashboard.nodes[0].observation, Observation::Unknown);
 }
 
@@ -207,19 +234,24 @@ fn non_object_saved_schedule_does_not_become_a_default_interval() {
     db.add_snapshot("fixture-node", 9_000, None, None, &json!([]), &json!({}), &json!({})).unwrap();
     db.set_meta("schedule", &json!(null)).unwrap();
     drop(db);
-    assert_eq!(source::load(&config, &data, 10_000).nodes[0].observation, Observation::Unknown);
+    assert_eq!(scoped_load(&config, &data, 10_000).nodes[0].observation, Observation::Unknown);
 }
 
 #[test]
 fn displayed_snapshot_becomes_stale_after_its_deadline() {
     let card = source::NodeCard {
         id: "fixture".into(),
+        fingerprint: None,
+        permit: None,
+        saved_state: source::SavedState::Unapproved,
+        previous: false,
         role: "test".into(),
         operating_state: "online".into(),
         local: Some(true),
         last_at: Some(9_000),
         observation: Observation::Current,
         failure_reason: None,
+        failure_at: None,
         max_age_ms: Some(1_000),
         score: None,
         critical: None,
@@ -237,7 +269,7 @@ fn saved_health_counts_match_the_success_snapshot() {
     let db = Store::open(&data).unwrap();
     db.add_snapshot("fixture-node", 9_000, None, Some(72), &json!([]), &json!({}), &json!({"critical":2,"warn":3})).unwrap();
     drop(db);
-    let dashboard = source::load(&config, &data, 10_000);
+    let dashboard = scoped_load(&config, &data, 10_000);
     assert_eq!((dashboard.nodes[0].score, dashboard.nodes[0].critical, dashboard.nodes[0].warnings), (Some(72), Some(2), Some(3)));
 }
 

@@ -14,6 +14,35 @@ CREATE TABLE IF NOT EXISTS tune_snapshots (
 ) WITHOUT ROWID;
 ";
 
+/// Minimal fields needed to show a saved machine observation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MachineReading {
+    pub last_at: Option<i64>,
+    pub score: Option<i64>,
+    pub critical: Option<u64>,
+    pub warnings: Option<u64>,
+    pub failure: ProbeFailure,
+    pub schedule: StoredSchedule,
+}
+
+/// A missing record and a malformed record must remain distinct.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProbeFailure {
+    #[default]
+    None,
+    At(i64),
+    Invalid,
+}
+
+/// A missing schedule differs from malformed or unreadable stored metadata.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StoredSchedule {
+    #[default]
+    Missing,
+    Minutes(i64),
+    Invalid,
+}
+
 /// 保存した分析結果（data は probe の出力そのまま）
 #[derive(Clone, Debug)]
 pub struct Snapshot {
@@ -85,5 +114,163 @@ impl Store {
         }
         rows.reverse();
         Ok(rows)
+    }
+}
+
+impl Store {
+    /// One bounded read of the requested ID's display fields and fixed metadata.
+    /// Snapshot bodies, history details and failure text never leave SQLite.
+    pub fn saved_machine_reading(&self, node_id: &str) -> Result<MachineReading> {
+        let row: (Option<i64>, Option<i64>, Option<i64>, Option<i64>, bool, Option<i64>, i64, Option<i64>) = self.conn.query_row(
+            "SELECT s.at, s.score, s.critical, s.warn, f.k IS NOT NULL,
+                    CASE WHEN f.k IS NULL THEN NULL
+                         WHEN typeof(f.v) != 'text' OR octet_length(f.v) > 8192 THEN NULL
+                         WHEN NOT json_valid(f.v) THEN NULL
+                         WHEN json_type(f.v) != 'object' THEN NULL
+                         WHEN (SELECT count(*) FROM json_each(f.v) WHERE key = 'at') != 1 THEN NULL
+                         WHEN (SELECT count(*) FROM json_each(f.v) WHERE key = 'error') != 1 THEN NULL
+                         WHEN json_type(f.v, '$.at') IS NOT 'integer' THEN NULL
+                         WHEN json_type(f.v, '$.error') IS NOT 'text' THEN NULL
+                         ELSE json_extract(f.v, '$.at') END,
+                    CASE WHEN q.k IS NULL THEN 0
+                         WHEN typeof(q.v) != 'text' OR octet_length(q.v) > 8192 THEN 2
+                         WHEN NOT json_valid(q.v) THEN 2
+                         WHEN json_type(q.v) != 'object' THEN 2
+                         WHEN (SELECT count(*) FROM json_each(q.v) WHERE key = 'probe_minutes') > 1 THEN 2
+                         WHEN json_type(q.v, '$.probe_minutes') IS NULL THEN 0
+                         WHEN json_type(q.v, '$.probe_minutes') = 'integer' THEN 1
+                         ELSE 2 END,
+                    CASE WHEN q.k IS NULL THEN NULL
+                         WHEN typeof(q.v) != 'text' OR octet_length(q.v) > 8192 THEN NULL
+                         WHEN NOT json_valid(q.v) THEN NULL
+                         WHEN json_type(q.v) != 'object' THEN NULL
+                         WHEN (SELECT count(*) FROM json_each(q.v) WHERE key = 'probe_minutes') > 1 THEN NULL
+                         WHEN json_type(q.v, '$.probe_minutes') != 'integer' THEN NULL
+                         ELSE json_extract(q.v, '$.probe_minutes') END
+                 FROM (SELECT 1) AS seed
+                 LEFT JOIN (
+                     SELECT at, score, critical, warn FROM tune_snapshots
+                     WHERE node_id = ?1 ORDER BY at DESC LIMIT 1
+                 ) AS s ON 1
+                 LEFT JOIN meta AS f ON f.k = ?2
+                 LEFT JOIN meta AS q ON q.k = 'schedule'",
+            params![node_id, format!("probeFailure:{node_id}")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+        )?;
+        let count = |value: Option<i64>, column| -> Result<Option<u64>> {
+            value.map(|value| u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(column, value))).transpose()
+        };
+        Ok(MachineReading {
+            last_at: row.0,
+            score: row.1,
+            critical: count(row.2, 2)?,
+            warnings: count(row.3, 3)?,
+            failure: match (row.4, row.5) {
+                (false, _) => ProbeFailure::None,
+                (true, Some(at)) => ProbeFailure::At(at),
+                (true, None) => ProbeFailure::Invalid,
+            },
+            schedule: match (row.6, row.7) {
+                (0, _) => StoredSchedule::Missing,
+                (1, Some(minutes)) => StoredSchedule::Minutes(minutes),
+                _ => StoredSchedule::Invalid,
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod scoped_observations_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn fixture_store() -> Store {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT, updated_at INTEGER)").unwrap();
+        Store { conn }
+    }
+
+    #[test]
+    fn returns_only_the_selected_summary_without_parsing_snapshot_body() {
+        let store = fixture_store();
+        store
+            .conn
+            .execute(
+                "INSERT INTO tune_snapshots (node_id, at, score, critical, warn, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params!["fixture-one", 9000, 70, 1, 2, "{invalid synthetic json"],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO tune_snapshots (node_id, at, score, critical, warn, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params!["fixture-two", 9500, "not-an-integer", 1, 2, "{invalid synthetic json"],
+            )
+            .unwrap();
+        let reading = store.saved_machine_reading("fixture-one").unwrap();
+        assert_eq!((reading.last_at, reading.score, reading.critical, reading.warnings), (Some(9000), Some(70), Some(1), Some(2)));
+        assert_eq!(reading.failure, ProbeFailure::None);
+    }
+
+    #[test]
+    fn distinguishes_missing_and_invalid_failure_metadata() {
+        let store = fixture_store();
+        for (key, value) in [
+            ("probeFailure:fixture-a", "not-json"),
+            ("probeFailure:fixture-b", "{\"at\":\"invalid\",\"error\":\"fixture\"}"),
+            ("probeFailure:fixture-c", "{\"at\":9000,\"error\":null}"),
+            ("probeFailure:fixture-d", "{\"at\":9000,\"error\":\"fixture\"}"),
+            ("probeFailure:fixture-e", "{\"at\":9000}"),
+        ] {
+            store.conn.execute("INSERT INTO meta (k, v, updated_at) VALUES (?1, ?2, 1)", params![key, value]).unwrap();
+        }
+        assert_eq!(store.saved_machine_reading("fixture-missing").unwrap().failure, ProbeFailure::None);
+        for id in ["fixture-a", "fixture-b", "fixture-c", "fixture-e"] {
+            assert_eq!(store.saved_machine_reading(id).unwrap().failure, ProbeFailure::Invalid);
+        }
+        assert_eq!(store.saved_machine_reading("fixture-d").unwrap().failure, ProbeFailure::At(9000));
+    }
+
+    #[test]
+    fn binds_machine_id_without_falling_through_to_other_rows() {
+        let store = fixture_store();
+        store.conn.execute("INSERT INTO tune_snapshots (node_id, at, data) VALUES (?1, ?2, ?3)", params!["fixture-one", 9000, "{}"]).unwrap();
+        let absent = store.saved_machine_reading("fixture-one' OR 1=1--").unwrap();
+        assert_eq!(absent.last_at, None);
+        assert_eq!(absent.failure, ProbeFailure::None);
+    }
+
+    #[test]
+    fn duplicate_failure_and_schedule_keys_are_unknown() {
+        for value in [r#"{"at":100,"at":9000,"error":"fixture"}"#, r#"{"at":9000,"error":"fixture","error":"another"}"#] {
+            let store = fixture_store();
+            store.conn.execute("INSERT INTO meta (k, v, updated_at) VALUES (?1, ?2, 1)", params!["probeFailure:fixture-one", value]).unwrap();
+            assert_eq!(store.saved_machine_reading("fixture-one").unwrap().failure, ProbeFailure::Invalid);
+        }
+        let store = fixture_store();
+        store.conn.execute("INSERT INTO meta (k, v, updated_at) VALUES (?1, ?2, 1)", params!["schedule", r#"{"probe_minutes":5,"probe_minutes":60}"#]).unwrap();
+        assert_eq!(store.saved_machine_reading("fixture-one").unwrap().schedule, StoredSchedule::Invalid);
+    }
+
+    #[test]
+    fn schedule_and_failure_metadata_respect_types_and_byte_limits() {
+        let long = "あ".repeat(2800);
+        let oversized_schedule = format!(r#"{{"probe_minutes":5,"padding":"{long}"}}"#);
+        for (value, expected) in [
+            ("{}".to_owned(), StoredSchedule::Missing),
+            (r#"{"probe_minutes":5}"#.to_owned(), StoredSchedule::Minutes(5)),
+            (r#"{"probe_minutes":"5"}"#.to_owned(), StoredSchedule::Invalid),
+            ("null".to_owned(), StoredSchedule::Invalid),
+            (oversized_schedule, StoredSchedule::Invalid),
+        ] {
+            let store = fixture_store();
+            store.conn.execute("INSERT INTO meta (k, v, updated_at) VALUES (?1, ?2, 1)", params!["schedule", value]).unwrap();
+            assert_eq!(store.saved_machine_reading("fixture-one").unwrap().schedule, expected);
+        }
+        let store = fixture_store();
+        let oversized_failure = format!(r#"{{"at":9000,"error":"{long}"}}"#);
+        store.conn.execute("INSERT INTO meta (k, v, updated_at) VALUES (?1, ?2, 1)", params!["probeFailure:fixture-one", oversized_failure]).unwrap();
+        assert_eq!(store.saved_machine_reading("fixture-one").unwrap().failure, ProbeFailure::Invalid);
     }
 }

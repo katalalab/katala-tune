@@ -37,7 +37,7 @@ pub use inventory::InventorySaved;
 pub use logs::{LogCount, LogRow, TopSignature};
 pub use netsec::NET_EVENT_DAYS;
 pub use provenance::{RunMeta, SpanIn, sha256_hex};
-pub use snapshots::Snapshot;
+pub use snapshots::{MachineReading, ProbeFailure, Snapshot, StoredSchedule};
 pub use topology::{TopologyLease, TopologyUiRequest};
 
 pub const DB_FILE: &str = "katala-tune.db";

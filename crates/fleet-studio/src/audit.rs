@@ -31,6 +31,7 @@ pub struct Audit {
     pub incomplete_nodes: Vec<String>,
     pub issues: Vec<AuditIssue>,
     pub observed_nodes: Vec<String>,
+    pub identity: Option<AuditIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +73,33 @@ pub fn targets(nodes: &[tune_core::nodes::Node], scope: Scope) -> Vec<tune_core:
 
 pub fn targets_for_host(nodes: &[tune_core::nodes::Node], scope: Scope, host: &str) -> Vec<tune_core::nodes::Node> {
     if crate::recent::normalized_hostname(host).is_none() { Vec::new() } else { targets(&crate::recent::resolved_nodes(nodes, host), scope) }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditIdentity {
+    pub node: String,
+    pub fingerprint: String,
+}
+
+/// Reuse the existing local audit eligibility checks and bind the unique row.
+pub fn identity_for_host(nodes: &[tune_core::nodes::Node], host: &str) -> Option<AuditIdentity> {
+    let selected = targets_for_host(nodes, Scope::Local, host);
+    if selected.len() != 1 {
+        return None;
+    }
+    let node = selected.first()?;
+    let fingerprint = crate::source::fingerprint_for_node(nodes, host, &node.id)?;
+    Some(AuditIdentity { node: node.id.clone(), fingerprint })
+}
+
+pub fn identity_matches(nodes: Option<&[tune_core::nodes::Node]>, host: &str, expected: &AuditIdentity) -> bool {
+    nodes.and_then(|nodes| identity_for_host(nodes, host)).as_ref() == Some(expected)
+}
+
+/// Re-read immediately before opening an audit location. Do not expose errors.
+pub fn revalidate_identity(config_path: &std::path::Path, host: &str, expected: &AuditIdentity) -> bool {
+    let current = tune_core::nodes::load_config(config_path).ok();
+    identity_matches(current.as_ref().map(|config| config.nodes.as_slice()), host, expected)
 }
 
 pub fn selection_warnings(selected: &[tune_core::nodes::Node], resolved: &[tune_core::nodes::Node], at: i64) -> Vec<AuditIssue> {
@@ -244,6 +272,7 @@ pub fn collect(config_path: &std::path::Path, scope: Scope) -> Result<Audit, &'s
     if crate::recent::normalized_hostname(&host).is_none() {
         return Err("この機体の識別が不明なため監査できません");
     }
+    let identity = identity_for_host(&config.nodes, &host).ok_or("監査対象の機体を一意に照合できません")?;
     let resolved = crate::recent::resolved_nodes(&config.nodes, &host);
     let nodes = targets(&resolved, scope);
     if nodes.is_empty() {
@@ -257,5 +286,10 @@ pub fn collect(config_path: &std::path::Path, scope: Scope) -> Result<Audit, &'s
     for repo in &mut audit.repos {
         repo.local = local.contains(&repo.node);
     }
+    let current = tune_core::nodes::load_config(config_path).ok();
+    if !identity_matches(current.as_ref().map(|config| config.nodes.as_slice()), &tune_core::nodes::local_host(), &identity) {
+        return Err("台帳の監査対象を再照合できないため結果を破棄しました");
+    }
+    audit.identity = Some(identity);
     Ok(audit)
 }
