@@ -46,7 +46,7 @@ impl SyncStatus {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecentEntry {
     pub node: String,
     pub local: bool,
@@ -77,6 +77,26 @@ pub struct RecentWork {
     pub local_ambiguous: bool,
     pub max_age_ms: Option<i64>,
     pub validated_at: Option<i64>,
+    pub selection_fingerprint: Option<String>,
+}
+
+pub fn empty_work_text(work: &RecentWork, now: i64) -> &'static str {
+    let observed = !work.nodes.is_empty()
+        && !work.selection_incomplete
+        && !work.node_limited
+        && !work.entries_limited
+        && work.nodes.iter().all(|node| {
+            node.collection_state() == CollectionState::Succeeded
+                && node.pending == Some(false)
+                && node.file_errors == Some(0)
+                && !node.session_error
+                && node.freshness(now, work.max_age_ms.unwrap_or(-1)) == Observation::Current
+        });
+    if observed {
+        "保存済みの表示範囲に作業はありません。収集の網羅性は未確認です。"
+    } else {
+        "保存済み作業の有無は未確認です。対象と収集状態を確認してください。"
+    }
 }
 
 /// A refresh invalidates private rows immediately and never overlaps database reads.
@@ -217,6 +237,26 @@ pub fn same_selection(before: &[Node], after: &[Node]) -> bool {
         && keys(before) == keys(after)
         && selection_incomplete(before) == selection_incomplete(after)
         && local_ambiguous(before) == local_ambiguous(after)
+}
+
+/// Store only a digest of the full ledger snapshot for an activation-time check.
+pub fn selection_fingerprint_for_host(nodes: &[Node], host: &str, node_id: &str) -> Option<String> {
+    normalized_hostname(host)?;
+    let resolved = resolved_nodes(nodes, host);
+    let selected = targets(&resolved);
+    if selected.len() != 1 || selected[0].id != node_id {
+        return None;
+    }
+    let values: Vec<_> = resolved.iter().map(|node| (&node.raw, node.local)).collect();
+    serde_json::to_vec(&values).ok().map(|bytes| tune_core::db::sha256_hex(&bytes))
+}
+
+/// Re-read the ledger immediately before handing a recent-work target to the OS.
+pub fn revalidate_local(config_path: &Path, host: &str, node_id: &str, fingerprint: &str) -> bool {
+    nodes::load_config(config_path)
+        .ok()
+        .and_then(|config| selection_fingerprint_for_host(&config.nodes, host, node_id))
+        .is_some_and(|current| current == fingerprint)
 }
 
 fn flag(value: Option<&Value>) -> Option<bool> {
@@ -443,6 +483,11 @@ pub fn load_for_host(config_path: &Path, data_dir: &Path, now: i64, host: &str, 
     result.max_age_ms = max_age(&db, current.as_ref().and_then(|current| current.schedule.as_ref()));
     if db.conn().execute_batch("COMMIT").is_err() {
         return RecentWork { error: Some("保存済み AI 情報を一貫して読み取れません"), ..Default::default() };
+    }
+    result.selection_fingerprint =
+        current.as_ref().and_then(|current| selected.first().and_then(|node| selection_fingerprint_for_host(&current.nodes, host, &node.id)));
+    if result.selection_fingerprint.is_none() {
+        return RecentWork { error: Some("台帳の対象を照合できないため最近の作業は非表示"), ..Default::default() };
     }
     result.validated_at = Some(tune_core::db::now_ms());
     result

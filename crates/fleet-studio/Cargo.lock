@@ -1474,6 +1474,7 @@ dependencies = [
  "tokio",
  "tune-core",
  "url",
+ "windows",
 ]
 
 [[package]]

@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+pub const REMOTE_DISABLED: &str = "遠隔監査は機体ごとの権限と接続先が未確認のため未対応です";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepoAudit {
     pub node: String,
@@ -205,7 +207,7 @@ fn safe_error(error: Option<&str>) -> &'static str {
 /// Run the existing bounded, read-only hygiene probe only when explicitly requested.
 pub fn collect(config_path: &std::path::Path, scope: Scope) -> Result<Audit, &'static str> {
     if scope == Scope::Fleet {
-        return Err("遠隔監査は機体ごとの権限と接続先が未確認のため未対応です");
+        return Err(REMOTE_DISABLED);
     }
     let config = tune_core::nodes::load_config(config_path).map_err(|_| "台帳を読み取れません")?;
     let host = tune_core::nodes::local_host();

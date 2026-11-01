@@ -20,7 +20,7 @@ pub fn repository_url(origin: &str) -> Option<String> {
         origin.to_owned()
     };
     let mut url = url::Url::parse(&candidate).ok()?;
-    if url.scheme() != "https" || url.host_str().is_none() {
+    if url.scheme() != "https" || url.host_str() != Some("github.com") || url.port().is_some() {
         return None;
     }
     url.set_password(None).ok()?;
@@ -42,6 +42,189 @@ pub fn local_directory(path: &str) -> Option<String> {
     }
     url::Url::from_directory_path(path).ok().map(String::from)
 }
+
+/// Keep keyboard activation aligned with the visible, filtered rows.
+pub fn selected_repository_url(repositories: &[crate::source::Repository], search: &str, selected: usize) -> Option<String> {
+    let search = search.to_lowercase();
+    repositories
+        .iter()
+        .filter(|repo| search.is_empty() || repo.name.to_lowercase().contains(&search))
+        .take(200)
+        .nth(selected)?
+        .origin
+        .as_deref()
+        .and_then(repository_url)
+}
+
+pub struct OpenTarget(Target);
+
+enum Target {
+    Github(String),
+    Directory(std::path::PathBuf),
+}
+
+impl OpenTarget {
+    /// Accept an already-sanitized URL, never credentials or query parameters.
+    pub fn github(value: &str) -> Option<Self> {
+        if value.len() > 2_048 || value.chars().any(char::is_control) {
+            return None;
+        }
+        let url = url::Url::parse(value).ok()?;
+        if url.scheme() != "https"
+            || url.host_str() != Some("github.com")
+            || url.port().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return None;
+        }
+        Some(Self(Target::Github(url.into())))
+    }
+
+    /// Parse a path without blocking on the filesystem; validation happens before launch.
+    pub fn directory(value: &str) -> Option<Self> {
+        if value.chars().any(char::is_control) {
+            return None;
+        }
+        let path = std::path::PathBuf::from(tune_core::nodes::expand(value));
+        if !path.is_absolute() || path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
+            return None;
+        }
+        #[cfg(windows)]
+        {
+            use std::path::{Component, Prefix};
+            if !matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))) {
+                return None;
+            }
+        }
+        Some(Self(Target::Directory(path)))
+    }
+
+    /// Call on a dedicated worker thread; never include targets or OS errors in output.
+    pub fn open(self) -> OpenResult {
+        self.open_guarded(|| true)
+    }
+
+    /// Check authorization both before path validation and just before OS handoff.
+    pub fn open_guarded(self, authorized: impl Fn() -> bool) -> OpenResult {
+        if !authorized() {
+            return OpenResult::SelectionChanged;
+        }
+        #[cfg(windows)]
+        {
+            let result = match self.0 {
+                Target::Github(value) => windows_open::github(&value, &authorized),
+                Target::Directory(path) => windows_open::directory(&path, &authorized),
+            };
+            result.unwrap_or(OpenResult::Failed)
+        }
+        #[cfg(not(windows))]
+        {
+            match self.0 {
+                Target::Github(value) => drop(value),
+                Target::Directory(path) => drop(path),
+            }
+            OpenResult::Unavailable
+        }
+    }
+}
+
+// The generated Windows bindings require unsafe calls. Keep the boundary narrow;
+// all inputs are validated again before an OS launch is attempted.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+#[path = "navigation_windows.rs"]
+mod windows_open;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenResult {
+    Accepted,
+    Failed,
+    Unavailable,
+    SelectionChanged,
+    Sample,
+}
+
+/// The final permission check must happen after preparation and before dispatch.
+pub fn finish_if_authorized(authorized: impl FnOnce() -> bool, dispatch: impl FnOnce() -> bool) -> OpenResult {
+    if !authorized() {
+        OpenResult::SelectionChanged
+    } else if dispatch() {
+        OpenResult::Accepted
+    } else {
+        OpenResult::Failed
+    }
+}
+
+pub fn sample_target_result(sample: bool) -> Option<OpenResult> {
+    sample.then_some(OpenResult::Sample)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OpenStatus {
+    #[default]
+    Idle,
+    Pending,
+    Waiting,
+    Accepted,
+    Failed,
+    Unavailable,
+    SelectionChanged,
+    Sample,
+}
+
+pub fn open_status_text(status: OpenStatus) -> Option<&'static str> {
+    match status {
+        OpenStatus::Idle => None,
+        OpenStatus::Pending => Some("リンクを開いています。"),
+        OpenStatus::Waiting => Some("リンクを開く処理の結果は未確認です（終了待ち）。"),
+        OpenStatus::Accepted => Some("リンクを OS に引き渡しました。表示や接続は未確認です。"),
+        OpenStatus::Failed => Some("リンクを開けませんでした。対象と OS の設定を確認してください。"),
+        OpenStatus::Unavailable => Some("この OS ではリンクを開く操作に未対応です。"),
+        OpenStatus::SelectionChanged => Some("台帳または対象が変わったため開けません。更新して確認してください。"),
+        OpenStatus::Sample => Some("サンプルの対象は実際には開きません。"),
+    }
+}
+
+#[derive(Default)]
+pub struct OpenState {
+    sequence: u64,
+    status: OpenStatus,
+}
+
+impl OpenState {
+    pub fn start(&mut self) -> Option<u64> {
+        if matches!(self.status, OpenStatus::Pending | OpenStatus::Waiting) {
+            return None;
+        }
+        self.sequence = self.sequence.wrapping_add(1);
+        self.status = OpenStatus::Pending;
+        Some(self.sequence)
+    }
+    pub fn status(&self) -> OpenStatus {
+        self.status
+    }
+    pub fn timed_out(&mut self, id: u64) {
+        if self.sequence == id && self.status == OpenStatus::Pending {
+            self.status = OpenStatus::Waiting;
+        }
+    }
+    pub fn finish(&mut self, id: u64, result: OpenResult) {
+        if self.sequence != id || !matches!(self.status, OpenStatus::Pending | OpenStatus::Waiting) {
+            return;
+        }
+        self.status = match result {
+            OpenResult::Accepted => OpenStatus::Accepted,
+            OpenResult::Failed => OpenStatus::Failed,
+            OpenResult::Unavailable => OpenStatus::Unavailable,
+            OpenResult::SelectionChanged => OpenStatus::SelectionChanged,
+            OpenResult::Sample => OpenStatus::Sample,
+        };
+    }
+}
+
 /// An asynchronous list replacement must not silently select a different link.
 #[derive(Default)]
 pub struct Selection(Option<usize>);

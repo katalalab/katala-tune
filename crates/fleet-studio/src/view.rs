@@ -3,7 +3,7 @@ use std::time::Duration;
 use fleet_studio::Observation;
 use fleet_studio::audit::{self, Audit, RepoAudit, Scope};
 use fleet_studio::llm::{self, Endpoint, ModelError, ModelObservation};
-use fleet_studio::navigation;
+use fleet_studio::navigation::{self, OpenResult, OpenState, OpenTarget};
 use fleet_studio::recent::{self, RecentEntry, RecentSlot, RecentWork, SyncStatus};
 use fleet_studio::source::{self, Coverage, Dashboard, NodeCard, Repository};
 use gpui::{Context, FocusHandle, IntoElement, KeyDownEvent, Render, SharedString, Window, div, prelude::*, rgb};
@@ -13,6 +13,12 @@ struct ModelLine {
     label: String,
     endpoint: Option<Endpoint>,
     observation: ModelObservation,
+}
+
+#[derive(Clone, Copy)]
+enum RecentOpen {
+    Directory,
+    PullRequest(usize),
 }
 
 pub struct FleetView {
@@ -26,7 +32,6 @@ pub struct FleetView {
     dashboard: Option<Dashboard>,
     models: Vec<ModelLine>,
     recent: RecentSlot,
-    recent_open_error: Option<&'static str>,
     audit: Option<Audit>,
     audit_error: Option<String>,
     auditing: bool,
@@ -39,6 +44,7 @@ pub struct FleetView {
     search: String,
     searching: bool,
     selected: navigation::Selection,
+    open_state: OpenState,
 }
 
 impl FleetView {
@@ -56,7 +62,6 @@ impl FleetView {
             dashboard: None,
             models: Vec::new(),
             recent: RecentSlot::default(),
-            recent_open_error: None,
             audit: None,
             audit_error: None,
             auditing: false,
@@ -69,6 +74,7 @@ impl FleetView {
             search: String::new(),
             searching: false,
             selected: navigation::Selection::default(),
+            open_state: OpenState::default(),
         };
         let executor = cx.background_executor().clone();
         cx.spawn(async move |view, cx| {
@@ -86,7 +92,6 @@ impl FleetView {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.selected.invalidate();
-        self.recent_open_error = None;
         if !self.sample {
             if let Some(generation) = self.recent.request() {
                 self.start_recent(generation, cx);
@@ -307,6 +312,11 @@ impl FleetView {
             return;
         }
         self.audit_error = None;
+        if scope == Scope::Fleet {
+            self.audit_error = Some(audit::REMOTE_DISABLED.into());
+            cx.notify();
+            return;
+        }
         if self.sample {
             self.audit = Some(Audit {
                 repos: vec![RepoAudit {
@@ -318,7 +328,7 @@ impl FleetView {
                     behind: Some(0),
                     local_only: None,
                     previous: false,
-                    local: false,
+                    local: true,
                     at: Some(tune_core::db::now_ms()),
                     error: None,
                 }],
@@ -422,10 +432,11 @@ impl FleetView {
                     self.selected.previous(count);
                 }
                 "enter" => {
-                    if self.selected.index().is_some_and(|index| index >= self.repository_count()) {
-                        self.recent_open_error = Some("最近の作業の安全なリンク起動は未対応です。");
+                    if let Some(entry) = self.selected_recent() {
+                        let kind = if entry.local && entry.directory_url.is_some() { RecentOpen::Directory } else { RecentOpen::PullRequest(0) };
+                        self.open_recent(entry, kind, cx);
                     } else if let Some(url) = self.selected_url() {
-                        cx.open_url(&url);
+                        self.open_repository(&url, cx);
                     }
                 }
                 "escape" => {
@@ -470,10 +481,112 @@ impl FleetView {
         }
         None
     }
+
+    fn selected_recent(&self) -> Option<RecentEntry> {
+        let index = self.selected.index()?.checked_sub(self.repository_count())?;
+        self.recent.data.as_ref()?.entries.iter().filter(|entry| self.matches_recent(entry)).nth(index).cloned()
+    }
+
+    fn open_github(&mut self, url: &str, cx: &mut Context<Self>) {
+        if let Some(target) = OpenTarget::github(url) {
+            self.open_target(target, None, cx);
+        } else {
+            self.open_failure(OpenResult::Failed, cx);
+        }
+    }
+
+    fn open_repository(&mut self, url: &str, cx: &mut Context<Self>) {
+        if let Some(result) = navigation::sample_target_result(self.sample) {
+            self.open_failure(result, cx);
+        } else {
+            self.open_github(url, cx);
+        }
+    }
+
+    fn open_failure(&mut self, result: OpenResult, cx: &mut Context<Self>) {
+        if let Some(id) = self.open_state.start() {
+            self.open_state.finish(id, result);
+            cx.notify();
+        }
+    }
+
+    fn open_recent(&mut self, entry: RecentEntry, kind: RecentOpen, cx: &mut Context<Self>) {
+        let Some(data) = self.recent.data.as_ref() else {
+            self.open_failure(OpenResult::SelectionChanged, cx);
+            return;
+        };
+        if !entry.local || !data.entries.contains(&entry) {
+            self.open_failure(OpenResult::SelectionChanged, cx);
+            return;
+        }
+        if let Some(result) = navigation::sample_target_result(self.sample) {
+            self.open_failure(result, cx);
+            return;
+        }
+        let permit = if self.sample {
+            None
+        } else if let Some(fingerprint) = &data.selection_fingerprint {
+            Some((entry.node.clone(), fingerprint.clone()))
+        } else {
+            self.open_failure(OpenResult::SelectionChanged, cx);
+            return;
+        };
+        let target = match kind {
+            RecentOpen::Directory if entry.directory_url.is_some() => entry.cwd.as_deref().and_then(OpenTarget::directory),
+            RecentOpen::PullRequest(index) => entry.prs.get(index).and_then(|url| recent::github_pr_url(url)).and_then(|url| OpenTarget::github(&url)),
+            _ => None,
+        };
+        if let Some(target) = target {
+            self.open_target(target, permit, cx);
+        } else {
+            self.open_failure(OpenResult::Failed, cx);
+        }
+    }
+
+    fn open_target(&mut self, target: OpenTarget, permit: Option<(String, String)>, cx: &mut Context<Self>) {
+        let Some(id) = self.open_state.start() else { return };
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if std::thread::Builder::new()
+            .name("fleet-studio-open".into())
+            .spawn(move || {
+                let allowed = || {
+                    permit.as_ref().is_none_or(|(node, fingerprint)| {
+                        recent::revalidate_local(&tune_core::nodes::user_config_path(), &tune_core::nodes::local_host(), node, fingerprint)
+                    })
+                };
+                let result = target.open_guarded(allowed);
+                let _ = sender.send(result);
+            })
+            .is_err()
+        {
+            self.open_state.finish(id, OpenResult::Failed);
+            cx.notify();
+            return;
+        }
+        let timer = cx.background_executor().timer(Duration::from_secs(5));
+        cx.spawn(async move |view, cx| {
+            timer.await;
+            let _ = view.update(cx, |view, cx| {
+                view.open_state.timed_out(id);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.spawn(async move |view, cx| {
+            let result = receiver.await.unwrap_or(OpenResult::Failed);
+            let _ = view.update(cx, |view, cx| {
+                view.open_state.finish(id, result);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
 }
 
 fn sample_recent() -> RecentWork {
     let now = tune_core::db::now_ms();
+    let cwd = if cfg!(windows) { r"C:\fixture\project" } else { "/fixture/project" };
     RecentWork {
         nodes: vec![SyncStatus {
             node: "fixture-node".into(),
@@ -488,9 +601,9 @@ fn sample_recent() -> RecentWork {
             node: "fixture-node".into(),
             local: true,
             tool: "fixture-agent".into(),
-            cwd: Some("fixture/project".into()),
+            cwd: Some(cwd.into()),
             activity_at: Some(now),
-            directory_url: None,
+            directory_url: recent::local_cwd_url(true, cwd),
             prs: vec!["https://github.com/example/fixture/pull/1".into()],
             pr_state: recent::PrState::Complete,
         }],
@@ -685,7 +798,7 @@ impl Render for FleetView {
                         when(repo.observed_at)
                     )));
                 if let Some(url) = url {
-                    item = item.cursor_pointer().on_click(move |_, _, cx| cx.open_url(&url));
+                    item = item.cursor_pointer().on_click(cx.listener(move |view, _, _, cx| view.open_repository(&url, cx)));
                 }
                 content = content.child(item);
             }
@@ -718,9 +831,6 @@ impl Render for FleetView {
             if let Some(error) = recent.error {
                 content = content.child(note(error.into(), 0xffb86c));
             }
-            if let Some(error) = self.recent_open_error {
-                content = content.child(note(error.into(), 0xffb86c));
-            }
             if recent.node_limited || recent.entries_limited || recent.selection_incomplete {
                 content = content.child(note("対象または表示範囲に上限・未確認があります。表示外は未確認です。".into(), 0xffb86c));
             }
@@ -741,34 +851,50 @@ impl Render for FleetView {
                 let prs = match entry.pr_state {
                     recent::PrState::Unknown => "PR: 不明".to_owned(),
                     recent::PrState::Empty => "PR: なし".to_owned(),
-                    recent::PrState::Complete => format!("PR: {} 件（安全な起動は未対応）", entry.prs.len()),
-                    recent::PrState::Partial => "PR: 一部未確認または上限（安全な起動は未対応）".to_owned(),
+                    recent::PrState::Complete => format!("PR: {} 件", entry.prs.len()),
+                    recent::PrState::Partial => "PR: 一部未確認または上限".to_owned(),
                 };
-                content = content.child(
-                    div()
-                        .p_3()
-                        .rounded_md()
-                        .bg(rgb(if self.selected.index() == Some(repo_count + index) { 0x233b56 } else { 0x182436 }))
-                        .flex()
-                        .flex_col()
-                        .child(format!("{}{} · {}", if self.selected.index() == Some(repo_count + index) { "› " } else { "  " }, entry.node, entry.tool))
-                        .child(div().text_sm().text_color(rgb(0x9baec4)).child(format!(
-                            "作業場所: {}{} / 最終活動: {}",
-                            entry.cwd.as_deref().unwrap_or("不明"),
-                            if entry.local { "" } else { "（遠隔・ローカルでは開けません）" },
-                            when(entry.activity_at)
-                        )))
-                        .child(div().text_sm().text_color(rgb(0x9baec4)).child(collection))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(0x9baec4))
-                                .child(format!("{prs}{}", if entry.directory_url.is_some() { " / 作業場所の安全な起動は未対応" } else { "" })),
-                        ),
-                );
+                let mut item = div()
+                    .p_3()
+                    .rounded_md()
+                    .bg(rgb(if self.selected.index() == Some(repo_count + index) { 0x233b56 } else { 0x182436 }))
+                    .flex()
+                    .flex_col()
+                    .child(format!("{}{} · {}", if self.selected.index() == Some(repo_count + index) { "› " } else { "  " }, entry.node, entry.tool))
+                    .child(div().text_sm().text_color(rgb(0x9baec4)).child(format!(
+                        "作業場所: {}{} / 最終活動: {}",
+                        entry.cwd.as_deref().unwrap_or("不明"),
+                        if entry.local { "" } else { "（遠隔・ローカルでは開けません）" },
+                        when(entry.activity_at)
+                    )))
+                    .child(div().text_sm().text_color(rgb(0x9baec4)).child(collection))
+                    .child(div().text_sm().text_color(rgb(0x9baec4)).child(prs));
+                let mut actions = div().flex().gap_4().text_sm();
+                if entry.local && entry.directory_url.is_some() {
+                    let selected_entry = entry.clone();
+                    actions = actions.child(
+                        div()
+                            .id(SharedString::from(format!("recent-dir-{index}")))
+                            .cursor_pointer()
+                            .child("場所を表示")
+                            .on_click(cx.listener(move |view, _, _, cx| view.open_recent(selected_entry.clone(), RecentOpen::Directory, cx))),
+                    );
+                }
+                for pr_index in 0..entry.prs.len() {
+                    let selected_entry = entry.clone();
+                    actions = actions.child(
+                        div()
+                            .id(SharedString::from(format!("recent-pr-{index}-{pr_index}")))
+                            .cursor_pointer()
+                            .child(format!("PR {} を開く", pr_index + 1))
+                            .on_click(cx.listener(move |view, _, _, cx| view.open_recent(selected_entry.clone(), RecentOpen::PullRequest(pr_index), cx))),
+                    );
+                }
+                item = item.child(actions);
+                content = content.child(item);
             }
             if recent.entries.is_empty() && recent.error.is_none() {
-                content = content.child(note("許可された機体に表示できる保存済み作業はありません。取得状態は上を確認してください。".into(), 0x9baec4));
+                content = content.child(note(recent::empty_work_text(recent, now).into(), 0x9baec4));
             }
         }
 
@@ -803,7 +929,7 @@ impl Render for FleetView {
                     when(repo.at),
                     repo.error.map_or(String::new(), |error| format!(" / {error}"))
                 );
-                let local_url = repo.local.then(|| navigation::local_directory(&repo.path)).flatten();
+                let local_path = repo.local.then(|| repo.path.clone());
                 let mut item = div()
                     .id(SharedString::from(format!("audit-{index}")))
                     .p_3()
@@ -813,8 +939,16 @@ impl Render for FleetView {
                     .flex_col()
                     .child(format!("{}{} · {}", repo.node, if repo.local { "（この機体）" } else { "（台帳名・接続先 hostname 未照合）" }, repo.path))
                     .child(div().text_sm().text_color(rgb(0x9baec4)).child(detail));
-                if let Some(url) = local_url {
-                    item = item.cursor_pointer().on_click(move |_, _, cx| cx.open_url(&url));
+                if let Some(path) = local_path {
+                    item = item.cursor_pointer().on_click(cx.listener(move |view, _, _, cx| {
+                        if let Some(result) = navigation::sample_target_result(view.sample) {
+                            view.open_failure(result, cx);
+                        } else if let Some(target) = OpenTarget::directory(&path) {
+                            view.open_target(target, None, cx);
+                        } else {
+                            view.open_failure(OpenResult::Failed, cx);
+                        }
+                    }));
                 }
                 content = content.child(item);
             }
@@ -890,6 +1024,15 @@ impl Render for FleetView {
             )
             .child(
                 div()
+                    .id("open-status")
+                    .px_5()
+                    .py_2()
+                    .bg(rgb(0x192b42))
+                    .text_sm()
+                    .child(navigation::open_status_text(self.open_state.status()).unwrap_or("リンク操作の結果をここに表示します。")),
+            )
+            .child(
+                div()
                     .id("search")
                     .px_5()
                     .py_3()
@@ -908,32 +1051,25 @@ impl Render for FleetView {
             )
             .child(content)
             .child(
-                div()
-                    .px_5()
-                    .py_3()
-                    .flex()
-                    .justify_between()
-                    .bg(rgb(0x132237))
-                    .child("/ 検索（Enter で確定） · ↑↓ 選択 · Enter で開く · 最近の作業の起動は未対応")
-                    .child(
-                        div()
-                            .flex()
-                            .gap_4()
-                            .child(
-                                div()
-                                    .id("documentation")
-                                    .cursor_pointer()
-                                    .child("説明")
-                                    .on_click(|_, _, cx| cx.open_url("https://github.com/katalalab/katala-tune#readme")),
-                            )
-                            .child(
-                                div()
-                                    .id("issues")
-                                    .cursor_pointer()
-                                    .child("Issues")
-                                    .on_click(|_, _, cx| cx.open_url("https://github.com/katalalab/katala-tune/issues")),
-                            ),
-                    ),
+                div().px_5().py_3().flex().justify_between().bg(rgb(0x132237)).child("/ 検索 · ↑↓ 選択 · Enter で開く · Esc 解除").child(
+                    div()
+                        .flex()
+                        .gap_4()
+                        .child(
+                            div()
+                                .id("documentation")
+                                .cursor_pointer()
+                                .child("説明")
+                                .on_click(cx.listener(|view, _, _, cx| view.open_github("https://github.com/katalalab/katala-tune", cx))),
+                        )
+                        .child(
+                            div()
+                                .id("issues")
+                                .cursor_pointer()
+                                .child("Issues")
+                                .on_click(cx.listener(|view, _, _, cx| view.open_github("https://github.com/katalalab/katala-tune/issues", cx))),
+                        ),
+                ),
             )
     }
 }

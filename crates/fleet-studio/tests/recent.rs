@@ -81,6 +81,43 @@ fn no_matching_local_ledger_row_is_unknown_without_opening_the_database() {
 }
 
 #[test]
+fn empty_recent_work_distinguishes_unknown_from_an_observed_empty_page() {
+    let mut work = recent::RecentWork::default();
+    assert!(recent::empty_work_text(&work, 10_000).contains("有無は未確認"));
+    work.nodes.push(recent::project_cursor("fixture", None, 10_000, 3_000));
+    assert!(recent::empty_work_text(&work, 10_000).contains("有無は未確認"));
+    let success = json!({"updated_at":9000,"last_ok_at":9000,"has_error":0,"no_python":0,"truncated":0,"file_error_count":0});
+    work.nodes[0] = recent::project_cursor("fixture", Some(&success), 10_000, 3_000);
+    work.max_age_ms = Some(3_000);
+    assert!(recent::empty_work_text(&work, 10_000).contains("表示範囲"));
+    assert!(recent::empty_work_text(&work, 20_000).contains("有無は未確認"));
+    work.nodes[0].file_errors = None;
+    assert!(recent::empty_work_text(&work, 10_000).contains("有無は未確認"));
+}
+
+#[test]
+fn opening_recent_work_rechecks_the_complete_ledger_snapshot_and_local_scope() {
+    let dir = fixture_dir();
+    let config = dir.join("nodes.json");
+    let initial = json!({"nodes":[{"id":"fixture-local","local_hostname":"fixture-host","shared":false,"alias":"fixture-alias"}]});
+    std::fs::write(&config, initial.to_string()).unwrap();
+    let parsed = tune_core::nodes::load_config(&config).unwrap();
+    let fingerprint = recent::selection_fingerprint_for_host(&parsed.nodes, "fixture-host", "fixture-local").unwrap();
+    assert!(recent::revalidate_local(&config, "fixture-host", "fixture-local", &fingerprint));
+    assert!(!recent::revalidate_local(&config, "fixture-other", "fixture-local", &fingerprint));
+    assert!(!recent::revalidate_local(&config, "fixture-host", "fixture-other", &fingerprint));
+    for changed in [
+        json!({"nodes":[{"id":"fixture-local","local_hostname":"fixture-host","shared":true,"alias":"fixture-alias"}]}),
+        json!({"nodes":[{"id":"fixture-local","local_hostname":"fixture-host","shared":false,"alias":"changed"}]}),
+        json!({"nodes":[{"id":"fixture-local","local_hostname":"fixture-host","shared":false,"alias":"fixture-alias"},{"id":"fixture-shared","local_hostname":"fixture-host.local","shared":true}]}),
+    ] {
+        std::fs::write(&config, changed.to_string()).unwrap();
+        assert!(!recent::revalidate_local(&config, "fixture-host", "fixture-local", &fingerprint));
+    }
+    assert!(!recent::revalidate_local(&dir.join("missing"), "fixture-host", "fixture-local", &fingerprint));
+}
+
+#[test]
 fn hostname_local_suffix_is_normalized_before_deciding_local_ambiguity() {
     let nodes = vec![
         node(json!({"id":"fixture-a","local_hostname":"fixture-host","shared":false})),
