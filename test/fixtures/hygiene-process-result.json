@@ -1,0 +1,39 @@
+{
+  "outputs": {
+    "valid": "{\"probe\":\"repo_hygiene\",\"roots\":[{\"path\":\"synthetic-root\",\"source\":\"opt\"}],\"repos\":[],\"enumerated\":0,\"skipped\":0,\"truncated\":false}",
+    "partial": "{\"probe\":\"repo_hygiene\",\"roots\":[{\"path\":\"synthetic-root\",\"source\":\"opt\"}],\"repos\":[],\"enumerated\":0,\"skipped\":0,\"truncated\":false,\"error\":\"walk_incomplete\"}",
+    "invalid": "{broken-json",
+    "wrong_probe": "{\"probe\":\"other\"}",
+    "missing_python": "@@KATALA_TUNE_NO_PYTHON@@",
+    "empty": ""
+  },
+  "results": [
+    { "name": "complete", "code": 0, "output": "valid", "failure": null, "ok": true, "error": null },
+    { "name": "complete_partial", "code": 0, "output": "partial", "failure": null, "ok": true, "error": "walk_incomplete" },
+    { "name": "nonzero_after_output", "code": 1, "output": "valid", "failure": null, "ok": false, "error": "probe_failed" },
+    { "name": "timeout_with_zero_code", "code": 0, "output": "valid", "failure": "timeout", "ok": false, "error": "timeout" },
+    { "name": "incomplete_with_zero_code", "code": 0, "output": "valid", "failure": "incomplete", "ok": false, "error": "incomplete" },
+    { "name": "signal_after_output", "code": null, "output": "valid", "failure": null, "ok": false, "error": "incomplete" },
+    { "name": "nonzero_without_output", "code": 2, "output": "empty", "failure": null, "ok": false, "error": "probe_failed" },
+    { "name": "timeout_without_output", "code": null, "output": "empty", "failure": "timeout", "ok": false, "error": "timeout" },
+    { "name": "timeout_with_marker", "code": null, "output": "missing_python", "failure": "timeout", "ok": false, "error": "timeout" },
+    { "name": "incomplete_with_marker", "code": null, "output": "missing_python", "failure": "incomplete", "ok": false, "error": "incomplete" },
+    { "name": "all_python_spawn_missing", "code": null, "output": "missing_python", "failure": "spawn_missing", "ok": false, "error": "no_python" },
+    { "name": "spawn_failed_with_marker", "code": null, "output": "missing_python", "failure": "spawn_failed", "ok": false, "error": "incomplete" },
+    { "name": "spawn_failed", "code": null, "output": "empty", "failure": "spawn_failed", "ok": false, "error": "incomplete" },
+    { "name": "nonzero_with_marker", "code": 1, "output": "missing_python", "failure": null, "ok": false, "error": "probe_failed" },
+    { "name": "missing_python", "code": 0, "output": "missing_python", "failure": null, "ok": false, "error": "no_python" },
+    { "name": "wrong_probe", "code": 0, "output": "wrong_probe", "failure": null, "ok": false, "error": "probe_failed" },
+    { "name": "invalid_json", "code": 0, "output": "invalid", "failure": null, "ok": false, "error": "probe_failed" }
+  ],
+  "completions": [
+    { "name": "complete_zero", "code": 0, "timed_out": false, "stdin_complete": true, "stdout_eof": true, "stderr_eof": true, "strict": 0, "failure": null, "legacy": 0 },
+    { "name": "complete_nonzero", "code": 7, "timed_out": false, "stdin_complete": true, "stdout_eof": true, "stderr_eof": true, "strict": 7, "failure": null, "legacy": 7 },
+    { "name": "signal", "code": null, "timed_out": false, "stdin_complete": true, "stdout_eof": true, "stderr_eof": true, "strict": null, "failure": "incomplete", "legacy": null },
+    { "name": "timeout_then_zero", "code": 0, "timed_out": true, "stdin_complete": true, "stdout_eof": true, "stderr_eof": true, "strict": null, "failure": "timeout", "legacy": 0 },
+    { "name": "stdin_incomplete", "code": 0, "timed_out": false, "stdin_complete": false, "stdout_eof": true, "stderr_eof": true, "strict": null, "failure": "incomplete", "legacy": 0 },
+    { "name": "stdout_incomplete", "code": 0, "timed_out": false, "stdin_complete": true, "stdout_eof": false, "stderr_eof": true, "strict": null, "failure": "incomplete", "legacy": 0 },
+    { "name": "stderr_incomplete", "code": 0, "timed_out": false, "stdin_complete": true, "stdout_eof": true, "stderr_eof": false, "strict": null, "failure": "incomplete", "legacy": 0 },
+    { "name": "both_incomplete_nonzero", "code": 7, "timed_out": false, "stdin_complete": true, "stdout_eof": false, "stderr_eof": false, "strict": null, "failure": "incomplete", "legacy": 7 }
+  ]
+}

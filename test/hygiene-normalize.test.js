@@ -105,7 +105,7 @@ test('error が不正型なら固定エラーにし、既知の分類と null �
     assert.ok(normalized.incomplete_fields?.includes('error'));
     assert.ok(hygiene.analyze(normalized).some((finding) => finding.id === 'repo-unobserved'));
   }
-  for (const error of [undefined, null, 'git_missing', 'walk_incomplete', 'no_python', 'timeout_or_unreachable', 'probe_failed', 'excluded', 'internal', 'unknown_error']) {
+  for (const error of [undefined, null, 'git_missing', 'walk_incomplete', 'no_python', 'timeout', 'incomplete', 'timeout_or_unreachable', 'probe_failed', 'excluded', 'internal', 'unknown_error']) {
     const normalized = hygiene.normalize({ ...audit(), error });
     assert.equal(normalized.error, error ?? null);
     assert.ok(!normalized.incomplete_fields?.includes('error'));
@@ -114,7 +114,7 @@ test('error が不正型なら固定エラーにし、既知の分類と null �
 
 test('未知の error は合成の機密らしい値を残さず未確認にする', () => {
   const marker = 'fixture-only-sensitive-value';
-  const values = ['', `https://unit-user:${marker}@example.test/r?token=${marker}`, { detail: marker }];
+  const values = ['', `https://unit-user:${marker}@example.com/r?token=${marker}`, { detail: marker }];
   for (const error of values) {
     const raw = { ...audit(), node_id: 'node-a', wall_s: 1, error };
     const normalized = hygiene.normalize(raw);

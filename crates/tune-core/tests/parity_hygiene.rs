@@ -143,7 +143,7 @@ fn normalize_metadata_preserves_unknown() {
 #[test]
 fn unknown_error_is_redacted() {
     let marker = "fixture-only-sensitive-value";
-    for error in [json!(""), json!(format!("https://unit-user:{marker}@example.test/r?token={marker}")), json!({ "detail": marker })] {
+    for error in [json!(""), json!(format!("https://unit-user:{marker}@example.com/r?token={marker}")), json!({ "detail": marker })] {
         let raw =
             json!({ "roots": [{ "path": "~/fixture", "source": "opt" }], "repos": [], "enumerated": 0, "skipped": 0, "truncated": false, "error": error });
         let normalized = normalize(&raw);
@@ -154,7 +154,18 @@ fn unknown_error_is_redacted() {
         assert!(!json!(analyze(&raw)).to_string().contains(marker));
         assert!(!tune_core::hygiene::progress(&raw, 1).1.contains(marker));
     }
-    for error in ["git_missing", "walk_incomplete", "excluded", "no_python", "timeout_or_unreachable", "probe_failed", "internal", "unknown_error"] {
+    for error in [
+        "git_missing",
+        "walk_incomplete",
+        "excluded",
+        "no_python",
+        "timeout",
+        "incomplete",
+        "timeout_or_unreachable",
+        "probe_failed",
+        "internal",
+        "unknown_error",
+    ] {
         assert_eq!(normalize(&json!({ "error": error }))["error"], error);
     }
 }
@@ -214,7 +225,7 @@ fn metadata_and_progress_match_js() {
     }
     for value in [
         json!(""),
-        json!("https://unit-user:fixture-only-sensitive-value@example.test/r?token=fixture-only-sensitive-value"),
+        json!("https://unit-user:fixture-only-sensitive-value@example.com/r?token=fixture-only-sensitive-value"),
         json!({ "detail": "fixture-only-sensitive-value" }),
         json!("no_python"),
         json!("timeout_or_unreachable"),
@@ -307,7 +318,7 @@ fn progress_raw_inputs_match_js() {
         cases.push(("error_invalid", raw));
     }
     let mut unknown = base.clone();
-    unknown["error"] = json!("https://unit-user:fixture-only-sensitive-value@example.test/r");
+    unknown["error"] = json!("https://unit-user:fixture-only-sensitive-value@example.com/r");
     cases.push(("error_invalid", unknown));
     let mut no_roots = base.clone();
     no_roots["roots"] = json!([]);

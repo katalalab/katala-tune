@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 
-use crate::ai_sessions::{NO_PYTHON, missing_python, run_python};
-use crate::collect::last_json_line;
+use crate::ai_sessions::{NO_PYTHON, run_python_strict};
+use crate::collect::{CompletionFailure, StrictRunResult, last_json_line};
 use crate::db::now_ms;
 use crate::js::{self, Obj};
 use crate::nodes::Node;
@@ -106,28 +106,35 @@ pub async fn audit_node(node: &Node, opts: &Value) -> Value {
     roots.extend(js::arr(node.get("repo_roots")).iter().cloned());
     o["roots"] = Value::Array(roots);
     let budget = clamp(js::get(Some(opts), "budget_s"), 5, 300, DEFAULT_BUDGET_S);
-    let res = run_python(node, &script(&o), Duration::from_secs((budget + 40) as u64)).await;
+    let res = run_python_strict(node, &script(&o), Duration::from_secs((budget + 40) as u64)).await;
     let wall_s = started.elapsed().as_secs_f64();
-    match last_json_line(&res.out).filter(|d| text(d.get("probe")) == Some("repo_hygiene")) {
+    let mut v = parse_run_result(&res);
+    v["node_id"] = node.id.clone().into();
+    v["wall_s"] = json!(wall_s);
+    v["at"] = now_ms().into();
+    v
+}
+
+fn parse_run_result(res: &StrictRunResult) -> Value {
+    let r = &res.result;
+    let no_python = r.out.lines().any(|line| js::trim(line) == NO_PYTHON);
+    if res.failure.is_some() || r.code != Some(0) {
+        let error = match res.failure {
+            Some(CompletionFailure::Timeout) => "timeout",
+            Some(CompletionFailure::SpawnMissing) if no_python => "no_python",
+            Some(_) => "incomplete",
+            None if r.code.is_none() => "incomplete",
+            None => "probe_failed",
+        };
+        return json!({ "ok": false, "error": error });
+    }
+    match last_json_line(&r.out).filter(|d| text(d.get("probe")) == Some("repo_hygiene")) {
         Some(data) => {
             let mut v = normalize(&data);
-            v["node_id"] = node.id.clone().into();
             v["ok"] = true.into();
-            v["wall_s"] = json!(wall_s);
-            v["at"] = now_ms().into();
             v
         }
-        None => {
-            // 標準エラーには何が混ざるか分からないので、理由の種類だけを残す
-            let error = if res.out.contains(NO_PYTHON) || missing_python(&res) {
-                "no_python"
-            } else if res.code.is_none() {
-                "timeout_or_unreachable"
-            } else {
-                "probe_failed"
-            };
-            json!({ "node_id": node.id, "ok": false, "error": error, "wall_s": wall_s, "at": now_ms() })
-        }
+        None => json!({ "ok": false, "error": if no_python { "no_python" } else { "probe_failed" } }),
     }
 }
 
@@ -230,7 +237,18 @@ pub fn normalize(data: &Value) -> Value {
         !v.is_null()
             && !matches!(
                 v.as_str(),
-                Some("git_missing" | "walk_incomplete" | "excluded" | "no_python" | "timeout_or_unreachable" | "probe_failed" | "internal" | "unknown_error")
+                Some(
+                    "git_missing"
+                        | "walk_incomplete"
+                        | "excluded"
+                        | "no_python"
+                        | "timeout"
+                        | "incomplete"
+                        | "timeout_or_unreachable"
+                        | "probe_failed"
+                        | "internal"
+                        | "unknown_error"
+                )
             )
     });
     let bad_counts = enumerated.is_some_and(|n| {
@@ -585,6 +603,40 @@ pub fn matrix(audits: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_hygiene_result_matches_shared_fixtures() {
+        let fixtures: Value = serde_json::from_str(include_str!("../../../test/fixtures/hygiene-process-result.json")).unwrap();
+        for case in fixtures["results"].as_array().unwrap() {
+            let failure = match case["failure"].as_str() {
+                Some("timeout") => Some(crate::collect::CompletionFailure::Timeout),
+                Some("incomplete") => Some(crate::collect::CompletionFailure::Incomplete),
+                Some("spawn_missing") => Some(crate::collect::CompletionFailure::SpawnMissing),
+                Some("spawn_failed") => Some(crate::collect::CompletionFailure::SpawnFailed),
+                None => None,
+                _ => unreachable!(),
+            };
+            let run = crate::collect::StrictRunResult {
+                result: crate::collect::RunResult {
+                    code: case["code"].as_i64().map(|n| n as i32),
+                    out: fixtures["outputs"][case["output"].as_str().unwrap()].as_str().unwrap().into(),
+                    err: "fixture-private-stderr".into(),
+                },
+                failure,
+            };
+            let parsed = parse_run_result(&run);
+            assert_eq!(parsed["ok"], case["ok"], "{}", case["name"]);
+            assert_eq!(parsed.get("error").unwrap_or(&Value::Null), &case["error"], "{}", case["name"]);
+            if case["ok"] == false {
+                assert!(parsed.get("repos").is_none(), "{}", case["name"]);
+                assert_eq!(normalize(&parsed)["error"], case["error"], "{}", case["name"]);
+            }
+            assert!(!parsed.to_string().contains("fixture-private-stderr"));
+            let mut other = StrictRunResult { result: run.result.clone(), failure: run.failure };
+            other.result.err = "Python was not found @@KATALA_TUNE_NO_PYTHON@@".into();
+            assert_eq!(parse_run_result(&other), parsed, "{}", case["name"]);
+        }
+    }
 
     #[test]
     fn incomplete_walk_is_distinct_from_truncation_and_keeps_observed_results() {
