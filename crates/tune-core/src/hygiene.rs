@@ -153,6 +153,7 @@ fn normalize_repo(r: &Value) -> Value {
     let is_count = |k: &str| g(k).and_then(Value::as_f64).is_some_and(|n| n.is_finite() && (0.0..=9_007_199_254_740_991.0).contains(&n) && n.fract() == 0.0);
     let ok = state_ok
         && ["tracked", "untracked", "conflicted"].iter().all(|k| is_count(k))
+        && ["ahead", "behind", "local_only", "stash"].iter().all(|k| g(k).is_none_or(Value::is_null) || is_count(k))
         && g("conflicted").and_then(Value::as_f64).zip(g("tracked").and_then(Value::as_f64)).is_some_and(|(c, t)| c <= t)
         && g("detached").is_some_and(Value::is_boolean)
         && g("upstream").is_some_and(Value::is_boolean);

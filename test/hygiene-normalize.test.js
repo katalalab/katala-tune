@@ -36,6 +36,35 @@ test('正常なゼロ・真偽値と任意項目の null は保つ', () => {
   assert.equal(hygiene.normalize({ repos: [largest] }).repos[0].tracked, Number.MAX_SAFE_INTEGER);
 });
 
+test('任意件数の不正値は未観測にし、null と欠損は許す', () => {
+  const fields = ['ahead', 'behind', 'local_only', 'stash'];
+  const invalid = ['1', false, -1, -0.5, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, {}, []];
+  for (const field of fields) {
+    for (const value of invalid) {
+      const [row] = hygiene.normalize({ repos: [{ ...observed(), [field]: value }] }).repos;
+      assert.equal(row.state, 'unobserved', `${field}: ${String(value)}`);
+      assert.equal(row.reason, 'git_failed');
+    }
+    const missing = observed();
+    delete missing[field];
+    const [row] = hygiene.normalize({ repos: [missing] }).repos;
+    assert.equal(row.state, 'ok');
+    assert.equal(row[field], null);
+    for (const value of [0, 1.0, Number.MAX_SAFE_INTEGER]) {
+      const [valid] = hygiene.normalize({ repos: [{ ...observed(), [field]: value }] }).repos;
+      assert.equal(valid.state, 'ok');
+      assert.equal(valid[field], value);
+    }
+  }
+});
+
+test('時刻のずれで負数になった経過秒は保つ', () => {
+  const [row] = hygiene.normalize({ repos: [{ ...observed(), dirty_age_s: -10, head_age_s: -20 }] }).repos;
+  assert.equal(row.state, 'ok');
+  assert.equal(row.dirty_age_s, -10);
+  assert.equal(row.head_age_s, -20);
+});
+
 test('正常な観測でも origin の認証情報は取り除く', () => {
   const raw = { ...observed(), origin: 'https://unit:token@example.com/acme/fixture.git?nonce=1' };
   const [row] = hygiene.normalize({ repos: [raw] }).repos;

@@ -145,7 +145,22 @@ fn normalize_observation_matches_js() {
     second["upstream"] = json!(true);
     let mut boundary = valid.clone();
     boundary["tracked"] = json!(9_007_199_254_740_991_u64);
-    let mut cases = vec![json!({ "repos": [valid.clone()] }), json!({ "repos": [second] }), json!({ "repos": [boundary] })];
+    let mut missing_optional = valid.clone();
+    for key in ["ahead", "behind", "local_only", "stash"] {
+        missing_optional.as_object_mut().unwrap().remove(key);
+    }
+    missing_optional["dirty_age_s"] = json!(-10);
+    missing_optional["head_age_s"] = json!(-20);
+    let mut optional_boundary = valid.clone();
+    optional_boundary["ahead"] = json!(9_007_199_254_740_991_u64);
+    optional_boundary["behind"] = json!(1.0);
+    let mut cases = vec![
+        json!({ "repos": [valid.clone()] }),
+        json!({ "repos": [second] }),
+        json!({ "repos": [boundary] }),
+        json!({ "repos": [missing_optional] }),
+        json!({ "repos": [optional_boundary] }),
+    ];
     let counts = vec![json!(null), json!("0"), json!(false), json!(-1), json!(-0.5), json!(1.5), json!(9_007_199_254_740_992_u64), json!({}), json!([])];
     let flags = vec![json!(null), json!("false"), json!(0), json!(1), json!({}), json!([])];
     for (fields, values) in [(&["tracked", "untracked", "conflicted"][..], &counts), (&["upstream", "detached"][..], &flags)] {
@@ -165,6 +180,14 @@ fn normalize_observation_matches_js() {
     let mut inconsistent = valid.clone();
     inconsistent["conflicted"] = json!(1);
     cases.push(json!({ "repos": [inconsistent] }));
+    let invalid_optional = vec![json!("1"), json!(false), json!(-1), json!(-0.5), json!(0.5), json!(9_007_199_254_740_992_u64), json!({}), json!([])];
+    for field in ["ahead", "behind", "local_only", "stash"] {
+        for value in &invalid_optional {
+            let mut row = valid.clone();
+            row[field] = value.clone();
+            cases.push(json!({ "repos": [row] }));
+        }
+    }
 
     // stdin を使い、実リポジトリの調査や一時ファイルの作成を行わない。
     let js_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("lib").join("hygiene.js");
@@ -196,10 +219,21 @@ fn normalize_observation_matches_js() {
     for (i, (j, r)) in js.iter().zip(&rust).enumerate() {
         assert!(same(j, r), "合成入力 #{i} の JS と Rust が不一致");
         let row = &r["normalized"]["repos"][0];
-        if i < 3 {
+        if i < 5 {
             assert_eq!(row["state"], "ok");
-            for key in ["branch", "ahead", "behind", "local_only", "dirty_age_s", "head_age_s", "stash", "origin"] {
+            for key in ["branch", "local_only", "stash", "origin"] {
                 assert!(row[key].is_null(), "任意項目 {key} の null が失われた");
+            }
+            if i != 4 {
+                assert!(row["ahead"].is_null());
+                assert!(row["behind"].is_null());
+            }
+            if i == 3 {
+                assert_eq!(row["dirty_age_s"], -10);
+                assert_eq!(row["head_age_s"], -20);
+            } else {
+                assert!(row["dirty_age_s"].is_null());
+                assert!(row["head_age_s"].is_null());
             }
         } else {
             assert_eq!(row["state"], "unobserved", "合成入力 #{i}");
