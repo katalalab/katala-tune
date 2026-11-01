@@ -121,7 +121,8 @@ impl Store {
     /// One bounded read of the requested ID's display fields and fixed metadata.
     /// Snapshot bodies, history details and failure text never leave SQLite.
     pub fn saved_machine_reading(&self, node_id: &str) -> Result<MachineReading> {
-        let row: (Option<i64>, Option<i64>, Option<i64>, Option<i64>, bool, Option<i64>, i64, Option<i64>) = self.conn.query_row(
+        type SavedMachineRow = (Option<i64>, Option<i64>, Option<i64>, Option<i64>, bool, Option<i64>, i64, Option<i64>);
+        let row: SavedMachineRow = self.conn.query_row(
             "SELECT s.at, s.score, s.critical, s.warn, f.k IS NOT NULL,
                     CASE WHEN f.k IS NULL THEN NULL
                          WHEN typeof(f.v) != 'text' OR octet_length(f.v) > 8192 THEN NULL
