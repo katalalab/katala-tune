@@ -131,7 +131,14 @@ fn check(kind: &str, inputs: &[Value], js: &Value, rust: &[Value]) {
 #[test]
 fn hygiene_matches_js() {
     let mut r = Rng(0x9E37_79B9_7F4A_7C15);
-    let raws: Vec<Value> = (0..300).map(|_| raw_audit(&mut r)).collect();
+    let mut raws: Vec<Value> = (0..300).map(|_| raw_audit(&mut r)).collect();
+    for truncated in [false, true] {
+        raws.push(json!({
+            "probe": "repo_hygiene", "error": "walk_incomplete", "truncated": truncated, "repos": [
+                {"state": "ok", "path": "fixture/project", "tracked": 1, "untracked": 0, "conflicted": 0, "upstream": false, "detached": false}
+            ]
+        }));
+    }
     let normalized: Vec<Value> = raws.iter().map(normalize).collect();
     let urls: Vec<Value> = URLS
         .iter()
