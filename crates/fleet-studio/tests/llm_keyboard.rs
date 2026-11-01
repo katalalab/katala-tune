@@ -159,7 +159,7 @@ fn search_recovery_keeps_action_keys_and_old_confirmation_blocked() {
 }
 
 #[test]
-fn focus_recovery_allows_only_l_and_m_to_start_selection_once() {
+fn focus_recovery_allows_l_and_m_to_start_selection_once() {
     let mut gate = NavigationKeyGate::default();
     gate.focus_lost();
     for key in ["l", "m"] {
