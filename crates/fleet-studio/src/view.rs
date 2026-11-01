@@ -3,7 +3,7 @@ use std::time::Duration;
 use fleet_studio::Observation;
 use fleet_studio::audit::{self, Audit, RepoAudit, Scope};
 use fleet_studio::llm::{self, Endpoint, ModelError, ModelObservation};
-use fleet_studio::navigation;
+use fleet_studio::navigation::{self, OpenResult, OpenState, OpenStatus, OpenTarget};
 use fleet_studio::source::{self, Coverage, Dashboard, NodeCard, Repository};
 use gpui::{Context, FocusHandle, IntoElement, KeyDownEvent, Render, SharedString, Window, div, prelude::*, rgb};
 
@@ -35,6 +35,7 @@ pub struct FleetView {
     search: String,
     searching: bool,
     selected: usize,
+    open_state: OpenState,
 }
 
 impl FleetView {
@@ -62,6 +63,7 @@ impl FleetView {
             search: String::new(),
             searching: false,
             selected: 0,
+            open_state: OpenState::default(),
         };
         let executor = cx.background_executor().clone();
         cx.spawn(async move |view, cx| {
@@ -375,7 +377,7 @@ impl FleetView {
                 "up" => self.selected = self.selected.saturating_sub(1),
                 "enter" => {
                     if let Some(url) = self.selected_url() {
-                        cx.open_url(&url);
+                        self.open_github(&url, cx);
                     }
                 }
                 "escape" => {
@@ -395,16 +397,47 @@ impl FleetView {
     }
 
     fn selected_url(&self) -> Option<String> {
-        self.dashboard
-            .as_ref()?
-            .repositories
-            .iter()
-            .filter(|repo| self.matches(&repo.name))
-            .take(200)
-            .nth(self.selected)?
-            .origin
-            .as_deref()
-            .and_then(navigation::repository_url)
+        navigation::selected_repository_url(&self.dashboard.as_ref()?.repositories, &self.search, self.selected)
+    }
+
+    fn open_github(&mut self, url: &str, cx: &mut Context<Self>) {
+        if let Some(target) = OpenTarget::github(url) {
+            self.open_target(target, cx);
+        }
+    }
+
+    fn open_target(&mut self, target: OpenTarget, cx: &mut Context<Self>) {
+        let Some(id) = self.open_state.start() else { return };
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        if std::thread::Builder::new()
+            .name("fleet-studio-open".into())
+            .spawn(move || {
+                let _ = sender.send(target.open());
+            })
+            .is_err()
+        {
+            self.open_state.finish(id, OpenResult::Failed);
+            cx.notify();
+            return;
+        }
+        let timer = cx.background_executor().timer(Duration::from_secs(5));
+        cx.spawn(async move |view, cx| {
+            timer.await;
+            let _ = view.update(cx, |view, cx| {
+                view.open_state.timed_out(id);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.spawn(async move |view, cx| {
+            let result = receiver.await.unwrap_or(OpenResult::Failed);
+            let _ = view.update(cx, |view, cx| {
+                view.open_state.finish(id, result);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 }
 
@@ -503,6 +536,17 @@ impl Render for FleetView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = tune_core::db::now_ms();
         let mut content = div().id("content").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5();
+        let open_message = match self.open_state.status() {
+            OpenStatus::Idle => None,
+            OpenStatus::Pending => Some("リンクを開いています。"),
+            OpenStatus::Waiting => Some("リンクを開く処理の結果は未確認です（終了待ち）。"),
+            OpenStatus::Accepted => Some("リンクを OS に引き渡しました。表示や接続は未確認です。"),
+            OpenStatus::Failed => Some("リンクを開けませんでした。対象と OS の設定を確認してください。"),
+            OpenStatus::Unavailable => Some("この OS ではリンクを開く操作に未対応です。"),
+        };
+        if let Some(message) = open_message {
+            content = content.child(note(message.into(), 0xffb86c));
+        }
         if self.load_timeout {
             content = content.child(note("保存データの読込が 5 秒を超過（終了待ち）。前回の結果は不明として表示します。".into(), 0xffb86c));
         }
@@ -567,12 +611,19 @@ impl Render for FleetView {
                     .flex_col()
                     .child(format!("{}{}", if self.selected == index { "› " } else { "  " }, repo.name))
                     .child(div().text_sm().text_color(rgb(0x9baec4)).child(format!(
-                        "{} / 取得: {}",
+                        "{} / 取得: {}{}",
                         if repo.previous { "前回（取得失敗・未確認）" } else { observation_text(repo.freshness(now)) },
-                        when(repo.observed_at)
+                        when(repo.observed_at),
+                        if repo.origin.is_none() {
+                            " / 元情報不明"
+                        } else if url.is_none() {
+                            " / 起動対象外（GitHub HTTPS 限定）"
+                        } else {
+                            ""
+                        }
                     )));
                 if let Some(url) = url {
-                    item = item.cursor_pointer().on_click(move |_, _, cx| cx.open_url(&url));
+                    item = item.cursor_pointer().on_click(cx.listener(move |view, _, _, cx| view.open_github(&url, cx)));
                 }
                 content = content.child(item);
             }
@@ -625,7 +676,7 @@ impl Render for FleetView {
                     when(repo.at),
                     repo.error.map_or(String::new(), |error| format!(" / {error}"))
                 );
-                let local_url = repo.local.then(|| navigation::local_directory(&repo.path)).flatten();
+                let local_path = repo.local && OpenTarget::directory(&repo.path).is_some();
                 let mut item = div()
                     .id(SharedString::from(format!("audit-{index}")))
                     .p_3()
@@ -634,9 +685,18 @@ impl Render for FleetView {
                     .flex()
                     .flex_col()
                     .child(format!("{}{} · {}", repo.node, if repo.local { "（この機体）" } else { "（台帳名・接続先 hostname 未照合）" }, repo.path))
-                    .child(div().text_sm().text_color(rgb(0x9baec4)).child(detail));
-                if let Some(url) = local_url {
-                    item = item.cursor_pointer().on_click(move |_, _, cx| cx.open_url(&url));
+                    .child(div().text_sm().text_color(rgb(0x9baec4)).child(if local_path {
+                        format!("{detail} / クリックで場所を表示")
+                    } else {
+                        detail
+                    }));
+                if local_path {
+                    let path = repo.path.clone();
+                    item = item.cursor_pointer().on_click(cx.listener(move |view, _, _, cx| {
+                        if let Some(target) = OpenTarget::directory(&path) {
+                            view.open_target(target, cx);
+                        }
+                    }));
                 }
                 content = content.child(item);
             }
@@ -739,14 +799,14 @@ impl Render for FleetView {
                                 .id("documentation")
                                 .cursor_pointer()
                                 .child("説明")
-                                .on_click(|_, _, cx| cx.open_url("https://github.com/katalalab/katala-tune#readme")),
+                                .on_click(cx.listener(|view, _, _, cx| view.open_github("https://github.com/katalalab/katala-tune", cx))),
                         )
                         .child(
                             div()
                                 .id("issues")
                                 .cursor_pointer()
                                 .child("Issues")
-                                .on_click(|_, _, cx| cx.open_url("https://github.com/katalalab/katala-tune/issues")),
+                                .on_click(cx.listener(|view, _, _, cx| view.open_github("https://github.com/katalalab/katala-tune/issues", cx))),
                         ),
                 ),
             )
