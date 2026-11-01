@@ -148,12 +148,19 @@ pub fn strip_url(s: Option<&str>) -> Option<String> {
 fn normalize_repo(r: &Value) -> Value {
     let x = Some(r);
     let g = |k: &str| js::get(x, k);
-    let ok = text(g("state")) == Some("ok");
+    let state_ok = text(g("state")) == Some("ok");
+    // JS で正確に表せる非負整数だけを受け入れ、表記上の 1.0 も 1 と同じように扱う。
+    let is_count = |k: &str| g(k).and_then(Value::as_f64).is_some_and(|n| n.is_finite() && (0.0..=9_007_199_254_740_991.0).contains(&n) && n.fract() == 0.0);
+    let ok = state_ok
+        && ["tracked", "untracked", "conflicted"].iter().all(|k| is_count(k))
+        && g("conflicted").and_then(Value::as_f64).zip(g("tracked").and_then(Value::as_f64)).is_some_and(|(c, t)| c <= t)
+        && g("detached").is_some_and(Value::is_boolean)
+        && g("upstream").is_some_and(Value::is_boolean);
     let reason = if ok {
         Value::Null
     } else {
         let t = text(g("reason")).unwrap_or("");
-        json!(if matches!(t, "timeout" | "git_failed" | "over_limit") { t } else { "git_failed" })
+        json!(if !state_ok && matches!(t, "timeout" | "git_failed" | "over_limit") { t } else { "git_failed" })
     };
     let base = Obj::new()
         .set("path", text(g("path")).unwrap_or(""))

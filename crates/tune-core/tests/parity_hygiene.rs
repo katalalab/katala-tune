@@ -2,8 +2,9 @@
 //! 入力は決まった種から作る架空のパス・origin・件数（実在のリポジトリ名などは使わない）。
 //! node（24 以上）が要る。無い環境では失敗する（KATALA_TUNE_PARITY=skip で飛ばせる）。
 
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 use tune_core::hygiene::{analyze, matrix, normalize, path_status, script, strip_url};
@@ -125,6 +126,87 @@ fn check(kind: &str, inputs: &[Value], js: &Value, rust: &[Value]) {
     assert_eq!(js.len(), rust.len(), "{kind}: 件数が違う");
     for (i, (j, r)) in js.iter().zip(rust).enumerate() {
         assert!(same(j, r), "{kind}: #{i} が JS と違う\n入力: {}\nJS:   {j}\nRust: {r}", inputs[i]);
+    }
+}
+
+#[test]
+fn normalize_observation_matches_js() {
+    let valid = json!({
+        "path": "~/fixture", "rel": "example.com/acme/fixture", "linked": false, "state": "ok",
+        "branch": null, "detached": false, "upstream": false, "ahead": null, "behind": null, "local_only": null,
+        "tracked": 0, "untracked": 0, "conflicted": 0, "dirty_age_s": null, "head_age_s": null, "stash": null,
+        "origin": null, "origin_host": null, "origin_path": null, "has_origin": null,
+    });
+    let mut second = valid.clone();
+    second["tracked"] = json!(1.0);
+    second["untracked"] = json!(2);
+    second["conflicted"] = json!(1);
+    second["detached"] = json!(true);
+    second["upstream"] = json!(true);
+    let mut boundary = valid.clone();
+    boundary["tracked"] = json!(9_007_199_254_740_991_u64);
+    let mut cases = vec![json!({ "repos": [valid.clone()] }), json!({ "repos": [second] }), json!({ "repos": [boundary] })];
+    let counts = vec![json!(null), json!("0"), json!(false), json!(-1), json!(-0.5), json!(1.5), json!(9_007_199_254_740_992_u64), json!({}), json!([])];
+    let flags = vec![json!(null), json!("false"), json!(0), json!(1), json!({}), json!([])];
+    for (fields, values) in [(&["tracked", "untracked", "conflicted"][..], &counts), (&["upstream", "detached"][..], &flags)] {
+        for field in fields {
+            for value in std::iter::once(None).chain(values.iter().cloned().map(Some)) {
+                let mut row = valid.clone();
+                if let Some(value) = value {
+                    row[*field] = value;
+                } else {
+                    row.as_object_mut().unwrap().remove(*field);
+                }
+                row["reason"] = json!("timeout");
+                cases.push(json!({ "repos": [row] }));
+            }
+        }
+    }
+    let mut inconsistent = valid.clone();
+    inconsistent["conflicted"] = json!(1);
+    cases.push(json!({ "repos": [inconsistent] }));
+
+    // stdin を使い、実リポジトリの調査や一時ファイルの作成を行わない。
+    let js_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("lib").join("hygiene.js");
+    let mut child = Command::new("node")
+        .arg("--no-warnings")
+        .arg("-e")
+        .arg("const h=require(process.argv[1]);const fs=require('node:fs');const a=JSON.parse(fs.readFileSync(0,'utf8'));console.log(JSON.stringify(a.map(x=>{const n=h.normalize(x);return {normalized:n,findings:h.analyze(n),matrix:h.matrix([{node_id:'node-a',...n}])}})))")
+        .arg(js_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("node が必要");
+    child.stdin.take().unwrap().write_all(serde_json::to_string(&cases).unwrap().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "JS 評価が失敗");
+    let js: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap();
+    let rust: Vec<Value> = cases
+        .iter()
+        .map(|raw| {
+            let normalized = normalize(raw);
+            let findings = analyze(&normalized);
+            let mut audit = normalized.clone();
+            audit["node_id"] = json!("node-a");
+            json!({ "normalized": normalized, "findings": findings, "matrix": matrix(&[audit]) })
+        })
+        .collect();
+    assert_eq!(js.len(), rust.len());
+    for (i, (j, r)) in js.iter().zip(&rust).enumerate() {
+        assert!(same(j, r), "合成入力 #{i} の JS と Rust が不一致");
+        let row = &r["normalized"]["repos"][0];
+        if i < 3 {
+            assert_eq!(row["state"], "ok");
+            for key in ["branch", "ahead", "behind", "local_only", "dirty_age_s", "head_age_s", "stash", "origin"] {
+                assert!(row[key].is_null(), "任意項目 {key} の null が失われた");
+            }
+        } else {
+            assert_eq!(row["state"], "unobserved", "合成入力 #{i}");
+            assert_eq!(row["reason"], "git_failed", "合成入力 #{i}");
+            assert_eq!(r["findings"][0]["id"], "repo-unobserved", "合成入力 #{i}");
+            assert_eq!(r["findings"].as_array().unwrap().len(), 1);
+        }
     }
 }
 
