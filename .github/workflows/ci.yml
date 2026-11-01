@@ -32,6 +32,9 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      - name: Repository hygiene walk mock
+        run: python3 -I -B test/test_repo_hygiene_walk.py
+        timeout-minutes: 1
       - name: Windows Security log cursor regression
         if: runner.os == 'Windows'
         shell: powershell

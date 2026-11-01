@@ -1,7 +1,9 @@
 """Synthetic directory traversal tests; no filesystem scan or subprocess is used."""
 import importlib.util
 import json
+import ntpath
 import pathlib
+import posixpath
 import unittest
 from unittest import mock
 
@@ -26,7 +28,54 @@ class InlinePool:
 
 
 class WalkTests(unittest.TestCase):
-    def run_probe(self, entries, repositories=(), deadline=None, stop_after_failure=False):
+    def test_root_normalization_preserves_posix_windows_and_unc_roots(self):
+        cases = [
+            ("/", posixpath, "/"),
+            ("//", posixpath, "//"),
+            ("///", posixpath, "/"),
+            ("/fixture///", posixpath, "/fixture"),
+            ("", posixpath, ""),
+            ("C:\\", ntpath, "C:/"),
+            ("C:", ntpath, "C:"),
+            ("//", ntpath, "//"),
+            ("///", ntpath, "///"),
+            ("C:\\fixture\\", ntpath, "C:/fixture"),
+            ("\\\\fixture-server\\share\\", ntpath, "//fixture-server/share/"),
+            ("\\\\fixture-server\\share", ntpath, "//fixture-server/share"),
+            ("", ntpath, ""),
+        ]
+        for value, pathmod, expected in cases:
+            with self.subTest(value=value, pathmod=pathmod.__name__):
+                self.assertEqual(probe.normalize_root(value, pathmod), expected)
+
+    def test_relative_paths_preserve_absolute_and_drive_relative_roots(self):
+        cases = [
+            ("/fixture/project", "/", posixpath, "fixture/project"),
+            ("//fixture/project", "//", posixpath, "fixture/project"),
+            ("C:/fixture/project", "C:/", ntpath, "fixture/project"),
+            ("C:project", "C:", ntpath, "project"),
+            ("C:/other", "C:", ntpath, None),
+            ("C:../other", "C:", ntpath, None),
+            ("C:child/../other", "C:", ntpath, None),
+            ("//fixture-server/share/project", "//fixture-server/share/", ntpath, "project"),
+            ("//fixture-server/share-other/project", "//fixture-server/share", ntpath, None),
+        ]
+        for path, root, pathmod, expected in cases:
+            with self.subTest(path=path, root=root):
+                self.assertEqual(probe.relative_to_root(path, root, pathmod), expected)
+
+    def test_unc_share_root_with_or_without_trailing_slash_is_same(self):
+        self.assertTrue(probe.same_root("//fixture-server/share/", "//fixture-server/share", ntpath))
+        self.assertTrue(probe.same_root("//FIXTURE-SERVER/share", "//fixture-server/share/", ntpath))
+        self.assertFalse(probe.same_root("//fixture-server/share/", "//fixture-server/other", ntpath))
+        self.assertFalse(probe.same_root("C:/", "C:", ntpath))
+
+    def test_explicit_posix_root_survives_ghq_selection(self):
+        with mock.patch.object(probe, "GHQ_ROOT_OPT", "/"), \
+             mock.patch.object(probe.shutil, "which", side_effect=AssertionError("must not run discovery")):
+            self.assertEqual(probe.ghq_root(), ("/", "opt"))
+
+    def run_probe(self, entries, repositories=(), deadline=None, stop_after_failure=False, root="/fixture", extra_roots=(), unavailable=(), links=()):
         def listdir(path):
             value = entries[probe.slash(path)]
             if isinstance(value, OSError):
@@ -36,15 +85,15 @@ class WalkTests(unittest.TestCase):
             return value
 
         def scan(path, _root):
-            return {"path": probe.slash(path), "state": "ok", "tracked": 1, "untracked": 0}
+            return {"path": probe.slash(path), "state": "ok", "tracked": 1, "untracked": 0, "conflicted": 0, "upstream": False, "detached": False}
 
         with mock.patch.object(probe.shutil, "which", return_value="synthetic-git"), \
-             mock.patch.object(probe, "ghq_root", return_value=("/fixture", "opt")), \
-             mock.patch.object(probe, "EXTRA_ROOTS", []), \
+             mock.patch.object(probe, "ghq_root", return_value=(root, "opt" if root else None)), \
+             mock.patch.object(probe, "EXTRA_ROOTS", extra_roots), \
              mock.patch.object(probe, "HOME", "/synthetic-home"), \
              mock.patch.object(probe.os, "listdir", side_effect=listdir), \
-             mock.patch.object(probe.os.path, "isdir", return_value=True), \
-             mock.patch.object(probe.os.path, "islink", return_value=False), \
+             mock.patch.object(probe.os.path, "isdir", side_effect=lambda path: probe.slash(path) not in unavailable), \
+             mock.patch.object(probe.os.path, "islink", side_effect=lambda path: probe.slash(path) in links), \
              mock.patch.object(probe.os.path, "isfile", return_value=False), \
              mock.patch.object(probe, "is_repo", side_effect=lambda path: probe.slash(path) in repositories), \
              mock.patch.object(probe, "scan", side_effect=scan), \
@@ -97,6 +146,54 @@ class WalkTests(unittest.TestCase):
         self.assertTrue(data["truncated"])
         self.assertNotIn("private-denied", raw)
         self.assertNotIn("private-error", raw)
+
+    def test_selected_root_unavailable_is_unknown_but_missing_optional_root_is_not(self):
+        data, raw = self.run_probe({}, unavailable={"/fixture"})
+        self.assertEqual(data.get("error"), "walk_incomplete")
+        self.assertFalse(data["truncated"])
+        self.assertEqual(data["repos"], [])
+        self.assertNotIn("/fixture", raw)
+        optional, _ = self.run_probe({}, root=None)
+        self.assertNotIn("error", optional)
+        self.assertEqual(optional["roots"], [])
+        blank, _ = self.run_probe({}, root=None, extra_roots=[""])
+        self.assertNotIn("error", blank)
+
+    def test_unavailable_extra_root_preserves_main_root_and_symlink_root_is_followed(self):
+        data, raw = self.run_probe(
+            {"/fixture": ["repo"]},
+            {"/fixture/repo"},
+            extra_roots=["/private-extra"],
+            unavailable={"/private-extra"},
+            links={"/fixture"},
+        )
+        self.assertEqual(data.get("error"), "walk_incomplete")
+        self.assertFalse(data["truncated"])
+        self.assertEqual(data["enumerated"], 1)
+        self.assertEqual(data["repos"][0]["path"], "/fixture/repo")
+        self.assertNotIn("private-extra", raw)
+
+    def test_unc_share_root_is_not_walked_twice(self):
+        data, _ = self.run_probe(
+            {"//fixture-server/share/": ["repo"]},
+            {"//fixture-server/share/repo"},
+            root="//fixture-server/share/",
+            extra_roots=["//fixture-server/share"],
+        )
+        self.assertNotIn("error", data)
+        self.assertEqual(len(data["roots"]), 1)
+        self.assertEqual(data["enumerated"], 1)
+
+    def test_unc_share_extra_roots_are_not_walked_twice(self):
+        data, _ = self.run_probe(
+            {"//fixture-server/share": ["repo"]},
+            {"//fixture-server/share/repo"},
+            root=None,
+            extra_roots=["//fixture-server/share", "//fixture-server/share/"],
+        )
+        self.assertNotIn("error", data)
+        self.assertEqual(len(data["roots"]), 1)
+        self.assertEqual(data["enumerated"], 1)
 
 
 if __name__ == "__main__":

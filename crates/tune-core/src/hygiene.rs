@@ -37,6 +37,16 @@ fn opt_s(v: Option<&Value>) -> Value {
 fn opt_i(v: Option<&Value>) -> Value {
     int(v).map_or(Value::Null, Value::from)
 }
+
+/// Do not present the number of unexplored repositories as known.
+pub fn walk_coverage_note(audit: &Value) -> &'static str {
+    if text(audit.get("error")) == Some("walk_incomplete") || audit.get("truncated") == Some(&Value::Bool(true)) {
+        "・探索未確認あり（件数不明）"
+    } else {
+        ""
+    }
+}
+
 /// UTF-16 の単位で比べる（JS の `<`）
 fn cmp16(a: &str, b: &str) -> Ordering {
     a.encode_utf16().cmp(b.encode_utf16())
@@ -491,7 +501,10 @@ mod tests {
             assert!(detail.contains("探索先の一部を確認できない"));
             assert_eq!(detail.contains("探索を時間または件数で打ち切った"), truncated);
             assert!(findings.iter().any(|finding| finding["id"] == "repo-dirty"));
+            assert_eq!(walk_coverage_note(&data), "・探索未確認あり（件数不明）");
         }
+        assert_eq!(walk_coverage_note(&json!({ "error": null, "truncated": true })), "・探索未確認あり（件数不明）");
+        assert_eq!(walk_coverage_note(&json!({ "error": "git_missing" })), "");
     }
 
     #[test]

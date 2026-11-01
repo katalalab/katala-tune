@@ -15,6 +15,7 @@ test('探索失敗を打切りと区別し、確認できた結果を保つ', ()
   assert.match(missing.detail, /探索先の一部を確認できない/);
   assert.doesNotMatch(missing.detail, /時間または件数で打ち切った/);
   assert.equal(findings.some((finding) => finding.id === 'repo-dirty'), true);
+  assert.equal(hygiene.walkCoverageNote(data), '・探索未確認あり（件数不明）');
 });
 
 test('探索失敗と時間・件数の打切りが同時なら両方を示す', () => {
@@ -22,4 +23,7 @@ test('探索失敗と時間・件数の打切りが同時なら両方を示す',
   const missing = hygiene.analyze(data).find((finding) => finding.id === 'repo-unobserved');
   assert.match(missing.detail, /探索先の一部を確認できない/);
   assert.match(missing.detail, /探索を時間または件数で打ち切った/);
+  assert.equal(hygiene.walkCoverageNote(data), '・探索未確認あり（件数不明）');
+  assert.equal(hygiene.walkCoverageNote({ error: null, truncated: true }), '・探索未確認あり（件数不明）');
+  assert.equal(hygiene.walkCoverageNote({ error: null }), '');
 });

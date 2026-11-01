@@ -13,6 +13,7 @@ const out = {};
 out.stripUrl = (cases.stripUrl || []).map((s) => plain(hygiene.stripUrl(s)));
 out.normalize = (cases.normalize || []).map((d) => plain(hygiene.normalize(d)));
 out.analyze = (cases.analyze || []).map((a) => plain(hygiene.analyze(a)));
+out.walkCoverageNote = (cases.walkCoverageNote || []).map((a) => hygiene.walkCoverageNote(a));
 out.pathStatus = (cases.pathStatus || []).map((r) => hygiene.pathStatus(r));
 out.matrix = (cases.matrix || []).map((a) => plain(hygiene.matrix(a)));
 out.script = (cases.script || []).map((o) => hygiene.script(o));
