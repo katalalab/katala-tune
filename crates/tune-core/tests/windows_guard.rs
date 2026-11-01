@@ -33,6 +33,21 @@ fn owned_fixture() {
             std::io::stdout().flush().unwrap();
             std::thread::sleep(Duration::from_secs(30));
         }
+        "bystander" => {
+            let expected = tune_core::collect::ProcessIdentity {
+                pid: std::env::var("KATALA_GUARD_PARENT_PID").unwrap().parse().unwrap(),
+                created_filetime: std::env::var("KATALA_GUARD_PARENT_CREATED").unwrap(),
+                os_session: std::env::var("KATALA_GUARD_PARENT_SESSION").unwrap().parse().unwrap(),
+            };
+            // Observe only the exact test process that started this fixture; a
+            // reused PID is not sufficient to keep an orphan fixture alive.
+            let parent = retain_test_child(expected.pid);
+            assert_eq!(retained_fixture_identity(&parent), expected);
+            let end = deadline(Duration::from_secs(60));
+            while !signaled(&parent) && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         "stdout" | "stderr" => {
             let block = [b'x'; 8192];
             for _ in 0..512 {
@@ -49,14 +64,47 @@ fn owned_fixture() {
             std::io::stdout().flush().unwrap();
             // It is intentionally not waited: only the product-owned Job may remove this descendant.
         }
-        "cancel" => {
-            let child = fixture_command("sleep").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-            let path = std::env::var_os("KATALA_GUARD_READY").unwrap();
-            let mut ready = std::fs::OpenOptions::new().create_new(true).write(true).open(path).unwrap();
-            writeln!(ready, "{} {}", std::process::id(), child.id()).unwrap();
-            ready.sync_all().unwrap();
-            drop(ready);
+        "cancel" | "cancel-pipe" => {
+            let mut command = fixture_command("sleep");
+            command.stdin(Stdio::null());
+            if mode == "cancel" {
+                command.stdout(Stdio::null()).stderr(Stdio::null());
+            }
+            let child = command.spawn().unwrap();
+            let path = std::path::PathBuf::from(std::env::var_os("KATALA_GUARD_READY").unwrap());
+            if mode == "cancel-pipe" {
+                publish_fixture_marker(&path, &format!("{} {}\n", std::process::id(), child.id()));
+            } else {
+                let mut ready = std::fs::OpenOptions::new().create_new(true).write(true).open(path).unwrap();
+                writeln!(ready, "{} {}", std::process::id(), child.id()).unwrap();
+                ready.sync_all().unwrap();
+            }
             std::thread::sleep(Duration::from_secs(30));
+        }
+        "owner-crash" => {
+            let directory = std::path::PathBuf::from(std::env::var_os("KATALA_GUARD_OWNER_DIR").unwrap());
+            publish_fixture_marker(&directory.join("owner-ready"), &format!("{}\n", std::process::id()));
+            let signal_dir = directory.clone();
+            std::thread::spawn(move || {
+                let end = deadline(Duration::from_secs(15));
+                while !signal_dir.join("crash-owner").exists() {
+                    assert!(Instant::now() < end, "fixture owner release deadline");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                terminate_fixture_self();
+            });
+            let mut environment = fixture_environment("cancel-pipe");
+            environment.push(("KATALA_GUARD_READY".into(), directory.join("children-ready").into_os_string()));
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let _ = runtime.block_on(run_standalone_windows_bounded(
+                &fixture_invocation(),
+                StandaloneWindowsEnvironment::new(&environment),
+                b"",
+                deadline(Duration::from_secs(15)),
+                65536,
+                65536,
+            ));
+            panic!("fixture owner unexpectedly completed before its forced exit");
         }
         "root-first" => {
             let directory = std::path::PathBuf::from(std::env::var_os("KATALA_GUARD_QUIET_DIR").unwrap());
@@ -134,6 +182,23 @@ fn owned_fixture() {
     }
     // Avoid test harness stdout/stderr trailers and release all inherited handles immediately.
     std::process::exit(0);
+}
+
+fn publish_fixture_marker(path: &std::path::Path, frame: &str) {
+    let temporary = path.with_extension("pending");
+    let mut file = std::fs::OpenOptions::new().create_new(true).write(true).open(&temporary).unwrap();
+    file.write_all(frame.as_bytes()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    std::fs::rename(temporary, path).unwrap();
+}
+
+#[allow(unsafe_code)]
+fn terminate_fixture_self() -> ! {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+    // SAFETY: the fixture targets only its own current-process pseudo-handle.
+    let result = unsafe { TerminateProcess(GetCurrentProcess(), 123) };
+    panic!("fixture self-termination returned unexpectedly: {result}");
 }
 
 fn fixture_invocation() -> Command {
@@ -468,6 +533,73 @@ fn signaled(handle: &std::os::windows::io::OwnedHandle) -> bool {
     unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(handle.as_raw_handle(), 0) == 0 }
 }
 
+#[allow(unsafe_code)]
+fn retained_fixture_identity(handle: &std::os::windows::io::OwnedHandle) -> tune_core::collect::ProcessIdentity {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::{
+        RemoteDesktop::ProcessIdToSessionId,
+        Threading::{GetProcessId, GetProcessTimes},
+    };
+    let mut created = Default::default();
+    let mut exited = Default::default();
+    let mut kernel = Default::default();
+    let mut user = Default::default();
+    // SAFETY: the caller retains this read-only observer while all outputs are valid.
+    let pid = unsafe { GetProcessId(handle.as_raw_handle()) };
+    assert_ne!(pid, 0);
+    // SAFETY: the same retained query handle and four distinct writable FILETIMEs.
+    assert_ne!(unsafe { GetProcessTimes(handle.as_raw_handle(), &mut created, &mut exited, &mut kernel, &mut user) }, 0);
+    let mut session = 0;
+    // SAFETY: the retained live process ID and writable session output are valid.
+    assert_ne!(unsafe { ProcessIdToSessionId(pid, &mut session) }, 0);
+    let created = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+    assert_ne!(created, 0);
+    tune_core::collect::ProcessIdentity { pid, created_filetime: created.to_string(), os_session: session }
+}
+
+struct OwnedBystander(std::process::Child);
+
+impl Drop for OwnedBystander {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() && self.0.kill().is_ok() {
+            let end = deadline(Duration::from_secs(2));
+            while matches!(self.0.try_wait(), Ok(None)) && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+fn owned_bystander() -> OwnedBystander {
+    // A separately started fixture is not a member of the invocation's Job.
+    // It observes this exact test process and exits on parent death or after a
+    // generous ceiling; its retained Child handle is the only cleanup target.
+    let parent_identity = tune_core::collect::current_windows_process_identity().unwrap();
+    let mut command = fixture_command("bystander");
+    command
+        .env("KATALA_GUARD_PARENT_PID", parent_identity.pid.to_string())
+        .env("KATALA_GUARD_PARENT_CREATED", parent_identity.created_filetime)
+        .env("KATALA_GUARD_PARENT_SESSION", parent_identity.os_session.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    OwnedBystander(command.spawn().unwrap())
+}
+
+#[tokio::test]
+async fn bystander_cleanup_on_unwind() {
+    let _serial = SERIAL.lock().await;
+    let mut bystander = owned_bystander();
+    assert!(bystander.0.try_wait().unwrap().is_none(), "the owned fixture must start live");
+    let observer = retain_test_child(bystander.0.id());
+    let result = std::panic::catch_unwind(|| {
+        let _owned = bystander;
+        panic!("synthetic panic to exercise owned fixture cleanup");
+    });
+    assert!(result.is_err());
+    assert!(signaled(&observer), "the retained owned fixture must exit during unwind cleanup");
+}
+
 #[tokio::test]
 async fn cancelling_future_closes_only_its_owned_job() {
     let _serial = SERIAL.lock().await;
@@ -510,6 +642,83 @@ async fn cancelling_future_closes_only_its_owned_job() {
     let exited = observers.iter().all(signaled);
     let _ = std::fs::remove_file(path);
     assert!(exited, "cancellation must terminate the retained owned process");
+}
+
+/// Outer ownership is a safety net; report whether it observed any live
+/// descendants requiring a lingering-descendant stop after owner exit.
+#[tokio::test]
+async fn owner_abrupt_exit_closes_its_job_and_pipe_holding_descendants() {
+    struct AbortOnDrop(tokio::task::JoinHandle<BoundedResult>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _serial = SERIAL.lock().await;
+    let mut bystander = owned_bystander();
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+    let parent = workspace.join("target");
+    std::fs::create_dir_all(&parent).unwrap();
+    let directory = parent.join(format!(
+        "fixture-owned-crash-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let mut environment = fixture_environment("owner-crash");
+    environment.push(("KATALA_GUARD_OWNER_DIR".into(), directory.as_os_str().to_owned()));
+    let end = deadline(Duration::from_secs(15));
+    let mut task = AbortOnDrop(tokio::spawn(async move {
+        run_standalone_windows_bounded(&fixture_invocation(), StandaloneWindowsEnvironment::new(&environment), b"", end, 65536, 65536).await
+    }));
+    let (owner_pid, child_pid, descendant_pid) = loop {
+        let owner = std::fs::read_to_string(directory.join("owner-ready")).ok().and_then(|value| value.strip_suffix('\n')?.parse::<u32>().ok());
+        let children = std::fs::read_to_string(directory.join("children-ready")).ok().and_then(|value| {
+            let frame = value.strip_suffix('\n')?;
+            let ids: Vec<_> = frame.split(' ').map(str::parse::<u32>).collect::<Result<_, _>>().ok()?;
+            (ids.len() == 2).then(|| (ids[0], ids[1]))
+        });
+        if let (Some(owner), Some((child, descendant))) = (owner, children) {
+            assert!(owner != child && owner != descendant && child != descendant);
+            break (owner, child, descendant);
+        }
+        assert!(Instant::now() < end && !task.0.is_finished(), "owned crash fixture did not become ready");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let owner = retain_test_child(owner_pid);
+    let child = retain_test_child(child_pid);
+    let descendant = retain_test_child(descendant_pid);
+    assert!(!signaled(&owner) && !signaled(&child) && !signaled(&descendant), "all three owned fixture processes must be live");
+    let owner_identity = retained_fixture_identity(&owner);
+    let child_identity = retained_fixture_identity(&child);
+    let descendant_identity = retained_fixture_identity(&descendant);
+    assert_eq!((owner_identity.pid, child_identity.pid, descendant_identity.pid), (owner_pid, child_pid, descendant_pid));
+    // Give the existing guard an opportunity to retain and check the two live
+    // descendant handles against its own Job before triggering owner exit.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(!task.0.is_finished() && !signaled(&owner) && !signaled(&child) && !signaled(&descendant));
+    std::fs::OpenOptions::new().create_new(true).write(true).open(directory.join("crash-owner")).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), &mut task.0).await.expect("outer owned guard must finish").unwrap();
+    assert!(signaled(&owner) && signaled(&child) && signaled(&descendant), "retained fixture process handles must all signal");
+    assert_eq!(result.code, Some(123));
+    assert_ack(&result, ProcessStop::Completed);
+    let receipt = result.process_receipt.as_ref().unwrap();
+    assert_eq!(receipt.root.as_ref(), Some(&owner_identity));
+    // The guard adds an observed descendant only after IsProcessInJob succeeds
+    // on that retained process object. Match the full identity, not just a PID.
+    assert!(receipt.observed.contains(&child_identity) && receipt.observed.contains(&descendant_identity));
+    assert!(receipt.total_processes >= 3);
+    assert!(bystander.0.try_wait().unwrap().is_none(), "the independent fixture must still be live");
+    bystander.0.kill().unwrap();
+    let cleanup_end = deadline(Duration::from_secs(2));
+    while bystander.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < cleanup_end, "the owned bystander did not exit");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for marker in ["owner-ready", "children-ready", "crash-owner"] {
+        std::fs::remove_file(directory.join(marker)).unwrap();
+    }
+    std::fs::remove_dir(directory).unwrap();
 }
 
 #[allow(unsafe_code)]
