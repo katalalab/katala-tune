@@ -141,6 +141,25 @@ fn normalize_metadata_preserves_unknown() {
 }
 
 #[test]
+fn unknown_error_is_redacted() {
+    let marker = "fixture-only-sensitive-value";
+    for error in [json!(""), json!(format!("https://unit-user:{marker}@example.test/r?token={marker}")), json!({ "detail": marker })] {
+        let raw =
+            json!({ "roots": [{ "path": "~/fixture", "source": "opt" }], "repos": [], "enumerated": 0, "skipped": 0, "truncated": false, "error": error });
+        let normalized = normalize(&raw);
+        assert_eq!(normalized["error"], "unknown_error");
+        assert!(normalized["incomplete_fields"].as_array().unwrap().contains(&json!("error")));
+        assert!(analyze(&raw).iter().any(|finding| finding["id"] == "repo-unobserved"));
+        assert!(!normalized.to_string().contains(marker));
+        assert!(!json!(analyze(&raw)).to_string().contains(marker));
+        assert!(!tune_core::hygiene::progress(&raw, 1).1.contains(marker));
+    }
+    for error in ["git_missing", "walk_incomplete", "excluded", "no_python", "timeout_or_unreachable", "probe_failed", "internal", "unknown_error"] {
+        assert_eq!(normalize(&json!({ "error": error }))["error"], error);
+    }
+}
+
+#[test]
 fn metadata_and_progress_match_js() {
     let base = json!({ "roots": [{ "path": "~/fixture", "source": "opt" }], "repos": [], "enumerated": 0, "skipped": 0, "truncated": false });
     let row =
@@ -193,6 +212,21 @@ fn metadata_and_progress_match_js() {
         raw["error"] = value;
         cases.push(raw);
     }
+    for value in [
+        json!(""),
+        json!("https://unit-user:fixture-only-sensitive-value@example.test/r?token=fixture-only-sensitive-value"),
+        json!({ "detail": "fixture-only-sensitive-value" }),
+        json!("no_python"),
+        json!("timeout_or_unreachable"),
+        json!("probe_failed"),
+        json!("excluded"),
+        json!("internal"),
+        json!("unknown_error"),
+    ] {
+        let mut raw = base.clone();
+        raw["error"] = value;
+        cases.push(raw);
+    }
     for value in [json!(null), json!("roots"), json!(false), json!({}), json!(["unknown-marker"]), json!(["roots", "unknown-marker"])] {
         let mut raw = base.clone();
         raw["incomplete_fields"] = value;
@@ -234,6 +268,7 @@ fn metadata_and_progress_match_js() {
         let (observed, line) = tune_core::hygiene::progress(&audit, findings.len());
         let rust = json!({ "normalized": normalized, "findings": findings, "progress": { "observed": observed, "line": &line } });
         assert!(same(j, &rust), "合成入力 #{i} の JS と Rust が不一致");
+        assert!(!rust.to_string().contains("fixture-only-sensitive-value"));
         if i == 0 {
             assert!(line.contains("見つけた 0 件・未観測 0 件"));
         } else if i != 27 {
@@ -270,6 +305,9 @@ fn progress_raw_inputs_match_js() {
         raw["error"] = value;
         cases.push(("error_invalid", raw));
     }
+    let mut unknown = base.clone();
+    unknown["error"] = json!("https://unit-user:fixture-only-sensitive-value@example.test/r");
+    cases.push(("error_invalid", unknown));
     let mut no_roots = base.clone();
     no_roots["roots"] = json!([]);
     cases.push(("no_roots", no_roots));

@@ -98,17 +98,34 @@ test('探索先が空なら既知のゼロを保持しつつ未確認にする',
   assert.doesNotMatch(missingGit[0].detail, /探索先がない/);
 });
 
-test('error が不正型なら不完全とし、文字列・null は保つ', () => {
+test('error が不正型なら固定エラーにし、既知の分類と null は保つ', () => {
   for (const error of [false, true, 0, {}, []]) {
     const normalized = hygiene.normalize({ ...audit(), error });
-    assert.equal(normalized.error, null);
+    assert.equal(normalized.error, 'unknown_error');
     assert.ok(normalized.incomplete_fields?.includes('error'));
     assert.ok(hygiene.analyze(normalized).some((finding) => finding.id === 'repo-unobserved'));
   }
-  for (const error of [undefined, null, 'git_missing', 'walk_incomplete']) {
+  for (const error of [undefined, null, 'git_missing', 'walk_incomplete', 'no_python', 'timeout_or_unreachable', 'probe_failed', 'excluded', 'internal', 'unknown_error']) {
     const normalized = hygiene.normalize({ ...audit(), error });
     assert.equal(normalized.error, error ?? null);
     assert.ok(!normalized.incomplete_fields?.includes('error'));
+  }
+});
+
+test('未知の error は合成の機密らしい値を残さず未確認にする', () => {
+  const marker = 'fixture-only-sensitive-value';
+  const values = ['', `https://unit-user:${marker}@example.test/r?token=${marker}`, { detail: marker }];
+  for (const error of values) {
+    const raw = { ...audit(), node_id: 'node-a', wall_s: 1, error };
+    const normalized = hygiene.normalize(raw);
+    const findings = hygiene.analyze(raw);
+    const progress = hygiene.progress(raw, findings.length);
+    assert.equal(normalized.error, 'unknown_error');
+    assert.ok(normalized.incomplete_fields?.includes('error'));
+    assert.ok(findings.some((finding) => finding.id === 'repo-unobserved'));
+    assert.match(progress.line, /未観測 件数不明/);
+    assert.ok(!JSON.stringify({ normalized, findings, progress }).includes(marker));
+    assert.equal(hygiene.normalize(normalized).error, 'unknown_error');
   }
 });
 

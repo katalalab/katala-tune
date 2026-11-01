@@ -216,7 +216,13 @@ pub fn normalize(data: &Value) -> Value {
         roots.iter().any(|r| text(js::get(Some(r), "path")).is_none_or(str::is_empty) || text(js::get(Some(r), "source")).is_none_or(str::is_empty))
     });
     let bad_repos = g("repos").and_then(Value::as_array).is_none();
-    let bad_error = g("error").is_some_and(|v| !v.is_null() && !v.is_string());
+    let bad_error = g("error").is_some_and(|v| {
+        !v.is_null()
+            && !matches!(
+                v.as_str(),
+                Some("git_missing" | "walk_incomplete" | "excluded" | "no_python" | "timeout_or_unreachable" | "probe_failed" | "internal" | "unknown_error")
+            )
+    });
     let bad_counts = enumerated.is_some_and(|n| {
         g("repos").and_then(Value::as_array).is_some_and(|repos| {
             let n = n as u128;
@@ -237,7 +243,7 @@ pub fn normalize(data: &Value) -> Value {
         "enumerated": enumerated, "skipped": skipped,
         "truncated": g("truncated").filter(|v| v.is_boolean()).cloned().unwrap_or(Value::Null),
         "elapsed_s": g("elapsed_s").filter(|v| v.is_number()).cloned().unwrap_or(Value::Null),
-        "error": opt_s(g("error")),
+        "error": if bad_error { json!("unknown_error") } else { opt_s(g("error")) },
         "repos": js::arr(g("repos")).iter().map(normalize_repo).collect::<Vec<_>>(),
     });
     if !incomplete.is_empty() {
