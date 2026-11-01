@@ -157,7 +157,7 @@ impl FleetView {
             .map(|endpoint| {
                 let mut observation =
                     previous.iter().find(|line| line.endpoint.as_ref() == Some(endpoint)).map(|line| line.observation.clone()).unwrap_or_default();
-                observation.latest = None;
+                observation.begin_refresh();
                 ModelLine { label: endpoint.label.clone(), endpoint: Some(endpoint.clone()), observation }
             })
             .collect();

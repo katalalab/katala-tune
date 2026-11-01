@@ -27,6 +27,11 @@ pub struct ModelObservation {
 }
 
 impl ModelObservation {
+    pub fn begin_refresh(&mut self) {
+        self.latest = None;
+        self.checked_at = None;
+    }
+
     pub fn record(&mut self, result: Result<Vec<String>, ModelError>, at: i64) {
         if let Ok(models) = &result {
             self.last_good = Some((models.clone(), at));

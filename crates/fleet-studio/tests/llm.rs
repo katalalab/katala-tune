@@ -72,3 +72,13 @@ fn slow_server_is_reported_as_a_timeout() {
     assert!(started.elapsed() < Duration::from_secs(2));
     server.join().unwrap();
 }
+
+#[test]
+fn starting_a_refresh_does_not_label_the_previous_check_as_the_current_attempt() {
+    let mut observation = fleet_studio::llm::ModelObservation::default();
+    observation.record(Ok(vec!["fixture-model".into()]), 100);
+    observation.begin_refresh();
+    assert_eq!(observation.checked_at, None);
+    assert_eq!(observation.latest, None);
+    assert_eq!(observation.last_good, Some((vec!["fixture-model".into()], 100)));
+}
