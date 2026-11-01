@@ -36,6 +36,13 @@ test('正常なゼロ・真偽値と任意項目の null は保つ', () => {
   assert.equal(hygiene.normalize({ repos: [largest] }).repos[0].tracked, Number.MAX_SAFE_INTEGER);
 });
 
+test('正常な観測でも origin の認証情報は取り除く', () => {
+  const raw = { ...observed(), origin: 'https://unit:token@example.com/acme/fixture.git?nonce=1' };
+  const [row] = hygiene.normalize({ repos: [raw] }).repos;
+  assert.equal(row.state, 'ok');
+  assert.equal(row.origin, 'https://example.com/acme/fixture.git');
+});
+
 test('既に未観測の行は従来どおり理由を保つ', () => {
   for (const reason of ['timeout', 'git_failed', 'over_limit']) {
     const [row] = hygiene.normalize({ repos: [{ state: 'unobserved', reason }] }).repos;
