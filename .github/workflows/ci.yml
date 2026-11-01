@@ -30,6 +30,9 @@ jobs:
         with:
           node-version: 24
           cache: npm
+      - name: Repository hygiene reader mock
+        run: python3 -I -B test/test_repo_hygiene_reader.py
+        timeout-minutes: 1
       - run: npm ci
       - run: npm test
       - name: Repository hygiene walk mock

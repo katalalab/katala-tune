@@ -16,7 +16,7 @@
 import json, os, re, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 
-KT_VERSION = "2026-11-01.2"   # 独立変更の統合時も別版に上げる（EOF 修正は .1）
+KT_VERSION = "2026-11-01.3"   # 調査スクリプトの版（数え方を変えたら上げる）
 KT_OPTS = {}                  # 呼び出し側が置き換える（数と文字列だけ）: { roots, ghq_root, max_repos, budget_s, cmd_s }
 MAX_REPOS = int(KT_OPTS.get("max_repos", 1000))
 BUDGET_S = float(KT_OPTS.get("budget_s", 60))
@@ -95,18 +95,23 @@ def run(cmd, timeout):
         p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=ENV, creationflags=NOWIN)
     except OSError:
         return None, "oserror"
-    buf, over = bytearray(), [False]
+    buf, over, eof = bytearray(), [False], [False]
 
     def read():
-        while True:
-            c = p.stdout.read(65536)
-            if not c:
-                return
-            if len(buf) + len(c) > MAX_OUT:
-                over[0] = True
-                p.kill()
-                return
-            buf.extend(c)
+        try:
+            while True:
+                c = p.stdout.read(65536)
+                if not c:
+                    eof[0] = True
+                    return
+                if len(buf) + len(c) > MAX_OUT:
+                    over[0] = True
+                    p.kill()
+                    return
+                buf.extend(c)
+        except Exception:
+            # 内容・パスを含みうる例外は出さず、EOF 未確認として扱う。
+            return
 
     th = threading.Thread(target=read, daemon=True)
     th.start()
@@ -117,9 +122,14 @@ def run(cmd, timeout):
         p.wait()
         th.join(1)
         return None, "timeout"
+    # 未終了 reader と buffer は残り、本数の上限はない。全体の時間上限や子孫回収も保証しない。
     th.join(5)
     if over[0]:
         return None, "over_limit"
+    if th.is_alive():
+        return None, "timeout"
+    if not eof[0]:
+        return None, "oserror"
     return p.returncode, bytes(buf).decode("utf-8", "replace")
 
 
