@@ -188,7 +188,12 @@ impl ModelConfirmation {
     }
 
     pub fn description(&self) -> String {
-        format!("{} / {} / 平文 HTTP / {}", self.endpoint.address, self.endpoint.protocol.label(), self.endpoint.label)
+        format!(
+            "{} / {} / 平文 HTTP / {}。この起動中は更新時にもモデル一覧を取得します。許可はいつでも取り消せますが、開始確定後の通信は停止を保証できません。",
+            self.endpoint.address,
+            self.endpoint.protocol.label(),
+            self.endpoint.label
+        )
     }
 }
 

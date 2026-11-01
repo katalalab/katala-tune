@@ -1085,7 +1085,7 @@ impl Render for FleetView {
                 } else if self.refresh_queue.pending() {
                     item = item.child(note("更新待ちのため、接続内容の確認はできません。".into(), 0xffb86c));
                 } else if let Some(confirmation) = self.model_confirmation.as_ref().filter(|confirmation| confirmation.endpoint() == &endpoint) {
-                    item = item.child(note(format!("接続内容を確認: {}。モデル一覧を取得します。", confirmation.description()), 0xffb86c));
+                    item = item.child(note(format!("接続内容を確認: {}", confirmation.description()), 0xffb86c));
                     let confirm_id = pointer_ids.get("llm-confirm", &[&address, protocol, &endpoint.label]);
                     let cancel_id = pointer_ids.get("llm-cancel-confirmation", &[&address, protocol, &endpoint.label]);
                     let selected = confirmation.clone();

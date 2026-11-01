@@ -320,6 +320,9 @@ fn confirmation_discloses_the_exact_target_protocol_and_plain_http() {
     assert!(description.contains("10.0.0.1:12345"));
     assert!(description.contains("openai"));
     assert!(description.contains("平文 HTTP"));
+    assert!(description.contains("更新時にも"));
+    assert!(description.contains("取り消せます"));
+    assert!(description.contains("停止を保証"));
 }
 
 #[test]
