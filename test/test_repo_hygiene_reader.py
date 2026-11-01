@@ -143,7 +143,8 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_complete_status_counts_tracked_and_untracked(self):
-        result, _status, calls = self.scan(FakeStream([HEADER, b"1 sample\0? sample-new\0"]))
+        record = b"1 .M N... 100644 100644 100644 " + b"a" * 40 + b" " + b"a" * 40 + b" sample\0"
+        result, _status, calls = self.scan(FakeStream([HEADER, record, b"? sample-new\0"]))
         self.assertEqual(result["state"], "ok")
         self.assertEqual((result["tracked"], result["untracked"]), (1, 1))
         self.assertEqual(len(calls), 2)

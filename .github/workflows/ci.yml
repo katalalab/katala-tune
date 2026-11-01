@@ -33,6 +33,9 @@ jobs:
       - name: Repository hygiene reader mock
         run: python3 -I -B test/test_repo_hygiene_reader.py
         timeout-minutes: 1
+      - name: Repository hygiene status mock
+        run: python3 -I -B test/test_repo_hygiene_status.py
+        timeout-minutes: 1
       - run: npm ci
       - run: npm test
       - name: Windows Security log cursor regression
