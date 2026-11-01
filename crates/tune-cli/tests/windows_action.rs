@@ -3,6 +3,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/windows_action_summary.rs"]
+mod safe_summary;
+
 fn launch(arguments: &[&str], base: &std::path::Path) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_tune"))
         .args(arguments)
@@ -157,8 +160,21 @@ mod windows {
         let body = b"Write-Error 'fixture'";
         let base = sandbox();
         let (child, reader, nonce) = receiver(&base);
+        let complete_started = Instant::now();
         let (status, response, diagnostic) = complete(child, reader, body, &nonce);
-        assert_eq!(status.code(), Some(0));
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{}",
+            crate::safe_summary::safe_summary(
+                crate::safe_summary::Fixture::WriteError,
+                status.code(),
+                &response,
+                &diagnostic,
+                (&nonce, body),
+                complete_started.elapsed()
+            )
+        );
         assert_eq!(terminal_code(&response), 7);
         assert!(response.starts_with(&format!("KT2 RESULT {nonce} {} 7 ", tune_core::db::sha256_hex(body)).into_bytes()));
         assert!(diagnostic.is_empty());
@@ -170,8 +186,21 @@ mod windows {
         let exact = b"$o=[Console]::OpenStandardOutput();$e=[Console]::OpenStandardError();$b=New-Object byte[] 65536;$o.Write($b,0,$b.Length);$e.Write($b,0,$b.Length);exit 0";
         let base = sandbox();
         let (child, reader, nonce) = receiver(&base);
+        let complete_started = Instant::now();
         let (status, response, diagnostic) = complete(child, reader, exact, &nonce);
-        assert_eq!(status.code(), Some(0));
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{}",
+            crate::safe_summary::safe_summary(
+                crate::safe_summary::Fixture::ExactCap,
+                status.code(),
+                &response,
+                &diagnostic,
+                (&nonce, exact),
+                complete_started.elapsed()
+            )
+        );
         let header = result(&nonce, exact, 0, 65_536, 65_536);
         assert_eq!(&response[..header.len()], header);
         assert_eq!(response.len(), header.len() + 131_072);

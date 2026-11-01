@@ -1,0 +1,23 @@
+{
+  "transport": [
+    { "kind": "events", "script": "param()\nWrite-Output 1\n", "cursors": {} },
+    { "kind": "events", "script": "\ufeffparam()\r\nWrite-Output 1\r\n", "cursors": { "win_system": "42; bad", "win_application": " 7tail", "neonmonitor": "not-a-number" } },
+    { "kind": "events", "script": "# synthetic\n", "repeat": 2048, "cursors": { "win_system": "9007199254740991", "win_application": "-9007199254740991", "neonmonitor": "9007199254740992" } },
+    { "kind": "events", "script": "", "cursors": {} },
+    { "kind": "events", "script": "\ufeff", "cursors": {} },
+    { "kind": "events", "script": "#", "repeat": 1048577, "cursors": {} },
+    { "kind": "events", "script": "日本語\n", "cursors": { "win_system": -5, "win_application": null, "neonmonitor": "  +00012tail" } },
+    { "kind": "logons", "script": "param()\n", "cursors": { "win_security": "9223372036854775807:9223372036854775807" } },
+    { "kind": "logons", "script": "param()\n", "cursors": { "win_security": "9007199254740993:1800000000000" } },
+    { "kind": "logons", "script": "param()\n", "cursors": { "win_security": "9223372036854775808:1" } },
+    { "kind": "logons", "script": "param()\n", "cursors": { "win_security": "42; bad:1" } },
+    { "kind": "logons", "script": "param()\n", "cursors": { "win_security": "-1:2" } }
+  ],
+  "results": [
+    { "code": 0, "output": "valid", "err": "" },
+    { "code": 255, "output": "valid", "err": "synthetic disconnect" },
+    { "code": null, "output": "valid", "err": "timeout 90000ms" },
+    { "code": 0, "output": "empty", "err": "synthetic empty output" },
+    { "code": 0, "output": "partial", "err": "synthetic partial output" }
+  ]
+}

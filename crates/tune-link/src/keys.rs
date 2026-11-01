@@ -415,6 +415,79 @@ mod tests {
         d
     }
 
+    // Generated and strictly verified with ed25519-dalek =2.2.0, using public
+    // synthetic inputs: Ed25519 seed [0x42; 32], X25519 secret [0x24; 32], and
+    // b"katala-tune/link/v1 static-key\0" || static_key || UTF-8 name.
+    // Keep the expected card independent of the current signer/binding helper.
+    fn ed25519_v2_card() -> Card {
+        Card::from_json(include_bytes!("../tests/fixtures/ed25519-v2-card.json")).unwrap()
+    }
+
+    #[test]
+    fn ed25519_compat_accepts_v2_card() {
+        let card = ed25519_v2_card();
+        let verified = card.verify().expect("a 2.2.0 card must remain valid");
+        assert_eq!(verified.name, "compat-é-署名");
+        assert_eq!(hex::encode(&verified.identity), card.identity);
+        assert_eq!(hex::encode(&verified.static_key), card.static_key);
+    }
+
+    #[test]
+    fn ed25519_compat_signs_identically_to_v2() {
+        let card = ed25519_v2_card();
+        let keys = DeviceKeys::from_secrets(&[0x42; 32], &[0x24; 32]);
+        // Ed25519 is deterministic: these bytes were already accepted by 2.2.0,
+        // so equality also protects new-signer -> old-verifier compatibility.
+        assert_eq!(keys.card("compat-é-署名"), card);
+    }
+
+    #[test]
+    fn ed25519_compat_loads_v2_key_file_without_rewriting() {
+        let dir = tmpdir("ed25519-compat");
+        ensure_private_dir(&dir).unwrap();
+        // The legacy on-disk format is literal, not derived from MAGIC/LEN.
+        // These are public test seeds, never device or release credentials.
+        let mut bytes = b"KTLINK1\n".to_vec();
+        bytes.extend_from_slice(&[0x42; 32]);
+        bytes.extend_from_slice(&[0x24; 32]);
+        write_private(&dir.join(KEY_FILE), &bytes, true).unwrap();
+        let (keys, created) = DeviceKeys::load_or_create(&dir).unwrap();
+        assert!(!created, "an existing legacy key must not be regenerated");
+        assert_eq!(keys.card("compat-é-署名"), ed25519_v2_card());
+        assert_eq!(fs::read(dir.join(KEY_FILE)).unwrap(), bytes);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ed25519_compat_rejects_weak_identity_forgery() {
+        let mut card = ed25519_v2_card();
+        // A = identity, R = basepoint, S = 1 satisfies ordinary verification
+        // for every message; strict verification must reject the weak A.
+        let mut identity = [0; 32];
+        identity[0] = 1;
+        card.identity = hex::encode(&identity);
+        let mut signature = [0x66; 64];
+        signature[0] = 0x58;
+        signature[32..].fill(0);
+        signature[32] = 1;
+        card.sig = hex::encode(&signature);
+        assert!(card.verify().is_err(), "migration must retain strict verification");
+    }
+
+    #[test]
+    fn ed25519_compat_rejects_noncanonical_scalar() {
+        let mut card = ed25519_v2_card();
+        let mut signature = hex::decode_array::<64>(&card.sig).unwrap();
+        // S + L for this v2 signature: the same group equation holds, but the
+        // noncanonical scalar must be rejected (including after a migration).
+        signature[32..].copy_from_slice(&[
+            0xfe, 0x93, 0x29, 0x33, 0xae, 0xf3, 0x64, 0xa4, 0x45, 0x56, 0xfa, 0x5a, 0x86, 0x7f, 0xa6, 0x82, 0xa2, 0x25, 0x18, 0xe2, 0x6b, 0x4e, 0x20, 0x2c,
+            0x88, 0x13, 0xd8, 0x0f, 0x88, 0x6e, 0x33, 0x16,
+        ]);
+        card.sig = hex::encode(&signature);
+        assert!(card.verify().is_err());
+    }
+
     #[test]
     fn card_binds_static_key_and_name() {
         let k = DeviceKeys::generate().unwrap();

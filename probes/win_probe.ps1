@@ -155,11 +155,17 @@ $agents = @($list | Where-Object { $_.name -match '^(claude|codex|opencode|curso
 
 # Process multiplication and trees (issues 38 and 30). Read-only. Command lines are read only for interpreters (node, python, git ...)
 # to build a short key (exe:script name); the command line itself is never output. Owner: session 0 (services and SSH logons) = system, otherwise user.
-$mxInterp = '^(node|nodejs|bun|deno|python3?|py|uv|uvx|npx|bunx|npm|pnpm|ruby|java|javaw|git)$'
+$mxInterp = '^(node|nodejs|bun|deno|python3?(\.\d+)?|py|uv|uvx|npx|bunx|npm|pnpm|ruby|java|javaw|git)$'
 $mxGeneric = @('index', 'main', 'cli', 'server', 'bin', 'run', 'app', 'start', 'dist', 'build', 'lib', 'src', 'out', 'node_modules', '__main__')
-$mxSkip = @('exec', 'run', 'x', 'dlx', 'tool', 'start')
-# Options known to take no value. Any other option may be followed by a value (a token etc.), so stop reading there.
-$mxValueless = @('-y', '--yes', '-q', '--quiet', '--silent', '-u', '-B', '-E', '-s', '-S', '-I', '-O', '-OO', '-i', '--no-warnings', '--no-deprecation', '--trace-warnings', '--enable-source-maps', '--inspect', '--')
+$mxSkip = @{ npm = @('exec', 'run', 'x'); pnpm = @('exec', 'run', 'dlx'); uv = @('tool', 'run'); bun = @('run', 'x') }
+# Options are interpreter-specific: Python -I takes no value, but Ruby -I takes a path.
+$mxValueless = @{
+  python = @('-q', '-u', '-B', '-E', '-s', '-S', '-I', '-O', '-OO', '-i')
+  node = @('--no-warnings', '--no-deprecation', '--trace-warnings', '--enable-source-maps', '--inspect', '-i')
+  npx = @('-y', '--yes', '-q', '--quiet', '--silent'); bunx = @('-y', '--yes')
+  npm = @('-y', '--yes', '-q', '--quiet', '--silent', '-s'); pnpm = @('--silent', '-s')
+  uv = @('-q', '--quiet'); uvx = @('-q', '--quiet')
+}
 $mxLaunchers = @('explorer', 'services', 'wininit', 'winlogon', 'svchost', 'sihost', 'csrss', 'smss', 'userinit', 'System', 'Idle', 'sshd')
 # Label = the script file name; for a generic name (index.js ...) only the package directly under node_modules.
 # Arbitrary parent directories (project or customer names) are never used.
@@ -181,18 +187,33 @@ function MxLabel([string]$path) {
 }
 function MxKey([string]$exe, [string[]]$tokens) {
   if ($exe -notmatch $mxInterp) { return $exe.Substring(0, [Math]::Min(48, $exe.Length)) }
+  $exe = $exe.ToLowerInvariant()
+  $family = $exe; if ($exe -like 'python*') { $family = 'python' } elseif ($exe -eq 'nodejs') { $family = 'node' }
   $label = $null
   $i = 0
+  $options = $true
+  $launcher = $true
   while ($i -lt $tokens.Count) {
     $t = [string]$tokens[$i]
-    if ($t -ceq '-m' -and $i + 1 -lt $tokens.Count) { $label = MxLabel (($tokens[$i + 1] -split '\.')[0]); break }
-    if ($t -ceq '-c' -and $exe -like 'python*') { break }
-    if (($t -ceq '-c' -or $t -ceq '-C' -or $t -ceq '-r' -or $t -ceq '--require') -and ($exe -eq 'git' -or $exe -eq 'node')) { $i += 2; continue }
-    if ($t.StartsWith('-')) {
-      if ($t.Contains('=') -or ($mxValueless -ccontains $t)) { $i++; continue }
+    if ($options -and $t -ceq '--') { $options = $false; $i++; continue }
+    if ($options -and $t -ceq '-m' -and $family -eq 'python' -and $i + 1 -lt $tokens.Count) {
+      if ($tokens[$i + 1] -cmatch '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$') { $label = MxLabel (($tokens[$i + 1] -split '\.')[0]) }
       break
     }
-    if ($mxSkip -contains $t) { $i++; continue }
+    if ($options -and $t -ceq '-c' -and $exe -like 'python*') { break }
+    if ($options -and (($exe -eq 'git' -and ($t -ceq '-c' -or $t -ceq '-C')) -or ($family -eq 'node' -and ($t -ceq '-r' -or $t -ceq '--require')))) { $i += 2; continue }
+    if ($options -and $t.StartsWith('-')) {
+      if ($t.Contains('=') -or ($mxValueless[$family] -ccontains $t)) { $i++; continue }
+      break
+    }
+    if ($options -and $launcher -and ($mxSkip[$exe] -ccontains $t)) {
+      if ($exe -eq 'uv' -and $t -ceq 'tool') {
+        if ($i + 1 -ge $tokens.Count -or $tokens[$i + 1] -cne 'run') { break }
+        $i++
+      }
+      $i++; $launcher = $false; continue
+    }
+    if ($exe -eq 'git' -and $t -cne 'fsmonitor--daemon') { break }
     $label = MxLabel ($t -replace '(?<=.)@[^@/\\]*$', '')
     break
   }
@@ -247,7 +268,7 @@ try {
     if (-not $t) { $t = @{ root = $x.name; pid = $x.pid; sys = $x.sys; count = 0; kb = 0.0; children = [int]$kids[$x.pid] }; $th[$x.pid] = $t }
     $t.count++; $t.kb += $r.kb
   }
-  $mxGroups = @($gh.Values | Where-Object { $_.count -ge 3 } | ForEach-Object {
+  $mxGroups = @($gh.Values | Where-Object { $_.count -ge 3 -or ($_.orphans -ge 2 -and $_.key -match 'mcp') } | ForEach-Object {
     $top = $null
     if ($_.parents.Count -gt 0) { $top = ($_.parents.GetEnumerator() | Sort-Object @{ e = 'Value'; Descending = $true }, @{ e = 'Name'; Descending = $false } | Select-Object -First 1).Key }
     $own = 'mixed'; if ($_.sys -eq 0) { $own = 'user' } elseif ($_.usr -eq 0) { $own = 'system' }
@@ -509,16 +530,22 @@ if (Test-Path $wcfg) {
 # no -d, no --exec, nothing runs inside it. If the running list cannot be read, no distro is touched either.
 # Invoke-KtWsl is the only place that starts wsl.exe, so a regression test can replace it with a fake.
 $KtWslInnerScript = @'
+LC_ALL=C
+export LC_ALL
 echo @@mem
 grep -E "^(MemTotal|MemAvailable|SwapTotal|SwapFree):" /proc/meminfo 2>/dev/null
+echo "@@status mem $?"
 echo @@psi
 cat /proc/pressure/memory 2>/dev/null
+echo "@@status psi $?"
 echo @@load
 cat /proc/loadavg 2>/dev/null
+echo "@@status load $?"
 echo @@ps
-ps -eo pid=,rss=,pcpu=,comm= --sort=-rss 2>/dev/null | head -n 8
+{ ps -eo pid=,rss=,pcpu=,comm= --sort=-rss 2>/dev/null; echo "@@status ps $?"; } | awk "NR <= 8 || /^@@status ps /"
 echo @@df
-df -P -k / 2>/dev/null | tail -n +2
+df -P -k / 2>/dev/null
+echo "@@status df $?"
 echo @@end
 '@
 function Test-KtWslInstalled { return (Test-Path (Join-Path $env:SystemRoot 'System32\wsl.exe')) }
@@ -594,33 +621,55 @@ function ConvertFrom-KtWslInside([string]$Text) {
   $load = $null
   $top = @()
   $disk = @()
+  $status = @{}
+  $invalid = @{}
   foreach ($line in ($Text -split "`n")) {
     $t = $line.TrimEnd("`r")
+    if ($t -match '^@@status (mem|psi|load|ps|df) ([0-9]+)$') { $status[$Matches[1]] = $Matches[2]; continue }
     if ($t -match '^@@(\w+)$') { $sec = $Matches[1]; continue }
     if ($sec -eq 'mem' -and $t -match '^(\w+):\s+(\d+)\s*kB') { $kv[$Matches[1]] = [double]$Matches[2] }
-    elseif ($sec -eq 'psi' -and $t -match '^(some|full)\s.*avg10=([0-9.]+)') { $psi[$Matches[1]] = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture) }
-    elseif ($sec -eq 'load' -and $t -match '^([0-9.]+)\s') { $load = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture) }
-    elseif ($sec -eq 'ps' -and $t -match '^\s*(\d+)\s+(\d+)\s+([0-9.]+)\s+(\S.*)$') {
+    elseif ($sec -eq 'psi' -and $t -match '^(some|full)\s.*avg10=([0-9]+(?:\.[0-9]+)?)\s') { $psi[$Matches[1]] = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture) }
+    elseif ($sec -eq 'load' -and $t -match '^([0-9]+(?:\.[0-9]+)?)\s') { $load = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture) }
+    elseif ($sec -eq 'ps' -and $t -match '^\s*(\d+)\s+(\d+)\s+([0-9]+(?:\.[0-9]+)?)\s+(\S.*)$') {
       $top += [pscustomobject]@{ pid = [int]$Matches[1]; name = $Matches[4].Trim(); mem_mb = [int]([double]$Matches[2] / 1024); cpu = [double]::Parse($Matches[3], [Globalization.CultureInfo]::InvariantCulture) }
     }
     elseif ($sec -eq 'df' -and $t -match '^\S+\s+(\d+)\s+(\d+)\s+(\d+)\s+\d+%\s+(\S+)$') {
       $tot = [double]$Matches[1]
-      if ($tot -gt 0) { $disk += [pscustomobject]@{ mount = $Matches[4]; total_gb = (R1 ($tot / 1048576)); free_gb = (R1 ([double]$Matches[3] / 1048576)); free_pct = (R1 ([double]$Matches[3] / $tot * 100)) } }
+      if ($tot -gt 0 -and [double]$Matches[3] -le $tot) { $disk += [pscustomobject]@{ mount = $Matches[4]; total_gb = (R1 ($tot / 1048576)); free_gb = (R1 ([double]$Matches[3] / 1048576)); free_pct = (R1 ([double]$Matches[3] / $tot * 100)) } } else { $invalid['df'] = $true }
     }
+    elseif ($t.Trim() -and $sec -in @('psi', 'load', 'ps', 'df') -and -not ($sec -eq 'df' -and $t -match '^Filesystem\s')) { $invalid[$sec] = $true }
   }
-  if (-not $kv.ContainsKey('MemTotal') -or -not $kv.ContainsKey('MemAvailable')) { return $null }
-  $swapTotal = if ($kv.ContainsKey('SwapTotal')) { $kv['SwapTotal'] } else { 0 }
-  $swapFree = if ($kv.ContainsKey('SwapFree')) { $kv['SwapFree'] } else { 0 }
+  if ($status['mem'] -ne '0' -or -not $kv.ContainsKey('MemTotal') -or -not $kv.ContainsKey('MemAvailable')) { return $null }
+  if ($kv['MemTotal'] -le 0 -or $kv['MemAvailable'] -gt $kv['MemTotal']) { return $null }
+  $errors = [ordered]@{}
+  foreach ($pair in @(@('psi', 'psi'), @('load', 'load'), @('ps', 'top'), @('df', 'disk'))) {
+    $section = $pair[0]; $key = $pair[1]
+    if (-not $status.ContainsKey($section)) { $errors[$key] = 'missing-status' }
+    elseif ($status[$section] -ne '0') { $errors[$key] = 'command-failed' }
+    elseif ($invalid[$section]) { $errors[$key] = 'invalid-data' }
+  }
+  if (-not $errors.Contains('psi') -and (-not $psi.ContainsKey('some') -or -not $psi.ContainsKey('full') -or $psi['some'] -gt 100 -or $psi['full'] -gt 100)) { $errors['psi'] = 'invalid-data' }
+  if (-not $errors.Contains('load') -and $null -eq $load) { $errors['load'] = 'invalid-data' }
+  if (-not $errors.Contains('disk') -and $disk.Count -eq 0) { $errors['disk'] = 'invalid-data' }
+  if ($errors.Contains('psi')) { $psi = @{} }
+  if ($errors.Contains('load')) { $load = $null }
+  if ($errors.Contains('top')) { $top = @() }
+  if ($errors.Contains('disk')) { $disk = @() }
+  $swapTotal = $null; $swapUsed = $null
+  if ($kv.ContainsKey('SwapTotal') -and $kv.ContainsKey('SwapFree') -and $kv['SwapFree'] -le $kv['SwapTotal']) {
+    $swapTotal = [int]($kv['SwapTotal'] / 1024); $swapUsed = [int](($kv['SwapTotal'] - $kv['SwapFree']) / 1024)
+  } else { $errors['swap'] = 'invalid-data' }
   return [ordered]@{
     mem_total_mb = [int]($kv['MemTotal'] / 1024)
     mem_available_mb = [int]($kv['MemAvailable'] / 1024)
-    swap_total_mb = [int]($swapTotal / 1024)
-    swap_used_mb = [int](($swapTotal - $swapFree) / 1024)
+    swap_total_mb = $swapTotal
+    swap_used_mb = $swapUsed
     psi_some_avg10 = $psi['some']
     psi_full_avg10 = $psi['full']
     load1 = $load
     top = @($top)
     disk = @($disk)
+    errors = $errors
   }
 }
 function Get-KtWslObservation([bool]$Enabled = $false) {

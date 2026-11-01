@@ -56,9 +56,13 @@ pub fn create(app: &AppHandle, show_when_loaded: bool) -> tauri::Result<WebviewW
             NewWindowResponse::Deny
         })
         .on_page_load(move |w, p| {
+            if p.event() == PageLoadEvent::Started {
+                w.app_handle().state::<crate::handoff_review::Review>().cancel();
+            }
             if p.event() != PageLoadEvent::Finished {
                 return;
             }
+            w.app_handle().state::<crate::handoff_review::Review>().ready();
             if show_when_loaded {
                 let _ = w.show();
                 let _ = w.set_focus();

@@ -66,6 +66,29 @@ test('従来の snapshot（distros 無し）の所見は変わらない', () => 
   assert.deepEqual(withEmpty, before);
 });
 
+test('distro 一覧取得失敗は、空一覧・無効・旧 snapshot と区別して所見に残る', () => {
+  for (const reason of ['timeout', 'exit 1', 'output-limit']) {
+    const f = find(win({ observation_enabled: true, installed: true, listed: false, list_error: reason, distros: [] }), 'wsl-list-failed');
+    assert.ok(f, reason);
+    assert.equal(f.severity, 'info');
+    assert.match(f.title, /一覧を読めなかった/);
+  }
+  for (const data of [{}, { observation_enabled: false }, { installed: false }, { installed: true, listed: true, distros: [] }]) {
+    assert.equal(find(win(data), 'wsl-list-failed'), undefined);
+  }
+});
+
+test('メモリの成功を保ちながら部分取得の欠測理由を所見に出す', () => {
+  const snap = win({ distros: [running('dev-a', 1000, 24000, { errors: { top: 'command-failed', disk: 'invalid-data', psi: 'missing-status' } })] });
+  assert.ok(find(snap, 'wsl-inside-memory'));
+  const f = find(snap, 'wsl-partial');
+  assert.ok(f);
+  assert.match(f.detail, /dev-a.*PSI.*取得結果を確認できなかった.*上位プロセス.*取得コマンドが失敗.*ディスク.*値を読めなかった/);
+  for (const errors of [undefined, {}, { top: null }, { unexpected: 'secret' }]) {
+    assert.equal(find(win({ distros: [running('dev-a', 20000, 24000, { errors })] }), 'wsl-partial'), undefined);
+  }
+});
+
 // ---- probe の構造（停止中の distro に触れない） ----
 const source = fs.readFileSync(PROBE);
 const text = source.subarray(3).toString('latin1');

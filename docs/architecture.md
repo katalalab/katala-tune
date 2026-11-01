@@ -50,7 +50,7 @@
 
 | 層 | 中身 | 置き場所 |
 |---|---|---|
-| サンプラー | 読み取り専用。1 行目に hello、以後 1 行 1 JSON を出し続ける。macOS は標準ライブラリだけ（ctypes で OS の統計を読み、他ユーザーのプロセスは setuid の ps を 15 秒ごと）。Windows は Rust のネイティブ版（`tune-agent sample`。PDH で性能カウンタを直接読み、プロセスは NtQuerySystemInformation 1 回。`~/.katala-tune/bin/tune-agent.exe` に置く）を先に使い、無ければ PowerShell 版（.NET の性能カウンタ）。GPU はどちらも 120 回で自分から終わる `nvidia-smi dmon` | `crates/tune-agent/src/sample*.rs`・`probes/live_mac.py`・`probes/live_win.ps1` |
+| サンプラー | 読み取り専用。1 行目に hello、以後 1 行 1 JSON を出し続ける。macOS は標準ライブラリだけ（ctypes で OS の統計を読み、他ユーザーのプロセスは setuid の ps を 15 秒ごと）。同じ値を sysctl・mach・libproc・IOKit で直接読む Rust 版（`tune-agent sample`、`sample_mac.rs`。live_mac.py と同時に動かして突き合わせる試験つき）を `~/.katala-tune/bin/tune-agent` に置いてあれば先に使い、無い・動かない（古い版・違うアーキテクチャ）ときは live_mac.py に戻る。Windows は Rust のネイティブ版（`tune-agent sample`。PDH で性能カウンタを直接読み、プロセスは NtQuerySystemInformation 1 回。`~/.katala-tune/bin/tune-agent.exe` に置く）を先に使い、無ければ PowerShell 版（.NET の性能カウンタ）。GPU はどちらも 120 回で自分から終わる `nvidia-smi dmon` | `crates/tune-agent/src/sample*.rs`・`probes/live_mac.py`・`probes/live_win.ps1` |
 | 取得の経路 | 今は子プロセス（この機体はローカル、ほかは SSH）。将来は tune-agent の暗号化通信に差し替える | `tune-core::live::Route` |
 | 解析・保持 | 行を読んで範囲に収め、機体ごとに直近 300 点を Rust 側に持つ | `tune-core::live`（`parse_line`・`Ring`） |
 | 管理 | 開始・停止、画面からの合図（liveStart の呼び直し）が 2 分途切れたら自動停止、同時に 6 台まで、続けての失敗は 3 回までつなぎ直す、アプリの終了・ウィンドウを閉じたときの停止 | `tune-core::live::Live`、`src-tauri/src/live.rs` |
@@ -63,6 +63,13 @@
 - Windows の SSH（Git Bash 経由）は、セッションが終わってもサンプラーの標準入出力が開いたまま残る。サンプラーは自分の上にいる sshd のプロセスを見張り、終わったら止まる
 - どの場合も、サンプラーは 15 分（`sampler_max_age`）で自分から終わり、続けるなら数えずにつなぎ直す
 
+サンプラーの置き方（`~/.katala-tune/bin` だけ。`crates/tune-core/src/helpers.rs`）:
+
+- この機体: アプリは起動のたびに、隣に同梱した `tune`・`tune-agent` を `~/.katala-tune/bin` へ写す（Mac の .app は universal の `tune-agent` を同梱）
+- 同じ OS のほかの機体: 常時監視のハブが、hello の版が古い・ネイティブが無い機体へ同梱のサンプラーを SSH の標準入力で送り、SHA-256 を確かめてから入れ替える（1 機体 1 時間に 1 回まで）
+- 違う OS の機体（Windows のハブから Mac など）: `tune agent-push <機体> --file <その OS 用の tune-agent>` で手で送る。中身がその OS の実行ファイル（PE・Mach-O）でなければ送らない。除外・SSH 禁止の機体へは送らない
+- 送らなくても動く: 無ければ macOS は live_mac.py、Windows は live_win.ps1 に戻る
+
 ## 電力・Clockと手動の接続診断
 
 - 電力・Clockは通常のprobeとライブサンプラーに取得元付きの数値を追加する。`tune-core::power` が校正・kWh・費用を計算し、`power_observation` が取得元・欠測・セッション・観測窓を区別して積分する。操作卓ごとの計算条件と観測は `engine_power` が私有DBに保存し、`renderer/power.js` が表示する。[電力・Clock](power-clock.md)
@@ -72,7 +79,7 @@
 
 ## 常時監視とハブ（画面が見ていなくても集める）
 
-ライブと同じサンプラー・同じ管理（`tune-core::live::Live`）を使い、`tune-core::monitor::run` が 15 秒ごとに合図を送って流れを保つ。終わった 1 分ぶんを `metrics_minute`（1 機体 1 分 1 行、項目ごとに [平均, 最大]、14 日）へ集計する。
+ライブと同じサンプラー・同じ管理（`tune-core::live::Live`）を使い、`tune-core::monitor::run` が 15 秒ごとに合図を送って流れを保つ。終わった 1 分ぶんを `metrics_minute`（1 機体 1 分 1 行、項目ごとに [平均, 最大]、14 日）へ集計する。 古い分は削除と同じトランザクションで数値だけの時間集約（90日）・日集約（400日）へ移す。集約は指標ごとの有効minute数で重みを付け、欠測を0にしない。全体5万行または16MiBの論理payloadを上限に古いbucketから整理し、容量による欠落を件数で残す。共有DB/WALファイル全体のhard capではない。整理失敗は内部記録へ残して5分後、成功後は24時間後に試す。既存画面の推移範囲は引き続き最大24時間で、長期履歴のUI/CLI・イベント重畳は別工程。保存数値のbaseline読み取りAPIは下記の範囲に限る。
 
 | 役割 | 動き |
 |---|---|
@@ -105,3 +112,10 @@
 - 調査は読み取り専用。変更する操作は許可リスト・確認ダイアログ・実行直前の台帳の読み直しを通す（docs/safety.md）
 - 外へ送るのは操作者が承認したときだけ。秘密・会話の本文・ツールの入出力・コマンドライン引数は取り出さない・保存しない。ただし topology の型付き宣言値は上記の private DB、cache、internal view の境界に従う
 - 個人・環境の情報をリポジトリに書かない（`npm run oss-check`）
+
+
+### 保存済み時系列のbaseline（読み取りAPI）
+
+`Store::metrics_baseline(node,metric,now)` / 互換版 `metricsBaseline` は、既存接続のSAVEPOINT内でseal・時間集約・未sealの分行を一貫して読む。schema作成・移行・pruneはしない（通常のStore/openDb初期化には別途write/migrationがある）。hour途中のsealではsum/有効minute数を結合し、rawのsample数を重みに使わない。SQLは選択した指標のJSONだけを射影し、他の機体・src・生ログは返さない。
+
+対象はcpu/mem/commit百分率のhourly means。過去28日を対象に、直近24時間を除いた27日からUTC曜日×4時間帯の基準を作り、直近24時間と比較する。未成熟/欠測は所見を出さず理由・coverageを返す。壊れた保存参照・時計rollback・行数超過は保留、I/O/busyはerrorとして伝える。日集約からhourを復元しない。UI/IPC/自動所見には未接続で、速度・リーク・変更因果・操作効果を示す機能ではない。検証範囲は [saved baseline受入記録](acceptance/saved-baseline.md)。

@@ -529,8 +529,16 @@ mod native_windows {
 
         let (_, digest) = artifact();
         // Exercise the independent verifier once, without repeating all roles.
+        let native_started = Instant::now();
         let (output, _retained, _) = run(&fixture, "topology-verify", &request, true, &digest);
-        assert!(output.status.success(), "native Unicode/worktree verification must exit zero: code={:?}", output.status.code());
+        assert!(
+            output.status.success(),
+            "native Unicode/worktree verification must exit zero: code={:?} elapsed_ms={} stdout_len={} stderr_len={}",
+            output.status.code(),
+            native_started.elapsed().as_millis(),
+            output.stdout.len(),
+            output.stderr.len()
+        );
         assert!(output.stderr.is_empty());
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("native Unicode/worktree capture JSON");
         assert_eq!(value["runtime"]["kind"], "native");
@@ -571,16 +579,22 @@ mod native_windows {
         legacy_request.nonce = reader::fresh_nonce().unwrap();
         legacy_request.probe_sha256 = reader::probe_sha256();
         legacy_request.git_artifact_sha256 = None;
+        // Match the normal 90s remote window minus its 3s transport reserve.
+        // Inbox PowerShell startup and two-checkout parity need that production
+        // window; dedicated short-budget tests still enforce actual expiry.
+        legacy_request.budget_ms = 87_000;
         legacy_request.roots = vec![normal(&fixture.repo), normal(&linked)];
         for approval in &mut legacy_request.source_allowlist {
             approval.relative_path = ".".into();
         }
         legacy_request.validate().unwrap();
+        let legacy_started = Instant::now();
         let (legacy_output, legacy_retained, legacy_body) = run(&fixture, "topology-reader", &legacy_request, true, &digest);
         assert!(
             legacy_output.status.success(),
-            "legacy Unicode/worktree reader must exit zero: code={:?} diagnostic={}",
+            "legacy Unicode/worktree reader must exit zero: code={:?} elapsed_ms={} diagnostic={}",
             legacy_output.status.code(),
+            legacy_started.elapsed().as_millis(),
             String::from_utf8_lossy(&legacy_output.stderr)
         );
         assert!(legacy_output.stderr.is_empty());
