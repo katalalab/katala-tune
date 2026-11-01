@@ -17,7 +17,7 @@ use fleet_studio::refresh::{self, FullRefresh};
 use fleet_studio::scope::{AuditGate, AuditTicket, Confirmation, Confirmations, Grants, Permit, RefreshGate};
 use fleet_studio::search_input::{KeyAction, KeyModifiers, SearchInput, search_key};
 use fleet_studio::source::{self, Coverage, Dashboard, NodeCard, Repository, SavedState};
-use gpui::{Context, FocusHandle, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, Render, SharedString, Window, div, prelude::*, rgb};
+use gpui::{Context, FocusHandle, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, Render, SharedString, Window, div, prelude::*, px, relative, rgb};
 
 enum ResumeSelection {
     Repository(String),
@@ -1378,7 +1378,8 @@ fn recent_status(status: &SyncStatus, now: i64, max_age_ms: Option<i64>) -> Stri
 }
 
 impl Render for FleetView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let compact = window.viewport_size().height <= px(480.0);
         self.reconcile_model_controls();
         let visible_models = self.visible_model_endpoints();
         let model_ticket = self.model_view.ticket();
@@ -1845,20 +1846,34 @@ impl Render for FleetView {
                 div()
                     .px_5()
                     .py_4()
+                    .when(compact, |header| header.py_2())
                     .flex()
+                    .flex_wrap()
+                    .gap_2()
                     .items_center()
                     .justify_between()
                     .bg(rgb(0x132237))
-                    .child(div().flex().flex_col().child(div().text_xl().child("Fleet Studio")).child(
-                        div().text_sm().text_color(rgb(0x9baec4)).child(if self.sample {
-                            "サンプルデータ · 読み取り専用"
+                    .child(if compact {
+                        div().text_sm().child(if self.sample {
+                            "Fleet Studio · サンプルデータ · 読み取り専用"
                         } else {
-                            "KatalaTune のデータ · 読み取り専用"
-                        }),
-                    ))
+                            "Fleet Studio · KatalaTune のデータ · 読み取り専用"
+                        })
+                    } else {
+                        div().flex().flex_col().child(div().text_xl().child("Fleet Studio")).child(
+                            div().text_sm().text_color(rgb(0x9baec4)).child(if self.sample {
+                                "サンプルデータ · 読み取り専用"
+                            } else {
+                                "KatalaTune のデータ · 読み取り専用"
+                            }),
+                        )
+                    })
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
+                            .min_w(px(0.0))
+                            .max_w(relative(1.0))
                             .gap_2()
                             .child(
                                 div()
@@ -1959,17 +1974,25 @@ impl Render for FleetView {
                 div()
                     .px_5()
                     .py_3()
+                    .when(compact, |footer| footer.py_2())
                     .flex()
+                    .flex_wrap()
+                    .gap_2()
                     .justify_between()
                     .bg(rgb(0x132237))
-                    .child(if cfg!(target_os = "windows") {
-                        "/ 検索 · M 機体 · L 追加先 · ↑↓ 選択 · Enter 確認 · Y 許可 · X 取消 · Esc 戻る"
-                    } else {
-                        "/ 検索 · M 機体 · ↑↓ 選択 · Enter 確認 · 許可はマウス · Esc 戻る"
-                    })
+                    .child(
+                        div().flex_1().min_w(px(0.0)).child(if cfg!(target_os = "windows") {
+                            "/ 検索 · M 機体 · L 追加先 · ↑↓ 選択 · Enter 確認 · Y 許可 · X 取消 · Esc 戻る"
+                        } else {
+                            "/ 検索 · M 機体 · ↑↓ 選択 · Enter 確認 · 許可はマウス · Esc 戻る"
+                        }),
+                    )
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
+                            .min_w(px(0.0))
+                            .max_w(relative(1.0))
                             .gap_4()
                             .child(
                                 div()
