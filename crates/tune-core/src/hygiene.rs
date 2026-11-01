@@ -37,6 +37,16 @@ fn opt_s(v: Option<&Value>) -> Value {
 fn opt_i(v: Option<&Value>) -> Value {
     int(v).map_or(Value::Null, Value::from)
 }
+
+/// Do not present the number of unexplored repositories as known.
+pub fn walk_coverage_note(audit: &Value) -> &'static str {
+    if text(audit.get("error")) == Some("walk_incomplete") || audit.get("truncated") == Some(&Value::Bool(true)) {
+        "・探索未確認あり（件数不明）"
+    } else {
+        ""
+    }
+}
+
 /// UTF-16 の単位で比べる（JS の `<`）
 fn cmp16(a: &str, b: &str) -> Ordering {
     a.encode_utf16().cmp(b.encode_utf16())
@@ -281,7 +291,7 @@ pub fn analyze(audit: &Value) -> Vec<Value> {
 
     let mut miss: Vec<String> = Vec::new();
     if let Some(e) = text(audit.get("error")).filter(|e| !e.is_empty()) {
-        miss.push(format!("調査が失敗した（{e}）"));
+        miss.push(if e == "walk_incomplete" { "探索先の一部を確認できない".into() } else { format!("調査が失敗した（{e}）") });
     }
     if !gone.is_empty() {
         let mut by: std::collections::BTreeMap<String, usize> = Default::default();
@@ -307,7 +317,11 @@ pub fn analyze(audit: &Value) -> Vec<Value> {
             "info",
             "リポジトリの一部を確認できていない".into(),
             format!("{}。確認できた {} 件だけで判定している（読めなかった分は「きれい」とは数えない）", miss.join("、"), seen.len()),
-            "読めない理由は、git の所有者違い（safe.directory）・壊れたリポジトリ・巨大で時間切れのどれかが多い。上限は repo_roots の絞り込みか調査の max_repos / budget_s で調整する。",
+            if text(audit.get("error")) == Some("walk_incomplete") {
+                "探索先への読み取り権限と移動・消失を確認する。ほかの未観測がある場合は、その理由も確認する。"
+            } else {
+                "読めない理由は、git の所有者違い（safe.directory）・壊れたリポジトリ・巨大で時間切れのどれかが多い。上限は repo_roots の絞り込みか調査の max_repos / budget_s で調整する。"
+            },
         );
     }
 
@@ -472,6 +486,26 @@ pub fn matrix(audits: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_walk_is_distinct_from_truncation_and_keeps_observed_results() {
+        for truncated in [false, true] {
+            let input = json!({
+                "probe": "repo_hygiene", "error": "walk_incomplete", "truncated": truncated,
+                "repos": [{"state": "ok", "path": "fixture/project", "tracked": 1, "untracked": 0, "conflicted": 0, "upstream": false, "detached": false}]
+            });
+            let data = normalize(&input);
+            let findings = analyze(&data);
+            let missing = findings.iter().find(|finding| finding["id"] == "repo-unobserved").unwrap();
+            let detail = missing["detail"].as_str().unwrap();
+            assert!(detail.contains("探索先の一部を確認できない"));
+            assert_eq!(detail.contains("探索を時間または件数で打ち切った"), truncated);
+            assert!(findings.iter().any(|finding| finding["id"] == "repo-dirty"));
+            assert_eq!(walk_coverage_note(&data), "・探索未確認あり（件数不明）");
+        }
+        assert_eq!(walk_coverage_note(&json!({ "error": null, "truncated": true })), "・探索未確認あり（件数不明）");
+        assert_eq!(walk_coverage_note(&json!({ "error": "git_missing" })), "");
+    }
 
     #[test]
     fn urls_lose_credentials() {

@@ -104,6 +104,7 @@ CPU 使用率・実行ファイル名・同名プロセス数だけでは、不�
 - 調査（`probes/repo_hygiene.py`）は opt-in で、`git status --porcelain=v2`・`config --get`・`rev-list --count`・`stash list`・`log -1` の読み取りだけを走らせる。fetch・checkout・gc・設定の変更はしない。`GIT_OPTIONAL_LOCKS=0` でインデックスを書き直さない。`test/hygiene.test.js` で、実行の前後にリポジトリのファイルと `.git` が変わらないことを確かめている。
 - ファイルの内容・差分・git の標準エラーは読まない・出さない。出すのはパス（ホームは `~`）・ブランチ名・件数・経過秒・origin（`user:pass@`・クエリ・フラグメントを除いたもの。解釈できない形は `(unparsed)`）・失敗の理由の種類（timeout・git_failed・over_limit）だけ。JS・Rust の取り込み側でも認証部をもう一度落とす。
 - 上限は、リポジトリ数（既定 1000）・全体の時間（既定 60 秒）・1 コマンドの時間（既定 12 秒）。超えた分・git を読めなかった分は `skipped` と `state: unobserved` で残し、所見に「確認できていない」と出す。きれい（0 件）とは区別する。git が無い機体は `error: git_missing`。
+- 指定された探索先をディレクトリとして確認できない場合や列挙に失敗した場合は、確認できた結果を残して `error: walk_incomplete` を返す。追加のエラー情報には失敗した場所や例外本文を含めず、時間・件数による打切りとは別に表示する。`roots` には従来どおり確認された探索先を載せる。子要素の `isdir` や `.git` の `exists` が失敗を false に畳む場合までは検出できない。
 - 共用機（`shared: true`）は既定で対象外。台帳の `"repo_hygiene": true` で入れ、`false` で外す。保存はしない（DB に入れない）。このアプリは dirty を戻さず、パスも移さない（所見に手順を書くだけ）。
 
 ## AI エージェントのセッション

@@ -16,7 +16,7 @@
 import json, os, re, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 
-KT_VERSION = "2026-10-11.1"   # 調査スクリプトの版（数え方を変えたら上げる）
+KT_VERSION = "2026-11-01.2"   # 独立変更の統合時も別版に上げる（EOF 修正は .1）
 KT_OPTS = {}                  # 呼び出し側が置き換える（数と文字列だけ）: { roots, ghq_root, max_repos, budget_s, cmd_s }
 MAX_REPOS = int(KT_OPTS.get("max_repos", 1000))
 BUDGET_S = float(KT_OPTS.get("budget_s", 60))
@@ -41,6 +41,42 @@ NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 def slash(p):
     return p.replace("\\", "/")
+
+
+def normalize_root(p, pathmod=os.path):
+    p = slash(p)
+    if p and not p.strip("/"):
+        return p if pathmod.sep == "\\" else ("//" if p == "//" else "/")
+    drive, tail = pathmod.splitdrive(p)
+    if drive and tail and not tail.strip("/"):
+        return drive + "/"  # Windows drive root or UNC share root
+    return p.rstrip("/")
+
+
+def relative_to_root(path, root, pathmod=os.path):
+    if not root:
+        return None
+    if path == root:
+        return ""
+    drive, tail = pathmod.splitdrive(root)
+    drive_relative = bool(drive and not tail and not drive.startswith("//"))
+    prefix = root if root.endswith("/") or drive_relative else root + "/"
+    if not path.startswith(prefix):
+        return None
+    relative = path[len(prefix):]
+    if drive_relative and (relative.startswith("/") or ".." in relative.split("/")):
+        return None
+    return relative
+
+
+def same_root(a, b, pathmod=os.path):
+    a, b = normalize_root(a, pathmod), normalize_root(b, pathmod)
+    if a == b:
+        return True
+    a_drive, a_tail = pathmod.splitdrive(a)
+    b_drive, b_tail = pathmod.splitdrive(b)
+    return (a_drive.startswith("//") and b_drive.startswith("//") and not a_tail.strip("/") and not b_tail.strip("/")
+            and pathmod.normcase(a_drive) == pathmod.normcase(b_drive))
 
 
 def shorten(p):
@@ -93,17 +129,17 @@ def git(path, *args):
 
 def ghq_root():
     if GHQ_ROOT_OPT:
-        return slash(os.path.expanduser(str(GHQ_ROOT_OPT))).rstrip("/"), "opt"
+        return normalize_root(os.path.expanduser(str(GHQ_ROOT_OPT))), "opt"
     if shutil.which("ghq"):
         rc, out = run(["ghq", "root"], 10)
         if rc == 0 and out.strip():
-            return slash(out.strip().splitlines()[0].strip()), "ghq"
+            return normalize_root(out.strip().splitlines()[0].strip()), "ghq"
     if os.environ.get("GHQ_ROOT"):
-        return slash(os.environ["GHQ_ROOT"].split(os.pathsep)[0]), "env"
+        return normalize_root(os.environ["GHQ_ROOT"].split(os.pathsep)[0]), "env"
     rc, out = run(["git", "config", "--global", "--get", "ghq.root"], 10)
     if rc == 0 and out.strip():
-        return slash(os.path.expanduser(out.strip().splitlines()[0])), "git-config"
-    d = slash(os.path.join(HOME, "ghq"))
+        return normalize_root(os.path.expanduser(out.strip().splitlines()[0])), "git-config"
+    d = normalize_root(os.path.join(HOME, "ghq"))
     return (d, "default") if os.path.isdir(d) else (None, None)
 
 
@@ -144,6 +180,7 @@ def find_repos(root, depth, state):
         try:
             names = sorted(os.listdir(d))
         except OSError:
+            state["incomplete"] = True
             continue
         for n in names:
             if n.startswith(".") and n not in KEEP_DOT:
@@ -207,8 +244,7 @@ def parse_status(out, now):
 
 def scan(path, root):
     d = {"path": shorten(path), "rel": None, "linked": False, "state": "unobserved"}
-    if root and (path == root or path.startswith(root + "/")):
-        d["rel"] = path[len(root) + 1:]
+    d["rel"] = relative_to_root(path, root)
     dotgit = os.path.join(path, ".git")
     d["linked"] = os.path.isfile(dotgit)
     if time.time() > DEADLINE:
@@ -275,17 +311,28 @@ def main():
         res.update(error="git_missing", elapsed_s=round(time.time() - T0, 1))
         print(json.dumps(res, ensure_ascii=False))
         return
-    walk = {"dirs": 0, "truncated": False}
+    walk = {"dirs": 0, "truncated": False, "incomplete": False}
     root, src = ghq_root()
     targets = []
-    if root and os.path.isdir(root):
-        res["roots"].append({"path": shorten(root), "source": src})
-        targets += [(p, root) for p in find_repos(root, GHQ_DEPTH, walk)]
+    selected_roots = [root] if root else []
+    if root:
+        if os.path.isdir(root):
+            res["roots"].append({"path": shorten(root), "source": src})
+            targets += [(p, root) for p in find_repos(root, GHQ_DEPTH, walk)]
+        else:
+            walk["incomplete"] = True
     for r in EXTRA_ROOTS:
-        r = slash(os.path.expanduser(r)).rstrip("/")
-        if os.path.isdir(r) and not (root and r == root):
+        r = normalize_root(os.path.expanduser(r))
+        if not r:
+            continue
+        if any(same_root(r, selected) for selected in selected_roots):
+            continue
+        selected_roots.append(r)
+        if os.path.isdir(r):
             res["roots"].append({"path": shorten(r), "source": "opt"})
             targets += [(p, root) for p in find_repos(r, EXTRA_DEPTH, walk)]
+        else:
+            walk["incomplete"] = True
     seen, uniq = set(), []
     for p, rt in targets:
         k = p.lower() if os.name == "nt" else p
@@ -296,6 +343,8 @@ def main():
     uniq.sort(key=lambda a: (os.path.isfile(os.path.join(a[0], ".git")) or "/.worktrees/" in a[0], a[0]))
     res["enumerated"] = len(uniq)
     res["truncated"] = walk["truncated"]
+    if walk["incomplete"]:
+        res["error"] = "walk_incomplete"
     take, rest = uniq[:MAX_REPOS], uniq[MAX_REPOS:]
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         res["repos"] = list(pool.map(lambda a: scan(*a), take))

@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::Command;
 
 use serde_json::{Value, json};
-use tune_core::hygiene::{analyze, matrix, normalize, path_status, script, strip_url};
+use tune_core::hygiene::{analyze, matrix, normalize, path_status, script, strip_url, walk_coverage_note};
 
 struct Rng(u64);
 impl Rng {
@@ -131,7 +131,14 @@ fn check(kind: &str, inputs: &[Value], js: &Value, rust: &[Value]) {
 #[test]
 fn hygiene_matches_js() {
     let mut r = Rng(0x9E37_79B9_7F4A_7C15);
-    let raws: Vec<Value> = (0..300).map(|_| raw_audit(&mut r)).collect();
+    let mut raws: Vec<Value> = (0..300).map(|_| raw_audit(&mut r)).collect();
+    for truncated in [false, true] {
+        raws.push(json!({
+            "probe": "repo_hygiene", "error": "walk_incomplete", "truncated": truncated, "repos": [
+                {"state": "ok", "path": "fixture/project", "tracked": 1, "untracked": 0, "conflicted": 0, "upstream": false, "detached": false}
+            ]
+        }));
+    }
     let normalized: Vec<Value> = raws.iter().map(normalize).collect();
     let urls: Vec<Value> = URLS
         .iter()
@@ -159,7 +166,7 @@ fn hygiene_matches_js() {
         json!({ "max_repos": 7.9, "budget_s": 300.5, "cmd_s": 0, "roots": (0..12).map(|i| format!("/r{i}")).collect::<Vec<_>>(), "ghq_root": "   " }),
     ];
 
-    let cases = json!({ "stripUrl": urls, "normalize": raws, "analyze": normalized, "pathStatus": rows, "matrix": matrices, "script": scripts });
+    let cases = json!({ "stripUrl": urls, "normalize": raws, "analyze": normalized, "walkCoverageNote": normalized, "pathStatus": rows, "matrix": matrices, "script": scripts });
     let Some(js) = run_js(&cases) else { return };
 
     let rs_urls: Vec<Value> = urls.iter().map(|u| strip_url(u.as_str()).map_or(Value::Null, Value::from)).collect();
@@ -167,6 +174,8 @@ fn hygiene_matches_js() {
     check("normalize", &raws, &js, &normalized);
     let rs_an: Vec<Value> = normalized.iter().map(|a| json!(analyze(a))).collect();
     check("analyze", &normalized, &js, &rs_an);
+    let rs_notes: Vec<Value> = normalized.iter().map(|a| json!(walk_coverage_note(a))).collect();
+    check("walkCoverageNote", &normalized, &js, &rs_notes);
     let rs_ps: Vec<Value> = rows.iter().map(|x| json!(path_status(x))).collect();
     check("pathStatus", &rows, &js, &rs_ps);
     let rs_mx: Vec<Value> = matrices.iter().map(|m| json!(matrix(m.as_array().unwrap()))).collect();
