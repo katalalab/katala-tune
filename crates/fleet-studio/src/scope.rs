@@ -201,6 +201,30 @@ pub fn may_show_saved(grants: &Grants, id: &str, permit: Option<&Permit>, rechec
     !rechecking && permit.is_some_and(|permit| grants.contains(id, permit))
 }
 
+pub fn cycle_machine_confirmation<T: PartialEq>(
+    confirmations: &mut Confirmations,
+    gate: &mut crate::confirmation_keys::ConfirmKeyGate<T>,
+    repository: &mut crate::navigation::Selection,
+    choices: &[(String, String)],
+    current: Option<&(String, String)>,
+    reverse: bool,
+) -> Option<(String, String)> {
+    repository.invalidate();
+    confirmations.clear();
+    gate.clear();
+    if choices.is_empty() {
+        return None;
+    }
+    let current = current.and_then(|current| choices.iter().position(|choice| choice == current));
+    let index = match (current, reverse) {
+        (Some(0), true) | (None, true) => choices.len() - 1,
+        (Some(index), true) => index - 1,
+        (Some(index), false) => (index + 1) % choices.len(),
+        (None, false) => 0,
+    };
+    Some(choices[index].clone())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MachineKey {
     Next,

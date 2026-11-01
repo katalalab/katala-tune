@@ -128,10 +128,10 @@ impl NavigationKeyGate {
         self.down = true;
         self.enter = true;
         self.revoke = true;
-        self.select = true;
+        self.select = false;
         self.refresh = true;
         self.audit = true;
-        self.machine = true;
+        self.machine = false;
         self.escape = true;
         self.search = true;
     }

@@ -108,6 +108,90 @@ fn navigation_repeat_without_held_flag_is_consumed_until_release() {
 }
 
 #[test]
+fn focus_recovery_allows_only_l_and_m_to_start_selection_once() {
+    let mut gate = NavigationKeyGate::default();
+    gate.focus_lost();
+    for key in ["l", "m"] {
+        assert!(gate.down(key, false));
+        assert!(!gate.down(key, false));
+        gate.up(key);
+        assert!(!gate.down(key, true));
+        gate.up(key);
+    }
+    for key in ["up", "down", "enter", "x", "r", "a", "escape", "/", "slash"] {
+        assert!(!gate.down(key, false));
+    }
+    let mut confirm = ConfirmKeyGate::<u64>::default();
+    confirm.focus_lost();
+    confirm.arm(1);
+    assert!(!confirm.down(Some(&1), false, false));
+}
+
+#[test]
+fn empty_machine_selection_cancels_confirmation_and_confirmation_key() {
+    let mut confirmations = fleet_studio::scope::Confirmations::default();
+    let old = confirmations.begin("fixture", "fingerprint").unwrap();
+    let mut gate = ConfirmKeyGate::default();
+    gate.arm(old.clone());
+    let mut repository = fleet_studio::navigation::Selection::default();
+    repository.next(1);
+    assert_eq!(repository.index(), Some(0));
+    let selected = fleet_studio::scope::cycle_machine_confirmation(&mut confirmations, &mut gate, &mut repository, &[], None, false);
+    assert_eq!(selected, None);
+    assert_eq!(repository.index(), None);
+    assert!(confirmations.current().is_none());
+    assert!(!confirmations.take_if(&old));
+    assert!(!gate.down(Some(&old), false, false));
+}
+
+#[test]
+fn machine_selection_preserves_cycling_order_after_confirmation_is_cleared() {
+    let mut confirmations = fleet_studio::scope::Confirmations::default();
+    let old = confirmations.begin("fixture-a", "fingerprint-a").unwrap();
+    let mut gate = ConfirmKeyGate::default();
+    gate.arm(old.clone());
+    let mut repository = fleet_studio::navigation::Selection::default();
+    let choices = vec![("fixture-a".to_owned(), "fingerprint-a".to_owned()), ("fixture-b".to_owned(), "fingerprint-b".to_owned())];
+    assert_eq!(
+        fleet_studio::scope::cycle_machine_confirmation(&mut confirmations, &mut gate, &mut repository, &choices, Some(&choices[0]), true),
+        Some(choices[1].clone())
+    );
+    assert!(!confirmations.take_if(&old));
+    assert_eq!(
+        fleet_studio::scope::cycle_machine_confirmation(&mut confirmations, &mut gate, &mut repository, &choices, Some(&choices[1]), false),
+        Some(choices[0].clone())
+    );
+}
+
+#[test]
+fn selection_keeps_remote_unapproved_and_invalidates_old_confirmations() {
+    let (mut models, first, second) = configured();
+    let visible = vec![first.clone(), second];
+    let old_model = llm_keyboard::prepare(&mut models, &visible, &first, false).unwrap();
+    let mut current_model = Some(old_model.clone());
+    llm_keyboard::dismiss(&mut models, &mut current_model);
+    let mut selection = ModelKeyboard::default();
+    selection.begin(&models, &visible);
+    assert_eq!(selection.current(&models, &visible), Some(&first));
+    assert!(models.confirm(&old_model).is_none());
+    assert!(!models.entries().iter().find(|entry| entry.endpoint == first).unwrap().authorized);
+
+    let mut confirmations = fleet_studio::scope::Confirmations::default();
+    let old_machine = confirmations.begin("fixture", "fingerprint").unwrap();
+    let mut gate = ConfirmKeyGate::default();
+    gate.arm(old_machine.clone());
+    let mut repository = fleet_studio::navigation::Selection::default();
+    let choices = vec![("fixture".to_owned(), "fingerprint".to_owned())];
+    assert_eq!(
+        fleet_studio::scope::cycle_machine_confirmation(&mut confirmations, &mut gate, &mut repository, &choices, None, false),
+        Some(choices[0].clone())
+    );
+    assert!(!confirmations.take_if(&old_machine));
+    assert!(!gate.down(Some(&old_machine), false, false));
+    assert!(!models.entries().iter().find(|entry| entry.endpoint == first).unwrap().authorized);
+}
+
+#[test]
 fn keyboard_routing_gives_search_and_blocked_input_priority() {
     assert_eq!(llm_keyboard::key("l", false, false, false, true), Some(ModelKey::Select));
     assert_eq!(llm_keyboard::key("enter", true, false, false, true), Some(ModelKey::Inspect));

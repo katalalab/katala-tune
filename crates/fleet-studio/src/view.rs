@@ -571,22 +571,20 @@ impl FleetView {
                 })
                 .collect()
         });
-        if choices.is_empty() {
+        let next = fleet_studio::scope::cycle_machine_confirmation(
+            &mut self.confirmations,
+            &mut self.confirmation_keys,
+            &mut self.selected,
+            &choices,
+            self.machine_focus.as_ref(),
+            reverse,
+        );
+        let Some(next) = next else {
             self.machine_focus = None;
             self.access_notice = Some("選択できる機体がありません。");
             return;
-        }
-        let current = self.machine_focus.as_ref().and_then(|focused| choices.iter().position(|choice| choice == focused));
-        let index = match (current, reverse) {
-            (Some(0), true) | (None, true) => choices.len() - 1,
-            (Some(index), true) => index - 1,
-            (Some(index), false) => (index + 1) % choices.len(),
-            (None, false) => 0,
         };
-        self.machine_focus = Some(choices[index].clone());
-        self.confirmations.clear();
-        self.confirmation_keys.clear();
-        self.selected.invalidate();
+        self.machine_focus = Some(next);
         self.access_notice = None;
     }
 
