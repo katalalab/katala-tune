@@ -251,6 +251,7 @@ pub struct ModelScope {
     rejected: usize,
     duplicates: usize,
     confirmation: Option<ModelConfirmation>,
+    confirmations_suspended: bool,
 }
 
 impl ModelScope {
@@ -314,10 +315,19 @@ impl ModelScope {
             entries.push(item);
         }
         self.entries = entries;
+        self.confirmations_suspended = false;
         requests
     }
 
+    pub fn suspend_confirmations(&mut self) {
+        self.confirmations_suspended = true;
+        self.confirmation = None;
+    }
+
     pub fn prepare_authorization(&mut self, endpoint: &Endpoint) -> Option<ModelConfirmation> {
+        if self.confirmations_suspended {
+            return None;
+        }
         let item = self.entries.iter().find(|item| &item.endpoint == endpoint && !item.authorized && !item.endpoint.address.ip().is_loopback())?;
         let confirmation = ModelConfirmation { endpoint: item.endpoint.clone(), nonce: Arc::new(()) };
         self.confirmation = Some(confirmation.clone());
@@ -342,7 +352,7 @@ impl ModelScope {
     }
 
     pub fn confirm(&mut self, confirmation: &ModelConfirmation) -> Option<ModelQuery> {
-        if self.confirmation.as_ref() != Some(confirmation) {
+        if self.confirmations_suspended || self.confirmation.as_ref() != Some(confirmation) {
             return None;
         }
         let item = self.entries.iter_mut().find(|item| item.endpoint == confirmation.endpoint)?;

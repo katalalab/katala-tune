@@ -116,18 +116,24 @@ impl FleetView {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        if !self.refresh_queue.request(self.data_inflight || self.model_scope.querying()) {
-            cx.notify();
-            return;
-        }
         self.selected.invalidate();
         self.pointer_ids.borrow_mut().clear();
+        self.model_confirmation = None;
+        self.model_scope.suspend_confirmations();
         if !self.sample {
             if let Some(generation) = self.recent.request() {
                 self.start_recent(generation, cx);
             }
             cx.notify();
         }
+        if !self.refresh_queue.request(self.data_inflight || self.model_scope.querying()) {
+            cx.notify();
+            return;
+        }
+        self.start_refresh(cx);
+    }
+
+    fn start_refresh(&mut self, cx: &mut Context<Self>) {
         if let Some(audit) = &mut self.audit {
             for repo in &mut audit.repos {
                 repo.previous = true;
@@ -237,7 +243,7 @@ impl FleetView {
     }
 
     fn prepare_model_confirmation(&mut self, endpoint: &Endpoint, cx: &mut Context<Self>) {
-        if !self.sample {
+        if !self.sample && !self.refresh_queue.pending() {
             self.model_confirmation = self.model_scope.prepare_authorization(endpoint);
             self.model_cancellation = None;
             self.pointer_ids.borrow_mut().clear();
@@ -246,7 +252,7 @@ impl FleetView {
     }
 
     fn confirm_model(&mut self, confirmation: &ModelConfirmation, cx: &mut Context<Self>) {
-        if self.sample || self.model_confirmation.as_ref() != Some(confirmation) {
+        if self.sample || self.refresh_queue.pending() || self.model_confirmation.as_ref() != Some(confirmation) {
             return;
         }
         self.model_confirmation = None;
@@ -284,7 +290,7 @@ impl FleetView {
 
     fn resume_refresh(&mut self, cx: &mut Context<Self>) {
         if self.refresh_queue.ready(self.data_inflight || self.model_scope.querying()) {
-            self.refresh(cx);
+            self.start_refresh(cx);
         }
     }
 
@@ -1076,6 +1082,8 @@ impl Render for FleetView {
                             .child("許可を取り消す")
                             .on_click(cx.listener(move |view, _, _, cx| view.revoke_model(&grant, cx))),
                     );
+                } else if self.refresh_queue.pending() {
+                    item = item.child(note("更新待ちのため、接続内容の確認はできません。".into(), 0xffb86c));
                 } else if let Some(confirmation) = self.model_confirmation.as_ref().filter(|confirmation| confirmation.endpoint() == &endpoint) {
                     item = item.child(note(format!("接続内容を確認: {}。モデル一覧を取得します。", confirmation.description()), 0xffb86c));
                     let confirm_id = pointer_ids.get("llm-confirm", &[&address, protocol, &endpoint.label]);

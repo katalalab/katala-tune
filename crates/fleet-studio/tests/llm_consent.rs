@@ -139,6 +139,23 @@ fn an_old_confirmation_cannot_authorize_after_configuration_changes() {
 }
 
 #[test]
+fn pending_refresh_suspends_old_and_new_confirmations_until_config_is_refreshed() {
+    let mut scope = ModelScope::default();
+    scope.refresh(Some(REMOTE));
+    let remote = llm::endpoint(REMOTE).unwrap();
+    let old = scope.prepare_authorization(&remote).unwrap();
+
+    scope.suspend_confirmations();
+    assert!(scope.confirm(&old).is_none());
+    assert!(scope.prepare_authorization(&remote).is_none());
+
+    scope.refresh(Some(REMOTE));
+    assert!(scope.confirm(&old).is_none());
+    let current = scope.prepare_authorization(&remote).unwrap();
+    assert!(scope.confirm(&current).is_some());
+}
+
+#[test]
 fn a_revoked_confirmation_cannot_be_replayed() {
     let mut scope = ModelScope::default();
     scope.refresh(Some(REMOTE));
