@@ -17,7 +17,8 @@ fn recent(name: &str, cwd: Option<&str>) -> RecentEntry {
         tool: name.into(),
         cwd: cwd.map(str::to_owned),
         activity_at: None,
-        directory_url: cwd.map(|_| "synthetic-directory".into()),
+        directory_url: cwd
+            .and_then(|value| fleet_studio::recent::local_cwd_candidate_with_home("fixture-node", true, value, std::path::Path::new(local_path()))),
         prs: Vec::new(),
         pr_state: PrState::Empty,
     }

@@ -1237,7 +1237,7 @@ fn sample_recent() -> RecentWork {
             tool: "fixture-agent".into(),
             cwd: Some(cwd.into()),
             activity_at: Some(now),
-            directory_url: recent::local_cwd_url(true, cwd),
+            directory_url: recent::local_cwd_candidate_with_home("fixture-node", true, cwd, std::path::Path::new(cwd)),
             prs: vec!["https://github.com/example/fixture/pull/1".into()],
             pr_state: recent::PrState::Complete,
         }],
@@ -1559,6 +1559,7 @@ impl Render for FleetView {
         }
 
         content = content.child(section("最近の作業", "保存済み・現在の稼働状態ではありません"));
+        content = content.child(note(recent::recent_provenance_notice(self.sample).into(), 0x9baec4));
         content = content
             .child(note("保存された取込上の記録です。収集の正常完了や網羅性は保証できず、台帳の機体 ID は接続先の本人確認ではありません。".into(), 0x9baec4));
         content = content.child(note(
@@ -1614,7 +1615,7 @@ impl Render for FleetView {
                     .child(div().text_sm().text_color(rgb(0x9baec4)).child(collection))
                     .child(div().text_sm().text_color(rgb(0x9baec4)).child(prs));
                 let mut actions = div().flex().gap_4().text_sm();
-                if entry.local && entry.directory_url.is_some() {
+                if navigation::recent_target(entry, RecentOpen::Directory).is_some() {
                     let selected_entry = (*entry).clone();
                     let ticket = self.recent_gate.ticket();
                     actions = actions.child(
@@ -1627,7 +1628,7 @@ impl Render for FleetView {
                                         &entry.node,
                                         &entry.tool,
                                         entry.cwd.as_deref().unwrap_or(""),
-                                        entry.directory_url.as_deref().unwrap_or(""),
+                                        entry.directory_url.as_ref().map_or("", |candidate| candidate.url()),
                                         if entry.local { "local" } else { "remote" }
                                     ]
                                 )

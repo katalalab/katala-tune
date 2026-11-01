@@ -110,6 +110,15 @@ impl OpenTarget {
         Some(Self(Target::Directory(path)))
     }
 
+    /// Use only the path bound to this row when the candidate was created.
+    fn recent_directory(entry: &crate::recent::RecentEntry) -> Option<Self> {
+        let path = entry.directory_url.as_ref()?.path_for(&entry.node, entry.local, entry.cwd.as_deref())?;
+        if !crate::recent::safe_local_directory_path(path) {
+            return None;
+        }
+        Some(Self(Target::Directory(path.to_path_buf())))
+    }
+
     /// Call on a dedicated worker thread; never include targets or OS errors in output.
     pub fn open(self) -> OpenResult {
         self.open_guarded(|| true)
@@ -282,9 +291,8 @@ pub fn recent_target(entry: &crate::recent::RecentEntry, kind: RecentOpen) -> Op
         return None;
     }
     match kind {
-        RecentOpen::Directory if entry.directory_url.is_some() => entry.cwd.as_deref().and_then(OpenTarget::directory),
+        RecentOpen::Directory => OpenTarget::recent_directory(entry),
         RecentOpen::PullRequest(index) => entry.prs.get(index).and_then(|url| crate::recent::github_pr_url(url)).and_then(|url| OpenTarget::github(&url)),
-        _ => None,
     }
 }
 
@@ -292,7 +300,7 @@ pub fn preferred_recent(entry: &crate::recent::RecentEntry) -> Option<RecentOpen
     if !entry.local {
         return None;
     }
-    Some(if entry.directory_url.is_some() { RecentOpen::Directory } else { RecentOpen::PullRequest(0) })
+    Some(if recent_target(entry, RecentOpen::Directory).is_some() { RecentOpen::Directory } else { RecentOpen::PullRequest(0) })
 }
 
 impl<'a> WorkRows<'a> {

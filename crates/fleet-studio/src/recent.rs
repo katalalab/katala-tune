@@ -1,5 +1,5 @@
 //! Privacy-preserving projection of saved AI session metadata. No collection runs here.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -93,6 +93,26 @@ impl SyncStatus {
     }
 }
 
+/// Immutable evidence for the row and path observed together.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecentDirectory {
+    node: String,
+    local: bool,
+    cwd: String,
+    path: PathBuf,
+    url: String,
+}
+
+impl RecentDirectory {
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub(crate) fn path_for(&self, node: &str, local: bool, cwd: Option<&str>) -> Option<&Path> {
+        (local && self.local == local && self.node == node && cwd == Some(self.cwd.as_str())).then_some(self.path.as_path())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecentEntry {
     pub node: String,
@@ -100,7 +120,7 @@ pub struct RecentEntry {
     pub tool: String,
     pub cwd: Option<String>,
     pub activity_at: Option<i64>,
-    pub directory_url: Option<String>,
+    pub directory_url: Option<RecentDirectory>,
     pub prs: Vec<String>,
     pub pr_state: PrState,
 }
@@ -379,28 +399,126 @@ pub fn project_prs(text: Option<&str>) -> (Vec<String>, PrState) {
     (valid.into_iter().take(MAX_PRS).collect(), if incomplete { PrState::Partial } else { PrState::Complete })
 }
 
+/// Classify home shorthand without interpreting paths for a different OS.
+fn home_shorthand_suffix(cwd: &str, windows: bool) -> Result<Option<&str>, ()> {
+    if cwd == "~" {
+        return Ok(Some(""));
+    }
+    let suffix = if let Some(rest) = cwd.strip_prefix("~/") {
+        Some(rest)
+    } else if let Some(rest) = cwd.strip_prefix("~\\") {
+        if !windows {
+            return Err(());
+        }
+        Some(rest)
+    } else {
+        None
+    };
+    if suffix.is_some_and(|rest| {
+        let bytes = rest.as_bytes();
+        rest.starts_with('/') || rest.starts_with('\\') || (windows && bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+    }) {
+        return Err(());
+    }
+    Ok(suffix)
+}
+
+/// A conservative subset of normal Win32 names; extended namespaces are not supported.
+#[cfg(any(windows, test))]
+fn reserved_windows_component(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ').to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") {
+        return true;
+    }
+    let Some(suffix) = stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT")) else {
+        return false;
+    };
+    let mut chars = suffix.chars();
+    matches!(chars.next(), Some('0'..='9' | '¹' | '²' | '³')) && chars.next().is_none()
+}
+
+/// Validate syntax only; the existing OS handoff checks actual directories.
+pub(crate) fn safe_local_directory_path(path: &Path) -> bool {
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    if !path.is_absolute()
+        || text.starts_with("\\\\")
+        || text.starts_with("//")
+        || text.chars().any(char::is_control)
+        || path.components().any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        if !matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))) {
+            return false;
+        }
+        for part in path.components() {
+            if let Component::Normal(name) = part {
+                let Some(name) = name.to_str() else {
+                    return false;
+                };
+                if name.starts_with(' ')
+                    || name.ends_with(' ')
+                    || name.ends_with('.')
+                    || reserved_windows_component(name)
+                    || name.chars().any(|ch| matches!(ch, ':' | '<' | '>' | '"' | '|' | '?' | '*'))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// A remote path or UNC path is never converted to a local file URL.
 pub fn local_cwd_url(local: bool, cwd: &str) -> Option<String> {
     local_cwd_url_with_home(local, cwd, &nodes::home())
 }
 
-pub fn local_cwd_url_with_home(local: bool, cwd: &str, home: &Path) -> Option<String> {
+fn local_cwd_path_and_url(local: bool, cwd: &str, home: &Path) -> Option<(PathBuf, String)> {
     if !local || cwd.len() > 2048 || cwd.chars().any(char::is_control) {
         return None;
     }
-    let path = if cwd == "~" {
-        home.to_path_buf()
-    } else if let Some(rest) = cwd.strip_prefix("~/").or_else(|| cwd.strip_prefix("~\\")) {
-        home.join(rest)
-    } else {
-        std::path::PathBuf::from(cwd)
+    let path = match home_shorthand_suffix(cwd, cfg!(windows)).ok()? {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(cwd),
     };
-    let text = path.to_string_lossy();
-    if !path.is_absolute() || text.starts_with("\\\\") || text.starts_with("//") {
+    if !safe_local_directory_path(&path) {
         return None;
     }
-    let url = url::Url::from_directory_path(path).ok()?;
-    if url.host_str().is_some() { None } else { Some(url.into()) }
+    let path: PathBuf = path.components().collect();
+    let url = url::Url::from_directory_path(&path).ok()?;
+    let roundtrip = url.to_file_path().ok()?;
+    if url.host_str().is_some() || !safe_local_directory_path(&roundtrip) || roundtrip != path {
+        return None;
+    }
+    Some((path, url.into()))
+}
+
+pub fn local_cwd_url_with_home(local: bool, cwd: &str, home: &Path) -> Option<String> {
+    local_cwd_path_and_url(local, cwd, home).map(|(_, url)| url)
+}
+
+/// Bind a locally validated path to the row for which it was observed.
+pub fn local_cwd_candidate_with_home(node: &str, local: bool, cwd: &str, home: &Path) -> Option<RecentDirectory> {
+    if node.is_empty() || node.chars().any(char::is_control) {
+        return None;
+    }
+    let (path, url) = local_cwd_path_and_url(local, cwd, home)?;
+    Some(RecentDirectory { node: node.into(), local, cwd: cwd.into(), path, url })
+}
+
+pub fn recent_provenance_notice(sample: bool) -> &'static str {
+    if sample {
+        "サンプルです。実データでは保存済みの場所が現在の作業場所と一致するか、保存元の実機・利用者・ホームが現在と同じかは未確認です。~ は読込時のホームで展開します。"
+    } else {
+        "保存済みの場所が現在の作業場所と一致するか、保存元の実機・利用者・ホームが現在と同じかは未確認です。~ は読込時のホームで展開します。"
+    }
 }
 
 pub fn file_error_count_text(count: Option<u64>) -> String {
@@ -436,7 +554,7 @@ fn entry(node: &Node, row: &Value, now: i64) -> RecentEntry {
         row.get(key).and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= max && !s.chars().any(char::is_control)).map(str::to_owned)
     };
     let cwd = text("cwd", 2048);
-    let directory_url = cwd.as_deref().and_then(|cwd| local_cwd_url(node.local, cwd));
+    let directory_url = cwd.as_deref().and_then(|cwd| local_cwd_candidate_with_home(&node.id, node.local, cwd, &nodes::home()));
     let (prs, pr_state) = project_prs(row.get("prs").and_then(Value::as_str));
     RecentEntry {
         node: node.id.clone(),
@@ -538,4 +656,67 @@ pub fn load_for_host(config_path: &Path, data_dir: &Path, now: i64, host: &str, 
     }
     result.validated_at = Some(tune_core::db::now_ms());
     result
+}
+
+#[cfg(test)]
+mod path_syntax_tests {
+    use super::{home_shorthand_suffix, recent_provenance_notice, reserved_windows_component};
+
+    #[test]
+    fn virtual_windows_and_posix_home_shorthand_reject_ambiguous_separators() {
+        assert_eq!(home_shorthand_suffix("~", false), Ok(Some("")));
+        assert_eq!(home_shorthand_suffix("~/project", false), Ok(Some("project")));
+        assert_eq!(home_shorthand_suffix("~\\project", false), Err(()));
+        assert_eq!(home_shorthand_suffix("~//project", false), Err(()));
+        assert_eq!(home_shorthand_suffix("~/\\project", false), Err(()));
+
+        assert_eq!(home_shorthand_suffix("~", true), Ok(Some("")));
+        assert_eq!(home_shorthand_suffix("~/project", true), Ok(Some("project")));
+        assert_eq!(home_shorthand_suffix("~\\project", true), Ok(Some("project")));
+        assert_eq!(home_shorthand_suffix("~//project", true), Err(()));
+        assert_eq!(home_shorthand_suffix("~\\\\project", true), Err(()));
+        assert_eq!(home_shorthand_suffix("~\\/project", true), Err(()));
+        assert_eq!(home_shorthand_suffix("~/C:/project", true), Err(()));
+    }
+
+    #[test]
+    fn virtual_windows_device_names_are_rejected_including_extensions_and_superscripts() {
+        for name in [
+            "CON",
+            "con.txt",
+            "PRN",
+            "aux.data",
+            "NUL.tar.gz",
+            "COM0",
+            "COM1",
+            "com9.txt",
+            "COM¹",
+            "COM².txt",
+            "com³.tar.gz",
+            "LPT0",
+            "LPT1",
+            "lpt9.log",
+            "LPT¹",
+            "lpt².txt",
+            "Lpt³.x",
+            "CONIN$",
+            "conout$.txt",
+        ] {
+            assert!(reserved_windows_component(name));
+        }
+        for name in ["console", "COM10", "LPT10", "NULled", "xCON", "COM⁴", ".env", "project"] {
+            assert!(!reserved_windows_component(name));
+        }
+    }
+
+    #[test]
+    fn provenance_notice_is_present_for_sample_and_regular_views() {
+        for sample in [false, true] {
+            let notice = recent_provenance_notice(sample);
+            for expected in ["保存", "現在の作業場所", "保存元", "実機", "利用者", "未確認", "ホーム"] {
+                assert!(notice.contains(expected));
+            }
+        }
+        assert!(recent_provenance_notice(true).contains("サンプル"));
+    }
 }
