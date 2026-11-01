@@ -102,6 +102,31 @@ fn permission_revoked_during_path_validation_prevents_os_handoff() {
     assert_eq!(finish_if_authorized(|| allowed.get(), || false), OpenResult::Failed);
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_targets_recheck_permission_immediately_before_os_handoff() {
+    use fleet_studio::navigation::{OpenResult, OpenTarget};
+    use std::cell::Cell;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let verify = |target: OpenTarget| {
+        let calls = Cell::new(0);
+        let result = target.open_guarded(|| {
+            let count = calls.get();
+            calls.set(count + 1);
+            count == 0
+        });
+        assert_eq!(result, OpenResult::SelectionChanged);
+        assert_eq!(calls.get(), 2);
+    };
+    verify(OpenTarget::github("https://github.com/example/fixture/pull/1").unwrap());
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("fixture-guard-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    verify(OpenTarget::directory(directory.to_str().unwrap()).unwrap());
+    std::fs::remove_dir(directory).unwrap();
+}
+
 #[test]
 fn late_results_do_not_replace_the_status_of_a_newer_request() {
     use fleet_studio::navigation::{OpenResult, OpenState, OpenStatus};
