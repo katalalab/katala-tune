@@ -293,7 +293,7 @@ impl FleetView {
         cx.spawn(async move |view, cx| {
             timer.await;
             let _ = view.update(cx, |view, cx| {
-                if view.auditing && view.audit_seq == seq && view.generation == generation {
+                if view.auditing && view.audit_seq == seq {
                     view.audit_error = Some("監査が時間上限を超過（終了待ち）".into());
                     cx.notify();
                 }
