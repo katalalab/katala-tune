@@ -11,6 +11,7 @@ pub mod refresh;
 pub mod scope;
 pub mod search_input;
 pub mod source;
+pub mod ui_consent;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Observation {

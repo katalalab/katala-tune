@@ -17,6 +17,7 @@ use fleet_studio::refresh::{self, FullRefresh};
 use fleet_studio::scope::{AuditGate, AuditTicket, Confirmation, Confirmations, Grants, Permit, RefreshGate};
 use fleet_studio::search_input::{KeyAction, KeyModifiers, SearchInput, search_key};
 use fleet_studio::source::{self, Coverage, Dashboard, NodeCard, Repository, SavedState};
+use fleet_studio::ui_consent::{self, MachineConfirmationResult, ModelConfirmationResult};
 use gpui::{Context, FocusHandle, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, Render, SharedString, Window, div, prelude::*, px, relative, rgb};
 
 enum ResumeSelection {
@@ -320,6 +321,11 @@ impl FleetView {
     }
 
     fn prepare_model_confirmation(&mut self, endpoint: &Endpoint, cx: &mut Context<Self>) {
+        if !ui_consent::preparation_available(self.sample) {
+            self.model_notice = Some(ui_consent::MODEL_UNAVAILABLE);
+            cx.notify();
+            return;
+        }
         let visible = self.visible_model_endpoints();
         if self.refresh_queue.pending() || !visible.contains(endpoint) {
             return;
@@ -346,19 +352,33 @@ impl FleetView {
 
     fn confirm_model(&mut self, confirmation: &ModelConfirmation, cx: &mut Context<Self>) {
         let visible = self.visible_model_endpoints();
-        if let Some(request) =
-            llm_keyboard::confirm(&mut self.model_scope, &visible, self.model_confirmation.as_ref(), confirmation, self.refresh_queue.pending())
-        {
-            self.model_view.invalidate();
-            self.model_confirmation = None;
-            self.confirmation_keys.clear();
-            self.pointer_ids.borrow_mut().clear();
-            let visible = self.visible_model_endpoints();
-            self.model_keyboard.authorized(&self.model_scope, &visible, confirmation.endpoint());
-            if self.model_keyboard.active() && self.model_keyboard.current(&self.model_scope, &visible).is_none() {
-                self.model_notice = Some("選択先が非表示になりました。取消は検索を解除し、L と上下キーで対象を選び直して X を押してください。");
+        match ui_consent::confirm_model(
+            self.sample,
+            &mut self.model_scope,
+            &visible,
+            &mut self.model_confirmation,
+            confirmation,
+            self.refresh_queue.pending(),
+        ) {
+            ModelConfirmationResult::Authorized(request) => {
+                self.model_view.invalidate();
+                self.model_confirmation = None;
+                self.confirmation_keys.clear();
+                self.pointer_ids.borrow_mut().clear();
+                let visible = self.visible_model_endpoints();
+                self.model_keyboard.authorized(&self.model_scope, &visible, confirmation.endpoint());
+                if self.model_keyboard.active() && self.model_keyboard.current(&self.model_scope, &visible).is_none() {
+                    self.model_notice = Some("選択先が非表示になりました。取消は検索を解除し、L と上下キーで対象を選び直して X を押してください。");
+                }
+                self.start_model_query(request, cx);
             }
-            self.start_model_query(request, cx);
+            ModelConfirmationResult::Unavailable => {
+                self.model_view.invalidate();
+                self.confirmation_keys.clear();
+                self.pointer_ids.borrow_mut().clear();
+                self.model_notice = Some(ui_consent::MODEL_UNAVAILABLE);
+            }
+            ModelConfirmationResult::Stale => {}
         }
         self.reconcile_model_controls();
         cx.notify();
@@ -480,6 +500,11 @@ impl FleetView {
     }
 
     fn request_machine_access(&mut self, id: String, fingerprint: String, cx: &mut Context<Self>) {
+        if !ui_consent::preparation_available(self.sample) {
+            self.access_notice = Some(ui_consent::MACHINE_UNAVAILABLE);
+            cx.notify();
+            return;
+        }
         if self.scope_check_pending || self.revoking.contains(&id) || self.grants.matching(&id, &fingerprint).is_some() {
             return;
         }
@@ -510,17 +535,25 @@ impl FleetView {
             .dashboard
             .as_ref()
             .is_some_and(|dashboard| dashboard.nodes.iter().any(|node| node.id == *id && node.fingerprint.as_deref() == Some(fingerprint.as_str())));
-        if !still_shown || !self.confirmations.take_if(&confirmation) {
+        if !still_shown {
             return;
         }
-        self.confirmation_keys.clear();
-        if !self.grants.authorize(id, fingerprint) {
-            self.access_notice = Some("表示許可を開始できません。");
-            cx.notify();
-            return;
+        match ui_consent::confirm_machine(self.sample, &mut self.confirmations, &mut self.grants, &confirmation) {
+            MachineConfirmationResult::Authorized => {
+                self.confirmation_keys.clear();
+                self.dashboard_gate.invalidate();
+                self.start_dashboard(cx);
+            }
+            MachineConfirmationResult::Unavailable => {
+                self.confirmation_keys.clear();
+                self.access_notice = Some(ui_consent::MACHINE_UNAVAILABLE);
+            }
+            MachineConfirmationResult::Stale => return,
+            MachineConfirmationResult::Failed => {
+                self.confirmation_keys.clear();
+                self.access_notice = Some("表示許可を開始できません。");
+            }
         }
-        self.dashboard_gate.invalidate();
-        self.start_dashboard(cx);
         cx.notify();
     }
 
@@ -590,7 +623,9 @@ impl FleetView {
 
     fn machine_banner(&self) -> Option<String> {
         let (id, fingerprint) = self.machine_focus.as_ref()?;
-        if self.confirmations.current().is_some_and(|pending| pending.id == *id && pending.fingerprint == *fingerprint) {
+        if !ui_consent::preparation_available(self.sample) && self.grants.matching(id, fingerprint).is_none() {
+            Some(format!("台帳 ID {id}: {}", ui_consent::MACHINE_UNAVAILABLE))
+        } else if self.confirmations.current().is_some_and(|pending| pending.id == *id && pending.fingerprint == *fingerprint) {
             if !cfg!(target_os = "windows") {
                 Some(format!("台帳 ID {id}: キーボードでの最終許可は未対応です。確認後、画面のボタンを使用してください。"))
             } else {
@@ -619,7 +654,11 @@ impl FleetView {
 
     fn confirm_focused_machine(&mut self, cx: &mut Context<Self>) {
         if !cfg!(target_os = "windows") {
-            self.access_notice = Some("この OS のキーボード最終許可は未対応です。画面のボタンを使用してください。");
+            self.access_notice = Some(if ui_consent::preparation_available(self.sample) {
+                "この OS のキーボード最終許可は未対応です。画面のボタンを使用してください。"
+            } else {
+                ui_consent::MACHINE_UNAVAILABLE
+            });
             return;
         }
         let Some((id, fingerprint)) = self.machine_focus.as_ref() else { return };
@@ -709,6 +748,19 @@ impl FleetView {
         let visible = self.visible_model_endpoints();
         let endpoint = self.model_keyboard.current(&self.model_scope, &visible);
         let authorized = endpoint.is_some_and(|endpoint| self.model_scope.entries().iter().any(|entry| &entry.endpoint == endpoint && entry.authorized));
+        if self.model_keyboard.active()
+            && !ui_consent::preparation_available(self.sample)
+            && !authorized
+            && let Some(endpoint) = endpoint
+        {
+            return Some(format!(
+                "{} / {} / {} / 平文 HTTP: {}",
+                endpoint.label,
+                endpoint.address,
+                endpoint.protocol.label(),
+                ui_consent::MODEL_UNAVAILABLE
+            ));
+        }
         llm_keyboard::banner(self.model_keyboard.active(), endpoint, self.model_confirmation.as_ref(), authorized, self.model_notice)
     }
 
@@ -981,7 +1033,11 @@ impl FleetView {
                     ModelKey::Leave => self.leave_model_keyboard(),
                     ModelKey::Consume => {}
                     ModelKey::Unsupported => {
-                        self.model_notice = Some("この OS の LLM キーボード選択は未対応です。画面のボタンを使用してください。");
+                        self.model_notice = Some(if ui_consent::preparation_available(self.sample) {
+                            "この OS の LLM キーボード選択は未対応です。画面のボタンを使用してください。"
+                        } else {
+                            ui_consent::MODEL_UNAVAILABLE
+                        });
                     }
                 }
                 self.focus.focus(window);
@@ -1463,7 +1519,21 @@ impl Render for FleetView {
                     item = item.child(div().text_sm().child("台帳の再照合が終わるまで待機中です。"));
                 } else if let Some(fingerprint) = fingerprint {
                     let pending = self.confirmations.current().filter(|pending| pending.id == id && pending.fingerprint == fingerprint).cloned();
-                    if let Some(confirmation) = pending {
+                    if !ui_consent::preparation_available(self.sample) {
+                        item = item.child(note(ui_consent::MACHINE_UNAVAILABLE.into(), 0xffd9a1));
+                        if let Some(confirmation) = pending {
+                            let nonce = confirmation.nonce.to_string();
+                            let cancel_id = pointer_ids.get("machine-cancel", &[&id, &fingerprint, &nonce]);
+                            item = item.child(
+                                div()
+                                    .id(SharedString::from(format!("machine-cancel-{cancel_id}")))
+                                    .cursor_pointer()
+                                    .text_sm()
+                                    .child("確認をキャンセル")
+                                    .on_click(cx.listener(move |view, _, _, cx| view.cancel_machine_access(confirmation.clone(), cx))),
+                            );
+                        }
+                    } else if let Some(confirmation) = pending {
                         item = item.child(div().text_sm().text_color(rgb(0xffd9a1)).child(fleet_studio::scope::MACHINE_CONFIRMATION));
                         let nonce = confirmation.nonce.to_string();
                         let yes_id = pointer_ids.get("machine-confirm", &[&id, &fingerprint, &nonce]);
@@ -1718,6 +1788,20 @@ impl Render for FleetView {
                             }
                         },
                     )));
+                } else if !ui_consent::preparation_available(self.sample) {
+                    item = item.child(note(ui_consent::MODEL_UNAVAILABLE.into(), 0xffb86c));
+                    if let Some(confirmation) = self.model_confirmation.as_ref().filter(|confirmation| confirmation.endpoint() == &endpoint) {
+                        let id = pointer_ids.get("llm-cancel-confirmation", &[&address, protocol, &endpoint.label]);
+                        let cancel = confirmation.clone();
+                        let ticket = model_ticket.clone();
+                        item = item.child(div().id(SharedString::from(format!("click-{id}"))).cursor_pointer().child("確認をキャンセル").on_click(
+                            cx.listener(move |view, _, _, cx| {
+                                if view.model_view.is_current(&ticket) {
+                                    view.cancel_model_confirmation(&cancel, cx);
+                                }
+                            }),
+                        ));
+                    }
                 } else if self.refresh_queue.pending() {
                     item = item.child(note("更新待ちのため、接続内容の確認はできません。".into(), 0xffb86c));
                 } else if let Some(confirmation) = self.model_confirmation.as_ref().filter(|confirmation| confirmation.endpoint() == &endpoint) {
@@ -1982,11 +2066,7 @@ impl Render for FleetView {
                     .justify_between()
                     .bg(rgb(0x132237))
                     .child(
-                        div().flex_1().min_w(px(0.0)).child(if cfg!(target_os = "windows") {
-                            "/ 検索 · M 機体 · L 追加先 · ↑↓ 選択 · Enter 確認 · Y 許可 · X 取消 · Esc 戻る"
-                        } else {
-                            "/ 検索 · M 機体 · ↑↓ 選択 · Enter 確認 · 許可はマウス · Esc 戻る"
-                        }),
+                        div().flex_1().min_w(px(0.0)).child(ui_consent::footer_notice(self.sample, cfg!(target_os = "windows"))),
                     )
                     .child(
                         div()
