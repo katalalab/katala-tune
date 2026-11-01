@@ -2,9 +2,99 @@ use fleet_studio::audit::project;
 use serde_json::json;
 
 #[test]
+fn audit_scope_incomplete_walk_keeps_current_and_previous_results() {
+    use fleet_studio::audit::preserve_previous;
+    let previous = project(&[json!({
+        "node_id":"fixture-node", "at":100, "ok":true, "roots":[{"path":"fixture"}], "truncated":false, "skipped":0,
+        "repos":[{"path":"fixture/previous","state":"ok","tracked":1,"untracked":0,"conflicted":0,"upstream":false,"detached":false}]
+    })]);
+    let mut next = project(&[json!({
+        "node_id":"fixture-node", "at":200, "ok":true, "roots":[{"path":"fixture"}], "truncated":false, "skipped":0,
+        "error":"walk_incomplete", "repos":[{"path":"fixture/current","state":"ok","tracked":2,"untracked":1,"conflicted":0,"upstream":false,"detached":false}]
+    })]);
+    assert_eq!(next.incomplete_nodes, vec!["fixture-node"]);
+    assert_eq!(next.issues[0].reason, "探索先の一部を確認できません");
+    assert_eq!(next.issues[0].at, Some(200));
+    assert_eq!(next.repos[0].dirty, Some(3));
+    assert_eq!(next.repos[0].at, Some(200));
+    assert!(!next.repos[0].previous);
+    preserve_previous(&previous, &mut next);
+    assert_eq!(next.repos.len(), 2);
+    assert_eq!(next.repos[1].path, "fixture/previous");
+    assert_eq!(next.repos[1].at, Some(100));
+    assert!(next.repos[1].previous);
+}
+
+#[test]
+fn audit_scope_missing_or_invalid_completion_metadata_is_incomplete() {
+    for field in ["truncated", "skipped"] {
+        for value in [None, Some(json!(null)), Some(json!("unknown")), Some(json!(-1))] {
+            let mut input = json!({"node_id":"fixture-node","at":123,"ok":true,"roots":[{"path":"fixture"}],"truncated":false,"skipped":0,"repos":[]});
+            if let Some(value) = value {
+                input[field] = value;
+            } else {
+                input.as_object_mut().unwrap().remove(field);
+            }
+            let audit = project(&[input]);
+            assert_eq!(audit.incomplete_nodes, vec!["fixture-node"], "{field}");
+            assert_eq!(audit.issues[0].reason, "探索の完了状態が不明");
+            assert_eq!(audit.issues[0].at, Some(123));
+        }
+    }
+}
+
+#[test]
+fn audit_scope_valid_completion_metadata_is_not_invented_as_missing() {
+    let audit = project(&[json!({"node_id":"fixture-node","ok":true,"roots":[{"path":"fixture"}],"truncated":false,"skipped":0,"repos":[]})]);
+    assert!(audit.incomplete_nodes.is_empty());
+    assert!(audit.issues.is_empty());
+}
+
+#[test]
+fn audit_scope_failed_node_never_replaces_previous_success_with_a_success_row() {
+    use fleet_studio::audit::preserve_previous;
+    let previous = project(&[json!({
+        "node_id":"fixture-node", "at":100, "ok":true, "roots":[{"path":"fixture"}], "truncated":false, "skipped":0,
+        "repos":[{"path":"fixture/repo","state":"ok","tracked":2,"untracked":1,"conflicted":0,"upstream":false,"detached":false}]
+    })]);
+    let mut failed = project(&[json!({
+        "node_id":"fixture-node", "at":200, "ok":false, "error":"timeout_or_unreachable", "roots":[{"path":"fixture"}],
+        "truncated":false, "skipped":0, "repos":[
+            {"path":"fixture/repo","state":"ok","tracked":0,"untracked":0,"conflicted":0,"upstream":false,"detached":false},
+            {"path":"fixture/other","state":"unobserved","reason":"git_failed"}
+        ]
+    })]);
+    assert_eq!(failed.issues[0].reason, "タイムアウトまたは接続不可");
+    assert_eq!(failed.repos[0].dirty, None);
+    assert_eq!(failed.repos[0].error, Some("機体の監査に失敗したため未確認"));
+    assert_eq!(failed.repos[1].error, Some("Git の読み取りに失敗"));
+    preserve_previous(&previous, &mut failed);
+    let old = failed.repos.iter().find(|row| row.path == "fixture/repo" && row.previous).unwrap();
+    assert_eq!(old.dirty, Some(3));
+    assert_eq!(old.at, Some(100));
+}
+
+#[test]
+fn audit_scope_reported_incomplete_fields_are_not_healthy() {
+    for marker in [json!(["repos"]), json!(["roots"]), json!(["counts"]), json!(["error"]), json!(["unknown"]), json!(null), json!("invalid")] {
+        let audit = project(&[json!({
+            "node_id":"fixture-node", "at":123, "ok":true, "roots":[{"path":"fixture"}],
+            "truncated":false, "skipped":0, "repos":[], "incomplete_fields":marker
+        })]);
+        assert_eq!(audit.incomplete_nodes, vec!["fixture-node"]);
+        assert_eq!(audit.issues[0].reason, "監査データの一部が不明");
+        assert_eq!(audit.issues[0].at, Some(123));
+    }
+    let valid = project(&[json!({
+        "node_id":"fixture-node", "ok":true, "roots":[{"path":"fixture"}], "truncated":false, "skipped":0, "repos":[], "incomplete_fields":[]
+    })]);
+    assert!(valid.incomplete_nodes.is_empty());
+}
+
+#[test]
 fn dirty_and_unpushed_values_come_from_existing_hygiene_output() {
-    let audit = project(&[json!({"node_id":"fixture-node","ok":true,"repos":[
-        {"path":"fixture/project","state":"ok","branch":"feature","tracked":2,"untracked":1,"upstream":true,"ahead":3,"behind":4}
+    let audit = project(&[json!({"node_id":"fixture-node","ok":true,"roots":[{"path":"fixture"}],"truncated":false,"skipped":0,"repos":[
+        {"path":"fixture/project","state":"ok","branch":"feature","tracked":2,"untracked":1,"conflicted":0,"upstream":true,"detached":false,"ahead":3,"behind":4}
     ]})]);
     assert_eq!(audit.repos[0].dirty, Some(3));
     assert_eq!(audit.repos[0].unpushed, Some(3));
@@ -14,7 +104,7 @@ fn dirty_and_unpushed_values_come_from_existing_hygiene_output() {
 #[test]
 fn unseen_repositories_and_failed_nodes_are_not_clean() {
     let audit = project(&[
-        json!({"node_id":"fixture-a","ok":true,"truncated":true,"repos":[{"path":"fixture/missing","state":"unobserved"}]}),
+        json!({"node_id":"fixture-a","ok":true,"roots":[{"path":"fixture"}],"truncated":true,"skipped":0,"repos":[{"path":"fixture/missing","state":"unobserved"}]}),
         json!({"node_id":"fixture-b","ok":false,"error":"timeout_or_unreachable"}),
     ]);
     assert_eq!(audit.repos[0].dirty, None);
@@ -24,8 +114,8 @@ fn unseen_repositories_and_failed_nodes_are_not_clean() {
 
 #[test]
 fn missing_upstream_uses_only_confirmed_local_only_count() {
-    let audit = project(&[json!({"node_id":"fixture-node","ok":true,"repos":[
-        {"path":"fixture/project","state":"ok","tracked":0,"untracked":0,"upstream":false,"local_only":null}
+    let audit = project(&[json!({"node_id":"fixture-node","ok":true,"roots":[{"path":"fixture"}],"truncated":false,"skipped":0,"repos":[
+        {"path":"fixture/project","state":"ok","tracked":0,"untracked":0,"conflicted":0,"upstream":false,"detached":false,"local_only":null}
     ]})]);
     assert_eq!(audit.repos[0].dirty, Some(0));
     assert_eq!(audit.repos[0].unpushed, None);
@@ -33,7 +123,7 @@ fn missing_upstream_uses_only_confirmed_local_only_count() {
 
 #[test]
 fn malformed_skip_count_is_incomplete() {
-    let audit = project(&[json!({"node_id":"fixture-node","ok":true,"skipped":"unknown","repos":[]})]);
+    let audit = project(&[json!({"node_id":"fixture-node","ok":true,"roots":[{"path":"fixture"}],"truncated":false,"skipped":"unknown","repos":[]})]);
     assert_eq!(audit.incomplete_nodes, vec!["fixture-node"]);
 }
 
@@ -110,15 +200,15 @@ fn failure_reports_a_safe_reason_and_observation_time() {
 
 #[test]
 fn missing_roots_are_not_a_healthy_empty_audit() {
-    let audit = project(&[json!({"node_id":"fixture-node","ok":true,"roots":[],"repos":[]})]);
+    let audit = project(&[json!({"node_id":"fixture-node","ok":true,"roots":[],"truncated":false,"skipped":0,"repos":[]})]);
     assert_eq!(audit.incomplete_nodes, vec!["fixture-node"]);
 }
 
 #[test]
 fn previous_values_survive_a_failed_refresh_without_becoming_current() {
     use fleet_studio::audit::preserve_previous;
-    let previous = project(&[json!({"node_id":"fixture-node","at":100,"ok":true,"roots":[{"path":"fixture"}],"repos":[
-        {"path":"fixture/repo","state":"ok","tracked":1,"untracked":0,"upstream":true,"ahead":2}
+    let previous = project(&[json!({"node_id":"fixture-node","at":100,"ok":true,"roots":[{"path":"fixture"}],"truncated":false,"skipped":0,"repos":[
+        {"path":"fixture/repo","state":"ok","tracked":1,"untracked":0,"conflicted":0,"upstream":true,"detached":false,"ahead":2}
     ]})]);
     let mut next = project(&[json!({"node_id":"fixture-node","at":200,"ok":false,"error":"timeout_or_unreachable"})]);
     preserve_previous(&previous, &mut next);
@@ -131,7 +221,7 @@ fn previous_values_survive_a_failed_refresh_without_becoming_current() {
 fn unrequested_failed_machine_keeps_its_previous_failure() {
     use fleet_studio::audit::preserve_previous;
     let previous = project(&[json!({"node_id":"fixture-remote","at":100,"ok":false,"error":"timeout_or_unreachable"})]);
-    let mut next = project(&[json!({"node_id":"fixture-local","at":200,"ok":true,"roots":[{"path":"fixture"}],"repos":[]})]);
+    let mut next = project(&[json!({"node_id":"fixture-local","at":200,"ok":true,"roots":[{"path":"fixture"}],"truncated":false,"skipped":0,"repos":[]})]);
     preserve_previous(&previous, &mut next);
     assert_eq!(next.issues[0].node, "fixture-remote");
     assert_eq!(next.issues[0].at, Some(100));

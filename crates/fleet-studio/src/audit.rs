@@ -101,14 +101,25 @@ pub fn project(results: &[Value]) -> Audit {
         let at = result.get("at").and_then(Value::as_i64);
         audit.observed_nodes.push(node.clone());
         let no_roots = result.get("roots").and_then(Value::as_array).is_none_or(Vec::is_empty);
-        let mut incomplete = result.get("ok").and_then(Value::as_bool) != Some(true)
-            || result.get("truncated").and_then(Value::as_bool) == Some(true)
-            || result.get("skipped").is_some_and(|value| value.as_u64().is_none_or(|count| count > 0))
+        let truncated = result.get("truncated").and_then(Value::as_bool);
+        let skipped = result.get("skipped").and_then(Value::as_u64);
+        let completion_unknown = truncated.is_none() || skipped.is_none();
+        let fields_incomplete = match result.get("incomplete_fields") {
+            None => false,
+            Some(Value::Array(fields)) => !fields.is_empty(),
+            Some(_) => true,
+        };
+        let node_ok = result.get("ok").and_then(Value::as_bool) == Some(true);
+        let mut incomplete = !node_ok
+            || truncated != Some(false)
+            || skipped != Some(0)
+            || fields_incomplete
             || result.get("error").is_some_and(|value| !value.is_null())
             || no_roots;
         if let Some(repos) = result.get("repos").and_then(Value::as_array) {
             for repo in repos {
-                let observed = repo.get("state").and_then(Value::as_str) == Some("ok");
+                let row_ok = repo.get("state").and_then(Value::as_str) == Some("ok");
+                let observed = node_ok && row_ok;
                 if !observed {
                     incomplete = true;
                 }
@@ -143,7 +154,13 @@ pub fn project(results: &[Value]) -> Audit {
                     previous: false,
                     local: false,
                     at,
-                    error: (!observed).then(|| safe_error(repo.get("reason").and_then(Value::as_str))),
+                    error: if !row_ok {
+                        Some(safe_error(repo.get("reason").and_then(Value::as_str)))
+                    } else if !node_ok {
+                        Some("機体の監査に失敗したため未確認")
+                    } else {
+                        None
+                    },
                 });
             }
         } else {
@@ -156,8 +173,12 @@ pub fn project(results: &[Value]) -> Audit {
                 safe_error(None)
             } else if no_roots {
                 "探索先を確認できません"
-            } else if result.get("truncated").and_then(Value::as_bool) == Some(true) {
+            } else if truncated == Some(true) {
                 "時間・件数の上限に到達"
+            } else if completion_unknown {
+                "探索の完了状態が不明"
+            } else if fields_incomplete {
+                "監査データの一部が不明"
             } else {
                 "一部を観測できません"
             };
@@ -199,6 +220,7 @@ fn safe_error(error: Option<&str>) -> &'static str {
         Some("git_missing") => "Git を利用できません",
         Some("git_failed") => "Git の読み取りに失敗",
         Some("over_limit") => "時間・件数の上限に到達",
+        Some("walk_incomplete") => "探索先の一部を確認できません",
         Some("excluded") => "運用対象外",
         _ => "詳細不明",
     }
