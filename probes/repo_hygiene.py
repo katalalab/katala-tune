@@ -13,10 +13,10 @@
 #     branch, detached, upstream（bool）, ahead, behind（upstream が無い・消えたなら null）, local_only（そのときの、どの remote にも無い commit 数）,
 #     tracked, untracked, conflicted, dirty_age_s（変更ファイルの最古の更新からの秒。測れなければ null）, head_age_s,
 #     stash（数。読めなければ null）, origin, origin_host, origin_path（owner/repo。origin が無い・読めない・パスと見なせなければ null）, has_origin }
-import json, os, re, shutil, subprocess, sys, threading, time
+import json, os, re, shutil, stat, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 
-KT_VERSION = "2026-11-01.5"   # 調査スクリプトの版（数え方を変えたら上げる）
+KT_VERSION = "2026-11-02.1"   # 調査スクリプトの版（数え方を変えたら上げる）
 KT_OPTS = {}                  # 呼び出し側が置き換える（数と文字列だけ）: { roots, ghq_root, max_repos, budget_s, cmd_s }
 MAX_REPOS = int(KT_OPTS.get("max_repos", 1000))
 BUDGET_S = float(KT_OPTS.get("budget_s", 60))
@@ -150,7 +150,21 @@ def ghq_root():
     if rc == 0 and out.strip():
         return normalize_root(os.path.expanduser(out.strip().splitlines()[0])), "git-config"
     d = normalize_root(os.path.join(HOME, "ghq"))
-    return (d, "default") if os.path.isdir(d) else (None, None)
+    try:
+        isdir = stat.S_ISDIR(os.stat(d).st_mode)
+    except FileNotFoundError:
+        try:
+            os.lstat(d)
+        except (FileNotFoundError, NotADirectoryError):
+            return None, None  # 任意の既定先が無いことは正常
+        except (OSError, ValueError):
+            pass
+        return d, "default"  # 壊れたリンクや属性不明は未確認
+    except NotADirectoryError:
+        return None, None
+    except (OSError, ValueError):
+        return d, "default"  # 選択済み root の確認失敗として main に伝える
+    return (d, "default") if isdir else (None, None)
 
 
 def sanitize(url):
@@ -175,7 +189,18 @@ def sanitize(url):
 
 
 def is_repo(p):
-    return os.path.exists(os.path.join(p, ".git"))
+    marker = os.path.join(p, ".git")
+    try:
+        os.stat(marker)
+        return True
+    except FileNotFoundError:
+        try:
+            os.lstat(marker)
+        except FileNotFoundError:
+            # marker が無いだけか、列挙後に親が消えたかを区別する。
+            if stat.S_ISDIR(os.stat(p).st_mode):
+                return False
+        raise OSError()  # 壊れた marker や移動・消失は未確認
 
 
 def find_repos(root, depth, state):
@@ -196,9 +221,35 @@ def find_repos(root, depth, state):
             if n.startswith(".") and n not in KEEP_DOT:
                 continue
             q = os.path.join(d, n)
-            if not os.path.isdir(q) or os.path.islink(q):
+            try:
+                try:
+                    mode = os.stat(q).st_mode
+                except FileNotFoundError:
+                    # リンク先のない通常 symlink は従来どおり対象外。
+                    os.lstat(q)
+                    if os.path.islink(q):
+                        continue
+                    raise
+                if not stat.S_ISDIR(mode):
+                    continue
+                islink = os.path.islink(q)
+                link_info = os.lstat(q)  # islink の False に畳まれる属性取得エラーを確認する
+                link_mode = stat.S_ISLNK(link_info.st_mode)
+                if islink:
+                    if not link_mode:
+                        raise OSError()  # 判定が食い違い、対象の状態が不明
+                    continue
+                if link_mode:
+                    # Windows の junction は islink=False でも辿る従来挙動。
+                    # 種別が識別できない不一致は、リンクではないと推測しない。
+                    junction = os.name == "nt" and getattr(link_info, "st_reparse_tag", None) == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+                    if not junction:
+                        raise OSError()
+                repo = is_repo(q)
+            except (OSError, ValueError):
+                state["incomplete"] = True
                 continue
-            if is_repo(q):
+            if repo:
                 found.append(slash(q))
             elif lvl + 1 < depth and n not in SKIP_DIRS:
                 stack.append((q, lvl + 1))
@@ -292,10 +343,14 @@ def parse_status(out, now):
 
 
 def scan(path, root):
-    d = {"path": shorten(path), "rel": None, "linked": False, "state": "unobserved"}
+    d = {"path": shorten(path), "rel": None, "linked": None, "state": "unobserved"}
     d["rel"] = relative_to_root(path, root)
     dotgit = os.path.join(path, ".git")
-    d["linked"] = os.path.isfile(dotgit)
+    try:
+        d["linked"] = stat.S_ISREG(os.stat(dotgit).st_mode)
+    except (OSError, ValueError):
+        d["reason"] = "probe_failed"
+        return d
     if time.time() > DEADLINE:
         d["reason"] = "over_limit"
         return d
@@ -392,7 +447,14 @@ def main():
             seen.add(k)
             uniq.append((p, rt))
     # 上限で切るときは、リンク worktree と .worktrees 配下を後に回す（本体のクローンを先に見る）
-    uniq.sort(key=lambda a: (os.path.isfile(os.path.join(a[0], ".git")) or "/.worktrees/" in a[0], a[0]))
+    def priority(item):
+        try:
+            linked = stat.S_ISREG(os.stat(os.path.join(item[0], ".git")).st_mode)
+        except (OSError, ValueError):
+            walk["incomplete"] = True
+            linked = True  # 属性が不明な候補より、既知の本体を先に確認する
+        return linked or "/.worktrees/" in item[0], item[0]
+    uniq.sort(key=priority)
     res["enumerated"] = len(uniq)
     res["truncated"] = walk["truncated"]
     if walk["incomplete"]:

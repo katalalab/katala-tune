@@ -4,6 +4,8 @@ import json
 import ntpath
 import pathlib
 import posixpath
+import stat
+import types
 import unittest
 from unittest import mock
 
@@ -95,6 +97,8 @@ class WalkTests(unittest.TestCase):
              mock.patch.object(probe.os.path, "isdir", side_effect=lambda path: probe.slash(path) not in unavailable), \
              mock.patch.object(probe.os.path, "islink", side_effect=lambda path: probe.slash(path) in links), \
              mock.patch.object(probe.os.path, "isfile", return_value=False), \
+             mock.patch.object(probe.os, "stat", return_value=types.SimpleNamespace(st_mode=stat.S_IFDIR)), \
+             mock.patch.object(probe.os, "lstat", return_value=types.SimpleNamespace(st_mode=stat.S_IFDIR)), \
              mock.patch.object(probe, "is_repo", side_effect=lambda path: probe.slash(path) in repositories), \
              mock.patch.object(probe, "scan", side_effect=scan), \
              mock.patch.object(probe, "ThreadPoolExecutor", InlinePool), \

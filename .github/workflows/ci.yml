@@ -41,6 +41,9 @@ jobs:
       - name: Repository hygiene walk mock
         run: python3 -I -B test/test_repo_hygiene_walk.py
         timeout-minutes: 1
+      - name: Repository hygiene metadata mock
+        run: python3 -I -B test/test_repo_hygiene_metadata.py
+        timeout-minutes: 1
       - name: Windows Security log cursor regression
         if: runner.os == 'Windows'
         shell: powershell

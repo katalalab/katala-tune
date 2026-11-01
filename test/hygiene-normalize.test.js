@@ -273,3 +273,47 @@ test('必須項目が欠けた行は未観測の所見になり、変更あり�
   assert.equal(hygiene.pathStatus(audit.repos[0]), 'unknown');
   assert.deepEqual(hygiene.matrix([{ node_id: 'node-a', ...audit }]), []);
 });
+
+test('metadata_unknown_remains_visible_with_unknown_state', () => {
+  const normal = { ...observed(), path: 'fixture/normal', origin_host: 'example.invalid', origin_path: 'group/item' };
+  const linked = { ...normal, path: 'fixture/linked', linked: true };
+  const unknown = { ...normal, path: 'fixture/unknown', linked: null, state: 'unobserved', reason: 'probe_failed', origin_path: 'group/unknown' };
+  const input = { ...audit(), enumerated: 3, repos: [normal, linked, unknown] };
+  const normalized = hygiene.normalize(input);
+  assert.deepEqual(normalized.repos.map((row) => row.linked), [false, true, null]);
+  assert.equal(normalized.repos[2].reason, 'probe_failed');
+  assert.deepEqual(hygiene.normalize(normalized), normalized);
+  assert.equal(hygiene.pathStatus(normalized.repos[2]), 'unknown');
+  const finding = hygiene.analyze(normalized).find((item) => item.id === 'repo-unobserved');
+  assert.match(finding.detail, /確認できなかった 1 件/);
+  assert.match(finding.detail, /probe_failed 1/);
+  assert.doesNotMatch(finding.detail, /git を読めなかった/);
+  const progress = hygiene.progress(input, 1);
+  assert.equal(progress.observed, 2);
+  assert.match(progress.line, /未観測 1 件/);
+  assert.deepEqual({ linked: normalized.repos.map((row) => row.linked), reason: normalized.repos[2].reason,
+    detail: finding.detail, advice: finding.advice, observed: progress.observed, progress: progress.line }, {
+    linked: [false, true, null], reason: 'probe_failed',
+    detail: '確認できなかった 1 件（probe_failed 1）。確認できた 2 件だけで判定している（読めなかった分は「きれい」とは数えない）',
+    advice: '対象の属性と読み取り権限、移動・消失を確認する。ほかの未観測がある場合は、その理由も確認する。',
+    observed: 2, progress: '?: 見つけた 3 件・未観測 1 件・時間不明・所見 1',
+  });
+  const truncated = { ...input, truncated: true };
+  assert.match(hygiene.analyze(truncated)[0].detail, /探索を時間または件数で打ち切った/);
+  assert.match(hygiene.progress(truncated, 1).line, /未観測 既知 1 件・探索未確認あり/);
+  const matrix = hygiene.matrix([{ node_id: 'node-a', repos: [normal, linked, unknown] }]);
+  assert.equal(matrix.length, 2);
+  assert.equal(matrix.find((row) => row.key === 'example.invalid/group/item').nodes['node-a'].copies, 1);
+  assert.equal(matrix.find((row) => row.key === 'example.invalid/group/unknown').nodes['node-a'].state, 'unobserved');
+  for (const value of [undefined, null, 'invalid']) {
+    const row = hygiene.normalize({ ...audit(), enumerated: 1, repos: [{ ...unknown, linked: value }] }).repos[0];
+    assert.equal(row.linked, null);
+    assert.equal(row.state, 'unobserved');
+    assert.equal(hygiene.pathStatus({ ...normal, linked: value }), 'unknown');
+    assert.equal(hygiene.normalize({ ...audit(), enumerated: 1, repos: [{ ...normal, linked: value }] }).repos[0].state, 'unobserved');
+  }
+  const secret = 'synthetic-private-reason';
+  const scrubbed = hygiene.normalize({ ...audit(), enumerated: 1, repos: [{ ...unknown, reason: secret }] });
+  assert.equal(scrubbed.repos[0].reason, 'git_failed');
+  assert.ok(!JSON.stringify({ scrubbed, findings: hygiene.analyze(scrubbed) }).includes(secret));
+});

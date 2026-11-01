@@ -173,6 +173,23 @@ fn audit_scope_incomplete_walk_keeps_current_and_previous_results() {
 }
 
 #[test]
+fn audit_scope_metadata_unknown_keeps_known_and_unknown_rows() {
+    let audit = project(&[json!({
+        "node_id":"fixture-node", "at":123, "ok":true, "roots":[{"path":"fixture","source":"opt"}],
+        "enumerated":2, "truncated":false, "skipped":0, "repos":[
+            {"path":"fixture/known","state":"ok","linked":false,"tracked":2,"untracked":1,"conflicted":0,"upstream":false,"detached":false},
+            {"path":"fixture/unknown","state":"unobserved","linked":null,"reason":"probe_failed"}
+        ]
+    })]);
+    assert_eq!(audit.incomplete_nodes, vec!["fixture-node"]);
+    assert_eq!(audit.repos.len(), 2);
+    assert_eq!(audit.repos[0].dirty, Some(3));
+    assert_eq!(audit.repos[1].path, "fixture/unknown");
+    assert_eq!(audit.repos[1].dirty, None);
+    assert_eq!(audit.repos[1].error, Some("監査情報を確認できません"));
+}
+
+#[test]
 fn audit_scope_missing_or_invalid_completion_metadata_is_incomplete() {
     for field in ["enumerated", "truncated", "skipped"] {
         for value in [None, Some(json!(null)), Some(json!("unknown")), Some(json!(-1))] {

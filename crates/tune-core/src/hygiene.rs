@@ -183,12 +183,12 @@ fn normalize_repo(r: &Value) -> Value {
         Value::Null
     } else {
         let t = text(g("reason")).unwrap_or("");
-        json!(if !state_ok && matches!(t, "timeout" | "git_failed" | "over_limit") { t } else { "git_failed" })
+        json!(if !state_ok && matches!(t, "timeout" | "git_failed" | "over_limit" | "probe_failed") { t } else { "git_failed" })
     };
     let base = Obj::new()
         .set("path", text(g("path")).unwrap_or(""))
         .set("rel", opt_s(g("rel")))
-        .set("linked", g("linked") == Some(&Value::Bool(true)))
+        .set("linked", g("linked").and_then(Value::as_bool).map_or(Value::Null, Value::Bool))
         .set("state", if ok { "ok" } else { "unobserved" })
         .set("reason", reason);
     if !ok {
@@ -295,6 +295,9 @@ pub fn path_status(r: &Value) -> &'static str {
     if js::get(x, "linked") == Some(&Value::Bool(true)) {
         return "linked";
     }
+    if js::get(x, "linked") != Some(&Value::Bool(false)) {
+        return "unknown";
+    }
     let Some(rel) = text(js::get(x, "rel")) else { return "outside" };
     if rel.starts_with(".worktrees/") {
         return "outside";
@@ -373,7 +376,8 @@ pub fn analyze(input: &Value) -> Vec<Value> {
         // JS の Object.keys(by).sort()（UTF-16 の順）
         let mut keys: Vec<&String> = by.keys().collect();
         keys.sort_by(|a, b| cmp16(a, b));
-        miss.push(format!("git を読めなかった {} 件（{}）", gone.len(), keys.iter().map(|k| format!("{k} {}", by[*k])).collect::<Vec<_>>().join("・")));
+        let action = if by.contains_key("probe_failed") { "確認できなかった" } else { "git を読めなかった" };
+        miss.push(format!("{action} {} 件（{}）", gone.len(), keys.iter().map(|k| format!("{k} {}", by[*k])).collect::<Vec<_>>().join("・")));
     }
     let skipped = audit.get("skipped").and_then(Value::as_f64).unwrap_or(0.0);
     if skipped > 0.0 {
@@ -391,6 +395,8 @@ pub fn analyze(input: &Value) -> Vec<Value> {
             format!("{}。確認できた {} 件だけで判定している（読めなかった分は「きれい」とは数えない）", miss.join("、"), seen.len()),
             if text(audit.get("error")) == Some("walk_incomplete") {
                 "探索先への読み取り権限と移動・消失を確認する。ほかの未観測がある場合は、その理由も確認する。"
+            } else if gone.iter().any(|r| text(r.get("reason")) == Some("probe_failed")) {
+                "対象の属性と読み取り権限、移動・消失を確認する。ほかの未観測がある場合は、その理由も確認する。"
             } else {
                 "読めない理由は、git の所有者違い（safe.directory）・壊れたリポジトリ・巨大で時間切れのどれかが多い。上限は repo_roots の絞り込みか調査の max_repos / budget_s で調整する。"
             },
@@ -657,6 +663,83 @@ mod tests {
         }
         assert_eq!(walk_coverage_note(&json!({ "error": null, "truncated": true })), "・探索未確認あり（件数不明）");
         assert_eq!(walk_coverage_note(&json!({ "error": "git_missing" })), "");
+    }
+
+    #[test]
+    fn metadata_unknown_remains_visible_with_unknown_state() {
+        let normal = json!({
+            "path": "fixture/normal", "rel": "example.invalid/group/item", "linked": false, "state": "ok",
+            "tracked": 0, "untracked": 0, "conflicted": 0, "upstream": false, "detached": false,
+            "origin_host": "example.invalid", "origin_path": "group/item"
+        });
+        let mut linked = normal.clone();
+        linked["path"] = json!("fixture/linked");
+        linked["linked"] = json!(true);
+        let mut unknown = normal.clone();
+        unknown["path"] = json!("fixture/unknown");
+        unknown["linked"] = Value::Null;
+        unknown["state"] = json!("unobserved");
+        unknown["reason"] = json!("probe_failed");
+        unknown["origin_path"] = json!("group/unknown");
+        let input = json!({
+            "roots": [{"path": "fixture", "source": "opt"}], "enumerated": 3, "skipped": 0, "truncated": false,
+            "repos": [normal, linked, unknown]
+        });
+        let data = normalize(&input);
+        assert_eq!(data["repos"][0]["linked"], false);
+        assert_eq!(data["repos"][1]["linked"], true);
+        assert_eq!(data["repos"][2]["linked"], Value::Null);
+        assert_eq!(data["repos"][2]["reason"], "probe_failed");
+        assert_eq!(normalize(&data), data);
+        assert_eq!(path_status(&data["repos"][2]), "unknown");
+        let findings = analyze(&data);
+        let finding = findings.iter().find(|item| item["id"] == "repo-unobserved").unwrap();
+        let detail = finding["detail"].as_str().unwrap();
+        assert!(detail.contains("確認できなかった 1 件"));
+        assert!(detail.contains("probe_failed 1"));
+        assert!(!detail.contains("git を読めなかった"));
+        let (observed, line) = progress(&input, 1);
+        assert_eq!(observed, Some(2));
+        assert!(line.contains("未観測 1 件"));
+        assert_eq!(
+            json!({"linked": [data["repos"][0]["linked"], data["repos"][1]["linked"], data["repos"][2]["linked"]],
+                "reason": data["repos"][2]["reason"], "detail": finding["detail"], "advice": finding["advice"],
+                "observed": observed, "progress": line}),
+            json!({"linked": [false, true, null], "reason": "probe_failed",
+                "detail": "確認できなかった 1 件（probe_failed 1）。確認できた 2 件だけで判定している（読めなかった分は「きれい」とは数えない）",
+                "advice": "対象の属性と読み取り権限、移動・消失を確認する。ほかの未観測がある場合は、その理由も確認する。",
+                "observed": 2, "progress": "?: 見つけた 3 件・未観測 1 件・時間不明・所見 1"})
+        );
+        let mut truncated = input.clone();
+        truncated["truncated"] = json!(true);
+        assert!(analyze(&truncated)[0]["detail"].as_str().unwrap().contains("探索を時間または件数で打ち切った"));
+        assert!(progress(&truncated, 1).1.contains("未観測 既知 1 件・探索未確認あり"));
+        let cells = matrix(&[json!({"node_id": "node-a", "repos": input["repos"]})]);
+        assert_eq!(cells.len(), 2);
+        let known = cells.iter().find(|cell| cell["key"] == "example.invalid/group/item").unwrap();
+        let missing = cells.iter().find(|cell| cell["key"] == "example.invalid/group/unknown").unwrap();
+        assert_eq!(known["nodes"]["node-a"]["copies"], 1);
+        assert_eq!(missing["nodes"]["node-a"]["state"], "unobserved");
+        for value in [Value::Null, json!("invalid")] {
+            let mut bad = input.clone();
+            bad["repos"][0]["linked"] = value.clone();
+            assert_eq!(path_status(&bad["repos"][0]), "unknown");
+            assert_eq!(normalize(&bad)["repos"][0]["state"], "unobserved");
+            bad["repos"][2]["linked"] = value;
+            assert_eq!(normalize(&bad)["repos"][2]["linked"], Value::Null);
+        }
+        let mut omitted = input;
+        omitted["repos"][2].as_object_mut().unwrap().remove("linked");
+        assert_eq!(normalize(&omitted)["repos"][2]["linked"], Value::Null);
+        omitted["repos"][0].as_object_mut().unwrap().remove("linked");
+        assert_eq!(path_status(&omitted["repos"][0]), "unknown");
+        assert_eq!(normalize(&omitted)["repos"][0]["state"], "unobserved");
+        let mut bad_reason = omitted;
+        bad_reason["repos"][2]["reason"] = json!("synthetic-private-reason");
+        let scrubbed = normalize(&bad_reason);
+        assert_eq!(scrubbed["repos"][2]["reason"], "git_failed");
+        assert!(!scrubbed.to_string().contains("synthetic-private-reason"));
+        assert!(!json!(analyze(&scrubbed)).to_string().contains("synthetic-private-reason"));
     }
 
     #[test]
