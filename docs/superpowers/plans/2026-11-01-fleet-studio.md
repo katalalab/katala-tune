@@ -9,6 +9,6 @@
 **Verification:** Test timestamp freshness, newer failures, missing or unreadable data, retired nodes, partial topology and local model endpoint failures. Build and run on the available desktop OS; document any Mac prerequisites and unverified behavior.
 
 1. Create the read-only view model and tests, reusing `nodes::load_config`, `Store::open_read_only`, `last_snapshots`, `probe_error`, and `topology_ui_view`.
-2. Add bounded model-list GET requests, an explicitly requested read-only hygiene audit, and explicit sample data.
+2. Add bounded model-list GET requests, an explicitly requested read-only hygiene audit with remote opt-in, and explicit sample data.
 3. Add the GPUI window with asynchronous loading, search and keyboard navigation, source links, timestamps, and visible failures.
 4. Verify the focused tests, the repository's applicable checks, real-data behavior and a native window. Document setup, limitations, updates and how to resume.

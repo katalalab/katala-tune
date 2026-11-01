@@ -593,7 +593,7 @@ impl Render for FleetView {
         for model in self.models.iter().filter(|model| self.matches(&model.label) || self.matches(&model_text(model))) {
             content = content.child(row(model.label.clone(), format!("{}  /  今回: {}", model_text(model), when(model.observation.checked_at))));
         }
-        content = content.child(section("リポジトリ衛生", if self.auditing { "取得中…" } else { "ローカル A / 全機は非共有・対象機へ SSH" }));
+        content = content.child(section("リポジトリ衛生", if self.auditing { "取得中…" } else { "ローカル A / 遠隔は台帳で明示した非共有機へ SSH" }));
         content =
             content.child(note("最後に fetch した追跡参照との差です。探索先の一部欠落やアクセス拒否は元ツールで判別できない場合があります。".into(), 0x9baec4));
         if let Some(error) = &self.audit_error {
@@ -700,7 +700,7 @@ impl Render for FleetView {
                                     .rounded_md()
                                     .bg(rgb(0x29486b))
                                     .cursor_pointer()
-                                    .child("全機を監査（SSH）")
+                                    .child("明示対象を監査（SSH）")
                                     .on_click(cx.listener(|view, _, _, cx| view.audit_repositories(Scope::Fleet, cx))),
                             ),
                     ),

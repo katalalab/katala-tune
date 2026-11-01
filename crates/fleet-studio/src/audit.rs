@@ -38,7 +38,13 @@ pub enum Scope {
 }
 
 pub fn targets(nodes: &[tune_core::nodes::Node], scope: Scope) -> Vec<tune_core::nodes::Node> {
-    nodes.iter().filter(|node| tune_core::hygiene::enabled(node) && !node.shared && (scope == Scope::Fleet || node.local)).cloned().collect()
+    nodes
+        .iter()
+        .filter(|node| {
+            tune_core::hygiene::enabled(node) && !node.shared && (node.local || (scope == Scope::Fleet && node.get("repo_hygiene") == Some(&Value::Bool(true))))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Preserve unknown repositories and incomplete node results.
@@ -155,6 +161,9 @@ pub fn collect(config_path: &std::path::Path, scope: Scope) -> Result<Audit, &'s
     let nodes = targets(&config.nodes, scope);
     if nodes.is_empty() {
         return Err("監査対象の機体がありません");
+    }
+    if scope == Scope::Fleet && !nodes.iter().any(|node| !node.local) {
+        return Err("台帳に明示された非共有の遠隔対象がありません");
     }
     let local: Vec<_> = nodes.iter().filter(|node| node.local).map(|node| node.id.clone()).collect();
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(|_| "監査を開始できません")?;

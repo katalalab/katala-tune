@@ -44,11 +44,12 @@ fn local_audit_never_selects_other_active_machines() {
     let nodes = vec![
         Node::from_value(&json!({"id":"fixture-local","os":"windows","local_hostname":"fixture-host"}), "fixture-host"),
         Node::from_value(&json!({"id":"fixture-remote","os":"macos","local_hostname":"fixture-other"}), "fixture-host"),
+        Node::from_value(&json!({"id":"fixture-opted-in","os":"macos","repo_hygiene":true,"local_hostname":"fixture-other"}), "fixture-host"),
         Node::from_value(&json!({"id":"fixture-shared","os":"windows","shared":true,"repo_hygiene":true,"local_hostname":"fixture-other"}), "fixture-host"),
         Node::from_value(&json!({"id":"fixture-retired","os":"windows","status":"retired","local_hostname":"fixture-host"}), "fixture-host"),
     ];
     assert_eq!(targets(&nodes, Scope::Local).iter().map(|node| node.id.as_str()).collect::<Vec<_>>(), vec!["fixture-local"]);
-    assert_eq!(targets(&nodes, Scope::Fleet).len(), 2);
+    assert_eq!(targets(&nodes, Scope::Fleet).iter().map(|node| node.id.as_str()).collect::<Vec<_>>(), vec!["fixture-local", "fixture-opted-in"]);
 }
 
 #[test]
