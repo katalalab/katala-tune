@@ -32,6 +32,14 @@ pub struct NodeCard {
 }
 
 impl NodeCard {
+    pub fn matches_search(&self, query: &str) -> bool {
+        query.is_empty() || format!("{} {} {}", self.id, self.role, self.operating_state).to_lowercase().contains(&query.to_lowercase())
+    }
+
+    pub fn is_visible_target(&self, id: &str, fingerprint: &str, query: &str) -> bool {
+        self.id == id && self.fingerprint.as_deref() == Some(fingerprint) && self.matches_search(query)
+    }
+
     pub fn identity_text(&self) -> &'static str {
         match self.local {
             Some(true) => "この機体",

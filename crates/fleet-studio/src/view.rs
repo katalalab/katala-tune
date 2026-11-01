@@ -17,8 +17,13 @@ use fleet_studio::refresh::{self, FullRefresh};
 use fleet_studio::scope::{AuditGate, AuditTicket, Confirmation, Confirmations, Grants, Permit, RefreshGate};
 use fleet_studio::search_input::{KeyAction, KeyModifiers, SearchInput, search_key};
 use fleet_studio::source::{self, Coverage, Dashboard, NodeCard, Repository, SavedState};
-use fleet_studio::ui_consent::{self, MachineConfirmationResult, ModelConfirmationResult};
-use gpui::{Context, FocusHandle, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, Render, SharedString, Window, div, prelude::*, px, relative, rgb};
+use fleet_studio::ui_consent::{
+    self, ConfirmationAction, ConsentFrame, ConsentPointer, ConsentScreen, ConsentTarget, MachineConfirmationResult, ModelConfirmationResult, PointerMark,
+    Presentation, ScrollMetrics, Viewport,
+};
+use gpui::{
+    Context, FocusHandle, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, Render, ScrollHandle, SharedString, Window, div, prelude::*, px, relative, rgb,
+};
 
 enum ResumeSelection {
     Repository(String),
@@ -26,16 +31,13 @@ enum ResumeSelection {
     Audit(RepoAudit),
 }
 
-#[derive(Clone, PartialEq, Eq)]
-enum KeyboardConfirmation {
-    Machine(Confirmation),
-    Model(ModelConfirmation),
-}
+type KeyboardConfirmation = ConsentTarget;
 
 pub struct FleetView {
     pub(crate) focus: FocusHandle,
     _focus_out: gpui::Subscription,
     _activation: gpui::Subscription,
+    _bounds: gpui::Subscription,
     sample: bool,
     recent_local: bool,
     generation: u64,
@@ -54,6 +56,9 @@ pub struct FleetView {
     model_keyboard: ModelKeyboard,
     model_view: ModelViewGate,
     confirmation_keys: ConfirmKeyGate<KeyboardConfirmation>,
+    consent_screen: ConsentScreen,
+    consent_pointer: ConsentPointer,
+    consent_scroll: ScrollHandle,
     navigation_keys: NavigationKeyGate,
     model_notice: Option<&'static str>,
     input_notice: Option<&'static str>,
@@ -96,10 +101,16 @@ impl FleetView {
                 view.leave_search(cx);
             }
         });
+        let bounds = cx.observe_window_bounds(window, |view, _, cx| {
+            if view.consent_screen.target().is_some() {
+                view.cancel_current_consent(cx);
+            }
+        });
         let mut view = Self {
             focus,
             _focus_out: focus_out,
             _activation: activation,
+            _bounds: bounds,
             sample,
             recent_local,
             generation: 0,
@@ -118,6 +129,9 @@ impl FleetView {
             model_keyboard: ModelKeyboard::default(),
             model_view: ModelViewGate::default(),
             confirmation_keys: ConfirmKeyGate::default(),
+            consent_screen: ConsentScreen::default(),
+            consent_pointer: ConsentPointer::default(),
+            consent_scroll: ScrollHandle::new(),
             navigation_keys: NavigationKeyGate::default(),
             model_notice: None,
             input_notice: None,
@@ -160,6 +174,8 @@ impl FleetView {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.consent_screen.invalidate();
+        self.consent_pointer.clear();
         self.selected.invalidate();
         self.machine_focus = None;
         self.model_keyboard.exit();
@@ -309,6 +325,8 @@ impl FleetView {
 
     fn lose_keyboard_focus(&mut self, cx: &mut Context<Self>) {
         llm_keyboard::focus_lost(&mut self.model_keyboard, &mut self.model_scope, &mut self.model_confirmation, &mut self.selected);
+        self.consent_screen.invalidate();
+        self.consent_pointer.clear();
         self.model_view.invalidate();
         self.machine_focus = None;
         self.confirmations.clear();
@@ -320,7 +338,279 @@ impl FleetView {
         cx.notify();
     }
 
+    fn begin_consent(&mut self, target: ConsentTarget) {
+        self.search.cancel_composition();
+        self.searching = false;
+        self.selecting = false;
+        self.paste_status = None;
+        self.input_notice = None;
+        self.consent_pointer.clear();
+        self.consent_scroll = ScrollHandle::new();
+        self.consent_screen.begin(target.clone());
+        self.confirmation_keys.arm(target);
+    }
+
+    fn cancel_current_consent(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.consent_screen.target().cloned() else { return };
+        self.cancel_consent(&target, cx);
+    }
+
+    fn cancel_consent(&mut self, target: &ConsentTarget, cx: &mut Context<Self>) {
+        if self.consent_screen.target() != Some(target) {
+            return;
+        }
+        match target {
+            ConsentTarget::Machine(confirmation) => {
+                self.confirmations.cancel_if(confirmation);
+                self.machine_focus = None;
+            }
+            ConsentTarget::Model(confirmation) => {
+                if self.model_confirmation.as_ref() == Some(confirmation) {
+                    self.dismiss_model_confirmation();
+                }
+                self.model_keyboard.exit();
+            }
+        }
+        self.consent_screen.invalidate();
+        self.consent_pointer.clear();
+        self.confirmation_keys.clear();
+        self.pointer_ids.borrow_mut().clear();
+        cx.notify();
+    }
+
+    fn consent_target_current(&self, target: &ConsentTarget) -> bool {
+        match target {
+            ConsentTarget::Machine(confirmation) => {
+                !self.scope_check_pending
+                    && !self.revoking.contains(&confirmation.id)
+                    && self.confirmations.current() == Some(confirmation)
+                    && self.dashboard.as_ref().is_some_and(|dashboard| {
+                        dashboard.nodes.iter().any(|node| node.is_visible_target(&confirmation.id, &confirmation.fingerprint, self.search.filter_text()))
+                    })
+            }
+            ConsentTarget::Model(confirmation) => {
+                !self.refresh_queue.pending()
+                    && self.model_confirmation.as_ref() == Some(confirmation)
+                    && self.visible_model_endpoints().contains(confirmation.endpoint())
+            }
+        }
+    }
+
+    fn confirm_consent(&mut self, target: ConsentTarget, frame: ConsentFrame, window: &Window, cx: &mut Context<Self>) {
+        if !self.consent_target_current(&target) {
+            return;
+        }
+        let size = window.viewport_size();
+        let viewport = Viewport::new(size.width.into(), size.height.into());
+        let metrics = self.consent_metrics();
+        if !self.consent_screen.accepts(&frame, &target, viewport, window.is_window_active(), metrics) {
+            self.input_notice = Some(ui_consent::unavailable_notice(metrics));
+            cx.notify();
+            return;
+        }
+        match target {
+            ConsentTarget::Machine(confirmation) => self.confirm_machine_access(confirmation, &frame, window, cx),
+            ConsentTarget::Model(confirmation) => self.confirm_model(&confirmation, &frame, window, cx),
+        }
+    }
+
+    fn consent_metrics(&self) -> ScrollMetrics {
+        let bounds = self.consent_scroll.bounds().size;
+        let offset = self.consent_scroll.offset();
+        let max = self.consent_scroll.max_offset();
+        ScrollMetrics {
+            bounds: Viewport::new(bounds.width.into(), bounds.height.into()),
+            offset_x: offset.x.into(),
+            offset_y: offset.y.into(),
+            max_x: max.width.into(),
+            max_y: max.height.into(),
+        }
+    }
+
+    fn render_consent(&mut self, target: ConsentTarget, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let size = window.viewport_size();
+        let offset = self.consent_scroll.offset();
+        let frame = self.consent_screen.present(Viewport::new(size.width.into(), size.height.into()), (offset.x.into(), offset.y.into()));
+        let generation = self.consent_screen.generation();
+        let mut body = div()
+            .id("consent-scroll")
+            .size_full()
+            .min_w(px(0.0))
+            .overflow_scroll()
+            .track_scroll(&self.consent_scroll)
+            .on_scroll_wheel(cx.listener(|view, _: &gpui::ScrollWheelEvent, _, _| view.consent_pointer.clear()))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .whitespace_normal()
+            .child(div().flex_shrink_0().w_full().text_lg().child(if self.sample { "確認 · サンプル" } else { "対象と権限の確認" }))
+            .child(disclosure_line("内容はスクロールで確認できます。上下・左右・Page Up / Down でも移動できます。Esc で中止します。"))
+            .child(disclosure_line(if cfg!(target_os = "windows") {
+                "末尾まで移動した後、最後のボタンか新たな Y の押下で実行します。"
+            } else {
+                "内容を確認した場合は、最後のボタンを押してください。"
+            }));
+
+        match &target {
+            ConsentTarget::Machine(confirmation) => {
+                body = body
+                    .child(disclosure_line(format!("台帳 ID: {}", ui_consent::disclosure_text(&confirmation.id))))
+                    .child(disclosure_line(
+                        "この台帳 ID に保存された過去の要約（記録時刻・スコア・件数・失敗・鮮度）を読みます。保存元の実機と現在の状態は未確認です。",
+                    ))
+                    .child(disclosure_line(
+                        "許可はこの起動中のみです。更新時に同じ ID を再読取し、後で取り消せます。開始済みの読み取りは遡って止められません。",
+                    ));
+            }
+            ConsentTarget::Model(confirmation) => {
+                let endpoint = confirmation.endpoint();
+                let request = match endpoint.protocol {
+                    llm::Protocol::OpenAi => "GET /v1/models",
+                    llm::Protocol::Ollama => "GET /api/tags",
+                };
+                body = body
+                    .child(disclosure_line(format!("表示名: {}", ui_consent::disclosure_text(&endpoint.label))))
+                    .child(disclosure_line(format!("接続先: {} / {} / 平文 HTTP", endpoint.address, endpoint.protocol.label())))
+                    .child(disclosure_line(format!("モデル一覧のみ取得します（{request}）。モデルのロードや推論は行いません。")))
+                    .child(disclosure_line(
+                        "許可はこの起動中のみです。有効化時と更新時に再取得し、後で取り消せます。開始済みの通信は止められない場合があります。",
+                    ));
+            }
+        }
+        body = body
+            .child(disclosure_line("会社管理の機体・データ・接続先の場合は、適用ルールと必要な権限を確認し、許可された範囲だけを選んでください。"))
+            .child(disclosure_line("対象と範囲を確認できない場合は「やめる」を選んでください。"))
+            .child(disclosure_line("文字が横に大きくはみ出す場合は許可できません。ウィンドウを拡大して対象を選び直してください。"))
+            .child(div().flex_shrink_0().w_full().h(px(48.0)).overflow_hidden().text_sm().text_color(rgb(0xffb86c)).child(self.input_notice.unwrap_or(" ")));
+        if let Some(frame) = frame {
+            let layout_frame = frame.clone();
+            cx.on_next_frame(window, move |view, window, _cx| {
+                let size = window.viewport_size();
+                let viewport = Viewport::new(size.width.into(), size.height.into());
+                let metrics = view.consent_metrics();
+                view.consent_screen.acknowledge_layout(&layout_frame, viewport, metrics);
+            });
+            let yes_target = target.clone();
+            let down_target = target.clone();
+            let down_frame = frame.clone();
+            let label = if self.sample { "確認して模擬する" } else { "確認して実行する" };
+            body = body.child(
+                div()
+                    .id(SharedString::from(format!("consent-confirm-{generation}")))
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_2()
+                    .bg(rgb(0x29486b))
+                    .cursor_pointer()
+                    .child(label)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, event: &gpui::MouseDownEvent, window, _cx| {
+                            if event.first_mouse || event.modifiers.modified() {
+                                view.consent_pointer.clear();
+                                return;
+                            }
+                            let size = window.viewport_size();
+                            let metrics = view.consent_metrics();
+                            let presentation = Presentation {
+                                screen: &view.consent_screen,
+                                frame: &down_frame,
+                                viewport: Viewport::new(size.width.into(), size.height.into()),
+                                active: window.is_window_active(),
+                                metrics,
+                            };
+                            let mark = PointerMark { x: event.position.x.into(), y: event.position.y.into(), clicks: event.click_count };
+                            view.consent_pointer.down(presentation, &down_target, mark, event.button == MouseButton::Left);
+                        }),
+                    )
+                    .capture_any_mouse_up(cx.listener(|view, event: &gpui::MouseUpEvent, _, _| {
+                        if event.button != MouseButton::Left {
+                            view.consent_pointer.clear();
+                        }
+                    }))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(|view, _, _, _| view.consent_pointer.clear()))
+                    .on_mouse_up_out(MouseButton::Right, cx.listener(|view, _, _, _| view.consent_pointer.clear()))
+                    .on_mouse_up_out(MouseButton::Middle, cx.listener(|view, _, _, _| view.consent_pointer.clear()))
+                    .on_mouse_up_out(MouseButton::Navigate(gpui::NavigationDirection::Back), cx.listener(|view, _, _, _| view.consent_pointer.clear()))
+                    .on_mouse_up_out(MouseButton::Navigate(gpui::NavigationDirection::Forward), cx.listener(|view, _, _, _| view.consent_pointer.clear()))
+                    .on_click(cx.listener(move |view, event: &gpui::ClickEvent, window, cx| {
+                        let gpui::ClickEvent::Mouse(mouse) = event else { return };
+                        if mouse.up.modifiers.modified() || mouse.up.click_count != 1 {
+                            view.consent_pointer.clear();
+                            return;
+                        }
+                        let size = window.viewport_size();
+                        let metrics = view.consent_metrics();
+                        let presentation = Presentation {
+                            screen: &view.consent_screen,
+                            frame: &frame,
+                            viewport: Viewport::new(size.width.into(), size.height.into()),
+                            active: window.is_window_active(),
+                            metrics,
+                        };
+                        let mark = PointerMark { x: mouse.down.position.x.into(), y: mouse.down.position.y.into(), clicks: mouse.down.click_count };
+                        if let Some(pressed_frame) = view.consent_pointer.release(presentation, &yes_target, mark, mouse.up.button == MouseButton::Left) {
+                            view.confirm_consent(yes_target.clone(), pressed_frame, window, cx);
+                        } else {
+                            view.input_notice = Some(ui_consent::unavailable_notice(metrics));
+                            cx.notify();
+                        }
+                    })),
+            );
+        } else {
+            body = body.child(
+                div().text_color(rgb(0xffb86c)).child("画面が小さすぎます。拡大すると確認を中止します。拡大後に対象を選び直すか、Esc で中止してください。"),
+            );
+        }
+        let cancel_target = target;
+        body = body.child(
+            div()
+                .id(SharedString::from(format!("consent-cancel-{generation}")))
+                .flex_shrink_0()
+                .px_3()
+                .py_2()
+                .bg(rgb(0x29486b))
+                .cursor_pointer()
+                .child("やめる")
+                .on_click(cx.listener(move |view, _, _, cx| view.cancel_consent(&cancel_target, cx))),
+        );
+        div()
+            .size_full()
+            .bg(rgb(0x0d1725))
+            .text_color(rgb(0xe7edf6))
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::on_key))
+            .on_key_up(cx.listener(Self::on_key_up))
+            .child(body)
+            .into_any_element()
+    }
+
+    fn scroll_consent(&mut self, action: ConfirmationAction, window: &Window) {
+        self.consent_pointer.clear();
+        let mut offset = self.consent_scroll.offset();
+        let max = self.consent_scroll.max_offset();
+        let page = window.viewport_size().height * 0.75;
+        match action {
+            ConfirmationAction::Up => offset.y += px(60.0),
+            ConfirmationAction::Down => offset.y -= px(60.0),
+            ConfirmationAction::Left => offset.x += px(60.0),
+            ConfirmationAction::Right => offset.x -= px(60.0),
+            ConfirmationAction::PageUp => offset.y += page,
+            ConfirmationAction::PageDown => offset.y -= page,
+            _ => return,
+        }
+        offset.x = offset.x.clamp(-max.width, px(0.0));
+        offset.y = offset.y.clamp(-max.height, px(0.0));
+        self.consent_scroll.set_offset(offset);
+    }
+
     fn prepare_model_confirmation(&mut self, endpoint: &Endpoint, cx: &mut Context<Self>) {
+        if !ui_consent::can_prepare_confirmation(self.search.is_composing()) {
+            self.model_notice = Some("検索の変換を確定または取消してから確認してください。");
+            cx.notify();
+            return;
+        }
         if !ui_consent::preparation_available(self.sample) {
             self.model_notice = Some(ui_consent::MODEL_UNAVAILABLE);
             cx.notify();
@@ -339,10 +629,8 @@ impl FleetView {
         self.confirmation_keys.clear();
         if let Some(confirmation) = llm_keyboard::prepare(&mut self.model_scope, &visible, endpoint, self.refresh_queue.pending()) {
             self.model_view.invalidate();
-            if self.model_keyboard.current(&self.model_scope, &visible) == Some(endpoint) {
-                self.confirmation_keys.arm(KeyboardConfirmation::Model(confirmation.clone()));
-            }
-            self.model_confirmation = Some(confirmation);
+            self.model_confirmation = Some(confirmation.clone());
+            self.begin_consent(ConsentTarget::Model(confirmation));
             self.model_cancellation = None;
             self.model_notice = None;
             self.pointer_ids.borrow_mut().clear();
@@ -350,11 +638,27 @@ impl FleetView {
         }
     }
 
-    fn confirm_model(&mut self, confirmation: &ModelConfirmation, cx: &mut Context<Self>) {
+    fn confirm_model(&mut self, confirmation: &ModelConfirmation, frame: &ConsentFrame, window: &Window, cx: &mut Context<Self>) {
         let visible = self.visible_model_endpoints();
-        match ui_consent::confirm_model(self.sample, &mut self.model_scope, &visible, &mut self.model_confirmation, confirmation, self.refresh_queue.pending())
-        {
+        let size = window.viewport_size();
+        let presentation = Presentation {
+            screen: &self.consent_screen,
+            frame,
+            viewport: Viewport::new(size.width.into(), size.height.into()),
+            active: window.is_window_active(),
+            metrics: self.consent_metrics(),
+        };
+        match ui_consent::confirm_model_presented(
+            presentation,
+            &mut self.model_scope,
+            &visible,
+            &mut self.model_confirmation,
+            confirmation,
+            self.refresh_queue.pending(),
+        ) {
             ModelConfirmationResult::Authorized(request) => {
+                self.consent_screen.invalidate();
+                self.consent_pointer.clear();
                 self.model_view.invalidate();
                 self.model_confirmation = None;
                 self.confirmation_keys.clear();
@@ -494,6 +798,11 @@ impl FleetView {
     }
 
     fn request_machine_access(&mut self, id: String, fingerprint: String, cx: &mut Context<Self>) {
+        if !ui_consent::can_prepare_confirmation(self.search.is_composing()) {
+            self.access_notice = Some("検索の変換を確定または取消してから確認してください。");
+            cx.notify();
+            return;
+        }
         if !ui_consent::preparation_available(self.sample) {
             self.access_notice = Some(ui_consent::MACHINE_UNAVAILABLE);
             cx.notify();
@@ -505,13 +814,13 @@ impl FleetView {
         let still_shown = self
             .dashboard
             .as_ref()
-            .is_some_and(|dashboard| dashboard.nodes.iter().any(|node| node.id == id && node.fingerprint.as_deref() == Some(fingerprint.as_str())));
+            .is_some_and(|dashboard| dashboard.nodes.iter().any(|node| node.is_visible_target(&id, &fingerprint, self.search.filter_text())));
         if still_shown {
             self.leave_model_keyboard();
             self.machine_focus = Some((id.clone(), fingerprint.clone()));
             self.selected.invalidate();
             if let Some(confirmation) = self.confirmations.begin(&id, &fingerprint) {
-                self.confirmation_keys.arm(KeyboardConfirmation::Machine(confirmation));
+                self.begin_consent(ConsentTarget::Machine(confirmation));
             } else {
                 self.access_notice = Some("確認を開始できません。");
             }
@@ -519,7 +828,7 @@ impl FleetView {
         }
     }
 
-    fn confirm_machine_access(&mut self, confirmation: Confirmation, cx: &mut Context<Self>) {
+    fn confirm_machine_access(&mut self, confirmation: Confirmation, frame: &ConsentFrame, window: &Window, cx: &mut Context<Self>) {
         let id = &confirmation.id;
         let fingerprint = &confirmation.fingerprint;
         if self.scope_check_pending || self.revoking.contains(id) || self.grants.matching(id, fingerprint).is_some() {
@@ -528,12 +837,22 @@ impl FleetView {
         let still_shown = self
             .dashboard
             .as_ref()
-            .is_some_and(|dashboard| dashboard.nodes.iter().any(|node| node.id == *id && node.fingerprint.as_deref() == Some(fingerprint.as_str())));
+            .is_some_and(|dashboard| dashboard.nodes.iter().any(|node| node.is_visible_target(id, fingerprint, self.search.filter_text())));
         if !still_shown {
             return;
         }
-        match ui_consent::confirm_machine(self.sample, &mut self.confirmations, &mut self.grants, &confirmation) {
+        let size = window.viewport_size();
+        let presentation = Presentation {
+            screen: &self.consent_screen,
+            frame,
+            viewport: Viewport::new(size.width.into(), size.height.into()),
+            active: window.is_window_active(),
+            metrics: self.consent_metrics(),
+        };
+        match ui_consent::confirm_machine_presented(presentation, &mut self.confirmations, &mut self.grants, &confirmation) {
             MachineConfirmationResult::Authorized => {
+                self.consent_screen.invalidate();
+                self.consent_pointer.clear();
                 self.confirmation_keys.clear();
                 self.dashboard_gate.invalidate();
                 self.start_dashboard(cx);
@@ -588,7 +907,7 @@ impl FleetView {
             dashboard
                 .nodes
                 .iter()
-                .filter(|node| self.matches(&format!("{} {} {}", node.id, node.role, node.operating_state)))
+                .filter(|node| node.matches_search(self.search.filter_text()))
                 .filter_map(|node| {
                     let fingerprint = node.fingerprint.as_ref()?;
                     if self.revoking.contains(&node.id) || (self.scope_check_pending && self.grants.matching(&node.id, fingerprint).is_none()) {
@@ -646,7 +965,7 @@ impl FleetView {
         }
     }
 
-    fn confirm_focused_machine(&mut self, cx: &mut Context<Self>) {
+    fn confirm_focused_machine(&mut self, window: &Window, cx: &mut Context<Self>) {
         if !cfg!(target_os = "windows") {
             self.access_notice = Some(if ui_consent::preparation_available(self.sample) {
                 "この OS のキーボード最終許可は未対応です。画面のボタンを使用してください。"
@@ -656,8 +975,10 @@ impl FleetView {
             return;
         }
         let Some((id, fingerprint)) = self.machine_focus.as_ref() else { return };
-        if let Some(confirmation) = self.confirmations.current().filter(|pending| pending.id == *id && pending.fingerprint == *fingerprint).cloned() {
-            self.confirm_machine_access(confirmation, cx);
+        if let Some(confirmation) = self.confirmations.current().filter(|pending| pending.id == *id && pending.fingerprint == *fingerprint).cloned()
+            && let Some(frame) = self.consent_screen.current_frame().cloned()
+        {
+            self.confirm_machine_access(confirmation, &frame, window, cx);
         }
     }
 
@@ -725,11 +1046,10 @@ impl FleetView {
             return Some(KeyboardConfirmation::Model(confirmation.clone()));
         }
         let (id, fingerprint) = self.machine_focus.as_ref()?;
-        let shown = self.dashboard.as_ref().is_some_and(|dashboard| {
-            dashboard.nodes.iter().any(|node| {
-                node.id == *id && node.fingerprint.as_ref() == Some(fingerprint) && self.matches(&format!("{} {} {}", node.id, node.role, node.operating_state))
-            })
-        });
+        let shown = self
+            .dashboard
+            .as_ref()
+            .is_some_and(|dashboard| dashboard.nodes.iter().any(|node| node.is_visible_target(id, fingerprint, self.search.filter_text())));
         shown.then_some(())?;
         self.confirmations
             .current()
@@ -960,6 +1280,47 @@ impl FleetView {
         let modified = modifiers.control || modifiers.platform || modifiers.alt || modifiers.shift || modifiers.function;
         let fresh = self.navigation_keys.down(key, event.is_held);
         let blocked = event.is_held || modified || !fresh;
+        if let Some(target) = self.consent_screen.target().cloned() {
+            match ui_consent::confirmation_action(key, event.is_held, modified, self.search.is_composing()) {
+                ConfirmationAction::Cancel if fresh => self.cancel_consent(&target, cx),
+                ConfirmationAction::Refresh if fresh => {
+                    self.cancel_consent(&target, cx);
+                    self.refresh(cx);
+                }
+                ConfirmationAction::Confirm if cfg!(target_os = "windows") => {
+                    let frame = self.consent_screen.current_frame().cloned();
+                    let size = window.viewport_size();
+                    let viewport = Viewport::new(size.width.into(), size.height.into());
+                    let metrics = self.consent_metrics();
+                    let ready = frame.as_ref().is_some_and(|frame| self.consent_screen.accepts(frame, &target, viewport, window.is_window_active(), metrics));
+                    if let Some(frame) = frame {
+                        let presentation = Presentation { screen: &self.consent_screen, frame: &frame, viewport, active: window.is_window_active(), metrics };
+                        if ui_consent::confirmation_key_down(presentation, &mut self.confirmation_keys, &target, event.is_held, modified) {
+                            self.confirm_consent(target, frame, window, cx);
+                        } else if ready {
+                            self.input_notice = Some("Y を離して押し直してください。必要な場合はもう一度押してください。");
+                        }
+                    } else {
+                        self.confirmation_keys.down(None, event.is_held, true);
+                    }
+                    if !ready {
+                        self.input_notice = Some(ui_consent::unavailable_notice(metrics));
+                    }
+                }
+                ConfirmationAction::Confirm => self.input_notice = Some("この OS では最後のボタンを押してください。"),
+                action @ (ConfirmationAction::Up
+                | ConfirmationAction::Down
+                | ConfirmationAction::Left
+                | ConfirmationAction::Right
+                | ConfirmationAction::PageUp
+                | ConfirmationAction::PageDown) => self.scroll_consent(action, window),
+                _ => {}
+            }
+            self.focus.focus(window);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if !blocked {
             self.input_notice = None;
         }
@@ -1011,8 +1372,11 @@ impl FleetView {
                     ModelKey::Previous => self.cycle_model(true),
                     ModelKey::Inspect => self.inspect_selected_model(cx),
                     ModelKey::Confirm => {
-                        if confirmed && let Some(KeyboardConfirmation::Model(confirmation)) = current.as_ref() {
-                            self.confirm_model(confirmation, cx);
+                        if confirmed
+                            && let Some(KeyboardConfirmation::Model(confirmation)) = current.as_ref()
+                            && let Some(frame) = self.consent_screen.current_frame().cloned()
+                        {
+                            self.confirm_model(confirmation, &frame, window, cx);
                         } else if matches!(current.as_ref(), Some(KeyboardConfirmation::Model(_))) {
                             self.input_notice = Some("Y を一度離し、もう一度押してください。必要なら確認を開き直してください。");
                         }
@@ -1044,7 +1408,7 @@ impl FleetView {
                     MachineKey::Activate => self.activate_machine(cx),
                     MachineKey::Confirm => {
                         if !cfg!(target_os = "windows") || confirmed {
-                            self.confirm_focused_machine(cx);
+                            self.confirm_focused_machine(window, cx);
                         } else if matches!(current.as_ref(), Some(KeyboardConfirmation::Machine(_))) {
                             self.input_notice = Some("Y を一度離し、もう一度押してください。必要なら確認を開き直してください。");
                         }
@@ -1423,6 +1787,12 @@ fn recent_status(status: &SyncStatus, now: i64, max_age_ms: Option<i64>) -> Stri
 
 impl Render for FleetView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(target) = self.consent_screen.target().cloned() {
+            if self.consent_target_current(&target) {
+                return self.render_consent(target, window, cx);
+            }
+            self.cancel_consent(&target, cx);
+        }
         let compact = window.viewport_size().height <= px(480.0);
         self.reconcile_model_controls();
         let visible_models = self.visible_model_endpoints();
@@ -1450,7 +1820,7 @@ impl Render for FleetView {
             content =
                 content.child(note("保存情報は台帳 ID に紐づく過去の要約です。保存元の実機・本文の完全性・現在の接続や正常性は未確認です。".into(), 0x9baec4));
             content = content.child(note("台帳の照合は更新時点のものです。取消中は開始済みの読み取りを待ちます。".into(), 0x9baec4));
-            for node in dashboard.nodes.iter().filter(|node| self.matches(&format!("{} {} {}", node.id, node.role, node.operating_state))) {
+            for node in dashboard.nodes.iter().filter(|node| node.matches_search(self.search.filter_text())) {
                 let id = node.id.clone();
                 let fingerprint = node.fingerprint.clone();
                 let identity = node.identity_text();
@@ -1507,47 +1877,17 @@ impl Render for FleetView {
                     item = item.child(div().text_sm().child("台帳の再照合が終わるまで待機中です。"));
                 } else if let Some(fingerprint) = fingerprint {
                     let pending = self.confirmations.current().filter(|pending| pending.id == id && pending.fingerprint == fingerprint).cloned();
-                    if !ui_consent::preparation_available(self.sample) {
-                        item = item.child(note(ui_consent::MACHINE_UNAVAILABLE.into(), 0xffd9a1));
-                        if let Some(confirmation) = pending {
-                            let nonce = confirmation.nonce.to_string();
-                            let cancel_id = pointer_ids.get("machine-cancel", &[&id, &fingerprint, &nonce]);
-                            item = item.child(
-                                div()
-                                    .id(SharedString::from(format!("machine-cancel-{cancel_id}")))
-                                    .cursor_pointer()
-                                    .text_sm()
-                                    .child("確認をキャンセル")
-                                    .on_click(cx.listener(move |view, _, _, cx| view.cancel_machine_access(confirmation.clone(), cx))),
-                            );
-                        }
-                    } else if let Some(confirmation) = pending {
-                        item = item.child(div().text_sm().text_color(rgb(0xffd9a1)).child(fleet_studio::scope::MACHINE_CONFIRMATION));
+                    if let Some(confirmation) = pending {
+                        item = item.child(note("確認を中止して対象を選び直してください。".into(), 0xffd9a1));
                         let nonce = confirmation.nonce.to_string();
-                        let yes_id = pointer_ids.get("machine-confirm", &[&id, &fingerprint, &nonce]);
                         let cancel_id = pointer_ids.get("machine-cancel", &[&id, &fingerprint, &nonce]);
-                        let cancel_confirmation = confirmation.clone();
                         item = item.child(
                             div()
-                                .flex()
-                                .gap_4()
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!("machine-confirm-{yes_id}")))
-                                        .cursor_pointer()
-                                        .text_sm()
-                                        .text_color(rgb(0x8fc9ff))
-                                        .child("確認して表示")
-                                        .on_click(cx.listener(move |view, _, _, cx| view.confirm_machine_access(confirmation.clone(), cx))),
-                                )
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!("machine-cancel-{cancel_id}")))
-                                        .cursor_pointer()
-                                        .text_sm()
-                                        .child("やめる")
-                                        .on_click(cx.listener(move |view, _, _, cx| view.cancel_machine_access(cancel_confirmation.clone(), cx))),
-                                ),
+                                .id(SharedString::from(format!("machine-cancel-{cancel_id}")))
+                                .cursor_pointer()
+                                .text_sm()
+                                .child("確認をキャンセル")
+                                .on_click(cx.listener(move |view, _, _, cx| view.cancel_machine_access(confirmation.clone(), cx))),
                         );
                     } else {
                         let button_id = pointer_ids.get("machine-request", &[&id, &fingerprint]);
@@ -1776,49 +2116,20 @@ impl Render for FleetView {
                             }
                         },
                     )));
-                } else if !ui_consent::preparation_available(self.sample) {
-                    item = item.child(note(ui_consent::MODEL_UNAVAILABLE.into(), 0xffb86c));
-                    if let Some(confirmation) = self.model_confirmation.as_ref().filter(|confirmation| confirmation.endpoint() == &endpoint) {
-                        let id = pointer_ids.get("llm-cancel-confirmation", &[&address, protocol, &endpoint.label]);
-                        let cancel = confirmation.clone();
-                        let ticket = model_ticket.clone();
-                        item = item.child(div().id(SharedString::from(format!("click-{id}"))).cursor_pointer().child("確認をキャンセル").on_click(
-                            cx.listener(move |view, _, _, cx| {
-                                if view.model_view.is_current(&ticket) {
-                                    view.cancel_model_confirmation(&cancel, cx);
-                                }
-                            }),
-                        ));
-                    }
                 } else if self.refresh_queue.pending() {
                     item = item.child(note("更新待ちのため、接続内容の確認はできません。".into(), 0xffb86c));
                 } else if let Some(confirmation) = self.model_confirmation.as_ref().filter(|confirmation| confirmation.endpoint() == &endpoint) {
-                    item = item.child(note(format!("接続内容を確認: {}", confirmation.description()), 0xffb86c));
-                    let confirm_id = pointer_ids.get("llm-confirm", &[&address, protocol, &endpoint.label]);
+                    item = item.child(note("確認を中止して対象を選び直してください。".into(), 0xffd9a1));
                     let cancel_id = pointer_ids.get("llm-cancel-confirmation", &[&address, protocol, &endpoint.label]);
-                    let selected = confirmation.clone();
                     let cancel = confirmation.clone();
-                    let confirm_ticket = model_ticket.clone();
                     let cancel_ticket = model_ticket.clone();
-                    item = item.child(
-                        div()
-                            .flex()
-                            .gap_3()
-                            .child(div().id(SharedString::from(format!("click-{confirm_id}"))).cursor_pointer().child("この接続を有効化").on_click(
-                                cx.listener(move |view, _, _, cx| {
-                                    if view.model_view.is_current(&confirm_ticket) {
-                                        view.confirm_model(&selected, cx);
-                                    }
-                                }),
-                            ))
-                            .child(div().id(SharedString::from(format!("click-{cancel_id}"))).cursor_pointer().child("キャンセル").on_click(cx.listener(
-                                move |view, _, _, cx| {
-                                    if view.model_view.is_current(&cancel_ticket) {
-                                        view.cancel_model_confirmation(&cancel, cx);
-                                    }
-                                },
-                            ))),
-                    );
+                    item = item.child(div().id(SharedString::from(format!("click-{cancel_id}"))).cursor_pointer().child("キャンセル").on_click(cx.listener(
+                        move |view, _, _, cx| {
+                            if view.model_view.is_current(&cancel_ticket) {
+                                view.cancel_model_confirmation(&cancel, cx);
+                            }
+                        },
+                    )));
                 } else {
                     let id = pointer_ids.get("llm-prepare", &[&address, protocol, &endpoint.label]);
                     let selected = endpoint.clone();
@@ -2077,7 +2388,12 @@ impl Render for FleetView {
                             ),
                     ),
             )
+            .into_any_element()
     }
+}
+
+fn disclosure_line(text: impl Into<SharedString>) -> impl IntoElement {
+    div().flex_shrink_0().w_full().min_w(px(0.0)).whitespace_normal().child(text.into())
 }
 
 fn section(title: &'static str, subtitle: &str) -> impl IntoElement {

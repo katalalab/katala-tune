@@ -113,12 +113,12 @@ fn paused_real_consent_does_not_stop_automatic_loopback_requests() {
 }
 
 #[test]
-fn preparation_is_temporarily_unavailable_only_for_real_mode() {
-    assert!(!ui_consent::preparation_available(false));
+fn preparation_is_available_while_legacy_final_entry_remains_guarded() {
+    assert!(ui_consent::preparation_available(false));
     assert!(ui_consent::preparation_available(true));
     for windows in [true, false] {
         let real = ui_consent::footer_notice(false, windows);
-        assert!(real.contains("新規許可停止"));
+        assert!(!real.contains("新規許可停止"));
         assert!(!real.contains("Y 許可"));
         assert!(!real.contains("許可はマウス"));
         assert!(ui_consent::footer_notice(true, windows).contains("模擬許可"));

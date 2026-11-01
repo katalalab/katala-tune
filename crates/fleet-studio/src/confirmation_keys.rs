@@ -46,7 +46,7 @@ impl<T: PartialEq> ConfirmKeyGate<T> {
         self.confirmation = Some(confirmation);
         self.generation = Arc::new(());
         self.ready = matches!(self.press, PressState::Up);
-        self.recovery = matches!(self.press, PressState::Unknown);
+        self.recovery = matches!(self.press, PressState::Unknown | PressState::Down(Some(_)));
         self.recovery_owner = None;
         if let PressState::Down(owner @ None) = &mut self.press {
             *owner = Some(self.generation.clone());
