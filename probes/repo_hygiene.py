@@ -16,7 +16,7 @@
 import json, os, re, shutil, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 
-KT_VERSION = "2026-10-11.1"   # 調査スクリプトの版（数え方を変えたら上げる）
+KT_VERSION = "2026-11-01.5"   # 調査スクリプトの版（数え方を変えたら上げる）
 KT_OPTS = {}                  # 呼び出し側が置き換える（数と文字列だけ）: { roots, ghq_root, max_repos, budget_s, cmd_s }
 MAX_REPOS = int(KT_OPTS.get("max_repos", 1000))
 BUDGET_S = float(KT_OPTS.get("budget_s", 60))
@@ -43,6 +43,42 @@ def slash(p):
     return p.replace("\\", "/")
 
 
+def normalize_root(p, pathmod=os.path):
+    p = slash(p)
+    if p and not p.strip("/"):
+        return p if pathmod.sep == "\\" else ("//" if p == "//" else "/")
+    drive, tail = pathmod.splitdrive(p)
+    if drive and tail and not tail.strip("/"):
+        return drive + "/"  # Windows drive root or UNC share root
+    return p.rstrip("/")
+
+
+def relative_to_root(path, root, pathmod=os.path):
+    if not root:
+        return None
+    if path == root:
+        return ""
+    drive, tail = pathmod.splitdrive(root)
+    drive_relative = bool(drive and not tail and not drive.startswith("//"))
+    prefix = root if root.endswith("/") or drive_relative else root + "/"
+    if not path.startswith(prefix):
+        return None
+    relative = path[len(prefix):]
+    if drive_relative and (relative.startswith("/") or ".." in relative.split("/")):
+        return None
+    return relative
+
+
+def same_root(a, b, pathmod=os.path):
+    a, b = normalize_root(a, pathmod), normalize_root(b, pathmod)
+    if a == b:
+        return True
+    a_drive, a_tail = pathmod.splitdrive(a)
+    b_drive, b_tail = pathmod.splitdrive(b)
+    return (a_drive.startswith("//") and b_drive.startswith("//") and not a_tail.strip("/") and not b_tail.strip("/")
+            and pathmod.normcase(a_drive) == pathmod.normcase(b_drive))
+
+
 def shorten(p):
     p = slash(p)
     h = slash(HOME).rstrip("/")
@@ -59,18 +95,23 @@ def run(cmd, timeout):
         p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=ENV, creationflags=NOWIN)
     except OSError:
         return None, "oserror"
-    buf, over = bytearray(), [False]
+    buf, over, eof = bytearray(), [False], [False]
 
     def read():
-        while True:
-            c = p.stdout.read(65536)
-            if not c:
-                return
-            if len(buf) + len(c) > MAX_OUT:
-                over[0] = True
-                p.kill()
-                return
-            buf.extend(c)
+        try:
+            while True:
+                c = p.stdout.read(65536)
+                if not c:
+                    eof[0] = True
+                    return
+                if len(buf) + len(c) > MAX_OUT:
+                    over[0] = True
+                    p.kill()
+                    return
+                buf.extend(c)
+        except Exception:
+            # 内容・パスを含みうる例外は出さず、EOF 未確認として扱う。
+            return
 
     th = threading.Thread(target=read, daemon=True)
     th.start()
@@ -81,9 +122,14 @@ def run(cmd, timeout):
         p.wait()
         th.join(1)
         return None, "timeout"
+    # 未終了 reader と buffer は残り、本数の上限はない。全体の時間上限や子孫回収も保証しない。
     th.join(5)
     if over[0]:
         return None, "over_limit"
+    if th.is_alive():
+        return None, "timeout"
+    if not eof[0]:
+        return None, "oserror"
     return p.returncode, bytes(buf).decode("utf-8", "replace")
 
 
@@ -93,17 +139,17 @@ def git(path, *args):
 
 def ghq_root():
     if GHQ_ROOT_OPT:
-        return slash(os.path.expanduser(str(GHQ_ROOT_OPT))).rstrip("/"), "opt"
+        return normalize_root(os.path.expanduser(str(GHQ_ROOT_OPT))), "opt"
     if shutil.which("ghq"):
         rc, out = run(["ghq", "root"], 10)
         if rc == 0 and out.strip():
-            return slash(out.strip().splitlines()[0].strip()), "ghq"
+            return normalize_root(out.strip().splitlines()[0].strip()), "ghq"
     if os.environ.get("GHQ_ROOT"):
-        return slash(os.environ["GHQ_ROOT"].split(os.pathsep)[0]), "env"
+        return normalize_root(os.environ["GHQ_ROOT"].split(os.pathsep)[0]), "env"
     rc, out = run(["git", "config", "--global", "--get", "ghq.root"], 10)
     if rc == 0 and out.strip():
-        return slash(os.path.expanduser(out.strip().splitlines()[0])), "git-config"
-    d = slash(os.path.join(HOME, "ghq"))
+        return normalize_root(os.path.expanduser(out.strip().splitlines()[0])), "git-config"
+    d = normalize_root(os.path.join(HOME, "ghq"))
     return (d, "default") if os.path.isdir(d) else (None, None)
 
 
@@ -144,6 +190,7 @@ def find_repos(root, depth, state):
         try:
             names = sorted(os.listdir(d))
         except OSError:
+            state["incomplete"] = True
             continue
         for n in names:
             if n.startswith(".") and n not in KEEP_DOT:
@@ -159,56 +206,94 @@ def find_repos(root, depth, state):
 
 
 def parse_status(out, now):
-    # porcelain v2 の -z 出力。ファイルの内容は含まれない。変更ファイルの最古の更新時刻だけを測る
+    # porcelain v2 の -z 出力。形式が欠けたら件数を確定しない。
+    if not out or not out.endswith("\0"):
+        return None
     info = {"branch": None, "detached": False, "upstream": False, "ahead": None, "behind": None, "tracked": 0, "untracked": 0, "conflicted": 0, "stash": None}
-    paths, oldest = [], None
+    paths = []
     toks = out.split("\0")
+    toks.pop()  # 最後の NUL の後にできる空要素
+    seen = set()
+    unborn = False
     i = 0
+
+    def count(value):
+        # JS/Rust の正規化でも確実に扱える範囲。巨大な整数を int に渡さない。
+        if len(value) > 16 or not re.fullmatch(r"[0-9]+", value):
+            return None
+        number = int(value)
+        return number if number <= 9007199254740991 else None
+
     while i < len(toks):
         t = toks[i]
         i += 1
         if not t:
-            continue
-        if t.startswith("# branch.head "):
-            h = t[len("# branch.head "):]
-            info["detached"] = h == "(detached)"
-            info["branch"] = None if info["detached"] else h
-        elif t.startswith("# branch.upstream "):
-            info["upstream"] = True
-        elif t.startswith("# branch.ab "):
-            m = re.match(r"# branch\.ab \+(\d+) -(\d+)", t)
-            if m:
-                info["ahead"], info["behind"] = int(m.group(1)), int(m.group(2))
-        elif t.startswith("# stash "):
-            m = re.match(r"# stash (\d+)", t)
-            info["stash"] = int(m.group(1)) if m else None
-        elif t.startswith("# "):
-            pass
-        elif t[0] == "?":
-            info["untracked"] += 1
-            if len(paths) < MAX_DIRTY_STAT:
-                paths.append(t[2:])
-        elif t[0] == "1":
+            return None
+        if t.startswith("# "):
+            key, sep, value = t[2:].partition(" ")
+            if key not in ("branch.oid", "branch.head", "branch.upstream", "branch.ab", "stash"):
+                continue  # 未知の header は porcelain v2 の拡張として許容する
+            if not sep or not value or key in seen:
+                return None
+            seen.add(key)
+            if key == "branch.oid":
+                unborn = value == "(initial)"
+                if not unborn and not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", value):
+                    return None
+            elif key == "branch.head":
+                if value == "(unknown)":
+                    return None
+                info["detached"] = value == "(detached)"
+                info["branch"] = None if info["detached"] else value
+            elif key == "branch.upstream":
+                info["upstream"] = True
+            elif key == "branch.ab":
+                if value == "+? -?":
+                    continue  # Git の quick 比較: 件数は未取得
+                match = re.fullmatch(r"\+([0-9]+) -([0-9]+)", value)
+                if not match:
+                    return None
+                ahead, behind = count(match.group(1)), count(match.group(2))
+                if ahead is None or behind is None:
+                    return None
+                info["ahead"], info["behind"] = ahead, behind
+            else:
+                stash = count(value)
+                if stash is None:
+                    return None
+                info["stash"] = stash
+        elif t.startswith("? ") or t.startswith("! "):
+            if not t[2:]:
+                return None
+            if t[0] == "?":
+                info["untracked"] += 1
+                if len(paths) < MAX_DIRTY_STAT:
+                    paths.append(t[2:])
+        elif t.startswith(("1 ", "2 ", "u ")):
+            kind = t[0]
+            limit = {"1": 8, "2": 9, "u": 10}[kind]
+            fields = t.split(" ", limit)
+            if len(fields) != limit + 1 or any(not field for field in fields[1:]):
+                return None
+            if kind == "2":
+                if i >= len(toks) or not toks[i]:
+                    return None
+                i += 1  # 改名元はレコード風のパスでも再解釈しない
             info["tracked"] += 1
+            if kind == "u":
+                info["conflicted"] += 1
             if len(paths) < MAX_DIRTY_STAT:
-                paths.append(t.split(" ", 8)[-1])
-        elif t[0] == "2":
-            info["tracked"] += 1
-            if len(paths) < MAX_DIRTY_STAT:
-                paths.append(t.split(" ", 9)[-1])
-            i += 1  # 改名の元のパス
-        elif t[0] == "u":
-            info["tracked"] += 1
-            info["conflicted"] += 1
-            if len(paths) < MAX_DIRTY_STAT:
-                paths.append(t.split(" ", 10)[-1])
-    return info, paths
+                paths.append(fields[-1])
+        else:
+            return None
+    if not {"branch.oid", "branch.head"}.issubset(seen) or ("branch.ab" in seen and "branch.upstream" not in seen):
+        return None
+    return info, paths, unborn
 
 
 def scan(path, root):
     d = {"path": shorten(path), "rel": None, "linked": False, "state": "unobserved"}
-    if root and (path == root or path.startswith(root + "/")):
-        d["rel"] = path[len(root) + 1:]
+    d["rel"] = relative_to_root(path, root)
     dotgit = os.path.join(path, ".git")
     d["linked"] = os.path.isfile(dotgit)
     if time.time() > DEADLINE:
@@ -218,9 +303,12 @@ def scan(path, root):
     if rc != 0:
         d["reason"] = out if rc is None and out in ("timeout", "over_limit") else "git_failed"
         return d
-    unborn = "\0# branch.oid (initial)\0" in "\0" + out
     now = time.time()
-    info, files = parse_status(out, now)
+    parsed = parse_status(out, now)
+    if parsed is None:
+        d["reason"] = "git_failed"
+        return d
+    info, files, unborn = parsed
     d.update(info)
     oldest = None
     for f in files[:MAX_DIRTY_STAT]:
@@ -275,17 +363,28 @@ def main():
         res.update(error="git_missing", elapsed_s=round(time.time() - T0, 1))
         print(json.dumps(res, ensure_ascii=False))
         return
-    walk = {"dirs": 0, "truncated": False}
+    walk = {"dirs": 0, "truncated": False, "incomplete": False}
     root, src = ghq_root()
     targets = []
-    if root and os.path.isdir(root):
-        res["roots"].append({"path": shorten(root), "source": src})
-        targets += [(p, root) for p in find_repos(root, GHQ_DEPTH, walk)]
+    selected_roots = [root] if root else []
+    if root:
+        if os.path.isdir(root):
+            res["roots"].append({"path": shorten(root), "source": src})
+            targets += [(p, root) for p in find_repos(root, GHQ_DEPTH, walk)]
+        else:
+            walk["incomplete"] = True
     for r in EXTRA_ROOTS:
-        r = slash(os.path.expanduser(r)).rstrip("/")
-        if os.path.isdir(r) and not (root and r == root):
+        r = normalize_root(os.path.expanduser(r))
+        if not r:
+            continue
+        if any(same_root(r, selected) for selected in selected_roots):
+            continue
+        selected_roots.append(r)
+        if os.path.isdir(r):
             res["roots"].append({"path": shorten(r), "source": "opt"})
             targets += [(p, root) for p in find_repos(r, EXTRA_DEPTH, walk)]
+        else:
+            walk["incomplete"] = True
     seen, uniq = set(), []
     for p, rt in targets:
         k = p.lower() if os.name == "nt" else p
@@ -296,6 +395,8 @@ def main():
     uniq.sort(key=lambda a: (os.path.isfile(os.path.join(a[0], ".git")) or "/.worktrees/" in a[0], a[0]))
     res["enumerated"] = len(uniq)
     res["truncated"] = walk["truncated"]
+    if walk["incomplete"]:
+        res["error"] = "walk_incomplete"
     take, rest = uniq[:MAX_REPOS], uniq[MAX_REPOS:]
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         res["repos"] = list(pool.map(lambda a: scan(*a), take))

@@ -2,11 +2,12 @@
 //! 入力は決まった種から作る架空のパス・origin・件数（実在のリポジトリ名などは使わない）。
 //! node（24 以上）が要る。無い環境では失敗する（KATALA_TUNE_PARITY=skip で飛ばせる）。
 
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
-use tune_core::hygiene::{analyze, matrix, normalize, path_status, script, strip_url};
+use tune_core::hygiene::{analyze, matrix, normalize, path_status, script, strip_url, walk_coverage_note};
 
 struct Rng(u64);
 impl Rng {
@@ -129,9 +130,414 @@ fn check(kind: &str, inputs: &[Value], js: &Value, rust: &[Value]) {
 }
 
 #[test]
+fn normalize_metadata_preserves_unknown() {
+    assert!(analyze(&json!({ "repos": [] })).iter().any(|finding| finding["id"] == "repo-unobserved"));
+    let raw = json!({ "roots": [], "repos": [], "enumerated": null, "skipped": null, "truncated": null });
+    let normalized = normalize(&raw);
+    assert!(normalized["enumerated"].is_null());
+    assert!(normalized["skipped"].is_null());
+    assert!(normalized["truncated"].is_null());
+    assert!(analyze(&normalized).iter().any(|finding| finding["id"] == "repo-unobserved"));
+}
+
+#[test]
+fn unknown_error_is_redacted() {
+    let marker = "fixture-only-sensitive-value";
+    for error in [json!(""), json!(format!("https://unit-user:{marker}@example.test/r?token={marker}")), json!({ "detail": marker })] {
+        let raw =
+            json!({ "roots": [{ "path": "~/fixture", "source": "opt" }], "repos": [], "enumerated": 0, "skipped": 0, "truncated": false, "error": error });
+        let normalized = normalize(&raw);
+        assert_eq!(normalized["error"], "unknown_error");
+        assert!(normalized["incomplete_fields"].as_array().unwrap().contains(&json!("error")));
+        assert!(analyze(&raw).iter().any(|finding| finding["id"] == "repo-unobserved"));
+        assert!(!normalized.to_string().contains(marker));
+        assert!(!json!(analyze(&raw)).to_string().contains(marker));
+        assert!(!tune_core::hygiene::progress(&raw, 1).1.contains(marker));
+    }
+    for error in ["git_missing", "walk_incomplete", "excluded", "no_python", "timeout_or_unreachable", "probe_failed", "internal", "unknown_error"] {
+        assert_eq!(normalize(&json!({ "error": error }))["error"], error);
+    }
+}
+
+#[test]
+fn metadata_and_progress_match_js() {
+    let base = json!({ "roots": [{ "path": "~/fixture", "source": "opt" }], "repos": [], "enumerated": 0, "skipped": 0, "truncated": false });
+    let row =
+        json!({ "state": "ok", "path": "~/fixture", "linked": false, "tracked": 1, "untracked": 0, "conflicted": 0, "detached": false, "upstream": false });
+    let mut cases = vec![base.clone()];
+    for field in ["enumerated", "skipped", "truncated", "roots", "repos"] {
+        let mut missing = base.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        cases.push(missing);
+        for value in [json!(null), json!("bad"), json!({})] {
+            let mut raw = base.clone();
+            raw[field] = value;
+            cases.push(raw);
+        }
+    }
+    for field in ["enumerated", "skipped"] {
+        for value in [json!(-1), json!(0.5), json!(9_007_199_254_740_992_u64)] {
+            let mut raw = base.clone();
+            raw[field] = value;
+            cases.push(raw);
+        }
+    }
+    let mut boundary = base.clone();
+    boundary["enumerated"] = json!(9_007_199_254_740_991_u64);
+    boundary["skipped"] = json!(9_007_199_254_740_991_u64);
+    cases.push(boundary);
+    let mut roots_partial = base.clone();
+    roots_partial["roots"] = json!([{ "path": "~/fixture", "source": "opt" }, null]);
+    cases.push(roots_partial);
+    let mut partial = base.clone();
+    partial["enumerated"] = json!(1.0);
+    partial["repos"] = json!([row.clone()]);
+    partial["error"] = json!("walk_incomplete");
+    cases.push(partial.clone());
+    let mut missing_git = base.clone();
+    missing_git["error"] = json!("git_missing");
+    cases.push(missing_git);
+    let mut truncated = base.clone();
+    truncated["truncated"] = json!(true);
+    cases.push(truncated);
+    for (n, s) in [(json!(0), json!(0)), (json!(3), json!(1)), (json!(1), json!(2)), (json!(0), json!(null))] {
+        let mut raw = base.clone();
+        raw["enumerated"] = n;
+        raw["skipped"] = s;
+        raw["repos"] = json!([row.clone()]);
+        cases.push(raw);
+    }
+    for value in [json!(false), json!(true), json!(0), json!({}), json!([])] {
+        let mut raw = base.clone();
+        raw["error"] = value;
+        cases.push(raw);
+    }
+    for value in [
+        json!(""),
+        json!(format!("{}{}{}", "https://unit-user:fixture-only-sensitive-value", "@", "example.test/r?token=fixture-only-sensitive-value")),
+        json!({ "detail": "fixture-only-sensitive-value" }),
+        json!("no_python"),
+        json!("timeout_or_unreachable"),
+        json!("probe_failed"),
+        json!("excluded"),
+        json!("internal"),
+        json!("unknown_error"),
+    ] {
+        let mut raw = base.clone();
+        raw["error"] = value;
+        cases.push(raw);
+    }
+    for value in [json!(null), json!("roots"), json!(false), json!({}), json!(["unknown-marker"]), json!(["roots", "unknown-marker"])] {
+        let mut raw = base.clone();
+        raw["incomplete_fields"] = value;
+        cases.push(raw);
+    }
+    for root in [json!({ "path": "", "source": "opt" }), json!({ "path": "~/fixture", "source": "" })] {
+        let mut raw = base.clone();
+        raw["roots"] = json!([root]);
+        cases.push(raw);
+    }
+    let mut no_roots = base.clone();
+    no_roots["roots"] = json!([]);
+    cases.push(no_roots.clone());
+    no_roots["error"] = json!("git_missing");
+    cases.push(no_roots);
+
+    let js_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("lib").join("hygiene.js");
+    let mut child = Command::new("node")
+        .arg("--no-warnings")
+        .arg("-e")
+        .arg("const h=require(process.argv[1]);const fs=require('node:fs');const a=JSON.parse(fs.readFileSync(0,'utf8'));console.log(JSON.stringify(a.map(x=>{const n=h.normalize(x);const f=h.analyze(n);return {normalized:n,findings:f,progress:h.progress({...n,node_id:'node-a',wall_s:1.25},f.length)}})))")
+        .arg(js_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("node が必要");
+    child.stdin.take().unwrap().write_all(serde_json::to_string(&cases).unwrap().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "JS 評価が失敗");
+    let js: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(js.len(), cases.len());
+    for (i, (raw, j)) in cases.iter().zip(&js).enumerate() {
+        let normalized = normalize(raw);
+        let findings = analyze(&normalized);
+        let mut audit = normalized.clone();
+        audit["node_id"] = json!("node-a");
+        audit["wall_s"] = json!(1.25);
+        let (observed, line) = tune_core::hygiene::progress(&audit, findings.len());
+        let rust = json!({ "normalized": normalized, "findings": findings, "progress": { "observed": observed, "line": &line } });
+        assert!(same(j, &rust), "合成入力 #{i} の JS と Rust が不一致");
+        assert!(!rust.to_string().contains("fixture-only-sensitive-value"));
+        if i == 0 {
+            assert!(line.contains("見つけた 0 件・未観測 0 件"));
+        } else if i != 27 {
+            assert!(line.contains("件数不明"), "合成入力 #{i} の進捗が不明を示さない");
+            assert!(!line.contains("未観測 0 件・"));
+        }
+    }
+    let normalized = normalize(&partial);
+    assert_eq!(normalized["error"], "walk_incomplete");
+    assert_eq!(normalized["repos"][0]["tracked"], 1);
+    let findings = analyze(&normalized);
+    assert!(findings.iter().any(|v| v["id"] == "repo-unobserved"));
+    assert!(findings.iter().any(|v| v["id"] == "repo-dirty"));
+}
+
+#[test]
+fn progress_raw_inputs_match_js() {
+    let base = json!({
+        "roots": [{ "path": "~/fixture", "source": "opt" }], "repos": [], "enumerated": 0, "skipped": 0, "truncated": false,
+        "node_id": "node-a", "wall_s": 1.25,
+    });
+    let mut missing = base.clone();
+    missing.as_object_mut().unwrap().remove("wall_s");
+    let mut cases = vec![("valid", base.clone()), ("time_missing", missing)];
+    for value in [json!(null), json!("1"), json!(false), json!(-1), json!({}), json!([])] {
+        let mut raw = base.clone();
+        raw["wall_s"] = value;
+        cases.push(("time_invalid", raw));
+    }
+    let mut zero = base.clone();
+    zero["wall_s"] = json!(0);
+    cases.push(("time_zero", zero));
+    for value in [json!(false), json!(true), json!(0), json!({}), json!([])] {
+        let mut raw = base.clone();
+        raw["error"] = value;
+        cases.push(("error_invalid", raw));
+    }
+    let mut unknown = base.clone();
+    unknown["error"] = json!(format!("{}{}{}", "https://unit-user:fixture-only-sensitive-value", "@", "example.test/r"));
+    cases.push(("error_invalid", unknown));
+    let mut no_roots = base.clone();
+    no_roots["roots"] = json!([]);
+    cases.push(("no_roots", no_roots));
+    let raw: Vec<&Value> = cases.iter().map(|(_, v)| v).collect();
+    let js_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("lib").join("hygiene.js");
+    let mut child = Command::new("node")
+        .arg("--no-warnings")
+        .arg("-e")
+        .arg("const h=require(process.argv[1]);const fs=require('node:fs');const a=JSON.parse(fs.readFileSync(0,'utf8'));console.log(JSON.stringify(a.map(x=>h.progress(x,0))))")
+        .arg(js_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("node が必要");
+    child.stdin.take().unwrap().write_all(serde_json::to_string(&raw).unwrap().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "JS 評価が失敗");
+    let js: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(js.len(), cases.len());
+    for ((kind, raw), j) in cases.iter().zip(js) {
+        let (observed, line) = tune_core::hygiene::progress(raw, 0);
+        assert!(same(&j, &json!({ "observed": observed, "line": &line })), "{kind} の JS と Rust が不一致");
+        assert!(line.starts_with("node-a:"));
+        match *kind {
+            "valid" => assert!(line.contains("未観測 0 件・1.3s")),
+            "time_zero" => assert!(line.contains("0.0s")),
+            "time_missing" | "time_invalid" => assert!(line.contains("時間不明")),
+            "error_invalid" | "no_roots" => assert!(line.contains("未観測 件数不明・1.3s")),
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn known_and_unknown_walk_progress_matches_js() {
+    let base = json!({
+        "node_id": "fixture-node", "wall_s": 1, "roots": [{"path": "fixture", "source": "opt"}],
+        "enumerated": 5, "skipped": 3, "truncated": false,
+        "repos": [
+            {"state": "ok", "path": "fixture/ok", "linked": false, "tracked": 0, "untracked": 0, "conflicted": 0, "upstream": false, "detached": false},
+            {"state": "unobserved", "path": "fixture/missing", "linked": false, "reason": "git_failed"}
+        ]
+    });
+    let mut cases = Vec::new();
+    for (error, truncated) in [(json!("walk_incomplete"), false), (json!(null), true), (json!("walk_incomplete"), true)] {
+        let mut audit = base.clone();
+        audit["error"] = error;
+        audit["truncated"] = json!(truncated);
+        cases.push(audit);
+    }
+    let mut mismatch = base.clone();
+    mismatch["enumerated"] = json!(4);
+    mismatch["truncated"] = json!(true);
+    cases.push(mismatch);
+    let mut skipped_unknown = base.clone();
+    skipped_unknown["skipped"] = Value::Null;
+    skipped_unknown["truncated"] = json!(true);
+    cases.push(skipped_unknown);
+    let js_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("lib").join("hygiene.js");
+    let mut child = Command::new("node")
+        .arg("--no-warnings")
+        .arg("-e")
+        .arg("const h=require(process.argv[1]);const fs=require('node:fs');console.log(JSON.stringify(JSON.parse(fs.readFileSync(0,'utf8')).map(x=>h.progress(x,1))))")
+        .arg(js_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("node が必要");
+    child.stdin.take().unwrap().write_all(serde_json::to_string(&cases).unwrap().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "JS 評価が失敗");
+    let js: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(js.len(), cases.len());
+    for (i, (audit, j)) in cases.iter().zip(js).enumerate() {
+        let (observed, line) = tune_core::hygiene::progress(audit, 1);
+        assert!(same(&j, &json!({"observed": observed, "line": &line})), "合成入力 #{i} の JS と Rust が不一致");
+        assert_eq!(observed, Some(1));
+        assert_eq!(line.matches("探索未確認あり").count(), 1);
+        if i < 3 {
+            assert!(line.contains("見つけた 5 件・未観測 既知 4 件・探索未確認あり（件数不明）"));
+        } else {
+            assert!(line.contains("未観測 件数不明"));
+            assert!(!line.contains("未観測 既知"));
+        }
+    }
+}
+
+#[test]
+fn normalize_observation_matches_js() {
+    let valid = json!({
+        "path": "~/fixture", "rel": "example.com/acme/fixture", "linked": false, "state": "ok",
+        "branch": null, "detached": false, "upstream": false, "ahead": null, "behind": null, "local_only": null,
+        "tracked": 0, "untracked": 0, "conflicted": 0, "dirty_age_s": null, "head_age_s": null, "stash": null,
+        "origin": null, "origin_host": null, "origin_path": null, "has_origin": null,
+    });
+    let mut second = valid.clone();
+    second["tracked"] = json!(1.0);
+    second["untracked"] = json!(2);
+    second["conflicted"] = json!(1);
+    second["linked"] = json!(true);
+    second["detached"] = json!(true);
+    second["upstream"] = json!(true);
+    let mut boundary = valid.clone();
+    boundary["tracked"] = json!(9_007_199_254_740_991_u64);
+    let mut missing_optional = valid.clone();
+    for key in ["ahead", "behind", "local_only", "stash"] {
+        missing_optional.as_object_mut().unwrap().remove(key);
+    }
+    missing_optional["dirty_age_s"] = json!(-10);
+    missing_optional["head_age_s"] = json!(-20);
+    let mut optional_boundary = valid.clone();
+    optional_boundary["ahead"] = json!(9_007_199_254_740_991_u64);
+    optional_boundary["behind"] = json!(1.0);
+    let mut whitespace_path = valid.clone();
+    whitespace_path["path"] = json!(" ");
+    let mut cases = vec![
+        json!({ "repos": [valid.clone()] }),
+        json!({ "repos": [second] }),
+        json!({ "repos": [boundary] }),
+        json!({ "repos": [missing_optional] }),
+        json!({ "repos": [optional_boundary] }),
+        json!({ "repos": [whitespace_path] }),
+    ];
+    let counts = vec![json!(null), json!("0"), json!(false), json!(-1), json!(-0.5), json!(1.5), json!(9_007_199_254_740_992_u64), json!({}), json!([])];
+    let flags = vec![json!(null), json!("false"), json!(0), json!(1), json!({}), json!([])];
+    for (fields, values) in [(&["tracked", "untracked", "conflicted"][..], &counts), (&["upstream", "detached", "linked"][..], &flags)] {
+        for field in fields {
+            for value in std::iter::once(None).chain(values.iter().cloned().map(Some)) {
+                let mut row = valid.clone();
+                if let Some(value) = value {
+                    row[*field] = value;
+                } else {
+                    row.as_object_mut().unwrap().remove(*field);
+                }
+                row["reason"] = json!("timeout");
+                cases.push(json!({ "repos": [row] }));
+            }
+        }
+    }
+    let mut inconsistent = valid.clone();
+    inconsistent["conflicted"] = json!(1);
+    cases.push(json!({ "repos": [inconsistent] }));
+    let invalid_optional = vec![json!("1"), json!(false), json!(-1), json!(-0.5), json!(0.5), json!(9_007_199_254_740_992_u64), json!({}), json!([])];
+    for field in ["ahead", "behind", "local_only", "stash"] {
+        for value in &invalid_optional {
+            let mut row = valid.clone();
+            row[field] = value.clone();
+            cases.push(json!({ "repos": [row] }));
+        }
+    }
+    for value in [None, Some(json!(null)), Some(json!("")), Some(json!(0)), Some(json!({}))] {
+        let mut row = valid.clone();
+        if let Some(value) = value {
+            row["path"] = value;
+        } else {
+            row.as_object_mut().unwrap().remove("path");
+        }
+        cases.push(json!({ "repos": [row] }));
+    }
+
+    // stdin を使い、実リポジトリの調査や一時ファイルの作成を行わない。
+    let js_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("lib").join("hygiene.js");
+    let mut child = Command::new("node")
+        .arg("--no-warnings")
+        .arg("-e")
+        .arg("const h=require(process.argv[1]);const fs=require('node:fs');const a=JSON.parse(fs.readFileSync(0,'utf8'));console.log(JSON.stringify(a.map(x=>{const n=h.normalize(x);return {normalized:n,findings:h.analyze(n),matrix:h.matrix([{node_id:'node-a',...n}])}})))")
+        .arg(js_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("node が必要");
+    child.stdin.take().unwrap().write_all(serde_json::to_string(&cases).unwrap().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "JS 評価が失敗");
+    let js: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap();
+    let rust: Vec<Value> = cases
+        .iter()
+        .map(|raw| {
+            let normalized = normalize(raw);
+            let findings = analyze(&normalized);
+            let mut audit = normalized.clone();
+            audit["node_id"] = json!("node-a");
+            json!({ "normalized": normalized, "findings": findings, "matrix": matrix(&[audit]) })
+        })
+        .collect();
+    assert_eq!(js.len(), rust.len());
+    for (i, (j, r)) in js.iter().zip(&rust).enumerate() {
+        assert!(same(j, r), "合成入力 #{i} の JS と Rust が不一致");
+        let row = &r["normalized"]["repos"][0];
+        if i < 6 {
+            assert_eq!(row["state"], "ok");
+            for key in ["branch", "local_only", "stash", "origin"] {
+                assert!(row[key].is_null(), "任意項目 {key} の null が失われた");
+            }
+            if i != 4 {
+                assert!(row["ahead"].is_null());
+                assert!(row["behind"].is_null());
+            }
+            if i == 3 {
+                assert_eq!(row["dirty_age_s"], -10);
+                assert_eq!(row["head_age_s"], -20);
+            } else {
+                assert!(row["dirty_age_s"].is_null());
+                assert!(row["head_age_s"].is_null());
+            }
+        } else {
+            assert_eq!(row["state"], "unobserved", "合成入力 #{i}");
+            assert_eq!(row["reason"], "git_failed", "合成入力 #{i}");
+            assert_eq!(r["findings"][0]["id"], "repo-unobserved", "合成入力 #{i}");
+            assert_eq!(r["findings"].as_array().unwrap().len(), 1);
+        }
+    }
+}
+
+#[test]
 fn hygiene_matches_js() {
     let mut r = Rng(0x9E37_79B9_7F4A_7C15);
-    let raws: Vec<Value> = (0..300).map(|_| raw_audit(&mut r)).collect();
+    let mut raws: Vec<Value> = (0..300).map(|_| raw_audit(&mut r)).collect();
+    for truncated in [false, true] {
+        raws.push(json!({
+            "probe": "repo_hygiene", "error": "walk_incomplete", "truncated": truncated, "enumerated": 1, "skipped": 0,
+            "roots": [{"path": "fixture", "source": "opt"}], "repos": [
+                {"state": "ok", "path": "fixture/project", "linked": false, "tracked": 1, "untracked": 0, "conflicted": 0, "upstream": false, "detached": false}
+            ]
+        }));
+    }
     let normalized: Vec<Value> = raws.iter().map(normalize).collect();
     let urls: Vec<Value> = URLS
         .iter()
@@ -159,7 +565,7 @@ fn hygiene_matches_js() {
         json!({ "max_repos": 7.9, "budget_s": 300.5, "cmd_s": 0, "roots": (0..12).map(|i| format!("/r{i}")).collect::<Vec<_>>(), "ghq_root": "   " }),
     ];
 
-    let cases = json!({ "stripUrl": urls, "normalize": raws, "analyze": normalized, "pathStatus": rows, "matrix": matrices, "script": scripts });
+    let cases = json!({ "stripUrl": urls, "normalize": raws, "analyze": normalized, "walkCoverageNote": normalized, "pathStatus": rows, "matrix": matrices, "script": scripts });
     let Some(js) = run_js(&cases) else { return };
 
     let rs_urls: Vec<Value> = urls.iter().map(|u| strip_url(u.as_str()).map_or(Value::Null, Value::from)).collect();
@@ -167,6 +573,8 @@ fn hygiene_matches_js() {
     check("normalize", &raws, &js, &normalized);
     let rs_an: Vec<Value> = normalized.iter().map(|a| json!(analyze(a))).collect();
     check("analyze", &normalized, &js, &rs_an);
+    let rs_notes: Vec<Value> = normalized.iter().map(|a| json!(walk_coverage_note(a))).collect();
+    check("walkCoverageNote", &normalized, &js, &rs_notes);
     let rs_ps: Vec<Value> = rows.iter().map(|x| json!(path_status(x))).collect();
     check("pathStatus", &rows, &js, &rs_ps);
     let rs_mx: Vec<Value> = matrices.iter().map(|m| json!(matrix(m.as_array().unwrap()))).collect();

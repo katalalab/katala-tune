@@ -96,19 +96,35 @@ pub fn selection_warnings(selected: &[tune_core::nodes::Node], resolved: &[tune_
 /// Preserve unknown repositories and incomplete node results.
 pub fn project(results: &[Value]) -> Audit {
     let mut audit = Audit::default();
-    for result in results {
-        let node = result.get("node_id").and_then(Value::as_str).unwrap_or("不明").to_owned();
-        let at = result.get("at").and_then(Value::as_i64);
+    for original in results {
+        // 再正規化しても観測時刻・機体 ID・収集失敗は元の結果から引き継ぐ。
+        let normalized = tune_core::hygiene::normalize(original);
+        let result = &normalized;
+        let node = original.get("node_id").and_then(Value::as_str).unwrap_or("不明").to_owned();
+        let at = original.get("at").and_then(Value::as_i64);
         audit.observed_nodes.push(node.clone());
         let no_roots = result.get("roots").and_then(Value::as_array).is_none_or(Vec::is_empty);
-        let mut incomplete = result.get("ok").and_then(Value::as_bool) != Some(true)
-            || result.get("truncated").and_then(Value::as_bool) == Some(true)
-            || result.get("skipped").is_some_and(|value| value.as_u64().is_none_or(|count| count > 0))
+        let enumerated = result.get("enumerated").and_then(Value::as_u64);
+        let truncated = result.get("truncated").and_then(Value::as_bool);
+        let skipped = result.get("skipped").and_then(Value::as_u64);
+        let completion_unknown = enumerated.is_none() || truncated.is_none() || skipped.is_none();
+        let fields_incomplete = match result.get("incomplete_fields") {
+            None => false,
+            Some(Value::Array(fields)) => !fields.is_empty(),
+            Some(_) => true,
+        };
+        let node_ok = original.get("ok").and_then(Value::as_bool) == Some(true);
+        let mut incomplete = !node_ok
+            || truncated != Some(false)
+            || skipped != Some(0)
+            || completion_unknown
+            || fields_incomplete
             || result.get("error").is_some_and(|value| !value.is_null())
             || no_roots;
         if let Some(repos) = result.get("repos").and_then(Value::as_array) {
             for repo in repos {
-                let observed = repo.get("state").and_then(Value::as_str) == Some("ok");
+                let row_ok = repo.get("state").and_then(Value::as_str) == Some("ok");
+                let observed = node_ok && row_ok;
                 if !observed {
                     incomplete = true;
                 }
@@ -143,21 +159,32 @@ pub fn project(results: &[Value]) -> Audit {
                     previous: false,
                     local: false,
                     at,
-                    error: (!observed).then(|| safe_error(repo.get("reason").and_then(Value::as_str))),
+                    error: if !row_ok {
+                        Some(safe_error(repo.get("reason").and_then(Value::as_str)))
+                    } else if !node_ok {
+                        Some("機体の監査に失敗したため未確認")
+                    } else {
+                        None
+                    },
                 });
             }
         } else {
             incomplete = true;
         }
         if incomplete && !audit.incomplete_nodes.contains(&node) {
-            let reason = if let Some(error) = result.get("error").and_then(Value::as_str).filter(|error| !error.is_empty()) {
+            let error = if node_ok { result.get("error") } else { original.get("error") };
+            let reason = if let Some(error) = error.and_then(Value::as_str).filter(|error| !error.is_empty()) {
                 safe_error(Some(error))
-            } else if result.get("ok").and_then(Value::as_bool) != Some(true) {
+            } else if !node_ok {
                 safe_error(None)
             } else if no_roots {
                 "探索先を確認できません"
-            } else if result.get("truncated").and_then(Value::as_bool) == Some(true) {
+            } else if truncated == Some(true) {
                 "時間・件数の上限に到達"
+            } else if completion_unknown {
+                "探索の完了状態が不明"
+            } else if fields_incomplete {
+                "監査データの一部が不明"
             } else {
                 "一部を観測できません"
             };
@@ -199,6 +226,7 @@ fn safe_error(error: Option<&str>) -> &'static str {
         Some("git_missing") => "Git を利用できません",
         Some("git_failed") => "Git の読み取りに失敗",
         Some("over_limit") => "時間・件数の上限に到達",
+        Some("walk_incomplete") => "探索先の一部を確認できません",
         Some("excluded") => "運用対象外",
         _ => "詳細不明",
     }
