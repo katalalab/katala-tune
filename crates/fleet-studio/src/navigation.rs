@@ -64,6 +64,14 @@ enum Target {
 }
 
 impl OpenTarget {
+    /// Describe the same validated target passed to the OS.
+    pub fn description(&self) -> String {
+        match &self.0 {
+            Target::Github(url) => format!("GitHub を開く: {url}"),
+            Target::Directory(path) => format!("場所を表示: {}", path.display()),
+        }
+    }
+
     /// Accept an already-sanitized URL, never credentials or query parameters.
     pub fn github(value: &str) -> Option<Self> {
         if value.len() > 2_048 || value.chars().any(char::is_control) {
@@ -245,4 +253,133 @@ impl Selection {
     pub fn previous(&mut self, count: usize) {
         self.0 = if count == 0 { None } else { Some(self.0.map_or(0, |index| index.saturating_sub(1).min(count - 1))) };
     }
+}
+
+/// Visible resume rows in the same order as the dashboard.
+pub struct WorkRows<'a> {
+    pub repositories: Vec<&'a crate::source::Repository>,
+    pub recent: Vec<&'a crate::recent::RecentEntry>,
+    pub audits: Vec<&'a crate::audit::RepoAudit>,
+    pub audit_total: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkRow<'a> {
+    Repository(&'a crate::source::Repository),
+    Recent(&'a crate::recent::RecentEntry),
+    Audit(&'a crate::audit::RepoAudit),
+}
+
+#[derive(Clone, Copy)]
+pub enum RecentOpen {
+    Directory,
+    PullRequest(usize),
+}
+
+/// Resolve the same target for keyboard activation and its fixed caption.
+pub fn recent_target(entry: &crate::recent::RecentEntry, kind: RecentOpen) -> Option<OpenTarget> {
+    if !entry.local {
+        return None;
+    }
+    match kind {
+        RecentOpen::Directory if entry.directory_url.is_some() => entry.cwd.as_deref().and_then(OpenTarget::directory),
+        RecentOpen::PullRequest(index) => entry.prs.get(index).and_then(|url| crate::recent::github_pr_url(url)).and_then(|url| OpenTarget::github(&url)),
+        _ => None,
+    }
+}
+
+pub fn preferred_recent(entry: &crate::recent::RecentEntry) -> Option<RecentOpen> {
+    if !entry.local {
+        return None;
+    }
+    Some(if entry.directory_url.is_some() { RecentOpen::Directory } else { RecentOpen::PullRequest(0) })
+}
+
+impl<'a> WorkRows<'a> {
+    pub fn new(
+        repositories: &'a [crate::source::Repository],
+        recent: &'a [crate::recent::RecentEntry],
+        audits: &'a [crate::audit::RepoAudit],
+        search: &str,
+    ) -> Self {
+        let search = search.to_lowercase();
+        let matches = |value: &str| search.is_empty() || value.to_lowercase().contains(&search);
+        let mut audit_rows: Vec<_> = audits.iter().filter(|row| matches(&format!("{} {}", row.node, row.path))).collect();
+        let audit_total = audit_rows.len();
+        audit_rows.truncate(200);
+        Self {
+            repositories: repositories.iter().filter(|repo| matches(&repo.name)).take(200).collect(),
+            recent: recent.iter().filter(|entry| matches(&format!("{} {} {}", entry.node, entry.tool, entry.cwd.as_deref().unwrap_or("")))).collect(),
+            audits: audit_rows,
+            audit_total,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.repositories.len() + self.recent.len() + self.audits.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.repositories.is_empty() && self.recent.is_empty() && self.audits.is_empty()
+    }
+
+    pub fn row(&self, selected: Option<usize>) -> Option<WorkRow<'a>> {
+        let index = selected?;
+        if let Some(repo) = self.repositories.get(index) {
+            return Some(WorkRow::Repository(repo));
+        }
+        let index = index.checked_sub(self.repositories.len())?;
+        if let Some(entry) = self.recent.get(index) {
+            return Some(WorkRow::Recent(entry));
+        }
+        let index = index.checked_sub(self.recent.len())?;
+        self.audits.get(index).map(|row| WorkRow::Audit(row))
+    }
+}
+
+pub fn selection_text(
+    selected: Option<WorkRow<'_>>,
+    sample: bool,
+    recent: Option<&crate::recent::RecentWork>,
+    audit: Option<&crate::audit::Audit>,
+    ticket: &crate::scope::AuditTicket,
+) -> Option<String> {
+    selection_text_for_platform(selected, sample, recent, audit, ticket, cfg!(windows))
+}
+
+pub fn selection_text_for_platform(
+    selected: Option<WorkRow<'_>>,
+    sample: bool,
+    recent: Option<&crate::recent::RecentWork>,
+    audit: Option<&crate::audit::Audit>,
+    ticket: &crate::scope::AuditTicket,
+    supported: bool,
+) -> Option<String> {
+    let selected = selected?;
+    let (label, target) = match selected {
+        WorkRow::Repository(repo) => {
+            let target = repo.origin.as_deref().and_then(repository_url).and_then(|url| OpenTarget::github(&url));
+            (format!("構成リポジトリ {}", repo.name), target.map(|target| target.description()))
+        }
+        WorkRow::Recent(entry) => {
+            let authorized = sample || recent.is_some_and(|work| work.selection_fingerprint.is_some() && work.entries.contains(entry));
+            let target = if authorized { preferred_recent(entry).and_then(|kind| recent_target(entry, kind)).map(|target| target.description()) } else { None };
+            (format!("最近の作業 {} · {}", entry.node, entry.tool), target)
+        }
+        WorkRow::Audit(row) => {
+            let target = match crate::audit::prepare_open(sample, true, ticket, audit, Some(row)) {
+                Ok((target, _)) => Some(target.description()),
+                Err(OpenResult::Sample) => Some(format!("サンプルの場所 {}（実際には開きません）", row.path)),
+                Err(_) => None,
+            };
+            (format!("衛生監査 {} · {}", row.node, row.path), target)
+        }
+    };
+    let target = match target {
+        Some(target) if !sample && !supported => format!("この OS では未対応（対象: {target}）"),
+        Some(target) => target,
+        None => "開けません".into(),
+    };
+    let note = if sample && !matches!(selected, WorkRow::Audit(_)) { "（サンプルは実際には開きません）" } else { "" };
+    Some(format!("選択: {label} / Enter: {target}{note}"))
 }

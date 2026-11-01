@@ -293,3 +293,45 @@ pub fn collect(config_path: &std::path::Path, scope: Scope) -> Result<Audit, &'s
     audit.identity = Some(identity);
     Ok(audit)
 }
+
+/// Begin an explicitly requested audit without retaining an old selection or ticket.
+pub fn begin(selected: &mut crate::navigation::Selection, gate: &mut crate::scope::AuditGate, current: &mut Option<Audit>) {
+    selected.invalidate();
+    gate.invalidate_and_clear(current);
+}
+
+/// Replace or discard the result without carrying a selection across list changes.
+pub fn replace(selected: &mut crate::navigation::Selection, current: &mut Option<Audit>, next: Option<Audit>) {
+    selected.invalidate();
+    *current = next;
+}
+
+pub fn prepare_open(
+    sample: bool,
+    visible: bool,
+    ticket: &crate::scope::AuditTicket,
+    audit: Option<&Audit>,
+    row: Option<&RepoAudit>,
+) -> Result<(crate::navigation::OpenTarget, AuditIdentity), crate::navigation::OpenResult> {
+    use crate::navigation::OpenResult;
+    let Some(row) = row else {
+        return Err(OpenResult::SelectionChanged);
+    };
+    if !visible || !ticket.is_current() {
+        return Err(OpenResult::SelectionChanged);
+    }
+    if sample {
+        return Err(OpenResult::Sample);
+    }
+    let Some(audit) = audit else {
+        return Err(OpenResult::SelectionChanged);
+    };
+    if !row.local || !audit.repos.contains(row) {
+        return Err(OpenResult::SelectionChanged);
+    }
+    let Some(identity) = audit.identity.as_ref().filter(|identity| identity.node == row.node) else {
+        return Err(OpenResult::SelectionChanged);
+    };
+    let target = crate::navigation::OpenTarget::directory(&row.path).ok_or(OpenResult::Failed)?;
+    Ok((target, identity.clone()))
+}

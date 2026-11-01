@@ -10,7 +10,7 @@ use fleet_studio::llm::{
     self, Endpoint, ModelConfirmation, ModelEntry, ModelError, ModelGrant, ModelObservation, ModelQuery, ModelRevocation, ModelScope, RefreshQueue,
 };
 use fleet_studio::llm_keyboard::{self, ModelKey, ModelKeyboard, ModelViewGate};
-use fleet_studio::navigation::{self, OpenResult, OpenState, OpenTarget};
+use fleet_studio::navigation::{self, OpenResult, OpenState, OpenTarget, RecentOpen, WorkRow};
 use fleet_studio::pointer_id::PointerIds;
 use fleet_studio::recent::{self, RecentEntry, RecentGate, RecentSlot, RecentTicket, RecentWork, SyncStatus};
 use fleet_studio::refresh::{self, FullRefresh};
@@ -19,10 +19,10 @@ use fleet_studio::search_input::{KeyAction, KeyModifiers, SearchInput, search_ke
 use fleet_studio::source::{self, Coverage, Dashboard, NodeCard, Repository, SavedState};
 use gpui::{Context, FocusHandle, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton, Render, SharedString, Window, div, prelude::*, rgb};
 
-#[derive(Clone, Copy)]
-enum RecentOpen {
-    Directory,
-    PullRequest(usize),
+enum ResumeSelection {
+    Repository(String),
+    Recent(RecentEntry, RecentOpen),
+    Audit(RepoAudit),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -817,34 +817,39 @@ impl FleetView {
         if self.auditing {
             return;
         }
+        self.selected.invalidate();
         self.audit_error = None;
         if scope == Scope::Fleet {
             self.audit_error = Some(audit::REMOTE_DISABLED.into());
             cx.notify();
             return;
         }
-        self.audit_gate.invalidate_and_clear(&mut self.audit);
+        audit::begin(&mut self.selected, &mut self.audit_gate, &mut self.audit);
         self.pointer_ids.borrow_mut().clear();
         if self.sample {
-            self.audit = Some(Audit {
-                repos: vec![RepoAudit {
-                    node: "fixture-node".into(),
-                    path: "fixture/project".into(),
-                    branch: Some("feature".into()),
-                    dirty: Some(1),
-                    unpushed: Some(2),
-                    behind: Some(0),
-                    local_only: None,
-                    previous: false,
-                    local: true,
-                    at: Some(tune_core::db::now_ms()),
-                    error: None,
-                }],
-                incomplete_nodes: Vec::new(),
-                issues: Vec::new(),
-                observed_nodes: vec!["fixture-node".into()],
-                identity: None,
-            });
+            audit::replace(
+                &mut self.selected,
+                &mut self.audit,
+                Some(Audit {
+                    repos: vec![RepoAudit {
+                        node: "fixture-node".into(),
+                        path: "fixture/project".into(),
+                        branch: Some("feature".into()),
+                        dirty: Some(1),
+                        unpushed: Some(2),
+                        behind: Some(0),
+                        local_only: None,
+                        previous: false,
+                        local: true,
+                        at: Some(tune_core::db::now_ms()),
+                        error: None,
+                    }],
+                    incomplete_nodes: Vec::new(),
+                    issues: Vec::new(),
+                    observed_nodes: vec!["fixture-node".into()],
+                    identity: None,
+                }),
+            );
             cx.notify();
             return;
         }
@@ -857,6 +862,7 @@ impl FleetView {
             timer.await;
             let _ = view.update(cx, |view, cx| {
                 if view.auditing && view.audit_seq == seq {
+                    view.selected.invalidate();
                     view.audit_error = Some("監査が時間上限を超過（終了待ち）".into());
                     cx.notify();
                 }
@@ -868,16 +874,20 @@ impl FleetView {
             let result = task.await;
             let _ = view.update(cx, |view, cx| {
                 view.auditing = false;
+                view.selected.invalidate();
                 if !ticket.is_current() {
                     view.audit_error = Some("更新により進行中だった監査結果を破棄しました。再監査は未実行です。".into());
                 } else {
                     match result {
                         Ok(audit) => {
                             view.pointer_ids.borrow_mut().clear();
-                            view.audit = Some(audit);
+                            audit::replace(&mut view.selected, &mut view.audit, Some(audit));
                             view.audit_error = None;
                         }
-                        Err(error) => view.audit_error = Some(error.into()),
+                        Err(error) => {
+                            audit::replace(&mut view.selected, &mut view.audit, None);
+                            view.audit_error = Some(error.into());
+                        }
                     }
                 }
                 cx.notify();
@@ -1019,22 +1029,30 @@ impl FleetView {
                 "r" => self.refresh(cx),
                 "a" => self.audit_repositories(Scope::Local, cx),
                 "down" => {
-                    let count = self.repository_count()
-                        + self.recent.data.as_ref().map_or(0, |data| data.entries.iter().filter(|entry| self.matches_recent(entry)).count());
+                    let count = self.work_rows().len();
                     self.selected.next(count);
                 }
                 "up" => {
-                    let count = self.repository_count()
-                        + self.recent.data.as_ref().map_or(0, |data| data.entries.iter().filter(|entry| self.matches_recent(entry)).count());
+                    let count = self.work_rows().len();
                     self.selected.previous(count);
                 }
                 "enter" => {
-                    if let Some(entry) = self.selected_recent() {
-                        let kind = if entry.local && entry.directory_url.is_some() { RecentOpen::Directory } else { RecentOpen::PullRequest(0) };
-                        let ticket = self.recent_gate.ticket();
-                        self.open_recent(entry, kind, ticket, cx);
-                    } else if let Some(url) = self.selected_url() {
-                        self.open_repository(&url, cx);
+                    let selected = self.work_rows().row(self.selected.index()).and_then(|row| match row {
+                        WorkRow::Repository(repo) => repo.origin.as_deref().and_then(navigation::repository_url).map(ResumeSelection::Repository),
+                        WorkRow::Recent(entry) => navigation::preferred_recent(entry).map(|kind| ResumeSelection::Recent(entry.clone(), kind)),
+                        WorkRow::Audit(repo) => Some(ResumeSelection::Audit(repo.clone())),
+                    });
+                    match selected {
+                        Some(ResumeSelection::Repository(url)) => self.open_repository(&url, cx),
+                        Some(ResumeSelection::Recent(entry, kind)) => {
+                            let ticket = self.recent_gate.ticket();
+                            self.open_recent(entry, kind, ticket, cx);
+                        }
+                        Some(ResumeSelection::Audit(repo)) => {
+                            let ticket = self.audit_gate.ticket();
+                            self.open_audit_row(repo, ticket, cx);
+                        }
+                        None => {}
                     }
                 }
                 "escape" => {
@@ -1062,36 +1080,11 @@ impl FleetView {
         self.search.filter_text().is_empty() || value.to_lowercase().contains(&self.search.filter_text().to_lowercase())
     }
 
-    fn matches_recent(&self, entry: &RecentEntry) -> bool {
-        self.matches(&format!("{} {} {}", entry.node, entry.tool, entry.cwd.as_deref().unwrap_or("")))
-    }
-
-    fn repository_count(&self) -> usize {
-        self.dashboard.as_ref().map_or(0, |dashboard| dashboard.repositories.iter().filter(|repo| self.matches(&repo.name)).take(200).count())
-    }
-
-    fn selected_url(&self) -> Option<String> {
-        let selected = self.selected.index()?;
-        let repo_count = self.repository_count();
-        if selected < repo_count {
-            return self
-                .dashboard
-                .as_ref()?
-                .repositories
-                .iter()
-                .filter(|repo| self.matches(&repo.name))
-                .take(200)
-                .nth(selected)?
-                .origin
-                .as_deref()
-                .and_then(navigation::repository_url);
-        }
-        None
-    }
-
-    fn selected_recent(&self) -> Option<RecentEntry> {
-        let index = self.selected.index()?.checked_sub(self.repository_count())?;
-        self.recent.data.as_ref()?.entries.iter().filter(|entry| self.matches_recent(entry)).nth(index).cloned()
+    fn work_rows(&self) -> navigation::WorkRows<'_> {
+        let repositories = self.dashboard.as_ref().map_or(&[][..], |dashboard| dashboard.repositories.as_slice());
+        let recent = self.recent.data.as_ref().map_or(&[][..], |recent| recent.entries.as_slice());
+        let audits = self.audit.as_ref().map_or(&[][..], |audit| audit.repos.as_slice());
+        navigation::WorkRows::new(repositories, recent, audits, self.search.filter_text())
     }
 
     fn open_github(&mut self, url: &str, cx: &mut Context<Self>) {
@@ -1142,11 +1135,7 @@ impl FleetView {
             self.open_failure(OpenResult::SelectionChanged, cx);
             return;
         };
-        let target = match kind {
-            RecentOpen::Directory if entry.directory_url.is_some() => entry.cwd.as_deref().and_then(OpenTarget::directory),
-            RecentOpen::PullRequest(index) => entry.prs.get(index).and_then(|url| recent::github_pr_url(url)).and_then(|url| OpenTarget::github(&url)),
-            _ => None,
-        };
+        let target = navigation::recent_target(&entry, kind);
         if let Some(target) = target {
             self.open_target(target, permit, cx);
         } else {
@@ -1156,6 +1145,14 @@ impl FleetView {
 
     fn open_target(&mut self, target: OpenTarget, permit: Option<(String, String, RecentTicket)>, cx: &mut Context<Self>) {
         self.open_target_checked(target, permit, None, cx);
+    }
+
+    fn open_audit_row(&mut self, row: RepoAudit, ticket: AuditTicket, cx: &mut Context<Self>) {
+        let visible = self.work_rows().audits.iter().any(|visible| **visible == row);
+        match audit::prepare_open(self.sample, visible, &ticket, self.audit.as_ref(), Some(&row)) {
+            Ok((target, identity)) => self.open_audit_target(target, ticket, identity, cx),
+            Err(result) => self.open_failure(result, cx),
+        }
     }
 
     fn open_audit_target(&mut self, target: OpenTarget, ticket: AuditTicket, identity: AuditIdentity, cx: &mut Context<Self>) {
@@ -1385,6 +1382,7 @@ impl Render for FleetView {
         self.reconcile_model_controls();
         let visible_models = self.visible_model_endpoints();
         let model_ticket = self.model_view.ticket();
+        let rows = self.work_rows();
         let now = tune_core::db::now_ms();
         let mut pointer_ids = self.pointer_ids.borrow_mut();
         pointer_ids.begin_frame();
@@ -1527,7 +1525,7 @@ impl Render for FleetView {
                 content = content.child(note("表示範囲を検索しています。保存 DB の構成情報の検索は未対応です。".into(), 0xffb86c));
             }
             let mut shown = 0;
-            for (index, repo) in dashboard.repositories.iter().filter(|repo| self.matches(&repo.name)).take(200).enumerate() {
+            for (index, repo) in rows.repositories.iter().enumerate() {
                 shown += 1;
                 let url = repo.origin.as_deref().and_then(navigation::repository_url);
                 let mut item = div()
@@ -1586,8 +1584,8 @@ impl Render for FleetView {
             for status in recent.nodes.iter().filter(|status| self.matches(&status.node)) {
                 content = content.child(row(status.node.clone(), recent_status(status, now, recent.max_age_ms)));
             }
-            let repo_count = self.repository_count();
-            for (index, entry) in recent.entries.iter().filter(|entry| self.matches_recent(entry)).enumerate() {
+            let repo_count = rows.repositories.len();
+            for (index, entry) in rows.recent.iter().enumerate() {
                 let collection = recent
                     .nodes
                     .iter()
@@ -1617,7 +1615,7 @@ impl Render for FleetView {
                     .child(div().text_sm().text_color(rgb(0x9baec4)).child(prs));
                 let mut actions = div().flex().gap_4().text_sm();
                 if entry.local && entry.directory_url.is_some() {
-                    let selected_entry = entry.clone();
+                    let selected_entry = (*entry).clone();
                     let ticket = self.recent_gate.ticket();
                     actions = actions.child(
                         div()
@@ -1640,7 +1638,7 @@ impl Render for FleetView {
                     );
                 }
                 for pr_index in 0..entry.prs.len() {
-                    let selected_entry = entry.clone();
+                    let selected_entry = (*entry).clone();
                     let ticket = self.recent_gate.ticket();
                     actions = actions.child(
                         div()
@@ -1773,7 +1771,8 @@ impl Render for FleetView {
                 content = content
                     .child(note(format!("{}: {}{} / {}", issue.node, if issue.previous { "前回: " } else { "" }, issue.reason, when(issue.at)), 0xffb86c));
             }
-            for repo in audit.repos.iter().filter(|repo| self.matches(&format!("{} {}", repo.node, repo.path))).take(200) {
+            let previous_count = rows.repositories.len() + rows.recent.len();
+            for (index, repo) in rows.audits.iter().enumerate() {
                 let detail = format!(
                     "{}  /  変更・未追跡 {}  /  未 push {}  /  behind {}  /  remote に無い {}  /  {}  /  {}{}",
                     repo.branch.as_deref().unwrap_or("branch 不明"),
@@ -1789,7 +1788,6 @@ impl Render for FleetView {
                     when(repo.at),
                     repo.error.map_or(String::new(), |error| format!(" / {error}"))
                 );
-                let local_path = repo.local.then(|| repo.path.clone());
                 let mut item = div()
                     .id(SharedString::from(format!(
                         "click-{}",
@@ -1797,35 +1795,28 @@ impl Render for FleetView {
                     )))
                     .p_3()
                     .rounded_md()
-                    .bg(rgb(0x182436))
+                    .bg(rgb(if self.selected.index() == Some(previous_count + index) { 0x233b56 } else { 0x182436 }))
                     .flex()
                     .flex_col()
-                    .child(format!("{}{} · {}", repo.node, if repo.local { "（この機体）" } else { "（台帳名・接続先 hostname 未照合）" }, repo.path))
+                    .child(format!(
+                        "{}{}{} · {}",
+                        if self.selected.index() == Some(previous_count + index) { "› " } else { "  " },
+                        repo.node,
+                        if repo.local { "（この機体）" } else { "（台帳名・接続先 hostname 未照合）" },
+                        repo.path
+                    ))
                     .child(div().text_sm().text_color(rgb(0x9baec4)).child(detail));
-                if let Some(path) = local_path {
+                if repo.local {
                     let ticket = self.audit_gate.ticket();
-                    let identity = audit.identity.clone().filter(|identity| identity.node == repo.node);
+                    let selected_repo = (*repo).clone();
                     item = item.cursor_pointer().on_click(cx.listener(move |view, _, _, cx| {
-                        if !ticket.is_current() {
-                            view.open_failure(OpenResult::SelectionChanged, cx);
-                        } else if let Some(result) = navigation::sample_target_result(view.sample) {
-                            view.open_failure(result, cx);
-                        } else if let Some(identity) = &identity {
-                            if let Some(target) = OpenTarget::directory(&path) {
-                                view.open_audit_target(target, ticket.clone(), identity.clone(), cx);
-                            } else {
-                                view.open_failure(OpenResult::Failed, cx);
-                            }
-                        } else {
-                            view.open_failure(OpenResult::SelectionChanged, cx);
-                        }
+                        view.open_audit_row(selected_repo.clone(), ticket.clone(), cx);
                     }));
                 }
                 content = content.child(item);
             }
-            let total = audit.repos.iter().filter(|repo| self.matches(&format!("{} {}", repo.node, repo.path))).count();
-            if total > 200 {
-                content = content.child(note(format!("{total} 件中 200 件を表示。検索で絞り込めます。"), 0x9baec4));
+            if rows.audit_total > rows.audits.len() {
+                content = content.child(note(format!("{} 件中 {} 件を表示。検索で絞り込めます。", rows.audit_total, rows.audits.len()), 0x9baec4));
             }
         } else if !self.auditing {
             let message = if self.audit_error.is_some() {
@@ -1836,6 +1827,9 @@ impl Render for FleetView {
             content = content.child(note(message.into(), 0x9baec4));
         }
 
+        let selected_text =
+            navigation::selection_text(rows.row(self.selected.index()), self.sample, self.recent.data.as_ref(), self.audit.as_ref(), &self.audit_gate.ticket())
+                .unwrap_or_else(|| "選択なし。↑↓ で構成リポジトリ・最近の作業・衛生監査から選びます。".into());
         pointer_ids.finish_frame();
         drop(pointer_ids);
         div()
@@ -1910,6 +1904,7 @@ impl Render for FleetView {
                     .text_sm()
                     .child(navigation::open_status_text(self.open_state.status()).unwrap_or("リンク操作の結果をここに表示します。")),
             )
+            .child(div().id("resume-selection").px_5().py_2().bg(rgb(0x192b42)).text_sm().child(selected_text))
             .when(!self.revoking.is_empty(), |root| {
                 root.child(div().px_5().py_2().text_sm().text_color(rgb(0xffb86c)).child("保存情報の取消処理中：開始済みの読み取りを待っています。"))
             })
