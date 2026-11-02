@@ -1032,6 +1032,19 @@ fn rules_health_logs_actions_match_js() {
             json!({ "node": { "id": "fixture" }, "snap": { "at": now, "data": { "probe": probe, "memory": memory } }, "findings": findings, "ctx": { "now": now } }),
         );
     }
+    for data in [Value::Null, json!([]), json!("invalid"), json!(0), json!(true)] {
+        node_in.push(json!({ "node": { "id": "fixture" }, "snap": { "at": now, "data": data }, "findings": [], "ctx": { "now": now } }));
+    }
+    for data in [
+        json!({}),
+        json!({"probe":"windows","memory":{"total_gb":64,"available_pct":50,"commit_pct":30}}),
+        json!({"memory":{"commit_pct":95}}),
+        json!({"probe":"windows","host":{"hostname":"\u{feff}"},"memory":{"total_gb":64,"available_pct":50,"commit_pct":30}}),
+        json!({"probe":"windows","host":{"hostname":"\u{85}"},"memory":{"total_gb":64,"available_pct":50,"commit_pct":30}}),
+    ] {
+        node_in.push(json!({ "node": { "id": "fixture" }, "snap": { "at": now, "data": data }, "findings": [], "ctx": { "now": now } }));
+    }
+    node_in.push(json!({ "node": { "id": "fixture" }, "snap": null, "findings": [], "ctx": { "now": now } }));
     let cases = json!({
         "analyze": analyze_in, "compare": compare_in, "nodeChecks": node_in, "appChecks": app_in, "failingJobs": jobs_in,
         "redact": redact_in, "fingerprint": fp_in, "normalize": normalize_in, "plan": plan_in, "logFindings": lf_in,

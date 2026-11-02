@@ -68,6 +68,7 @@ const scoreClass = (s) => `sc-${Charts.scoreTone(s)}`;
 function memoryObservationKnown(d) {
   const m = d?.memory;
   const pct = (v) => Number.isFinite(v) && v >= 0 && v <= 100;
+  if (typeof d?.host?.hostname !== 'string' || !d.host.hostname.trim() || /[\u0000-\u001f\u007f-\u009f]/u.test(d.host.hostname)) return false;
   if (!m || !Number.isFinite(m.total_gb) || m.total_gb <= 0 || !pct(m.available_pct)) return false;
   if (d.probe === 'windows') return pct(m.commit_pct);
   if (d.probe === 'mac') return ['normal', 'warn', 'critical'].includes(m.pressure) && Number.isFinite(m.swap_used_gb) && m.swap_used_gb >= 0;

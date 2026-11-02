@@ -37,7 +37,7 @@ test('現在の状態は現行台帳とアプリ自身だけを集計し、保�
   assert.equal(rows.length, 3);
 });
 const snap = (data, ago = 5) => ({ at: now - ago * 60000, wall_s: 4, data });
-const win = { probe: 'windows', host: { cores: 8 }, cpu_busy: 10, memory: { available_pct: 50, commit_pct: 40 }, disk: [{ mount: 'C:', free_gb: 300, free_pct: 30 }],
+const win = { probe: 'windows', host: { hostname: 'fixture', cores: 8 }, cpu_busy: 10, memory: { available_pct: 50, commit_pct: 40 }, disk: [{ mount: 'C:', free_gb: 300, free_pct: 30 }],
   stability_7d: { bugcheck_1001: 0, kernel_power_41: 0 }, defender: { realtime: true }, processes: { apps: [], top_cpu: [] },
   jobs: [
     { kind: 'schtask', id: '\\ok', name: 'ok', state: 'ready', last_result: 0 },
@@ -84,7 +84,42 @@ test('機能チェック: 分析が古い・失敗した・未実施を区別す
   assert.equal(nodeChecks({ id: 'a' }, null, [], { now })[0].status, 'unknown');
 });
 
-const memoryCheck = (probe, memory, findings = []) => nodeChecks({ id: 'fixture' }, snap({ probe, memory }), findings, { now }).find((check) => check.id === 'memory');
+test('分析データ全体が未取得または不正なら成功とせずメモリも不明にする', () => {
+  for (const data of [undefined, null, [], 'invalid', 0, true]) {
+    const checks = nodeChecks({ id: 'a' }, { at: now, data }, [], { now });
+    assert.equal(checks.find((c) => c.id === 'probe').status, 'unknown');
+    assert.equal(checks.find((c) => c.id === 'memory').status, 'unknown');
+  }
+  const checks = nodeChecks({ id: 'a' }, null, [], { now });
+  assert.equal(checks.find((c) => c.id === 'memory').status, 'unknown');
+  const failed = nodeChecks({ id: 'a' }, { at: now, data: null }, [], { now, lastError: 'timeout' });
+  assert.equal(failed.find((c) => c.id === 'probe').status, 'fail');
+});
+
+test('空または出所不明な object を分析成功やメモリ正常としない', () => {
+  for (const data of [
+    {}, { other: 1 }, { probe: 'windows', memory: {} },
+    { probe: 'windows', host: { hostname: ' ' }, memory: {} },
+    { probe: 'windows', host: { hostname: '\uFEFF' }, memory: {} },
+    { probe: 'windows', host: { hostname: '\u0085' }, memory: {} },
+    { probe: 'windows', host: { hostname: 'fixture\u0001' }, memory: {} },
+    { probe: 'other', host: { hostname: 'fixture' }, memory: {} },
+    { probe: 'windows', host: { hostname: 'fixture' }, memory: null },
+    { probe: 'windows', memory: { total_gb: 64, available_pct: 50, commit_pct: 30 } },
+  ]) {
+    const checks = nodeChecks({ id: 'a' }, { at: now, data }, [], { now });
+    assert.equal(checks.find((c) => c.id === 'probe').status, 'unknown');
+    assert.equal(checks.find((c) => c.id === 'memory').status, 'unknown');
+  }
+  const risky = nodeChecks({ id: 'a' }, { at: now, data: { memory: { commit_pct: 95 } } }, [], { now });
+  assert.equal(risky.find((c) => c.id === 'probe').status, 'unknown');
+  assert.equal(risky.find((c) => c.id === 'memory').status, 'fail');
+  const unicode = nodeChecks({ id: 'a' }, { at: now, data: { probe: 'windows', host: { hostname: '作業機' }, memory: { total_gb: 64, available_pct: 50, commit_pct: 30 } } }, [], { now });
+  assert.equal(unicode.find((c) => c.id === 'probe').status, 'ok');
+  assert.equal(unicode.find((c) => c.id === 'memory').status, 'ok');
+});
+
+const memoryCheck = (probe, memory, findings = []) => nodeChecks({ id: 'fixture' }, snap({ probe, memory, host: { hostname: 'fixture' } }), findings, { now }).find((check) => check.id === 'memory');
 
 test('macOS のメモリ圧迫が未取得なら正常としない', () => {
   for (const pressure of ['unknown', null, undefined]) {

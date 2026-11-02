@@ -78,6 +78,13 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
     let probe_every = minutes("probe_minutes", 60.0) * 60000.0;
     let logs_every = minutes("logs_minutes", 15.0) * 60000.0;
     let d = get(snap, "data");
+    let data_valid = d.is_some_and(Value::is_object);
+    let host = get(d, "host");
+    let metadata_known = data_valid
+        && (js::is_str(get(d, "probe"), "mac") || js::is_str(get(d, "probe"), "windows"))
+        && host.is_some_and(Value::is_object)
+        && get(host, "hostname").and_then(Value::as_str).is_some_and(|name| !js::trim(name).is_empty() && !name.chars().any(char::is_control))
+        && get(d, "memory").is_some_and(Value::is_object);
     let mut out = Out(Vec::new());
     let has = |prefix: &str| {
         findings.iter().find(|f| {
@@ -94,6 +101,8 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
         out.add("probe", "分析", "fail", format!("前回の分析が失敗: {}", js::slice16(tail, 120)));
     } else if !present(snap) {
         out.add("probe", "分析", "unknown", "まだ分析していない");
+    } else if !metadata_known {
+        out.add("probe", "分析", "unknown", "分析データまたは取得元情報が未取得・形式不正");
     } else if now - num(get(snap, "at")) > probe_every * 3.0 {
         out.add(
             "probe",
@@ -180,7 +189,10 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
             out.add("logs", "ログ取り込み", "ok", format!("{} か所、最新 {} 分前{wait}{na}", cur.len(), age_min_f(newest, now)));
         }
     }
-    let Some(d) = d.filter(|v| truthy(Some(v))) else { return out.0 };
+    let Some(d) = d.filter(|v| v.is_object()) else {
+        out.add("memory", "メモリ", "unknown", "分析データが未取得または形式不正");
+        return out.0;
+    };
     let d = Some(d);
 
     // 定期処理（launchd / タスクスケジューラ）
@@ -298,38 +310,42 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
             "fail"
         } else if mem_warn {
             "warn"
-        } else if mem_known {
+        } else if mem_known && metadata_known {
             "ok"
         } else {
             "unknown"
         },
-        if is_win {
-            format!(
-                "総量 {} GB・空き {}%・コミット {}%{}{}",
-                if total.is_some() { string(get(m, "total_gb")) } else { "不明".into() },
-                if avail.is_some() { string(get(m, "available_pct")) } else { "不明".into() },
-                if commit.is_some() { string(get(m, "commit_pct")) } else { "不明".into() },
-                if pressure_known && pressure != Some("normal") { format!("・圧迫 {}", string(get(m, "pressure"))) } else { String::new() },
-                swap_note
-            )
-        } else if is_mac {
-            format!(
-                "総量 {} GB・空き {}%・圧迫 {}・swap {} GB{}{}",
-                if total.is_some() { string(get(m, "total_gb")) } else { "不明".into() },
-                if avail.is_some() { string(get(m, "available_pct")) } else { "不明".into() },
-                if pressure_known { string(get(m, "pressure")) } else { "不明".into() },
-                if swap.is_some() { string(get(m, "swap_used_gb")) } else { "不明".into() },
-                if commit.is_some_and(|v| v >= 80.0) { format!("・コミット {}%", string(get(m, "commit_pct"))) } else { String::new() },
-                swap_note
-            )
-        } else {
-            format!(
-                "OS 不明・圧迫 {}・コミット {}%{}",
-                if pressure_known { string(get(m, "pressure")) } else { "不明".into() },
-                if commit.is_some() { string(get(m, "commit_pct")) } else { "不明".into() },
-                swap_note
-            )
-        },
+        format!(
+            "{}{}",
+            if is_win {
+                format!(
+                    "総量 {} GB・空き {}%・コミット {}%{}{}",
+                    if total.is_some() { string(get(m, "total_gb")) } else { "不明".into() },
+                    if avail.is_some() { string(get(m, "available_pct")) } else { "不明".into() },
+                    if commit.is_some() { string(get(m, "commit_pct")) } else { "不明".into() },
+                    if pressure_known && pressure != Some("normal") { format!("・圧迫 {}", string(get(m, "pressure"))) } else { String::new() },
+                    swap_note
+                )
+            } else if is_mac {
+                format!(
+                    "総量 {} GB・空き {}%・圧迫 {}・swap {} GB{}{}",
+                    if total.is_some() { string(get(m, "total_gb")) } else { "不明".into() },
+                    if avail.is_some() { string(get(m, "available_pct")) } else { "不明".into() },
+                    if pressure_known { string(get(m, "pressure")) } else { "不明".into() },
+                    if swap.is_some() { string(get(m, "swap_used_gb")) } else { "不明".into() },
+                    if commit.is_some_and(|v| v >= 80.0) { format!("・コミット {}%", string(get(m, "commit_pct"))) } else { String::new() },
+                    swap_note
+                )
+            } else {
+                format!(
+                    "OS 不明・圧迫 {}・コミット {}%{}",
+                    if pressure_known { string(get(m, "pressure")) } else { "不明".into() },
+                    if commit.is_some() { string(get(m, "commit_pct")) } else { "不明".into() },
+                    swap_note
+                )
+            },
+            if metadata_known { "" } else { "・取得元情報不明" }
+        ),
     );
     let busy = get(d, "cpu_busy");
     let cpu_known = busy.and_then(Value::as_f64).is_some_and(|n| n.is_finite());
@@ -497,8 +513,60 @@ mod tests {
 
     fn memory_check_with_findings(probe: &str, memory: Value, findings: &[Value]) -> Check {
         let now = 1_800_000_000_000_i64;
-        let snap = json!({ "at": now, "data": { "probe": probe, "memory": memory } });
+        let snap = json!({ "at": now, "data": { "probe": probe, "memory": memory, "host": {"hostname":"fixture"} } });
         node_checks(&json!({ "id": "fixture" }), Some(&snap), findings, &json!({ "now": now })).into_iter().find(|check| check.id == "memory").unwrap()
+    }
+
+    #[test]
+    fn missing_or_invalid_data_is_unknown_not_success() {
+        let node = json!({"id":"fixture"});
+        let ctx = json!({"now":1_800_000_000_000_i64});
+        for data in [Value::Null, json!([]), json!("invalid"), json!(0), json!(true)] {
+            let snap = json!({"at":1_800_000_000_000_i64,"data":data});
+            let checks = node_checks(&node, Some(&snap), &[], &ctx);
+            assert_eq!(checks.iter().find(|c| c.id == "probe").unwrap().status, "unknown");
+            assert_eq!(checks.iter().find(|c| c.id == "memory").unwrap().status, "unknown");
+        }
+        let checks = node_checks(&node, None, &[], &ctx);
+        assert_eq!(checks.iter().find(|c| c.id == "memory").unwrap().status, "unknown");
+        let snap = json!({"at":1_800_000_000_000_i64,"data":null});
+        let failed = node_checks(&node, Some(&snap), &[], &json!({"now":1_800_000_000_000_i64,"lastError":"timeout"}));
+        assert_eq!(failed.iter().find(|c| c.id == "probe").unwrap().status, "fail");
+    }
+
+    #[test]
+    fn unidentified_data_is_unknown_but_preserves_observed_danger() {
+        let node = json!({"id":"fixture"});
+        let ctx = json!({"now":1_800_000_000_000_i64});
+        for data in [
+            json!({}),
+            json!({"other":1}),
+            json!({"probe":"windows","memory":{}}),
+            json!({"probe":"windows","host":{"hostname":" "},"memory":{}}),
+            json!({"probe":"windows","host":{"hostname":"\u{feff}"},"memory":{}}),
+            json!({"probe":"windows","host":{"hostname":"\u{85}"},"memory":{}}),
+            json!({"probe":"windows","host":{"hostname":"fixture\u{1}"},"memory":{}}),
+            json!({"probe":"other","host":{"hostname":"fixture"},"memory":{}}),
+            json!({"probe":"windows","host":{"hostname":"fixture"},"memory":null}),
+            json!({"probe":"windows","memory":{"total_gb":64,"available_pct":50,"commit_pct":30}}),
+        ] {
+            let checks = node_checks(&node, Some(&json!({"at":1_800_000_000_000_i64,"data":data})), &[], &ctx);
+            assert_eq!(checks.iter().find(|c| c.id == "probe").unwrap().status, "unknown");
+            assert_eq!(checks.iter().find(|c| c.id == "memory").unwrap().status, "unknown");
+        }
+        let checks = node_checks(&node, Some(&json!({"at":1_800_000_000_000_i64,"data":{"memory":{"commit_pct":95}}})), &[], &ctx);
+        assert_eq!(checks.iter().find(|c| c.id == "probe").unwrap().status, "unknown");
+        assert_eq!(checks.iter().find(|c| c.id == "memory").unwrap().status, "fail");
+        let unicode = node_checks(
+            &node,
+            Some(
+                &json!({"at":1_800_000_000_000_i64,"data":{"probe":"windows","host":{"hostname":"作業機"},"memory":{"total_gb":64,"available_pct":50,"commit_pct":30}}}),
+            ),
+            &[],
+            &ctx,
+        );
+        assert_eq!(unicode.iter().find(|c| c.id == "probe").unwrap().status, "ok");
+        assert_eq!(unicode.iter().find(|c| c.id == "memory").unwrap().status, "ok");
     }
 
     #[test]

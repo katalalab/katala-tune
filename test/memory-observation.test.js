@@ -43,7 +43,7 @@ print(json.dumps(rows))
   const { nodeChecks } = require('../lib/health');
   const now = 1_800_000_000_000;
   const status = ([used, total]) => nodeChecks({ id: 'fixture' }, {
-    at: now, data: { probe: 'mac', memory: { total_gb: 16, available_pct: 50, pressure: 'normal', swap_used_gb: used, swap_total_gb: total } },
+    at: now, data: { probe: 'mac', host: { hostname: 'fixture' }, memory: { total_gb: 16, available_pct: 50, pressure: 'normal', swap_used_gb: used, swap_total_gb: total } },
   }, [], { now }).find((check) => check.id === 'memory').status;
   assert.equal(status(samples[0]), 'unknown');
   assert.equal(status(samples[1]), 'ok');
@@ -102,7 +102,7 @@ test('機体詳細もメモリ欠測を不明と示す', () => {
   assert.match(renderMachine('mac', { total_gb: 16, available_pct: 50, swap_used_gb: 0 }), /swap 0 GB/);
 });
 
-function renderOverviewParts(memory, findings = [], probe = 'windows') {
+function renderOverviewParts(memory, findings = [], probe = 'windows', hostname = 'fixture') {
   const text = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'app.js'), 'utf8');
   const cardStart = text.indexOf('function cardHtml(n, coverage) {');
   const cardEnd = text.indexOf('\nfunction renderOverview()', cardStart);
@@ -113,7 +113,7 @@ function renderOverviewParts(memory, findings = [], probe = 'windows') {
   const helperEnd = helperStart < 0 ? -1 : text.indexOf('\nfunction nodeDot(', helperStart);
   const helper = helperStart >= 0 && helperEnd > helperStart ? text.slice(helperStart, helperEnd) : '';
   const node = { id: 'fixture', os: probe };
-  const result = { ok: true, score: 100, findings, data: { probe, memory, host: { cpu: 'fixture', cores: 1 }, disk: [] } };
+  const result = { ok: true, score: 100, findings, data: { probe, memory, host: { hostname, cpu: 'fixture', cores: 1 }, disk: [] } };
   const context = {
     node, result,
     state: { results: { fixture: result }, busy: new Set() },
@@ -161,6 +161,14 @@ test('Mac のカードもメモリの取得漏れを示す', () => {
   const [known] = renderOverviewParts({ total_gb: 16, available_pct: 50, pressure: 'normal', swap_used_gb: 0 }, [], 'mac');
   assert.match(missing, /メモリ不明/);
   assert.doesNotMatch(known, /メモリ不明/);
+});
+
+test('ホスト名が未取得ならメモリ値が揃っていても出所を不明とする', () => {
+  for (const hostname of [' ', '\uFEFF', '\u0085', 'fixture\u0001']) {
+    const [card, details] = renderOverviewParts({ total_gb: 64, available_pct: 50, commit_pct: 30 }, [], 'windows', hostname);
+    assert.match(card, /メモリ不明/);
+    assert.match(details, /メモリ不明/);
+  }
 });
 
 test('所見がない場合も全体の正常性やスコアの取得範囲を断定しない', () => {
