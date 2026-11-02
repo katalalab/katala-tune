@@ -1,0 +1,125 @@
+name: Fleet Studio
+
+# A path-filtered workflow should not be a required check for every PR.
+on:
+  pull_request:
+    paths:
+      - 'crates/fleet-studio/**'
+      - 'crates/tune-core/**'
+      - 'rust-toolchain.toml'
+      - 'rust-toolchain'
+      - '.github/workflows/fleet-studio.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'probes/**'
+      - 'config/**'
+      - 'test/**'
+      - 'data/**'
+  push:
+    branches:
+      - main
+    paths:
+      - 'crates/fleet-studio/**'
+      - 'crates/tune-core/**'
+      - 'rust-toolchain.toml'
+      - 'rust-toolchain'
+      - '.github/workflows/fleet-studio.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'probes/**'
+      - 'config/**'
+      - 'test/**'
+      - 'data/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS default
+            os: macos-latest
+            features: gui
+          - name: macOS runtime shaders
+            os: macos-latest
+            features: gui,gpui/runtime_shaders
+          - name: Windows
+            os: windows-latest
+            features: gui
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Verify repository Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          line_number=0
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            line="${line%$'\r'}"
+            case "$line_number:$line" in
+              '0:[toolchain]'|'1:channel = "1.99.0"'|'2:profile = "minimal"'|'3:components = ["rustfmt", "clippy"]') ;;
+              *) exit 1 ;;
+            esac
+            line_number=$((line_number + 1))
+          done < rust-toolchain.toml
+          [[ "$line_number" -eq 4 ]]
+      - name: Install pinned Rust
+        shell: bash
+        run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Check Rust version
+        shell: bash
+        run: rustc +1.99.0 --version
+      - name: Check Metal compiler tools
+        if: matrix.name == 'macOS default'
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun --find metal >/dev/null
+          xcrun --find metallib >/dev/null
+      - name: Confirm navigation tests are present
+        shell: bash
+        run: |
+          set -euo pipefail
+          listing="$(cargo +1.99.0 test --locked --manifest-path crates/fleet-studio/Cargo.toml --features "${{ matrix.features }}" --test macos_navigation -- --list)"
+          found=0
+          while IFS= read -r line; do
+            if [[ "${line%$'\r'}" == 'macos_sample_audit_never_reads_or_resolves_home: test' ]]; then
+              found=1
+            fi
+          done <<< "$listing"
+          [[ "$found" -eq 1 ]]
+      - name: Test macOS navigation policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          if output="$(cargo +1.99.0 test --locked --manifest-path crates/fleet-studio/Cargo.toml --features "${{ matrix.features }}" --test macos_navigation -- --test-threads=1 --color never)"; then
+            :
+          else
+            status=$?
+            printf '%s\n' "$output"
+            exit "$status"
+          fi
+          printf '%s\n' "$output"
+          result_pattern='^test result: ok[.] ([1-9][0-9]*) passed; 0 failed; 0 ignored; [0-9]+ measured; 0 filtered out; finished in [0-9]+([.][0-9]+)?s$'
+          result_lines=0
+          while IFS= read -r line; do
+            line="${line%$'\r'}"
+            if [[ "$line" == 'test result:'* ]]; then
+              result_lines=$((result_lines + 1))
+              [[ "$line" =~ $result_pattern ]] || exit 1
+            fi
+          done <<< "$output"
+          [[ "$result_lines" -eq 1 ]]
+      - name: Build Fleet Studio
+        shell: bash
+        run: cargo +1.99.0 build --locked --manifest-path crates/fleet-studio/Cargo.toml --features "${{ matrix.features }}" --bin fleet-studio
