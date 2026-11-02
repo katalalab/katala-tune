@@ -69,6 +69,15 @@ fn record(app: &AppHandle, patch: Value) {
     let _ = e.with_db(|d| d.set_meta("updateState", &Value::Object(s)));
 }
 
+/// 確認の結果として残す値。自動の確認とメニューの「更新を確認…」で同じ形にする
+/// （メニューで新しい版を見つけて取り消した・確かめられなかったときも、前の「最新」を残さない）
+fn check_patch(checked: Result<Option<&str>, &String>, at: i64) -> Value {
+    match checked {
+        Ok(available) => json!({ "checked_at": at, "available": available, "error": null }),
+        Err(e) => json!({ "checked_at": at, "error": format!("更新を確かめられなかった: {e}") }),
+    }
+}
+
 /// 入れてよい時: ウィンドウが見えていない・分析も取り込みもしていない
 fn idle(app: &AppHandle) -> bool {
     let visible = app.get_webview_window("main").and_then(|w| w.is_visible().ok()).unwrap_or(false);
@@ -119,9 +128,9 @@ pub fn start(app: AppHandle) {
             if !is_busy() && last_check.is_none_or(|t| t.elapsed() >= every) {
                 last_check = Some(Instant::now());
                 let checked = async { app.updater().map_err(|e| e.to_string())?.check().await.map_err(|e| e.to_string()) }.await;
+                record(&app, check_patch(checked.as_ref().map(|u| u.as_ref().map(|u| u.version.as_str())), now_ms()));
                 match checked {
                     Ok(Some(u)) => {
-                        record(&app, json!({ "checked_at": now_ms(), "available": u.version, "error": null }));
                         let auto = auto(&app);
                         if auto && ready.as_ref().is_none_or(|(r, _, _)| r.version != u.version) {
                             match download(&u).await {
@@ -138,11 +147,8 @@ pub fn start(app: AppHandle) {
                             told = Some(u.version.clone());
                         }
                     }
-                    Ok(None) => {
-                        record(&app, json!({ "checked_at": now_ms(), "available": null, "error": null }));
-                        ready = None;
-                    }
-                    Err(e) => record(&app, json!({ "checked_at": now_ms(), "error": format!("更新を確かめられなかった: {e}") })),
+                    Ok(None) => ready = None,
+                    Err(_) => {}
                 }
             }
             if ready.is_some() && !auto(&app) {
@@ -188,8 +194,9 @@ pub async fn check_and_install(app: &AppHandle) -> Result<String, String> {
 
 async fn run(app: &AppHandle) -> Result<String, String> {
     let updater = app.updater().map_err(|e| e.to_string())?;
-    let Some(update) = updater.check().await.map_err(|e| format!("更新を確かめられなかった: {e}"))? else {
-        record(app, json!({ "checked_at": now_ms(), "available": null, "error": null }));
+    let checked = updater.check().await.map_err(|e| e.to_string());
+    record(app, check_patch(checked.as_ref().map(|u| u.as_ref().map(|u| u.version.as_str())), now_ms()));
+    let Some(update) = checked.map_err(|e| format!("更新を確かめられなかった: {e}"))? else {
         return Ok(format!("最新の版（{}）", app.package_info().version));
     };
     let title = format!("新しい版があります（{} → {}）", update.current_version, update.version);
@@ -201,8 +208,9 @@ async fn run(app: &AppHandle) -> Result<String, String> {
     if !crate::confirm::ask(app.clone(), INSTALL)(title, detail).await {
         return Ok(format!("取り消した（{}）", update.version));
     }
-    let bytes = download(&update).await.map_err(|e| format!("入れなかった（{e}）"))?;
-    install(app, &update, &bytes).await?;
+    // 失敗は自動の確認と同じく状態に残す（通知だけでは、ダッシュボードに前の記録が残る）
+    let bytes = download(&update).await.inspect_err(|e| record(app, json!({ "error": e }))).map_err(|e| format!("入れなかった（{e}）"))?;
+    install(app, &update, &bytes).await.inspect_err(|e| record(app, json!({ "error": e })))?;
     Ok(String::new())
 }
 
@@ -215,4 +223,21 @@ pub fn from_menu(app: &AppHandle) {
             Err(e) => notify(&app, "Katala Tune: 更新できなかった", &e),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn check_patch_records_found_latest_and_failure_alike() {
+        let found = super::check_patch(Ok(Some("0.8.0")), 5);
+        assert_eq!(found, json!({ "checked_at": 5, "available": "0.8.0", "error": null }));
+        let latest = super::check_patch(Ok(None), 6);
+        assert_eq!(latest, json!({ "checked_at": 6, "available": null, "error": null }));
+        let failed = super::check_patch(Err(&"offline".to_string()), 7);
+        assert_eq!(failed, json!({ "checked_at": 7, "error": "更新を確かめられなかった: offline" }));
+        // 確かめられなかったときは前に見つけた版（available）を消さない
+        assert!(failed.get("available").is_none());
+    }
 }
