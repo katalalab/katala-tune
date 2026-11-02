@@ -268,10 +268,24 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
     }
     let m = get(d, "memory");
     let is_win = js::is_str(get(d, "probe"), "windows");
-    let avail = get(m, "available_pct");
-    let commit = num(get(m, "commit_pct"));
-    let mem_bad = js::is_str(get(m, "pressure"), "critical") || commit >= 90.0 || (present(avail) && is_win && num(avail) < 10.0);
-    let mem_warn = js::is_str(get(m, "pressure"), "warn") || commit >= 80.0 || (is_win && num(avail) < 20.0);
+    let is_mac = js::is_str(get(d, "probe"), "mac");
+    let percent = |value: Jv<'_>| value.and_then(Value::as_f64).filter(|v| v.is_finite() && (0.0..=100.0).contains(v));
+    let avail = percent(get(m, "available_pct"));
+    let commit = percent(get(m, "commit_pct"));
+    let pressure = get(m, "pressure").and_then(Value::as_str);
+    let pressure_known = matches!(pressure, Some("normal" | "warn" | "critical"));
+    let swap = get(m, "swap_used_gb").and_then(Value::as_f64).filter(|v| v.is_finite() && *v >= 0.0);
+    let swap_finding = findings.iter().find(|finding| js::is_str(finding.get("id"), "swap"));
+    let mem_bad = (pressure_known && pressure == Some("critical"))
+        || commit.is_some_and(|v| v >= 90.0)
+        || (is_win && avail.is_some_and(|v| v < 10.0))
+        || swap_finding.is_some_and(|finding| js::is_str(finding.get("severity"), "critical"));
+    let mem_warn = (pressure_known && pressure == Some("warn"))
+        || commit.is_some_and(|v| v >= 80.0)
+        || (is_win && avail.is_some_and(|v| v < 20.0))
+        || swap_finding.is_some();
+    let mem_known = if is_win { avail.is_some() && commit.is_some() } else { is_mac && pressure_known && swap.is_some() };
+    let swap_note = if swap_finding.is_some() { "・swap の所見あり" } else { "" };
     out.add(
         "memory",
         "メモリ",
@@ -279,13 +293,34 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
             "fail"
         } else if mem_warn {
             "warn"
-        } else {
+        } else if mem_known {
             "ok"
+        } else {
+            "unknown"
         },
         if is_win {
-            format!("空き {}%・コミット {}%", string(avail), string(get(m, "commit_pct")))
+            format!(
+                "空き {}%・コミット {}%{}{}",
+                if avail.is_some() { string(get(m, "available_pct")) } else { "不明".into() },
+                if commit.is_some() { string(get(m, "commit_pct")) } else { "不明".into() },
+                if pressure_known && pressure != Some("normal") { format!("・圧迫 {}", string(get(m, "pressure"))) } else { String::new() },
+                swap_note
+            )
+        } else if is_mac {
+            format!(
+                "圧迫 {}・swap {} GB{}{}",
+                if pressure_known { string(get(m, "pressure")) } else { "不明".into() },
+                if swap.is_some() { string(get(m, "swap_used_gb")) } else { "不明".into() },
+                if commit.is_some_and(|v| v >= 80.0) { format!("・コミット {}%", string(get(m, "commit_pct"))) } else { String::new() },
+                swap_note
+            )
         } else {
-            format!("圧迫 {}・swap {} GB", string(get(m, "pressure")), string(get(m, "swap_used_gb")))
+            format!(
+                "OS 不明・圧迫 {}・コミット {}%{}",
+                if pressure_known { string(get(m, "pressure")) } else { "不明".into() },
+                if commit.is_some() { string(get(m, "commit_pct")) } else { "不明".into() },
+                swap_note
+            )
         },
     );
     let busy = get(d, "cpu_busy");
@@ -447,6 +482,73 @@ pub fn app_checks(ctx: &Value) -> Vec<Check> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn memory_check(probe: &str, memory: Value) -> Check {
+        memory_check_with_findings(probe, memory, &[])
+    }
+
+    fn memory_check_with_findings(probe: &str, memory: Value, findings: &[Value]) -> Check {
+        let now = 1_800_000_000_000_i64;
+        let snap = json!({ "at": now, "data": { "probe": probe, "memory": memory } });
+        node_checks(&json!({ "id": "fixture" }), Some(&snap), findings, &json!({ "now": now })).into_iter().find(|check| check.id == "memory").unwrap()
+    }
+
+    #[test]
+    fn incomplete_memory_observations_are_unknown() {
+        let cases = [
+            ("mac", json!({ "pressure": "unknown", "swap_used_gb": 0 })),
+            ("mac", json!({ "pressure": null, "swap_used_gb": 0 })),
+            ("mac", json!({ "pressure": "normal", "swap_used_gb": null })),
+            ("windows", json!({ "available_pct": 50, "commit_pct": null })),
+            ("windows", json!({ "available_pct": null, "commit_pct": 30 })),
+            ("windows", json!({})),
+            ("windows", json!({ "available_pct": "50", "commit_pct": 30 })),
+            ("windows", json!({ "available_pct": -1, "commit_pct": 30 })),
+            ("windows", json!({ "available_pct": 50, "commit_pct": 101 })),
+        ];
+        for (probe, memory) in cases {
+            let check = memory_check(probe, memory);
+            assert_eq!(check.status, "unknown");
+            assert!(check.detail.as_deref().is_some_and(|detail| detail.contains("不明")));
+        }
+    }
+
+    #[test]
+    fn observed_memory_warnings_survive_other_missing_metrics() {
+        let cases = [
+            ("windows", json!({ "available_pct": null, "commit_pct": 95 }), "fail"),
+            ("windows", json!({ "available_pct": null, "commit_pct": 85 }), "warn"),
+            ("windows", json!({ "available_pct": 0, "commit_pct": null }), "fail"),
+            ("windows", json!({ "available_pct": 50, "commit_pct": 30 }), "ok"),
+            ("mac", json!({ "pressure": "critical", "swap_used_gb": null }), "fail"),
+            ("mac", json!({ "pressure": "warn", "swap_used_gb": null }), "warn"),
+            ("mac", json!({ "pressure": "normal", "swap_used_gb": 0 }), "ok"),
+        ];
+        for (probe, memory, expected) in cases {
+            assert_eq!(memory_check(probe, memory).status, expected);
+        }
+    }
+
+    #[test]
+    fn mac_swap_finding_is_not_reported_as_normal() {
+        let memory = json!({ "pressure": "normal", "swap_used_gb": 8 });
+        let warning = memory_check_with_findings("mac", memory.clone(), &[json!({ "id": "swap", "severity": "warn" })]);
+        assert_eq!(warning.status, "warn");
+        assert!(warning.detail.as_deref().is_some_and(|detail| detail.contains("swap の所見")));
+        assert_eq!(memory_check_with_findings("mac", memory.clone(), &[json!({ "id": "swap", "severity": "critical" })]).status, "fail");
+        assert_eq!(memory_check_with_findings("mac", memory, &[json!({ "id": "swap-other", "severity": "warn" })]).status, "ok");
+    }
+
+    #[test]
+    fn known_pressure_and_commit_danger_survive_unknown_os() {
+        let pressure = memory_check("other", json!({ "pressure": "critical", "swap_used_gb": 0 }));
+        assert_eq!(pressure.status, "fail");
+        assert!(pressure.detail.as_deref().is_some_and(|detail| detail.contains("OS 不明") && detail.contains("critical")));
+        let commit = memory_check("other", json!({ "commit_pct": 95 }));
+        assert_eq!(commit.status, "fail");
+        assert!(commit.detail.as_deref().is_some_and(|detail| detail.contains("OS 不明") && detail.contains("95")));
+        assert_eq!(memory_check("other", json!({ "pressure": "normal", "commit_pct": 30, "swap_used_gb": 0 })).status, "unknown");
+    }
 
     #[test]
     fn failing_jobs_skip_sched_ok_and_disabled() {

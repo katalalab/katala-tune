@@ -997,6 +997,29 @@ fn rules_health_logs_actions_match_js() {
         lf_in.push(json!({ "node_id": "pc", "now": now, "logs": groups, "dropped": dropped }));
     }
 
+    for (probe, memory) in [
+        ("mac", json!({ "pressure": "unknown", "swap_used_gb": 0 })),
+        ("mac", json!({ "pressure": "normal", "swap_used_gb": null })),
+        ("mac", json!({ "pressure": "warn", "swap_used_gb": null })),
+        ("windows", json!({ "available_pct": 50, "commit_pct": null })),
+        ("windows", json!({ "available_pct": null, "commit_pct": 30 })),
+        ("windows", json!({ "available_pct": null, "commit_pct": 95 })),
+        ("windows", json!({ "available_pct": "50", "commit_pct": 30 })),
+    ] {
+        node_in.push(
+            json!({ "node": { "id": "fixture" }, "snap": { "at": now, "data": { "probe": probe, "memory": memory } }, "findings": [], "ctx": { "now": now } }),
+        );
+    }
+    for (probe, memory, findings) in [
+        ("mac", json!({ "pressure": "normal", "swap_used_gb": 8 }), json!([{ "id": "swap", "severity": "warn" }])),
+        ("mac", json!({ "pressure": "normal", "swap_used_gb": 8 }), json!([{ "id": "swap", "severity": "critical" }])),
+        ("other", json!({ "pressure": "critical" }), json!([])),
+        ("other", json!({ "commit_pct": 95 }), json!([])),
+    ] {
+        node_in.push(
+            json!({ "node": { "id": "fixture" }, "snap": { "at": now, "data": { "probe": probe, "memory": memory } }, "findings": findings, "ctx": { "now": now } }),
+        );
+    }
     let cases = json!({
         "analyze": analyze_in, "compare": compare_in, "nodeChecks": node_in, "appChecks": app_in, "failingJobs": jobs_in,
         "redact": redact_in, "fingerprint": fp_in, "normalize": normalize_in, "plan": plan_in, "logFindings": lf_in,
