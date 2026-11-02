@@ -23,7 +23,7 @@ macOS の例:
 cargo run --manifest-path crates/fleet-studio/Cargo.toml --features gui --locked -j 1
 ```
 
-macOS の既定ビルドは、GPUI 0.2.2 のシェーダーを事前コンパイルするために `xcrun metal` と `xcrun metallib` が必要です。Command Line Tools の有無だけでは、これらを利用できるかは判断できません。この版の macOS ビルドと画面は未検証です。Windows のネイティブ画面でビルド・起動を確認しています。
+macOS の既定ビルドは、GPUI 0.2.2 のシェーダーを事前コンパイルするために `xcrun metal` と `xcrun metallib` が必要です。Command Line Tools の有無だけでは、これらを利用できるかは判断できません。この版の macOS ビルドと画面は未検証です。Windows では旧版のサンプルをビルド・起動して操作を確認しています。score の取得範囲の注記を含む現在の版は、ビルド・起動とも未確認です。
 
 `--features 'gui,gpui/runtime_shaders'` はシェーダーを実行時にコンパイルする未検証の代替候補です。この指定でも Metal 自体、bindgen が利用できる libclang、SDK などは引き続き必要です。Windows 向けの依存 feature 解決では指定の反映を確認していますが、macOS 向けの依存解決・ビルド・起動、起動時コンパイルの成否や性能への影響は未確認です。
 
