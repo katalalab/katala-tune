@@ -83,6 +83,10 @@ impl Grants {
         self.entries.get(id).filter(|permit| permit.is_active() && permit.fingerprint == fingerprint).cloned()
     }
 
+    pub fn has_active_id(&self, id: &str) -> bool {
+        self.entries.get(id).is_some_and(Permit::is_active)
+    }
+
     pub fn contains(&self, id: &str, permit: &Permit) -> bool {
         self.entries.get(id).is_some_and(|current| current.same_as(permit))
     }
@@ -260,6 +264,27 @@ pub const MACHINE_CONFIRMATION: &str =
 /// Fixed keyboard confirmation, shown beside the selected ID.
 pub const MACHINE_CONFIRMATION_KEYBOARD: &str =
     "保存要約の閲覧権限と適用ルールを確認した場合のみ Y で表示。許可中は更新時に再読取し、取消できます。保存元の実機は未確認。Esc で中止。";
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use crate::startup_selection::{Candidate, PendingSelection, PlanError, StartupRequest};
+
+    #[test]
+    fn startup_grant_failure_rolls_back_only_new_grants() {
+        let mut grants = Grants::default();
+        assert!(grants.authorize("existing", "old"));
+        let existing = grants.matching("existing", "old").unwrap();
+        grants.next_serial.store(u64::MAX - 1, Ordering::SeqCst);
+        let mut pending = PendingSelection::new(StartupRequest::Requested(vec!["first".into(), "second".into()]));
+        let cards = [Candidate { id: "first", fingerprint: Some("fp1") }, Candidate { id: "second", fingerprint: Some("fp2") }];
+        assert_eq!(pending.apply(&cards, &mut grants), Err(PlanError::GrantFailed));
+        assert!(existing.is_active());
+        assert!(grants.matching("first", "fp1").is_none());
+        assert!(grants.matching("second", "fp2").is_none());
+        assert_eq!(pending.apply(&cards, &mut grants), Ok(0));
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AuditTicket {

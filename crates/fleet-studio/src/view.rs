@@ -17,6 +17,7 @@ use fleet_studio::refresh::{self, FullRefresh};
 use fleet_studio::scope::{AuditGate, AuditTicket, Confirmation, Confirmations, Grants, Permit, RefreshGate};
 use fleet_studio::search_input::{KeyAction, KeyModifiers, SearchInput, search_key};
 use fleet_studio::source::{self, Coverage, Dashboard, NodeCard, Repository, SavedState};
+use fleet_studio::startup_selection::{Candidate as StartupCandidate, PendingSelection};
 use fleet_studio::ui_consent::{
     self, ConfirmationAction, ConsentFrame, ConsentPointer, ConsentScreen, ConsentTarget, MachineConfirmationResult, ModelConfirmationResult, PointerMark,
     Presentation, ScrollMetrics, Viewport,
@@ -45,6 +46,7 @@ pub struct FleetView {
     load_timeout: bool,
     dashboard: Option<Dashboard>,
     grants: Grants,
+    startup_selection: PendingSelection,
     confirmations: Confirmations,
     machine_focus: Option<(String, String)>,
     revoking: HashSet<String>,
@@ -88,7 +90,14 @@ pub struct FleetView {
 }
 
 impl FleetView {
-    pub fn new(sample: bool, recent_local: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        sample: bool,
+        recent_local: bool,
+        startup_selection: PendingSelection,
+        startup_notice: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window);
         let focus_out = cx.on_focus_out(&focus, window, |view, _, _, cx| {
@@ -118,12 +127,13 @@ impl FleetView {
             load_timeout: false,
             dashboard: None,
             grants: Grants::default(),
+            startup_selection,
             confirmations: Confirmations::default(),
             machine_focus: None,
             revoking: HashSet::new(),
             dashboard_gate: RefreshGate::default(),
             scope_check_pending: false,
-            access_notice: None,
+            access_notice: startup_notice,
             model_scope: ModelScope::default(),
             model_confirmation: None,
             model_keyboard: ModelKeyboard::default(),
@@ -739,6 +749,9 @@ impl FleetView {
                 if view.dashboard_gate.is_current(ticket) {
                     view.loading = false;
                     view.load_timeout = true;
+                    if view.startup_selection.cancel() {
+                        view.access_notice = Some("台帳の確認が時間切れです。起動時の自動表示は取り消しました。");
+                    }
                     if let Some(data) = &mut view.dashboard {
                         for node in &mut data.nodes {
                             if matches!(node.observation, Observation::Current | Observation::Stale) {
@@ -762,14 +775,28 @@ impl FleetView {
             let mut data = task.await;
             let _ = view.update(cx, |view, cx| {
                 let Some(finished) = view.dashboard_gate.finish(ticket) else { return };
+                let mut startup_refresh = false;
                 if finished.accept {
                     view.scope_check_pending = false;
                     if data.config_error.is_some() {
                         view.grants.clear();
+                        if view.startup_selection.cancel() {
+                            view.access_notice = Some("台帳を確認できないため、起動時の自動表示を取り消しました。");
+                        }
                     } else {
                         let fingerprints =
                             data.nodes.iter().filter_map(|node| node.fingerprint.as_ref().map(|fingerprint| (node.id.clone(), fingerprint.clone()))).collect();
                         view.grants.reconcile(&fingerprints);
+                        let candidates: Vec<_> =
+                            data.nodes.iter().map(|node| StartupCandidate { id: &node.id, fingerprint: node.fingerprint.as_deref() }).collect();
+                        match view.startup_selection.apply(&candidates, &mut view.grants) {
+                            Ok(0) => {}
+                            Ok(_) => {
+                                startup_refresh = true;
+                                view.access_notice = Some("起動時に指定された機体の保存要約を読み込みます。表示許可は取り消せます。");
+                            }
+                            Err(_) => view.access_notice = Some("起動時の機体指定を確認できないため、保存要約は自動表示しません。"),
+                        }
                     }
                     source::discard_revoked(&mut data, &view.grants);
                     view.pointer_ids.borrow_mut().clear();
@@ -788,7 +815,7 @@ impl FleetView {
                 view.loading = false;
                 view.load_timeout = false;
                 view.revoking.clear();
-                if finished.restart {
+                if finished.restart || startup_refresh {
                     view.start_dashboard(cx);
                 }
                 cx.notify();

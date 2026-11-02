@@ -11,6 +11,7 @@ pub mod refresh;
 pub mod scope;
 pub mod search_input;
 pub mod source;
+pub mod startup_selection;
 pub mod ui_consent;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
