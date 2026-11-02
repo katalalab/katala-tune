@@ -120,6 +120,15 @@ impl Mock {
 }
 
 impl Runner for Mock {
+    fn run_mac_probe<'a>(
+        &'a self,
+        cmd: &'a str,
+        args: &'a [String],
+        input: Option<&'a [u8]>,
+        timeout: std::time::Duration,
+    ) -> tune_core::collect::MacProbeFuture<'a> {
+        Box::pin(async move { Ok(self.run(cmd, args, input, timeout).await) })
+    }
     fn run<'a>(&'a self, cmd: &'a str, args: &'a [String], _input: Option<&'a [u8]>, _timeout: Duration) -> RunFuture<'a> {
         Box::pin(async move {
             self.calls.lock().unwrap().push((cmd.to_string(), args.to_vec()));
@@ -136,7 +145,7 @@ impl Runner for Mock {
 }
 
 fn ok_reply() -> RunResult {
-    RunResult { code: Some(0), out: "{\"probe\":\"windows\",\"cpu_busy\":1}\n".into(), err: String::new() }
+    RunResult { code: Some(0), out: "{\"probe\":\"windows\",\"probe_version\":2,\"host\":{},\"cpu_busy\":1}\n".into(), err: String::new() }
 }
 
 fn tmp(tag: &str) -> PathBuf {

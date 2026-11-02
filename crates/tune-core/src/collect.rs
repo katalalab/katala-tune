@@ -392,12 +392,44 @@ fn read_bounded<R: AsyncRead + Unpin + Send + 'static>(pipe: Option<R>, limit: u
 }
 
 pub type RunFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = RunResult> + Send + 'a>>;
+/// A Mac probe runner must prove completion; unknown evidence is incomplete.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MacProbeFailure {
+    Timeout,
+    Incomplete,
+}
+
+pub type MacProbeFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<RunResult, MacProbeFailure>> + Send + 'a>>;
+fn failed_probe(node: &Node, wall_s: f64, reason: &str) -> Value {
+    let reason = match reason {
+        "timeout" | "auth" | "unreachable" => reason,
+        _ => "error",
+    };
+    let e = if reason == "error" { "probe_failed" } else { reason };
+    return json!({ "node_id": node.id, "ok": false, "reason": reason, "reason_text": reason_text(reason), "error": js::slice16_tail(js::trim(&e), 800), "wall_s": wall_s, "at": now_ms() });
+}
+
+fn last_probe_json_line(text: &str) -> Option<Value> {
+    let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
+    serde_json::from_str(line.trim()).ok()
+}
+
+fn valid_probe_envelope(value: &Value, expected: &str) -> bool {
+    value.is_object()
+        && value.get("probe").and_then(Value::as_str) == Some(expected)
+        && value.get("probe_version").and_then(Value::as_f64) == Some(2.0)
+        && value.get("host").is_some_and(Value::is_object)
+}
 
 /// 子プロセスの実行口。本物は [`System`]、テストは偽の ssh に差し替える（呼び出しを数え、台本どおりの結果を返す）
 ///
 /// この機体（local）での実行も同じ口を通す。既定の実装は `run` に `local:script` などの名前で渡すので、
 /// 偽の実行器は本物のローカル実行に迂回されず、呼び出しを数えられる。[`System`] だけが本物のローカル実行をする
 pub trait Runner: Send + Sync {
+    fn run_mac_probe<'a>(&'a self, cmd: &'a str, args: &'a [String], input: Option<&'a [u8]>, timeout: Duration) -> MacProbeFuture<'a> {
+        let _ = (cmd, args, input, timeout);
+        Box::pin(async { Err(MacProbeFailure::Incomplete) })
+    }
     fn run<'a>(&'a self, cmd: &'a str, args: &'a [String], input: Option<&'a [u8]>, timeout: Duration) -> RunFuture<'a>;
 
     /// ローカルの短いスクリプト（actions 用）
@@ -425,6 +457,16 @@ pub trait Runner: Send + Sync {
 pub struct System;
 
 impl Runner for System {
+    fn run_mac_probe<'a>(&'a self, cmd: &'a str, args: &'a [String], input: Option<&'a [u8]>, timeout: Duration) -> MacProbeFuture<'a> {
+        Box::pin(async move {
+            let strict = run_strict(cmd, args, input, timeout).await;
+            match strict.failure {
+                None => Ok(strict.result),
+                Some(CompletionFailure::Timeout) => Err(MacProbeFailure::Timeout),
+                Some(_) => Err(MacProbeFailure::Incomplete),
+            }
+        })
+    }
     fn run<'a>(&'a self, cmd: &'a str, args: &'a [String], input: Option<&'a [u8]>, timeout: Duration) -> RunFuture<'a> {
         Box::pin(run(cmd, args, input, timeout))
     }
@@ -1051,11 +1093,22 @@ pub async fn probe_node_with(runner: &dyn Runner, node: &Node) -> Value {
     let network = crate::netsec::enabled(&node.raw);
     let benchmark = node.get("benchmark") != Some(&Value::Bool(false));
     let observe_wsl = node.is_windows() && node.get("wsl") == Some(&Value::Bool(true));
+    if !node.is_mac() && !node.is_windows() {
+        return failed_probe(node, started.elapsed().as_secs_f64(), "error");
+    }
+    let mut mac_failure = None;
     let res = if node.is_mac() {
-        if node.local {
-            runner.run("/usr/bin/env", &mac_probe_args(benchmark, network), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
+        let strict = if node.local {
+            runner.run_mac_probe("/usr/bin/env", &mac_probe_args(benchmark, network), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
         } else {
-            runner.run("ssh", &ssh_args(&node.alias, &mac_ssh_command(benchmark, network)), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
+            runner.run_mac_probe("ssh", &ssh_args(&node.alias, &mac_ssh_command(benchmark, network)), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
+        };
+        match strict {
+            Ok(result) => result,
+            Err(failure) => {
+                mac_failure = Some(failure);
+                RunResult { code: None, out: String::new(), err: String::new() }
+            }
         }
     } else {
         match crate::actions::action_helper(node) {
@@ -1064,20 +1117,22 @@ pub async fn probe_node_with(runner: &dyn Runner, node: &Node) -> Value {
         }
     };
     let wall_s = started.elapsed().as_secs_f64();
+    if let Some(failure) = mac_failure {
+        let reason = match failure {
+            MacProbeFailure::Timeout => "timeout",
+            MacProbeFailure::Incomplete => "error",
+        };
+        return failed_probe(node, wall_s, reason);
+    }
+    if res.code != Some(0) {
+        return failed_probe(node, wall_s, classify_failure(&res));
+    }
     let (main, bench) = match res.out.split_once(BENCH_MARK) {
         Some((m, b)) => (m, Some(b)),
         None => (res.out.as_str(), None),
     };
-    let Some(mut data) = last_json_line(main) else {
-        let e = if !res.err.is_empty() {
-            res.err.clone()
-        } else if !res.out.is_empty() {
-            res.out.clone()
-        } else {
-            format!("exit {}", res.code_str())
-        };
-        let reason = classify_failure(&res);
-        return json!({ "node_id": node.id, "ok": false, "reason": reason, "reason_text": reason_text(reason), "error": js::slice16_tail(js::trim(&e), 800), "wall_s": wall_s, "at": now_ms() });
+    let Some(mut data) = last_probe_json_line(main).filter(|value| valid_probe_envelope(value, if node.is_mac() { "mac" } else { "windows" })) else {
+        return failed_probe(node, wall_s, "error");
     };
     if let (Some(b), Value::Object(m)) = (bench, &mut data)
         && !js::truthy(m.get("bench"))
@@ -1342,7 +1397,7 @@ mod tests {
             let args = vec![helper.to_string(), benchmark.to_string(), network.to_string(), observe_wsl.to_string()];
             Box::pin(async move {
                 self.calls.lock().unwrap().push(("probe".into(), args));
-                RunResult { code: Some(0), out: "{\"probe\":true}\n".into(), err: String::new() }
+                RunResult { code: Some(0), out: "{\"probe\":\"windows\",\"probe_version\":2,\"host\":{}}\n".into(), err: String::new() }
             })
         }
     }

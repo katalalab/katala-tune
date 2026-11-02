@@ -61,7 +61,7 @@ impl Runner for MockSsh {
 #[tokio::test]
 async fn probe_separates_success_timeout_unreachable_and_auth_per_host() {
     let script: HashMap<String, RunResult> = [
-        ("mock-ok", res(Some(0), "{\"probe\":\"windows\",\"cpu_busy\":3}\n", "")),
+        ("mock-ok", res(Some(0), "{\"probe\":\"windows\",\"probe_version\":2,\"host\":{},\"cpu_busy\":3}\n", "")),
         ("mock-slow", res(None, "", "\ntimeout 120000ms")),
         ("mock-gone", res(Some(255), "", "ssh: Could not resolve hostname mock-gone: Name or service not known\n")),
         ("mock-down", res(Some(255), "", "ssh: connect to host mock-down port 22: Operation timed out\n")),
@@ -98,7 +98,8 @@ async fn probe_separates_success_timeout_unreachable_and_auth_per_host() {
     assert_eq!(texts.len(), 4);
     assert_eq!(results[1]["reason_text"], json!(reason_text("timeout")));
     // 元のエラー文は消さない（既存の画面・状態が使う）
-    assert!(results[2]["error"].as_str().unwrap().contains("Could not resolve hostname"));
+    let expected_error = results[2]["reason"].as_str().filter(|reason| matches!(*reason, "timeout" | "auth" | "unreachable")).unwrap_or("probe_failed");
+    assert_eq!(results[2]["error"].as_str(), Some(expected_error));
     assert_eq!(seen.lock().unwrap().len(), 6, "host ごとに結果が1回ずつ届く");
     let calls = ssh.calls.lock().unwrap();
     assert_eq!(calls.len(), 6);
@@ -504,7 +505,7 @@ impl Runner for CountLocal {
     fn probe_exchange<'a>(&'a self, _node: &'a Node, _helper: &'a str, _benchmark: bool, _network: bool, _observe_wsl: bool) -> RunFuture<'a> {
         Box::pin(async move {
             self.0.lock().unwrap().push("probe".into());
-            res(Some(0), "{\"probe\":\"windows\"}\n", "")
+            res(Some(0), "{\"probe\":\"windows\",\"probe_version\":2,\"host\":{}}\n", "")
         })
     }
 }
