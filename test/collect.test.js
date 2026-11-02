@@ -125,7 +125,7 @@ test('Windows probe は v2 helper と固定 named transport だけを使い、st
         run: async () => { genericCalls++; return { code: 0, out: '{"wrong":true}\n', err: '' }; },
         probeExchange: async (...args) => {
           call = args;
-          return { code: 0, out: '{"probe":true}\n', err: '' };
+          return { code: 0, out: '{"probe":"windows","probe_version":2,"host":{}}\n', err: '' };
         },
       },
     );

@@ -46,7 +46,7 @@ test('厳格完了は終了・送信・両 EOF の合成状態を確認し、既
       child.emit('close', fixture.code);
       const result = await pending;
       assert.equal(result.code, strict ? fixture.strict : fixture.legacy, fixture.name);
-      if (strict) assert.equal(result.completion_failure ?? null, fixture.failure, fixture.name);
+      if (strict) assert.equal(result.completion_failure, fixture.failure, fixture.name);
       else assert.deepEqual(Object.keys(result).sort(), ['code', 'err', 'out']);
     }
   }
@@ -94,4 +94,41 @@ test('厳格完了は実行体不存在とその他の起動不能を区別す�
   child.emit('spawn');
   child.emit('error', Object.assign(new Error('fixture'), { code: 'ENOENT' }));
   assert.equal((await pending).completion_failure, 'incomplete');
+});
+
+test('strict_exit_before_eof_is_proven', async () => {
+  const { child, pending } = fakeRunner(true);
+  child.emit('exit', 0);
+  child.stdin.emit('finish');
+  child.stderr.emit('end');
+  child.stdout.emit('end');
+  child.emit('close', 0);
+  const result = await pending;
+  assert.equal(result.code, 0);
+  assert.equal(result.completion_failure, null);
+});
+
+test('strict_late_success_after_timeout_is_rejected', async () => {
+  const { child, pending, advance } = fakeRunner(true);
+  advance(100);
+  child.stdin.emit('finish');
+  child.stdout.emit('end');
+  child.stderr.emit('end');
+  child.emit('exit', 0);
+  child.emit('close', 0);
+  advance(501);
+  const result = await pending;
+  assert.equal(result.completion_failure, 'timeout');
+});
+
+test('default_result_shape_remains_unchanged', async () => {
+  const { child, pending } = fakeRunner(false);
+  child.stdin.emit('finish');
+  child.stdout.emit('end');
+  child.stderr.emit('end');
+  child.emit('exit', 0);
+  child.emit('close', 0);
+  const result = await pending;
+  assert.equal(result.code, 0);
+  assert.equal(Object.prototype.hasOwnProperty.call(result, 'completion_failure'), false);
 });

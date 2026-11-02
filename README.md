@@ -125,3 +125,11 @@ MIT（[LICENSE](LICENSE)）
 Windows の 0.7 系候補では、通常収集にも承認済み helper の v2 record が必要です。初回導入・更新は [helper の承認とロールバック](docs/windows-helper-approval.md)、検証済みの範囲と公開前の条件は [Windows release readiness](docs/acceptance/windows-release-readiness.md) を参照してください。
 
 保存済み数値のbaseline読み取りAPIは、JS/Rustで同一の合成データを検証する開発中の基盤です。画面・自動所見への接続や操作効果の検証は含みません。対象指標・不足時の保留・検証範囲は [受入記録](docs/acceptance/saved-baseline.md) を参照してください。
+
+### JavaScript collector の完了確認と互換性
+
+Mac と Windows の収集結果は、終了成功と既知の組み込みプローブの形式（OS ごとの種別、version 2、host object）が確認できた場合に採用します。Mac では入力の書き込みと標準出力・標準エラーの両 EOF も確認します。従来の `code`・`out`・`err` だけを返し完了を証明できない注入 runner は、正常な結果として扱いません。Windows は従来の専用 exchange による完了確認を使います。
+
+JSON は benchmark の区切りより前の最後の非空行を使います。JSON より前の banner は許容しますが、後置 banner、壊れた最終行、未知 version を返す旧版・独自 helper は受け付けません。benchmark を無効にした場合、応答に benchmark が含まれていても取り込まず、分析に使用しません。
+
+指標の欠損・null や任意機能の未取得は拒否せず、部分的な結果を保持します。全指標を取得できない場合の coverage・score の扱いは別途検証が必要です。Mac の終了後の出力 drain には 500ms の猶予があり、この値は厳密な壁時計期限や子孫 process の回収を保証しません。収集時の失敗にはプローブの生出力や runner の例外本文を含めず、固定の分類を返します。保存処理や過去の記録については別途確認が必要です。

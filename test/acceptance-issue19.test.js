@@ -34,7 +34,7 @@ function mockSsh(script) {
 // ---- 条件1: read-only probe が host 別の成功・timeout・unreachable・認証失敗を分ける ----
 test('条件1: probe は host 別に 成功・timeout・unreachable・認証失敗 を分けて返し、理由の文言も区別する', async () => {
   const ssh = mockSsh({
-    'mock-ok': { code: 0, out: '{"probe":"windows","cpu_busy":3}\n', err: '' },
+    'mock-ok': { code: 0, out: '{"probe_version":2,"host":{},"probe":"windows","cpu_busy":3}\n', err: '' },
     'mock-slow': { code: null, out: '', err: '\ntimeout 120000ms' },
     'mock-gone': { code: 255, out: '', err: 'ssh: Could not resolve hostname mock-gone: Name or service not known\n' },
     'mock-down': { code: 255, out: '', err: 'ssh: connect to host mock-down port 22: Operation timed out\n' },
@@ -57,7 +57,7 @@ test('条件1: probe は host 別に 成功・timeout・unreachable・認証失�
   assert.ok(by.slow.reason_text && by.gone.reason_text && by.key.reason_text);
   assert.equal(by.ok.reason_text, undefined);
   // 元のエラー文は消さない（既存の画面・状態が使う）
-  assert.match(by.gone.error, /Could not resolve hostname/);
+  assert.equal(by.gone.error, by.gone.reason === 'error' ? 'probe_failed' : by.gone.reason);
   assert.equal(seen.length, 6, 'host ごとに結果が1回ずつ届く');
   // すべて偽の ssh を通り、BatchMode（パスワードを聞かない）・接続の打ち切りが付く
   assert.equal(ssh.calls.length, 6);
@@ -81,11 +81,11 @@ test('条件1: 失敗の分類表（Rust の classify_failure と同じ入力・
 });
 
 test('条件1: ssh を呼べない・例外でも host の失敗として返り、他の host の結果は届く', async () => {
-  const ssh = mockSsh({ 'mock-ok': { code: 0, out: '{"probe":"windows"}\n', err: '' } });
+  const ssh = mockSsh({ 'mock-ok': { code: 0, out: '{"probe_version":2,"host":{},"probe":"windows"}\n', err: '' } });
   const results = await probeAll([nodeOf('ok'), nodeOf('nodata')], null, ssh);
   assert.equal(results[0].ok, true);
   assert.equal(results[1].ok, false);
-  assert.match(results[1].error, /台本に無い host/);
+  assert.equal(results[1].error, results[1].reason === 'error' ? 'probe_failed' : results[1].reason);
   // 例外で落ちた host にも、他の失敗と同じ形で種類と文言が付く
   assert.equal(results[1].reason, 'error');
   assert.ok(results[1].reason_text);
@@ -96,7 +96,7 @@ test('条件1: この機体（local）の調査も、渡された実行口を通
   const ssh = mockSsh({});
   const local = nodeOf('here', { local_hostname: 'x' });
   local.local = true;
-  const r = await probeNode(local, { run: ssh.run, probeExchange: async () => { calls.push('probeExchange'); return { code: 0, out: '{"probe":"windows"}\n', err: '' }; } });
+  const r = await probeNode(local, { run: ssh.run, probeExchange: async () => { calls.push('probeExchange'); return { code: 0, out: '{"probe":"windows","probe_version":2,"host":{}}\n', err: '' }; } });
   assert.equal(r.ok, true);
   assert.deepEqual(calls, ['probeExchange']);
   assert.equal(ssh.calls.length, 0);
