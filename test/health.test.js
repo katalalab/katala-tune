@@ -88,25 +88,37 @@ const memoryCheck = (probe, memory, findings = []) => nodeChecks({ id: 'fixture'
 
 test('macOS のメモリ圧迫が未取得なら正常としない', () => {
   for (const pressure of ['unknown', null, undefined]) {
-    const check = memoryCheck('mac', { pressure, swap_used_gb: 0 });
+    const check = memoryCheck('mac', { total_gb: 16, available_pct: 50, pressure, swap_used_gb: 0 });
     assert.equal(check.status, 'unknown');
     assert.match(check.detail, /不明/);
   }
-  const missingSwap = memoryCheck('mac', { pressure: 'normal', swap_used_gb: null });
+  const missingSwap = memoryCheck('mac', { total_gb: 16, available_pct: 50, pressure: 'normal', swap_used_gb: null });
   assert.equal(missingSwap.status, 'unknown');
   assert.match(missingSwap.detail, /不明/);
 });
 
 test('Windows の空き・コミットが未取得なら正常や欠測由来の警告としない', () => {
   for (const memory of [
-    { available_pct: 50, commit_pct: null },
-    { available_pct: null, commit_pct: 30 },
+    { total_gb: 64, available_pct: 50, commit_pct: null },
+    { total_gb: 64, available_pct: null, commit_pct: 30 },
     {},
-    { available_pct: '50', commit_pct: 30 },
-    { available_pct: -1, commit_pct: 30 },
-    { available_pct: 50, commit_pct: 101 },
+    { total_gb: 64, available_pct: '50', commit_pct: 30 },
+    { total_gb: 64, available_pct: -1, commit_pct: 30 },
+    { total_gb: 64, available_pct: 50, commit_pct: 101 },
   ]) {
     const check = memoryCheck('windows', memory);
+    assert.equal(check.status, 'unknown');
+    assert.match(check.detail, /不明/);
+  }
+});
+
+test('メモリの総量または Mac の空き率が欠測なら正常としない', () => {
+  for (const [probe, memory] of [
+    ['mac', { total_gb: 16, available_pct: null, pressure: 'normal', swap_used_gb: 0 }],
+    ['mac', { total_gb: null, available_pct: 50, pressure: 'normal', swap_used_gb: 0 }],
+    ['windows', { total_gb: null, available_pct: 50, commit_pct: 30 }],
+  ]) {
+    const check = memoryCheck(probe, memory);
     assert.equal(check.status, 'unknown');
     assert.match(check.detail, /不明/);
   }
@@ -116,14 +128,14 @@ test('他のメモリ項目が未取得でも観測済みの警告・危険は�
   assert.equal(memoryCheck('windows', { available_pct: null, commit_pct: 95 }).status, 'fail');
   assert.equal(memoryCheck('windows', { available_pct: null, commit_pct: 85 }).status, 'warn');
   assert.equal(memoryCheck('windows', { available_pct: 0, commit_pct: null }).status, 'fail');
-  assert.equal(memoryCheck('windows', { available_pct: 50, commit_pct: 30 }).status, 'ok');
+  assert.equal(memoryCheck('windows', { total_gb: 64, available_pct: 50, commit_pct: 30 }).status, 'ok');
   assert.equal(memoryCheck('mac', { pressure: 'critical', swap_used_gb: null }).status, 'fail');
   assert.equal(memoryCheck('mac', { pressure: 'warn', swap_used_gb: null }).status, 'warn');
-  assert.equal(memoryCheck('mac', { pressure: 'normal', swap_used_gb: 0 }).status, 'ok');
+  assert.equal(memoryCheck('mac', { total_gb: 16, available_pct: 50, pressure: 'normal', swap_used_gb: 0 }).status, 'ok');
 });
 
 test('Mac の swap 所見があれば圧迫が正常でも警告を残す', () => {
-  const memory = { pressure: 'normal', swap_used_gb: 8 };
+  const memory = { total_gb: 16, available_pct: 50, pressure: 'normal', swap_used_gb: 8 };
   const warning = memoryCheck('mac', memory, [{ id: 'swap', severity: 'warn' }]);
   assert.equal(warning.status, 'warn');
   assert.match(warning.detail, /swap の所見/);

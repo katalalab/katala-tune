@@ -65,13 +65,21 @@ const counts = (r) => { const c = { critical: 0, warn: 0, info: 0 }; (r?.finding
 const osIcon = (n) => (n.os === 'windows' ? 'win' : 'mac');
 const sysDisk = (d) => (d?.disk || []).find((x) => x.mount === '/' || /^C:/i.test(x.mount));
 const scoreClass = (s) => `sc-${Charts.scoreTone(s)}`;
+function memoryObservationKnown(d) {
+  const m = d?.memory;
+  const pct = (v) => Number.isFinite(v) && v >= 0 && v <= 100;
+  if (!m || !Number.isFinite(m.total_gb) || m.total_gb <= 0 || !pct(m.available_pct)) return false;
+  if (d.probe === 'windows') return pct(m.commit_pct);
+  if (d.probe === 'mac') return ['normal', 'warn', 'critical'].includes(m.pressure) && Number.isFinite(m.swap_used_gb) && m.swap_used_gb >= 0;
+  return false;
+}
 function nodeDot(n) {
   if (state.busy.has(n.id)) return 'busy';
   const r = state.results[n.id];
   if (r && !r.ok) return 'crit';
   if (!r) { const fl = fleetNode(n.id); return fl ? (fl.state === 'online' ? 'ok' : 'warn') : ''; }
   const c = counts(r);
-  return c.critical ? 'crit' : c.warn ? 'warn' : 'ok';
+  return c.critical ? 'crit' : c.warn ? 'warn' : '';
 }
 
 // 検索欄: 値はすぐ覚え、打ち終わってから描き直して選択範囲を戻す。破棄済みの入力欄からは描き直さない
@@ -186,15 +194,21 @@ function cardHtml(n, coverage) {
   const fl = fleetNode(n.id);
   const c = counts(r);
   const disk = sysDisk(d);
-  const memUsed = d?.memory?.available_pct != null ? 100 - d.memory.available_pct : fl?.metrics?.mem ?? null;
-  const cpu = d?.cpu_busy ?? fl?.metrics?.cpu ?? null;
-  const diskUsed = disk ? 100 - disk.free_pct : fl?.metrics?.disk ?? null;
+  const validPct = (v) => Number.isFinite(v) && v >= 0 && v <= 100;
+  const fleetValue = (key) => !r?.ok && validPct(fl?.metrics?.[key]) ? fl.metrics[key] : null;
+  const fleetMem = fleetValue('mem'), fleetCpu = fleetValue('cpu'), fleetDisk = fleetValue('disk');
+  const memUsed = r?.ok ? (validPct(d?.memory?.available_pct) ? 100 - d.memory.available_pct : null) : fleetMem;
+  const cpu = r?.ok ? (validPct(d?.cpu_busy) ? d.cpu_busy : null) : fleetCpu;
+  const diskUsed = r?.ok ? (validPct(disk?.free_pct) ? 100 - disk.free_pct : null) : fleetDisk;
+  const memoryUnknown = !!r?.ok && !memoryObservationKnown(d);
+  const total = Number.isFinite(d?.memory?.total_gb) && d.memory.total_gb > 0 ? d.memory.total_gb : '不明';
   const busy = state.busy.has(n.id);
   const cmp = r?.compare;
   const delta = cmp ? ` <span class="delta ${cmp.verdict}">${cmp.bench_ratio >= 1 ? '+' : ''}${((cmp.bench_ratio - 1) * 100).toFixed(0)}%</span>` : '';
   const tags = [n.local ? UI.chip('この機体', 'blue') : '', n.shared ? UI.chip('提案のみ', 'gray') : '', opChip(n)].join('');
   const sev = [c.critical ? UI.chip(`重大 ${c.critical}`, 'red') : '', c.warn ? UI.chip(`注意 ${c.warn}`, 'orange') : '', c.info ? UI.chip(`提案 ${c.info}`, 'blue') : '',
-    r?.ok && !c.critical && !c.warn && (!coverage || coverage === 'fresh') ? UI.chip('良好', 'green') : ''].join('');
+    memoryUnknown ? UI.chip('メモリ不明', 'gray') : '',
+    r?.ok && !c.critical && !c.warn && !memoryUnknown && (!coverage || coverage === 'fresh') ? UI.chip('所見なし', 'gray') : ''].join('');
   return `<div class="card${busy ? ' busy' : ''}" data-id="${esc(n.id)}" tabindex="0" role="button" aria-label="${esc(n.id)} の詳細を開く">
     <div class="card-top">
       <div class="card-id"><div class="card-name">${icon(osIcon(n))}<span>${esc(n.id)}</span></div>
@@ -202,13 +216,13 @@ function cardHtml(n, coverage) {
       ${Charts.ring(r?.ok ? r.score : null)}
     </div>
     <div class="card-meters">
-      ${Charts.meter(cpu, { label: 'CPU', ...TH.cpu, text: cpu != null ? `${Math.round(cpu)}%` : '-' })}
-      ${Charts.meter(memUsed, { label: 'メモリ', ...TH.mem, text: memUsed != null ? `${Math.round(memUsed)}%` : '-' })}
-      ${Charts.meter(diskUsed, { label: 'ディスク', ...TH.disk, text: disk ? `空き ${disk.free_gb} GB` : diskUsed != null ? `${Math.round(diskUsed)}%` : '-' })}
+      ${Charts.meter(cpu, { label: fleetCpu != null ? 'CPU（fleet・時刻未確認）' : 'CPU', ...TH.cpu, text: cpu != null ? `${Math.round(cpu)}%` : '不明' })}
+      ${Charts.meter(memUsed, { label: fleetMem != null ? 'メモリ（fleet・時刻未確認）' : 'メモリ', ...TH.mem, text: memUsed != null ? `${Math.round(memUsed)}%` : '不明' })}
+      ${Charts.meter(diskUsed, { label: fleetDisk != null ? 'ディスク（fleet・時刻未確認）' : 'ディスク', ...TH.disk, text: diskUsed != null && disk ? `空き ${disk.free_gb ?? '不明'} GB` : diskUsed != null ? `${Math.round(diskUsed)}%` : '不明' })}
     </div>
-    <div class="card-hw">${esc(d ? `${d.host.cpu} · ${d.host.cores} スレッド · ${d.memory.total_gb} GB` : n.os === 'macos' ? 'macOS' : 'Windows')}</div>
+    <div class="card-hw">${esc(d ? `${d.host?.cpu ?? '不明'} · ${d.host?.cores ?? '不明'} スレッド · ${total} GB` : n.os === 'macos' ? 'macOS' : 'Windows')}</div>
     <div class="card-foot">${coverage ? UI.chip(COVERAGE_LABEL[coverage], COVERAGE_TONE[coverage]) : ''}${sev}${d?.bench ? `<span title="1スレッドの固定計算。小さいほど速い">計測 ${esc(d.bench.median_ms)} ms${delta}</span>` : ''}
-      <span class="right">${busy ? '分析中…' : r ? esc(ago(r.at)) : '未分析'}</span></div>
+      ${r?.ok ? '<span class="faint">スコアの取得範囲は未確認</span>' : ''}<span class="right">${busy ? '分析中…' : r ? esc(ago(r.at)) : '未分析'}</span></div>
     ${r && !r.ok ? `<div class="err"><b>分析できませんでした${r.reason_text ? `（${esc(r.reason_text)}）` : ''}</b>\n${esc(r.error)}</div>` : ''}
   </div>`;
 }
@@ -315,16 +329,18 @@ function compareHtml(cmp) {
 function nodeProps(n, r) {
   const d = r?.ok ? r.data : null;
   const c = counts(r);
+  const memoryUnknown = !!r?.ok && !memoryObservationKnown(d);
+  const total = Number.isFinite(d?.memory?.total_gb) && d.memory.total_gb > 0 ? d.memory.total_gb : '不明';
   const stateChip = !r ? UI.chip('未分析', 'gray', { dot: true }) : !r.ok ? UI.chip('分析できない', 'red', { dot: true })
-    : c.critical ? UI.chip(`重大 ${c.critical}`, 'red', { dot: true }) : c.warn ? UI.chip(`注意 ${c.warn}`, 'orange', { dot: true }) : UI.chip('良好', 'green', { dot: true });
-  const more = r?.ok ? [c.critical && c.warn ? UI.chip(`注意 ${c.warn}`, 'orange') : '', c.info ? UI.chip(`提案 ${c.info}`, 'blue') : ''].join('') : '';
+    : c.critical ? UI.chip(`重大 ${c.critical}`, 'red', { dot: true }) : c.warn ? UI.chip(`注意 ${c.warn}`, 'orange', { dot: true }) : memoryUnknown ? UI.chip('メモリ不明', 'gray', { dot: true }) : UI.chip('所見なし', 'gray', { dot: true });
+  const more = r?.ok ? [c.critical && c.warn ? UI.chip(`注意 ${c.warn}`, 'orange') : '', c.info ? UI.chip(`提案 ${c.info}`, 'blue') : '', memoryUnknown && (c.critical || c.warn) ? UI.chip('メモリ不明', 'gray') : ''].join('') : '';
   const cmp = r?.compare;
   return UI.props([
     ['状態', stateChip + more, 'status'],
-    r?.ok && ['スコア', `${Charts.ring(r.score, { size: 18, stroke: 3, label: false })}<span class="num"><b class="${scoreClass(r.score)}">${esc(r.score)}</b> / 100</span>`, 'gauge'],
+    r?.ok && ['スコア', `${Charts.ring(r.score, { size: 18, stroke: 3, label: false })}<span class="num"><b class="${scoreClass(r.score)}">${esc(r.score)}</b> / 100</span><span class="faint">取得範囲は未確認</span>`, 'gauge'],
     cmp && ['前回比', compareHtml(cmp), 'history'],
     ['OS', esc(d?.host?.os || (n.os === 'macos' ? 'macOS' : 'Windows')), osIcon(n)],
-    d && ['CPU・メモリ', esc(`${d.host.cpu} · ${d.host.cores} スレッド · ${d.memory.total_gb} GB`), 'machine'],
+    d && ['CPU・メモリ', esc(`${d.host?.cpu ?? '不明'} · ${d.host?.cores ?? '不明'} スレッド · ${total} GB`), 'machine'],
     ['接続', `<code>${esc(n.alias)}</code>${n.local ? UI.chip('この機体（ローカルで実行）', 'blue') : ''}${n.shared ? UI.chip('共用機・提案のみ', 'gray') : ''}`, 'link'],
     r?.at && ['最終分析', `<span>${esc(fmtTime(r.at))}</span><span class="faint">${esc(ago(r.at))}</span>${r.stale ? UI.chip('前回の結果', 'default', { title: 'アプリを開いたときに保存済みの結果を表示しています' }) : ''}`, 'actions'],
     d?.bench && ['計測', `<span class="num">${esc(d.bench.median_ms)} ms</span><span class="faint">1スレッドの固定計算。小さいほど速い</span>`, 'resources'],
@@ -485,10 +501,19 @@ function gpuHtml(g) {
 }
 
 function machineHtml(d, r) {
+  const memory = d.memory || {};
+  const nonnegative = (value) => Number.isFinite(value) && value >= 0 ? value : '不明';
+  const percent = (value) => Number.isFinite(value) && value >= 0 && value <= 100 ? value : '不明';
+  const total = Number.isFinite(memory.total_gb) && memory.total_gb > 0 ? memory.total_gb : '不明';
+  const memoryDetail = d.probe === 'mac'
+    ? ` · swap ${nonnegative(memory.swap_used_gb)} GB`
+    : d.probe === 'windows'
+      ? ` · コミット ${percent(memory.commit_pct)}%`
+      : `${memory.swap_used_gb != null ? ` · swap ${nonnegative(memory.swap_used_gb)} GB` : ''}${memory.commit_pct != null ? ` · コミット ${percent(memory.commit_pct)}%` : ''}`;
   const rows = [
     ['OS', d.host.os], ['CPU', `${d.host.cpu}（${d.host.cores} スレッド${d.host.p_cores ? ` · P ${d.host.p_cores} / E ${d.host.e_cores}` : ''}）`],
     ['稼働時間', d.host.uptime_h != null ? `${(d.host.uptime_h / 24).toFixed(1)} 日` : '-'],
-    ['メモリ', `${d.memory.total_gb} GB · 空き ${d.memory.available_pct}%${d.memory.swap_used_gb != null ? ` · swap ${d.memory.swap_used_gb} GB` : ''}${d.memory.commit_pct != null ? ` · コミット ${d.memory.commit_pct}%` : ''}`],
+    ['メモリ', `${total} GB · 空き ${percent(memory.available_pct)}%${memoryDetail}`],
     ['計測（5回）', d.bench ? `${d.bench.runs_ms.join(' / ')} ms（中央値 ${d.bench.median_ms}）` : d.benchmark_skipped ? '台帳の設定で省略' : '計測結果なし'],
   ];
   if (d.load) rows.push(['load', d.load.join(' / ')]);
@@ -657,12 +682,15 @@ function renderResources() {
         const d = r.data;
         const disk = sysDisk(d);
         const g = d.gpus?.[0];
-        const commit = d.memory.commit_pct;
+        const memory = d.memory || {};
+        const commit = memory.commit_pct;
+        const swap = memory.swap_used_gb;
+        const available = Number.isFinite(memory.available_pct) && memory.available_pct >= 0 && memory.available_pct <= 100 ? memory.available_pct : null;
         const sw = d.probe === 'windows'
-          ? `<span class="${commit >= 90 ? 'sc-crit' : commit >= 80 ? 'sc-warn' : ''}">${esc(commit)}%</span>`
-          : `${esc(d.memory.swap_used_gb)} GB`;
+          ? (Number.isFinite(commit) && commit >= 0 && commit <= 100 ? `<span class="${commit >= 90 ? 'sc-crit' : commit >= 80 ? 'sc-warn' : ''}">${esc(commit)}%</span>` : '不明')
+          : (Number.isFinite(swap) && swap >= 0 ? `${esc(swap)} GB` : '不明');
         return `<td><b>${esc(n.id)}</b><span class="sub">${esc(d.host.cpu)}</span></td>
-          ${m(d.cpu_busy, TH.cpu)}${m(d.memory.available_pct != null ? 100 - d.memory.available_pct : null, TH.mem)}
+          ${m(d.cpu_busy, TH.cpu)}${m(available != null ? 100 - available : null, TH.mem)}
           <td class="n mid">${sw}</td>${m(disk ? 100 - disk.free_pct : null, TH.disk)}<td class="n mid">${disk ? esc(disk.free_gb) + ' GB' : '-'}</td>
           <td class="n mid">${g ? `${esc(g.util ?? '-')}% · ${esc(g.temp_c ?? '-')}°C` : '<span class="faint">-</span>'}</td><td class="n mid">${withUnit(g?.power_w,' W')}</td><td class="n mid">${withUnit(g?.clocks_graphics_mhz,' MHz')}</td><td class="n mid">${d.host.uptime_h != null ? (d.host.uptime_h / 24).toFixed(1) + ' 日' : '-'}</td>
           <td class="n mid">${d.bench ? `${esc(d.bench.median_ms)} ms` : d.benchmark_skipped ? '省略' : '-'}</td><td class="n mid"><span class="score-cell">${Charts.ring(r.score, { size: 26, stroke: 3 })}</span></td>`;

@@ -430,7 +430,8 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
     let m = get(s, "memory");
     let mg = |k: &str| get(m, k);
     if !is_win {
-        let pressure_detail = || format!("圧縮 {} GB、swap {}/{} GB", string(mg("compressed_gb")), string(mg("swap_used_gb")), string(mg("swap_total_gb")));
+        let swap_text = |key| if present(mg(key)) { string(mg(key)) } else { "不明".into() };
+        let pressure_detail = || format!("圧縮 {} GB、swap {}/{} GB", string(mg("compressed_gb")), swap_text("swap_used_gb"), swap_text("swap_total_gb"));
         if js::is_str(mg("pressure"), "critical") {
             out.simple(
                 "mem-pressure",
@@ -457,7 +458,11 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 "warn",
                 "memory",
                 format!("swap を {} GB 使っている", string(mg("swap_used_gb"))),
-                format!("実メモリ {} GB に対して {}%", string(mg("total_gb")), to_fixed(num(mg("swap_used_gb")) / num(mg("total_gb")) * 100.0, 0)),
+                if mg("total_gb").and_then(Value::as_f64).is_some_and(|v| v > 0.0 && v.is_finite()) {
+                    format!("実メモリ {} GB に対して {}%", string(mg("total_gb")), to_fixed(num(mg("swap_used_gb")) / num(mg("total_gb")) * 100.0, 0))
+                } else {
+                    "実メモリの総量・割合は不明".into()
+                },
                 "一度大きく溜まった swap はアプリを閉じても残りやすい。大口を閉じたあと、余裕のある時間に再起動すると解消する。",
             );
         }
@@ -489,6 +494,28 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 "予約だけで実際には使われていない分も含む。WSL や大きなモデルを動かすとここで詰まる。ページファイルが 4GB 固定なら「システム管理サイズ」に戻すと余裕ができる。",
             );
         }
+    }
+    // OS が不明か取得元と食い違っても、観測済みの危険値は残す。
+    if !is_win {
+        if let Some(commit) = mg("commit_pct").and_then(Value::as_f64).filter(|v| (80.0..=100.0).contains(v)) {
+            out.simple(
+                "commit-source",
+                if commit >= 90.0 { "critical" } else { "warn" },
+                "memory",
+                format!("取得元要確認: コミット済みメモリ {}%", string(mg("commit_pct"))),
+                "OS と一致しない、または OS が不明な計測値".into(),
+                "保存された値の取得元と時刻を確認し、必要に応じて再取得する。",
+            );
+        }
+    } else if js::is_str(mg("pressure"), "warn") || js::is_str(mg("pressure"), "critical") {
+        out.simple(
+            "pressure-source",
+            if js::is_str(mg("pressure"), "critical") { "critical" } else { "warn" },
+            "memory",
+            format!("取得元要確認: メモリ圧迫 {}", string(mg("pressure"))),
+            "OS と一致しない計測値".into(),
+            "保存された値の取得元と時刻を確認し、必要に応じて再取得する。",
+        );
     }
     for a in arr(get(procs, "apps")).iter().filter(|a| total_mb_truthy && num(a.get("mem_mb")) >= total_mb * 0.2).take(3) {
         out.simple(
@@ -772,6 +799,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
     // WSL / コンテナ VM
     if is_win {
         let wsl_memory = get(get(s, "wsl"), "memory");
+        let wsl_total = get(get(s, "memory"), "total_gb").and_then(Value::as_f64).filter(|v| v.is_finite() && *v > 0.0);
         let vm = arr(get(procs, "apps")).iter().find(|a| string(a.get("app")).to_ascii_lowercase().starts_with("vmmem"));
         let wslconfig = |total: f64| {
             format!(
@@ -779,7 +807,7 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 js::num_str(js::max(&[8.0, js::round(total / 2.0)]))
             )
         };
-        if let Some(vm) = vm.filter(|vm| total_mb_truthy && num(vm.get("mem_mb")) >= total_mb * 0.25 && !truthy(wsl_memory)) {
+        if let Some(vm) = vm.filter(|vm| wsl_total.is_some() && num(vm.get("mem_mb")) >= total_mb * 0.25 && !truthy(wsl_memory)) {
             out.add(
                 "wsl-limit".into(),
                 "warn",
@@ -796,9 +824,9 @@ pub fn analyze(snap: &Value, node: &Value) -> Vec<Value> {
                 "info",
                 "memory",
                 "WSL のメモリ上限が未設定".into(),
-                "既定では実メモリの半分まで使う".into(),
-                "常用するなら上限と autoMemoryReclaim を設定しておくと、使い終わったメモリが Windows に戻る。GPU 計算 PID がある・GPU 使用率が高い・GPU 状態を取得できない、または GPU 学習保護の機体では、`wsl --shutdown` と上限変更の反映を保留する。".into(),
-                Some(vec![wslconfig(num(or(get(get(s, "memory"), "total_gb"), Some(&Value::from(16)))))]),
+                if wsl_total.is_some() { "既定では実メモリの半分まで使う" } else { "物理メモリの総量は不明" }.into(),
+                if wsl_total.is_some() { "常用するなら上限と autoMemoryReclaim を設定しておくと、使い終わったメモリが Windows に戻る。GPU 計算 PID がある・GPU 使用率が高い・GPU 状態を取得できない、または GPU 学習保護の機体では、`wsl --shutdown` と上限変更の反映を保留する。" } else { "物理メモリの総量を確認してから上限を検討する。" }.into(),
+                wsl_total.map(|total| vec![wslconfig(total)]),
                 None,
             );
         }
@@ -1035,6 +1063,71 @@ pub fn compare(prev: Option<&Value>, cur: Option<&Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swap_ratio_does_not_invent_missing_memory_total() {
+        for total in [Value::Null, json!(0), json!(-1)] {
+            let findings = analyze(&json!({"probe":"mac", "memory":{"total_gb":total,"swap_used_gb":8}}), &json!({}));
+            let finding = findings.iter().find(|f| f["id"] == "swap").unwrap();
+            let detail = finding["detail"].as_str().unwrap();
+            assert!(detail.contains("不明"));
+            assert!(!detail.contains("Infinity") && !detail.contains("NaN"));
+        }
+        let findings = analyze(&json!({"probe":"mac", "memory":{"total_gb":16,"swap_used_gb":8}}), &json!({}));
+        assert!(findings.iter().find(|f| f["id"] == "swap").unwrap()["detail"].as_str().unwrap().contains("50%"));
+    }
+
+    #[test]
+    fn memory_risks_survive_unknown_or_inconsistent_os() {
+        for probe in [Value::Null, json!("mac")] {
+            for (commit, expected) in [(json!(95), "critical"), (json!(85), "warn")] {
+                let findings = analyze(&json!({"probe": probe, "memory": {"commit_pct": commit}}), &json!({}));
+                let finding = findings.iter().find(|f| f["id"] == "commit-source").unwrap();
+                assert_eq!(finding["severity"], expected);
+            }
+            for commit in [Value::Null, json!("95"), json!(101), json!(-1)] {
+                let findings = analyze(&json!({"probe": probe, "memory": {"commit_pct": commit}}), &json!({}));
+                assert!(!findings.iter().any(|f| f["id"] == "commit-source"));
+            }
+        }
+        for (pressure, expected) in [("critical", "critical"), ("warn", "warn")] {
+            let findings = analyze(&json!({"probe": "windows", "memory": {"pressure": pressure}}), &json!({}));
+            let finding = findings.iter().find(|f| f["id"] == "pressure-source").unwrap();
+            assert_eq!(finding["severity"], expected);
+        }
+    }
+
+    #[test]
+    fn memory_pressure_detail_distinguishes_missing_swap_from_zero() {
+        for pressure in ["warn", "critical"] {
+            for (used, total, expected) in [(Value::Null, Value::Null, "swap 不明/不明 GB"), (json!(0), json!(0), "swap 0/0 GB")] {
+                let snap = json!({ "probe": "mac", "memory": { "total_gb": 16, "pressure": pressure, "compressed_gb": 1, "swap_used_gb": used, "swap_total_gb": total } });
+                let findings = analyze(&snap, &json!({}));
+                let finding = findings.iter().find(|finding| finding["id"] == "mem-pressure").unwrap();
+                assert!(finding["detail"].as_str().is_some_and(|detail| detail.contains(expected)));
+            }
+        }
+    }
+
+    #[test]
+    fn wsl_limit_does_not_invent_total_memory() {
+        for total in [Value::Null, json!(0), json!(-1)] {
+            let snap = json!({ "probe": "windows", "memory": { "total_gb": total }, "wsl": { "config": false }, "processes": { "apps": [] } });
+            let findings = analyze(&snap, &json!({}));
+            let finding = findings.iter().find(|finding| finding["id"] == "wsl-limit").unwrap();
+            assert!(finding["detail"].as_str().is_some_and(|detail| detail.contains("不明")));
+            assert!(finding.get("commands").is_none());
+        }
+        let snap = json!({ "probe": "windows", "memory": { "total_gb": 64 }, "wsl": { "config": false }, "processes": { "apps": [] } });
+        let findings = analyze(&snap, &json!({}));
+        let finding = findings.iter().find(|finding| finding["id"] == "wsl-limit").unwrap();
+        assert!(finding["commands"][0].as_str().is_some_and(|text| text.contains("memory=32GB")));
+        let invalid = json!({ "probe": "windows", "memory": { "total_gb": -1 }, "wsl": { "config": false }, "processes": { "apps": [{ "app": "vmmemWSL", "mem_mb": 1024 }] } });
+        let findings = analyze(&invalid, &json!({}));
+        let finding = findings.iter().find(|finding| finding["id"] == "wsl-limit").unwrap();
+        assert_eq!(finding["severity"], "info");
+        assert!(finding.get("commands").is_none());
+    }
 
     #[test]
     fn same_name_roots_have_distinct_selectable_ids() {

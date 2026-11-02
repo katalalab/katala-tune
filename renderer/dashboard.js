@@ -114,13 +114,15 @@
   function mdmTable(d) {
     const yes = (b, okText, ngText, ngTone = 'orange') => (b == null ? '<span class="muted">–</span>' : b ? UI.chip(okText, 'green') : UI.chip(ngText, ngTone));
     return UI.table({
-      cols: [{ label: '機体' }, { label: 'OS' }, { label: '稼働', cls: 'n' }, { label: 'スコア', cls: 'n' }, { label: '所見' }, { label: '空きが最小のディスク' }, { label: '防御' }, { label: '電源' }, { label: '7 日の停止', cls: 'n' }, { label: 'サンプラー' }, { label: '最終分析' }],
+      cols: [{ label: '機体' }, { label: 'OS' }, { label: '稼働', cls: 'n' }, { label: 'スコア（取得範囲未確認）', cls: 'n' }, { label: '所見' }, { label: '空きが最小のディスク' }, { label: '防御' }, { label: '電源' }, { label: '7 日の停止', cls: 'n' }, { label: 'サンプラー' }, { label: '最終分析' }],
       rows: d.nodes,
       cls: 'scroll-x dash-mdm',
       row: (n) => {
         const l = n.last || {};
         const disk = l.disk_low ? `${esc(l.disk_low.mount)} ${UI.chip(`${r0(l.disk_low.free_pct)}%`, l.disk_low.free_pct < 10 ? 'red' : l.disk_low.free_pct < 20 ? 'orange' : 'default')}` : '<span class="muted">–</span>';
-        const counts = [l.critical ? UI.chip(`重大 ${l.critical}`, 'red') : '', l.warn ? UI.chip(`注意 ${l.warn}`, 'orange') : ''].join('') || (l.at ? UI.chip('良好', 'green') : '<span class="muted">–</span>');
+        const counts = l.ok === false ? UI.chip('分析失敗', 'red')
+          : l.ok !== true || l.findings_known !== true ? (l.at ? UI.chip('所見不明', 'gray') : '<span class="muted">–</span>')
+            : [l.critical ? UI.chip(`重大 ${l.critical}`, 'red') : '', l.warn ? UI.chip(`注意 ${l.warn}`, 'orange') : ''].join('') || UI.chip('所見なし', 'gray');
         const stops = num(l.bugchecks_7d) ? (l.bugchecks_7d > 0 ? UI.chip(String(l.bugchecks_7d), 'red') : '0') : '<span class="muted">–</span>';
         return `<td class="nowrap"><b class="link" data-goto="${esc(n.id)}" tabindex="0">${esc(n.id)}</b></td><td class="nowrap">${esc(l.os || n.os)}</td>`
           + `<td class="n num">${num(l.uptime_h) ? esc(fmtUptime(l.uptime_h)) : '–'}</td><td class="n num">${num(l.score) ? esc(l.score) : '–'}</td><td>${counts}</td><td class="nowrap">${disk}</td>`

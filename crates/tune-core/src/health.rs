@@ -270,6 +270,7 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
     let is_win = js::is_str(get(d, "probe"), "windows");
     let is_mac = js::is_str(get(d, "probe"), "mac");
     let percent = |value: Jv<'_>| value.and_then(Value::as_f64).filter(|v| v.is_finite() && (0.0..=100.0).contains(v));
+    let total = get(m, "total_gb").and_then(Value::as_f64).filter(|v| v.is_finite() && *v > 0.0);
     let avail = percent(get(m, "available_pct"));
     let commit = percent(get(m, "commit_pct"));
     let pressure = get(m, "pressure").and_then(Value::as_str);
@@ -284,7 +285,11 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
         || commit.is_some_and(|v| v >= 80.0)
         || (is_win && avail.is_some_and(|v| v < 20.0))
         || swap_finding.is_some();
-    let mem_known = if is_win { avail.is_some() && commit.is_some() } else { is_mac && pressure_known && swap.is_some() };
+    let mem_known = if is_win {
+        total.is_some() && avail.is_some() && commit.is_some()
+    } else {
+        is_mac && total.is_some() && avail.is_some() && pressure_known && swap.is_some()
+    };
     let swap_note = if swap_finding.is_some() { "・swap の所見あり" } else { "" };
     out.add(
         "memory",
@@ -300,7 +305,8 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
         },
         if is_win {
             format!(
-                "空き {}%・コミット {}%{}{}",
+                "総量 {} GB・空き {}%・コミット {}%{}{}",
+                if total.is_some() { string(get(m, "total_gb")) } else { "不明".into() },
                 if avail.is_some() { string(get(m, "available_pct")) } else { "不明".into() },
                 if commit.is_some() { string(get(m, "commit_pct")) } else { "不明".into() },
                 if pressure_known && pressure != Some("normal") { format!("・圧迫 {}", string(get(m, "pressure"))) } else { String::new() },
@@ -308,7 +314,9 @@ pub fn node_checks(node: &Value, snap: Option<&Value>, findings: &[Value], ctx: 
             )
         } else if is_mac {
             format!(
-                "圧迫 {}・swap {} GB{}{}",
+                "総量 {} GB・空き {}%・圧迫 {}・swap {} GB{}{}",
+                if total.is_some() { string(get(m, "total_gb")) } else { "不明".into() },
+                if avail.is_some() { string(get(m, "available_pct")) } else { "不明".into() },
                 if pressure_known { string(get(m, "pressure")) } else { "不明".into() },
                 if swap.is_some() { string(get(m, "swap_used_gb")) } else { "不明".into() },
                 if commit.is_some_and(|v| v >= 80.0) { format!("・コミット {}%", string(get(m, "commit_pct"))) } else { String::new() },
@@ -496,15 +504,15 @@ mod tests {
     #[test]
     fn incomplete_memory_observations_are_unknown() {
         let cases = [
-            ("mac", json!({ "pressure": "unknown", "swap_used_gb": 0 })),
-            ("mac", json!({ "pressure": null, "swap_used_gb": 0 })),
-            ("mac", json!({ "pressure": "normal", "swap_used_gb": null })),
-            ("windows", json!({ "available_pct": 50, "commit_pct": null })),
-            ("windows", json!({ "available_pct": null, "commit_pct": 30 })),
+            ("mac", json!({ "total_gb": 16, "available_pct": 50, "pressure": "unknown", "swap_used_gb": 0 })),
+            ("mac", json!({ "total_gb": 16, "available_pct": 50, "pressure": null, "swap_used_gb": 0 })),
+            ("mac", json!({ "total_gb": 16, "available_pct": 50, "pressure": "normal", "swap_used_gb": null })),
+            ("windows", json!({ "total_gb": 64, "available_pct": 50, "commit_pct": null })),
+            ("windows", json!({ "total_gb": 64, "available_pct": null, "commit_pct": 30 })),
             ("windows", json!({})),
-            ("windows", json!({ "available_pct": "50", "commit_pct": 30 })),
-            ("windows", json!({ "available_pct": -1, "commit_pct": 30 })),
-            ("windows", json!({ "available_pct": 50, "commit_pct": 101 })),
+            ("windows", json!({ "total_gb": 64, "available_pct": "50", "commit_pct": 30 })),
+            ("windows", json!({ "total_gb": 64, "available_pct": -1, "commit_pct": 30 })),
+            ("windows", json!({ "total_gb": 64, "available_pct": 50, "commit_pct": 101 })),
         ];
         for (probe, memory) in cases {
             let check = memory_check(probe, memory);
@@ -519,10 +527,10 @@ mod tests {
             ("windows", json!({ "available_pct": null, "commit_pct": 95 }), "fail"),
             ("windows", json!({ "available_pct": null, "commit_pct": 85 }), "warn"),
             ("windows", json!({ "available_pct": 0, "commit_pct": null }), "fail"),
-            ("windows", json!({ "available_pct": 50, "commit_pct": 30 }), "ok"),
+            ("windows", json!({ "total_gb": 64, "available_pct": 50, "commit_pct": 30 }), "ok"),
             ("mac", json!({ "pressure": "critical", "swap_used_gb": null }), "fail"),
             ("mac", json!({ "pressure": "warn", "swap_used_gb": null }), "warn"),
-            ("mac", json!({ "pressure": "normal", "swap_used_gb": 0 }), "ok"),
+            ("mac", json!({ "total_gb": 16, "available_pct": 50, "pressure": "normal", "swap_used_gb": 0 }), "ok"),
         ];
         for (probe, memory, expected) in cases {
             assert_eq!(memory_check(probe, memory).status, expected);
@@ -530,8 +538,22 @@ mod tests {
     }
 
     #[test]
+    fn missing_total_or_mac_available_is_unknown() {
+        let cases = [
+            ("mac", json!({ "total_gb": 16, "available_pct": null, "pressure": "normal", "swap_used_gb": 0 })),
+            ("mac", json!({ "total_gb": null, "available_pct": 50, "pressure": "normal", "swap_used_gb": 0 })),
+            ("windows", json!({ "total_gb": null, "available_pct": 50, "commit_pct": 30 })),
+        ];
+        for (probe, memory) in cases {
+            let result = memory_check(probe, memory);
+            assert_eq!(result.status, "unknown");
+            assert!(result.detail.as_deref().is_some_and(|detail| detail.contains("不明")));
+        }
+    }
+
+    #[test]
     fn mac_swap_finding_is_not_reported_as_normal() {
-        let memory = json!({ "pressure": "normal", "swap_used_gb": 8 });
+        let memory = json!({ "total_gb": 16, "available_pct": 50, "pressure": "normal", "swap_used_gb": 8 });
         let warning = memory_check_with_findings("mac", memory.clone(), &[json!({ "id": "swap", "severity": "warn" })]);
         assert_eq!(warning.status, "warn");
         assert!(warning.detail.as_deref().is_some_and(|detail| detail.contains("swap の所見")));

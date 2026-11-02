@@ -22,6 +22,29 @@ function RNum($x, $d = 1) {
   if ([double]::IsNaN($v) -or [double]::IsInfinity($v)) { return $null }
   return [math]::Round($v, $d)
 }
+function Get-KtMemoryNumber($x) {
+  if ($null -eq $x -or $x -is [bool]) { return $null }
+  $s = ([string]$x).Trim()
+  $v = 0.0
+  if (-not $s -or -not [double]::TryParse($s, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$v)) { return $null }
+  if ([double]::IsNaN($v) -or [double]::IsInfinity($v) -or $v -lt 0) { return $null }
+  return $v
+}
+function Get-KtMemoryValues($os) {
+  $physicalTotal = Get-KtMemoryNumber $os.TotalVisibleMemorySize
+  $physicalFree = Get-KtMemoryNumber $os.FreePhysicalMemory
+  $virtualTotal = Get-KtMemoryNumber $os.TotalVirtualMemorySize
+  $virtualFree = Get-KtMemoryNumber $os.FreeVirtualMemory
+  if ($null -ne $physicalTotal -and $physicalTotal -le 0) { $physicalTotal = $null }
+  if ($null -ne $virtualTotal -and $virtualTotal -le 0) { $virtualTotal = $null }
+  if ($null -ne $physicalFree -and $null -ne $physicalTotal -and $physicalFree -gt $physicalTotal) { $physicalFree = $null }
+  if ($null -ne $virtualFree -and $null -ne $virtualTotal -and $virtualFree -gt $virtualTotal) { $virtualFree = $null }
+  $totalGb = if ($null -ne $physicalTotal) { R1 ($physicalTotal / 1MB) } else { $null }
+  $freeGb = if ($null -ne $physicalFree) { R1 ($physicalFree / 1MB) } else { $null }
+  $availablePct = if ($null -ne $physicalTotal -and $null -ne $physicalFree) { R1 ($physicalFree / $physicalTotal * 100) } else { $null }
+  $commitPct = if ($null -ne $virtualTotal -and $null -ne $virtualFree) { R1 ((1 - $virtualFree / $virtualTotal) * 100) } else { $null }
+  return [ordered]@{ total_gb = $totalGb; free_gb = $freeGb; available_pct = $availablePct; commit_pct = $commitPct }
+}
 # Short reason for a failed read. "no-permission" when the account may not read it (no admin rights are requested).
 # Read both pipes concurrently. A root exit without EOF, or either stream over
 # its limit, discards the capture. The outer native Job owns descendant cleanup.
@@ -75,7 +98,6 @@ function NsErr($e) {
 $os = Get-CimInstance Win32_OperatingSystem
 $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
 $ncpu = [int]$env:NUMBER_OF_PROCESSORS
-$totalMb = [double]$os.TotalVisibleMemorySize / 1024
 
 # CPU snapshots pair one cumulative read with its own monotonic timestamp.
 # Process objects expose live properties; never defer the second read until after CIM.
@@ -286,8 +308,7 @@ try {
 $mxCim = $null; $mxCmd = $null; $gh = $null; $th = $null; $kids = $null
 
 # Memory
-$commitPct = $null
-if ($os.TotalVirtualMemorySize -gt 0) { $commitPct = R1 ((1 - $os.FreeVirtualMemory / $os.TotalVirtualMemorySize) * 100) }
+$memoryValues = Get-KtMemoryValues $os
 $pf = Get-CimInstance Win32_PageFileUsage | Measure-Object -Property AllocatedBaseSize, CurrentUsage, PeakUsage -Sum
 $pfa = @{}; foreach ($m in $pf) { $pfa[$m.Property] = $m.Sum }
 
@@ -999,7 +1020,7 @@ $result = [ordered]@{
   cpu_busy_samples = $hostCpu.samples
   cpu_perf_pct = (R1 $perfInfo.PercentProcessorPerformance)
   cpu_clock = [ordered]@{ nominal_mhz = $cpu.MaxClockSpeed; effective_mhz = $cpuEffectiveMhz; source = "Win32_PerfFormattedData_Counters_ProcessorInformation.ProcessorFrequency * PercentProcessorPerformance / 100"; availability = $(if ($null -ne $cpuEffectiveMhz) { "available" } else { "unavailable" }) }
-  memory = [ordered]@{ total_gb = (R1 ($totalMb / 1024)); free_gb = (R1 ($os.FreePhysicalMemory / 1MB)); available_pct = (R1 ($os.FreePhysicalMemory / $os.TotalVisibleMemorySize * 100)); commit_pct = $commitPct; pagefile_alloc_mb = $pfa['AllocatedBaseSize']; pagefile_used_mb = $pfa['CurrentUsage']; pagefile_peak_mb = $pfa['PeakUsage'] }
+  memory = [ordered]@{ total_gb = $memoryValues.total_gb; free_gb = $memoryValues.free_gb; available_pct = $memoryValues.available_pct; commit_pct = $memoryValues.commit_pct; pagefile_alloc_mb = $pfa['AllocatedBaseSize']; pagefile_used_mb = $pfa['CurrentUsage']; pagefile_peak_mb = $pfa['PeakUsage'] }
   processes = [ordered]@{
     count = @($list).Count
     threads = $(if (@($list | Where-Object { $null -eq $_.thread_count }).Count -eq 0) { ($list | Measure-Object thread_count -Sum).Sum } else { $null })

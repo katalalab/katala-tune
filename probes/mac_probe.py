@@ -87,6 +87,9 @@ def memory():
     gb = lambda k: round(pages.get(k, 0) * page / 2**30, 2)
     swap = sysctl("vm.swapusage")  # total = 2048.00M  used = 1003.75M  free = ...
     sw = dict(re.findall(r"(total|used|free) = ([\d.]+)M", swap))
+    def swap_gb(key):
+        value = num(sw.get(key))
+        return round(value / 1024, 2) if value is not None and math.isfinite(value) and value >= 0 else None
     level = {"1": "normal", "2": "warn", "4": "critical"}.get(sysctl("kern.memorystatus_vm_pressure_level"), "unknown")
     return {
         "total_gb": round(int(sysctl("hw.memsize") or 0) / 2**30, 1),
@@ -95,8 +98,8 @@ def memory():
         "compressed_gb": gb("Pages occupied by compressor"),
         "available_pct": num(sysctl("kern.memorystatus_level")),
         "pressure": level,
-        "swap_used_gb": round(num(sw.get("used"), 0) / 1024, 2),
-        "swap_total_gb": round(num(sw.get("total"), 0) / 1024, 2),
+        "swap_used_gb": swap_gb("used"),
+        "swap_total_gb": swap_gb("total"),
     }
 
 

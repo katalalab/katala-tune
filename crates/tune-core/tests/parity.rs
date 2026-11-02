@@ -386,6 +386,10 @@ fn fixtures() -> Vec<(Value, Value)> {
     vec![
         (mac_fixture(json!({})), json!({})),
         (win_fixture(json!({})), json!({})),
+        (json!({ "memory": { "commit_pct": 95 } }), json!({})),
+        (mac_fixture(json!({ "memory": { "commit_pct": 85 } })), json!({})),
+        (mac_fixture(json!({ "memory": { "total_gb": null, "swap_used_gb": 8 } })), json!({})),
+        (win_fixture(json!({ "memory": { "pressure": "critical" } })), json!({})),
         (
             mac_fixture(json!({ "processes": { "top_cpu": [
                 { "pid": 500, "name": "Google Drive", "app": "Google Drive", "cpu": 105 },
@@ -569,6 +573,14 @@ fn rules_health_logs_actions_match_js() {
 
     // 判定（rules）
     let mut analyze_in: Vec<Value> = fixtures().into_iter().map(|(snap, node)| json!({ "snap": snap, "node": node })).collect();
+    for pressure in ["warn", "critical"] {
+        analyze_in.push(json!({ "snap": { "probe": "mac", "memory": { "total_gb": 16, "pressure": pressure, "compressed_gb": 1, "swap_used_gb": null, "swap_total_gb": null } }, "node": {} }));
+    }
+    for total in [Value::Null, json!(0), json!(-1), json!(64)] {
+        analyze_in.push(
+            json!({ "snap": { "probe": "windows", "memory": { "total_gb": total }, "wsl": { "config": false }, "processes": { "apps": [] } }, "node": {} }),
+        );
+    }
     // WSL advice must retain its GPU hold conditions even with configured memory.
     let gpu_states = [
         json!({"gpu_compute":{"availability":"available","apps":[{"pid":4242,"used_memory_mb":null}]},"gpus":[{"util":0}]}),

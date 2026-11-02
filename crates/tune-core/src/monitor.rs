@@ -656,6 +656,10 @@ pub async fn run(
 // ダッシュボード
 // ---------------------------------------------------------------------------
 
+fn dashboard_analysis_state(r: &Value) -> (Option<bool>, bool) {
+    (r.get("ok").and_then(Value::as_bool), r.get("findings").and_then(Value::as_array).is_some())
+}
+
 /// 機体ごとの今・直近 60 分・分析の要約・注意と、全体の状態を 1 つに（画面はこれを描くだけ）
 pub fn dashboard(engine: &Engine, live: Option<&Live>, minutes: i64) -> Result<Value, String> {
     let now = now_ms();
@@ -680,10 +684,11 @@ pub fn dashboard(engine: &Engine, live: Option<&Live>, minutes: i64) -> Result<V
         let count = |s: &str| findings.iter().filter(|f| f.get("severity").and_then(Value::as_str) == Some(s)).count();
         let last = r.map(|r| {
             let d = &r["data"];
+            let (ok, findings_known) = dashboard_analysis_state(r);
             let disks: Vec<&Value> = d.get("disk").and_then(Value::as_array).map(|a| a.iter().collect()).unwrap_or_default();
             let low_disk = disks.iter().filter_map(|x| Some((x.get("mount")?.as_str()?, x.get("free_pct")?.as_f64()?))).min_by(|a, b| a.1.total_cmp(&b.1));
             json!({
-                "at": r.get("at"), "score": r.get("score"),
+                "at": r.get("at"), "ok": ok, "findings_known": findings_known, "score": r.get("score"),
                 "os": d.pointer("/host/os"), "cpu": d.pointer("/host/cpu"), "model": d.pointer("/host/model"),
                 "uptime_h": d.pointer("/host/uptime_h"), "mem_total_gb": d.pointer("/memory/total_gb"),
                 "disk_low": low_disk.map(|(m, p)| json!({ "mount": m, "free_pct": p })),
@@ -726,6 +731,14 @@ pub fn dashboard(engine: &Engine, live: Option<&Live>, minutes: i64) -> Result<V
 mod tests {
     use super::*;
     use crate::live::{Gpu, Mem};
+
+    #[test]
+    fn dashboard_analysis_state_distinguishes_failure_and_missing_findings() {
+        assert_eq!(dashboard_analysis_state(&json!({"ok": false, "at": 1})), (Some(false), false));
+        assert_eq!(dashboard_analysis_state(&json!({"at": 1})), (None, false));
+        assert_eq!(dashboard_analysis_state(&json!({"ok": true, "findings": []})), (Some(true), true));
+        assert_eq!(dashboard_analysis_state(&json!({"ok": true})), (Some(true), false));
+    }
 
     fn sample(t: i64, cpu: f64, mem: f64, gtemp: Option<f64>) -> Sample {
         Sample {

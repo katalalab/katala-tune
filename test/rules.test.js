@@ -19,6 +19,53 @@ const win = (over = {}) => ({
   stability_7d: { bugcheck_1001: 0, kernel_power_41: 0, unexpected_6008: 0 }, defender: { realtime: true }, ...over,
 });
 
+test('Mac の圧迫所見では未取得の swap を不明とし、実測の 0 を残す', () => {
+  for (const pressure of ['warn', 'critical']) {
+    const base = { total_gb: 16, pressure, compressed_gb: 1, swap_used_gb: null, swap_total_gb: null };
+    const missing = analyze(mac({ memory: base })).find((finding) => finding.id === 'mem-pressure');
+    assert.match(missing.detail, /swap 不明\/不明 GB/);
+    const zero = analyze(mac({ memory: { ...base, swap_used_gb: 0, swap_total_gb: 0 } })).find((finding) => finding.id === 'mem-pressure');
+    assert.match(zero.detail, /swap 0\/0 GB/);
+  }
+});
+
+test('swap の所見は総メモリ不明時に比率を計算しない', () => {
+  for (const total_gb of [null, 0, -1]) {
+    const finding = analyze(mac({ memory: { total_gb, swap_used_gb: 8 } })).find((item) => item.id === 'swap');
+    assert.match(finding.detail, /不明/);
+    assert.doesNotMatch(finding.detail, /Infinity|NaN/);
+  }
+  const known = analyze(mac({ memory: { total_gb: 16, swap_used_gb: 8 } })).find((item) => item.id === 'swap');
+  assert.match(known.detail, /50%/);
+});
+
+test('OS が不明か異なる記録でも観測済みのメモリ危険値を隠さない', () => {
+  for (const probe of [undefined, 'mac']) {
+    const critical = analyze({ probe, memory: { commit_pct: 95 } }).find((item) => item.id === 'commit-source');
+    const warn = analyze({ probe, memory: { commit_pct: 85 } }).find((item) => item.id === 'commit-source');
+    assert.equal(critical?.severity, 'critical');
+    assert.equal(warn?.severity, 'warn');
+    for (const commit_pct of [null, '95', 101, -1]) assert.equal(analyze({ probe, memory: { commit_pct } }).some((item) => item.id === 'commit-source'), false);
+  }
+  for (const [pressure, severity] of [['critical', 'critical'], ['warn', 'warn']]) {
+    assert.equal(analyze(win({ memory: { pressure } })).find((item) => item.id === 'pressure-source')?.severity, severity);
+  }
+});
+
+test('WSL 上限の提案は総メモリ未取得時に値を推測しない', () => {
+  for (const total_gb of [null, 0, -1]) {
+    const finding = analyze(win({ memory: { total_gb }, wsl: { config: false } })).find((item) => item.id === 'wsl-limit');
+    assert.ok(finding);
+    assert.match(finding.detail, /不明/);
+    assert.equal(finding.commands, undefined);
+  }
+  const known = analyze(win({ memory: { total_gb: 64 }, wsl: { config: false } })).find((item) => item.id === 'wsl-limit');
+  assert.match(known.commands[0], /memory=32GB/);
+  const invalidWithVm = analyze(win({ memory: { total_gb: -1 }, wsl: { config: false }, processes: { apps: [{ app: 'vmmemWSL', mem_mb: 1024 }], top_cpu: [] } })).find((item) => item.id === 'wsl-limit');
+  assert.equal(invalidWithVm.severity, 'info');
+  assert.equal(invalidWithVm.commands, undefined);
+});
+
 const cacheCases = require('./fixtures/cache-accounting.json');
 const cacheInspect = 'du -sh ~/Library/Caches/* 2>/dev/null | sort -h | tail -15   # 大きいものを確認';
 for (const c of cacheCases) test(`cache accounting: ${c.name}`, () => {
