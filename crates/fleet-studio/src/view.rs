@@ -1837,8 +1837,13 @@ impl Render for FleetView {
                 let detail = if !show_saved {
                     format!("{status}  /  台帳: {}  /  {}", node.operating_state, identity)
                 } else {
+                    let coverage_note = if node.score.is_some() || node.critical.is_some() || node.warnings.is_some() {
+                        "（取得範囲はこの画面では未検証）"
+                    } else {
+                        ""
+                    };
                     format!(
-                        "{}{}  /  台帳: {}  /  {}  /  重大 {}・注意 {}・score {}  /  {}: {}{}{}",
+                        "{}{}  /  台帳: {}  /  {}  /  重大 {}・注意 {}・score {}{coverage_note}  /  {}: {}{}{}",
                         status,
                         if node.previous { "（前回値・最新の読取は未確認）" } else { "" },
                         node.operating_state,
