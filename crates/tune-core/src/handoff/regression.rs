@@ -147,6 +147,8 @@ fn pending_row_exists_before_launch_and_the_same_row_is_finalized() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["id"], id.borrow().as_str());
     assert_eq!(rows[0]["state"], "ok");
+    assert!(rows[0]["output"].as_str().unwrap().contains("ターミナルの起動を要求"));
+    assert!(rows[0]["output"].as_str().unwrap().contains("CLI の起動は未確認"));
     assert!(rows[0]["undo"].is_null());
 }
 

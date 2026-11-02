@@ -65,3 +65,24 @@ Focused Rust verification on macOS used `CARGO_BUILD_JOBS=2` and `RUST_TEST_THRE
 | `d0699ea68ac5b0197ec552c5d1f7259ddf381b61` | `cargo test -p katala-tune --lib confirm:: --locked` | GREEN: 2 passed |
 
 These focused runs required no compile fixes. They do not run the full workspace, the Windows-specific console tests, or real application windows. Earlier native acceptance does not certify the follow-up changes. Remaining native checks must use isolated application data and synthetic findings: cancel/reload after preview acceptance and during native confirmation, protection/configuration changes while confirmation is open, and audit failure outcomes without claiming that an uncertain launch never occurred. Recheck bounded text/visible buttons and default cancellation on both supported platforms, and use a fake CLI rather than submitting to an AI service.
+
+## 2026-10-29 post-merge follow-up
+
+On `db56810223b28d987eebd53a9361e844e656ed23`, isolated macOS and Windows debug builds used synthetic findings, separate application data and a recording-only fake CLI. Native default cancellation, protection changes during confirmation, audit insertion failure, audit finalization failure, prompt hash and fake CLI arguments were checked on both platforms. Closing and reopening the review also allowed a new review on both platforms. Windows additionally refused a changed connection and unreadable configuration during confirmation and surfaced cancellation audit failure. Update checks were disabled only in the isolated test builds; approvals were not automated. Reopening the dashboard briefly started its local live sampler, but the reviewed findings remained synthetic and no AI service was called.
+
+A separate Windows test with the production launcher and no CLI on PATH reproduced a misleading success message: the terminal reported `codex command not found` while the app and audit said Codex had opened. The launcher can confirm only that the terminal open request succeeded. This follow-up changes the message and audit to record that request and say CLI startup is unverified. The corrected Windows debug build showed the missing-command message and recorded the new wording. Focused handoff tests passed on macOS (20) and Windows (21), and the outcome display tests passed on both (3 each). The macOS full `npm run check` passed using two Rust test threads and process-local Git signing disabled for temporary test repositories; no tests were filtered.
+
+Real CLI installation, authentication and network behavior were not tested in this follow-up; this is not full release acceptance.
+
+
+## 2026-10-29 native follow-up: reload and minimum-size review
+
+The corrected build was tested on macOS and Windows with isolated data, a fake CLI and update checks disabled in the test builds. A debug-only injected script invoked `location.reload()` during the review and three seconds after proceeding to the native confirmation; this tests page replacement, not a normal user-facing reload control. On both platforms the review was cancelled on reload, and approving the already-open native confirmation after the replacement wrote a cancellation rather than launching. A new review could be opened and cancelled afterward. The reload produced expected Tauri warnings about callbacks belonging to the previous page.
+
+At the minimum window size (1040×640 logical pixels), both platforms showed the review buttons and allowed scrolling to the end of a synthetic prompt containing 81 protected entries. On macOS, additional native tests confirmed that a changed alias and invalid configuration are refused after approval, and cancellation audit insertion failure is reported. The injected database trigger and temporary configuration were restored. On Windows, the dashboard title wrapped awkwardly at this size; this is outside the handoff dialog and was not changed. Reload briefly activated the dashboard's local live sampler on both machines; the reviewed findings were synthetic. No real AI service was called.
+
+The page replacement tests cover the explicit test-triggered reload scenarios above, not every possible timing race. The native popup remains visible until dismissed, but its approval is invalid after replacement. Real CLI installation, authentication, network operation and release packaging remain untested.
+
+## Audit-list review follow-up
+
+Successful `ai-handoff` entries display “起動要求済み” rather than a generic success badge. The list renders the legacy Codex and Claude Code success wording as a terminal request with CLI startup unverified; stored rows and the `ok` contract remain unchanged. Focused renderer tests cover both legacy agents, the current wording, escaping, incomplete and failed records, and unrelated actions. Native macOS and Windows views were checked with isolated synthetic audit databases containing both old and new wording; the legacy stored value was verified unchanged.
