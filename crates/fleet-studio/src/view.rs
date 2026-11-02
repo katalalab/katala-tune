@@ -1589,7 +1589,9 @@ impl FleetView {
                             .revalidate(|| recent::revalidate_local(&tune_core::nodes::user_config_path(), &tune_core::nodes::local_host(), node, fingerprint))
                     })
                 };
-                let result = target.open_guarded(allowed);
+                let current =
+                    || audit_permit.as_ref().is_none_or(|(ticket, _)| ticket.is_current()) && permit.as_ref().is_none_or(|(_, _, ticket)| ticket.is_current());
+                let result = target.open_guarded_with_current(allowed, current);
                 let _ = sender.send(result);
             })
             .is_err()

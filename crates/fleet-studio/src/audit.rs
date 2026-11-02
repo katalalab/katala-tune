@@ -306,13 +306,15 @@ pub fn replace(selected: &mut crate::navigation::Selection, current: &mut Option
     *current = next;
 }
 
-pub fn prepare_open(
+#[doc(hidden)]
+pub fn prepare_open_with_target<T>(
     sample: bool,
     visible: bool,
     ticket: &crate::scope::AuditTicket,
     audit: Option<&Audit>,
     row: Option<&RepoAudit>,
-) -> Result<(crate::navigation::OpenTarget, AuditIdentity), crate::navigation::OpenResult> {
+    target: impl FnOnce(&str) -> Option<T>,
+) -> Result<(T, AuditIdentity), crate::navigation::OpenResult> {
     use crate::navigation::OpenResult;
     let Some(row) = row else {
         return Err(OpenResult::SelectionChanged);
@@ -332,6 +334,16 @@ pub fn prepare_open(
     let Some(identity) = audit.identity.as_ref().filter(|identity| identity.node == row.node) else {
         return Err(OpenResult::SelectionChanged);
     };
-    let target = crate::navigation::OpenTarget::directory(&row.path).ok_or(OpenResult::Failed)?;
+    let target = target(&row.path).ok_or(OpenResult::Failed)?;
     Ok((target, identity.clone()))
+}
+
+pub fn prepare_open(
+    sample: bool,
+    visible: bool,
+    ticket: &crate::scope::AuditTicket,
+    audit: Option<&Audit>,
+    row: Option<&RepoAudit>,
+) -> Result<(crate::navigation::OpenTarget, AuditIdentity), crate::navigation::OpenResult> {
+    prepare_open_with_target(sample, visible, ticket, audit, row, crate::navigation::OpenTarget::directory)
 }

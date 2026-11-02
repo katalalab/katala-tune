@@ -58,6 +58,9 @@ pub fn selected_repository_url(repositories: &[crate::source::Repository], searc
 
 pub struct OpenTarget(Target);
 
+#[path = "navigation_macos_policy.rs"]
+pub mod macos_policy;
+
 enum Target {
     Github(String),
     Directory(std::path::PathBuf),
@@ -96,6 +99,12 @@ impl OpenTarget {
         if value.chars().any(char::is_control) {
             return None;
         }
+        #[cfg(target_os = "macos")]
+        let path = {
+            static HOME: macos_policy::MacHome = macos_policy::MacHome::new();
+            HOME.resolve(value, || std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default())?
+        };
+        #[cfg(not(target_os = "macos"))]
         let path = std::path::PathBuf::from(tune_core::nodes::expand(value));
         if !path.is_absolute() || path.components().any(|part| matches!(part, std::path::Component::ParentDir)) {
             return None;
@@ -126,19 +135,37 @@ impl OpenTarget {
 
     /// Check authorization both before path validation and just before OS handoff.
     pub fn open_guarded(self, authorized: impl Fn() -> bool) -> OpenResult {
-        if !authorized() {
-            return OpenResult::SelectionChanged;
-        }
+        self.open_guarded_with_current(&authorized, &authorized)
+    }
+
+    /// Use the cheap ticket check during macOS path validation, and the full
+    /// authorization check before validation and immediately before handoff.
+    pub fn open_guarded_with_current(self, authorized: impl Fn() -> bool, current: impl Fn() -> bool) -> OpenResult {
         #[cfg(windows)]
         {
+            let _ = current;
+            if !authorized() {
+                return OpenResult::SelectionChanged;
+            }
             let result = match self.0 {
                 Target::Github(value) => windows_open::github(&value, &authorized),
                 Target::Directory(path) => windows_open::directory(&path, &authorized),
             };
             result.unwrap_or(OpenResult::Failed)
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         {
+            match self.0 {
+                Target::Github(value) => macos_open::github(&value, &authorized),
+                Target::Directory(path) => macos_open::directory(&path, &authorized, &current),
+            }
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            let _ = current;
+            if !authorized() {
+                return OpenResult::SelectionChanged;
+            }
             match self.0 {
                 Target::Github(value) => drop(value),
                 Target::Directory(path) => drop(path),
@@ -154,6 +181,13 @@ impl OpenTarget {
 #[allow(unsafe_code)]
 #[path = "navigation_windows.rs"]
 mod windows_open;
+
+// AppKit, Objective-C messaging and fd-based validation are confined to the
+// macOS adapter; the shared policy can be tested without touching an OS.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+#[path = "navigation_macos.rs"]
+mod macos_open;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenResult {
@@ -352,7 +386,7 @@ pub fn selection_text(
     audit: Option<&crate::audit::Audit>,
     ticket: &crate::scope::AuditTicket,
 ) -> Option<String> {
-    selection_text_for_platform(selected, sample, recent, audit, ticket, cfg!(windows))
+    selection_text_for_platform(selected, sample, recent, audit, ticket, cfg!(any(windows, target_os = "macos")))
 }
 
 pub fn selection_text_for_platform(
