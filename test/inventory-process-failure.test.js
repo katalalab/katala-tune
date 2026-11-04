@@ -17,14 +17,29 @@ test('failed or unconfirmed process cannot authorize inventory replacement', asy
     assert.equal(got.ok, false);
     assert.equal(got.items, undefined);
   }
-  result = { code: 0, out: '{"items":[{"source":"app","name":"fixture"}]}', err: '' };
+  result = { code: 0, out: '{"items":[{"source":"app","name":"fixture"}],"failed_sources":[]}', err: '' };
   const got = await inventoryNode({ id: 'fixture', os: 'macos', local: true });
   assert.equal(got.ok, true);
   assert.equal(got.items.length, 1);
 });
 
+test('incomplete inventory payload cannot authorize inventory replacement', async () => {
+  for (const payload of [
+    { items: [] },
+    { items: [], failed_sources: null },
+    { items: [], failed_sources: [null] },
+    { items: [{ source: 'app' }], failed_sources: [] },
+    { items: [{ source: 'app', name: '' }], failed_sources: [] },
+  ]) {
+    result = { code: 0, out: JSON.stringify(payload), err: '' };
+    const got = await inventoryNode({ id: 'fixture', os: 'macos', local: true });
+    assert.equal(got.ok, false, JSON.stringify(payload));
+    assert.equal(got.items, undefined);
+  }
+});
+
 test('all inventory transports require completed IO', async () => {
-  result = { code: 0, out: '{"items":[]}', err: '' };
+  result = { code: 0, out: '{"items":[],"failed_sources":[]}', err: '' };
   for (const node of [
     { id: 'fixture', os: 'macos', local: true }, { id: 'fixture', os: 'macos', local: false, alias: 'fixture' },
     { id: 'fixture', os: 'windows', local: true }, { id: 'fixture', os: 'windows', local: false, alias: 'fixture' },

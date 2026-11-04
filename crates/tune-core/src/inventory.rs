@@ -261,7 +261,13 @@ pub async fn inventory_node(node: &Node) -> Value {
 /// 調査の出力を結果の形にする（inventoryNode の後半）
 pub fn parse_result(node_id: &str, res: &RunResult, wall_s: f64) -> Value {
     // A syntactically valid JSON line is not proof that the process succeeded.
-    let data = (res.code == Some(0)).then(|| last_json_line(&res.out)).flatten().filter(|d| d.get("items").is_some_and(Value::is_array));
+    let nonempty_string = |v: &Value| v.as_str().is_some_and(|s| !js::trim(s).is_empty());
+    let data = (res.code == Some(0)).then(|| last_json_line(&res.out)).flatten().filter(|d| {
+        d.get("failed_sources").and_then(Value::as_array).is_some_and(|a| a.iter().all(&nonempty_string))
+            && d.get("items")
+                .and_then(Value::as_array)
+                .is_some_and(|a| a.iter().all(|it| it.get("source").is_some_and(nonempty_string) && it.get("name").is_some_and(nonempty_string)))
+    });
     let Some(data) = data else {
         let e = if !res.err.is_empty() {
             res.err.clone()
@@ -369,5 +375,20 @@ mod tests {
         );
         assert_eq!(ok["failedSources"], json!(["app"]));
         assert_eq!(items_of(&ok)[0].name, "a");
+    }
+
+    #[test]
+    fn incomplete_payload_does_not_replace_inventory() {
+        for payload in [
+            json!({"items": []}),
+            json!({"items": [], "failed_sources": null}),
+            json!({"items": [], "failed_sources": [null]}),
+            json!({"items": [{"source": "app"}], "failed_sources": []}),
+            json!({"items": [{"source": "app", "name": ""}], "failed_sources": []}),
+        ] {
+            let result = parse_result("fixture", &RunResult { code: Some(0), out: payload.to_string(), err: String::new() }, 1.0);
+            assert_eq!(result["ok"], json!(false), "{payload}");
+            assert!(result.get("items").is_none());
+        }
     }
 }
