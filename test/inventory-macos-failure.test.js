@@ -30,11 +30,11 @@ def listing(p):
         os.path.normpath(node): ['20.0'],
         os.path.normpath(os.path.join(node, '20.0', 'lib', 'node_modules')): ['demo'],
     }
-    if sys.argv[2] in ('brew_version', 'brew_present'):
+    if sys.argv[2] in ('brew_version', 'brew_present', 'brew_receipt'):
         entries[os.path.normpath('/opt/homebrew/Cellar')] = ['demo']
         entries[os.path.normpath('/opt/homebrew/Cellar/demo')] = ['1.0']
         return entries.get(os.path.normpath(os.fspath(p)), [])
-    if sys.argv[2] == 'none': return entries.get(os.path.normpath(os.fspath(p)), [])
+    if sys.argv[2] in ('none', 'npm_metadata', 'app_metadata'): return entries.get(os.path.normpath(os.fspath(p)), [])
     return []
 class EmptyScan:
     def __enter__(self): return iter(())
@@ -44,7 +44,7 @@ def scanning(p):
         raise PermissionError('synthetic denied')
     return EmptyScan()
 def stat(p, *args, **kwargs):
-    if sys.argv[2] == 'brew_present' and os.path.normpath(os.fspath(p)) == os.path.normpath('/opt/homebrew/Cellar/demo/1.0'):
+    if sys.argv[2] in ('brew_present', 'brew_receipt') and os.path.normpath(os.fspath(p)) == os.path.normpath('/opt/homebrew/Cellar/demo/1.0'):
         return os.stat_result((0o040755, 0, 0, 1, 0, 0, 0, 0, 1, 0))
     if sys.argv[2] == 'brew_version' and os.path.normpath(os.fspath(p)) == os.path.normpath('/opt/homebrew/Cellar/demo/1.0'):
         raise PermissionError('synthetic denied')
@@ -55,8 +55,16 @@ def stat(p, *args, **kwargs):
             return os.stat_result((0,) * 10)
     raise FileNotFoundError('synthetic missing')
 env = {'HOME': home, 'USERPROFILE': home, 'MISE_DATA_DIR': os.path.join(home, '.local', 'share', 'mise')}
+def open_metadata(p, *args, **kwargs):
+    if sys.argv[2] == 'npm_metadata' and os.path.normpath(os.fspath(p)) == os.path.normpath(os.path.join(node, '20.0', 'lib', 'node_modules', 'demo', 'package.json')):
+        raise PermissionError('synthetic denied')
+    if sys.argv[2] == 'app_metadata' and os.path.normpath(os.fspath(p)) == os.path.normpath('/Applications/Visible.app/Contents/Info.plist'):
+        raise PermissionError('synthetic denied')
+    if sys.argv[2] == 'brew_receipt' and os.path.normpath(os.fspath(p)) == os.path.normpath('/opt/homebrew/Cellar/demo/1.0/INSTALL_RECEIPT.json'):
+        raise PermissionError('synthetic denied')
+    raise FileNotFoundError('synthetic missing')
 out = io.StringIO()
-with patch.dict(os.environ, env, clear=True), patch('os.listdir', listing), patch('os.scandir', scanning), patch('os.stat', stat), patch('os.path.realpath', side_effect=lambda p: p), patch('builtins.open', side_effect=FileNotFoundError()), contextlib.redirect_stdout(out):
+with patch.dict(os.environ, env, clear=True), patch('os.listdir', listing), patch('os.scandir', scanning), patch('os.stat', stat), patch('os.path.realpath', side_effect=lambda p: p), patch('builtins.open', side_effect=open_metadata), contextlib.redirect_stdout(out):
     exec(compile(source, sys.argv[1], 'exec'), {})
 print(out.getvalue(), end='')
 `;
@@ -85,6 +93,17 @@ test('macOS readable Homebrew version remains available', () => {
   const result = runProbe('brew_present');
   assert.deepEqual(result.failed_sources, []);
   assert.ok(result.items.some(item => item.source === 'brew' && item.name === 'demo' && item.version === '1.0'));
+});
+
+for (const [mode, source, name] of [['npm_metadata', 'npm', 'demo'], ['app_metadata', 'app', 'Visible'], ['brew_receipt', 'brew', 'demo']]) test(`macOS unreadable ${source} metadata preserves the previous version`, () => {
+  const result = runProbe(mode);
+  const db = openDb(fs.mkdtempSync(path.join(os.tmpdir(), 'kt-macos-metadata-')));
+  db.saveInventory('fixture', [{ source, name, version: '1', explicit: false, extra: null }], 1000);
+  db.saveInventory('fixture', normalizeItems(result.items), 2000, { skipSources: result.failed_sources });
+  const saved = db.inventory({ node_id: 'fixture' }).find(item => item.name === name);
+  assert.equal(saved.version, '1');
+  assert.equal(saved.explicit, false);
+  assert.ok(result.failed_sources.includes(source));
 });
 
 for (const source of ['app', 'npm', 'platform', 'brew']) {

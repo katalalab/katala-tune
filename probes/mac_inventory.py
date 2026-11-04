@@ -59,7 +59,7 @@ def brew():
             try:
                 with open(os.path.join(cellar, name, ver or "", "INSTALL_RECEIPT.json")) as f:
                     explicit = bool(json.load(f).get("installed_on_request", True))
-            except (OSError, ValueError):
+            except (FileNotFoundError, NotADirectoryError):
                 pass
             add("brew", name, ver, explicit)
         for name in listdir(os.path.join(prefix, "Caskroom")):
@@ -79,10 +79,10 @@ def apps():
             try:
                 with open(os.path.join(app, "Contents", "Info.plist"), "rb") as f:
                     info = plistlib.load(f)
-            except Exception:
+            except (FileNotFoundError, NotADirectoryError):
                 pass
             bid = info.get("CFBundleIdentifier")
-            mas = os.path.exists(os.path.join(app, "Contents", "_MASReceipt"))
+            mas = exists_checked(os.path.join(app, "Contents", "_MASReceipt"))
             add("app", name, info.get("CFBundleShortVersionString") or info.get("CFBundleVersion"), True,
                 id=bid if isinstance(bid, str) else None, store="mas" if mas else None)
 
@@ -119,7 +119,7 @@ def npm_global():
                 try:
                     with open(os.path.join(root, pkg, "package.json")) as f:
                         ver = json.load(f).get("version")
-                except (OSError, ValueError):
+                except (FileNotFoundError, NotADirectoryError):
                     pass
                 add("npm", pkg, ver)
 
