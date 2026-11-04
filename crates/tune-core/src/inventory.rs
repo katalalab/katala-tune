@@ -260,7 +260,8 @@ pub async fn inventory_node(node: &Node) -> Value {
 
 /// 調査の出力を結果の形にする（inventoryNode の後半）
 pub fn parse_result(node_id: &str, res: &RunResult, wall_s: f64) -> Value {
-    let data = last_json_line(&res.out).filter(|d| d.get("items").is_some_and(Value::is_array));
+    // A syntactically valid JSON line is not proof that the process succeeded.
+    let data = (res.code == Some(0)).then(|| last_json_line(&res.out)).flatten().filter(|d| d.get("items").is_some_and(Value::is_array));
     let Some(data) = data else {
         let e = if !res.err.is_empty() {
             res.err.clone()
@@ -356,6 +357,11 @@ mod tests {
     fn failed_probe_is_an_error() {
         let r = parse_result("n", &RunResult { code: Some(1), out: String::new(), err: "boom\n".into() }, 1.0);
         assert_eq!((r["ok"].clone(), r["error"].clone()), (json!(false), json!("boom")));
+        for code in [Some(1), None] {
+            let failed = parse_result("n", &RunResult { code, out: "{\"items\":[]}".into(), err: "synthetic failure".into() }, 1.0);
+            assert_eq!(failed["ok"], json!(false));
+            assert!(failed.get("items").is_none());
+        }
         let ok = parse_result(
             "n",
             &RunResult { code: Some(0), out: "{\"items\":[{\"source\":\"brew\",\"name\":\"a\"}],\"failed_sources\":[\"app\"]}".into(), err: String::new() },
