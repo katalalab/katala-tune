@@ -205,7 +205,7 @@ function inventoryView({ all = false } = {}) {
   const shown = all ? inventory.matrix(rows, { matchSlug, explicitOnly: false }) : m;
   const cats = cached ? new Map(cached.tools.map((t) => [t.slug, t.category])) : new Map();
   return {
-    nodes: cfg.nodes.map(({ id, os: o }) => ({ id, os: o, count: rows.filter((r) => r.node_id === id && r.explicit).length, error: lastInventoryError[id] || null })),
+    nodes: cfg.nodes.map(({ id, os: o }) => ({ id, os: o, count: rows.filter((r) => r.node_id === id && r.explicit).length, error: lastInventoryError[id] || null, partial_sources: db.getMeta(`inventoryPartial:${id}`) || [] })),
     groups: shown.map((g) => ({ ...g, category: g.slug ? cats.get(g.slug) || null : null })), all,
     events: db.inventoryEvents(100), sources: inventory.SOURCES, lastInventoryAt: db.getMeta('lastInventoryAt'), inventorying,
     dogu: cached ? { at: cached.at, tools: cached.tools.length, matched: m.filter((g) => g.slug).length, draft: dogu.deckDraft(m, cached.tools, exclude), exclude } : null,

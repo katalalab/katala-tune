@@ -4,11 +4,36 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const vm = require('node:vm');
 const { normalizeItems, normName, matrix } = require('../lib/inventory');
 const dogu = require('../lib/dogu');
 const { openDb } = require('../lib/db');
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'kt-inv-'));
+
+test('部分取得の種類を保存し、完全な再取得後に警告を消す', () => {
+  const dir = tmp();
+  const db = openDb(dir);
+  db.saveInventory('fixture', [], 1000, { skipSources: ['brew', 'npm', 'brew'] });
+  assert.deepEqual(db.getMeta('inventoryPartial:fixture'), ['brew', 'npm']);
+  assert.deepEqual(openDb(dir).getMeta('inventoryPartial:fixture'), ['brew', 'npm']);
+  db.saveInventory('fixture', [], 2000);
+  assert.deepEqual(db.getMeta('inventoryPartial:fixture'), []);
+});
+
+test('Electron 一覧は保存された部分取得を返し、完全な再取得後は返さない', () => {
+  const db = openDb(tmp());
+  const src = fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8');
+  const start = src.indexOf('function inventoryView(');
+  const end = src.indexOf('\n// 1分ごと', start);
+  assert.ok(start >= 0 && end > start);
+  const context = vm.createContext({ cfg: { nodes: [{ id: 'fixture', os: 'macos' }] }, db, inventory: require('../lib/inventory'), dogu: {}, lastInventoryError: {}, inventorying: false });
+  vm.runInContext(src.slice(start, end), context);
+  db.saveInventory('fixture', [], 1000, { skipSources: ['brew'] });
+  assert.deepEqual(Array.from(context.inventoryView({}).nodes[0].partial_sources), ['brew']);
+  db.saveInventory('fixture', [], 2000);
+  assert.deepEqual(Array.from(context.inventoryView({}).nodes[0].partial_sources), []);
+});
 
 test('棚卸しの結果を種類と名前で一意にし、空の名前を捨てる', () => {
   const items = normalizeItems([

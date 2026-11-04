@@ -63,7 +63,7 @@
         })),
         cols: d.nodes.map((n) => ({ key: n.id, html: `<span class="inv-col">${UI.icon(n.os === 'windows' ? 'win' : 'mac')}${UI.esc(n.id)}</span>`, attrs: `title="${UI.esc(`${n.id}: 自分で入れた道具 ${n.count} 件`)}"` })),
         cell: (r, c) => cellOf(d, r.g, c.key),
-      }) : UI.empty(d.groups.length ? '該当する道具はありません' : 'まだ棚卸ししていません。「棚卸しする」で全機体の道具を集めます。')}
+      }) : UI.empty(d.groups.length ? '該当する道具はありません' : d.nodes.some((n) => Array.isArray(n.partial_sources) && n.partial_sources.length) ? '表示できる道具はありません。一部の取得に失敗しています。' : 'まだ棚卸ししていません。「棚卸しする」で全機体の道具を集めます。')}
       ${rows.length > shown.length ? `<p class="note-line"><button class="btn small" id="invMore">さらに ${Math.min(300, rows.length - shown.length)} 件を表示</button></p>` : ''}
       <p class="note-line">黄色のセルは、その道具を入れている機体のうち多数派と版が違うもの（同じ機体の中の書き方の違いは数えない）。● は版の無いもの。</p>`;
   }
@@ -139,6 +139,7 @@
     inv.data = d;
     const explicit = d.nodes.reduce((s, n) => s + (n.count || 0), 0);
     const errs = d.nodes.filter((n) => n.error);
+    const partial = d.nodes.filter((n) => Array.isArray(n.partial_sources) && n.partial_sources.length);
     const running = inv.running || d.inventorying;
     const tabs = [['matrix', '機体×道具', d.groups.length, 'tool'], ['history', '追加・削除の履歴', d.events.length, 'history'], ['dogu', 'Do-gu', d.dogu ? d.dogu.draft.length : null, 'link']];
     const sch = state.status?.schedule || state.cfg?.schedule || {};
@@ -158,6 +159,7 @@
         actions: `<button class="btn primary" id="invRun"${running ? ' disabled' : ''}>${UI.icon('play')}${running ? '棚卸し中…' : '棚卸しする'}</button>`,
       })}
       ${errs.length ? UI.callout({ tone: 'red', icon: 'alert', title: `${errs.length} 台で棚卸しできませんでした`, body: `<div class="list">${errs.map((n) => `<div class="li"><div class="li-main"><div class="li-title"><span class="node">${UI.esc(n.id)}</span></div><div class="li-sub err">${UI.esc(String(n.error).slice(0, 300))}</div></div></div>`).join('')}</div><p class="note-line">前回の一覧はそのまま残しています（失敗を「削除」とは見なしません）。</p>` }) : ''}
+      ${partial.length ? UI.callout({ tone: 'orange', icon: 'alert', title: `${partial.length} 台で一部を取得できませんでした`, body: `<div class="list">${partial.map((n) => `<div class="li"><span class="node">${UI.esc(n.id)}</span>: ${UI.esc(n.partial_sources.map((s) => srcLabel(d, s)).join('・'))}</div>`).join('')}</div><p class="note-line">取得できなかった種類は前回の一覧を残しています。完全に取得できるまで、一覧は最新でない場合があります。</p>` }) : ''}
       ${UI.tabs(tabs, inv.tab)}
       ${body}
       ${inv.tab === 'matrix' ? scheduleRow() : ''}`);
@@ -201,7 +203,8 @@
     try {
       const r = await window.tune.inventoryRun();
       const ng = (r.nodes || []).filter((n) => n.error).length;
-      toast(r.busy ? '別の棚卸しが実行中です' : `棚卸しが ${((Date.now() - t0) / 1000).toFixed(1)} 秒で終わりました${ng ? `（${ng} 台失敗）` : ''}`);
+      const partial = (r.nodes || []).filter((n) => Array.isArray(n.partial_sources) && n.partial_sources.length).length;
+      toast(r.busy ? '別の棚卸しが実行中です' : `棚卸しが ${((Date.now() - t0) / 1000).toFixed(1)} 秒で終わりました${ng ? `（${ng} 台失敗）` : ''}${partial ? `（${partial} 台で一部未取得）` : ''}`);
     } catch (e) {
       toast(`棚卸しできませんでした: ${e?.message || e}`, 6000);
     }

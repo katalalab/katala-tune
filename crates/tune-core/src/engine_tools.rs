@@ -107,7 +107,11 @@ impl Engine {
     /// all: 依存として入ったものも含める（既定は自分で入れたものだけ）。下書きはいつも自分で入れたものだけから作る
     pub fn inventory_view(&self, all: bool) -> Result<Value, String> {
         let cfg = self.config();
-        let (rows, events, cached, exclude, last_at, marks) = self.with_db(|d| {
+        let (rows, events, cached, exclude, last_at, marks, partials) = self.with_db(|d| {
+            let mut partials = HashMap::new();
+            for n in &cfg.nodes {
+                partials.insert(n.id.clone(), d.get_meta(&format!("inventoryPartial:{}", n.id))?.filter(Value::is_array).unwrap_or_else(|| json!([])));
+            }
             Ok((
                 d.inventory(None, false)?,
                 d.inventory_events(100)?,
@@ -115,6 +119,7 @@ impl Engine {
                 d.get_meta(dogu::META_EXCLUDE)?,
                 d.get_meta("lastInventoryAt")?,
                 d.inventory_nodes()?,
+                partials,
             ))
         })?;
         let tools: Option<Vec<Value>> = cached.as_ref().map(|c| js::arr(c.get("tools")).to_vec());
@@ -141,7 +146,7 @@ impl Engine {
             .map(|n| {
                 let count = rows.iter().filter(|r| js::is_str(r.get("node_id"), &n.id) && js::truthy(r.get("explicit"))).count();
                 let last_ok = marks.iter().find(|m| js::is_str(m.get("node_id"), &n.id)).and_then(|m| m.get("last_ok_at").cloned()).unwrap_or(Value::Null);
-                json!({ "id": n.id, "os": n.os, "count": count, "error": errors.get(&n.id), "last_ok_at": last_ok })
+                json!({ "id": n.id, "os": n.os, "count": count, "error": errors.get(&n.id), "last_ok_at": last_ok, "partial_sources": partials.get(&n.id).cloned().unwrap_or_else(|| json!([])) })
             })
             .collect();
         let exclude: Vec<String> = exclude.as_ref().map(|e| js::arr(Some(e)).iter().map(|s| js::string(Some(s))).collect()).unwrap_or_default();
@@ -552,6 +557,15 @@ mod tests {
         assert_eq!(v["dogu"]["exclude"], json!(["gh"]));
         assert!(!v["dogu"]["draft"].as_array().unwrap().iter().any(|d| d["slug"] == "gh"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn inventory_view_shows_partial_sources_until_complete_refresh() {
+        let (e, _base) = engine("partial-view");
+        e.with_db(|d| d.save_inventory("n1", &[], 2000, &["brew".into()])).unwrap();
+        assert_eq!(e.inventory_view(false).unwrap()["nodes"][0]["partial_sources"], json!(["brew"]));
+        e.with_db(|d| d.save_inventory("n1", &[], 3000, &[])).unwrap();
+        assert_eq!(e.inventory_view(false).unwrap()["nodes"][0]["partial_sources"], json!([]));
     }
 
     #[tokio::test]

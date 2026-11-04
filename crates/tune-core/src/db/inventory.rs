@@ -127,6 +127,8 @@ impl Store {
                  ON CONFLICT (node_id) DO UPDATE SET last_ok_at = excluded.last_ok_at",
             )?
             .execute(params![node_id, now, now])?;
+            db.prepare_cached("INSERT OR REPLACE INTO meta (k, v, updated_at) VALUES (?, ?, ?)")?
+                .execute(params![format!("inventoryPartial:{node_id}"), serde_json::json!(&skipped).to_string(), now])?;
             Ok(())
         })?;
         Ok(c)
@@ -217,5 +219,14 @@ mod tests {
         assert!(db.save_inventory("empty", &[], 1000, &[]).unwrap().baseline);
         let d = db.save_inventory("empty", &[it("brew", "new", "1")], 2000, &[]).unwrap();
         assert_eq!((d.baseline, d.added), (false, 1));
+    }
+
+    #[test]
+    fn partial_sources_persist_until_a_complete_refresh() {
+        let db = Store::open_in_memory().unwrap();
+        db.save_inventory("fixture", &[], 1000, &["brew".into(), "npm".into(), "brew".into()]).unwrap();
+        assert_eq!(db.get_meta("inventoryPartial:fixture").unwrap(), Some(serde_json::json!(["brew", "npm"])));
+        db.save_inventory("fixture", &[], 2000, &[]).unwrap();
+        assert_eq!(db.get_meta("inventoryPartial:fixture").unwrap(), Some(serde_json::json!([])));
     }
 }
