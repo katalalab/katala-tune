@@ -391,4 +391,29 @@ mod tests {
             assert!(result.get("items").is_none());
         }
     }
+
+    #[test]
+    fn partial_macos_probe_result_preserves_failed_source_in_rust_store() {
+        use crate::db::Store;
+
+        for failed in ["app", "npm"] {
+            let store = Store::open_in_memory().unwrap();
+            let baseline = normalize_items(&[json!({"source": failed, "name": "PreviouslySeen"}), json!({"source": "brew", "name": "NoLongerInstalled"})]);
+            store.save_inventory("fixture", &baseline, 1000, &[]).unwrap();
+
+            // Shape emitted by the macOS probe after a source-specific failure.
+            let payload = json!({"items": [], "errors": ["synthetic denied"], "failed_sources": [failed]});
+            let run = RunResult { code: Some(0), out: payload.to_string(), err: String::new() };
+            let result = parse_result("fixture", &run, 0.0);
+            assert_eq!(result["ok"], json!(true));
+            let failed_sources: Vec<String> = result["failedSources"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_owned()).collect();
+            let saved = store.save_inventory("fixture", &items_of(&result), 2000, &failed_sources).unwrap();
+            assert_eq!(saved.removed, 1, "only the successfully scanned source may be removed");
+            assert_eq!(saved.skipped, vec![failed.to_owned()]);
+            let rows = store.inventory(Some("fixture"), false).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["source"], failed);
+            assert_eq!(rows[0]["name"], "PreviouslySeen");
+        }
+    }
 }
