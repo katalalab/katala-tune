@@ -30,6 +30,18 @@ const commit = (dir, name, body = 'x') => {
 };
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'kt-hyg-'));
+function removeFixture(root) {
+  // Git objects are read-only on Windows; touch only files in this fixture.
+  const makeWritable = dir => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const target = path.join(dir, entry.name);
+      if (entry.isDirectory()) makeWritable(target);
+      else if (!entry.isSymbolicLink()) fs.chmodSync(target, 0o666);
+    }
+  };
+  makeWritable(root);
+  fs.rmSync(root, { recursive: true, force: true });
+}
 const CRED = 'https://fixtureuser:fixture-secret-token@example.com/acme/%s.git?token=query-secret#frag';
 
 // 架空の ghq root を作る: 期待どおり置いたもの・dirty・ahead・behind・stash・名前が食い違うもの・origin 無し・壊れたもの・リンク worktree
@@ -89,7 +101,7 @@ function probe(opts, env = {}) {
 let FX;
 before(() => { FX = fixture(); });
 after(() => {
-  if (FX) fs.rmSync(FX.base, { recursive: true, force: true });
+  if (FX) removeFixture(FX.base);
   fs.rmSync(gitConfigDir, { recursive: true, force: true });
 });
 
@@ -209,7 +221,7 @@ test('detached HEAD の remote に無いコミットも数える', () => {
     assert.deepEqual([r.state, r.detached, r.local_only], ['ok', true, 2]);
     assert.ok(hygiene.analyze(hygiene.normalize(data)).some((x) => x.id === 'repo-unpushed'));
   } finally {
-    fs.rmSync(base, { recursive: true, force: true });
+    removeFixture(base);
   }
 });
 
