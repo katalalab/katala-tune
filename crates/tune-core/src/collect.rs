@@ -1438,6 +1438,15 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn strict_inventory_local_powershell_accepts_complete_response() {
+        let script = b"\xef\xbb\xbfWrite-Output '{\"items\":[]}'\r\n";
+        let r = local::powershell_file_complete(script, "", Duration::from_secs(5)).await;
+        assert_eq!(r.code, Some(0));
+        assert_eq!(r.out.trim(), "{\"items\":[]}");
+    }
+
     #[tokio::test]
     async fn kt2_exchange_waits_for_ready_and_rejects_unverified_terminal_states() {
         if cfg!(windows) {

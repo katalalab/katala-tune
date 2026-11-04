@@ -3,6 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const collect = require('../lib/collect');
 const realRun = collect.run;
+const realPowerShellFile = collect.localShell.powershellFile;
 let result;
 let strict;
 collect.run = async (_cmd, _args, opts) => { strict = opts.requireComplete; return result; };
@@ -67,4 +68,11 @@ test('strict collection preserves verified success and nonzero status', async ()
     assert.equal(result.code, exit);
     assert.equal(result.out.trim(), '{"items":[]}');
   }
+});
+
+test('strict local Windows transport accepts a synthetic PowerShell response', { skip: process.platform !== 'win32' }, async () => {
+  const script = Buffer.from('\ufeffWrite-Output \'{"items":[]}\'\r\n', 'utf8');
+  const got = await realPowerShellFile(script, '', 5000, true);
+  assert.equal(got.code, 0);
+  assert.equal(got.out.trim(), '{"items":[]}');
 });
