@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+script_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+printf 'dir=%s\n' "$script_dir"
+printf '<%s>\n' "$@"
+powershell.exe -NoProfile -NonInteractive -File "$(cygpath -w "$script_dir/check-window.ps1")"
+printf 'fixture stderr\n' >&2
+exit 7

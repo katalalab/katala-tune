@@ -67,6 +67,30 @@ pub fn command(cmd: &str) -> Command {
     c
 }
 
+/// Windows の op-agent が Bash shim の場合は Git Bash を直接起動する。
+pub fn fleet_command() -> Command {
+    #[cfg(windows)]
+    {
+        windows_fleet_command(&crate::nodes::home(), std::env::var_os("ProgramFiles").as_deref())
+    }
+    #[cfg(not(windows))]
+    command("op-agent")
+}
+
+#[cfg(windows)]
+fn windows_fleet_command(home: &std::path::Path, program_files: Option<&std::ffi::OsStr>) -> Command {
+    let script = home.join("bin").join("op-agent");
+    if let Some(dir) = program_files {
+        let bash = PathBuf::from(dir).join("Git").join("bin").join("bash.exe");
+        if bash.is_file() && script.is_file() {
+            let mut c = Command::new(bash);
+            c.env("PATH", &*PATH).creation_flags(0x0800_0000).args(["--noprofile", "--norc"]).arg(script);
+            return c;
+        }
+    }
+    command("op-agent")
+}
+
 #[cfg(any(windows, test))]
 fn windows_ssh_program(
     program_files: Option<&std::ffi::OsStr>,
@@ -1096,6 +1120,18 @@ pub async fn exec_on_with_input(runner: &dyn Runner, node: &Node, script: &str, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn fleet_shim_preserves_arguments_output_and_exit_code() {
+        let home = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/fleet launcher");
+        let mut command = windows_fleet_command(&home, std::env::var_os("ProgramFiles").as_deref());
+        let output = command.args(["run", "--env-file=value & \"quoted\"", "--", "python3", "scripts/fleet-status.py", "--json"]).output().await.unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("<--env-file=value & \"quoted\">"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("console=hidden"));
+        assert_eq!(output.stderr, b"fixture stderr\n");
+    }
 
     // An OS read error / failed reader task without an OS child. The signal
     // places failure on either side of the first REQUEST operation.

@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
+const { fleetLaunch } = require('./lib/fleet-launch');
 const { loadConfig, ensureConfig } = require('./lib/nodes');
 const { probeAll, execOn, actionExchange } = require('./lib/collect');
 const { analyze, score, compare } = require('./lib/rules');
@@ -298,7 +299,8 @@ ipcMain.handle('fleet', async () => {
   if (!repo) return { disabled: true };
   if (!fs.existsSync(path.join(repo, cfg.fleet.env_file))) return (fleetCache = { error: `katala-fleet が見つからない: ${repo}` });
   const res = await new Promise((resolve) => {
-    const child = spawn('op-agent', ['run', `--env-file=${cfg.fleet.env_file}`, '--', 'python3', 'scripts/fleet-status.py', '--json'], { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
+    const launch = fleetLaunch(cfg.fleet.env_file);
+    const child = spawn(launch.program, launch.args, { ...launch.options, cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '', err = '';
     const t = setTimeout(() => child.kill('SIGKILL'), 60000);
     child.stdout.on('data', (d) => { out += d; });

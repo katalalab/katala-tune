@@ -577,7 +577,7 @@ impl Engine {
         let cache = if !repo.join(&f.env_file).exists() {
             json!({ "error": format!("katala-fleet が見つからない: {}", f.repo) })
         } else {
-            let mut c = collect::command("op-agent");
+            let mut c = collect::fleet_command();
             c.args(["run", &format!("--env-file={}", f.env_file), "--", "python3", "scripts/fleet-status.py", "--json"])
                 .current_dir(&repo)
                 .stdin(std::process::Stdio::null())
