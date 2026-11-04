@@ -108,6 +108,15 @@ pub fn decode(buf: &[u8]) -> String {
 
 /// コマンドを実行し、標準入力に input を渡す。timeout を過ぎたら強制終了して `timeout <ms>ms` を err に足す
 pub async fn run(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Duration) -> RunResult {
+    run_impl(cmd, args, input, timeout, false).await
+}
+
+/// Reject partial output when the caller needs an authoritative complete result.
+pub async fn run_complete(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Duration) -> RunResult {
+    run_impl(cmd, args, input, timeout, true).await
+}
+
+async fn run_impl(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Duration, require_complete: bool) -> RunResult {
     let mut c = command(cmd);
     c.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     let mut child = match c.spawn() {
@@ -117,18 +126,18 @@ pub async fn run(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Dura
     let mut stdin = child.stdin.take();
     let input = input.map(<[u8]>::to_vec).unwrap_or_default();
     let writer = tokio::spawn(async move {
-        if let Some(si) = stdin.as_mut() {
-            let _ = si.write_all(&input).await;
-            let _ = si.shutdown().await;
-        }
+        let ok = if let Some(si) = stdin.as_mut() { si.write_all(&input).await.is_ok() && si.shutdown().await.is_ok() } else { false };
         drop(stdin);
+        ok
     });
     let (out, read_out) = read_into_buffer(child.stdout.take());
     let (err, read_err) = read_into_buffer(child.stderr.take());
     let mut extra = String::new();
+    let mut timed_out = false;
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(st) => st.ok(),
         Err(_) => {
+            timed_out = true;
             let _ = child.start_kill();
             extra.push_str(&format!("\ntimeout {}ms", timeout.as_millis()));
             child.wait().await.ok()
@@ -136,16 +145,33 @@ pub async fn run(cmd: &str, args: &[String], input: Option<&[u8]>, timeout: Dura
     };
     // 孫プロセスがパイプを握り続けても止まらないよう、子が終わってから待つのは PIPE_GRACE まで。
     // 過ぎたら読み取り（と書き込み）を止め、それまでに読んだ分を返す
-    let deadline = tokio::time::Instant::now() + PIPE_GRACE;
-    for mut task in [writer, read_out, read_err] {
-        if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
-            task.abort();
-            let _ = task.await;
-        }
-    }
+    let complete = await_process_io([writer, read_out, read_err], PIPE_GRACE).await;
     let out = std::mem::take(&mut *lock_buf(&out));
     let err = std::mem::take(&mut *lock_buf(&err));
-    RunResult { code: status.and_then(|s| s.code()), out: decode(&out), err: decode(&err) + &extra }
+    let code = if require_complete && (!complete || timed_out) {
+        extra.push_str("\nincomplete process output");
+        None
+    } else {
+        status.and_then(|s| s.code())
+    };
+    RunResult { code, out: decode(&out), err: decode(&err) + &extra }
+}
+
+async fn await_process_io(tasks: [JoinHandle<bool>; 3], grace: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + grace;
+    let mut complete = true;
+    for mut task in tasks {
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(Ok(true)) => (),
+            Ok(_) => complete = false,
+            Err(_) => {
+                complete = false;
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+    complete
 }
 
 mod bounded;
@@ -847,16 +873,18 @@ fn lock_buf(b: &SharedBuf) -> std::sync::MutexGuard<'_, Vec<u8>> {
 }
 
 /// パイプを読み終わるまで共有のバッファへ貯めるタスク。止めても、それまでに読んだ分はバッファに残る
-fn read_into_buffer<R: AsyncRead + Unpin + Send + 'static>(pipe: Option<R>) -> (SharedBuf, JoinHandle<()>) {
+fn read_into_buffer<R: AsyncRead + Unpin + Send + 'static>(pipe: Option<R>) -> (SharedBuf, JoinHandle<bool>) {
     let buf = SharedBuf::default();
     let b = buf.clone();
     let task = tokio::spawn(async move {
-        let Some(mut p) = pipe else { return };
+        let Some(mut p) = pipe else { return false };
         let mut chunk = vec![0u8; 16 * 1024];
-        while let Ok(n) = p.read(&mut chunk).await
-            && n > 0
-        {
-            lock_buf(&b).extend_from_slice(&chunk[..n]);
+        loop {
+            match p.read(&mut chunk).await {
+                Ok(0) => return true,
+                Ok(n) => lock_buf(&b).extend_from_slice(&chunk[..n]),
+                Err(_) => return false,
+            }
         }
     });
     (buf, task)
@@ -874,6 +902,14 @@ pub mod local {
 
     /// PowerShell スクリプトを一時ファイルに置いて実行する（Windows のローカル実行）
     pub async fn powershell_file(script: &[u8], params: &str, timeout: Duration) -> RunResult {
+        powershell_file_impl(script, params, timeout, false).await
+    }
+
+    pub async fn powershell_file_complete(script: &[u8], params: &str, timeout: Duration) -> RunResult {
+        powershell_file_impl(script, params, timeout, true).await
+    }
+
+    async fn powershell_file_impl(script: &[u8], params: &str, timeout: Duration, require_complete: bool) -> RunResult {
         let dir = std::env::temp_dir().join("katala-tune");
         if let Err(e) = std::fs::create_dir_all(&dir) {
             return RunResult { code: None, out: String::new(), err: e.to_string() };
@@ -885,7 +921,7 @@ pub mod local {
         let mut args: Vec<String> = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"].iter().map(|s| s.to_string()).collect();
         args.push(f.to_string_lossy().into_owned());
         args.extend(params.split(' ').filter(|s| !s.is_empty()).map(str::to_string));
-        let r = run("powershell.exe", &args, None, timeout).await;
+        let r = run_impl("powershell.exe", &args, None, timeout, require_complete).await;
         let _ = std::fs::remove_file(&f);
         r
     }
@@ -1375,6 +1411,31 @@ mod tests {
         // Windows の cmd は改行が CRLF なので、前後の空白を除いて比べる
         assert_eq!((r.code, r.out.trim(), r.err.trim()), (Some(0), "first", "oops"), "それまでに読んだ分は捨てない");
         assert!(started.elapsed() < Duration::from_secs(4), "孫の終わりを待たない: {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn strict_inventory_collection_rejects_inherited_pipe_without_eof() {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        writer.write_all(b"{\"items\":[]}\n").await.unwrap();
+        let (out, read_out) = read_into_buffer(Some(reader));
+        let (_, read_err) = read_into_buffer(Some(tokio::io::empty()));
+        assert!(!await_process_io([tokio::spawn(async { true }), read_out, read_err], Duration::from_millis(25)).await);
+        assert_eq!(&*lock_buf(&out), b"{\"items\":[]}\n");
+        drop(writer);
+        let (_, read_out) = read_into_buffer(Some(tokio::io::empty()));
+        let (_, read_err) = read_into_buffer(Some(tokio::io::empty()));
+        assert!(await_process_io([tokio::spawn(async { true }), read_out, read_err], Duration::from_secs(1)).await);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn strict_inventory_collection_preserves_verified_exit_status() {
+        for exit in [0, 7] {
+            let script = format!("process.stdin.resume(); process.stdin.on('end',()=>{{process.stdout.write('fixture'); process.exitCode={exit};}})");
+            let r = run_complete("node", &["-e".into(), script], Some(b"fixture"), Duration::from_secs(5)).await;
+            assert_eq!(r.code, Some(exit));
+            assert_eq!(r.out, "fixture");
+        }
     }
 
     #[tokio::test]

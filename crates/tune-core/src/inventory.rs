@@ -239,9 +239,9 @@ pub async fn inventory_node(node: &Node) -> Value {
     let res: RunResult = if node.is_mac() {
         let script = MAC_INVENTORY.as_bytes();
         if node.local {
-            collect::run("/usr/bin/env", &["python3".into(), "-".into()], Some(script), Duration::from_secs(60)).await
+            collect::run_complete("/usr/bin/env", &["python3".into(), "-".into()], Some(script), Duration::from_secs(60)).await
         } else {
-            collect::run(
+            collect::run_complete(
                 "ssh",
                 &ssh_args(&node.alias, "command -v python3 >/dev/null && exec python3 - || exec /usr/bin/python3 -"),
                 Some(script),
@@ -250,10 +250,10 @@ pub async fn inventory_node(node: &Node) -> Value {
             .await
         }
     } else if node.local {
-        collect::local::powershell_file(WIN_INVENTORY, "", Duration::from_secs(90)).await
+        collect::local::powershell_file_complete(WIN_INVENTORY, "", Duration::from_secs(90)).await
     } else {
         let remote = "mkdir -p ~/.katala-tune && cat > ~/.katala-tune/inventory.ps1 && powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$(cygpath -w ~/.katala-tune/inventory.ps1)\"";
-        collect::run("ssh", &ssh_args(&node.alias, remote), Some(WIN_INVENTORY), Duration::from_secs(90)).await
+        collect::run_complete("ssh", &ssh_args(&node.alias, remote), Some(WIN_INVENTORY), Duration::from_secs(90)).await
     };
     parse_result(&node.id, &res, started.elapsed().as_secs_f64())
 }
