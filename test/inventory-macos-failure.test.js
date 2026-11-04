@@ -39,9 +39,16 @@ def scanning(p):
     if denied and os.path.normpath(os.fspath(p)) == os.path.normpath(denied):
         raise PermissionError('synthetic denied')
     return EmptyScan()
+def stat(p, *args, **kwargs):
+    if os.path.normpath(os.fspath(p)) == os.path.normpath(os.path.join(home, '.cargo', 'bin', 'rustup')):
+        if sys.argv[2] == 'platform':
+            raise PermissionError('synthetic denied')
+        if sys.argv[2] == 'platform_present':
+            return os.stat_result((0,) * 10)
+    raise FileNotFoundError('synthetic missing')
 env = {'HOME': home, 'USERPROFILE': home, 'MISE_DATA_DIR': os.path.join(home, '.local', 'share', 'mise')}
 out = io.StringIO()
-with patch.dict(os.environ, env, clear=True), patch('os.listdir', listing), patch('os.scandir', scanning), patch('os.path.exists', return_value=False), patch('os.path.realpath', side_effect=lambda p: p), patch('builtins.open', side_effect=FileNotFoundError()), contextlib.redirect_stdout(out):
+with patch.dict(os.environ, env, clear=True), patch('os.listdir', listing), patch('os.scandir', scanning), patch('os.stat', stat), patch('os.path.realpath', side_effect=lambda p: p), patch('builtins.open', side_effect=FileNotFoundError()), contextlib.redirect_stdout(out):
     exec(compile(source, sys.argv[1], 'exec'), {})
 print(out.getvalue(), end='')
 `;
@@ -60,7 +67,13 @@ test('macOS readable and missing roots report available apps and npm packages', 
   assert.ok(!result.items.some(item => item.name === '.hidden'));
 });
 
-for (const source of ['app', 'npm']) {
+test('macOS installed platform is reported', () => {
+  const result = runProbe('platform_present');
+  assert.deepEqual(result.failed_sources, []);
+  assert.ok(result.items.some(item => item.source === 'platform' && item.name === 'rustup'));
+});
+
+for (const source of ['app', 'npm', 'platform']) {
   test(`macOS ${source} access denial must protect previous inventory`, () => {
     const result = runProbe(source);
     assert.ok(result.failed_sources.includes(source), `missing ${source} failure: ${JSON.stringify(result)}`);

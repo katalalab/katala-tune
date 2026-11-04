@@ -31,6 +31,15 @@ def listdir(p):
         return []
 
 
+def exists_checked(p):
+    # os.path.exists は権限エラーも False にするため、取得失敗と不在を区別する。
+    try:
+        os.stat(p)
+        return True
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+
+
 def newest(dirpath):
     vs = [v for v in listdir(dirpath) if os.path.isdir(os.path.join(dirpath, v))]
     return max(vs, key=lambda v: os.path.getmtime(os.path.join(dirpath, v))) if vs else None
@@ -136,7 +145,7 @@ def platform():
         "nix": ["/nix/store"],
     }
     for name, paths in checks.items():
-        if any(os.path.exists(p) for p in paths):
+        if any(exists_checked(p) for p in paths):
             add("platform", name)
 
 
