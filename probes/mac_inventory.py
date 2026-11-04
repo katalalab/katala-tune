@@ -10,7 +10,7 @@
 #   bin:   パッケージマネージャを通さずに置いた CLI（~/.local/bin・~/.bun/bin・~/go/bin・~/.deno/bin・/usr/local/bin）。
 #          Homebrew へのリンク・退避ファイル（.bak など拡張子つき）は数えない。~/bin は個人のスクリプト置き場なので見ない
 #   platform: パッケージマネージャ・ランタイム管理そのもの（Homebrew・rustup/cargo・nvm・rbenv・pyenv・Nix・colima・Docker）
-import json, os, plistlib, time
+import json, os, plistlib, stat, time
 
 HOME = os.path.expanduser("~")
 t0 = time.time()
@@ -41,7 +41,12 @@ def exists_checked(p):
 
 
 def newest(dirpath):
-    vs = [v for v in listdir(dirpath) if os.path.isdir(os.path.join(dirpath, v))]
+    def is_dir(p):
+        try:
+            return stat.S_ISDIR(os.stat(p).st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+    vs = [v for v in listdir(dirpath) if is_dir(os.path.join(dirpath, v))]
     return max(vs, key=lambda v: os.path.getmtime(os.path.join(dirpath, v))) if vs else None
 
 

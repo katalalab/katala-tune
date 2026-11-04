@@ -30,6 +30,10 @@ def listing(p):
         os.path.normpath(node): ['20.0'],
         os.path.normpath(os.path.join(node, '20.0', 'lib', 'node_modules')): ['demo'],
     }
+    if sys.argv[2] in ('brew_version', 'brew_present'):
+        entries[os.path.normpath('/opt/homebrew/Cellar')] = ['demo']
+        entries[os.path.normpath('/opt/homebrew/Cellar/demo')] = ['1.0']
+        return entries.get(os.path.normpath(os.fspath(p)), [])
     if sys.argv[2] == 'none': return entries.get(os.path.normpath(os.fspath(p)), [])
     return []
 class EmptyScan:
@@ -40,6 +44,10 @@ def scanning(p):
         raise PermissionError('synthetic denied')
     return EmptyScan()
 def stat(p, *args, **kwargs):
+    if sys.argv[2] == 'brew_present' and os.path.normpath(os.fspath(p)) == os.path.normpath('/opt/homebrew/Cellar/demo/1.0'):
+        return os.stat_result((0o040755, 0, 0, 1, 0, 0, 0, 0, 1, 0))
+    if sys.argv[2] == 'brew_version' and os.path.normpath(os.fspath(p)) == os.path.normpath('/opt/homebrew/Cellar/demo/1.0'):
+        raise PermissionError('synthetic denied')
     if os.path.normpath(os.fspath(p)) == os.path.normpath(os.path.join(home, '.cargo', 'bin', 'rustup')):
         if sys.argv[2] == 'platform':
             raise PermissionError('synthetic denied')
@@ -73,15 +81,21 @@ test('macOS installed platform is reported', () => {
   assert.ok(result.items.some(item => item.source === 'platform' && item.name === 'rustup'));
 });
 
-for (const source of ['app', 'npm', 'platform']) {
+test('macOS readable Homebrew version remains available', () => {
+  const result = runProbe('brew_present');
+  assert.deepEqual(result.failed_sources, []);
+  assert.ok(result.items.some(item => item.source === 'brew' && item.name === 'demo' && item.version === '1.0'));
+});
+
+for (const source of ['app', 'npm', 'platform', 'brew']) {
   test(`macOS ${source} access denial must protect previous inventory`, () => {
-    const result = runProbe(source);
+    const result = runProbe(source === 'brew' ? 'brew_version' : source);
     assert.ok(result.failed_sources.includes(source), `missing ${source} failure: ${JSON.stringify(result)}`);
     assert.ok(result.errors.length > 0);
     const db = openDb(fs.mkdtempSync(path.join(os.tmpdir(), 'kt-macos-inventory-')));
     db.saveInventory('fixture', [{ source, name: 'PreviouslySeen', version: '1', explicit: true, extra: null }], 1000);
     const saved = db.saveInventory('fixture', normalizeItems(result.items), 2000, { skipSources: result.failed_sources });
     assert.equal(saved.removed, 0);
-    assert.ok(db.inventory({ node_id: 'fixture' }).some(item => item.name === 'PreviouslySeen'));
+    assert.ok(db.inventory({ node_id: 'fixture' }).some(item => item.name === 'PreviouslySeen' && item.version === '1'));
   });
 }
