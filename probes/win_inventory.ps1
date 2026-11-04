@@ -52,7 +52,10 @@ Section @('winreg') {
       Add-Item $out 'winreg' $n ([string]$e.DisplayVersion) $true $e.Publisher
     }
   }
-  if ($unreadable) { [void]$errors.Add("winreg: $unreadable entries unreadable (skipped)") }
+  if ($unreadable) {
+    [void]$errors.Add("winreg: $unreadable entries unreadable (skipped)")
+    [void]$failed.Add('winreg') # Keep previous winreg entries when any entry was unreadable.
+  }
 }
 
 Section @('scoop') {
