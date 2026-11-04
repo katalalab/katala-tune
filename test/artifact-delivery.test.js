@@ -12,7 +12,19 @@ const clone = value => JSON.parse(JSON.stringify(value));
 
 function temporary(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'artifact-test-'));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true })); return root;
+  t.after(() => {
+    // Git objects are read-only on Windows, so make only this fixture's files writable.
+    const makeWritable = dir => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const target = path.join(dir, entry.name);
+        if (entry.isDirectory()) makeWritable(target);
+        else if (!entry.isSymbolicLink()) fs.chmodSync(target, 0o666);
+      }
+    };
+    makeWritable(root);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  return root;
 }
 function fixture(t) {
   const root = temporary(t);
