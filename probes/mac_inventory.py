@@ -10,7 +10,7 @@
 #   bin:   パッケージマネージャを通さずに置いた CLI（~/.local/bin・~/.bun/bin・~/go/bin・~/.deno/bin・/usr/local/bin）。
 #          Homebrew へのリンク・退避ファイル（.bak など拡張子つき）は数えない。~/bin は個人のスクリプト置き場なので見ない
 #   platform: パッケージマネージャ・ランタイム管理そのもの（Homebrew・rustup/cargo・nvm・rbenv・pyenv・Nix・colima・Docker）
-import json, os, plistlib, glob, time
+import json, os, plistlib, time
 
 HOME = os.path.expanduser("~")
 t0 = time.time()
@@ -55,7 +55,7 @@ def brew():
 def apps():
     seen = set()
     for root in ("/Applications", os.path.join(HOME, "Applications"), "/Applications/Utilities"):
-        for app in glob.glob(os.path.join(root, "*.app")):
+        for app in (os.path.join(root, name) for name in listdir(root) if name.endswith(".app")):
             name = os.path.basename(app)[:-4]
             # macOS 付属のアプリ（Safari など）は /System 配下への参照なので数えない。Xcode・Final Cut など Apple 製でも自分で入れたものは数える
             if name in seen or os.path.realpath(app).startswith("/System/"):
@@ -91,7 +91,8 @@ def uv_cargo():
 
 def npm_global():
     roots = ["/opt/homebrew/lib/node_modules", "/usr/local/lib/node_modules"]
-    roots += glob.glob(os.path.join(HOME, ".local", "share", "mise", "installs", "node", "*", "lib", "node_modules"))
+    node_root = os.path.join(HOME, ".local", "share", "mise", "installs", "node")
+    roots += [os.path.join(node_root, version, "lib", "node_modules") for version in listdir(node_root)]
     seen = set()
     for root in roots:
         for name in listdir(root):
