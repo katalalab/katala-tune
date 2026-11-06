@@ -25,9 +25,9 @@ CACHE_DIRS = [
 ]
 
 
-def run(cmd, timeout=8):
+def run(cmd, timeout=8, env=None):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env).stdout
     except Exception:
         return ""
 
@@ -308,7 +308,7 @@ def processes():
     top_cpu = by(procs, "cpu", 15)
     # 起動時刻（lstart）。終了操作の直前に、同じ PID が同じプロセスのままかを確かめるのに使う
     if top_cpu:
-        out = run(["ps", "-o", "pid=,lstart=", "-p", ",".join(str(p["pid"]) for p in top_cpu)])
+        out = run(["ps", "-o", "pid=,lstart=", "-p", ",".join(str(p["pid"]) for p in top_cpu)], env={**os.environ, "LC_ALL": "C"})
         starts = {int(l.split(None, 1)[0]): l.split(None, 1)[1].strip() for l in out.splitlines() if len(l.split(None, 1)) == 2}
         for p in top_cpu:
             p["start"] = starts.get(p["pid"])

@@ -465,7 +465,7 @@ async fn kill_script_stops_before_kill_when_target_identity_or_load_differs() {
     let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
     let pid = i64::from(child.id());
     let ps = |field: &str| {
-        let o = std::process::Command::new("ps").args(["-p", &pid.to_string(), "-o", field]).output().unwrap();
+        let o = std::process::Command::new("ps").env("LC_ALL", "C").args(["-p", &pid.to_string(), "-o", field]).output().unwrap();
         String::from_utf8_lossy(&o.stdout).trim().to_string()
     };
     let lstart = ps("lstart=");

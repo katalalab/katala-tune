@@ -380,7 +380,7 @@ test('条件3: プロセス終了スクリプトは、名前・起動時刻・�
   const child = spawn('sleep', ['30'], { stdio: 'ignore' });
   try {
     const pid = child.pid;
-    const lstart = execFileSync('ps', ['-p', String(pid), '-o', 'lstart=']).toString().trim();
+    const lstart = execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], { env: { ...process.env, LC_ALL: 'C' } }).toString().trim();
     const mac = { id: 'm', alias: 'mock-m', os: 'macos' };
     const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
     const cases = [
