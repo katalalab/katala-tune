@@ -140,7 +140,9 @@ fn mac_kill_script(pid: i64, name: &str, start: Option<&str>, min_cpu: i64) -> S
         format!("[ \"$n\" = '{name}' ] || {{ echo \"PID {pid} は今 ${{n:-存在しない}}\"; exit 3; }}"),
         match start {
             Some(s) => {
-                format!("[ \"$(LC_ALL=C ps -p {pid} -o lstart= | sed 's/^ *//;s/ *$//')\" = '{s}' ] || {{ echo \"PID {pid} は別の起動時刻のプロセス\"; exit 3; }}")
+                format!(
+                    "[ \"$(LC_ALL=C ps -p {pid} -o lstart= | sed 's/^ *//;s/ *$//')\" = '{s}' ] || {{ echo \"PID {pid} は別の起動時刻のプロセス\"; exit 3; }}"
+                )
             }
             None => ":".into(),
         },
