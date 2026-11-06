@@ -66,6 +66,32 @@ print(json.dumps({"parsed": len(rows), "kept": kept, "dropped": dropped, "events
   assert.ok(flood.ts >= T0 + (FLOOD - 1) * 100 - 1000);
 });
 
+test('probe: macOS カーネルログの読取起点は、古い cursor でも直近12時間より前に遡らない（初回は2時間）', () => {
+  // log show は呼ばずに、渡された --start を記録する。now は固定
+  const res = py(`
+import time, types
+NOW = 1_800_000_000.0
+m.time.time = lambda: NOW
+seen = []
+def fake_run(args, **kw):
+    seen.append(args[args.index("--start") + 1])
+    return types.SimpleNamespace(returncode=0, stdout="")
+m.subprocess.run = fake_run
+fmt = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+cases = {"stale": NOW - 16 * 86400, "recent": NOW - 3600, "first": 0}
+out = {}
+for name, cursor in cases.items():
+    r = m.kernel(cursor)
+    out[name] = {"start": seen[-1], "cursor": r["cursor"]}
+out["expect"] = {"stale": fmt(NOW - 12 * 3600), "recent": fmt(NOW - 3600), "first": fmt(NOW - 2 * 3600)}
+print(json.dumps(out))`);
+  assert.equal(res.stale.start, res.expect.stale);
+  assert.equal(res.recent.start, res.expect.recent);
+  assert.equal(res.first.start, res.expect.first);
+  // 何も出なかったときも cursor は窓の起点まで進み、次回は古い範囲を読み直さない
+  assert.equal(Number(res.stale.cursor), 1_800_000_000 - 12 * 3600 + 1);
+});
+
 test('probe: 形の違うものが上限を超えたら新しい 300 行を残し、切った分は実際の件数で dropped に数える', () => {
   const lines = [];
   for (let i = 0; i < 500; i++) lines.push(line(i, `ExampleBus: unique fault ${'abcdefghij'[i % 10]}${'klmnopqrst'[(i / 10 | 0) % 10]}${'uvwxyzabcd'[(i / 100 | 0) % 10]} word${String.fromCharCode(97 + (i % 26))}`.replace(/\d/g, '')));
