@@ -1,4 +1,5 @@
 ﻿$ErrorActionPreference="Stop"
+$ProgressPreference="SilentlyContinue"
 [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false)
 try {
 $p=[Console]::In.ReadToEnd().Split([char]10)
