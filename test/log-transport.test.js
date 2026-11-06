@@ -22,6 +22,12 @@ test('Windows log body travels on SSH stdin while bootstrap command stays fixed'
   assert.equal(windowsLogonsTransport({ win_security: '9223372036854775807:9223372036854775807' }, script).command, large.command);
 });
 
+test('Windows log bootstrap silences progress records before running the body', () => {
+  const { command } = windowsRemoteTransport({}, Buffer.from('Write-Output 1\n'));
+  const lines = Buffer.from(command.split(' ').pop(), 'base64').toString('utf16le').split('\n');
+  assert.ok(lines.slice(0, 3).includes('$ProgressPreference="SilentlyContinue"'));
+});
+
 test('Windows log transport rejects empty body and normalizes BOM/CRLF', () => {
   assert.throws(() => windowsRemoteTransport({}, Buffer.alloc(0)), /Invalid Windows log transport request/);
   const lf = windowsRemoteTransport({}, Buffer.from('param()\nWrite-Output 1\n'));
