@@ -19,6 +19,9 @@ test('Windows log body travels on SSH stdin while bootstrap command stays fixed'
   assert.deepEqual(frame.slice(0, 6), ['KTLOG1', 'events', '-9007199254740991', '0', '0', String(script.length)]);
   assert.equal(Buffer.from(frame[7], 'base64').compare(script), 0);
   assert.equal(frame[6], require('node:crypto').createHash('sha256').update(script).digest('hex'));
+  // The bootstrap reads exactly 8 lines and never waits for stdin EOF, which can stall behind Git Bash.
+  assert.equal(frame.length, 9);
+  assert.equal(frame[8], '');
   assert.equal(windowsLogonsTransport({ win_security: '9223372036854775807:9223372036854775807' }, script).command, large.command);
 });
 
@@ -26,6 +29,8 @@ test('Windows log bootstrap silences progress records before running the body', 
   const { command } = windowsRemoteTransport({}, Buffer.from('Write-Output 1\n'));
   const lines = Buffer.from(command.split(' ').pop(), 'base64').toString('utf16le').split('\n');
   assert.ok(lines.slice(0, 3).includes('$ProgressPreference="SilentlyContinue"'));
+  assert.ok(lines.some((l) => l.includes('$i.ReadLine()')));
+  assert.ok(!lines.some((l) => l.includes('ReadToEnd')));
 });
 
 test('Windows log transport rejects empty body and normalizes BOM/CRLF', () => {
