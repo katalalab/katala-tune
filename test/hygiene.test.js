@@ -182,7 +182,8 @@ function fakeGit(name, pattern, body) {
 
 test('status の後の git が時間切れなら、きれいとは数えず未観測にする', { skip: process.platform === 'win32' }, () => {
   const env = fakeGit('bin-revlist', 'rev-list', 'sleep 5');
-  const { data } = probe({ ghq_root: FX.ghq, cmd_s: 1, budget_s: 30 }, env);
+  // acme/clean は本物の git が時間内に読み切る必要がある。負荷の高い機体でも 1 秒を超えるので 3 秒にする（偽の rev-list は 5 秒止まる）
+  const { data } = probe({ ghq_root: FX.ghq, cmd_s: 3, budget_s: 30 }, env);
   const r = byPath(hygiene.normalize(data));
   assert.deepEqual([r['acme/localonly'].state, r['acme/localonly'].reason], ['unobserved', 'timeout']);
   assert.equal(r['acme/clean'].state, 'ok', 'upstream のあるリポジトリは rev-list を呼ばない');
