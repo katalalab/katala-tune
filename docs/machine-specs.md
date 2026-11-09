@@ -4,7 +4,7 @@ Tauri版のサイドバー「スペック比較」から機体を選び、「仕
 
 ## 収集方法
 
-Rustの `tune specs-local` は台帳・DBを開かず、その機体の読取結果を `katala_specs.v1` JSONで返す。WindowsはOS内蔵のCIM（PowerShell経由）と、導入済みの場合は `nvidia-smi` を使う。macOSは `system_profiler`、`sysctl`、`pmset` を使う。Pythonや配置した調査スクリプトは使わない。追加ソフトウェアはインストールしない。
+Rustの `tune specs-local` は台帳・DBを開かず、その機体の読取結果を `katala_specs.v1` JSONで返す。WindowsはOS内蔵のCIM（PowerShell経由）と、導入済みの場合は `nvidia-smi` を使う。macOSは `system_profiler`、`sysctl`、`pmset` と、Wi-Fi のカードの型名と版に限って `ioreg`（`IO80211HardwareVersion`・`IO80211DriverVersion` の 2 項目だけ。同じ節点の SSID・BSSID・MAC は読まない）を使う。`system_profiler SPAirPortDataType` は周囲の網の走査を待って 15〜30 秒かかり、制限時間内に返らないことが多いため使わない。Pythonや配置した調査スクリプトは使わない。追加ソフトウェアはインストールしない。
 
 `tune specs [機体ID ...]` はローカルまたは既存SSH接続で収集し、私有DBに最新の成功結果と最終試行を保存する。引数省略時は稼働中の収集許可機が対象。画面では明示的に選択した機体のみを収集する。共用機は既定で除外し、台帳の `specs: true` による明示的な読取許可がある場合だけ対象になる。`shared` 自体や最適化の許可は変更しない。台帳の `specs: false`、退役・一時停止・対象外の機体は収集を拒否する。
 

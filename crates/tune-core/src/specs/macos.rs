@@ -44,6 +44,26 @@ pub async fn collect() -> Value {
             raw.insert(key.into(), v);
         }
     }
+    // SPAirPortDataType は周囲の網の走査を待つので 15〜30 秒かかり、-timeout 内に返らないことも多い。
+    // 使うのはカードの型名と版だけなので、Wi-Fi の節点から ioreg で 2 つの項目だけを読む（同じ節点の SSID・BSSID・MAC は読まない）
+    let r = collect::run_bounded(
+        "/usr/sbin/ioreg",
+        &["-r".into(), "-k".into(), "IO80211HardwareVersion".into(), "-d1".into(), "-l".into(), "-w0".into()],
+        &[],
+        Duration::from_secs(5),
+        MAX_BYTES,
+        1024,
+    )
+    .await;
+    if r.timed_out {
+        errors.insert("wifi".into(), json!("timeout"));
+    } else if r.spawn_failed {
+        errors.insert("wifi".into(), json!("tool_missing"));
+    } else if r.code != Some(0) || r.output_limited {
+        errors.insert("wifi".into(), json!("error"));
+    } else {
+        raw.insert("wifi".into(), wifi_versions(&String::from_utf8_lossy(&r.stdout)));
+    }
     let r = collect::run_bounded("/usr/bin/pmset", &["-g".into(), "custom".into()], &[], Duration::from_secs(3), 16384, 1024).await;
     if r.code == Some(0) {
         let mut modes = Vec::new();
@@ -83,7 +103,6 @@ const TYPES: &[(&str, &str)] = &[
     ("SPNVMeDataType", "storage"),
     ("SPSerialATADataType", "storage"),
     ("SPEthernetDataType", "network"),
-    ("SPAirPortDataType", "network"),
     ("SPUSBDataType", "usb"),
     ("SPThunderboltDataType", "thunderbolt"),
     ("SPPCIDataType", "pci"),
@@ -101,9 +120,6 @@ fn walk<'a>(items: &'a [Value], out: &mut Vec<&'a Value>, depth: usize) {
         }
         out.push(v);
         if let Some(children) = v["_items"].as_array() {
-            walk(children, out, depth + 1);
-        }
-        if let Some(children) = v["spairport_airport_interfaces"].as_array() {
             walk(children, out, depth + 1);
         }
     }
@@ -164,8 +180,6 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
                     ("os_version", "version"),
                     ("kernel_version", "kernel"),
                     ("boot_mode", "boot_mode"),
-                    ("spairport_wireless_card_type", "model"),
-                    ("spairport_wireless_firmware_version", "firmware_version"),
                 ],
             );
             if *id == "gpu" {
@@ -199,6 +213,16 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
             "ok"
         };
         merge(sections, id, components, status, &source);
+    }
+    const WIFI_SOURCE: &str = "ioreg IO80211HardwareVersion";
+    if let Some(error) = raw["errors"]["wifi"].as_str() {
+        merge(sections, "network", vec![], error, WIFI_SOURCE);
+    } else if raw["wifi"].is_object() {
+        let fields = mapped(&raw["wifi"], &[("hardware_version", "model"), ("driver_version", "firmware_version")]);
+        match fields.get("model").and_then(Value::as_str).map(String::from) {
+            Some(model) => merge(sections, "network", vec![component(&model, WIFI_SOURCE, fields)], "ok", WIFI_SOURCE),
+            None => merge(sections, "network", vec![], "empty", WIFI_SOURCE),
+        }
     }
     if let Some(hw) = raw["SPHardwareDataType"].as_array().and_then(|a| a.first()) {
         let mut cpu =
@@ -304,6 +328,36 @@ pub fn normalize(raw: &Value, sections: &mut Map<String, Value>) {
     entry["providers"].as_array_mut().expect("providers").push(json!({"source":"pmset -g custom","status":pmset_state}));
 }
 
+#[cfg(any(target_os = "macos", test))]
+/// ioreg の出力から Wi-Fi のカードの型名（IO80211HardwareVersion）と版（IO80211DriverVersion）だけを取り出す。無ければ空のオブジェクト。
+/// Apple のチップは 1 行の文字列、Broadcom は `vendorid: 0x14e4` などを並べた複数行の値で、後者は system_profiler と同じ
+/// 「(ベンダー, チップ番号)」の形にする（ほかの行は使わない）
+pub(super) fn wifi_versions(text: &str) -> Value {
+    let value = |key: &str| {
+        let prefix = format!("\"{key}\" = \"");
+        let mut lines = text.lines();
+        let first = lines.by_ref().find_map(|l| l.trim_start().trim_start_matches('|').trim_start().strip_prefix(prefix.as_str()))?;
+        let mut parts = vec![first];
+        while !parts.last().is_some_and(|l| l.ends_with('"')) && parts.len() < 32 {
+            parts.push(lines.next()?);
+        }
+        let joined = parts.join("\n");
+        joined.strip_suffix('"').map(str::to_string)
+    };
+    let mut out = Map::new();
+    if let Some(hw) = value("IO80211HardwareVersion") {
+        let field = |name: &str| hw.lines().find_map(|l| l.trim().strip_prefix(name)?.trim().strip_prefix("0x").map(str::to_uppercase));
+        let model = if hw.contains('\n') { field("vendorid:").zip(field("chipnum:")).map(|(v, c)| format!("Wi-Fi (0x{v}, 0x{c})")) } else { Some(hw) };
+        if let Some(m) = model {
+            out.insert("hardware_version".into(), json!(m));
+        }
+    }
+    if let Some(v) = value("IO80211DriverVersion") {
+        out.insert("driver_version".into(), json!(v));
+    }
+    Value::Object(out)
+}
+
 fn merge(sections: &mut Map<String, Value>, id: &str, components: Vec<Value>, status: &str, source: &str) {
     let entry = sections.get_mut(id).expect("known section");
     let items = entry["components"].as_array_mut().expect("components");
@@ -323,4 +377,58 @@ fn merge(sections: &mut Map<String, Value>, id: &str, components: Vec<Value>, st
     });
     let sources: Vec<_> = entry["providers"].as_array().into_iter().flatten().filter_map(|p| p["source"].as_str()).collect();
     entry["source"] = json!(sources.join(" / "));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wifi_versions_reads_only_the_two_version_keys() {
+        let text = "+-o AppleWLANDriver  <class IOUserService>\n    {\n      \"IO80211SSID\" = \"home-network\"\n      \"IO80211BSSID\" = <aabbccddeeff>\n      \"IO80211DriverVersion\" = \"Jan 1 2026 version X chip id: 0x11\"\n      \"IO80211HardwareVersion\" = \"chip id: 0x11 api 1.2 firmware [Rev 1]\"\n    }\n";
+        let v = wifi_versions(text);
+        assert_eq!(v, json!({ "hardware_version": "chip id: 0x11 api 1.2 firmware [Rev 1]", "driver_version": "Jan 1 2026 version X chip id: 0x11" }));
+        assert_eq!(wifi_versions(""), json!({}));
+        // Broadcom は複数行。ベンダーとチップ番号だけを使う
+        let broadcom = "    {\n      \"IO80211HardwareVersion\" = \"vendorid: 0x14e4\ndeviceid: 0x4434\nchipnum: 0x4388\nboardrev: 0x1100\"\n      \"IO80211DriverVersion\" = \"wl0: Feb  2 2026 version 23.50 FWID 01-abc\"\n    }\n";
+        assert_eq!(
+            wifi_versions(broadcom),
+            json!({ "hardware_version": "Wi-Fi (0x14E4, 0x4388)", "driver_version": "wl0: Feb  2 2026 version 23.50 FWID 01-abc" })
+        );
+        // 閉じない値は読まない
+        assert_eq!(wifi_versions("\"IO80211HardwareVersion\" = \"vendorid: 0x14e4\nchipnum: 0x4388"), json!({}));
+    }
+
+    #[test]
+    fn wifi_section_from_ioreg() {
+        let mut sections = Map::new();
+        for id in SECTIONS {
+            sections.insert((*id).into(), section(vec![], "not_collected", ""));
+        }
+        normalize(
+            &json!({ "wifi": { "hardware_version": "chip id: 0x11", "driver_version": "v1" }, "SPEthernetDataType": [{ "_name": "Ethernet" }] }),
+            &mut sections,
+        );
+        let network = &sections["network"];
+        assert_eq!(network["status"], "ok");
+        let models: Vec<&str> = network["components"].as_array().into_iter().flatten().filter_map(|c| c["fields"]["model"].as_str()).collect();
+        assert_eq!(models, ["Ethernet", "chip id: 0x11"]);
+        assert_eq!(network["components"][1]["fields"]["firmware_version"], "v1");
+        assert_eq!(network["components"][1]["source"], "ioreg IO80211HardwareVersion");
+
+        // 失敗は欠測として残し、取れた分と合わせて partial にする
+        let mut failed = Map::new();
+        for id in SECTIONS {
+            failed.insert((*id).into(), section(vec![], "not_collected", ""));
+        }
+        normalize(&json!({ "errors": { "wifi": "timeout" }, "SPEthernetDataType": [{ "_name": "Ethernet" }] }), &mut failed);
+        assert_eq!(failed["network"]["status"], "partial");
+        // Wi-Fi の無い機体は空（失敗ではない）
+        let mut none = Map::new();
+        for id in SECTIONS {
+            none.insert((*id).into(), section(vec![], "not_collected", ""));
+        }
+        normalize(&json!({ "wifi": {} }), &mut none);
+        assert_eq!(none["network"]["status"], "empty");
+    }
 }
