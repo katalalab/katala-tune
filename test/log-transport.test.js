@@ -144,10 +144,16 @@ test('Windows Git Bash executes >8191-byte bodies and rejects corrupt or truncat
   const fields = transport.input.split('\n');
   const changed = (i, v) => { const a = [...fields]; a[i] = v; return a.join('\n'); };
   for (const [name, input] of [
-    ['empty', ''], ['missing-final-quantum', transport.input.slice(0, -4)], ['partial-quantum', transport.input.slice(0, -1)],
-    ['extra-byte', transport.input + 'A'], ['extra-newline', transport.input + '\n'], ['empty-body', changed(7, '')], ['bad-hash', changed(6, '0'.repeat(64))], ['bad-cursor', changed(2, '42;Write-Output bad')],
+    ['empty', ''], ['missing-final-quantum', transport.input.slice(0, -5)], ['partial-quantum', transport.input.slice(0, -2)],
+    ['missing-line', fields.slice(0, 7).join('\n')], ['extra-byte', changed(7, fields[7] + 'A')], ['empty-body', changed(7, '')], ['bad-hash', changed(6, '0'.repeat(64))], ['bad-cursor', changed(2, '42;Write-Output bad')],
     ['bad-length', changed(5, '0')], ['bad-kind', changed(1, 'other')], ['invalid-base64', changed(7, '!')],
   ]) await t.test(name, async () => assert.equal((await execute(input)).code, null));
+  // 8 行のフレームだけを読み、EOF は待たない。後ろに続くデータは読まれず、実行もされない
+  for (const tail of ['A', '\n', 'Write-Output bad\n']) {
+    const r = await execute(transport.input + tail);
+    assert.equal(r.code, 0, r.err);
+    assert.deepEqual(JSON.parse(r.out), { text: '日本語', cursor: 42 });
+  }
   for (const body of [Buffer.from('param(\n'), Buffer.from([255]), Buffer.from('param()\n[Console]::WriteLine("{}")\nexit 7')]) {
     const t = windowsRemoteTransport({}, body);
     assert.equal((await runWindowsLogs(bash, ['-c', t.command], { input: t.input, timeoutMs: 30000 })).code, null);
