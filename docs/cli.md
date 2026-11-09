@@ -22,3 +22,5 @@ macOSでは `~/.katala-tune/bin/tune versions` のように実行する。各JSO
 `tune specs --saved [機体ID ...]` は保存済みの仕様と最終試行だけをJSONで表示する。SSHやローカル収集を実行せず、既存DBを読取専用で開く。DB未作成の場合は `report: null` を返し、DBやディレクトリを作成しない。引数省略時は台帳の全機体を表示し、退役・共用・収集停止の機体も閲覧できる。出力の `read_only: true` はこの保存済み表示を示し、別プロセスでの収集中かどうかは判定しない。
 
 `tune specs [機体ID ...]` は収集・保存、`tune specs-local` は台帳・DB不要の単体収集。[機体仕様の詳細](machine-specs.md)を参照。指定したIDとオプションはDB初期化前に検証する。その他の従来コマンドのJSON出力形式は変更していない。
+
+`tune ssh [--probe] [機体ID ...]` は、この機体の SSH クライアントから台帳の機体へ向けた設定・鍵・known_hosts を読み取り専用で点検する。引数省略時は運用対象のうちこの機体以外が対象。秘密鍵は開かず、出力に接続先の名前・ユーザー名・鍵のパス・指紋・コメントを含めない。DB・設定・known_hosts は変更しない。`--probe` を付けたときだけ BatchMode で接続し、所要時間と失敗の種類（`unreachable`・`auth`・`timeout`・`error`）を返す。所見の種類は [roadmap.md](roadmap.md) の「SSH」を参照。
