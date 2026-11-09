@@ -72,8 +72,9 @@ function NsErr($e) {
   return $m
 }
 
-$os = Get-CimInstance Win32_OperatingSystem
-$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+# -Property keeps the provider from computing every counter (about 1s each for these two classes on some machines).
+$os = Get-CimInstance Win32_OperatingSystem -Property Caption,BuildNumber,LastBootUpTime,TotalVisibleMemorySize,FreePhysicalMemory,TotalVirtualMemorySize,FreeVirtualMemory
+$cpu = Get-CimInstance Win32_Processor -Property Name,MaxClockSpeed | Select-Object -First 1
 $ncpu = [int]$env:NUMBER_OF_PROCESSORS
 $totalMb = [double]$os.TotalVisibleMemorySize / 1024
 
