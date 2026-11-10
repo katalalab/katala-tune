@@ -45,12 +45,20 @@ async fn audits_config_keys_and_known_hosts_with_real_openssh() {
     let dir = std::env::temp_dir().join(format!("kt-ssh-audit-{}-{}", std::process::id(), tune_core::db::now_ms()));
     std::fs::create_dir_all(&dir).expect("scratch");
     let _cleanup = Scratch(dir.clone());
-    let good = keygen(&dir, "id_good", "ed25519", "256");
+    let good = keygen(&dir, "id_kt-good", "ed25519", "256");
     let weak = keygen(&dir, "id_weak", "rsa", "2048");
     let public_key = std::fs::read_to_string(good.with_extension("pub")).expect("pub");
-    let known = dir.join("known_hosts");
+    let known = dir.join("known hosts");
     // 公開鍵の中身は何でもよい（登録の有無だけを見る）
-    std::fs::write(&known, format!("[127.0.0.1]:1 {}", public_key.split_whitespace().take(2).collect::<Vec<_>>().join(" "))).expect("known_hosts");
+    std::fs::write(
+        &known,
+        format!(
+            "[127.0.0.1]:1 {}\nfixture-host-key {}\n",
+            public_key.split_whitespace().take(2).collect::<Vec<_>>().join(" "),
+            public_key.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
+        ),
+    )
+    .expect("known_hosts");
     let common = format!(
         "  HostName 127.0.0.1\n  IdentitiesOnly yes\n  IdentityAgent none\n  UserKnownHostsFile \"{}\"\n  GlobalKnownHostsFile \"{}\"\n  StrictHostKeyChecking yes\n  ConnectTimeout 3\n",
         known.display(),
@@ -61,14 +69,22 @@ async fn audits_config_keys_and_known_hosts_with_real_openssh() {
         &config,
         format!(
             "Host kt-good\n  Port 1\n  IdentityFile \"{}\"\n{common}\nHost kt-weak\n  Port 9\n  IdentityFile \"{}\"\n  ForwardAgent yes\n{common}\nHost kt-nokey\n  Port 1\n  IdentityFile \"{}\"\n{common}",
-            good.display(),
+            dir.join("id_%n").display(),
             weak.display(),
             dir.join("missing").display()
         ),
     )
     .expect("config");
 
-    let nodes = [node("kt-good"), node("kt-weak"), node("kt-nokey"), node("-oProxyCommand=x")];
+    // 公開鍵だけの IdentityFile と HostKeyAlias は実際の OpenSSH の設定として解決する。
+    use std::io::Write;
+    writeln!(
+        std::fs::OpenOptions::new().append(true).open(&config).unwrap(),
+        "\nHost kt-public\n  Port 9\n  HostKeyAlias fixture-host-key\n  IdentityFile \"{}\"\n{common}",
+        good.with_extension("pub").display()
+    )
+    .unwrap();
+    let nodes = [node("kt-good"), node("kt-weak"), node("kt-nokey"), node("kt-public"), node("-oProxyCommand=x")];
     let report = audit_all(&nodes, &Opts { probe: true, config: Some(config) }).await;
     let by_id = |id: &str| report["nodes"].as_array().and_then(|a| a.iter().find(|n| n["node_id"] == id)).cloned().unwrap_or(Value::Null);
 
@@ -87,6 +103,10 @@ async fn audits_config_keys_and_known_hosts_with_real_openssh() {
     assert_eq!(w["known_host"], false);
     assert_eq!(w["keys"][0]["type"], "RSA");
     assert_eq!(codes(&w), ["rsa_short", "unknown_host", "forward_agent", "probe_unreachable"]);
+
+    let p = by_id("kt-public");
+    assert_eq!(p["known_host"], true, "HostKeyAlias にはポートを付けない");
+    assert_eq!(p["keys"][0]["type"], "ED25519", "公開鍵だけの IdentityFile も解析する");
 
     let n = by_id("kt-nokey");
     assert_eq!(n["keys"], json!([]));

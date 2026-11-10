@@ -32,6 +32,7 @@ pub struct Opts {
 /// `ssh -G` の解決結果のうち、点検に使う項目
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Resolved {
+    pub user: String,
     pub hostname: String,
     pub port: u16,
     pub host_key_alias: Option<String>,
@@ -39,6 +40,7 @@ pub struct Resolved {
     pub identities_only: bool,
     pub identity_agent: Option<String>,
     pub strict: String,
+    /// ssh -G のパス一覧を行ごとに保持する（空白を含むパスの引用符は出力されない）。
     pub known_hosts_files: Vec<String>,
     pub proxy: bool,
     pub forward_agent: bool,
@@ -52,6 +54,7 @@ pub fn parse_resolved(text: &str) -> Resolved {
         let Some((key, value)) = line.split_once(' ') else { continue };
         let value = value.trim();
         match key {
+            "user" => r.user = value.into(),
             "hostname" => r.hostname = value.into(),
             "port" => r.port = value.parse().unwrap_or(22),
             "hostkeyalias" => r.host_key_alias = Some(value.into()),
@@ -59,7 +62,7 @@ pub fn parse_resolved(text: &str) -> Resolved {
             "identitiesonly" => r.identities_only = value == "yes",
             "identityagent" => r.identity_agent = Some(value.into()),
             "stricthostkeychecking" => r.strict = value.into(),
-            "userknownhostsfile" | "globalknownhostsfile" => r.known_hosts_files.extend(value.split_whitespace().map(String::from)),
+            "userknownhostsfile" | "globalknownhostsfile" => r.known_hosts_files.push(value.into()),
             "proxyjump" | "proxycommand" => r.proxy |= value != "none",
             "forwardagent" => r.forward_agent = value != "no",
             _ => {}
@@ -267,7 +270,7 @@ fn age_days(path: &Path) -> Option<i64> {
     Some(SystemTime::now().duration_since(modified).map_or(0, |d| (d.as_secs() / 86_400) as i64))
 }
 
-async fn agent_for(r: &Resolved) -> Agent {
+async fn agent_for(r: &Resolved, alias: &str) -> Agent {
     let socket = match AgentUse::of(r) {
         AgentUse::Disabled => return Agent::default(),
         AgentUse::Default => None,
@@ -279,7 +282,7 @@ async fn agent_for(r: &Resolved) -> Agent {
                     Ok(v) => Some(v),
                     Err(_) => return Agent::default(),
                 },
-                None => Some(nodes::expand(raw.trim_matches('"'))),
+                None => Some(expand_identity(raw.trim_matches('"'), alias, r)),
             }
         }
     };
@@ -290,34 +293,102 @@ async fn agent_for(r: &Resolved) -> Agent {
     parse_agent(r.code, &r.out)
 }
 
-async fn known_host(r: &Resolved) -> Option<bool> {
+async fn known_host(r: &Resolved, alias: &str) -> Option<bool> {
     let name = r.host_key_alias.as_deref().unwrap_or(&r.hostname);
     if !safe_name(name) {
         return None;
     }
-    let target = if r.port == 22 { name.to_string() } else { format!("[{name}]:{}", r.port) };
-    let mut checked = false;
-    for file in &r.known_hosts_files {
-        let path = PathBuf::from(nodes::expand(file));
-        if !path.is_file() {
-            continue;
-        }
-        let res = run_local("ssh-keygen", &["-F".into(), target.clone(), "-f".into(), path.to_string_lossy().into_owned()], &[], &[]).await;
-        match res.code {
-            Some(0) => return Some(true),
-            Some(_) => checked = true,
-            None => {}
+    let target = if r.host_key_alias.is_some() || r.port == 22 { name.to_string() } else { format!("[{name}]:{}", r.port) };
+    let mut uncertain = false;
+    for group in &r.known_hosts_files {
+        // ssh -G は空白を含むパスの引用符を落とす。行全体が既存のファイルなら
+        // そのまま扱い、複数パスへの分割が曖昧なときは「未登録」と断定しない。
+        let whole = expand_identity(group, alias, r);
+        let paths: Vec<String> =
+            if Path::new(&whole).is_file() { vec![whole] } else { group.split_whitespace().map(|file| expand_identity(file, alias, r)).collect() };
+        let ambiguous = paths.len() > 1;
+        for file in paths {
+            if file == "none" {
+                continue;
+            }
+            let path = Path::new(&file);
+            if !path.is_file() {
+                uncertain |= ambiguous;
+                continue;
+            }
+            let res = run_local("ssh-keygen", &["-F".into(), target.clone(), "-f".into(), file], &[], &[]).await;
+            match res.code {
+                Some(0) => return Some(true),
+                Some(1) => {}
+                _ => uncertain = true,
+            }
         }
     }
-    // known_hosts が 1 つも無いのは「登録が無い」と同じ
-    if checked || r.known_hosts_files.iter().all(|f| !Path::new(&nodes::expand(f)).is_file()) { Some(false) } else { None }
+    if uncertain { None } else { Some(false) }
+}
+
+/// `ssh -G` は IdentityFile の `%` を展開しないので、よく使う分だけ ssh と同じに展開する（知らない記号はそのまま残し、ファイルが無い扱いになる）
+fn expand_identity(path: &str, alias: &str, r: &Resolved) -> String {
+    let mut out = String::new();
+    let mut chars = path.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => out.push('%'),
+            Some('d') => out.push_str(&nodes::home().to_string_lossy()),
+            Some('h') => out.push_str(&r.hostname),
+            Some('n') => out.push_str(alias),
+            Some('p') => out.push_str(&r.port.to_string()),
+            Some('r') => out.push_str(&r.user),
+            Some('u') => out.push_str(&std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default()),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    nodes::expand(&out)
+}
+
+/// probe の引数。読み取り専用に保つため、known_hosts への書き込み（accept-new・no・UpdateHostKeys）・
+/// 転送の待ち受け・LocalCommand を止める（capabilities・specs と同じ）
+fn probe_args(alias: &str, opts: &Opts) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "UpdateHostKeys=no",
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "PermitLocalCommand=no",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "ForwardX11=no",
+        "-o",
+        "RemoteCommand=none",
+        "-o",
+        "RequestTTY=no",
+        "-o",
+        "ForkAfterAuthentication=no",
+        "-o",
+        "Tunnel=no",
+    ]
+    .map(String::from)
+    .into();
+    args.extend(collect::SSH_OPTS.iter().map(|s| s.to_string()));
+    args.extend(config_args(opts));
+    args.extend(["--".to_string(), alias.into(), "exit 0".into()]);
+    args
 }
 
 async fn probe(alias: &str, opts: &Opts) -> (Option<&'static str>, u64) {
-    let mut args: Vec<String> = collect::SSH_OPTS.iter().map(|s| s.to_string()).collect();
-    args.extend(config_args(opts));
-    args.push(alias.into());
-    args.push("exit 0".into());
+    let args = probe_args(alias, opts);
     let t = Instant::now();
     let r = collect::run("ssh", &args, None, PROBE_TIMEOUT).await;
     let ms = t.elapsed().as_millis() as u64;
@@ -330,7 +401,7 @@ pub async fn audit_node(node: &Node, opts: &Opts) -> Value {
         return json!({ "node_id": node.id, "ok": false, "error": "台帳の alias が SSH の Host 名として使えない" });
     }
     let mut args = config_args(opts);
-    args.extend(["-G".to_string(), node.alias.clone()]);
+    args.extend(["-G".to_string(), "--".to_string(), node.alias.clone()]);
     let res = run_local("ssh", &args, &[], &[]).await;
     if res.code != Some(0) {
         return json!({ "node_id": node.id, "ok": false, "error": "ssh -G で設定を解決できない" });
@@ -338,15 +409,17 @@ pub async fn audit_node(node: &Node, opts: &Opts) -> Value {
     let resolved = parse_resolved(&res.out);
     let mut files = Vec::new();
     for f in &resolved.identity_files {
-        let path = PathBuf::from(nodes::expand(f));
+        let path = PathBuf::from(expand_identity(f, &node.alias, &resolved));
         if !path.is_file() {
             continue;
         }
         let mut pub_path = path.clone().into_os_string();
-        pub_path.push(".pub");
+        if path.extension().is_none_or(|ext| ext != "pub") {
+            pub_path.push(".pub");
+        }
         files.push(FileKey { key: key_of(Path::new(&pub_path)).await, age_days: age_days(&path) });
     }
-    let (agent, known) = tokio::join!(agent_for(&resolved), known_host(&resolved));
+    let (agent, known) = tokio::join!(agent_for(&resolved, &node.alias), known_host(&resolved, &node.alias));
     let (probe_result, probe_ms) = if opts.probe {
         let (r, ms) = probe(&node.alias, opts).await;
         (Some(r), Some(ms))
@@ -419,7 +492,7 @@ mod tests {
         assert!(r.identities_only && r.proxy && !r.forward_agent);
         assert_eq!(r.identity_agent.as_deref(), Some("~/agent.sock"));
         assert_eq!(r.strict, "accept-new");
-        assert_eq!(r.known_hosts_files, ["~/.ssh/known_hosts", "~/.ssh/known_hosts2", "/etc/ssh/ssh_known_hosts"]);
+        assert_eq!(r.known_hosts_files, ["~/.ssh/known_hosts ~/.ssh/known_hosts2", "/etc/ssh/ssh_known_hosts"]);
         assert_eq!(r.host_key_alias.as_deref(), Some("alias-key"));
         let defaults = parse_resolved("hostname h\nproxycommand none\nforwardagent yes\n");
         assert_eq!((defaults.port, defaults.strict.as_str(), defaults.proxy, defaults.forward_agent), (22, "ask", false, true));
@@ -527,6 +600,65 @@ mod tests {
         assert_eq!(v["keys"][0]["in_agent"], true);
         assert_eq!(v["keys"][1]["source"], "agent");
         assert_eq!(v["probe"], json!({ "ok": false, "ms": 1234, "reason": "timeout" }));
+    }
+
+    #[test]
+    fn probe_never_writes_known_hosts_or_opens_forwards() {
+        let args = probe_args("kt-host", &Opts::default());
+        for opt in ["StrictHostKeyChecking=yes", "UpdateHostKeys=no", "ClearAllForwardings=yes", "PermitLocalCommand=no", "BatchMode=yes"] {
+            assert!(args.iter().any(|a| a == opt), "{opt}");
+        }
+        // コマンドラインの -o は設定ファイルより優先される。alias は -- の後
+        assert_eq!(&args[args.len() - 3..], ["--", "kt-host", "exit 0"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_overrides_unsafe_config_with_real_openssh() {
+        let dir = std::env::temp_dir().join(format!("kt-ssh-options-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config");
+        std::fs::write(&config, "Host fixture\n HostName 192.0.2.1\n IdentityAgent none\n IdentityFile none\n StrictHostKeyChecking no\n UpdateHostKeys yes\n ForwardAgent yes\n ForwardX11 yes\n PermitLocalCommand yes\n LocalCommand touch should-not-exist\n RemoteCommand touch remote-should-not-exist\n LocalForward 12345 localhost:12346\n RequestTTY force\n ForkAfterAuthentication yes\n Tunnel yes\n").unwrap();
+        let mut args = probe_args("fixture", &Opts { config: Some(config), probe: true });
+        args.insert(0, "-G".into());
+        let result = run_local("ssh", &args, &[], &[]).await;
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(result.code, Some(0));
+        for expected in [
+            "stricthostkeychecking true",
+            "updatehostkeys false",
+            "forwardagent no",
+            "forwardx11 no",
+            "permitlocalcommand no",
+            "clearallforwardings yes",
+            "requesttty false",
+            "forkafterauthentication no",
+            "tunnel false",
+        ] {
+            assert!(result.out.lines().any(|line| line == expected), "missing {expected}");
+        }
+        assert!(!result.out.lines().any(|line| line.starts_with("localforward ") || line.starts_with("remotecommand ")));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_missing_known_hosts_is_unknown() {
+        let missing = std::env::temp_dir().join(format!("kt-missing-{}-{}", std::process::id(), now_ms()));
+        let mut r = Resolved {
+            hostname: "fixture".into(),
+            port: 22,
+            known_hosts_files: vec![missing.join("known hosts").to_string_lossy().into_owned()],
+            ..Resolved::default()
+        };
+        assert_eq!(known_host(&r, "fixture").await, None);
+        r.known_hosts_files = vec![missing.join("known_hosts").to_string_lossy().into_owned()];
+        assert_eq!(known_host(&r, "fixture").await, Some(false));
+    }
+
+    #[test]
+    fn identity_file_tokens_are_expanded() {
+        let r = Resolved { user: "u1".into(), hostname: "h1".into(), port: 2222, ..Resolved::default() };
+        assert_eq!(expand_identity("/k/%h-%r-%n-%p-%%-%C", "a1", &r), "/k/h1-u1-a1-2222-%-%C");
+        assert_eq!(expand_identity("%d/x", "a1", &r), format!("{}/x", nodes::home().to_string_lossy()));
     }
 
     #[test]
