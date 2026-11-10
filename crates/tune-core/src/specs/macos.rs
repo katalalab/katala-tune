@@ -45,7 +45,7 @@ pub async fn collect() -> Value {
         }
     }
     // SPAirPortDataType は周囲の網の走査を待つので 15〜30 秒かかり、-timeout 内に返らないことも多い。
-    // 使うのはカードの型名と版だけなので、Wi-Fi の節点から ioreg で 2 つの項目だけを読む（同じ節点の SSID・BSSID・MAC は読まない）
+    // 使うのはカードの型名と版だけなので、Wi-Fi の節点から ioreg で 2 つの項目だけを読む（同じ節点の SSID・BSSID・MAC は抽出・保存しない）
     let r = collect::run_bounded(
         "/usr/sbin/ioreg",
         &["-r".into(), "-k".into(), "IO80211HardwareVersion".into(), "-d1".into(), "-l".into(), "-w0".into()],
@@ -339,14 +339,24 @@ pub(super) fn wifi_versions(text: &str) -> Value {
         let first = lines.by_ref().find_map(|l| l.trim_start().trim_start_matches('|').trim_start().strip_prefix(prefix.as_str()))?;
         let mut parts = vec![first];
         while !parts.last().is_some_and(|l| l.ends_with('"')) && parts.len() < 32 {
-            parts.push(lines.next()?);
+            let next = lines.next()?;
+            // 壊れた文字列から次のプロパティや節点へ読み進めない。
+            if next.trim_start().starts_with(['"', '{', '}', '|', '+']) {
+                return None;
+            }
+            parts.push(next);
         }
         let joined = parts.join("\n");
         joined.strip_suffix('"').map(str::to_string)
     };
     let mut out = Map::new();
     if let Some(hw) = value("IO80211HardwareVersion") {
-        let field = |name: &str| hw.lines().find_map(|l| l.trim().strip_prefix(name)?.trim().strip_prefix("0x").map(str::to_uppercase));
+        let field = |name: &str| {
+            hw.lines().find_map(|l| {
+                let hex = l.trim().strip_prefix(name)?.trim().strip_prefix("0x")?;
+                (!hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| hex.to_uppercase())
+            })
+        };
         let model = if hw.contains('\n') { field("vendorid:").zip(field("chipnum:")).map(|(v, c)| format!("Wi-Fi (0x{v}, 0x{c})")) } else { Some(hw) };
         if let Some(m) = model {
             out.insert("hardware_version".into(), json!(m));
@@ -397,6 +407,14 @@ mod tests {
         );
         // 閉じない値は読まない
         assert_eq!(wifi_versions("\"IO80211HardwareVersion\" = \"vendorid: 0x14e4\nchipnum: 0x4388"), json!({}));
+    }
+
+    #[test]
+    fn wifi_versions_rejects_unclosed_values_before_private_properties() {
+        let text = "\"IO80211DriverVersion\" = \"unterminated\n  \"IO80211SSID\" = \"fixture-private-network\"\n";
+        assert_eq!(wifi_versions(text), json!({}));
+        let text = "\"IO80211HardwareVersion\" = \"vendorid: 0x14e4\nchipnum: 0x4388 private-value\"";
+        assert_eq!(wifi_versions(text), json!({}));
     }
 
     #[test]
