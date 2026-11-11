@@ -2,22 +2,20 @@
 
 ## 未リリース
 
-- macOS のディスク測定で、取得失敗を 0 B/s と扱わない。Python/Rust とも読取・書込を別々に欠測にし、復帰・ディスク交換・counter reset 後は基点を取り直す。欠測を除いた分集計と保存後の再読を合成試験で確認する。
-- macOS のネイティブのサンプラー（`tune-agent sample`）: live_mac.py と同じ行・同じ値を sysctl・mach・libproc・IOKit で直接読む。Python 版と同時に動かして行の形と値を突き合わせる試験（`crates/tune-agent/tests/live_mac_parity.rs`）と、計算部分を Python の関数と同じ入力で比べる試験を追加。ライブ表示は `~/.katala-tune/bin/tune-agent` があれば先に使い、無い・動かないときは live_mac.py に戻る。
-- サンプラーの配置: Mac の .app に universal の `tune-agent` を同梱し、Mac のハブもほかの Mac の古いサンプラーを入れ替える。違う OS の機体へは新しい `tune agent-push <機体> [--file PATH]` で送る（SHA-256 確認・OS の実行形式の確認つき）。
-
-## 0.7.0-rc.1
+## 0.7.0
 
 検証候補。正式公開・自動配信は Windows の検出調査、helper 配備と実機受入の完了後に判断する。
 
+- 概要に分析の取得状況と機体名・役割・OS・要対応の絞り込みを追加。古い結果と対象外を平均・優先所見から除外し、取得失敗と未分析を分ける。検索・再描画後の選択範囲とフォーカスを保持し、選択状態を支援技術にも伝える。
+- macOS のディスク測定で、取得失敗を 0 B/s と扱わない。Python/Rust とも読取・書込を別々に欠測にし、復帰・ディスク交換・counter reset 後は基点を取り直す。欠測を除いた分集計と保存後の再読を合成試験で確認する。
+- macOS のネイティブのサンプラー（`tune-agent sample`）: live_mac.py と同じ行・同じ値を sysctl・mach・libproc・IOKit で直接読む。Python 版と同時に動かして行の形と値を突き合わせる試験（`crates/tune-agent/tests/live_mac_parity.rs`）と、計算部分を Python の関数と同じ入力で比べる試験を追加。ライブ表示は `~/.katala-tune/bin/tune-agent` があれば先に使い、無い・動かないときは live_mac.py に戻る。
+- サンプラーの配置: Mac の .app に universal の `tune-agent` を同梱し、Mac のハブもほかの Mac の古いサンプラーを入れ替える。違う OS の機体へは新しい `tune agent-push <機体> [--file PATH]` で送る（SHA-256 確認・OS の実行形式の確認つき）。
 - Windows の収集・変更操作を固定 helper と期限・出力上限・所有子プロセスの終了確認で囲む。承認済み helper の v2 record が無い Windows 収集は拒否する。既存台帳への配備受入は別工程。
 - Windows の継承環境のドライブ情報、文字列化した probe の BOM、GPU 関連付けと NVIDIA 出力の改行処理による失敗を修正。実際の埋め込みスクリプトを動かす回帰試験を追加。
 - 入れ子の収集にも出力上限と EOF の期限を設け、local の GPU 操作も固定 receiver を通す。Windows の既存 helper は自動で上書きせず、承認済みバイナリと台帳を組で更新する。
 - CLI の help / cli-info と版の照合を統合し、設定・DB を初期化しない発見経路を追加。
 - 隔離した Windows QA の収集は専用 data/bin の helper を使い、通常運用の helper を呼び出さない。
-
 - Mac / Windowsのスペック比較（0.6.5-specs.1）: Rustの `tune specs-local` / `tune specs`、部品・版・構成・取得可能な設定、出典付き公式仕様の完全一致照合、失敗時の前回値保持、Tauriの比較表・差分・検索・JSONコピー。詳細は docs/machine-specs.md。
-
 - 所見を AI エージェントへ渡すボタン（Tauri 版）: 所見ごとに「Claude Code で調べる」「Codex で調べる」「AI 用にコピー」。プロンプトは DB の最新の所見から Rust 側で作り、全文を確認ダイアログで見せて承認したときだけ、操作卓の新しいターミナルで CLI を読み取り寄りの権限（Claude は plan、Codex は read-only）の対話として開く。共用機・運用対象外の機体は断り、開いた・開けなかった・中止を実行記録に残す。
 - リポジトリの衛生監査（opt-in・読み取り専用）: `npm run hygiene` / `tune hygiene`。dirty・未 push・stash・ghq のパスと origin の不一致を機体横断で集め、読めない・上限超過は未観測として残す。
 - 運用対象外になった既存のライブ収集も停止する。分析失敗の日時・理由を保存して再起動後も対象台帳と状態に反映し、新しい成功結果で回復を判定する。`tune ledger` は台帳や DB の初期化・移行を行わず、WSL の取得失敗は未観測として扱う。
