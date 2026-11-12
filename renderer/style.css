@@ -115,7 +115,8 @@ code { font: 12.5px var(--mono); background: var(--code-inline); color: var(--co
 .ws-mark { width: 22px; height: 22px; border-radius: 5px; display: grid; place-items: center; background: var(--text); color: var(--bg); flex: none; }
 .ws-mark .i { width: 15px; height: 15px; stroke-width: 2; }
 .side-nav, .side-nodes, .side-foot { -webkit-app-region: no-drag; padding: 0 8px; }
-.side-nav { display: grid; gap: 1px; margin-top: 6px; }
+/* 短い窓ではナビを先にスクロールさせ、機体の一覧を少なくとも3行は残す */
+.side-nav { display: grid; gap: 1px; margin-top: 6px; flex: 0 1 auto; min-height: 92px; overflow: auto; align-content: start; }
 .side-item { display: flex; align-items: center; gap: 9px; width: 100%; height: 30px; padding: 0 8px; border: 0; border-radius: 6px; background: none; text-align: left; color: var(--text2); font-size: 14px; font-weight: 500; min-width: 0; }
 .side-item > span:not(.badge):not(.dot) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .side-item .i { width: 18px; height: 18px; color: var(--text3); }
@@ -127,7 +128,7 @@ code { font: 12.5px var(--mono); background: var(--code-inline); color: var(--co
 .side-item .badge.warn { color: var(--orange); }
 .side-section { display: flex; align-items: center; gap: 6px; padding: 18px 16px 4px; font-size: 12px; font-weight: 600; color: var(--text3); -webkit-app-region: no-drag; }
 .side-count { margin-left: auto; font-weight: 500; font-variant-numeric: tabular-nums; }
-.side-nodes { overflow: auto; flex: 1; display: grid; gap: 1px; align-content: start; padding-bottom: 8px; }
+.side-nodes { overflow: auto; flex: 1 1 0; min-height: 96px; display: grid; gap: 1px; align-content: start; padding-bottom: 8px; }
 .side-nodes .side-item { font-weight: 500; }
 .side-foot { display: grid; gap: 1px; padding: 8px 8px 12px; box-shadow: inset 0 1px 0 var(--line); }
 .side-foot .side-item { height: 28px; font-size: 13px; }
@@ -578,6 +579,14 @@ td .databar { margin-top: 5px; }
 
 @media (prefers-reduced-motion: reduce) { *, *::after { animation: none !important; transition: none !important; } }
 @media (prefers-reduced-transparency: reduce) { .sidebar { background: var(--side-solid); } }
+@media (max-height: 760px) {
+  .side-item { height: 27px; }
+  .side-section { padding-top: 12px; }
+  .ph { padding-top: 8px; }
+  .ph-icon { width: 30px; height: 30px; margin: 0 0 6px -3px; }
+  .ph-icon .i { width: 26px; height: 26px; }
+  .ph-title { font-size: 26px; }
+}
 @media (max-width: 1180px) {
   .logs-grid { grid-template-columns: minmax(0, 1fr); gap: 0; }
   .summary { grid-template-columns: 168px minmax(0, 1fr); }
