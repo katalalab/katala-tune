@@ -61,7 +61,7 @@ $netCat = OpenCat 'Network Interface'
 $procCat = OpenCat 'Process'
 
 $totalBytes = $null
-try { $totalBytes = [double](Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize * 1024 } catch { }
+try { $totalBytes = [double](Get-CimInstance Win32_OperatingSystem -Property TotalVisibleMemorySize).TotalVisibleMemorySize * 1024 } catch { }
 if (-not $totalBytes) { $errs.Add('memory: total unknown') }
 
 # CPU package power: Windows Energy Meter exposes RAPL package instances as interval-average mW.
