@@ -234,6 +234,14 @@ const COMMANDS: &[Command] = &[
         notes: "省略時は全運用対象のうち有効な機体。opt-in・読取専用・DB保存なし。--repos で個別行も出す。",
     },
     Command {
+        name: "ssh",
+        arguments: &["[--probe]", "[node ...]"],
+        summary: "SSH の設定・鍵・known_hosts を点検",
+        format: "json",
+        effects: CONFIG | CONNECT,
+        notes: "省略時は全運用対象（この機体を除く）。ssh -G・ssh-keygen・ssh-add で読むだけで、秘密鍵は開かない。接続先の名前・パス・指紋は出さない。--probe だけ BatchMode で接続する。DB保存なし。",
+    },
+    Command {
         name: "export",
         arguments: &["[--since <epoch-ms>]"],
         summary: "常時監視の集計と最新結果をエクスポート",
