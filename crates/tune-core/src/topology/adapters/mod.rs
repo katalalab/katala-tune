@@ -4,6 +4,8 @@ pub(crate) mod docker_api;
 pub mod github;
 pub mod local;
 pub mod native_execution;
+#[cfg(katala_ci_diagnostics)]
+pub mod native_private_diagnostics;
 pub mod native_protocol;
 pub mod native_reader;
 pub mod remote;
