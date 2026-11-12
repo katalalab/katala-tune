@@ -396,12 +396,20 @@ pub fn app_checks(ctx: &Value) -> Vec<Check> {
     } else {
         let lp = get(s, "lastProbeAt");
         let ll = get(s, "lastLogsAt");
-        let late = truthy(lp) && now - num(lp) > num(get(s, "probe_minutes")) * 60000.0 * 2.0;
+        let late = (truthy(lp) && now - num(lp) > num(get(s, "probe_minutes")) * 60000.0 * 2.0)
+            || (truthy(ll) && now - num(ll) > num(get(s, "logs_minutes")) * 60000.0 * 2.0);
+        let status = if late {
+            "warn"
+        } else if !truthy(lp) || !truthy(ll) {
+            "unknown"
+        } else {
+            "ok"
+        };
         let when = |v: Jv<'_>| if truthy(v) { format!("{} 分前", age_min(v, now)) } else { "まだ".into() };
         out.add(
             "scheduler",
             "自動スキャン",
-            if late { "warn" } else { "ok" },
+            status,
             format!(
                 "分析 {} 分ごと（前回 {}）、ログ {} 分ごと（前回 {}）",
                 string(get(s, "probe_minutes")),

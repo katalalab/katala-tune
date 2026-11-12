@@ -105,3 +105,17 @@ test('定期処理: 台帳の expect.ignore_jobs（意図どおり非0で終わ�
   assert.equal(c.status, 'warn');
   assert.equal(c.detail, '1 件が前回失敗: bad2（既知 1 件を除く）');
 });
+
+test('自動スキャンは未実行を正常扱いせず、分析とログの双方の遅延を見る', () => {
+  const scheduler = { enabled: true, probe_minutes: 60, logs_minutes: 15 };
+  const check = (extra) => appChecks({ now, scheduler: { ...scheduler, ...extra } }).find(c => c.id === 'scheduler');
+  assert.equal(check({}).status, 'unknown');
+  assert.equal(check({ lastProbeAt: now }).status, 'unknown');
+  assert.equal(check({ lastLogsAt: now }).status, 'unknown');
+  assert.equal(check({ lastProbeAt: now, lastLogsAt: now }).status, 'ok');
+  assert.equal(check({ lastProbeAt: now, lastLogsAt: now - 31 * 60000 }).status, 'warn');
+  assert.equal(check({ lastProbeAt: now - 121 * 60000, lastLogsAt: now }).status, 'warn');
+  assert.equal(check({ lastProbeAt: now - 121 * 60000 }).status, 'warn');
+  assert.equal(check({ lastProbeAt: now - 120 * 60000, lastLogsAt: now - 30 * 60000 }).status, 'ok');
+  assert.equal(check({ enabled: false }).status, 'warn');
+});
