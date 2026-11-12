@@ -724,7 +724,9 @@ mod tests {
         assert!(command.starts_with("powershell.exe "));
         assert!(command.contains("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand "));
         assert!(command.len() < 8191);
-        assert!(bootstrap.contains("[Console]::In.ReadToEnd()"));
+        // 8 行を読み切れば EOF を待たない（Git Bash 経由の stdin では EOF が届かず止まることがある）
+        assert!(bootstrap.contains("$i.ReadLine()") && !bootstrap.contains("ReadToEnd"));
+        assert!(transport.input.ends_with('\n') && transport.input.matches('\n').count() == 8);
         assert!(bootstrap.contains("[ScriptBlock]::Create($utf8.GetString($b))"));
         assert!(transport.input.starts_with("KTLOG1\nevents\n42\n7\n0\n"));
         let mut max_cursors = Map::new();
