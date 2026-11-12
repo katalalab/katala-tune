@@ -172,7 +172,7 @@ async fn push_agent_with(node: &Node, bytes: &[u8], runner: &dyn collect::Runner
          && {mode}{{ [ ! -e {name} ] || mv -f {name} {name}.old-{stamp}; }} && mv -f {name}.new {name} \
          && {{ rm -f {name}.old-* 2>/dev/null; true; }} && echo pushed-{hash}"
     );
-    let r = runner.run("ssh", &collect::ssh_args(&node.alias, &remote), Some(bytes), Duration::from_secs(120)).await;
+    let r = runner.run("ssh", &collect::node_ssh_args(node, &remote), Some(bytes), Duration::from_secs(120)).await;
     if r.out.contains(&format!("pushed-{hash}")) {
         Ok(hash)
     } else {

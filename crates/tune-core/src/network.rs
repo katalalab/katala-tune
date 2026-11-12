@@ -61,7 +61,7 @@ pub async fn check_one(runner: &dyn Runner, node: &Node, active: bool) -> Value 
             }
             runner.run("/usr/bin/python3", &args, Some(MAC.as_bytes()), TIMEOUT).await
         } else {
-            runner.run("ssh", &collect::ssh_args(&node.alias, &format!("exec /usr/bin/python3 -{suffix}")), Some(MAC.as_bytes()), TIMEOUT).await
+            runner.run("ssh", &collect::node_ssh_args(node, &format!("exec /usr/bin/python3 -{suffix}")), Some(MAC.as_bytes()), TIMEOUT).await
         }
     } else {
         let script = String::from_utf8_lossy(WIN).trim_start_matches('\u{feff}').to_string();
@@ -79,7 +79,7 @@ pub async fn check_one(runner: &dyn Runner, node: &Node, active: bool) -> Value 
             let args = ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded].iter().map(|s| s.to_string()).collect::<Vec<_>>();
             runner.run("powershell.exe", &args, Some(payload.as_bytes()), TIMEOUT).await
         } else {
-            runner.run("ssh", &collect::ssh_args(&node.alias, &command), Some(payload.as_bytes()), TIMEOUT).await
+            runner.run("ssh", &collect::node_ssh_args(node, &command), Some(payload.as_bytes()), TIMEOUT).await
         }
     };
     let data = collect::last_json_line(&result.out).and_then(|v| sanitize(&v, node, active));

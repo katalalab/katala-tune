@@ -84,7 +84,8 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 }
 ```
 
-- `alias` は `~/.ssh/config` の Host 名。非対話（BatchMode）で入れる鍵が要る。Windows 側は OpenSSH サーバーと、既定シェル（Git Bash または PowerShell）で `powershell.exe` が動くこと
+- `alias` は `~/.ssh/config` の Host 名。非対話（BatchMode）で入れる鍵が要る。Windows 側は OpenSSH サーバーと Git for Windows（`C:\Program Files\Git\bin\bash.exe`）が要る。送るコマンドは Git Bash の構文で書いている
+- `ssh_shell`（任意、Windows のみ）: その機体の OpenSSH の既定シェル。`powershell` か `cmd` を書くと、コマンドを base64 にして Git Bash へ渡す（標準入出力はバイト列のまま。PowerShell では `Start-Process -NoNewWindow` で継承させる）。省略時は既定シェルを Git Bash とみなし、従来どおりそのまま送る
 - `local_hostname` がこの機体の hostname と一致すると、SSH を使わずローカルで実行する
 - `status`（任意）: 運用状態。`online`（省略時）・`retired`（退役）・`no-ssh`（SSH 対象外）・`paused`（一時停止）・`out-of-scope`（対象外）。`online` 以外の機体には SSH も probe も実行せず（分析・ログ取り込み・棚卸し・AI・接続診断・ライブ・変更操作のすべて）、設定も変えない。過去の履歴は閲覧できる。値が読めないとき（綴り違い）は安全側に倒して対象外にし、「状態」で注意にする。`status_reason`（理由）と `status_date`（判断日）を併記できる。**運用状態は操作者がこの台帳を編集してだけ変わる**。`online` の機体が到達できないときは「到達不能（運用対象）」として異常のまま扱い、`status` を自動で変えない
 - `shared: true` は提案のみ。`protect` は終了を提案しても実行しないアプリ名

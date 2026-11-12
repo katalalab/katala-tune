@@ -10,7 +10,7 @@ use regex::Regex;
 use serde_json::{Map, Value, json};
 
 use crate::collate::locale_compare;
-use crate::collect::{self, RunResult, last_json_line, ssh_args};
+use crate::collect::{self, RunResult, last_json_line, node_ssh_args};
 use crate::db::now_ms;
 use crate::js::{self, WS};
 use crate::nodes::Node;
@@ -243,7 +243,7 @@ pub async fn inventory_node(node: &Node) -> Value {
         } else {
             collect::run(
                 "ssh",
-                &ssh_args(&node.alias, "command -v python3 >/dev/null && exec python3 - || exec /usr/bin/python3 -"),
+                &node_ssh_args(node, "command -v python3 >/dev/null && exec python3 - || exec /usr/bin/python3 -"),
                 Some(script),
                 Duration::from_secs(60),
             )
@@ -253,7 +253,7 @@ pub async fn inventory_node(node: &Node) -> Value {
         collect::local::powershell_file(WIN_INVENTORY, "", Duration::from_secs(90)).await
     } else {
         let remote = "mkdir -p ~/.katala-tune && cat > ~/.katala-tune/inventory.ps1 && powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$(cygpath -w ~/.katala-tune/inventory.ps1)\"";
-        collect::run("ssh", &ssh_args(&node.alias, remote), Some(WIN_INVENTORY), Duration::from_secs(90)).await
+        collect::run("ssh", &node_ssh_args(node, remote), Some(WIN_INVENTORY), Duration::from_secs(90)).await
     };
     parse_result(&node.id, &res, started.elapsed().as_secs_f64())
 }
