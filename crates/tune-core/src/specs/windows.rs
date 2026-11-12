@@ -6,8 +6,9 @@ const SCRIPT: &str = r#"
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $r = @{}; $errors = @{}
+# -Property limits what the provider computes (Win32_Processor and Win32_OperatingSystem otherwise spend about 1s each on load and memory counters).
 function Q($key, $class, $props) {
-  try { $r[$key] = @(Get-CimInstance -ClassName $class -OperationTimeoutSec 8 | Select-Object -Property $props) }
+  try { $r[$key] = @(Get-CimInstance -ClassName $class -Property $props -OperationTimeoutSec 8 | Select-Object -Property $props) }
   catch { $errors[$key] = $(if ($_.Exception.HResult -eq -2147024891) { "permission_denied" } else { "error" }) }
 }
 Q "system" "Win32_ComputerSystem" @("Manufacturer","Model","SystemType","HypervisorPresent")
@@ -20,10 +21,11 @@ Q "firmware" "Win32_BIOS" @("Manufacturer","SMBIOSBIOSVersion","ReleaseDate")
 Q "os" "Win32_OperatingSystem" @("Caption","Version","BuildNumber","OSArchitecture")
 Q "audio" "Win32_SoundDevice" @("Name","Manufacturer","Status")
 try {
+  # No -Property here: DriverVersionString and Virtual are PowerShell type-data properties, not CIM properties.
   $r.network = @(Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetAdapter -OperationTimeoutSec 8 | Select-Object InterfaceDescription,DriverVersionString,DriverDate,LinkSpeed,MediaConnectState,FullDuplex,Virtual)
 } catch { $errors.network = "error" }
 try {
-  $pnp = @(Get-CimInstance Win32_PnPEntity -OperationTimeoutSec 8)
+  $pnp = @(Get-CimInstance Win32_PnPEntity -Property Name,Manufacturer,PNPClass,Status,PNPDeviceID -OperationTimeoutSec 8)
   foreach ($kind in @("usb","pci","thunderbolt")) {
     $r[$kind] = @($pnp | Where-Object { $(if ($kind -eq "thunderbolt") { $_.Name -match "Thunderbolt|USB4" } else { $_.PNPDeviceID -like ($kind + "\*") }) } | ForEach-Object {
       $vendor = $null; $product = $null
@@ -34,7 +36,7 @@ try {
   }
 } catch { foreach ($kind in @("usb","pci","thunderbolt")) { $errors[$kind] = "error" } }
 try {
-  $r.drivers = @(Get-CimInstance Win32_PnPSignedDriver -OperationTimeoutSec 8 | Where-Object { $_.DeviceClass -in @("DISPLAY","NET","MEDIA","USB","SCSIADAPTER","HDC") } | Select-Object DeviceName,Manufacturer,DriverVersion,DriverDate,DeviceClass)
+  $r.drivers = @(Get-CimInstance Win32_PnPSignedDriver -Property DeviceName,Manufacturer,DriverVersion,DriverDate,DeviceClass -OperationTimeoutSec 8 | Where-Object { $_.DeviceClass -in @("DISPLAY","NET","MEDIA","USB","SCSIADAPTER","HDC") } | Select-Object DeviceName,Manufacturer,DriverVersion,DriverDate,DeviceClass)
 } catch { $errors.drivers = "error" }
 try {
   $ids = @()
