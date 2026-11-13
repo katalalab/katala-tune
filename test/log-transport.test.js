@@ -19,6 +19,9 @@ test('Windows log body travels on SSH stdin while bootstrap command stays fixed'
   assert.deepEqual(frame.slice(0, 6), ['KTLOG1', 'events', '-9007199254740991', '0', '0', String(script.length)]);
   assert.equal(Buffer.from(frame[7], 'base64').compare(script), 0);
   assert.equal(frame[6], require('node:crypto').createHash('sha256').update(script).digest('hex'));
+  // The bootstrap reads exactly 8 lines and never waits for stdin EOF, which can stall behind Git Bash.
+  assert.equal(frame.length, 9);
+  assert.equal(frame[8], '');
   assert.equal(windowsLogonsTransport({ win_security: '9223372036854775807:9223372036854775807' }, script).command, large.command);
 });
 
@@ -26,6 +29,8 @@ test('Windows log bootstrap silences progress records before running the body', 
   const { command } = windowsRemoteTransport({}, Buffer.from('Write-Output 1\n'));
   const lines = Buffer.from(command.split(' ').pop(), 'base64').toString('utf16le').split('\n');
   assert.ok(lines.slice(0, 3).includes('$ProgressPreference="SilentlyContinue"'));
+  assert.ok(lines.some((l) => l.includes('$i.ReadLine()')));
+  assert.ok(!lines.some((l) => l.includes('ReadToEnd')));
 });
 
 test('Windows log transport rejects empty body and normalizes BOM/CRLF', () => {
@@ -125,30 +130,56 @@ test('verified logs keep DB idempotency; failed transport preserves stored curso
   assert.ok(db.cursor(node.id, 'win_system').last_error);
 });
 
-test('Windows Git Bash executes >8191-byte bodies and rejects corrupt or truncated stdin', { skip: process.platform !== 'win32' && 'Windows Git Bash + PS5.1 acceptance fixture' }, async t => {
+test('Windows Git Bash executes >8191-byte bodies and rejects corrupt or truncated stdin', { skip: process.platform !== 'win32' && !process.env.KATALA_TEST_PWSH && 'Windows Git Bash + PS5.1 or explicit local PowerShell fixture' }, async t => {
   const fs = require('node:fs');
   const path = require('node:path');
   const bash = path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Git', 'bin', 'bash.exe');
-  assert.ok(fs.existsSync(bash), 'Windows CI must provide Git Bash');
+  const executable = process.platform === 'win32' ? bash : process.env.KATALA_TEST_PWSH;
+  assert.ok(fs.existsSync(executable), 'A local PowerShell test runtime is required');
   const script = Buffer.from('param([long]$SysCursor,[long]$AppCursor,[long]$NeonCursor)\n' + '# padding\n'.repeat(2000) + '[Console]::WriteLine("{`"text`":`"日本語`",`"cursor`":"+$SysCursor+"}")\n');
   const transport = windowsRemoteTransport({ win_system: '42' }, script);
-  const execute = input => runWindowsLogs(bash, ['-c', transport.command], { input, timeoutMs: 30000 });
+  const args = command => process.platform === 'win32' ? ['-c', command] : command.split(' ').slice(1);
+  const execute = input => runWindowsLogs(executable, args(transport.command), { input, timeoutMs: 30000 });
+  await t.test('complete frame exits while stdin remains open', async t => {
+    const { spawn } = require('node:child_process');
+    const { once } = require('node:events');
+    const child = spawn(executable, args(transport.command), { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    t.after(() => { child.stdin.destroy(); if (child.exitCode === null) child.kill('SIGKILL'); });
+    const closed = once(child, 'close');
+    const output = [];
+    child.stdout.on('data', chunk => output.push(chunk));
+    child.stderr.resume();
+    child.stdin.on('error', () => {});
+    const timer = setTimeout(() => child.kill('SIGKILL'), 30000);
+    t.after(() => clearTimeout(timer));
+    child.stdin.write(transport.input);
+    const [code, signal] = await closed;
+    assert.equal(signal, null, 'frame processing must finish without stdin EOF');
+    assert.equal(code, 0);
+    assert.deepEqual(JSON.parse(Buffer.concat(output).toString('utf8')), { text: '日本語', cursor: 42 });
+  });
   const result = await execute(transport.input);
   assert.equal(result.code, 0, result.err);
   assert.deepEqual(JSON.parse(result.out), { text: '日本語', cursor: 42 });
   const fields = transport.input.split('\n');
   const changed = (i, v) => { const a = [...fields]; a[i] = v; return a.join('\n'); };
   for (const [name, input] of [
-    ['empty', ''], ['missing-final-quantum', transport.input.slice(0, -4)], ['partial-quantum', transport.input.slice(0, -1)],
-    ['extra-byte', transport.input + 'A'], ['extra-newline', transport.input + '\n'], ['empty-body', changed(7, '')], ['bad-hash', changed(6, '0'.repeat(64))], ['bad-cursor', changed(2, '42;Write-Output bad')],
+    ['empty', ''], ['missing-final-quantum', transport.input.slice(0, -5)], ['partial-quantum', transport.input.slice(0, -2)],
+    ['missing-line', fields.slice(0, 7).join('\n')], ['extra-byte', changed(7, fields[7] + 'A')], ['empty-body', changed(7, '')], ['bad-hash', changed(6, '0'.repeat(64))], ['bad-cursor', changed(2, '42;Write-Output bad')],
     ['bad-length', changed(5, '0')], ['bad-kind', changed(1, 'other')], ['invalid-base64', changed(7, '!')],
   ]) await t.test(name, async () => assert.equal((await execute(input)).code, null));
+  // 8 行のフレームだけを読み、EOF は待たない。後ろに続くデータは読まれず、実行もされない
+  for (const tail of ['A', '\n', 'Write-Output bad\n']) {
+    const r = await execute(transport.input + tail);
+    assert.equal(r.code, 0, r.err);
+    assert.deepEqual(JSON.parse(r.out), { text: '日本語', cursor: 42 });
+  }
   for (const body of [Buffer.from('param(\n'), Buffer.from([255]), Buffer.from('param()\n[Console]::WriteLine("{}")\nexit 7')]) {
     const t = windowsRemoteTransport({}, body);
-    assert.equal((await runWindowsLogs(bash, ['-c', t.command], { input: t.input, timeoutMs: 30000 })).code, null);
+    assert.equal((await runWindowsLogs(executable, args(t.command), { input: t.input, timeoutMs: 30000 })).code, null);
   }
   const logons = windowsLogonsTransport({ win_security: '9223372036854775807:9223372036854775807' }, Buffer.from('param([long]$SecCursor,[long]$SecTime)\n[Console]::WriteLine("$SecCursor`n$SecTime")'));
-  const security = await runWindowsLogs(bash, ['-c', logons.command], { input: logons.input, timeoutMs: 30000 });
+  const security = await runWindowsLogs(executable, args(logons.command), { input: logons.input, timeoutMs: 30000 });
   assert.equal(security.code, 0);
   assert.equal(security.out.trim().replace(/\r/g, ''), '9223372036854775807\n9223372036854775807');
 });

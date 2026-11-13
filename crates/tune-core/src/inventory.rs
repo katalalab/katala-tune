@@ -252,10 +252,23 @@ pub async fn inventory_node(node: &Node) -> Value {
     } else if node.local {
         collect::local::powershell_file(WIN_INVENTORY, "", Duration::from_secs(90)).await
     } else {
-        let remote = "mkdir -p ~/.katala-tune && cat > ~/.katala-tune/inventory.ps1 && powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"$(cygpath -w ~/.katala-tune/inventory.ps1)\"";
-        collect::run("ssh", &node_ssh_args(node, remote), Some(WIN_INVENTORY), Duration::from_secs(90)).await
+        // SSH の既定シェル（bash / cmd / PowerShell）に依存しないよう、base64 のスクリプトを標準入力で渡し、
+        // 固定の小さなローダーだけを -EncodedCommand で起動する（capabilities と同じ方式）。ファイルは置かない。
+        let (remote, input) = windows_remote_command();
+        collect::run("ssh", &node_ssh_args(node, &remote), Some(&input), Duration::from_secs(90)).await
     };
     parse_result(&node.id, &res, started.elapsed().as_secs_f64())
+}
+
+/// Windows 機へ送る（リモートコマンド, 標準入力）。コマンドは固定のローダーだけで、スクリプトは標準入力の1行（base64）。
+fn windows_remote_command() -> (String, Vec<u8>) {
+    let script = String::from_utf8_lossy(WIN_INVENTORY);
+    let script = script.trim_start_matches('\u{feff}');
+    let input = format!("{}\n", crate::logs::base64(script.as_bytes())).into_bytes();
+    let loader = "& ([scriptblock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadLine()))))";
+    let utf16: Vec<u8> = loader.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let remote = format!("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {}", crate::logs::base64(&utf16));
+    (remote, input)
 }
 
 /// 調査の出力を結果の形にする（inventoryNode の後半）
@@ -293,6 +306,20 @@ pub fn items_of(result: &Value) -> Vec<Item> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_remote_command_is_shell_agnostic() {
+        let (remote, input) = windows_remote_command();
+        let (head, encoded) = remote.rsplit_once(' ').expect("encoded command");
+        assert_eq!(head, "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand");
+        // bash / cmd / PowerShell のどれが既定でも同じ意味になるよう、メタ文字を含まない。
+        assert!(encoded.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')), "{encoded}");
+        assert!(!remote.contains(['&', '|', ';', '$', '"', '\'', '`', '<', '>', '%', '~']));
+        // スクリプトは標準入力の 1 行（base64）で、BOM は含まない。
+        let line = std::str::from_utf8(&input).expect("ascii");
+        assert!(line.ends_with('\n') && line.trim_end().bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')));
+        assert_eq!(line.matches('\n').count(), 1);
+    }
 
     #[test]
     fn version_core_takes_leading_numbers() {

@@ -42,7 +42,7 @@ pub(super) fn windows_script_transport(script: &[u8], kind: &str, cursors: [&str
         return Err("Windows log bootstrap exceeds 8191 bytes".into());
     }
     let input =
-        format!("KTLOG1\n{kind}\n{}\n{}\n{}\n{}\n{}\n{}", cursors[0], cursors[1], cursors[2], body.len(), crate::db::sha256_hex(&body), super::base64(&body));
+        format!("KTLOG1\n{kind}\n{}\n{}\n{}\n{}\n{}\n{}\n", cursors[0], cursors[1], cursors[2], body.len(), crate::db::sha256_hex(&body), super::base64(&body));
     Ok(Transport { command, bootstrap, input })
 }
 
