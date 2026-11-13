@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
-use crate::collect::{self, RunResult, last_json_line, ssh_args};
+use crate::collect::{self, RunResult, last_json_line, node_ssh_args};
 use crate::js;
 use crate::nodes::Node;
 
@@ -172,7 +172,7 @@ fn mac_python(local: bool, alias: &str) -> (String, Vec<String>) {
         ("/usr/bin/env".into(), ["python3", "-X", "utf8", "-c", MAC_BOOT].map(String::from).to_vec())
     } else {
         let remote = format!("command -v python3 >/dev/null && exec python3 -X utf8 -c '{MAC_BOOT}' || exec /usr/bin/python3 -X utf8 -c '{MAC_BOOT}'");
-        ("ssh".into(), ssh_args(alias, &remote))
+        ("ssh".into(), collect::ssh_args(alias, &remote))
     }
 }
 
@@ -197,7 +197,7 @@ pub async fn run_python(node: &Node, src: &str, timeout: Duration) -> RunResult 
         }
         last
     } else {
-        collect::run("ssh", &ssh_args(&node.alias, &windows_remote()), input, timeout).await
+        collect::run("ssh", &node_ssh_args(node, &windows_remote()), input, timeout).await
     }
 }
 

@@ -8,7 +8,7 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::{Map, Value, json};
 
-use crate::collect::{self, MAC_LOGS, RunResult, WIN_LOGONS, WIN_LOGS, last_json_line, ssh_args};
+use crate::collect::{self, MAC_LOGS, RunResult, WIN_LOGONS, WIN_LOGS, last_json_line, node_ssh_args};
 use crate::db::{LogRow, Store, now_ms};
 use crate::js::{self, Obj, get, present, string, truthy};
 use crate::nodes::Node;
@@ -234,7 +234,7 @@ async fn ssh_transport(node: &Node, transport: Result<transport::Transport, Stri
     match transport {
         Ok(transport) => {
             let mut command = collect::command("ssh");
-            command.args(ssh_args(&node.alias, &transport.command));
+            command.args(node_ssh_args(node, &transport.command));
             transport::run(command, transport.input.as_bytes(), t).await
         }
         Err(err) => RunResult { code: None, out: String::new(), err },
@@ -257,7 +257,7 @@ async fn fetch_logs(node: &Node, cursors: &Map<String, Value>) -> RunResult {
         } else {
             let a = args.join(" ");
             let remote = format!("command -v python3 >/dev/null && exec python3 - {a} || exec /usr/bin/python3 - {a}");
-            collect::run("ssh", &ssh_args(&node.alias, &remote), Some(MAC_LOGS.as_bytes()), t).await
+            collect::run("ssh", &node_ssh_args(node, &remote), Some(MAC_LOGS.as_bytes()), t).await
         };
     }
     let t = Duration::from_secs(90);
@@ -724,7 +724,9 @@ mod tests {
         assert!(command.starts_with("powershell.exe "));
         assert!(command.contains("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand "));
         assert!(command.len() < 8191);
-        assert!(bootstrap.contains("[Console]::In.ReadToEnd()"));
+        // 8 行を読み切れば EOF を待たない（Git Bash 経由の stdin では EOF が届かず止まることがある）
+        assert!(bootstrap.contains("$i.ReadLine()") && !bootstrap.contains("ReadToEnd"));
+        assert!(transport.input.ends_with('\n') && transport.input.matches('\n').count() == 8);
         assert!(bootstrap.contains("[ScriptBlock]::Create($utf8.GetString($b))"));
         assert!(transport.input.starts_with("KTLOG1\nevents\n42\n7\n0\n"));
         let mut max_cursors = Map::new();

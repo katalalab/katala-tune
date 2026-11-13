@@ -26,6 +26,8 @@
 //!   tune hygiene [--ghq-root D] [--root D]... [--max-repos N] [--budget 秒] [--repos] [機体 ...]
 //!                                    リポジトリの衛生監査（dirty・未 push・stash・ghq のパスと origin の不一致。opt-in・読み取り専用・保存しない。
 //!                                    --repos でリポジトリごとの行も出す。台帳の repo_hygiene: false の機体と共用機は対象外）
+//!   tune ssh [--probe] [機体 ...]    この機体の SSH クライアントから台帳の機体への設定・鍵・known_hosts の点検（読み取り専用・保存しない。
+//!                                    接続先の名前・パス・指紋は出さない。--probe で BatchMode の接続も試して所要時間と失敗の種類を測る）
 //!   tune export [--since ms]         常時監視の集計と最新の分析結果を写しの形で（ハブとして写される側。読み取り専用）
 //!   tune hub-pull                    ハブから 1 回写す（台帳の機体へ SSH して tune export を呼ぶ）
 //!   tune monitor ['{"enabled":true,"hub":"id"}']  常時監視とハブの設定を見る・変える
@@ -68,7 +70,7 @@ use tune_core::{
 
 fn usage() -> ExitCode {
     eprintln!(
-        "使い方: tune <paths|probe|hygiene|logs|ledger|last|power|network|capabilities|specs-local|specs|maintenance-plan|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|agent-push|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
+        "使い方: tune <paths|probe|hygiene|ssh|logs|ledger|last|power|network|capabilities|specs-local|specs|maintenance-plan|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|agent-push|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
     );
     ExitCode::from(2)
 }
@@ -252,6 +254,40 @@ async fn hygiene(rest: &[String]) -> Result<(), String> {
     }
     let ok: Vec<Value> = results.into_iter().filter(|r| r["ok"] == true).collect();
     print(&json!({ "nodes": nodes_out, "skipped_nodes": skipped.iter().map(|n| &n.id).collect::<Vec<_>>(), "matrix": hygiene::matrix(&ok) }));
+    Ok(())
+}
+
+/// SSH の設定・鍵・known_hosts の点検（tune_core::ssh_audit）。保存しない
+async fn ssh_audit(rest: &[String]) -> Result<(), String> {
+    use tune_core::ssh_audit;
+    let mut opts = ssh_audit::Opts::default();
+    let mut ids = Vec::new();
+    for a in rest {
+        match a.as_str() {
+            "--probe" => opts.probe = true,
+            x if x.starts_with("--") => return Err(format!("知らない引数: {x}")),
+            x => ids.push(x.to_string()),
+        }
+    }
+    let report = ssh_audit::audit_all(&targets(&ids)?, &opts).await;
+    for n in report["nodes"].as_array().map_or(&[][..], Vec::as_slice) {
+        let id = n["node_id"].as_str().unwrap_or("?");
+        if n["ok"] != true {
+            eprintln!("{id}: NG {}", n["error"].as_str().unwrap_or(""));
+            continue;
+        }
+        let findings: Vec<&str> = n["findings"].as_array().map(|a| a.iter().filter_map(|f| f["code"].as_str()).collect()).unwrap_or_default();
+        let probe = n
+            .get("probe")
+            .map(|p| if p["ok"] == true { format!("・接続 {}ms", p["ms"]) } else { format!("・接続 NG {}", p["reason"].as_str().unwrap_or("")) });
+        eprintln!(
+            "{id}: 鍵 {} 個{}・所見 {}",
+            n["keys"].as_array().map_or(0, Vec::len),
+            probe.unwrap_or_default(),
+            if findings.is_empty() { "なし".to_string() } else { findings.join(", ") }
+        );
+    }
+    print(&report);
     Ok(())
 }
 
@@ -456,6 +492,7 @@ async fn async_main(args: Vec<String>) -> ExitCode {
             Ok(())
         }
         "hygiene" => hygiene(rest).await,
+        "ssh" => ssh_audit(rest).await,
         "agent-push" => agent_push(rest).await.map(|v| print(&v)),
         "probe" => match targets(rest) {
             Ok(t) => {

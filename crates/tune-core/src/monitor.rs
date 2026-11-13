@@ -316,7 +316,7 @@ pub async fn pull(engine: &Engine) -> Result<Value, String> {
             let cursor = engine.with_db(|d| d.get_meta("hubCursor"))?.and_then(|v| v.as_i64()).unwrap_or(0);
             // 前回の終わりより 2 分前から（その後に書かれた分の集計を取りこぼさない。置き換えなので重なってよい）
             let since = cursor.saturating_sub(2 * MINUTE).max(0);
-            let r = collect::run("ssh", &collect::ssh_args(&hub.alias, &hub_command(&hub, since)), None, Duration::from_secs(60)).await;
+            let r = collect::run("ssh", &collect::node_ssh_args(&hub, &hub_command(&hub, since)), None, Duration::from_secs(60)).await;
             let line = r.out.lines().rev().find(|l| l.trim_start().starts_with('{')).ok_or_else(|| {
                 let e = r.err.trim();
                 format!(

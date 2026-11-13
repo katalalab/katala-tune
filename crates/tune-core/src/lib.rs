@@ -57,6 +57,7 @@ pub mod power_observation;
 pub mod prices;
 pub mod rules;
 pub mod specs;
+pub mod ssh_audit;
 pub mod topology;
 pub mod version_inventory;
 pub mod wsl;
