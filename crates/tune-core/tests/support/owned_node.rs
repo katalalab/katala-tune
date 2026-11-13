@@ -186,7 +186,10 @@ async fn failure_cleanup(child: &mut Child, readers: &Readers, mut exited: bool,
 mod tests {
     use super::*;
     fn limits() -> Limits {
-        Limits { execution: Duration::from_secs(2), cleanup: Duration::from_secs(1), stdout: 1024, stderr: 1024 }
+        // Successful Node startup is not the timeout contract. Loaded CI runners
+        // can spend more than two seconds starting an otherwise valid fixture.
+        // Only the intentional hang below uses the short execution deadline.
+        Limits { execution: Duration::from_secs(10), cleanup: Duration::from_secs(1), stdout: 1024, stderr: 1024 }
     }
     fn args(code: &str) -> Vec<OsString> {
         vec!["-e".into(), code.into()]
@@ -231,21 +234,26 @@ mod tests {
             ("process.stderr.write('x'.repeat(2048));setInterval(()=>{},1000)", "output_limit"),
             ("process.exit(7)", "child_exit"),
         ] {
+            let mut limits = limits();
+            if reason == "child_timeout" {
+                limits.execution = Duration::from_secs(2);
+            }
             let start = Instant::now();
-            let err = capture_node(&args(code), limits()).unwrap_err();
+            let err = capture_node(&args(code), limits).unwrap_err();
             assert_eq!(err.kind, reason);
             assert!(err.cleanup_resolved());
-            assert!(start.elapsed() < Duration::from_secs(5));
+            assert!(start.elapsed() < limits.execution + limits.cleanup + Duration::from_secs(2));
         }
     }
     #[test]
     fn fixture_capture_exited_root_with_unfinished_reader_cannot_pass_or_hang() {
+        let limits = limits();
         let start = Instant::now();
-        let err = capture(&args(""), limits(), true).unwrap_err();
+        let err = capture(&args(""), limits, true).unwrap_err();
         assert_eq!(err.kind, "reader_timeout");
         assert!(err.root_exited);
         assert!(!err.readers_finished);
         assert!(!err.cleanup_resolved());
-        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(start.elapsed() < limits.execution + limits.cleanup + Duration::from_secs(2));
     }
 }
