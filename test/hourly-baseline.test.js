@@ -165,7 +165,8 @@ test('pure report is independent of host timezone and never echoes identifiers',
   const points = series().map(p => ({ ...p, node_id: 'do-not-echo-fixture', raw: 'canary-only' }));
   const code = `const fs=require('node:fs'); const {analyzeHours}=require(process.argv[1]); const x=JSON.parse(fs.readFileSync(0,'utf8')); process.stdout.write(JSON.stringify(analyzeHours(x.points,x.opts)));`;
   const modulePath = path.resolve(__dirname, '../lib/hourly-baseline.js');
-  const run = TZ => execFileSync(process.execPath, ['-e', code, modulePath], {input:JSON.stringify({points,opts:opts()}),env:{...process.env,TZ},encoding:'utf8',timeout:5000,maxBuffer:1024*1024});
+  // Parallel CI fixtures can delay Node startup; this checks timezone independence, not latency.
+  const run = TZ => execFileSync(process.execPath, ['-e', code, modulePath], {input:JSON.stringify({points,opts:opts()}),env:{...process.env,TZ},encoding:'utf8',timeout:30000,maxBuffer:1024*1024});
   assert.equal(run('Pacific/Kiritimati'), run('America/Los_Angeles'));
   const report = JSON.stringify(analyzeHours(points, opts()));
   assert.ok(!report.includes('do-not-echo-fixture') && !report.includes('canary-only'));
