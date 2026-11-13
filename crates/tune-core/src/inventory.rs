@@ -10,7 +10,7 @@ use regex::Regex;
 use serde_json::{Map, Value, json};
 
 use crate::collate::locale_compare;
-use crate::collect::{self, RunResult, last_json_line, ssh_args};
+use crate::collect::{self, RunResult, last_json_line, node_ssh_args};
 use crate::db::now_ms;
 use crate::js::{self, WS};
 use crate::nodes::Node;
@@ -243,7 +243,7 @@ pub async fn inventory_node(node: &Node) -> Value {
         } else {
             collect::run(
                 "ssh",
-                &ssh_args(&node.alias, "command -v python3 >/dev/null && exec python3 - || exec /usr/bin/python3 -"),
+                &node_ssh_args(node, "command -v python3 >/dev/null && exec python3 - || exec /usr/bin/python3 -"),
                 Some(script),
                 Duration::from_secs(60),
             )
@@ -255,7 +255,7 @@ pub async fn inventory_node(node: &Node) -> Value {
         // SSH の既定シェル（bash / cmd / PowerShell）に依存しないよう、base64 のスクリプトを標準入力で渡し、
         // 固定の小さなローダーだけを -EncodedCommand で起動する（capabilities と同じ方式）。ファイルは置かない。
         let (remote, input) = windows_remote_command();
-        collect::run("ssh", &ssh_args(&node.alias, &remote), Some(&input), Duration::from_secs(90)).await
+        collect::run("ssh", &node_ssh_args(node, &remote), Some(&input), Duration::from_secs(90)).await
     };
     parse_result(&node.id, &res, started.elapsed().as_secs_f64())
 }
