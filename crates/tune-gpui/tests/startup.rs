@@ -60,3 +60,14 @@ fn selftest_refuses_invalid_ledger_before_creating_a_database() {
     assert!(!data.exists());
     assert_eq!(std::fs::read(f.0.join("invalid.json")).unwrap(), b"invalid fixture");
 }
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[test]
+fn unsupported_desktop_does_not_open_or_create_user_state() {
+    let f = Fixture::new();
+    let out = f.run(&[]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("supports macOS and Windows"));
+    assert_eq!(std::fs::read(f.0.join("production")).unwrap(), b"keep");
+    assert_eq!(std::fs::read(f.0.join("invalid.json")).unwrap(), b"invalid fixture");
+}
