@@ -26,6 +26,13 @@ echo "$out"
 cargo test --manifest-path "$repo/Cargo.toml" -p tune-gpui --release --locked --test saved_views -- --ignored
 echo "e2e-gpui OK"
 
+# macOS の native terminate でも、受理済みの合成収集と保存 ACK を待つ。
+# 実 SSH / 実機の統計取得は使わず、Close / Quit と保存故障を専用 fixture で検証する。
+if [ "$(uname -s)" = "Darwin" ]; then
+  cargo test --manifest-path "$repo/Cargo.toml" -p tune-gpui --release --locked --test native_shutdown -- --ignored --test-threads=1
+  echo "e2e-gpui native shutdown OK"
+fi
+
 # 任意: E2E_LIVE_NODE=<id> を付けると、その機体のライブ（1 秒ごとのサンプル）が 8 秒で数点届くことも確かめる。
 # 台帳は実機のものを読むだけで、データは一時領域。
 if [ -n "${E2E_LIVE_NODE:-}" ]; then
