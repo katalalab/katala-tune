@@ -170,6 +170,10 @@ mod tests {
             assert_eq!(resolved(&path.join("missing/preview-data")).unwrap(), canonical.join("missing/preview-data"));
         }
         std::fs::write(canonical.join("file"), b"owned path error fixture").unwrap();
+        assert_eq!(resolved(&canonical.join("file")).unwrap(), canonical.join("file"));
+        // Windows reports a descendant of a regular file as missing rather than
+        // Unix ENOTDIR; only Unix promises a real error for this fixture.
+        #[cfg(unix)]
         assert!(resolved(&canonical.join("file/child")).is_err(), "real filesystem errors must still propagate");
     }
 
