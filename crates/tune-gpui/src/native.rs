@@ -118,6 +118,10 @@ fn severity_color(s: Severity) -> Hsla {
 }
 
 /// 棒の推移グラフ。0〜`max` を高さにし、点が無ければ空の枠だけ描く
+fn chips_key(id: &str) -> usize {
+    id.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize))
+}
+
 fn trend(values: &[f64], max: f64, color: Hsla, height: f32) -> gpui::Div {
     let mut bars = div().h(px(height)).flex().items_end().gap_px();
     for v in values.iter().rev().take(model::LIVE_KEEP).rev() {
@@ -246,7 +250,7 @@ fn page_desc(page: Page) -> &'static str {
         Page::Dashboard => "保存済みの監視データ。収集済みの Live があれば最新の値を表示します。表示だけでは収集を開始しません。",
         Page::Overview => "全機体の状態と、優先して見るもの。直近の分析の結果です。",
         Page::Status => "保存済みの現在状態と、最近の変化。ここで状態を計算し直すことはしません。",
-        Page::Resources => "全機体の CPU・メモリ・ディスク・swap を、直近の分析の値で並べます。",
+        Page::Resources => "全機体の CPU・メモリ・ディスク・swap を、直近の分析の値で並べます。ライブは機体を選んで開始します。",
         Page::Processes => "直近の分析時点の、アプリ別の使用量。メモリの多い上位を機体ごとに出します。",
         Page::Security => "ネットワークとセキュリティの監視の状態。読み取りだけで、遮断や設定の変更はしません。",
         Page::Network => "設定確認と外部到達診断。選んだボタンを押したときだけ実行します。",
@@ -665,7 +669,7 @@ impl TuneApp {
     }
 
     fn navigate(&mut self, page: Page, selected: Option<String>, cx: &mut Context<Self>) {
-        if self.selected != selected {
+        if self.selected != selected || self.page != page {
             self.live.stop(Stop::User);
         }
         self.live_notice = None;
@@ -700,7 +704,7 @@ impl TuneApp {
     fn live_start(&mut self, id: &str, window: &Window) {
         self.live_notice = None;
         self.live.set_active(window.is_window_active());
-        if self.selected.as_deref() != Some(id) {
+        if self.selected.as_deref() != Some(id) && !(self.selected.is_none() && self.page == Page::Resources && self.nodes.iter().any(|n| n.id == id)) {
             self.live_notice = Some("ライブを開始する機体を先に開いてください".into());
             return;
         }
@@ -1171,59 +1175,7 @@ impl TuneApp {
                 )
         };
         facts = facts.child(toggle);
-        let live_panel = if on {
-            let l = {
-                let store = self.live_store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                store.0.get(id).cloned().unwrap_or_default()
-            };
-            let now = |v: Option<f64>| v.map_or("–".to_string(), |x| format!("{x:.0}%"));
-            let status = if l.cpu.is_empty() { Some(format!("接続中… {}", l.detail.clone().unwrap_or_default())) } else { None };
-            Some(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_3()
-                    .rounded_md()
-                    .bg(palette::card())
-                    .border_1()
-                    .border_color(palette::accent())
-                    .child(div().text_xs().text_color(palette::muted()).child(format!("ライブ（直近 {} 有効点まで）· {}", model::LIVE_KEEP, l.state)))
-                    .when_some(status, |d, s| d.child(div().text_sm().text_color(palette::warn()).child(s)))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(div().text_xs().text_color(palette::muted()).child("CPU"))
-                                    .child(div().text_xl().font_weight(FontWeight::BOLD).child(now(l.latest_cpu))),
-                            )
-                            .child(trend(&l.cpu, 100.0, palette::accent(), 48.0)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(div().text_xs().text_color(palette::muted()).child("メモリ使用"))
-                                    .child(div().text_xl().font_weight(FontWeight::BOLD).child(now(l.latest_mem))),
-                            )
-                            .child(trend(&l.mem, 100.0, palette::warn(), 48.0)),
-                    ),
-            )
-        } else {
-            None
-        };
+        let live_panel = if on { Some(self.live_panel(id)) } else { None };
         let mut trends = div().flex().flex_wrap().gap_5();
         for (label, values, max, color) in [
             ("スコア", &n.score_trend, 100.0, palette::ok()),
@@ -1267,6 +1219,100 @@ impl TuneApp {
             .when_some(live_panel, |d, p| d.child(p))
             .child(trends)
             .child(body)
+    }
+    /// 機体のライブ値（CPU・メモリ）の枠。詳細画面とリソース画面で共有する。
+    fn live_panel(&self, id: &str) -> gpui::Div {
+        let l = {
+            let store = self.live_store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            store.0.get(id).cloned().unwrap_or_default()
+        };
+        let now = |v: Option<f64>| v.map_or("–".to_string(), |x| format!("{x:.0}%"));
+        let status = if l.cpu.is_empty() { Some(format!("接続中… {}", l.detail.clone().unwrap_or_default())) } else { None };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .rounded_md()
+            .bg(palette::card())
+            .border_1()
+            .border_color(palette::accent())
+            .child(div().text_xs().text_color(palette::muted()).child(format!("ライブ（直近 {} 有効点まで）· {}", model::LIVE_KEEP, l.state)))
+            .when_some(status, |d, s| d.child(div().text_sm().text_color(palette::warn()).child(s)))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().text_color(palette::muted()).child("CPU"))
+                            .child(div().text_xl().font_weight(FontWeight::BOLD).child(now(l.latest_cpu))),
+                    )
+                    .child(trend(&l.cpu, 100.0, palette::accent(), 48.0)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().text_color(palette::muted()).child("メモリ使用"))
+                            .child(div().text_xl().font_weight(FontWeight::BOLD).child(now(l.latest_mem))),
+                    )
+                    .child(trend(&l.mem, 100.0, palette::warn(), 48.0)),
+            )
+    }
+
+    /// リソース画面の上部。台帳で観測できる機体を選んでライブ（1 秒ごと）を一つだけ開始する。
+    /// 画面を開く・再読込するだけでは開始せず、別画面への移動や非アクティブ化で止まる。
+    fn resources_live(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut chips = div().flex().flex_wrap().gap_2();
+        for node in self.nodes.iter().filter(|n| !matches!(n.health, Health::Excluded(_))) {
+            let id = node.id.clone();
+            let on = self.live.on(&id);
+            chips = chips.child(
+                div()
+                    .id(("resources-live", chips_key(&id)))
+                    .px_3()
+                    .py_1p5()
+                    .rounded_md()
+                    .text_sm()
+                    .cursor_pointer()
+                    .bg(if on { palette::crit() } else { palette::card() })
+                    .border_1()
+                    .border_color(palette::line())
+                    .child(if on { format!("{id} を止める") } else { format!("{id} のライブ") })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |app, _, window, cx| {
+                            if app.live.on(&id) {
+                                app.live.stop(Stop::User);
+                            } else {
+                                app.live_start(&id, window);
+                            }
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        let active = self.nodes.iter().find(|n| self.live.on(&n.id)).map(|n| n.id.clone());
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .px_5()
+            .py_3()
+            .child(div().text_xs().text_color(palette::muted()).child("ライブは選んだ機体を一つだけ、押したときに開始します。"))
+            .child(chips)
+            .when_some(active, |d, id| d.child(self.live_panel(&id)))
     }
     fn dashboard_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
         let mut toolbar = div().flex().flex_wrap().gap_2().px_5().py_3();
@@ -1681,6 +1727,9 @@ impl Render for TuneApp {
                     }
                 }))
                 .into_any_element(),
+            None if self.page == Page::Resources => {
+                div().flex_1().min_h_0().flex().flex_col().child(self.resources_live(cx)).child(self.record_panel(cx)).into_any_element()
+            }
             None => self.record_panel(cx).into_any_element(),
         };
         div()
