@@ -21,6 +21,12 @@ GPUIは起動引数の検証後、config/dataの相対パスと既存の親デ�
 
 起動だけではhelperをコピー・インストール・更新しない。WindowsのProbeと承認付き変更操作には、対象Previewの`data/bin/tune.exe`へ検証済みartifactを明示的に配置し、その版に一致する承認レコードをPreview用台帳に用意する必要がある。欠けている場合やハッシュ・承認が合わない場合は既存の検証で失敗し、HOMEのhelperへ切り替えない。Liveのnative samplerは別の`data/bin/tune-agent`（Windowsでは`tune-agent.exe`）で、実行ファイル隣やHOMEから補わない。native samplerが無い場合は既存のスクリプト経路を使うため、その実行環境と収集の成功は別途確認が必要。`tune.exe`の承認はnative samplerの配布や検証を兼ねない。
 
+`gpui-preview` CIはmacOS arm64とWindows x64で、同じソースからreleaseのGUI・診断CLI・native samplerをビルドする。artifact名は`gpui-preview-<runner OS>-<run ID>-<attempt>`。`manifest.json`の`katala_gpui_preview.v2`は、`katala-tune-gpui`（`gui`）、`tune`（`diagnostic-cli`）、`tune-agent`（`native-sampler`）の三つだけを記録し、Windowsでは各ファイル名に`.exe`が付く。各項目に実バイト数とSHA-256を持ち、manifest全体に版・revision・sourceTree・platform・architecture・release target・workflow/run/attemptを記録する。対象外のOS/arch、非既定のCargo target、欠落・空・256 MiB超・symlinkの入力、既存の出力先を拒否する。途中で保存に失敗した出力にはmanifestを作らず、再利用もしない。
+
+このmanifestは出所とファイルの照合材料であり、CI全体の成功や導入の承認を証明しない。操作者はGitHub runの実際の成功、ZIPのdigest、レビュー済みsourceTree、対象機のOS/arch、展開した三ファイルの名前・サイズ・SHA-256を別途照合する。過去の`katala_gpui_preview.v1`はGUIとCLIの二ファイルの記録として保持し、v2として読み替えない。
+
+検証したnative samplerの対象Preview `data/bin`への配置は手動で行う。GPUI用installerと自動同期は未実装。CIのstagingは通常のbin、Preview data、DB、台帳を変更しない。特に同梱releaseの`tune.exe`は診断用で、Windowsの固定Probe・承認付き操作に使うhelperとして自動承認されない。それらには[Windows helperの導入・更新](windows-helper-approval.md)の専用all-success CI debug CLI artifactと非公開の`action_helper` v2承認記録を別途使う。native samplerの出所確認は、そのaction helperの承認を兼ねない。
+
 `scripts/e2e-gpui.sh`はモデル・保存データ・入力編集・起動引数のテストを実行し、見本台帳と一時DBで全17画面の読み込みsmokeを行う。続いて合成の分析・ログ・操作記録を持つDBでも実行ファイルから全画面を開き、前後の観測・収集カーソル・状態・操作記録が不変であることを確認する。この追加テストはdesktop GPUセッションが必要なため、通常の`cargo test`ではignoreし、このスクリプトから明示実行する。
 
 通常起動は概要を表示するPreviewで、最後のウィンドウを閉じると実行中の収集と保存ACKを待って終了する。`--resident`を付けた場合だけ、最後のウィンドウを閉じてもアプリとトレイを保持する。`--resident --hidden`は最初からユーザー画面を作らない。トレイの「開く」「ダッシュボード」「状態」で一つのウィンドウを表示でき、「終了」は実行中の処理を待って終了する。Windowsでは左クリックでも開き、右クリックでメニューを表示する。macOSではメニューバーのトレイメニューとDockからの再表示に対応する。
