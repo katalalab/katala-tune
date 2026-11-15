@@ -25,7 +25,7 @@ use gpui::{
 };
 use model::{Finding, Health, NodeView, Severity};
 use tune_core::engine::{Engine, Host};
-use tune_core::live::{Live, ProcessRoute, Stop};
+use tune_core::live::{Live, Owner, ProcessRoute, Stop};
 use tune_core::nodes;
 
 actions!(tune, [Quit, CloseWindow, GoOverview, NextPage, PreviousPage, Refresh, FocusSearch, FocusContent, ToggleFocus, NextRow, PreviousRow, CopyRecord]);
@@ -168,12 +168,20 @@ impl LiveControl {
     fn stop_locked(&self, state: &mut LiveState, why: Stop) {
         state.generation = state.generation.wrapping_add(1);
         if let Some(intent) = state.intent.take() {
-            self.live.stop(Some(&[intent.id]), why);
+            self.live.release_owned(Owner::Ui, &[intent.id], why);
         }
     }
 
     fn stop(&self, why: Stop) {
-        self.stop_locked(&mut self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner), why);
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A failed current ledger read remains an administrative stop of the
+        // selected target; normal navigation/focus/manual stops only release UI.
+        if why == Stop::Excluded
+            && let Some(intent) = state.intent.as_ref()
+        {
+            self.live.stop(Some(std::slice::from_ref(&intent.id)), why.clone());
+        }
+        self.stop_locked(&mut state, why);
     }
 
     fn set_active(&self, active: bool) {
@@ -216,6 +224,7 @@ impl LiveControl {
             return;
         }
         if let Some(error) = config_error {
+            self.live.stop(Some(&[id.to_string()]), Stop::Excluded);
             self.stop_locked(&mut state, Stop::Excluded);
             state.notice = Some(format!("ライブ停止: 台帳を読み込めません: {error}"));
             return;
@@ -233,7 +242,7 @@ impl LiveControl {
                 state.notice = Some(format!("ライブ停止: {detail}"));
                 return;
             }
-            if !self.live.heartbeat(id) {
+            if !self.live.heartbeat_owned(Owner::Ui, id) {
                 let notice = self.terminal_notice(id);
                 self.stop_locked(&mut state, Stop::User);
                 state.notice = Some(notice);
@@ -242,7 +251,7 @@ impl LiveControl {
         } else {
             let target: Vec<_> = target.cloned().into_iter().collect();
             let unknown = if target.is_empty() { vec![id.to_string()] } else { Vec::new() };
-            let result = self.live.start(&target, &unknown);
+            let result = self.live.start_owned(Owner::Ui, &target, &unknown);
             if let Some(refusal) = result["refused"].as_array().and_then(|r| r.first()) {
                 let detail = refusal["detail"].as_str().unwrap_or("開始できません");
                 let notice = format!("ライブを開始できません: {detail}");
@@ -262,7 +271,9 @@ impl LiveControl {
     /// immediately, so the matching owned stream must stop at that same boundary.
     fn accept_nodes(&self, nodes: &[NodeView]) {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.intent.as_ref().is_some_and(|intent| nodes.iter().any(|node| node.id == intent.id && matches!(node.health, Health::Excluded(_)))) {
+        let excluded: Vec<String> = nodes.iter().filter(|node| matches!(node.health, Health::Excluded(_))).map(|node| node.id.clone()).collect();
+        self.live.stop(Some(&excluded), Stop::Excluded);
+        if state.intent.as_ref().is_some_and(|intent| excluded.contains(&intent.id)) {
             self.stop_locked(&mut state, Stop::Excluded);
         }
     }
@@ -1880,6 +1891,133 @@ mod tests {
 
     fn node(id: &str) -> nodes::Node {
         nodes::Node::from_value(&json!({"id":id,"os":"macos"}), "synthetic-host")
+    }
+
+    /// Synthetic transport only; Live parses samples and owns all lifecycle state.
+    #[derive(Default)]
+    struct SteadyRoute(AtomicUsize);
+    impl LiveRoute for SteadyRoute {
+        fn open(&self, _: &nodes::Node, _: &Opts) -> Result<Source, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let (lines, receive) = tokio::sync::mpsc::channel(4);
+            let (stop, mut stopped) = tokio::sync::oneshot::channel();
+            let (done, finished) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(10));
+                loop {
+                    tokio::select! {
+                        _ = &mut stopped => break,
+                        _ = interval.tick() => {
+                            if lines.send(r#"{"type":"s","cpu":5}"#.into()).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = done.send(tune_core::live::Ended::default());
+            });
+            Ok(Source::new(receive, stop, finished))
+        }
+    }
+
+    fn shared_controller() -> (LiveControl, Arc<SteadyRoute>) {
+        let route = Arc::new(SteadyRoute::default());
+        let live = Live::new(route.clone(), Opts::default(), Box::new(|_| {}));
+        (LiveControl::new(live, true), route)
+    }
+
+    async fn samples_after(live: &Live, before: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while live.samples("a").len() <= before {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the existing shared sampler must continue delivering samples");
+    }
+
+    #[tokio::test]
+    async fn live_ui_stop_navigation_inactivity_and_release_preserve_monitor_samples() {
+        for action in ["manual", "navigation", "inactive", "release", "pending_hidden"] {
+            let (control, route) = shared_controller();
+            control.live.start_owned(Owner::Monitor, &[node("a")], &[]);
+            let (generation, id) = control.request("a").unwrap();
+            if action != "pending_hidden" {
+                control.complete(generation, &id, &[node("a")], None);
+            }
+            samples_after(&control.live, 0).await;
+            match action {
+                "manual" | "navigation" => control.stop(Stop::User),
+                "inactive" | "pending_hidden" => control.set_active(false),
+                "release" => control.stop(Stop::Hidden),
+                _ => unreachable!(),
+            }
+            let active = control.live.active();
+            if active == ["a"] {
+                samples_after(&control.live, control.live.samples("a").len()).await;
+            }
+            let monitor_renewed = control.live.heartbeat_owned(Owner::Monitor, "a");
+            let released = control.live.release_owned(Owner::Monitor, &["a".into()], Stop::User);
+            control.live.shutdown(Duration::from_secs(1)).await;
+            assert!(!control.on("a"));
+            assert_eq!(active, ["a"], "{action} may release only UI intent");
+            assert!(monitor_renewed, "{action} must preserve the monitor claim");
+            assert_eq!(released["stopped"], json!(["a"]));
+            assert_eq!(route.0.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_accepted_exclusion_stops_monitor_owned_nodes_without_ui_intent() {
+        let (control, _) = shared_controller();
+        control.live.start_owned(Owner::Monitor, &[node("a")], &[]);
+        let views = model::build(&[json!({"id":"a","status":"paused"})], &[]);
+        control.accept_nodes(&views);
+        let active = control.live.active();
+        let renewed = control.live.heartbeat_owned(Owner::Monitor, "a");
+        control.live.shutdown(Duration::from_secs(1)).await;
+        assert!(active.is_empty(), "accepted exclusion is administrative, regardless of UI intent");
+        assert!(!renewed);
+    }
+
+    #[tokio::test]
+    async fn live_current_ledger_read_failure_stops_both_owners() {
+        for from_reader in [false, true] {
+            let (control, _) = shared_controller();
+            let (generation, id) = control.request("a").unwrap();
+            control.complete(generation, &id, &[node("a")], None);
+            control.live.start_owned(Owner::Monitor, &[node("a")], &[]);
+            if from_reader {
+                control.stop(Stop::Excluded);
+            } else {
+                control.complete(generation, &id, &[], Some("invalid synthetic ledger".into()));
+            }
+            assert!(control.live.active().is_empty());
+            assert!(!control.on("a"));
+            assert!(!control.live.heartbeat_owned(Owner::Monitor, "a"));
+            control.live.shutdown(Duration::from_secs(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn live_monitor_release_preserves_the_ui_claim_and_samples() {
+        let (control, route) = shared_controller();
+        let (generation, id) = control.request("a").unwrap();
+        control.complete(generation, &id, &[node("a")], None);
+        control.live.start_owned(Owner::Monitor, &[node("a")], &[]);
+        samples_after(&control.live, 0).await;
+        let stopped = control.live.release_owned(Owner::Monitor, &["a".into()], Stop::User);
+        let active = control.live.active();
+        if active == ["a"] {
+            samples_after(&control.live, control.live.samples("a").len()).await;
+        }
+        let renewed = control.live.heartbeat_owned(Owner::Ui, "a");
+        control.stop(Stop::User);
+        control.live.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(stopped["stopped"], json!([]));
+        assert_eq!(active, ["a"]);
+        assert!(renewed);
+        assert_eq!(route.0.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
