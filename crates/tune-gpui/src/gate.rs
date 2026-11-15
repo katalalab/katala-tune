@@ -228,4 +228,38 @@ mod tests {
         assert_eq!(r["cancelled"], json!(true), "{r}");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// 承認して実行する経路を、本物の Engine で最後まで通す（macOS のローカルだけ）。
+    /// 実機の設定は変えない: このテストが自分で起動した `sleep` を、承認の関門を通して終了させる。
+    /// 台帳もデータも一時のもの。承認するまで何も起きず、承認すると実行記録に成功が残る。
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn approved_action_runs_for_real_on_a_process_this_test_started() {
+        let mut child = std::process::Command::new("sleep").arg("300").spawn().expect("sleep を起動できない");
+        let pid = child.id();
+        // 終了したらすぐ回収する（回収しないとゾンビのまま残り、Engine が「終了未確認」と正しく報告する）
+        let (reaped_tx, reaped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || drop(reaped_tx.send(child.wait())));
+        let (e, dir) = engine(json!([{ "id": "box", "os": "macos", "local_hostname": tune_core::nodes::local_host() }]));
+        let (g, _) = gate();
+        let action = json!({ "type": "kill-process", "params": { "pid": pid, "name": "sleep", "min_cpu": 0 } });
+        let (e2, g2) = (e.clone(), g.clone());
+        let run = tokio::spawn(async move { e2.confirm_and_run("box", &action, "テスト: sleep を終了", None, g2.confirm()).await });
+        let p = wait_pending(&g).await;
+        assert!(p.detail.contains("sleep"), "何をするかが承認の前に見える: {}", p.detail);
+        // 承認するまでは何も起きていない
+        assert!(reaped_rx.try_recv().is_err(), "承認の前にプロセスが終了してはいけない");
+        g.answer(true);
+        let r = run.await.unwrap().unwrap();
+        assert_eq!(r["ok"], json!(true), "{r}");
+        let gone = reaped_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        if !gone {
+            // 後始末（テストが失敗しても sleep を残さない）
+            drop(std::process::Command::new("kill").args(["-9", &pid.to_string()]).status());
+        }
+        assert!(gone, "承認した操作でプロセスが終了する");
+        let log = e.with_db(|d| d.actions(10)).unwrap();
+        assert!(log.iter().any(|a| a["ok"] == json!(true) && a["type"] == json!("kill-process")), "実行記録に成功が残る: {log:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
