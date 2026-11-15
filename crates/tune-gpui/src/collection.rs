@@ -14,6 +14,7 @@ pub enum Kind {
     Inventory,
     Ai,
     Specs,
+    Network,
 }
 impl Kind {
     pub fn label(self) -> &'static str {
@@ -23,6 +24,7 @@ impl Kind {
             Self::Inventory => "道具の棚卸し",
             Self::Ai => "AI取り込み",
             Self::Specs => "詳細仕様の収集",
+            Self::Network => "ネットワーク確認",
         }
     }
     pub fn for_page(page: Page) -> Option<Self> {
@@ -31,6 +33,7 @@ impl Kind {
             Page::Tools => Some(Self::Inventory),
             Page::Ai => Some(Self::Ai),
             Page::Specs => Some(Self::Specs),
+            Page::Network => Some(Self::Network),
             _ => None,
         }
     }
@@ -52,7 +55,7 @@ impl Receipt {
         if problem(&value["error"]) {
             out.add(value, Outcome::Failed, "収集を開始・完了できません");
         } else if !out.busy {
-            let key = if kind == Kind::Specs { "nodes" } else { "results" };
+            let key = if matches!(kind, Kind::Specs | Kind::Network) { "nodes" } else { "results" };
             if let Some(rows) = value[key].as_array() {
                 for row in rows {
                     let (state, reason) = classify(kind, row);
@@ -255,6 +258,16 @@ fn classify(kind: Kind, row: &Value) -> (Outcome, String) {
     if row["ok"] != true {
         return (Outcome::Failed, "成功を確認できません".into());
     }
+    if kind == Kind::Network {
+        // 到達性の × や未取得は、ネットワークの所見であって収集の失敗ではない。成功とは分けて「部分」に数える
+        let flags = NET_FLAGS.map(|(key, label)| match row["data"][key].as_bool() {
+            Some(true) => format!("{label} ○"),
+            Some(false) => format!("{label} ×"),
+            None => format!("{label} –"),
+        });
+        let all_ok = NET_FLAGS.iter().all(|(key, _)| row["data"][key] == true);
+        return (if all_ok { Outcome::Complete } else { Outcome::Partial }, flags.join(" · "));
+    }
     let mut issues = Vec::new();
     match kind {
         Kind::Probe => {
@@ -291,6 +304,27 @@ fn classify(kind: Kind, row: &Value) -> (Outcome, String) {
     )
 }
 
+const NET_FLAGS: [(&str, &str); 5] = [
+    ("interface_up", "インターフェース"),
+    ("link_active", "リンク"),
+    ("ip_address_present", "IP"),
+    ("default_route_present", "既定経路"),
+    ("dns_configured", "DNS"),
+];
+
+/// 受動の到達性確認の対象外の理由（tune-core の選択と同じ条件。選べない機体が一台でもあると全体が拒否されるので、先に外す）
+pub fn network_refusal(node: &Node) -> Option<String> {
+    node.refusal().or_else(|| {
+        if node.get("connectivity") == Some(&Value::Bool(false)) {
+            Some("台帳で接続診断を止めています".into())
+        } else if !node.is_mac() && !node.is_windows() {
+            Some("接続診断は macOS / Windows に対応しています".into())
+        } else {
+            None
+        }
+    })
+}
+
 fn select(kind: Kind, nodes: &[Node], ids: Option<&[String]>) -> Result<(Vec<Node>, Vec<Value>), String> {
     if ids.is_some_and(|ids| ids.iter().any(|id| !nodes.iter().any(|n| &n.id == id))) {
         return Err("未知の機体です".into());
@@ -301,6 +335,7 @@ fn select(kind: Kind, nodes: &[Node], ids: Option<&[String]>) -> Result<(Vec<Nod
         let reason = node.refusal().or_else(|| match kind {
             Kind::Ai if !tune_core::ai_sessions::enabled(node) => Some("現在の台帳でAI取り込みが許可されていません（共用機は明示opt-inが必要）".into()),
             Kind::Specs => tune_core::specs::select(std::slice::from_ref(node), std::slice::from_ref(&node.id)).err(),
+            Kind::Network => network_refusal(node),
             _ => None,
         });
         if let Some(reason) = reason {
@@ -323,13 +358,17 @@ pub async fn run(engine: Arc<Engine>, kind: Kind, ids: Option<Vec<String>>) -> R
         Err(error) => return Receipt::error(kind, &error),
     };
     if targets.is_empty() {
-        return Receipt::from_result(kind, &json!({if kind == Kind::Specs { "nodes" } else { "results" }: []}), excluded);
+        return Receipt::from_result(kind, &json!({if matches!(kind, Kind::Specs | Kind::Network) { "nodes" } else { "results" }: []}), excluded);
     }
     let mut value = match kind {
         Kind::Probe => engine.run_probe(ids, false).await,
         Kind::Logs => engine.sync_logs(targets.clone()).await,
         Kind::Inventory => engine.run_inventory(ids).await,
         Kind::Ai => engine.ai_sync(ids).await,
+        Kind::Network => match engine.network_check(&targets.iter().map(|n| n.id.clone()).collect::<Vec<_>>(), false).await {
+            Ok(value) => value,
+            Err(error) => return Receipt::error(kind, &error),
+        },
         Kind::Specs => match engine.specs_refresh(targets.iter().map(|n| n.id.clone()).collect()).await {
             Ok(value) => value,
             Err(error) => return Receipt::error(kind, &error),
@@ -352,7 +391,7 @@ pub async fn run(engine: Arc<Engine>, kind: Kind, ids: Option<Vec<String>>) -> R
             }
         }
     }
-    if kind == Kind::Specs
+    if matches!(kind, Kind::Specs | Kind::Network)
         && let Some(rows) = value["nodes"].as_array_mut()
     {
         rows.retain(|row| targets.iter().any(|node| row["node_id"] == node.id));
@@ -364,6 +403,29 @@ pub async fn run(engine: Arc<Engine>, kind: Kind, ids: Option<Vec<String>>) -> R
 mod tests {
     use super::*;
     use tune_core::engine::NoHost;
+
+    #[test]
+    fn network_false_and_missing_flags_are_partial_not_failed() {
+        let all = json!({"interface_up":true,"link_active":true,"ip_address_present":true,"default_route_present":true,"dns_configured":true});
+        let mut no_route = all.clone();
+        no_route["default_route_present"] = json!(false);
+        let mut unknown = all.clone();
+        unknown.as_object_mut().unwrap().remove("dns_configured");
+        let r = Receipt::from_result(
+            Kind::Network,
+            &json!({"nodes":[
+                {"node_id":"good","ok":true,"data":all},
+                {"node_id":"no-route","ok":true,"data":no_route},
+                {"node_id":"unknown","ok":true,"data":unknown},
+                {"node_id":"down","ok":false,"error":"ssh failed"},
+                {"node_id":"off","skipped":true}
+            ]}),
+            vec![],
+        );
+        assert_eq!((r.complete, r.partial, r.failed, r.skipped), (1, 2, 1, 1));
+        assert!(r.rows[1].detail.contains("既定経路 ×"));
+        assert!(r.rows[2].detail.contains("DNS –"));
+    }
 
     #[test]
     fn source_errors_and_null_slots_are_not_complete_log_results() {
