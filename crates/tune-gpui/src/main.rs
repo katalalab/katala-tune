@@ -460,7 +460,7 @@ impl TuneApp {
                 .items_center()
                 .gap_2()
                 .px_3()
-                .py_1p5()
+                .py_1()
                 .rounded_md()
                 .cursor_pointer()
                 .when(active, |d| d.bg(palette::card()))
@@ -474,10 +474,11 @@ impl TuneApp {
         };
         let mut list = div().flex().flex_col().gap_0p5().p_2();
         list = list.child(row(("nav", 0usize).into(), "概要".into(), palette::accent(), String::new(), self.selected.is_none() && self.page == Page::Overview, None, cx));
+        list = list.child(div().px_3().pt_2().pb_0p5().text_xs().text_color(palette::muted()).child("画面"));
         for (i, page) in Page::NAV.into_iter().enumerate() {
             let fails = if page == Page::Status { self.status.count(model::CheckStatus::Fail) } else { 0 };
             list = list.child(
-                div().id(("page", i)).flex().items_center().gap_2().px_3().py_1p5().rounded_md().cursor_pointer()
+                div().id(("page", i)).flex().items_center().gap_2().px_3().py_1().rounded_md().cursor_pointer()
                     .when(self.selected.is_none() && self.page == page, |d| d.bg(palette::card()))
                     .hover(|d| d.bg(palette::card()))
                     .child(div().size_2().rounded_full().bg(if fails > 0 { palette::crit() } else { palette::muted() }))
@@ -486,6 +487,7 @@ impl TuneApp {
                     .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| app.open_page(page, cx))),
             );
         }
+        list = list.child(div().px_3().pt_3().pb_0p5().text_xs().text_color(palette::muted()).child(format!("機体 {}", self.nodes.len())));
         for (i, n) in self.nodes.iter().enumerate() {
             let tail = match &n.health {
                 Health::Scored(s) => s.to_string(),
@@ -1447,7 +1449,7 @@ fn main() {
     let rt_exit = rt.clone();
 
     Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
+        let bounds = Bounds::centered(None, size(px(960.0), px(780.0)), cx);
         let window = cx
             .open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), titlebar: Some(gpui::TitlebarOptions { title: Some("Katala Tune".into()), appears_transparent: false, traffic_light_position: Some(point(px(12.0), px(12.0))) }), ..Default::default() }, move |_, cx| {
                 cx.new(|cx| TuneApp::new(engine, rt, dirty, handles, cx))
