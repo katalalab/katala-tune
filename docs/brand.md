@@ -34,3 +34,15 @@ npm run gpui:package:mac
 "dist/Katala Tune GPUI.app/Contents/MacOS/katala-tune" \
   --config config/nodes.example.json --data target/brand-smoke --selftest
 ```
+
+## 検証記録（2026-11-15、macOS / Apple Silicon）
+
+GPUI の実画面で、埋め込んだPNGの色・サイズ・余白を確認した。合成台帳だけを使い、実機の分析は実行していない。
+
+![GPUI の実画面](brand-gpui.png)
+
+`npm run icons` は正常終了し、16〜128pxを明暗両背景で目視確認した。ICO は16/24/32/48/64/128/256pxの7フレーム、テンプレートPNGは18/36pxでRGBが黒のみ、背景は透明。`npm run gpui:package:mac`、`plutil -lint`、`codesign --verify --strict` が通り、バンドルの `--selftest` は `selftest ok nodes=4` を返した。
+
+`cargo test --release --locked --package tune-gpui --target-dir target/gpui` は6件成功。JavaScriptは661件成功・27件スキップ・失敗なし。`cargo fmt --all --check`、gitleaks、HEADの `npm run oss-check` は成功。`npm run oss-check -- --history` は既存mainコミット `a5ef618` のメッセージ中に台帳由来の語を2件検出した。アイコン変更のコミットには検出はなく、既存の公開履歴は書き換えていない。
+
+全体の `npm run check` は、今回変更していない `tune-core/src/live.rs` の `large_enum_variant` 2件でClippyが停止する。`cargo test --workspace --locked` は `tune-core` の単体テストで344件成功・5件失敗・4件無視となった。失敗はmiseの未信頼設定が影響する4件と `mac_sampler_runs_here` の観測値の不一致1件。全体検査の成功は主張しない。Windows実機での表示、Developer ID署名と公証は未実施。
