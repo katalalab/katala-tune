@@ -114,11 +114,15 @@ struct TuneApp {
     live_dirty: Arc<AtomicBool>,
     /// ライブを流している機体と、最後に合図（heartbeat）を送った時刻
     live_on: Option<(String, Instant)>,
+    page_logs: bool,
+    log_level: Option<&'static str>,
+    logs: Vec<model::LogRow>,
+    sigs: Vec<model::Signature>,
 }
 
 impl TuneApp {
     fn new(engine: Arc<Engine>, rt: Arc<tokio::runtime::Runtime>, dirty: Arc<AtomicBool>, live: LiveHandles, cx: &mut Context<Self>) -> Self {
-        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None };
+        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page_logs: false, log_level: None, logs: Vec::new(), sigs: Vec::new() };
         app.reload();
         // 通知を待つ代わりに 0.4 秒ごとに旗を見る。変わったときだけ読み直して描き直す
         cx.spawn(async move |this, cx| {
@@ -167,6 +171,24 @@ impl TuneApp {
         if self.selected.as_ref().is_some_and(|id| !self.nodes.iter().any(|n| &n.id == id)) {
             self.selected = None;
         }
+        if self.page_logs {
+            self.load_logs();
+        }
+    }
+
+    /// 直近 7 日。重い取り込みはせず、保存済みを読むだけ
+    fn load_logs(&mut self) {
+        let since = now_ms() - 7 * 86_400_000;
+        let mut f = serde_json::json!({ "since": since, "limit": 200 });
+        if let Some(l) = self.log_level {
+            f["level"] = l.into();
+        }
+        if let Ok(rows) = self.engine.logs_query(&f) {
+            self.logs = model::log_rows(&rows);
+        }
+        if let Ok(sigs) = self.engine.logs_signatures(&serde_json::json!({ "since": since, "limit": 15 })) {
+            self.sigs = model::signatures(&sigs);
+        }
     }
 
     /// 合図は 30 秒ごと。Engine 側は 2 分途切れると自動で止める
@@ -197,6 +219,15 @@ impl TuneApp {
             self.live_stop();
         }
         self.selected = id;
+        self.page_logs = false;
+        cx.notify();
+    }
+
+    fn open_logs(&mut self, cx: &mut Context<Self>) {
+        self.live_stop();
+        self.selected = None;
+        self.page_logs = true;
+        self.load_logs();
         cx.notify();
     }
 
@@ -233,7 +264,15 @@ impl TuneApp {
                 }))
         };
         let mut list = div().flex().flex_col().gap_0p5().p_2();
-        list = list.child(row(("nav", 0usize).into(), "概要".into(), palette::accent(), String::new(), self.selected.is_none(), None, cx));
+        list = list.child(row(("nav", 0usize).into(), "概要".into(), palette::accent(), String::new(), self.selected.is_none() && !self.page_logs, None, cx));
+        list = list.child(
+            div().id(("nav", 9999usize)).flex().items_center().gap_2().px_3().py_1p5().rounded_md().cursor_pointer()
+                .when(self.page_logs, |d| d.bg(palette::card()))
+                .hover(|d| d.bg(palette::card()))
+                .child(div().size_2().rounded_full().bg(palette::muted()))
+                .child(div().flex_1().text_sm().child("ログ"))
+                .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.open_logs(cx))),
+        );
         for (i, n) in self.nodes.iter().enumerate() {
             let tail = match &n.health {
                 Health::Scored(s) => s.to_string(),
@@ -256,7 +295,7 @@ impl TuneApp {
     }
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = self.selected.clone().unwrap_or_else(|| "概要".into());
+        let title = if self.page_logs { "ログ".to_string() } else { self.selected.clone().unwrap_or_else(|| "概要".into()) };
         let (crit, warn): (usize, usize) = self.nodes.iter().fold((0, 0), |a, n| (a.0 + n.count(Severity::Critical), a.1 + n.count(Severity::Warn)));
         let busy = self.probing;
         div()
@@ -348,6 +387,55 @@ impl TuneApp {
             grid = grid.child(div().text_color(palette::muted()).child("台帳に機体がありません（~/.config/katala-tune/nodes.json）"));
         }
         div().id("overview-scroll").flex_1().overflow_y_scroll().child(grid)
+    }
+
+    fn logs_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = now_ms();
+        let level_color = |l: &str| match l {
+            "critical" | "error" => palette::crit(),
+            "warn" => palette::warn(),
+            _ => palette::muted(),
+        };
+        let mut filters = div().flex().gap_2();
+        for (i, (label, level)) in [("すべて", None), ("重大", Some("critical")), ("エラー", Some("error")), ("警告", Some("warn"))].into_iter().enumerate() {
+            let active = self.log_level == level;
+            filters = filters.child(
+                div().id(("lvl", i)).px_3().py_1().rounded_md().text_sm().cursor_pointer()
+                    .bg(if active { palette::accent() } else { palette::card() })
+                    .child(label)
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| {
+                        app.log_level = level;
+                        app.load_logs();
+                        cx.notify();
+                    })),
+            );
+        }
+        let mut sigs = div().flex().flex_col().gap_1p5().w(px(360.0)).flex_none();
+        sigs = sigs.child(div().text_xs().text_color(palette::muted()).child("同種ログ（7 日）"));
+        for s in &self.sigs {
+            sigs = sigs.child(
+                div().flex().flex_col().gap_0p5().p_2().rounded_md().bg(palette::card())
+                    .child(div().flex().items_center().gap_2().child(chip(model::level_label(&s.level), level_color(&s.level))).child(div().text_xs().text_color(palette::muted()).child(format!("{} 件 · {} 台", s.count, s.nodes))))
+                    .child(div().text_xs().child(s.sample.clone())),
+            );
+        }
+        if self.sigs.is_empty() {
+            sigs = sigs.child(div().text_sm().text_color(palette::muted()).child("まだログを取り込んでいません"));
+        }
+        let mut rows = div().flex().flex_col().gap_1().flex_1().min_w_0();
+        rows = rows.child(div().text_xs().text_color(palette::muted()).child(format!("新しい順（{} 件）", self.logs.len().min(200))));
+        for l in &self.logs {
+            rows = rows.child(
+                div().flex().items_center().gap_2().px_2().py_1().rounded_md().bg(palette::card())
+                    .child(div().w(px(56.0)).flex_none().child(chip(model::level_label(&l.level), level_color(&l.level))))
+                    .child(div().text_xs().text_color(palette::muted()).w(px(84.0)).flex_none().truncate().child(l.node.clone()))
+                    .child(div().text_xs().text_color(palette::muted()).w(px(64.0)).flex_none().child(model::ago(now, l.ts_ms)))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().child(l.message.clone())),
+            );
+        }
+        div().id("logs").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5()
+            .child(filters)
+            .child(div().flex().gap_4().child(sigs).child(rows))
     }
 
     fn finding_row(f: &Finding) -> impl IntoElement {
@@ -457,6 +545,7 @@ impl TuneApp {
 impl Render for TuneApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match self.selected.clone() {
+            _ if self.page_logs => self.logs_page(cx).into_any_element(),
             Some(id) => self.detail(&id, cx).into_any_element(),
             None => self.overview(cx).into_any_element(),
         };
@@ -541,6 +630,12 @@ fn main() {
         })
         .detach();
         cx.activate(true);
+        // --open logs|<機体 id>: 起動時に開く画面（画面確認・スクリーンショット用）
+        match arg("--open").as_deref() {
+            Some("logs") => drop(window.update(cx, |v, _, cx| v.open_logs(cx))),
+            Some(id) => drop(window.update(cx, |v, _, cx| v.select(Some(id.to_string()), cx))),
+            None => {}
+        }
         if selftest {
             let view = window.update(cx, |v, _, _| v.nodes.len()).unwrap_or(0);
             // --live <id>: その機体のライブを流し、点が届くまで確かめる（E2E 用）
@@ -548,9 +643,17 @@ fn main() {
             if let Some(id) = &live_id {
                 window.update(cx, |v, _, _| v.live_start(id)).ok();
             }
+            let logs = std::env::args().any(|a| a == "--logs");
+            if logs {
+                window.update(cx, |v, _, cx| v.open_logs(cx)).ok();
+            }
             cx.spawn(async move |cx| {
                 cx.background_executor().timer(Duration::from_millis(if live_id.is_some() { 8000 } else { 1500 })).await;
                 println!("selftest ok nodes={view}");
+                if logs {
+                    let (r, g) = window.update(cx, |v, _, _| (v.logs.len(), v.sigs.len())).unwrap_or((0, 0));
+                    println!("selftest logs rows={r} sigs={g}");
+                }
                 if let Some(id) = live_id {
                     let n = window
                         .update(cx, |v, _, _| v.live_store.lock().map_or(0, |s| s.0.get(&id).map_or(0, |l| l.cpu.len())))
