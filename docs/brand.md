@@ -24,14 +24,14 @@ GPUI は原本から生成した128pxの `build/mark.png` を `include_bytes!` �
 npm run gpui:package:mac
 ```
 
-`dist/Katala Tune GPUI.app` を作り、`CFBundleIconFile` に新しい ICNS を指定する。Tauri と同名の実行ファイルが衝突しないよう、Cargo の出力は `target/gpui` に分離する。識別子は `org.katala.tune.gpui`。既存アプリや実機の台帳を置き換えない。
+`dist/Katala Tune GPUI Preview.app` を作り、`CFBundleIconFile` に新しい ICNS を指定する。Tauri と実行ファイルが衝突しないよう `katala-tune-gpui` を使い、Cargo の出力も `target/gpui` に分離する。識別子は `org.katala.tune.gpui.preview`。`KatalaTuneRevision` にビルドしたコミットを記録する。既存Tauriアプリや実機の台帳を置き換えない。
 
 ローカル確認用の ad-hoc 署名であり、Developer ID署名・公証・自動更新つきの配布は既存のリリース作業として扱う。Windows の ICO と Tauri 用画像は更新するが、GPUI の Windows 配布工程はここでは追加しない。
 
 動作確認は合成台帳と専用のデータ保存先で行う。
 
 ```sh
-"dist/Katala Tune GPUI.app/Contents/MacOS/katala-tune" \
+"dist/Katala Tune GPUI Preview.app/Contents/MacOS/katala-tune-gpui" \
   --config config/nodes.example.json --data target/brand-smoke --selftest
 ```
 
