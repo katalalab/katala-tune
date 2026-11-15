@@ -114,11 +114,12 @@ enum Page {
     Processes,
     Security,
     Network,
+    Link,
 }
 
 impl Page {
     /// サイドバーに並べる順
-    const NAV: [Self; 13] = [Self::Status, Self::Resources, Self::Processes, Self::Security, Self::Network, Self::Power, Self::Specs, Self::Tools, Self::Ai, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
+    const NAV: [Self; 14] = [Self::Status, Self::Resources, Self::Processes, Self::Security, Self::Network, Self::Link, Self::Power, Self::Specs, Self::Tools, Self::Ai, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
 
     fn title(self) -> &'static str {
         match self {
@@ -136,6 +137,7 @@ impl Page {
             Self::Processes => "プロセス",
             Self::Security => "セキュリティ",
             Self::Network => "ネットワーク",
+            Self::Link => "接続",
         }
     }
 
@@ -154,6 +156,7 @@ impl Page {
             "processes" => Self::Processes,
             "security" => Self::Security,
             "network" => Self::Network,
+            "link" => Self::Link,
             _ => return None,
         })
     }
@@ -185,6 +188,7 @@ struct TuneApp {
     ai: model::AiView,
     specs: model::SpecsView,
     security: model::SecurityView,
+    peers: Vec<model::PeerRow>,
     network: Arc<Mutex<Option<Vec<model::NetRow>>>>,
     network_busy: Arc<AtomicBool>,
     gate: Gate,
@@ -201,7 +205,7 @@ struct TuneApp {
 impl TuneApp {
     fn new(engine: Arc<Engine>, rt: Arc<tokio::runtime::Runtime>, dirty: Arc<AtomicBool>, live: LiveHandles, cx: &mut Context<Self>) -> Self {
         let live_dirty_for_gate = live.dirty.clone();
-        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page: Page::Overview, actions: Vec::new(), power: Default::default(), tools: Default::default(), ai: Default::default(), specs: Default::default(), security: Default::default(), network: Arc::new(Mutex::new(None)), network_busy: Arc::new(AtomicBool::new(false)), gate: { let f = live_dirty_for_gate; Gate::new(move || f.store(true, Ordering::Release)) }, result: Arc::new(Mutex::new(None)), schedule: Default::default(), status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
+        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page: Page::Overview, actions: Vec::new(), power: Default::default(), tools: Default::default(), ai: Default::default(), specs: Default::default(), security: Default::default(), peers: Vec::new(), network: Arc::new(Mutex::new(None)), network_busy: Arc::new(AtomicBool::new(false)), gate: { let f = live_dirty_for_gate; Gate::new(move || f.store(true, Ordering::Release)) }, result: Arc::new(Mutex::new(None)), schedule: Default::default(), status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
         app.reload();
         app.load_status();
         // 通知を待つ代わりに 0.4 秒ごとに旗を見る。変わったときだけ読み直して描き直す
@@ -297,6 +301,13 @@ impl TuneApp {
             Page::Security => {
                 if let Ok(v) = self.engine.netsec_view(&serde_json::json!({})) {
                     self.security = model::security(&v);
+                }
+            }
+            Page::Link => {
+                let dir = tune_link::console_dir(self.engine.data_dir());
+                if let Ok(list) = tune_link::peers::PeerStore::new(&dir).list() {
+                    let rows: Vec<_> = list.iter().filter(|p| p.role == tune_link::peers::Role::Agent).map(tune_link::peers::Peer::summary).collect();
+                    self.peers = model::peers(&rows);
                 }
             }
             Page::Overview | Page::Resources | Page::Processes | Page::Network => {}
@@ -962,6 +973,25 @@ impl TuneApp {
             .when(rows_data.is_none() && !busy, |d| d.child(div().text_sm().text_color(palette::muted()).child("まだ確認していません。「全機を確認」を押してください。")))
     }
 
+    /// ペア済みの tune-agent（公開鍵の指紋・名前・つなぎ先・時刻）。ペアリングと解除は鍵とコードを扱うので、この画面ではしない
+    fn link_page(&self) -> impl IntoElement {
+        let now = now_ms();
+        let mut rows = div().flex().flex_col().gap_1();
+        for p in &self.peers {
+            rows = rows.child(
+                div().flex().items_center().gap_2().px_3().py_2().rounded_md().bg(palette::card())
+                    .child(div().w(px(140.0)).flex_none().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(p.name.clone()))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().child(p.fingerprint.clone()))
+                    .child(div().w(px(160.0)).flex_none().truncate().text_xs().text_color(palette::muted()).child(if p.addr.is_empty() { "–".to_string() } else { p.addr.clone() }))
+                    .child(div().w(px(80.0)).flex_none().text_xs().text_color(palette::muted()).child(p.paired_ms.map_or("–".to_string(), |t| model::ago(now, t)))),
+            );
+        }
+        div().id("link").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5()
+            .child(div().text_xs().text_color(palette::muted()).child("ペア済みの tune-agent の一覧（公開鍵の指紋・つなぎ先・ペアリングした時刻）。ペアリングと解除は鍵とコードを扱うため、この画面ではできません。旧画面か CLI（tune agent-pair / agent-unpair）で行います。調べる経路は今は SSH のままです。"))
+            .child(rows)
+            .when(self.peers.is_empty(), |d| d.child(div().text_sm().text_color(palette::muted()).child("ペア済みの機体はありません")))
+    }
+
     fn actions_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let now = now_ms();
         let mut rows = div().flex().flex_col().gap_1();
@@ -1207,6 +1237,7 @@ impl Render for TuneApp {
                 Page::Processes => self.processes_page().into_any_element(),
                 Page::Security => self.security_page().into_any_element(),
                 Page::Network => self.network_page(cx).into_any_element(),
+                Page::Link => self.link_page().into_any_element(),
             },
         };
         div()
@@ -1353,7 +1384,7 @@ fn main() {
                     println!("selftest confirm shown={shown} approved={:?}", demo_result.lock().map(|r| *r).unwrap_or(None));
                 }
                 // 開いた画面のデータが読めたか（画面ごとの件数）。--open <page> と併用する
-                let counts = window.update(cx, |v, _, _| format!("power={} actions={} status={} topology={} tools={} ai={} specs={} security={} procs={}", v.power.rows.len(), v.actions.len(), v.status.checks.len(), v.topology.entities.len(), v.tools.groups.len(), v.ai.sessions, v.specs.sections.len(), v.security.nodes.len(), v.nodes.iter().filter(|n| !n.apps.is_empty()).count())).unwrap_or_default();
+                let counts = window.update(cx, |v, _, _| format!("power={} actions={} status={} topology={} tools={} ai={} specs={} security={} procs={} peers={}", v.power.rows.len(), v.actions.len(), v.status.checks.len(), v.topology.entities.len(), v.tools.groups.len(), v.ai.sessions, v.specs.sections.len(), v.security.nodes.len(), v.nodes.iter().filter(|n| !n.apps.is_empty()).count(), v.peers.len())).unwrap_or_default();
                 println!("selftest page {counts}");
                 if net_id.is_some() {
                     println!("selftest network ok_rows={}", net_result.lock().map_or(0, |n| n.unwrap_or(0)));

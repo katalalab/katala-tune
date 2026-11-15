@@ -810,6 +810,28 @@ pub fn action_message(node: &str, r: Result<Value, String>) -> String {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PeerRow {
+    pub name: String,
+    /// 公開鍵の指紋（公開情報）
+    pub fingerprint: String,
+    pub addr: String,
+    pub paired_ms: Option<i64>,
+}
+
+/// ペア済みの tune-agent の一覧（`Peer::summary` の形）。公開鍵の指紋と名前・つなぎ先・時刻だけで、秘密鍵やコードは扱わない
+pub fn peers(rows: &[Value]) -> Vec<PeerRow> {
+    rows.iter()
+        .filter(|p| p.get("role").and_then(Value::as_str).is_none_or(|r| r == "agent"))
+        .map(|p| PeerRow {
+            name: str_of(p.get("name")),
+            fingerprint: str_of(p.get("fingerprint")),
+            addr: str_of(p.get("addr")),
+            paired_ms: p.get("paired_at").and_then(Value::as_i64),
+        })
+        .collect()
+}
+
 /// ライブ表示で貯める点（直近 3 分 = 1 秒ごとに 180 点）
 pub const LIVE_KEEP: usize = 180;
 
@@ -1127,6 +1149,19 @@ mod tests {
         assert_eq!(r[0].flags[0], ("インターフェース", None));
         assert!(r[1].skipped && !r[1].ok && r[1].error == "x");
         assert!(network(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn peers_keep_only_agents_and_public_fields() {
+        let rows = vec![
+            json!({"name": "a", "role": "agent", "fingerprint": "ab:cd", "addr": "h:1", "paired_at": 5, "secret": "x"}),
+            json!({"name": "console", "role": "console", "fingerprint": "zz"}),
+            json!({"name": "b", "fingerprint": "ef"}),
+        ];
+        let p = peers(&rows);
+        assert_eq!(p.len(), 2);
+        assert_eq!((p[0].name.as_str(), p[0].fingerprint.as_str(), p[0].addr.as_str(), p[0].paired_ms), ("a", "ab:cd", "h:1", Some(5)));
+        assert_eq!(p[1].paired_ms, None);
     }
 
     #[test]
