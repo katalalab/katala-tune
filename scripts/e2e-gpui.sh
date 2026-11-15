@@ -21,3 +21,11 @@ if [ -n "${E2E_LIVE_NODE:-}" ]; then
   [ "${pts:-0}" -ge 3 ] || { echo "E2E 失敗: ライブの点が $pts 点（3 点以上が必要）" >&2; exit 1; }
   echo "e2e-gpui live OK"
 fi
+
+# 任意: E2E_LOGS=1 で、保存済みログの読み出し（実機のデータを読むだけ）が画面モデルまで届くことを確かめる。
+if [ -n "${E2E_LOGS:-}" ]; then
+  out=$(./target/release/katala-tune --selftest --logs)
+  echo "$out"
+  echo "$out" | grep -q "^selftest logs rows=" || { echo "E2E 失敗: ログの読み出し" >&2; exit 1; }
+  echo "e2e-gpui logs OK"
+fi

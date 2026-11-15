@@ -143,6 +143,59 @@ pub fn uptime(h: f64) -> String {
     if h >= 48.0 { format!("{:.0} 日", h / 24.0) } else { format!("{h:.0} 時間") }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogRow {
+    pub node: String,
+    pub ts_ms: i64,
+    pub level: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Signature {
+    pub level: String,
+    pub sample: String,
+    pub count: i64,
+    pub nodes: i64,
+}
+
+/// 1 行 1 画面行に収める（長いログは先頭の 1 行だけ、char 単位で切る）
+fn one_line(s: &str, max: usize) -> String {
+    let first = s.lines().next().unwrap_or("");
+    if first.chars().count() > max { first.chars().take(max).collect::<String>() + "…" } else { first.to_string() }
+}
+
+pub fn log_rows(rows: &[Value]) -> Vec<LogRow> {
+    rows.iter()
+        .map(|r| LogRow {
+            node: str_of(r.get("node_id")),
+            ts_ms: r.get("ts").and_then(Value::as_f64).map_or(0, |t| t as i64),
+            level: str_of(r.get("level")),
+            message: one_line(&str_of(r.get("message")), 200),
+        })
+        .collect()
+}
+
+pub fn signatures(rows: &[Value]) -> Vec<Signature> {
+    rows.iter()
+        .map(|r| Signature {
+            level: str_of(r.get("level")),
+            sample: one_line(&str_of(r.get("sample")), 160),
+            count: r.get("n").and_then(Value::as_i64).unwrap_or(0),
+            nodes: r.get("nodes").and_then(Value::as_i64).unwrap_or(0),
+        })
+        .collect()
+}
+
+pub fn level_label(l: &str) -> &'static str {
+    match l {
+        "critical" => "重大",
+        "error" => "エラー",
+        "warn" => "警告",
+        _ => "情報",
+    }
+}
+
 /// ライブ表示で貯める点（直近 3 分 = 1 秒ごとに 180 点）
 pub const LIVE_KEEP: usize = 180;
 
@@ -264,6 +317,19 @@ mod tests {
         s.merge(&json!({"nodes": {"a": {"points": pts}}}));
         assert_eq!(s.0["a"].cpu.len(), LIVE_KEEP);
         s.merge(&json!({"bad": 1}));
+    }
+
+    #[test]
+    fn log_rows_and_signatures_are_one_line_and_tolerant() {
+        let rows = log_rows(&[json!({"node_id": "a", "ts": 1700000000000.0, "level": "error", "message": "first\nsecond"}), json!({})]);
+        assert_eq!(rows[0].message, "first");
+        assert_eq!(rows[0].ts_ms, 1_700_000_000_000);
+        assert_eq!(rows[1].level, "");
+        let long = "あ".repeat(300);
+        assert_eq!(log_rows(&[json!({"message": long})])[0].message.chars().count(), 201);
+        let s = signatures(&[json!({"level": "warn", "sample": "x", "n": 5, "nodes": 2})]);
+        assert_eq!((s[0].count, s[0].nodes), (5, 2));
+        assert_eq!(level_label("warn"), "警告");
     }
 
     #[test]
