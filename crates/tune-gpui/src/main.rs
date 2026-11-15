@@ -617,7 +617,7 @@ fn main() {
     let rt_exit = rt.clone();
 
     Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1120.0), px(720.0)), cx);
+        let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
         let window = cx
             .open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), titlebar: Some(gpui::TitlebarOptions { title: Some("Katala Tune".into()), appears_transparent: false, traffic_light_position: Some(point(px(12.0), px(12.0))) }), ..Default::default() }, move |_, cx| {
                 cx.new(|cx| TuneApp::new(engine, rt, dirty, handles, cx))
