@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct Options {
     pub config: PathBuf,
@@ -19,6 +19,36 @@ pub struct Options {
 }
 
 pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Options>, String> {
+    let Some(mut options) = parse_options(arguments)? else { return Ok(None) };
+    // Freeze paths before IPC/runtime threads. Every normal/diagnostic entry
+    // shares these exact paths with Engine, OS integration and helper lookup.
+    options.config = resolved(&options.config)?;
+    options.data = resolved(&options.data)?;
+    tune_core::helpers::bind_process_data_dir(&options.data)?;
+    Ok(Some(options))
+}
+
+/// Canonicalize existing ancestors too, so missing and later-created paths
+/// have the same identity. Resolve symlinks before `..`; never create state.
+pub(super) fn resolved(path: &Path) -> Result<PathBuf, String> {
+    let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
+    let mut result = PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            std::path::Component::CurDir => {}
+            part => result.push(part.as_os_str()),
+        }
+        if result.exists() {
+            result = result.canonicalize().map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(result)
+}
+
+fn parse_options(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Options>, String> {
     let values: Vec<_> = arguments.into_iter().collect();
     if values.len() == 1 && matches!(values[0].to_str(), Some("--help" | "-h")) {
         return Ok(None);
@@ -111,6 +141,7 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
 
 #[cfg(test)]
 mod tests {
+    use super::parse_options as parse;
     use super::*;
 
     #[test]

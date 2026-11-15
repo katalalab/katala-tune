@@ -1,9 +1,12 @@
 //! Bounded local activation IPC. Ownership is acquired before Engine/DB startup.
 //! This protocol can only show a window; it cannot authorize collection or OS effects.
+use crate::startup::resolved;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::path::PathBuf;
 use std::{
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -46,25 +49,6 @@ pub enum Claim {
     Forwarded,
 }
 
-/// Canonicalize existing ancestors too, so a missing data directory and its
-/// later-created form claim the same identity. Resolve symlinks before `..`.
-fn resolved(path: &Path) -> Result<PathBuf, String> {
-    let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
-    let mut result = PathBuf::new();
-    for part in absolute.components() {
-        match part {
-            std::path::Component::ParentDir => {
-                result.pop();
-            }
-            std::path::Component::CurDir => {}
-            part => result.push(part.as_os_str()),
-        }
-        if result.exists() {
-            result = result.canonicalize().map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(result)
-}
 fn namespace(config: &Path, data: &Path) -> Result<String, String> {
     let mut hash = Sha256::new();
     let user = platform::user()?;

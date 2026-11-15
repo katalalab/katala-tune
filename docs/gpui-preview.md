@@ -17,6 +17,10 @@ cargo run -p tune-gpui --release --locked -- --config /path/to/ledger.json --dat
 
 実行ファイルは`katala-tune-gpui`。Tauri版の`katala-tune`を上書きしない。既定のDBは通常のdataディレクトリの`gpui-preview`配下に分ける。`--data`で指定したDBは初期化・移行・分析保存の対象となるため、既存版と同時に同じDBを使わない。
 
+GPUIは起動引数の検証後、config/dataの相対パスと既存の親ディレクトリを解決し、helperの探索先をそのdataの`bin`へプロセス内で一度だけ固定する。`--data`は環境変数より優先し、省略時は`KATALA_TUNE_DATA_DIR`（無指定なら通常のdataディレクトリ）の`gpui-preview/bin`を使う。通常・常駐・非表示・診断起動で共通し、環境変数を書き換えない。別のdataへの再束縛は拒否する。未束縛のCLI/Tauriの探索先は従来どおり。
+
+起動だけではhelperをコピー・インストール・更新しない。WindowsのProbeと承認付き変更操作には、対象Previewの`data/bin/tune.exe`へ検証済みartifactを明示的に配置し、その版に一致する承認レコードをPreview用台帳に用意する必要がある。欠けている場合やハッシュ・承認が合わない場合は既存の検証で失敗し、HOMEのhelperへ切り替えない。Liveのnative samplerは別の`data/bin/tune-agent`（Windowsでは`tune-agent.exe`）で、実行ファイル隣やHOMEから補わない。native samplerが無い場合は既存のスクリプト経路を使うため、その実行環境と収集の成功は別途確認が必要。`tune.exe`の承認はnative samplerの配布や検証を兼ねない。
+
 `scripts/e2e-gpui.sh`はモデル・保存データ・入力編集・起動引数のテストを実行し、見本台帳と一時DBで全17画面の読み込みsmokeを行う。続いて合成の分析・ログ・操作記録を持つDBでも実行ファイルから全画面を開き、前後の観測・収集カーソル・状態・操作記録が不変であることを確認する。この追加テストはdesktop GPUセッションが必要なため、通常の`cargo test`ではignoreし、このスクリプトから明示実行する。
 
 通常起動は概要を表示するPreviewで、最後のウィンドウを閉じると実行中の収集と保存ACKを待って終了する。`--resident`を付けた場合だけ、最後のウィンドウを閉じてもアプリとトレイを保持する。`--resident --hidden`は最初からウィンドウを作らない。トレイの「開く」「ダッシュボード」「状態」で一つのウィンドウを表示でき、「終了」は実行中の処理を待って終了する。Windowsでは左クリックでも開き、右クリックでメニューを表示する。macOSではメニューバーのトレイメニューとDockからの再表示に対応する。
