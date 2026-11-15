@@ -111,11 +111,12 @@ enum Page {
     Specs,
     Processes,
     Security,
+    Network,
 }
 
 impl Page {
     /// サイドバーに並べる順
-    const NAV: [Self; 12] = [Self::Status, Self::Resources, Self::Processes, Self::Security, Self::Power, Self::Specs, Self::Tools, Self::Ai, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
+    const NAV: [Self; 13] = [Self::Status, Self::Resources, Self::Processes, Self::Security, Self::Network, Self::Power, Self::Specs, Self::Tools, Self::Ai, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
 
     fn title(self) -> &'static str {
         match self {
@@ -132,6 +133,7 @@ impl Page {
             Self::Specs => "スペック比較",
             Self::Processes => "プロセス",
             Self::Security => "セキュリティ",
+            Self::Network => "ネットワーク",
         }
     }
 
@@ -149,6 +151,7 @@ impl Page {
             "specs" => Self::Specs,
             "processes" => Self::Processes,
             "security" => Self::Security,
+            "network" => Self::Network,
             _ => return None,
         })
     }
@@ -180,6 +183,8 @@ struct TuneApp {
     ai: model::AiView,
     specs: model::SpecsView,
     security: model::SecurityView,
+    network: Arc<Mutex<Option<Vec<model::NetRow>>>>,
+    network_busy: Arc<AtomicBool>,
     schedule: model::ScheduleView,
     status: model::StatusView,
     topology: model::TopologyView,
@@ -190,7 +195,7 @@ struct TuneApp {
 
 impl TuneApp {
     fn new(engine: Arc<Engine>, rt: Arc<tokio::runtime::Runtime>, dirty: Arc<AtomicBool>, live: LiveHandles, cx: &mut Context<Self>) -> Self {
-        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page: Page::Overview, actions: Vec::new(), power: Default::default(), tools: Default::default(), ai: Default::default(), specs: Default::default(), security: Default::default(), schedule: Default::default(), status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
+        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page: Page::Overview, actions: Vec::new(), power: Default::default(), tools: Default::default(), ai: Default::default(), specs: Default::default(), security: Default::default(), network: Arc::new(Mutex::new(None)), network_busy: Arc::new(AtomicBool::new(false)), schedule: Default::default(), status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
         app.reload();
         app.load_status();
         // 通知を待つ代わりに 0.4 秒ごとに旗を見る。変わったときだけ読み直して描き直す
@@ -288,7 +293,7 @@ impl TuneApp {
                     self.security = model::security(&v);
                 }
             }
-            Page::Overview | Page::Resources | Page::Processes => {}
+            Page::Overview | Page::Resources | Page::Processes | Page::Network => {}
         }
     }
 
@@ -352,6 +357,24 @@ impl TuneApp {
         if let Ok(v) = self.engine.status_snapshot() {
             self.status = model::status(&v);
         }
+    }
+
+    /// 受動の到達性確認（読み取りだけ）。各機体へ接続するので時間がかかることがある。ボタンを押したときだけ走らせる
+    fn network_check(&mut self, cx: &mut Context<Self>) {
+        if self.network_busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (engine, slot, busy, dirty) = (self.engine.clone(), self.network.clone(), self.network_busy.clone(), self.live_dirty.clone());
+        self.rt.spawn(async move {
+            let rows = match engine.network_check(&[], false).await {
+                Ok(v) => model::network(&v),
+                Err(e) => vec![model::NetRow { node: "（確認できません）".into(), ok: false, skipped: false, error: e, at_ms: None, flags: Vec::new() }],
+            };
+            *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rows);
+            busy.store(false, Ordering::Release);
+            dirty.store(true, Ordering::Release);
+        });
+        cx.notify();
     }
 
     fn probe_all(&mut self, cx: &mut Context<Self>) {
@@ -875,6 +898,40 @@ impl TuneApp {
             .when(enabled == 0, |d| d.child(div().text_sm().text_color(palette::warn()).child("どの機体でも有効になっていません。台帳の設定で機体ごとに有効にします。")))
     }
 
+    fn network_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let busy = self.network_busy.load(Ordering::Acquire);
+        let rows_data = self.network.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let now = now_ms();
+        let mut rows = div().flex().flex_col().gap_1();
+        for r in rows_data.iter().flatten() {
+            let mut flags = div().flex().gap_2().flex_1().min_w_0();
+            for (label, v) in &r.flags {
+                let (text, color) = match v { Some(true) => (format!("{label} ○"), palette::ok()), Some(false) => (format!("{label} ×"), palette::crit()), None => (format!("{label} –"), palette::muted()) };
+                flags = flags.child(chip(text, color));
+            }
+            rows = rows.child(
+                div().flex().items_center().gap_2().px_3().py_2().rounded_md().bg(palette::card())
+                    .child(div().w(px(120.0)).flex_none().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(r.node.clone()))
+                    .child(div().w(px(72.0)).flex_none().child(if r.skipped { chip("対象外", palette::muted()) } else if r.ok { chip("確認済", palette::ok()) } else { chip("失敗", palette::crit()) }))
+                    .child(div().w(px(64.0)).flex_none().text_xs().text_color(palette::muted()).child(r.at_ms.map_or(String::new(), |a| model::ago(now, a))))
+                    .child(if r.ok { flags.into_any_element() } else { div().flex_1().min_w_0().truncate().text_xs().text_color(palette::muted()).child(r.error.clone()).into_any_element() }),
+            );
+        }
+        div().id("network").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5()
+            .child(div().flex().items_center().gap_3()
+                .child(div().flex_1().text_xs().text_color(palette::muted()).child("各機体のネットワークの到達性を、受動的に（外へ探りを入れずに）確認します。結果は真偽だけで、IP アドレスは含みません。押したときだけ各機体へ接続します。"))
+                .child(
+                    div().id("net-check").px_3().py_1p5().rounded_md().text_sm()
+                        .bg(if busy { palette::line() } else { palette::accent() })
+                        .text_color(if busy { palette::muted() } else { rgb(0xffffff).into() })
+                        .when(!busy, |d| d.cursor_pointer())
+                        .child(if busy { "確認中…" } else { "全機を確認" })
+                        .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.network_check(cx))),
+                ))
+            .child(rows)
+            .when(rows_data.is_none() && !busy, |d| d.child(div().text_sm().text_color(palette::muted()).child("まだ確認していません。「全機を確認」を押してください。")))
+    }
+
     fn actions_page(&self) -> impl IntoElement {
         let now = now_ms();
         let mut rows = div().flex().flex_col().gap_1();
@@ -1039,6 +1096,7 @@ impl Render for TuneApp {
                 Page::Specs => self.specs_page().into_any_element(),
                 Page::Processes => self.processes_page().into_any_element(),
                 Page::Security => self.security_page().into_any_element(),
+                Page::Network => self.network_page(cx).into_any_element(),
             },
         };
         div()
@@ -1138,15 +1196,29 @@ fn main() {
                 window.update(cx, |v, _, _| v.live_start(id)).ok();
             }
             let logs = std::env::args().any(|a| a == "--logs");
+            // --network <id>: 受動の到達性確認をその機体だけに走らせ、結果が届くまで確かめる（E2E 用）
+            let net_id = arg("--network");
+            let net_engine = window.update(cx, |v, _, _| (v.engine.clone(), v.rt.clone())).ok();
+            let net_result: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
+            if let (Some(id), Some((engine, rt))) = (net_id.clone(), net_engine) {
+                let slot = net_result.clone();
+                rt.spawn(async move {
+                    let n = engine.network_check(&[id], false).await.map(|v| model::network(&v).iter().filter(|r| r.ok).count()).unwrap_or(0);
+                    *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(n);
+                });
+            }
             if logs {
                 window.update(cx, |v, _, cx| v.open_page(Page::Logs, cx)).ok();
             }
             cx.spawn(async move |cx| {
-                cx.background_executor().timer(Duration::from_millis(if live_id.is_some() { 8000 } else { 1500 })).await;
+                cx.background_executor().timer(Duration::from_millis(if live_id.is_some() { 8000 } else if net_id.is_some() { 4000 } else { 1500 })).await;
                 println!("selftest ok nodes={view}");
                 // 開いた画面のデータが読めたか（画面ごとの件数）。--open <page> と併用する
                 let counts = window.update(cx, |v, _, _| format!("power={} actions={} status={} topology={} tools={} ai={} specs={} security={} procs={}", v.power.rows.len(), v.actions.len(), v.status.checks.len(), v.topology.entities.len(), v.tools.groups.len(), v.ai.sessions, v.specs.sections.len(), v.security.nodes.len(), v.nodes.iter().filter(|n| !n.apps.is_empty()).count())).unwrap_or_default();
                 println!("selftest page {counts}");
+                if net_id.is_some() {
+                    println!("selftest network ok_rows={}", net_result.lock().map_or(0, |n| n.unwrap_or(0)));
+                }
                 if logs {
                     let (r, g) = window.update(cx, |v, _, _| (v.logs.len(), v.sigs.len())).unwrap_or((0, 0));
                     println!("selftest logs rows={r} sigs={g}");

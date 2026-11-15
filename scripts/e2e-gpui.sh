@@ -40,3 +40,11 @@ if [ -n "${E2E_PAGES:-}" ]; then
   done
   echo "e2e-gpui pages OK"
 fi
+
+# 任意: E2E_NETWORK_NODE=<id> で、その機体への受動の到達性確認が結果を返すことを確かめる（読み取りだけ。ローカルの機体を指定する）。
+if [ -n "${E2E_NETWORK_NODE:-}" ]; then
+  out=$(./target/release/katala-tune --selftest --network "$E2E_NETWORK_NODE" --data "$tmp/net-data" | grep "^selftest network")
+  echo "$out"
+  [ "$out" = "selftest network ok_rows=1" ] || { echo "E2E 失敗: ネットワーク確認 ($out)" >&2; exit 1; }
+  echo "e2e-gpui network OK"
+fi

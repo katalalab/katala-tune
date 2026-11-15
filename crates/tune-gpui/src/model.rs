@@ -743,6 +743,43 @@ pub fn security(v: &Value) -> SecurityView {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetRow {
+    pub node: String,
+    pub ok: bool,
+    pub skipped: bool,
+    pub error: String,
+    pub at_ms: Option<i64>,
+    /// (項目名, 値)。値が取れなかった項目は None（false とは区別する）
+    pub flags: Vec<(&'static str, Option<bool>)>,
+}
+
+/// `Engine::network_check` の結果（受動確認。到達性の真偽だけで、宛先の IP は含まない）
+pub fn network(v: &Value) -> Vec<NetRow> {
+    const KEYS: [(&str, &str); 5] = [
+        ("interface_up", "インターフェース"),
+        ("link_active", "リンク"),
+        ("ip_address_present", "IP"),
+        ("default_route_present", "既定経路"),
+        ("dns_configured", "DNS"),
+    ];
+    v.get("nodes")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|n| NetRow {
+                    node: str_of(n.get("node_id")),
+                    ok: n.get("ok").and_then(Value::as_bool) == Some(true),
+                    skipped: n.get("skipped").and_then(Value::as_bool) == Some(true),
+                    error: one_line(&str_of(n.get("error")), 120),
+                    at_ms: n.get("at").and_then(Value::as_i64),
+                    flags: KEYS.iter().map(|(k, label)| (*label, n.get("data").and_then(|d| d.get(*k)).and_then(Value::as_bool))).collect(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// ライブ表示で貯める点（直近 3 分 = 1 秒ごとに 180 点）
 pub const LIVE_KEEP: usize = 180;
 
@@ -1010,6 +1047,20 @@ mod tests {
         assert_eq!((s.nodes[0].enabled, s.nodes[0].checks, s.nodes[1].enabled), (true, 2, false));
         assert_eq!((s.events, s.peers, s.keep_days), (1, 0, 30));
         assert_eq!(security(&json!({})), SecurityView::default());
+    }
+
+    #[test]
+    fn network_keeps_unknown_flags_distinct_from_false() {
+        let v = json!({"nodes": [
+            {"node_id": "a", "ok": true, "at": 3, "data": {"dns_configured": true, "link_active": false}},
+            {"node_id": "b", "ok": false, "skipped": true, "error": "x\ny"}
+        ]});
+        let r = network(&v);
+        assert_eq!(r[0].flags[1], ("リンク", Some(false)));
+        assert_eq!(r[0].flags[4], ("DNS", Some(true)));
+        assert_eq!(r[0].flags[0], ("インターフェース", None));
+        assert!(r[1].skipped && !r[1].ok && r[1].error == "x");
+        assert!(network(&json!({})).is_empty());
     }
 
     #[test]
