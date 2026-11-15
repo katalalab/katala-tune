@@ -5,7 +5,8 @@
 
 mod model;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +16,7 @@ use gpui::{
 };
 use model::{Finding, Health, NodeView, Severity};
 use tune_core::engine::{Engine, Host};
+use tune_core::live::{Live, ProcessRoute, Stop};
 use tune_core::nodes;
 
 #[cfg(target_os = "macos")]
@@ -73,9 +75,9 @@ fn severity_color(s: Severity) -> Hsla {
 }
 
 /// 棒の推移グラフ。0〜`max` を高さにし、点が無ければ空の枠だけ描く
-fn trend(values: &[f64], max: f64, color: Hsla, height: f32) -> gpui::Div {
+fn trend(values: &[f64], max: f64, color: Hsla, height: f32, take: usize) -> gpui::Div {
     let mut bars = div().h(px(height)).flex().items_end().gap_px();
-    for v in values.iter().rev().take(60).rev() {
+    for v in values.iter().rev().take(take).rev() {
         let h = ((v / max).clamp(0.0, 1.0) as f32 * height).max(1.0);
         bars = bars.child(div().w(px(3.0)).h(px(h)).rounded_sm().bg(color));
     }
@@ -93,6 +95,12 @@ fn chip(text: impl Into<gpui::SharedString>, color: Hsla) -> gpui::Div {
         .child(text.into())
 }
 
+struct LiveHandles {
+    live: Arc<Live>,
+    store: Arc<Mutex<model::LiveStore>>,
+    dirty: Arc<AtomicBool>,
+}
+
 struct TuneApp {
     engine: Arc<Engine>,
     rt: Arc<tokio::runtime::Runtime>,
@@ -101,11 +109,16 @@ struct TuneApp {
     selected: Option<String>,
     probing: bool,
     notice: Option<String>,
+    live: Arc<Live>,
+    live_store: Arc<Mutex<model::LiveStore>>,
+    live_dirty: Arc<AtomicBool>,
+    /// ライブを流している機体と、最後に合図（heartbeat）を送った時刻
+    live_on: Option<(String, Instant)>,
 }
 
 impl TuneApp {
-    fn new(engine: Arc<Engine>, rt: Arc<tokio::runtime::Runtime>, dirty: Arc<AtomicBool>, cx: &mut Context<Self>) -> Self {
-        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None };
+    fn new(engine: Arc<Engine>, rt: Arc<tokio::runtime::Runtime>, dirty: Arc<AtomicBool>, live: LiveHandles, cx: &mut Context<Self>) -> Self {
+        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None };
         app.reload();
         // 通知を待つ代わりに 0.4 秒ごとに旗を見る。変わったときだけ読み直して描き直す
         cx.spawn(async move |this, cx| {
@@ -114,6 +127,10 @@ impl TuneApp {
                 let alive = this
                     .update(cx, |app, cx| {
                         let probing = app.engine.is_probing();
+                        app.live_heartbeat();
+                        if app.live_dirty.swap(false, Ordering::AcqRel) {
+                            cx.notify();
+                        }
                         if app.dirty.swap(false, Ordering::AcqRel) || probing != app.probing {
                             app.probing = probing;
                             app.reload();
@@ -152,6 +169,37 @@ impl TuneApp {
         }
     }
 
+    /// 合図は 30 秒ごと。Engine 側は 2 分途切れると自動で止める
+    fn live_heartbeat(&mut self) {
+        if self.live_on.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(30)) {
+            let id = self.live_on.as_ref().map(|(id, _)| id.clone()).unwrap_or_default();
+            self.live_start(&id);
+        }
+    }
+
+    fn live_start(&mut self, id: &str) {
+        let cfg = self.engine.reload_config();
+        let nodes: Vec<_> = cfg.nodes.iter().filter(|n| n.id == id).cloned().collect();
+        let _g = self.rt.enter();
+        self.live.start(&nodes, &[]);
+        self.live_on = Some((id.to_string(), Instant::now()));
+    }
+
+    fn live_stop(&mut self) {
+        if let Some((id, _)) = self.live_on.take() {
+            self.live.stop(Some(&[id]), Stop::User);
+        }
+    }
+
+    fn select(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        // 画面を移ったらライブは止める（見ていない機体に流し続けない）
+        if self.live_on.as_ref().map(|(i, _)| i) != id.as_ref() {
+            self.live_stop();
+        }
+        self.selected = id;
+        cx.notify();
+    }
+
     fn probe_all(&mut self, cx: &mut Context<Self>) {
         if self.probing {
             return;
@@ -181,8 +229,7 @@ impl TuneApp {
                 .child(div().flex_1().truncate().text_sm().child(label))
                 .child(div().text_xs().text_color(palette::muted()).child(tail))
                 .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| {
-                    app.selected = target.clone();
-                    cx.notify();
+                    app.select(target.clone(), cx);
                 }))
         };
         let mut list = div().flex().flex_col().gap_0p5().p_2();
@@ -290,11 +337,10 @@ impl TuneApp {
                     )))
                     .child(metric("CPU", n.cpu_busy, "%"))
                     .child(metric("空きメモリ", n.mem_avail_pct, "%"))
-                    .when(!n.score_trend.is_empty(), |d| d.child(trend(&n.score_trend, 100.0, score_color(&n.health), 18.0)))
+                    .when(!n.score_trend.is_empty(), |d| d.child(trend(&n.score_trend, 100.0, score_color(&n.health), 18.0, 60)))
                     .child(foot)
                     .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| {
-                        app.selected = Some(id.clone());
-                        cx.notify();
+                        app.select(Some(id.clone()), cx);
                     })),
             );
         }
@@ -320,7 +366,7 @@ impl TuneApp {
             .when(!f.advice.is_empty(), |d| d.child(div().text_xs().child(f.advice.clone())))
     }
 
-    fn detail(&self, id: &str) -> impl IntoElement {
+    fn detail(&self, id: &str, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(n) = self.nodes.iter().find(|n| n.id == id) else {
             return div().id("detail").p_5().child("機体が見つかりません");
         };
@@ -338,6 +384,48 @@ impl TuneApp {
         if let Some(u) = n.uptime_h {
             facts = facts.child(chip(format!("稼働 {}", model::uptime(u)), palette::muted()));
         }
+        let on = self.live_on.as_ref().is_some_and(|(i, _)| i == id);
+        let toggle = {
+            let id = id.to_string();
+            div()
+                .id("live-toggle")
+                .px_3()
+                .py_1p5()
+                .rounded_md()
+                .text_sm()
+                .cursor_pointer()
+                .bg(if on { palette::crit() } else { palette::card() })
+                .border_1()
+                .border_color(palette::line())
+                .child(if on { "ライブを止める" } else { "ライブ（1 秒ごと）" })
+                .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| {
+                    if app.live_on.is_some() {
+                        app.live_stop();
+                    } else {
+                        app.live_start(&id);
+                    }
+                    cx.notify();
+                }))
+        };
+        let live_panel = if on {
+            let store = self.live_store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let l = store.0.get(id).cloned().unwrap_or_default();
+            let now = |v: &[f64]| v.last().map_or("–".to_string(), |x| format!("{x:.0}%"));
+            let status = if l.cpu.is_empty() { Some(format!("接続中… {}", l.detail.clone().unwrap_or_default())) } else { None };
+            Some(
+                div().flex().flex_col().gap_2().p_3().rounded_md().bg(palette::card()).border_1().border_color(palette::accent())
+                    .child(div().text_xs().text_color(palette::muted()).child(format!("ライブ（直近 {} 秒）· {}", l.cpu.len(), l.state)))
+                    .when_some(status, |d, s| d.child(div().text_sm().text_color(palette::warn()).child(s)))
+                    .child(div().flex().items_end().gap_4()
+                        .child(div().flex().flex_col().gap_1().child(div().text_xs().text_color(palette::muted()).child("CPU")).child(div().text_xl().font_weight(FontWeight::BOLD).child(now(&l.cpu))))
+                        .child(trend(&l.cpu, 100.0, palette::accent(), 48.0, model::LIVE_KEEP)))
+                    .child(div().flex().items_end().gap_4()
+                        .child(div().flex().flex_col().gap_1().child(div().text_xs().text_color(palette::muted()).child("メモリ使用")).child(div().text_xl().font_weight(FontWeight::BOLD).child(now(&l.mem))))
+                        .child(trend(&l.mem, 100.0, palette::warn(), 48.0, model::LIVE_KEEP))),
+            )
+        } else {
+            None
+        };
         let mut trends = div().flex().flex_wrap().gap_5();
         for (label, values, max, color) in [
             ("スコア", &n.score_trend, 100.0, palette::ok()),
@@ -348,7 +436,7 @@ impl TuneApp {
                 trends = trends.child(
                     div().flex().flex_col().gap_1().p_3().rounded_md().bg(palette::card())
                         .child(div().text_xs().text_color(palette::muted()).child(format!("{label}（直近 {} 回）", values.len().min(60))))
-                        .child(trend(values, max, color, 44.0)),
+                        .child(trend(values, max, color, 44.0, 60)),
                 );
             }
         }
@@ -362,14 +450,14 @@ impl TuneApp {
             Health::Scored(_) if n.findings.is_empty() => div().text_sm().text_color(palette::ok()).child("所見はありません"),
             Health::Scored(_) => list,
         };
-        div().id("detail").flex_1().overflow_y_scroll().flex().flex_col().gap_4().p_5().child(facts).child(trends).child(body)
+        div().id("detail").flex_1().overflow_y_scroll().flex().flex_col().gap_4().p_5().child(div().flex().items_center().gap_3().child(div().flex_1().child(facts)).child(toggle)).when_some(live_panel, |d, p| d.child(p)).child(trends).child(body)
     }
 }
 
 impl Render for TuneApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match self.selected.clone() {
-            Some(id) => self.detail(&id).into_any_element(),
+            Some(id) => self.detail(&id, cx).into_any_element(),
             None => self.overview(cx).into_any_element(),
         };
         div()
@@ -420,11 +508,30 @@ fn main() {
         }
     };
 
+    let live_store = Arc::new(Mutex::new(model::LiveStore::default()));
+    let live_dirty = Arc::new(AtomicBool::new(false));
+    let live = {
+        let (store, flag) = (live_store.clone(), live_dirty.clone());
+        let _g = rt.enter();
+        let live = Live::new(
+            Arc::new(ProcessRoute),
+            tune_core::monitor::live_opts(engine.config().nodes.len()),
+            Box::new(move |ev| {
+                store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).merge(&ev);
+                flag.store(true, Ordering::Release);
+            }),
+        );
+        rt.spawn(live.clone().run_ticker());
+        live
+    };
+    let handles = LiveHandles { live: live.clone(), store: live_store, dirty: live_dirty };
+    let rt_exit = rt.clone();
+
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1120.0), px(720.0)), cx);
         let window = cx
             .open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), titlebar: Some(gpui::TitlebarOptions { title: Some("Katala Tune".into()), appears_transparent: false, traffic_light_position: Some(point(px(12.0), px(12.0))) }), ..Default::default() }, move |_, cx| {
-                cx.new(|cx| TuneApp::new(engine, rt, dirty, cx))
+                cx.new(|cx| TuneApp::new(engine, rt, dirty, handles, cx))
             })
             .expect("window");
         cx.on_window_closed(|cx| {
@@ -436,12 +543,25 @@ fn main() {
         cx.activate(true);
         if selftest {
             let view = window.update(cx, |v, _, _| v.nodes.len()).unwrap_or(0);
+            // --live <id>: その機体のライブを流し、点が届くまで確かめる（E2E 用）
+            let live_id = arg("--live");
+            if let Some(id) = &live_id {
+                window.update(cx, |v, _, _| v.live_start(id)).ok();
+            }
             cx.spawn(async move |cx| {
-                cx.background_executor().timer(Duration::from_millis(1500)).await;
+                cx.background_executor().timer(Duration::from_millis(if live_id.is_some() { 8000 } else { 1500 })).await;
                 println!("selftest ok nodes={view}");
+                if let Some(id) = live_id {
+                    let n = window
+                        .update(cx, |v, _, _| v.live_store.lock().map_or(0, |s| s.0.get(&id).map_or(0, |l| l.cpu.len())))
+                        .unwrap_or(0);
+                    println!("selftest live points={n}");
+                }
                 cx.update(|cx| cx.quit()).ok();
             })
             .detach();
         }
     });
+    // 画面を閉じたら、流している調査の子プロセスを止めてから終わる
+    rt_exit.block_on(live.shutdown(Duration::from_secs(3)));
 }

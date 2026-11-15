@@ -11,3 +11,13 @@ out=$(./target/release/katala-tune --selftest --config config/nodes.example.json
 echo "$out"
 [ "$out" = "selftest ok nodes=$n" ] || { echo "E2E 失敗: 期待 nodes=$n" >&2; exit 1; }
 echo "e2e-gpui OK"
+
+# 任意: E2E_LIVE_NODE=<id> を付けると、その機体のライブ（1 秒ごとのサンプル）が 8 秒で数点届くことも確かめる。
+# 台帳は実機のものを読むだけで、データは一時領域。
+if [ -n "${E2E_LIVE_NODE:-}" ]; then
+  live=$(./target/release/katala-tune --selftest --live "$E2E_LIVE_NODE" --data "$tmp/live-data")
+  echo "$live"
+  pts=$(echo "$live" | sed -n 's/^selftest live points=//p')
+  [ "${pts:-0}" -ge 3 ] || { echo "E2E 失敗: ライブの点が $pts 点（3 点以上が必要）" >&2; exit 1; }
+  echo "e2e-gpui live OK"
+fi

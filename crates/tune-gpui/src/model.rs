@@ -147,6 +147,53 @@ pub fn uptime(h: f64) -> String {
     if h >= 48.0 { format!("{:.0} 日", h / 24.0) } else { format!("{h:.0} 時間") }
 }
 
+/// ライブ表示で貯める点（直近 3 分 = 1 秒ごとに 180 点）
+pub const LIVE_KEEP: usize = 180;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LiveNode {
+    /// connecting / live / stopped など（Engine の phase 名）
+    pub state: String,
+    pub detail: Option<String>,
+    pub cpu: Vec<f64>,
+    pub mem: Vec<f64>,
+    last_t: i64,
+}
+
+/// `Live` が送るイベント `{ nodes: { id: { state, detail, points: [{t, cpu, mem}] } } }` を貯める。
+/// 同じ時刻以前の点は捨て（開始時の全体と差分が重なる）、古い点は LIVE_KEEP を超えたら落とす。
+#[derive(Clone, Debug, Default)]
+pub struct LiveStore(pub std::collections::HashMap<String, LiveNode>);
+
+impl LiveStore {
+    pub fn merge(&mut self, ev: &Value) {
+        let Some(nodes) = ev.get("nodes").and_then(Value::as_object) else { return };
+        for (id, n) in nodes {
+            let s = self.0.entry(id.clone()).or_default();
+            if let Some(st) = n.get("state").and_then(Value::as_str) {
+                s.state = st.to_string();
+            }
+            if n.get("detail").is_some() {
+                s.detail = n.get("detail").and_then(Value::as_str).map(str::to_string);
+            }
+            for p in n.get("points").and_then(Value::as_array).into_iter().flatten() {
+                let t = p.get("t").and_then(Value::as_i64).unwrap_or(0);
+                if t <= s.last_t {
+                    continue;
+                }
+                s.last_t = t;
+                s.cpu.push(p.get("cpu").and_then(Value::as_f64).unwrap_or(0.0));
+                s.mem.push(p.get("mem").and_then(Value::as_f64).unwrap_or(0.0));
+            }
+            for v in [&mut s.cpu, &mut s.mem] {
+                if v.len() > LIVE_KEEP {
+                    v.drain(..v.len() - LIVE_KEEP);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +244,21 @@ mod tests {
     fn series_skips_rows_without_the_value() {
         let rows = vec![json!({"score": 80}), json!({"score": null}), json!({"cpu": 3}), json!({"score": 60.5})];
         assert_eq!(series(&rows, "score"), [80.0, 60.5]);
+    }
+
+    #[test]
+    fn live_store_dedups_overlap_and_caps() {
+        let mut s = LiveStore::default();
+        s.merge(&json!({"nodes": {"a": {"state": "live", "points": [{"t": 1, "cpu": 10, "mem": 50}, {"t": 2, "cpu": 20, "mem": 51}]}}}));
+        // 開始時の全体（t=1,2 を含む）が後から届いても重ならない
+        s.merge(&json!({"nodes": {"a": {"points": [{"t": 2, "cpu": 99}, {"t": 3, "cpu": 30, "mem": 52}]}}}));
+        let a = &s.0["a"];
+        assert_eq!(a.cpu, [10.0, 20.0, 30.0]);
+        assert_eq!(a.state, "live");
+        let pts: Vec<_> = (10..10 + 300).map(|t| json!({"t": t, "cpu": 1})).collect();
+        s.merge(&json!({"nodes": {"a": {"points": pts}}}));
+        assert_eq!(s.0["a"].cpu.len(), LIVE_KEEP);
+        s.merge(&json!({"bad": 1}));
     }
 
     #[test]
