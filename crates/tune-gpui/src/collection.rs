@@ -580,4 +580,22 @@ mod tests {
             assert_eq!(engine.with_db(|d| d.get_meta(marker)).unwrap(), None);
         }
     }
+    /// この機体だけを対象に、実際に受動の到達性確認を走らせる（手動: `cargo test -p tune-gpui -- --ignored network_runs`）。
+    /// 外部へは何も送らず、結果は真偽だけ。CI では走らせない（ネットワークの状態に依存するため）。
+    #[tokio::test]
+    #[ignore = "この機体の実ネットワークを読む。手動で走らせる"]
+    async fn network_runs_a_real_passive_check_on_this_machine() {
+        let host = String::from_utf8(std::process::Command::new("hostname").output().unwrap().stdout).unwrap().trim().to_owned();
+        let os = if cfg!(target_os = "macos") { "macos" } else { "windows" };
+        let f = Fixture(std::env::temp_dir().join(format!("tune-ui-net-{}-{}", std::process::id(), tune_core::db::now_ms())));
+        std::fs::create_dir_all(&f.0).unwrap();
+        let config = f.0.join("nodes.json");
+        std::fs::write(&config, json!({"nodes":[{"id":"this-machine","os":os,"local_hostname":host}]}).to_string()).unwrap();
+        let engine = Engine::open(config, f.0.join("data"), Arc::new(NoHost)).unwrap();
+        let r = run(engine, Kind::Network, None).await;
+        eprintln!("{}", r.copy_text());
+        assert_eq!((r.failed, r.skipped), (0, 0));
+        assert_eq!(r.complete + r.partial, 1);
+        assert!(!r.copy_text().contains(&host));
+    }
 }
