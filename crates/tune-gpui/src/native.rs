@@ -1439,8 +1439,24 @@ impl Render for TuneApp {
 }
 
 fn open_route(target: &str, ledger: &[nodes::Node]) -> Result<Route, String> {
-    let keys =
-        ["overview", "status", "resources", "processes", "jobs", "logs", "tools", "ai", "security", "specs", "power", "topology", "actions", "link", "review"];
+    let keys = [
+        "overview",
+        "status",
+        "resources",
+        "processes",
+        "jobs",
+        "logs",
+        "tools",
+        "ai",
+        "security",
+        "specs",
+        "power",
+        "topology",
+        "actions",
+        "network",
+        "link",
+        "review",
+    ];
     if let Some((_, page)) = keys.into_iter().zip(Page::ALL).find(|(key, page)| *key == target || page.label() == target) {
         return Ok(Route::Page(page));
     }
