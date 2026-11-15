@@ -119,7 +119,13 @@ fn namespace_child() {
         let expected = if case == "legacy-env" { stale.join("bin") } else { root.join("home/.katala-tune/bin") };
         assert_eq!(tune_core::helpers::bin_dir(), expected);
         let launch = local_windows_launch();
-        assert_eq!(PathBuf::from(launch.program), root.join("owned-app").join(tune_core::helpers::exe("tune-agent")), "legacy sibling priority");
+        // Windows current_exe may use a disk path while the fixture is verbatim.
+        // Compare the selected existing file, preserving legacy sibling priority.
+        assert_eq!(
+            PathBuf::from(launch.program).canonicalize().unwrap(),
+            root.join("owned-app").join(tune_core::helpers::exe("tune-agent")).canonicalize().unwrap(),
+            "legacy sibling priority"
+        );
         return;
     }
     let expected = match case.as_str() {
