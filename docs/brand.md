@@ -49,7 +49,7 @@ GPUI の実画面で、埋め込んだPNGの色・サイズ・余白を確認し
 
 ## CI修正とインストールへの反映
 
-PR #134の初回CIではJavaScriptが3 OSで成功し、Rustは上記の列挙型のサイズ警告で失敗した。`Hello` を `Box` に置き、イベントのサイズを64バイト以下に保つ回帰テストを追加した。LinuxにはGPUI用の `libxkbcommon-x11-dev` を追加し、GPUIの古いxattr依存と互換性のあるlibc版を固定した。詳しい依存条件は `gpui-preview.md` に記載する。
+PR #134の初回CIではJavaScriptが3 OSで成功し、Rustは上記の列挙型のサイズ警告で失敗した。`Hello` を `Box` に置き、イベントのサイズを64バイト以下に保つ回帰テストを追加した。当初はLinux用ライブラリとlibcの互換版固定で検証した。最終的には先行するmainの変更に合わせ、GPUI依存をmacOS / Windowsに限定し、Linuxのcore / CLI検証を継続する構成へ統合した。libcの固定は解除している。詳しい依存条件は `gpui-preview.md` に記載する。
 
 GPUIの追加済みのライブ・ログ・構成図・状態画面を保持し、起動引数の検証、対象外の機体の表示、プレビュー用DBの分離を統合した。`--open` と自己検証の `--live` / `--logs` も起動引数テストで検査する。配布物は既存のGPUI Previewと同じ識別子を使い、ビルド元のコミットをInfo.plistへ記録する。
 
