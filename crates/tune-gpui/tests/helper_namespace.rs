@@ -100,7 +100,15 @@ fn namespace_child() {
     }
     if case == "invalid" {
         assert!(tune_core::helpers::bind_process_data_dir(std::path::Path::new("relative-data")).is_err());
-        assert!(tune_core::helpers::bind_process_data_dir(&root.join("parent/../other-data")).is_err());
+        // PathBuf::join removes .. for verbatim Windows paths; append OS text
+        // so this direct binding fixture actually supplies unresolved input.
+        let mut unresolved = root.as_os_str().to_os_string();
+        let separator = std::path::MAIN_SEPARATOR;
+        unresolved.push(format!("{separator}parent{separator}..{separator}other-data"));
+        let unresolved = PathBuf::from(unresolved);
+        assert!(unresolved.is_absolute());
+        assert!(unresolved.components().any(|part| matches!(part, std::path::Component::ParentDir)));
+        assert!(tune_core::helpers::bind_process_data_dir(&unresolved).is_err());
         assert!(startup::parse(["--hidden".into()]).is_err());
         assert!(startup::parse(["--selftest".into()]).is_err());
         assert!(startup::parse(["--help".into()]).unwrap().is_none());
