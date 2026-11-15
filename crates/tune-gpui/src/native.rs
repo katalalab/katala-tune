@@ -2175,6 +2175,7 @@ struct Session {
     initial: Option<Route>,
     review: Option<std::path::PathBuf>,
     admission: Option<(Arc<LiveControl>, gate::Gate)>,
+    keeper: Option<gpui::WindowId>,
 }
 struct NativeWindows<'a> {
     cx: &'a mut App,
@@ -2227,7 +2228,41 @@ impl crate::resident::Backend<gpui::WindowHandle<TuneApp>> for NativeWindows<'_>
         Ok(handle)
     }
 }
+// This boundary is compiled on both desktop targets; only Windows residents
+// request an internal window. No application state is captured by its view.
+fn keeper_options(resident: bool, windows: bool) -> Option<WindowOptions> {
+    (resident && windows).then(|| WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds { origin: point(px(0.), px(0.)), size: size(px(1.), px(1.)) })),
+        titlebar: None,
+        show: false,
+        focus: false,
+        // GPUI Windows maps PopUp to WS_EX_TOOLWINDOW, excluding the taskbar.
+        kind: gpui::WindowKind::PopUp,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        ..Default::default()
+    })
+}
+
 impl Session {
+    fn windows_changed(&mut self, remaining: &[gpui::WindowId]) -> bool {
+        if self.windows.exiting {
+            return false;
+        }
+        if self.keeper.is_some_and(|id| !remaining.contains(&id)) {
+            // Losing the owned keeper makes the next native close unsafe. Drain
+            // through the normal quit observer rather than strand a resident.
+            self.close_ui();
+            return true;
+        }
+        if self.windows.current.is_some_and(|window| !remaining.contains(&window.window_id())) {
+            self.revoke_current_ui();
+            self.windows.current = None;
+        }
+        // Ignore exactly our internal window. Unknown/user windows still count.
+        remaining.iter().all(|id| Some(*id) == self.keeper) && self.window_closed()
+    }
     fn open(&mut self, target: Option<&str>, cx: &mut App) -> Result<gpui::WindowHandle<TuneApp>, String> {
         let requested = target.map(|v| open_route(v, &self.engine.config().nodes)).transpose()?;
         let mut backend = NativeWindows {
@@ -2378,6 +2413,7 @@ pub fn run(options: startup::Options) {
         initial: initial_route,
         review: review_path.clone(),
         admission: None,
+        keeper: None,
     }));
     let application = Application::new();
     let reopen = session.clone();
@@ -2421,6 +2457,13 @@ pub fn run(options: startup::Options) {
         } else {
             None
         };
+        // GPUI Windows unconditionally quits after the last raw native window
+        // closes. EmptyView owns no UI controls/Reader/Engine or producers. Keep
+        // this window until App::shutdown has run the synchronous drain observer.
+        if let Some(options) = keeper_options(resident, cfg!(target_os = "windows")) {
+            let keeper = cx.open_window(options, |_, cx| cx.new(|_| gpui::EmptyView)).expect("resident keeper");
+            session.borrow_mut().keeper = Some(keeper.window_id());
+        }
         let window = if hidden { None } else { Some(session.borrow_mut().open(None, cx).expect("window")) };
         let host = quit_host.clone();
         let quitting = session.clone();
@@ -2436,14 +2479,16 @@ pub fn run(options: startup::Options) {
         cx.on_action(|_: &Quit, cx| cx.quit());
         let closing = session.clone();
         cx.on_window_closed(move |cx| {
-            if cx.windows().is_empty() && closing.borrow_mut().window_closed() {
+            let remaining: Vec<_> = cx.windows().iter().map(|window| window.window_id()).collect();
+            let quit = closing.borrow_mut().windows_changed(&remaining);
+            if quit {
                 quit_host.request_exit();
                 cx.quit();
             }
         })
         .detach();
         let events = session.clone();
-        // This app-owned task and instance guard survive zero windows. Polls
+        // This app-owned task and instance guard survive zero user windows. Polls
         // bounded event queues + memory only; no DB or OS status polling.
         cx.spawn(async move |cx| {
             let _instance_lifetime = instance;
