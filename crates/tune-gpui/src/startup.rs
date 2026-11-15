@@ -41,7 +41,8 @@ pub(super) fn resolved(path: &Path) -> Result<PathBuf, String> {
             std::path::Component::CurDir => {}
             part => result.push(part.as_os_str()),
         }
-        if result.exists() {
+        // Missing tails are valid; other filesystem errors must fail closed.
+        if result.try_exists().map_err(|e| e.to_string())? {
             result = result.canonicalize().map_err(|e| e.to_string())?;
         }
     }

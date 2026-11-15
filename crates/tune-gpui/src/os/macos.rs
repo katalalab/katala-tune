@@ -70,15 +70,15 @@ impl LoginPaths {
             return Ok(());
         }
         let home = account_home().filter(|path| path.is_absolute()).ok_or_else(|| Effect::Unsupported("OS アカウントの既定ホームを確認できません".into()))?;
-        if self.home == home
-            && !self.inherited_paths
-            && self.config == home.join(".config/katala-tune/nodes.json")
-            && self.data == home.join("Library/Application Support").join(tune_core::nodes::PRODUCT_NAME).join("data/gpui-preview")
-        {
-            Ok(())
-        } else {
-            Err(Effect::Unsupported("起動時の台帳・データパスを OS のログイン環境で再現できません".into()))
+        let unsupported = || Effect::Unsupported("起動時の台帳・データパスを OS のログイン環境で再現できません".into());
+        if self.home != home || self.inherited_paths {
+            return Err(unsupported());
         }
+        // Compare the same resolved defaults that a standard relaunch uses.
+        let config = crate::startup::resolved(&home.join(".config/katala-tune/nodes.json")).map_err(|_| unsupported())?;
+        let data = crate::startup::resolved(&home.join("Library/Application Support").join(tune_core::nodes::PRODUCT_NAME).join("data/gpui-preview"))
+            .map_err(|_| unsupported())?;
+        if self.config == config && self.data == data { Ok(()) } else { Err(unsupported()) }
     }
 }
 // Resolve the UID's account record independently of HOME/dirs. Called only
@@ -300,13 +300,104 @@ impl Service for Mac {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn launch(home: &str) -> LoginPaths {
-        let home = PathBuf::from(home);
+    fn launch(home: impl AsRef<Path>) -> LoginPaths {
+        let home = home.as_ref().to_path_buf();
         LoginPaths {
             config: home.join(".config/katala-tune/nodes.json"),
             data: home.join("Library/Application Support/Katala Tune/data/gpui-preview"),
             home,
             inherited_paths: false,
+        }
+    }
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new(case: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("kt-login-paths-{case}-{}-{}", std::process::id(), tune_core::db::now_ms()));
+            std::fs::create_dir(&root).unwrap();
+            let fixture = Self(root.canonicalize().unwrap());
+            std::fs::create_dir(fixture.0.join("home")).unwrap();
+            fixture
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn login_reproducibility_resolves_owned_default_symlinks_and_missing_tails() {
+        use std::os::unix::fs::symlink;
+        for case in ["config-directory", "config-file", "data-ancestor", "missing-tails"] {
+            let fixture = Fixture::new(case);
+            let home = fixture.0.join("home");
+            match case {
+                "config-directory" => {
+                    std::fs::create_dir_all(fixture.0.join("storage/katala-tune")).unwrap();
+                    std::fs::write(fixture.0.join("storage/katala-tune/nodes.json"), b"{}").unwrap();
+                    symlink(fixture.0.join("storage"), home.join(".config")).unwrap();
+                }
+                "config-file" => {
+                    std::fs::create_dir_all(home.join(".config/katala-tune")).unwrap();
+                    std::fs::write(fixture.0.join("ledger.json"), b"{}").unwrap();
+                    symlink(fixture.0.join("ledger.json"), home.join(".config/katala-tune/nodes.json")).unwrap();
+                }
+                "data-ancestor" => {
+                    std::fs::create_dir(home.join("Library")).unwrap();
+                    std::fs::create_dir(fixture.0.join("storage")).unwrap();
+                    symlink(fixture.0.join("storage"), home.join("Library/Application Support")).unwrap();
+                }
+                _ => {}
+            }
+            let mut paths = launch(&home);
+            // The same production resolver that startup uses; no helper binding,
+            // account lookup, bundle query or ServiceManagement call is needed.
+            paths.config = crate::startup::resolved(&paths.config).unwrap();
+            paths.data = crate::startup::resolved(&paths.data).unwrap();
+            assert!(paths.check(true, || Some(home.clone())).is_ok(), "resolved standard paths must remain reproducible: {case}");
+            if case == "missing-tails" {
+                assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0, "checking must not create missing defaults");
+            }
+            eprintln!("login default paths case={case}: passed");
+        }
+    }
+    #[test]
+    fn login_reproducibility_refuses_unresolvable_owned_defaults() {
+        use std::os::unix::fs::symlink;
+        for case in ["config-loop", "data-loop"] {
+            let fixture = Fixture::new(case);
+            let home = fixture.0.join("home");
+            let paths = launch(&home);
+            let default = if case == "config-loop" {
+                symlink(home.join(".config"), home.join(".config")).unwrap();
+                &paths.config
+            } else {
+                std::fs::create_dir(home.join("Library")).unwrap();
+                symlink(home.join("Library/Application Support"), home.join("Library/Application Support")).unwrap();
+                &paths.data
+            };
+            assert!(matches!(paths.check(true, || Some(home.clone())), Err(Effect::Unsupported(_))), "unresolvable default must not authorize login: {case}");
+            assert!(crate::startup::resolved(default).is_err(), "the shared resolver must propagate the filesystem error: {case}");
+            assert!(paths.check(false, || panic!("disable must not query account or resolve defaults")).is_ok());
+            eprintln!("login default paths case={case}: refused");
+        }
+    }
+    #[test]
+    fn login_reproducibility_keeps_raw_home_environment_and_explicit_path_guards() {
+        let fixture = Fixture::new("guards");
+        let home = fixture.0.join("home");
+        let alias = fixture.0.join("home-alias");
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        assert_eq!(crate::startup::resolved(&alias).unwrap(), home);
+        for field in ["home-alias", "environment", "config", "data"] {
+            let mut paths = launch(&home);
+            match field {
+                "home-alias" => paths.home = alias.clone(),
+                "environment" => paths.inherited_paths = true,
+                "config" => paths.config = fixture.0.join("other/nodes.json"),
+                _ => paths.data = fixture.0.join("other/data"),
+            }
+            assert!(matches!(paths.check(true, || Some(home.clone())), Err(Effect::Unsupported(_))), "guard must remain closed: {field}");
+            assert!(paths.check(false, || panic!("disable must not query account or resolve defaults")).is_ok());
         }
     }
     #[test]
