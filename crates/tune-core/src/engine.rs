@@ -842,6 +842,7 @@ mod tests {
         std::fs::write(&config, r#"{"nodes":[]}"#).unwrap();
         engine.with_db(|d| d.conn().execute_batch("DROP TABLE meta")).unwrap();
         assert!(engine.checked_schedule().is_err());
+        drop(engine);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -870,6 +871,7 @@ mod tests {
         engine.with_db(|d| d.set_meta("hubPull", &json!({"ok":true,"snapshot_fresh":false,"at":now_ms()}))).unwrap();
         engine.checked_tick().await.unwrap();
         assert!(engine.with_db(|d| d.get_meta("lastProbeAt")).unwrap().is_some());
+        drop(engine);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

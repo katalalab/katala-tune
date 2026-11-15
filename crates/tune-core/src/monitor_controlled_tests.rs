@@ -61,6 +61,7 @@ async fn controlled_paused_never_collects_with_enabled_settings() {
     worker.await.unwrap();
     live.shutdown(Duration::from_secs(1)).await;
     assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+    drop((live, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
 #[tokio::test]
@@ -103,6 +104,7 @@ async fn controlled_pause_resume_and_invalid_ledger_release_only_monitor() {
     live.release_owned(Owner::Ui, &live.active(), Stop::User);
     live.shutdown(Duration::from_secs(1)).await;
     assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+    drop((live, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -166,6 +168,7 @@ async fn controlled_fresh_hub_does_not_start_local_then_stale_and_db_error_trans
     worker.await.unwrap();
     live.shutdown(Duration::from_secs(1)).await;
     engine.finish_monitor_journal(Duration::from_secs(1)).await;
+    drop((live, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
 #[tokio::test]
@@ -206,6 +209,7 @@ async fn controlled_paused_pull_coalesces_pending_requests_without_collection() 
     worker.await.unwrap();
     live.shutdown(Duration::from_secs(1)).await;
     engine.finish_monitor_journal(Duration::from_secs(1)).await;
+    drop((live, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -235,6 +239,7 @@ async fn controlled_exit_waits_for_current_transport_without_starting_collection
     assert!(live.active().is_empty());
     live.shutdown(Duration::from_secs(1)).await;
     engine.finish_monitor_journal(Duration::from_secs(1)).await;
+    drop((live, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
 struct FailedHub;
@@ -275,6 +280,7 @@ async fn controlled_failed_pull_notifies_saved_result_without_collecting() {
     worker.await.unwrap();
     live.shutdown(Duration::from_secs(1)).await;
     engine.finish_monitor_journal(Duration::from_secs(1)).await;
+    drop((live, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -299,6 +305,7 @@ async fn controlled_paused_checks_full_ledger_removal_without_acquiring_monitor(
     worker.await.unwrap();
     live.shutdown(Duration::from_secs(1)).await;
     engine.finish_monitor_journal(Duration::from_secs(1)).await;
+    drop((live, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -325,6 +332,7 @@ async fn controlled_disabled_hub_pull_keeps_page_bound_and_cursor() {
     worker.await.unwrap();
     live.shutdown(Duration::from_secs(1)).await;
     engine.finish_monitor_journal(Duration::from_secs(1)).await;
+    drop((live, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -355,6 +363,7 @@ async fn controlled_hub_change_wakes_pull_and_uses_new_hub_freshness() {
     worker.await.unwrap();
     live.shutdown(Duration::from_secs(1)).await;
     engine.finish_monitor_journal(Duration::from_secs(1)).await;
+    drop((live, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -414,6 +423,7 @@ async fn controlled_releases_monitor_before_new_noncollecting_pull_preserving_ui
         worker.await.unwrap();
         live.shutdown(Duration::from_secs(1)).await;
         assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+        drop((live, engine));
         std::fs::remove_dir_all(dir).unwrap();
         assert!(!monitor_a && !monitor_b, "paused={paused}: release Monitor ownership before entering the new blocked hub pull");
         assert!(ui, "paused={paused}: releasing Monitor must preserve the UI claim");
@@ -504,6 +514,7 @@ async fn controlled_worker_input_failure_requires_explicit_restart_after_repair(
         worker.await.unwrap();
         live.shutdown(Duration::from_secs(1)).await;
         assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+        drop((live, engine));
         std::fs::remove_dir_all(dir).unwrap();
         assert!(!resumed && extra_pulls == 0 && !pull_collected, "{failure}: repair/save/time/pull cannot grant Run permission");
         assert!(ui_continues, "{failure}: Monitor failure must preserve UI sampling");
@@ -552,6 +563,7 @@ async fn controlled_old_pull_failure_cannot_revoke_new_start_or_exit() {
         worker.await.unwrap();
         live.shutdown(Duration::from_secs(1)).await;
         assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+        drop((live, engine));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -570,6 +582,7 @@ async fn controlled_unset_settings_are_valid_and_legacy_malformed_defaults_stay_
         assert_eq!(legacy.hub, None);
     }
     live.shutdown(Duration::from_secs(1)).await;
+    drop((live, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -592,6 +605,7 @@ async fn controlled_valid_ledger_removal_wins_over_malformed_settings() {
     worker.await.unwrap();
     live.shutdown(Duration::from_secs(1)).await;
     assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+    drop((live, engine));
     std::fs::remove_dir_all(dir).unwrap();
     assert!(active.is_empty() && !ui, "valid full-ledger removal must revoke even Ui ownership before rejecting malformed settings");
 }
