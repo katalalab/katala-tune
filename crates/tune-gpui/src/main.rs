@@ -53,6 +53,18 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // Argument/help handling is portable; filesystem preparation is desktop-only.
+    if !cfg!(any(target_os = "macos", target_os = "windows")) {
+        eprintln!("GPUI preview currently supports macOS and Windows; use tune for the CLI");
+        std::process::exit(2);
+    }
+    let options = match startup::prepare(options) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     native::run(options);
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -70,7 +82,5 @@ fn main() {
             options.review,
             options.shutdown_check,
         ));
-        eprintln!("GPUI preview currently supports macOS and Windows; use tune for the CLI");
-        std::process::exit(2);
     }
 }
