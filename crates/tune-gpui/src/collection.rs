@@ -105,6 +105,8 @@ impl Receipt {
             badge: badge.into(),
             tone,
             detail: bounded(&format!("{reason}\n{}", serde_json::to_string_pretty(value).unwrap_or_default()), MAX_DETAIL),
+            // 収集の結果の行は元に戻せない（元に戻せるのは実行記録の行だけ）
+            undo: None,
         });
     }
     pub fn summary(&self) -> String {
