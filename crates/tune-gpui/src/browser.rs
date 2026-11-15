@@ -2,7 +2,7 @@
 //! requests; a slow query cannot create an unbounded queue of database readers.
 use crate::{
     model::{self, NodeView},
-    panels::{self, Page, Panel},
+    panels::{self, LogLevel, Page, Panel},
 };
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
@@ -18,6 +18,7 @@ pub struct Request {
     pub generation: u64,
     pub route: Route,
     pub query: String,
+    pub log_level: LogLevel,
 }
 pub struct Response {
     pub generation: u64,
@@ -58,7 +59,7 @@ impl Reader {
                         Ok(nodes)
                     });
                     let panel = match request.route {
-                        Route::Page(page) if page != Page::Overview => Some(panels::load(&engine, page, &request.query)),
+                        Route::Page(page) if page != Page::Overview => Some(panels::load(&engine, page, &request.query, request.log_level)),
                         _ => None,
                     };
                     Response { generation, nodes, panel, config_error: engine.config_error() }

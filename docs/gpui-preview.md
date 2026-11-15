@@ -26,3 +26,7 @@ cargo run -p tune-gpui --release --locked -- --config /path/to/ledger.json --dat
 プレビューのGUI対象は既存アプリと同じmacOSとWindows。Linuxではcore・CLIを検証し、GPUIとそのプラットフォーム依存をビルドへ入れない。Linuxでこのバイナリを起動すると、台帳・DBを開かずに未対応として終了する。
 
 容量は実行ファイル単体とapp bundleを分けて測る。WebViewを使わなくても、機能範囲・画面・台帳・DBが違う状態のRSSを一律の軽量化率として比較しない。
+
+機体詳細のLiveと、システム全体を表すKマークは既存mainから保持する。Liveは明示的な開始操作でのみ動き、別画面への移動・ウィンドウの非アクティブ化・終了で停止する。GPUIの公開APIで非表示を確実に区別できないため、別アプリへの切り替えでも停止し、復帰時は利用者が再開する。停止・接続失敗の再試行上限に達した後はheartbeatで再開しない。CPUやメモリの欠測を0として表示しない。
+
+`--open logs|status|topology|<node-id>`で初期画面を指定できる。`--selftest --live <node-id>`は保存画面の検証後に指定機体の実収集を別段階で行い、8秒で3点以上のCPU観測を要求する。明示的な実機用台帳を指定して使う。`--selftest --logs`は保存ログの読み出し件数も出力する。`scripts/e2e-gpui.sh`の任意の`E2E_LIVE_NODE` / `E2E_LOGS`経路でも実行できる。通常の保存画面smokeは実収集をしない。

@@ -2,7 +2,7 @@
 
 The full migration must retain all sixteen existing views, node tabs, live stream ownership, guarded actions, settings, host integration and the updater. Deployment and actual GUI E2E on both desktop targets remain release gates. A saved-data browser alone does not complete that migration.
 
-This increment adds functional native browsers for status, resources, processes, scheduled jobs, logs, inventory, AI usage and sessions, security, specifications, power, topology and action history. Overview and node findings/history remain available. Network diagnostics, pairing, the monitor dashboard, live streams, settings and guarded mutations follow in later increments; they must not be presented as working controls before their host contracts are connected.
+This increment adds functional native browsers for status, resources, processes, scheduled jobs, logs, inventory, AI usage and sessions, security, specifications, power, topology and action history. Overview and node findings/history remain available. Network diagnostics, pairing, the monitor dashboard, resource live streams, settings and guarded mutations follow in later increments; they must not be presented as working controls before their host contracts are connected.
 
 ## Global constraints
 
@@ -22,3 +22,7 @@ This increment adds functional native browsers for status, resources, processes,
 4. Review the complete diff, run repository checks and supported-platform builds, then publish the reviewed preview increment through a PR and CI artifacts. Record actual platform verification and remaining gaps.
 
 The full goal also requires the remaining host features, complete GUI E2E, rollout to every configured machine and measurement of release size, memory and responsiveness. Unreachable machines stay deferred until the user restores connectivity; no polling is needed while that work is deferred.
+
+## Concurrent main integration
+
+While this increment was under verification, main gained the K-mark branding, packaging script, and node Live/log/status/topology views. Preserve branding, packaging, initial-route flags, optional diagnostics, node Live and log level selection. The new async panels replace the earlier synchronous saved-data renderers. Node Live must stop on navigation/deactivation/release, respect current ledger failures and terminal retry state, and retain missing values. Revalidate the combined tree; earlier results apply only to the pre-merge revision.

@@ -159,6 +159,61 @@ pub fn uptime(h: f64) -> String {
     if h >= 48.0 { format!("{:.0} 日", h / 24.0) } else { format!("{h:.0} 時間") }
 }
 
+/// ライブ表示で貯める点（直近 3 分 = 1 秒ごとに 180 点）
+pub const LIVE_KEEP: usize = 180;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LiveNode {
+    /// connecting / live / stopped など（Engine の phase 名）
+    pub state: String,
+    pub detail: Option<String>,
+    pub cpu: Vec<f64>,
+    pub mem: Vec<f64>,
+    pub latest_cpu: Option<f64>,
+    pub latest_mem: Option<f64>,
+    last_t: Option<i64>,
+}
+
+/// `Live` が送るイベント `{ nodes: { id: { state, detail, points: [{t, cpu, mem}] } } }` を貯める。
+/// 同じ時刻以前の点は捨て（開始時の全体と差分が重なる）、古い点は LIVE_KEEP を超えたら落とす。
+#[derive(Clone, Debug, Default)]
+pub struct LiveStore(pub std::collections::HashMap<String, LiveNode>);
+
+impl LiveStore {
+    pub fn merge(&mut self, ev: &Value) {
+        let Some(nodes) = ev.get("nodes").and_then(Value::as_object) else { return };
+        for (id, n) in nodes {
+            let s = self.0.entry(id.clone()).or_default();
+            if let Some(st) = n.get("state").and_then(Value::as_str) {
+                s.state = st.to_string();
+            }
+            if n.get("detail").is_some() {
+                s.detail = n.get("detail").and_then(Value::as_str).map(str::to_string);
+            }
+            for p in n.get("points").and_then(Value::as_array).into_iter().flatten() {
+                let Some(t) = p.get("t").and_then(Value::as_i64) else { continue };
+                if s.last_t.is_some_and(|last| t <= last) {
+                    continue;
+                }
+                s.last_t = Some(t);
+                s.latest_cpu = p.get("cpu").and_then(Value::as_f64);
+                s.latest_mem = p.get("mem").and_then(Value::as_f64);
+                if let Some(cpu) = s.latest_cpu {
+                    s.cpu.push(cpu);
+                }
+                if let Some(mem) = s.latest_mem {
+                    s.mem.push(mem);
+                }
+            }
+            for v in [&mut s.cpu, &mut s.mem] {
+                if v.len() > LIVE_KEEP {
+                    v.drain(..v.len() - LIVE_KEEP);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +226,30 @@ mod tests {
         let rows = build(&nodes, &last);
         assert_eq!(rows[0].count(Severity::Critical), 0);
         assert!(!matches!(rows[0].health, Health::Scored(_) | Health::Unobserved));
+    }
+
+    #[test]
+    fn live_missing_metrics_stay_unknown_and_do_not_add_zero_samples() {
+        let mut store = LiveStore::default();
+        store.merge(&json!({"nodes":{"a":{"points":[{"t":1,"cpu":12,"mem":30},{"t":2,"mem":40}]}}}));
+        let a = &store.0["a"];
+        assert_eq!(a.cpu, [12.0]);
+        assert_eq!(a.mem, [30.0, 40.0]);
+        assert_eq!(a.latest_cpu, None);
+        assert_eq!(a.latest_mem, Some(40.0));
+    }
+
+    #[test]
+    fn live_store_ignores_overlap_and_caps_each_available_metric() {
+        let mut store = LiveStore::default();
+        store.merge(&json!({"nodes":{"a":{"state":"live","points":[{"t":1,"cpu":12}]}}}));
+        store.merge(&json!({"nodes":{"a":{"points":[{"t":1,"cpu":99},{"t":2,"cpu":0}]}}}));
+        assert_eq!(store.0["a"].cpu, [12.0, 0.0]);
+        let points: Vec<_> = (3..303).map(|t| json!({"t":t,"cpu":1})).collect();
+        store.merge(&json!({"nodes":{"a":{"points":points}}}));
+        assert_eq!(store.0["a"].cpu.len(), LIVE_KEEP);
+        assert!(store.0["a"].mem.is_empty());
+        assert_eq!(store.0["a"].state, "live");
     }
 
     fn ledger() -> Vec<Value> {

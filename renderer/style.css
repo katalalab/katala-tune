@@ -112,8 +112,8 @@ code { font: 12.5px var(--mono); background: var(--code-inline); color: var(--co
 .side-top { padding: 10px 10px 4px; flex: none; }
 .platform-darwin .side-top { padding-top: 44px; }
 .ws { display: flex; align-items: center; gap: 9px; height: 34px; padding: 0 8px; font-weight: 600; font-size: 14px; }
-.ws-mark { width: 22px; height: 22px; border-radius: 5px; display: grid; place-items: center; background: var(--text); color: var(--bg); flex: none; }
-.ws-mark .i { width: 15px; height: 15px; stroke-width: 2; }
+.ws-mark { width: 22px; height: 22px; border-radius: 5px; display: grid; place-items: center; background: #182230; flex: none; }
+.ws-mark img { display: block; }
 .side-nav, .side-nodes, .side-foot { -webkit-app-region: no-drag; padding: 0 8px; }
 /* 短い窓ではナビを先にスクロールさせ、機体の一覧を少なくとも3行は残す */
 .side-nav { display: grid; gap: 1px; margin-top: 6px; flex: 0 1 auto; min-height: 92px; overflow: auto; align-content: start; }

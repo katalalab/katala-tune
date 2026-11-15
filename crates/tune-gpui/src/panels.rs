@@ -2,6 +2,26 @@
 use serde_json::{Value, json};
 use tune_core::{db::TopologyUiRequest, engine::Engine};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogLevel {
+    #[default]
+    All,
+    Error,
+    Warn,
+    Info,
+}
+impl LogLevel {
+    pub const ALL: [Self; 4] = [Self::All, Self::Error, Self::Warn, Self::Info];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "すべて",
+            Self::Error => "エラー",
+            Self::Warn => "警告",
+            Self::Info => "情報",
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Page {
     Overview,
@@ -253,7 +273,7 @@ fn money(v: &Value) -> String {
     v.as_f64().map_or_else(|| "単価不明（算出不可）".into(), |n| format!("${n:.4}（既知単価分の推定）"))
 }
 
-pub fn load(engine: &Engine, page: Page, query: &str) -> Result<Panel, String> {
+pub fn load(engine: &Engine, page: Page, query: &str, log_level: LogLevel) -> Result<Panel, String> {
     // Validate before every accessor, including pages without backend search.
     if query.len() > 256 || query.chars().any(char::is_control) {
         return Err("検索は制御文字を含まない256バイト以内で指定してください".into());
@@ -307,6 +327,14 @@ pub fn load(engine: &Engine, page: Page, query: &str) -> Result<Panel, String> {
         Page::Resources | Page::Processes | Page::Jobs => snapshots(engine, page, &mut p)?,
         Page::Logs => {
             let mut filter = json!({"limit":2000,"offset":0});
+            if let Some(level) = match log_level {
+                LogLevel::All => None,
+                LogLevel::Error => Some("error"),
+                LogLevel::Warn => Some("warn"),
+                LogLevel::Info => Some("info"),
+            } {
+                filter["level"] = json!(level);
+            }
             if !query.is_empty() {
                 filter["q"] = json!(query);
             }
@@ -371,7 +399,7 @@ pub fn load(engine: &Engine, page: Page, query: &str) -> Result<Panel, String> {
                     if error.is_some() { Tone::Error } else { Tone::Muted },
                 );
             }
-            p.note.push_str(" ログは最新の生行最大2000件を取得した後で現行のプライバシー設定を適用する有界窓です。表示件数は全履歴の総数・末尾を意味しません。検索はFTS5式。署名は検索なしのときだけ別集計で最大50件。収集状態は検索とは別の全許可対象です。");
+            p.note.push_str(" ログは検索・レベルを適用した最新の生行最大2000件を取得した後で現行のプライバシー設定を適用する有界窓です。表示件数は全履歴の総数・末尾を意味しません。検索はFTS5式。署名は検索なしのときだけログのレベルとは別集計で最大50件。収集状態は検索・レベルとは別の全許可対象です。");
         }
         Page::Tools => inventory(&engine.inventory_view(false)?, &mut p),
         Page::Ai => {
@@ -1080,11 +1108,29 @@ mod tests {
     }
 
     #[test]
+    fn log_level_filters_in_sql_before_the_raw_row_budget_and_combines_with_search() {
+        let f = Fixture::new(json!([{"id":"example-node","os":"windows","alias":"unused"}]));
+        let now = tune_core::db::now_ms();
+        f.engine
+            .with_db(|d| {
+                let mut logs = (0..2000).map(|i| json!({"uid":format!("error-{i}"),"ts":now+i,"level":"error","message":"error needle"})).collect::<Vec<_>>();
+                logs.push(json!({"uid":"older-warning","ts":now-1,"level":"warn","message":"WARN_SENTINEL needle"}));
+                d.insert_logs("example-node", "win_system", &tune_core::logs::normalize("win_system", &logs), now)?;
+                Ok(())
+            })
+            .unwrap();
+        let panel = load(&f.engine, Page::Logs, "needle", LogLevel::Warn).unwrap();
+        let records: Vec<_> = panel.rows.iter().filter(|r| r.title.starts_with("ログ ·")).collect();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].detail.contains("WARN_SENTINEL"));
+    }
+
+    #[test]
     fn every_saved_page_loads_empty_without_recompute_or_collection() {
         let f = Fixture::new(json!([]));
         let before = f.engine.with_db(|d| Ok((d.checks()?, d.check_events(150)?, d.cursors()?))).unwrap();
         for page in Page::ALL.into_iter().filter(|p| *p != Page::Overview) {
-            let p = load(&f.engine, page, "").unwrap_or_else(|e| panic!("{page:?}: {e}"));
+            let p = load(&f.engine, page, "", LogLevel::All).unwrap_or_else(|e| panic!("{page:?}: {e}"));
             assert!(!p.note.is_empty(), "{page:?}");
         }
         let after = f.engine.with_db(|d| Ok((d.checks()?, d.check_events(150)?, d.cursors()?))).unwrap();
@@ -1093,10 +1139,10 @@ mod tests {
     #[test]
     fn nullable_power_and_ai_prices_never_become_zero() {
         let f = Fixture::new(json!([{"id":"example-node","os":"macos","alias":"unused"}]));
-        let power = load(&f.engine, Page::Power, "").unwrap();
+        let power = load(&f.engine, Page::Power, "", LogLevel::All).unwrap();
         assert!(text(&power).contains("未取得"));
         assert!(!text(&power).contains("0 W"));
-        let ai = load(&f.engine, Page::Ai, "").unwrap();
+        let ai = load(&f.engine, Page::Ai, "", LogLevel::All).unwrap();
         assert!(text(&ai).contains("単価不明"));
         assert!(!text(&ai).contains("$0"));
     }
@@ -1126,15 +1172,15 @@ mod tests {
             })
             .unwrap();
         for page in [Page::Logs, Page::Status, Page::Security] {
-            assert!(!text(&load(&f.engine, page, "").unwrap()).contains("PRIVATE_SENTINEL"));
+            assert!(!text(&load(&f.engine, page, "", LogLevel::All).unwrap()).contains("PRIVATE_SENTINEL"));
         }
     }
     #[test]
     fn invalid_queries_are_rejected_before_reading_any_page() {
         let f = Fixture::new(json!([]));
         for page in Page::ALL {
-            assert!(load(&f.engine, page, "bad\nquery").unwrap_err().contains("検索"));
-            assert!(load(&f.engine, page, &"あ".repeat(86)).unwrap_err().contains("検索"));
+            assert!(load(&f.engine, page, "bad\nquery", LogLevel::All).unwrap_err().contains("検索"));
+            assert!(load(&f.engine, page, &"あ".repeat(86), LogLevel::All).unwrap_err().contains("検索"));
         }
     }
     #[test]
@@ -1143,10 +1189,10 @@ mod tests {
         f.engine
             .with_db(|d| d.add_action(&json!({"id":"example-action","at":1,"node_id":"example-node","type":"example","label":"pending action","ok":null})))
             .unwrap();
-        let actions = load(&f.engine, Page::Actions, "").unwrap();
+        let actions = load(&f.engine, Page::Actions, "", LogLevel::All).unwrap();
         assert_eq!(actions.rows[0].badge, "未完了");
         assert_eq!(actions.rows[0].tone, Tone::Warning);
-        assert!(load(&f.engine, Page::Logs, "\"").is_err());
+        assert!(load(&f.engine, Page::Logs, "\"", LogLevel::All).is_err());
     }
     #[test]
     fn failed_and_excluded_snapshots_do_not_show_previous_processes_or_jobs() {
@@ -1165,16 +1211,16 @@ mod tests {
             Ok(())
         }).unwrap();
         for page in [Page::Resources, Page::Processes, Page::Jobs] {
-            let panel = load(&f.engine, page, "").unwrap();
+            let panel = load(&f.engine, page, "", LogLevel::All).unwrap();
             assert!(!text(&panel).contains("OLD_SENTINEL"));
             assert!(panel.rows.iter().any(|r| r.badge == "直近分析失敗"));
             assert!(panel.rows.iter().any(|r| r.badge == "運用対象外"));
         }
-        let procs = load(&f.engine, Page::Processes, "example-process").unwrap();
+        let procs = load(&f.engine, Page::Processes, "example-process", LogLevel::All).unwrap();
         assert_eq!(procs.rows.len(), 1);
         assert!(procs.rows[0].detail.contains("CPU 100%"));
         assert!(procs.rows[0].detail.contains("メモリ 未取得 MiB"));
-        assert!(text(&load(&f.engine, Page::Resources, "").unwrap()).contains("example-volume"));
+        assert!(text(&load(&f.engine, Page::Resources, "", LogLevel::All).unwrap()).contains("example-volume"));
     }
 
     #[test]
@@ -1198,13 +1244,13 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let logs = load(&f.engine, Page::Logs, "").unwrap();
+        let logs = load(&f.engine, Page::Logs, "", LogLevel::All).unwrap();
         let cursor = logs.rows.iter().find(|r| r.title.starts_with("収集状態")).unwrap();
         assert_eq!(cursor.tone, Tone::Error);
         assert!(cursor.detail.contains("not-found-for-account"));
         assert!(cursor.detail.contains("synthetic temporary error"));
         assert!(!cursor.detail.contains("最終成功 未取得"));
-        let status = load(&f.engine, Page::Status, "").unwrap();
+        let status = load(&f.engine, Page::Status, "", LogLevel::All).unwrap();
         assert!(status.rows.iter().any(|r| r.title.starts_with("チェック") && r.badge == "ok" && r.detail.contains("temporary error retained")));
     }
 
@@ -1219,7 +1265,7 @@ mod tests {
             d.save_limits("example-node","codex",&LimitsReport {state:"ok".into(),windows:vec![LimitWindow {mins:Some(300),used_pct:125.0,resets_at:Some(1_800_003_600)}],..Default::default()},now)?;
             d.save_limits("example-node","codex",&LimitsReport {state:"error".into(),error:Some("synthetic latest limit failure".into()),..Default::default()},now+1000)
         }).unwrap();
-        let panel = load(&f.engine, Page::Ai, "").unwrap();
+        let panel = load(&f.engine, Page::Ai, "", LogLevel::All).unwrap();
         let cursor = panel.rows.iter().find(|r| r.title.starts_with("AI取込状態")).unwrap();
         assert_eq!(cursor.badge, "直近失敗");
         assert!(cursor.detail.contains("続きあり・上限到達: はい"));
@@ -1282,7 +1328,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let panel = load(&f.engine, Page::Logs, "").unwrap();
+        let panel = load(&f.engine, Page::Logs, "", LogLevel::All).unwrap();
         assert_eq!(panel.rows.iter().filter(|r| r.title.starts_with("ログ ·")).count(), 0);
         assert!(!panel.note.contains("すべて表示"));
         assert!(panel.note.contains("全履歴の総数・末尾を意味しません"));
@@ -1304,7 +1350,7 @@ mod tests {
                 d.set_meta("specsAttempt:example-node", &json!({"ok":false,"at":now,"error":"synthetic latest specs failure"}))
             })
             .unwrap();
-        let panel = load(&f.engine, Page::Specs, "").unwrap();
+        let panel = load(&f.engine, Page::Specs, "", LogLevel::All).unwrap();
         assert!(panel.rows.iter().any(|r| r.badge == "古い保存値" && r.detail.contains("synthetic latest specs failure")));
         assert!(panel.rows.iter().any(|r| r.title.starts_with("仕様区分")));
         assert!(text(&panel).contains("Example Processor"));
@@ -1317,11 +1363,11 @@ mod tests {
             for i in 0..101 {d.add_action(&json!({"id":format!("example-{i}"),"at":i,"node_id":"example-node","label":if i==100 {"検索対象"} else {"other"},"type":"example","ok":true}))?;}
             Ok(())
         }).unwrap();
-        let panel = load(&f.engine, Page::Actions, "検索対象").unwrap();
+        let panel = load(&f.engine, Page::Actions, "検索対象", LogLevel::All).unwrap();
         assert_eq!(panel.rows.len(), 1);
         assert!(panel.facts.iter().any(|(k, v)| k.contains("最大100") && v == "100"));
         assert!(panel.note.contains("上部の集計値は検索前"));
-        let panel = load(&f.engine, Page::Actions, "other").unwrap();
+        let panel = load(&f.engine, Page::Actions, "other", LogLevel::All).unwrap();
         assert_eq!(panel.rows.len(), 99);
     }
     #[test]
@@ -1352,7 +1398,7 @@ mod tests {
                 d.add_snapshot("example-settings-missing", now, None, None, &json!([]), &json!({"power":{"soc_w":30}}), &json!({}))
             })
             .unwrap();
-        let p = load(&f.engine, Page::Power, "").unwrap();
+        let p = load(&f.engine, Page::Power, "", LogLevel::All).unwrap();
         assert!(p.rows.iter().any(|r| r.title.contains("example-failed")
             && r.badge == "直近分析失敗"
             && r.detail.contains("synthetic latest power analysis failure")
@@ -1385,7 +1431,7 @@ mod tests {
                 )
             })
             .unwrap();
-        let p = load(&f.engine, Page::Resources, "").unwrap();
+        let p = load(&f.engine, Page::Resources, "", LogLevel::All).unwrap();
         let row = p.rows.iter().find(|r| r.title.starts_with("リソース")).unwrap();
         assert!(row.detail.contains("部分観測"));
         assert!(row.detail.contains("1 / 2"));
