@@ -8585,6 +8585,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tune-core",
+ "unicode-segmentation",
 ]
 
 [[package]]
