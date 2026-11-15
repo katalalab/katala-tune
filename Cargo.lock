@@ -7964,8 +7964,10 @@ version = "0.7.0-rc.1"
 dependencies = [
  "gpui",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
  "tune-core",
+ "tune-link",
  "unicode-segmentation",
 ]
 

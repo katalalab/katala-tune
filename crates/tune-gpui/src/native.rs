@@ -11,7 +11,7 @@ use crate::{
     input::{self, SearchInput, Submitted},
     model,
     panels::{LogLevel, Page, Panel, Tone},
-    startup,
+    review, startup,
 };
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -319,6 +319,9 @@ struct TuneApp {
     collection: Job,
     notice: Option<String>,
     live_notice: Option<String>,
+    /// 読み込んだ完了台帳（画面へのドラッグか --review）。保存しない
+    review: Option<(review::Source, review::Document)>,
+    review_error: Option<String>,
     /// 変更操作の承認の関門（確認欄）。進むのは「実行する」を押したときだけ
     gate: gate::Gate,
     /// 変更操作の結果（画面上部に一行で出す）
@@ -380,6 +383,8 @@ impl TuneApp {
             collection: Job::default(),
             notice: None,
             live_notice: None,
+            review: None,
+            review_error: None,
             gate: gate::Gate::new(move || gate_dirty.store(true, Ordering::Release)),
             action_result: Arc::new(Mutex::new(None)),
         };
@@ -432,6 +437,9 @@ impl TuneApp {
                                 // Keep the previous diagnostic visible even if a read
                                 // fails; the current ledger error remains in notice.
                                 app.panel = app.collection.restore_network(app.page, response.panel);
+                                if app.page == Page::Review && app.selected.is_none() {
+                                    app.panel = Some(Ok(app.review_panel()));
+                                }
                                 if app.selected.as_ref().is_some_and(|id| !app.nodes.iter().any(|n| &n.id == id)) {
                                     app.navigate(Page::Overview, None, cx);
                                 }
@@ -462,6 +470,33 @@ impl TuneApp {
             self.panel = Some(Err(error));
         }
         cx.notify();
+    }
+
+    /// 完了台帳 JSON を読む（保存しない・外部参照を取得しない）。読めなければ理由を出し、前の表示は消す
+    fn load_review(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        match review::load(path, review::now_ms()) {
+            Ok(loaded) => {
+                self.review = Some(loaded);
+                self.review_error = None;
+            }
+            Err(error) => {
+                self.review = None;
+                self.review_error = Some(error);
+            }
+        }
+        if self.page == Page::Review && self.selected.is_none() {
+            self.panel = Some(Ok(self.review_panel()));
+            self.selected_row = None;
+            self.scroll = UniformListScrollHandle::new();
+        }
+        cx.notify();
+    }
+
+    fn review_panel(&self) -> Panel {
+        match &self.review {
+            Some((source, doc)) => review::panel(source, doc),
+            None => review::empty_panel(self.review_error.as_deref()),
+        }
     }
 
     fn navigate(&mut self, page: Page, selected: Option<String>, cx: &mut Context<Self>) {
@@ -1387,6 +1422,14 @@ impl Render for TuneApp {
         let main = match self.selected.clone() {
             Some(id) => self.detail(&id, cx).into_any_element(),
             None if self.page == Page::Overview => self.overview(cx).into_any_element(),
+            None if self.page == Page::Review => self
+                .record_panel(cx)
+                .on_drop(cx.listener(|app, paths: &gpui::ExternalPaths, _, cx| {
+                    if let Some(path) = paths.paths().first() {
+                        app.load_review(path, cx);
+                    }
+                }))
+                .into_any_element(),
             None => self.record_panel(cx).into_any_element(),
         };
         div()
@@ -1451,7 +1494,24 @@ impl Render for TuneApp {
 }
 
 fn open_route(target: &str, ledger: &[nodes::Node]) -> Result<Route, String> {
-    let keys = ["overview", "status", "resources", "processes", "jobs", "logs", "tools", "ai", "security", "network", "specs", "power", "topology", "actions"];
+    let keys = [
+        "overview",
+        "status",
+        "resources",
+        "processes",
+        "jobs",
+        "logs",
+        "tools",
+        "ai",
+        "security",
+        "network",
+        "specs",
+        "power",
+        "topology",
+        "actions",
+        "link",
+        "review",
+    ];
     if let Some((_, page)) = keys.into_iter().zip(Page::ALL).find(|(key, page)| *key == target || page.label() == target) {
         return Ok(Route::Page(page));
     }
@@ -1462,7 +1522,7 @@ fn open_route(target: &str, ledger: &[nodes::Node]) -> Result<Route, String> {
 }
 
 pub fn run(options: startup::Options) {
-    let startup::Options { config, data, selftest, open, live_id, logs, confirm_demo } = options;
+    let startup::Options { config, data, selftest, open, live_id, logs, confirm_demo, review: review_path } = options;
     if (selftest || config.exists())
         && let Err(error) = nodes::load_config(&config)
     {
@@ -1559,6 +1619,14 @@ pub fn run(options: startup::Options) {
         })
         .detach();
         cx.activate(true);
+        if let Some(path) = &review_path {
+            window
+                .update(cx, |app, _, cx| {
+                    app.load_review(path, cx);
+                    app.navigate(Page::Review, None, cx);
+                })
+                .ok();
+        }
         if let Some(route) = initial_route {
             window
                 .update(cx, |app, _, cx| match route {
@@ -1573,6 +1641,7 @@ pub fn run(options: startup::Options) {
                     let mut count = 0;
                     let mut nodes = 0;
                     let mut log_counts = None;
+                    let mut review_rows = None;
                     // All saved-data routes run before any explicit live diagnostic.
                     for page in Page::ALL {
                         window.update(cx, |app, _, cx| app.navigate(page, None, cx)).map_err(|_| "selftest window closed".to_string())?;
@@ -1586,6 +1655,9 @@ pub fn run(options: startup::Options) {
                                     }
                                     if app.loading {
                                         return None;
+                                    }
+                                    if review_path.is_some() && page == Page::Review {
+                                        review_rows = app.panel.as_ref().and_then(|p| p.as_ref().ok()).map(|p| p.rows.len());
                                     }
                                     if logs && page == Page::Logs {
                                         log_counts = app.panel.as_ref().and_then(|p| p.as_ref().ok()).map(|p| {
@@ -1650,6 +1722,9 @@ pub fn run(options: startup::Options) {
                     if logs {
                         let (rows, sigs) = log_counts.ok_or_else(|| "selftest logs did not load".to_string())?;
                         println!("selftest logs rows={rows} sigs={sigs}");
+                    }
+                    if review_path.is_some() {
+                        println!("selftest review rows={}", review_rows.ok_or_else(|| "selftest review did not load".to_string())?);
                     }
                     if confirm_demo {
                         // 確認欄が出て描かれ、「やめる」で進まないこと（何も実行しない）

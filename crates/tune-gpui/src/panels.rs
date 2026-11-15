@@ -38,9 +38,11 @@ pub enum Page {
     Power,
     Topology,
     Actions,
+    Link,
+    Review,
 }
 impl Page {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 16] = [
         Self::Overview,
         Self::Status,
         Self::Resources,
@@ -55,6 +57,8 @@ impl Page {
         Self::Power,
         Self::Topology,
         Self::Actions,
+        Self::Link,
+        Self::Review,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -72,6 +76,8 @@ impl Page {
             Self::Power => "電力・Clock",
             Self::Topology => "構成図",
             Self::Actions => "実行記録",
+            Self::Link => "接続",
+            Self::Review => "レビュー",
         }
     }
     pub fn search_hint(self) -> &'static str {
@@ -439,6 +445,9 @@ pub fn load(engine: &Engine, page: Page, query: &str, log_level: LogLevel) -> Re
             let request = TopologyUiRequest { filter: query.into(), ..Default::default() };
             topology(&engine.topology_ui_view(&request)?, &mut p);
         }
+        Page::Link => link(engine, &mut p)?,
+        // 読み込んだ完了台帳は画面側の状態。何も読み込んでいないときの表だけをここで返す
+        Page::Review => p = crate::review::empty_panel(None),
         Page::Actions => {
             let actions = engine.with_db(|d| d.actions(100))?;
             fact(&mut p, "取得窓の操作記録数（最大100）", actions.len());
@@ -476,6 +485,28 @@ pub fn load(engine: &Engine, page: Page, query: &str, log_level: LogLevel) -> Re
     let shown = p.rows.len();
     fact(&mut p, "今回の表示レコード数", shown);
     Ok(p)
+}
+
+/// ペア済みの tune-agent（公開鍵の指紋・名前・つなぎ先・ペアリングした時刻だけ）。秘密鍵とコードは読まない。
+/// ペアリングと解除は鍵とコードを扱うので、この画面ではしない。
+fn link(engine: &Engine, p: &mut Panel) -> Result<(), String> {
+    let dir = tune_link::console_dir(engine.data_dir());
+    let peers = tune_link::peers::PeerStore::new(&dir).list().map_err(|e| e.to_string())?;
+    let agents: Vec<_> = peers.iter().filter(|x| x.role == tune_link::peers::Role::Agent).map(tune_link::peers::Peer::summary).collect();
+    fact(p, "ペア済みの tune-agent", agents.len());
+    for a in &agents {
+        row(
+            p,
+            format!("ペア済み · {}", field(a, "name")),
+            format!("公開鍵の指紋 {} · つなぎ先 {} · ペアリング {}", field(a, "fingerprint"), field(a, "addr"), time(&a["paired_at"])),
+            "ペア済み",
+            Tone::Normal,
+        );
+    }
+    p.note.push_str(
+        "ペア済みの機体の一覧だけです（公開鍵の指紋・名前・つなぎ先・時刻。秘密鍵とコードは読みません）。ペアリングと解除は鍵とコードを扱うため、この画面ではできません。既存版か CLI（tune agent-pair / agent-unpair）で行います。調べる経路は今は SSH のままです。",
+    );
+    Ok(())
 }
 
 fn snapshots(engine: &Engine, page: Page, p: &mut Panel) -> Result<(), String> {

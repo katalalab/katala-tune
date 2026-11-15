@@ -10,6 +10,8 @@ pub struct Options {
     pub logs: bool,
     /// --selftest 用: 確認欄を出して「やめる」で終える（何も実行しない）
     pub confirm_demo: bool,
+    /// 起動時に読む完了台帳（task-completion.v1）。画面へのドラッグでも読める
+    pub review: Option<PathBuf>,
 }
 
 pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Options>, String> {
@@ -19,6 +21,7 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
     }
     let (mut config, mut data, mut selftest) = (None, None, false);
     let (mut open, mut live_id, mut logs, mut confirm_demo) = (None, None, false, false);
+    let mut review: Option<PathBuf> = None;
     let mut args = values.into_iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
@@ -35,6 +38,12 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
                 let target = if name == "--open" { &mut open } else { &mut live_id };
                 if target.replace(value).is_some() {
                     return Err(format!("duplicate option: {name}"));
+                }
+            }
+            Some("--review") => {
+                let path = args.next().filter(|v| !v.is_empty() && !v.to_string_lossy().starts_with('-')).ok_or("--review requires a path")?;
+                if review.replace(PathBuf::from(path)).is_some() {
+                    return Err("duplicate option: --review".into());
                 }
             }
             Some("--config" | "--data") => {
@@ -63,6 +72,7 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
         live_id,
         logs,
         confirm_demo,
+        review,
     }))
 }
 
