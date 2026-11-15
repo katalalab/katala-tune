@@ -29,3 +29,14 @@ if [ -n "${E2E_LOGS:-}" ]; then
   echo "$out" | grep -q "^selftest logs rows=" || { echo "E2E 失敗: ログの読み出し" >&2; exit 1; }
   echo "e2e-gpui logs OK"
 fi
+
+# 任意: E2E_PAGES=1 で、各画面（電力・実行記録・状態・構成図）のデータが実機の保存済みから読めることを確かめる（読み取りだけ）。
+if [ -n "${E2E_PAGES:-}" ]; then
+  for pair in power:power actions:actions status:status topology:topology; do
+    pg=${pair%%:*}; key=${pair##*:}
+    n=$(./target/release/katala-tune --selftest --open "$pg" | sed -n "s/.*selftest page .*\b$key=\([0-9]*\).*/\1/p")
+    [ "${n:-0}" -ge 1 ] || { echo "E2E 失敗: $pg のデータが読めない（$n）" >&2; exit 1; }
+    echo "page $pg rows=$n"
+  done
+  echo "e2e-gpui pages OK"
+fi

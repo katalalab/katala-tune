@@ -105,11 +105,12 @@ enum Page {
     Actions,
     Schedule,
     Resources,
+    Power,
 }
 
 impl Page {
     /// サイドバーに並べる順
-    const NAV: [Self; 6] = [Self::Status, Self::Resources, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
+    const NAV: [Self; 7] = [Self::Status, Self::Resources, Self::Power, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
 
     fn title(self) -> &'static str {
         match self {
@@ -120,6 +121,7 @@ impl Page {
             Self::Actions => "実行記録",
             Self::Schedule => "スケジュール",
             Self::Resources => "リソース",
+            Self::Power => "電力・Clock",
         }
     }
 
@@ -131,6 +133,7 @@ impl Page {
             "actions" => Self::Actions,
             "schedule" => Self::Schedule,
             "resources" => Self::Resources,
+            "power" => Self::Power,
             _ => return None,
         })
     }
@@ -157,6 +160,7 @@ struct TuneApp {
     live_on: Option<(String, Instant)>,
     page: Page,
     actions: Vec<model::ActionRow>,
+    power: model::PowerView,
     schedule: model::ScheduleView,
     status: model::StatusView,
     topology: model::TopologyView,
@@ -167,7 +171,7 @@ struct TuneApp {
 
 impl TuneApp {
     fn new(engine: Arc<Engine>, rt: Arc<tokio::runtime::Runtime>, dirty: Arc<AtomicBool>, live: LiveHandles, cx: &mut Context<Self>) -> Self {
-        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page: Page::Overview, actions: Vec::new(), schedule: Default::default(), status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
+        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page: Page::Overview, actions: Vec::new(), power: Default::default(), schedule: Default::default(), status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
         app.reload();
         app.load_status();
         // 通知を待つ代わりに 0.4 秒ごとに旗を見る。変わったときだけ読み直して描き直す
@@ -238,6 +242,11 @@ impl TuneApp {
             Page::Schedule => {
                 if let Ok(v) = self.engine.status_snapshot() {
                     self.schedule = model::schedule(&v);
+                }
+            }
+            Page::Power => {
+                if let Ok(v) = self.engine.power_report() {
+                    self.power = model::power(&v);
                 }
             }
             Page::Overview | Page::Resources => {}
@@ -646,6 +655,30 @@ impl TuneApp {
             .child(rows)
     }
 
+    /// 電力と Clock。計測できていない値は 0 ではなく「–」と理由で出す
+    fn power_page(&self) -> impl IntoElement {
+        let p = &self.power;
+        let w = |v: Option<f64>| v.map_or("–".to_string(), |v| format!("{v:.1} W"));
+        let mut rows = div().flex().flex_col().gap_1();
+        for r in &p.rows {
+            let color = match r.kind.as_str() { "measured" => palette::ok(), "estimated" => palette::warn(), _ => palette::muted() };
+            let clock = self.nodes.iter().find(|n| n.id == r.node).map(|n| n.cpu_name.clone()).unwrap_or_default();
+            rows = rows.child(
+                div().flex().items_center().gap_2().px_3().py_2().rounded_md().bg(palette::card())
+                    .child(div().w(px(120.0)).flex_none().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(r.node.clone()))
+                    .child(div().w(px(72.0)).flex_none().child(chip(model::power_kind_label(&r.kind), color)))
+                    .child(div().w(px(90.0)).flex_none().text_xs().child(format!("合計 {}", w(r.total_w.or(r.wall_w)))))
+                    .child(div().w(px(90.0)).flex_none().text_xs().text_color(palette::muted()).child(format!("CPU {}", w(r.cpu_w))))
+                    .child(div().w(px(90.0)).flex_none().text_xs().text_color(palette::muted()).child(format!("GPU {}", w(r.gpu_w))))
+                    .child(div().w(px(120.0)).flex_none().text_xs().text_color(palette::muted()).child(r.projected_kwh.map_or("月間 –".to_string(), |k| format!("予測 {k:.1} kWh"))))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().text_color(palette::muted()).child(if r.missing.is_empty() { clock } else { format!("不足: {}", r.missing.join(", ")) })),
+            );
+        }
+        div().id("power").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5()
+            .child(div().text_xs().text_color(palette::muted()).child(format!("電力を計測できている機体: {} / {} 台（計測できない値は 0 ではなく「–」と不足項目で示します）。合計: {}", p.available, p.expected, w(p.fleet_total_w))))
+            .child(rows)
+    }
+
     fn actions_page(&self) -> impl IntoElement {
         let now = now_ms();
         let mut rows = div().flex().flex_col().gap_1();
@@ -804,6 +837,7 @@ impl Render for TuneApp {
                 Page::Actions => self.actions_page().into_any_element(),
                 Page::Schedule => self.schedule_page().into_any_element(),
                 Page::Resources => self.resources_page(cx).into_any_element(),
+                Page::Power => self.power_page().into_any_element(),
             },
         };
         div()
@@ -909,6 +943,9 @@ fn main() {
             cx.spawn(async move |cx| {
                 cx.background_executor().timer(Duration::from_millis(if live_id.is_some() { 8000 } else { 1500 })).await;
                 println!("selftest ok nodes={view}");
+                // 開いた画面のデータが読めたか（画面ごとの件数）。--open <page> と併用する
+                let counts = window.update(cx, |v, _, _| format!("power={} actions={} status={} topology={}", v.power.rows.len(), v.actions.len(), v.status.checks.len(), v.topology.entities.len())).unwrap_or_default();
+                println!("selftest page {counts}");
                 if logs {
                     let (r, g) = window.update(cx, |v, _, _| (v.logs.len(), v.sigs.len())).unwrap_or((0, 0));
                     println!("selftest logs rows={r} sigs={g}");

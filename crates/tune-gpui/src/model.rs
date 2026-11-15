@@ -434,6 +434,69 @@ pub fn schedule(v: &Value) -> ScheduleView {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PowerRow {
+    pub node: String,
+    /// measured / estimated / missing など（Engine の summary.kind）
+    pub kind: String,
+    pub total_w: Option<f64>,
+    pub wall_w: Option<f64>,
+    pub cpu_w: Option<f64>,
+    pub gpu_w: Option<f64>,
+    pub missing: Vec<String>,
+    pub projected_kwh: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PowerView {
+    pub rows: Vec<PowerRow>,
+    pub available: i64,
+    pub expected: i64,
+    pub fleet_total_w: Option<f64>,
+}
+
+/// `Engine::power_report`。値の無い機体は「未計測」として出し、0 とは扱わない
+pub fn power(v: &Value) -> PowerView {
+    let f = |s: &Value, k: &str| s.get(k).and_then(Value::as_f64);
+    let rows = v
+        .get("nodes")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|n| {
+                    let s = n.get("summary").cloned().unwrap_or(Value::Null);
+                    PowerRow {
+                        node: str_of(n.get("node_id")),
+                        kind: str_of(s.get("kind")),
+                        total_w: f(&s, "total_w"),
+                        wall_w: f(&s, "wall_w"),
+                        cpu_w: f(&s, "cpu_w"),
+                        gpu_w: f(&s, "gpu_w"),
+                        missing: s.get("missing").and_then(Value::as_array).map(|m| m.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+                        projected_kwh: f(&s, "projected_kwh"),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let fleet = v.get("fleet").cloned().unwrap_or(Value::Null);
+    PowerView {
+        rows,
+        available: fleet.get("available").and_then(Value::as_i64).unwrap_or(0),
+        expected: fleet.get("expected").and_then(Value::as_i64).unwrap_or(0),
+        fleet_total_w: f(&fleet, "total_w"),
+    }
+}
+
+pub fn power_kind_label(k: &str) -> &'static str {
+    match k {
+        "measured" => "実測",
+        "estimated" => "推定",
+        "missing" => "未計測",
+        _ => "不明",
+    }
+}
+
 /// ライブ表示で貯める点（直近 3 分 = 1 秒ごとに 180 点）
 pub const LIVE_KEEP: usize = 180;
 
@@ -624,6 +687,22 @@ mod tests {
         assert!(s.enabled);
         assert_eq!((s.probe_minutes, s.logs_minutes, s.inventory_hours, s.last_probe_ms), (Some(60), None, Some(24), Some(9)));
         assert_eq!(schedule(&json!({})), ScheduleView::default());
+    }
+
+    #[test]
+    fn power_keeps_missing_as_none_not_zero() {
+        let v = json!({"fleet": {"available": 1, "expected": 8, "total_w": null}, "nodes": [
+            {"node_id": "a", "summary": {"kind": "measured", "total_w": 120.5, "cpu_w": 30, "missing": []}},
+            {"node_id": "b", "summary": {"kind": "missing", "missing": ["gpu_w", "cpu_w"], "total_w": null}},
+            {"node_id": "c"}
+        ]});
+        let p = power(&v);
+        assert_eq!((p.available, p.expected, p.fleet_total_w), (1, 8, None));
+        assert_eq!(p.rows[0].total_w, Some(120.5));
+        assert_eq!(p.rows[1].total_w, None);
+        assert_eq!(p.rows[1].missing, ["gpu_w", "cpu_w"]);
+        assert_eq!(power_kind_label(&p.rows[2].kind), "不明");
+        assert_eq!(power(&json!({})), PowerView::default());
     }
 
     #[test]
