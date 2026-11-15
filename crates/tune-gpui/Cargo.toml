@@ -23,6 +23,17 @@ gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "w
 sha2 = "0.11"
 tune-link.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6.5"
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSString", "NSError"] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationTrigger", "UNNotificationSettings"] }
+objc2-service-management = { version = "0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg = "0.56.0"
+
 [lints]
 workspace = true
 

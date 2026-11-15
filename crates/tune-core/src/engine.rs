@@ -34,6 +34,10 @@ pub trait Host: Send + Sync + 'static {
     fn open_at_login(&self) -> bool {
         false
     }
+    /// OS observation when available. Legacy hosts preserve their bool contract.
+    fn open_at_login_state(&self) -> Option<bool> {
+        Some(self.open_at_login())
+    }
     /// 1台の道具の棚卸しが終わった（画面の `onInventoryResult`）
     fn inventory_result(&self, _r: &Value) {}
     /// 1台の AI エージェントのセッションの取り込みが終わった（画面の `onAiSynced`）
@@ -344,7 +348,7 @@ impl Engine {
         let now = now_ms();
         let cfg = self.config();
         let sch = self.schedule();
-        let open_at_login = self.host.open_at_login();
+        let open_at_login = self.host.open_at_login_state();
         let errors = lock(&self.last_probe_error).clone();
         let (fleet, fleet_at) = lock(&self.fleet).clone();
         let mut changed = Vec::new();
@@ -425,7 +429,7 @@ impl Engine {
         let events = crate::netsec::filter_check_rows(events, &nodes);
         Ok(json!({
             "checks": checks, "events": events, "schedule": self.schedule(),
-            "lastProbeAt": lp, "lastLogsAt": ll, "openAtLogin": self.host.open_at_login(),
+            "lastProbeAt": lp, "lastLogsAt": ll, "openAtLogin": self.host.open_at_login_state(),
             "counts": status_counts(&checks), "probing": self.is_probing(), "syncing": self.is_syncing(),
         }))
     }

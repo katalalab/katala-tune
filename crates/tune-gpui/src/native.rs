@@ -24,7 +24,7 @@ use gpui::{
     WindowBounds, WindowOptions, actions, canvas, div, hsla, img, point, prelude::*, px, rgb, size, uniform_list,
 };
 use model::{Finding, Health, NodeView, Severity};
-use tune_core::engine::{Engine, Host};
+use tune_core::engine::Engine;
 use tune_core::live::{Live, Owner, ProcessRoute, Stop};
 use tune_core::nodes;
 
@@ -66,33 +66,6 @@ pub(crate) mod palette {
     }
     pub fn crit() -> Hsla {
         rgb(0xe5584f).into()
-    }
-}
-
-/// 分析・取り込みの完了などを画面側に知らせるだけの Host（描画はここでは触らない）
-struct DirtyHost(Arc<AtomicBool>);
-
-impl Host for DirtyHost {
-    fn logs_synced(&self, _: &serde_json::Value) {
-        self.0.store(true, Ordering::Release);
-    }
-    fn inventory_result(&self, _: &serde_json::Value) {
-        self.0.store(true, Ordering::Release);
-    }
-    fn ai_synced(&self, _: &serde_json::Value) {
-        self.0.store(true, Ordering::Release);
-    }
-    fn topology_updated(&self, _: &serde_json::Value) {
-        self.0.store(true, Ordering::Release);
-    }
-    fn probe_result(&self, _: &serde_json::Value) {
-        self.0.store(true, Ordering::Release);
-    }
-    fn checks_updated(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-    fn state_changed(&self) {
-        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -264,6 +237,7 @@ fn page_desc(page: Page) -> &'static str {
 }
 
 struct LiveHandles {
+    os: Arc<crate::native_host::NativeHost>,
     monitor: Arc<crate::monitor_host::MonitorHost>,
     live: Arc<Live>,
     store: Arc<Mutex<model::LiveStore>>,
@@ -446,6 +420,7 @@ impl LiveControl {
 }
 
 struct TuneApp {
+    os: Arc<crate::native_host::NativeHost>,
     monitor: Arc<crate::monitor_host::MonitorHost>,
     monitor_command_tail: Option<tokio::task::JoinHandle<()>>,
     monitor_records: Arc<Mutex<Option<Result<serde_json::Value, String>>>>,
@@ -524,6 +499,7 @@ impl TuneApp {
         // 確認欄が出た・消えたときの描き直しは、live_dirty の旗（cx.notify だけ）で知らせる
         let gate_dirty = handles.dirty.clone();
         let mut app = Self {
+            os: handles.os,
             monitor: handles.monitor,
             monitor_command_tail: None,
             monitor_records: Arc::new(Mutex::new(None)),
@@ -1544,6 +1520,49 @@ impl TuneApp {
                     cx.listener(move |app, _, _, _| app.monitor_command("records", Some(serde_json::json!({"before_id":before_id})))),
                 ));
         }
+        use crate::native_host::Action;
+        let os = self.os.snapshot();
+        let mut os_controls = div().px_5().flex().flex_wrap().gap_2();
+        for (id, label, action) in [
+            ("os-refresh", "OS 状態を照会", Action::Refresh),
+            ("os-permission", "通知の許可を要求", Action::Permission),
+            ("os-settings", "通知設定を開く", Action::Settings),
+            ("os-test", "合成テスト通知を送信", Action::Test),
+            ("os-login-on", "ログイン起動を有効にする", Action::Login(true)),
+            ("os-login-off", "ログイン起動を無効にする", Action::Login(false)),
+        ] {
+            os_controls = os_controls.child(
+                div()
+                    .id(id)
+                    .px_3()
+                    .py_2()
+                    .bg(palette::card())
+                    .text_xs()
+                    .child(if os.busy { format!("{label}（操作中）") } else { label.into() })
+                    .when(!os.busy, |d| d.cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, _| app.os.act(action)))),
+            );
+        }
+        details = details
+            .child(div().px_5().text_xs().child(format!(
+                "OS 前回照会 {} · {} · 通知許可 {} · ログイン起動 {}",
+                os.queried_at.map_or_else(|| "未照会".into(), |t| crate::panels::time(&serde_json::json!(t))),
+                os.observed.source,
+                os.observed.notification.label(),
+                os.observed.login.label()
+            )))
+            .child(os_controls)
+            .child(
+                div()
+                    .px_5()
+                    .text_xs()
+                    .text_color(palette::muted())
+                    .child("操作後は OS 状態を再照会してください。通知の受理は表示の証明ではありません。ログイン起動は収集を開始しません。"),
+            );
+        for (label, result) in [("OS 操作", os.action), ("変更通知", os.notification)] {
+            if let Some((at, effect)) = result {
+                details = details.child(div().px_5().text_xs().child(format!("{label} {} · {}", crate::panels::time(&serde_json::json!(at)), effect.label())));
+            }
+        }
         details = details.child(tools);
         let mut settings = div().id("monitor-settings").px_5().py_2().flex().flex_wrap().gap_2();
         if let Some(Ok(view)) = &self.dashboard {
@@ -2154,9 +2173,10 @@ pub fn run(options: startup::Options) {
     let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio"));
     // Engine の中の tokio 呼び出し（接続・子プロセス）が動くよう、ランタイムの文脈で開く
     let dirty = Arc::new(AtomicBool::new(true));
+    let os = Arc::new(crate::native_host::NativeHost::new(dirty.clone(), crate::os::platform(&config, &data, selftest), rt.handle().clone()));
     let engine = {
         let _g = rt.enter();
-        match Engine::open(config, data, Arc::new(DirtyHost(dirty.clone()))) {
+        match Engine::open(config, data, os.clone()) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("katala-tune: {e}");
@@ -2191,7 +2211,7 @@ pub fn run(options: startup::Options) {
     };
     let monitor = Arc::new(crate::monitor_host::MonitorHost::new(engine.clone(), live.clone(), rt.handle().clone(), dirty.clone()));
     let monitor_exit = monitor.clone();
-    let handles = LiveHandles { monitor, live: live.clone(), store: live_store, dirty: live_dirty };
+    let handles = LiveHandles { os, monitor, live: live.clone(), store: live_store, dirty: live_dirty };
     let rt_exit = rt.clone();
     let failed = Arc::new(AtomicBool::new(false));
     let failed_exit = failed.clone();

@@ -20,7 +20,11 @@ mod monitor_host;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod native;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+mod native_host;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod network;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod os;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod panels;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
