@@ -21,6 +21,7 @@ unicode-segmentation = "1.12"
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "windows-manifest"] }
 sha2 = "0.11"
+tray-icon = { version = "0.25.1", default-features = false }
 tune-link.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -33,6 +34,7 @@ objc2-service-management = { version = "0.3.2", default-features = false, featur
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.56.0"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory"] }
 
 [lints]
 workspace = true

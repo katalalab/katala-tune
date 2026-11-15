@@ -7974,9 +7974,11 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "tokio",
+ "tray-icon",
  "tune-core",
  "tune-link",
  "unicode-segmentation",
+ "windows-sys 0.61.2",
  "winreg",
 ]
 
