@@ -39,6 +39,9 @@ fn invalid_startup_arguments_are_rejected_before_opening_user_state() {
     let f = Fixture::new();
     for (args, expected) in [
         (vec!["--selftest"], "--selftest requires --config and --data"),
+        (vec!["--hidden"], "--hidden requires --resident"),
+        (vec!["--resident", "--selftest"], "cannot be combined with diagnostics"),
+        (vec!["--resident", "--hidden", "--shutdown-check", "quit"], "cannot be combined with diagnostics"),
         (vec!["--selftest", "--data"], "--data requires a path"),
         (vec!["--dat"], "unknown option"),
         (vec!["--config", "--data", "unused"], "--config requires a path"),

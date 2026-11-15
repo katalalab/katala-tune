@@ -14,6 +14,8 @@ mod gate;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod input;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+mod instance;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod model;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod monitor_host;
@@ -28,17 +30,21 @@ mod os;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod panels;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+mod resident;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod review;
 mod startup;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod text;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod tray;
 
 fn main() {
     let options = match startup::parse(std::env::args_os().skip(1)) {
         Ok(Some(options)) => options,
         Ok(None) => {
             println!(
-                "katala-tune-gpui [--config <ledger.json>] [--data <directory>] [--open <view|node-id>] [--review <file.json>] [--selftest [--live <node-id>] [--logs] [--confirm-demo] [--shutdown-check close|quit|native-quit]]\nmacOS / Windows preview; data defaults to a separate gpui-preview directory. --selftest requires both paths; without explicit diagnostics it checks startup and saved-data routes only. --shutdown-check starts a Probe job and expects an injected synthetic transport plus parent markers under <data>/shutdown-check."
+                "katala-tune-gpui [--config <ledger.json>] [--data <directory>] [--open <view|node-id>] [--review <file.json>] [--resident [--hidden]] [--selftest [--live <node-id>] [--logs] [--confirm-demo] [--shutdown-check close|quit|native-quit]]\nmacOS / Windows preview; data defaults to a separate gpui-preview directory. --selftest requires both paths; without explicit diagnostics it checks startup and saved-data routes only. --shutdown-check starts a Probe job and expects an injected synthetic transport plus parent markers under <data>/shutdown-check."
             );
             return;
         }
@@ -55,6 +61,8 @@ fn main() {
             options.config,
             options.data,
             options.selftest,
+            options.resident,
+            options.hidden,
             options.open,
             options.live_id,
             options.logs,

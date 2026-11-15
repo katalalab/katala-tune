@@ -5,6 +5,8 @@ pub struct Options {
     pub config: PathBuf,
     pub data: PathBuf,
     pub selftest: bool,
+    pub resident: bool,
+    pub hidden: bool,
     pub open: Option<String>,
     pub live_id: Option<String>,
     pub logs: bool,
@@ -23,12 +25,15 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
     }
     let (mut config, mut data, mut selftest) = (None, None, false);
     let (mut open, mut live_id, mut logs, mut confirm_demo) = (None, None, false, false);
+    let (mut resident, mut hidden) = (false, false);
     let mut review: Option<PathBuf> = None;
     let mut shutdown_check = None;
     let mut args = values.into_iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--selftest") if !selftest => selftest = true,
+            Some("--resident") if !resident => resident = true,
+            Some("--hidden") if !hidden => hidden = true,
             Some("--shutdown-check") => {
                 let mode = args
                     .next()
@@ -70,6 +75,15 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
             _ => return Err("unknown option; use --help".into()),
         }
     }
+    if hidden && !resident {
+        return Err("--hidden requires --resident".into());
+    }
+    if (resident || hidden) && (selftest || shutdown_check.is_some() || live_id.is_some() || logs || confirm_demo) {
+        return Err("--resident/--hidden cannot be combined with diagnostics".into());
+    }
+    if open.as_deref().is_some_and(|s| s.len() > 256 || s.chars().any(char::is_control)) {
+        return Err("--open must be at most 256 bytes without control characters".into());
+    }
     if selftest && (config.is_none() || data.is_none()) {
         return Err("--selftest requires --config and --data".into());
     }
@@ -84,6 +98,8 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
         // Preview data stays separate from the existing application by default.
         data: data.unwrap_or_else(|| tune_core::nodes::data_dir().join("gpui-preview")),
         selftest,
+        resident,
+        hidden,
         open,
         live_id,
         logs,
@@ -96,6 +112,27 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_hidden_are_explicit_and_diagnostics_are_disjoint() {
+        let ordinary = parse([]).unwrap().unwrap();
+        assert!(!ordinary.resident && !ordinary.hidden);
+        let hidden = parse(["--resident", "--hidden", "--open", "status"].map(OsString::from)).unwrap().unwrap();
+        assert!(hidden.resident && hidden.hidden);
+        assert_eq!(hidden.open.as_deref(), Some("status"));
+        for args in [
+            vec!["--hidden"],
+            vec!["--resident", "--selftest"],
+            vec!["--resident", "--shutdown-check", "close"],
+            vec!["--resident", "--logs"],
+            vec!["--resident", "--live", "fixture"],
+            vec!["--resident", "--confirm-demo"],
+            vec!["--resident", "--resident"],
+        ] {
+            assert!(parse(args.into_iter().map(OsString::from)).is_err());
+        }
+        assert!(parse(["--open", &"x".repeat(257)].map(OsString::from)).is_err());
+    }
 
     #[test]
     fn preview_and_selftest_modes_keep_all_explicit_options() {

@@ -381,6 +381,10 @@ impl MonitorHost {
         let handle = self.rt.clone();
         self.start_manual_with(job, kind, move || handle.block_on(collection::run(engine, kind, None, progress)))
     }
+    #[cfg(test)]
+    pub(crate) fn start_fixture_manual(&self, job: &mut Job, work: impl FnOnce() -> Receipt + Send + 'static) -> Result<(), String> {
+        self.start_manual_with(job, Kind::Probe, work)
+    }
     fn start_manual_with(&self, job: &mut Job, kind: Kind, work: impl FnOnce() -> Receipt + Send + 'static) -> Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.exiting {
