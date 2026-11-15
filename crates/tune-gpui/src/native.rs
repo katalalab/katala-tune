@@ -6,6 +6,7 @@
 
 use crate::{
     browser::{Reader, Request, Route},
+    collection::{self, Job, Kind},
     input::{self, SearchInput, Submitted},
     model,
     panels::{LogLevel, Page, Panel, Tone},
@@ -314,6 +315,7 @@ struct TuneApp {
     selected_row: Option<usize>,
     scroll: UniformListScrollHandle,
     probing: bool,
+    collection: Job,
     notice: Option<String>,
     live_notice: Option<String>,
 }
@@ -368,6 +370,7 @@ impl TuneApp {
             selected_row: None,
             scroll: UniformListScrollHandle::new(),
             probing: false,
+            collection: Job::default(),
             notice: None,
             live_notice: None,
         };
@@ -387,6 +390,10 @@ impl TuneApp {
                         }
                         if app.live_dirty.swap(false, Ordering::AcqRel) {
                             cx.notify();
+                        }
+                        if app.collection.poll() {
+                            // Receipt ownership is independent of route/query generations.
+                            app.reload(cx);
                         }
                         let probing = app.engine.is_probing();
                         if app.dirty.swap(false, Ordering::AcqRel) || probing != app.probing {
@@ -515,16 +522,81 @@ impl TuneApp {
         cx.notify();
     }
 
-    fn probe_all(&mut self, cx: &mut Context<Self>) {
-        if self.probing {
+    fn collect(&mut self, kind: Kind, cx: &mut Context<Self>) {
+        if kind == Kind::Probe && self.probing {
             return;
         }
-        self.probing = true;
+        let Some(sender) = self.collection.begin(kind) else {
+            return;
+        };
         let engine = self.engine.clone();
+        let handle = self.rt.handle().clone();
         self.rt.spawn(async move {
-            engine.run_probe(None, false).await;
+            // Engine entry points also do synchronous ledger/SQLite work. Keep
+            // the entire invocation off GPUI, including the immediate reread.
+            let result = tokio::task::spawn_blocking(move || handle.block_on(collection::run(engine, kind, None)))
+                .await
+                .unwrap_or_else(|_| collection::Receipt::error(kind, "収集タスクが停止しました"));
+            let _ = sender.send(result);
         });
         cx.notify();
+    }
+
+    fn collection_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut status = div().id("collection-status").flex_none().max_h(px(190.)).overflow_y_scroll().px_5().py_2().text_xs();
+        if let Some(kind) = self.collection.running {
+            status = status.child(div().text_color(palette::accent()).child(format!("{}を実行中…（画面を移動しても継続します）", kind.label())));
+        }
+        if let Some(result) = &self.collection.result {
+            status =
+                status
+                    .child(
+                        div().flex().items_center().gap_3().child(div().flex_1().child(result.summary())).child(
+                            div()
+                                .id("copy-collection-result")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(palette::card())
+                                .cursor_pointer()
+                                .child("収集結果の詳細をコピー")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|app, _, _, cx| {
+                                        if let Some(result) = &app.collection.result {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(result.copy_text()));
+                                        }
+                                    }),
+                                ),
+                        ),
+                    )
+                    .child(div().text_color(palette::muted()).child(
+                        "直近の明示収集の結果。最大24行・詳細は各2048文字。部分成功と対象外を完全成功へ含めません。保存画面の検索・再読込では消えません。",
+                    ));
+            for row in &result.rows {
+                let color = match row.tone {
+                    Tone::Error => palette::crit(),
+                    Tone::Warning => palette::warn(),
+                    Tone::Good => palette::ok(),
+                    _ => palette::muted(),
+                };
+                status = status.child(
+                    div()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(palette::line())
+                        .child(div().text_color(color).child(format!("{} · {}", row.title, row.badge)))
+                        .child(div().text_color(palette::muted()).child({
+                            let mut preview: String = row.detail.chars().take(240).collect();
+                            if row.detail.chars().count() > 240 {
+                                preview.push_str("…（続きは詳細コピー）");
+                            }
+                            preview
+                        })),
+                );
+            }
+        }
+        status
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -610,7 +682,7 @@ impl TuneApp {
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.selected.clone().unwrap_or_else(|| self.page.label().into());
         let (crit, warn): (usize, usize) = self.nodes.iter().fold((0, 0), |a, n| (a.0 + n.count(Severity::Critical), a.1 + n.count(Severity::Warn)));
-        let busy = self.probing;
+        let busy = self.probing || self.collection.running.is_some();
         div()
             .flex()
             .items_center()
@@ -632,8 +704,8 @@ impl TuneApp {
                     .bg(if busy { palette::line() } else { palette::accent() })
                     .text_color(if busy { palette::muted() } else { rgb(0xffffff).into() })
                     .when(!busy, |d| d.cursor_pointer())
-                    .child(if busy { "分析中…" } else { "全機を分析" })
-                    .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.probe_all(cx))),
+                    .child(if busy { "収集実行中…" } else { "全機を分析" })
+                    .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.collect(Kind::Probe, cx))),
             )
     }
 
@@ -888,7 +960,7 @@ impl TuneApp {
             .child(body)
     }
     fn record_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let toolbar = div()
+        let mut toolbar = div()
             .flex()
             .items_center()
             .gap_2()
@@ -919,6 +991,21 @@ impl TuneApp {
                     .child("再読込")
                     .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.reload(cx))),
             );
+        if let Some(kind) = Kind::for_page(self.page) {
+            let busy = self.collection.running.is_some();
+            toolbar = toolbar.child(
+                div()
+                    .id("collect-page")
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(if busy { palette::line() } else { palette::accent() })
+                    .text_sm()
+                    .when(!busy, |d| d.cursor_pointer())
+                    .child(if busy { "収集実行中…".to_owned() } else { format!("全対象の{}", kind.label()) })
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| app.collect(kind, cx))),
+            );
+        }
         let mut body = div().flex_1().min_h_0().flex().flex_col().child(toolbar);
         if self.page == Page::Logs {
             let mut levels = div().flex().gap_2().px_5().pb_3();
@@ -1135,6 +1222,7 @@ impl Render for TuneApp {
                     .flex()
                     .flex_col()
                     .child(self.header(cx))
+                    .child(self.collection_status(cx))
                     .when_some(self.notice.clone(), |d, n| d.child(div().px_5().py_2().text_xs().text_color(palette::warn()).child(n)))
                     .when_some(self.live_notice.clone(), |d, n| d.child(div().px_5().py_2().text_xs().text_color(palette::warn()).child(n)))
                     .child(main),

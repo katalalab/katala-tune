@@ -440,6 +440,11 @@ impl Engine {
         }
         self.host.state_changed();
         let cfg = self.reload_config();
+        if let Some(error) = self.config_error() {
+            self.probing.store(false, Ordering::SeqCst);
+            self.host.state_changed();
+            return json!({ "error": error });
+        }
         let all = ids.as_ref().is_none_or(Vec::is_empty);
         let selected: Vec<Node> = cfg.nodes.iter().filter(|n| all || ids.as_ref().is_some_and(|i| i.contains(&n.id))).cloned().collect();
         // 運用対象でない機体（retired など）には接続しない。除外は失敗ではなく理由つきで返す
