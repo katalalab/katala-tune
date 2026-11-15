@@ -2461,7 +2461,14 @@ pub fn run(options: startup::Options) {
         // closes. EmptyView owns no UI controls/Reader/Engine or producers. Keep
         // this window until App::shutdown has run the synchronous drain observer.
         if let Some(options) = keeper_options(resident, cfg!(target_os = "windows")) {
-            let keeper = cx.open_window(options, |_, cx| cx.new(|_| gpui::EmptyView)).expect("resident keeper");
+            let keeper = cx
+                .open_window(options, |window, cx| {
+                    // Hidden Windows placement is deferred; size this owned
+                    // window's content explicitly without showing it.
+                    window.resize(size(px(1.), px(1.)));
+                    cx.new(|_| gpui::EmptyView)
+                })
+                .expect("resident keeper");
             session.borrow_mut().keeper = Some(keeper.window_id());
         }
         let window = if hidden { None } else { Some(session.borrow_mut().open(None, cx).expect("window")) };

@@ -35,7 +35,7 @@ GPUIは起動引数の検証後、config/dataの相対パスと既存の親デ�
 
 通常起動は、同じ実行ファイル・解決済みconfig/dataパス・現在ユーザーの組み合わせで単一起動になる。二度目の起動はDBを開かず、既存アプリの表示だけを要求する。`--open`は256バイト以内で、既存アプリが表示先を検証する。二度目の`--review`は未対応として理由つきで拒否するため、既存ウィンドウへのドラッグか別のdata領域を使う。別の実行ファイルやdata領域は独立したPreviewになるので、異なる版から同じDBを指定しない。実行ファイル移動・更新時やTauri版との所有統合は正式移行で扱う。
 
-Windowsの常駐時は、GPUI 0.2.2が最後のネイティブウィンドウ破棄で終了するため、空の非表示keeperを一つ保持する。`show=false`、`focus=false`、taskbarに出ないtool windowとして作り、画面・Reader・UI Live・収集処理を持たせない。指定boundsは1×1だが、GPUIは非表示時のplacement適用を保留するため、物理HWNDサイズやrenderer確保量が1×1になるとは限らない。platform/renderer資源は必要で、ゼロGPU確保を保証するものではない。実サイズとCPU/RSSは実機受入で確認する。通常Preview、診断、macOSにはkeeperを作らない。ユーザー画面のCloseで現在の確認GateとUI Liveだけを失効し、承認済みの収集は保持する。keeperが失われた場合は終了処理へ進み、明示的な終了でも保存ACKを同期的に待ってからkeeperを含む全ウィンドウを破棄する。
+Windowsの常駐時は、GPUI 0.2.2が最後のネイティブウィンドウ破棄で終了するため、空の非表示keeperを一つ保持する。`show=false`、`focus=false`、taskbarに出ないtool windowとして作り、画面・Reader・UI Live・収集処理を持たせない。指定boundsは1×1で、非表示時に保留されるplacementとは別に、生成時の公開resize APIでもcontentの1×1を要求する。実際の物理HWNDサイズはscale factorなどの影響を受け、renderer確保量が1×1相当になるとは限らない。platform/renderer資源は必要で、ゼロGPU確保を保証するものではない。実サイズとCPU/RSSは実機受入で確認する。通常Preview、診断、macOSにはkeeperを作らない。ユーザー画面のCloseで現在の確認GateとUI Liveだけを失効し、承認済みの収集は保持する。keeperが失われた場合は終了処理へ進み、明示的な終了でも保存ACKを同期的に待ってからkeeperを含む全ウィンドウを破棄する。
 
 `--hidden`単独、常駐オプションと`--selftest`などの診断オプションの混在は、DB・トレイを作る前に拒否する。診断は単一起動とトレイを使わない。常駐の自動検証は偽UI/OSと一時DB・一時IPCで行い、実トレイ操作、Dock再表示、Windows実画面・権限・ログイン起動の受入は別途必要。既存版との全機能同等性や実測性能を示すものではない。
 
