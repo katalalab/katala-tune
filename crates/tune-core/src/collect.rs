@@ -152,6 +152,8 @@ mod bounded;
 pub use bounded::{BoundedResult, ProcessIdentity, ProcessReceipt, ProcessStop};
 #[cfg(windows)]
 mod windows;
+#[cfg(any(windows, test))]
+mod windows_pid_list;
 #[cfg(windows)]
 mod windows_pin;
 #[cfg(windows)]

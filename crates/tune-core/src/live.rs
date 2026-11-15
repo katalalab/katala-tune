@@ -1315,6 +1315,17 @@ impl Live {
         json!({ "started": started, "running": running, "refused": refused, "limit": self.opts.max_streams, "snapshot": snapshot })
     }
 
+    /// Renew only an existing running stream. This never starts a new sampler.
+    pub fn heartbeat(&self, id: &str) -> bool {
+        let mut state = self.lock();
+        if state.closed {
+            return false;
+        }
+        let Some(stream) = state.streams.get_mut(id).filter(|s| !s.stopping) else { return false };
+        stream.last_hb = Instant::now();
+        true
+    }
+
     /// 止める（ids が None なら全部）。戻り値は `{ stopped: [id] }`。止まり終わったら画面へ state: stopped を送る
     pub fn stop(&self, ids: Option<&[String]>, why: Stop) -> Value {
         let mut st = self.lock();
@@ -2390,6 +2401,55 @@ mod tests {
         assert!(s["a"]["detail"].as_str().unwrap().contains("exit 255: Connection closed"), "{}", s["a"]["detail"]);
         assert_eq!(route.opened.load(Ordering::SeqCst), 3, "最初の 1 回 + つなぎ直し 2 回");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_renews_existing_streams_without_starting_missing_or_stopped_targets() {
+        if cfg!(windows) {
+            return;
+        }
+        let (route, dir) = fake(STEADY);
+        let (sink, _) = events();
+        let live = Live::new(route.clone(), quick(), sink);
+        assert!(!live.heartbeat("missing"));
+        assert_eq!(route.opened.load(Ordering::SeqCst), 0);
+        live.start(&[node("fixture", "macos")], &[]);
+        until("initial sample", || state(&live, "fixture").0 == "running").await;
+        // Advance just the fixture's heartbeat age instead of sleeping through
+        // the production idle budget. A no-op renewal must fail the next tick.
+        live.lock().streams.get_mut("fixture").unwrap().last_hb = Instant::now() - quick().idle_stop - Duration::from_secs(1);
+        let renewed = live.heartbeat("fixture");
+        live.tick();
+        let kept_running = live.active().contains(&"fixture".to_string());
+        live.stop(None, Stop::User);
+        let while_stopping = live.heartbeat("fixture");
+        until("stopped", || state(&live, "fixture").0 == "stopped").await;
+        let after_stopping = live.heartbeat("fixture");
+        let opened = route.opened.load(Ordering::SeqCst);
+        live.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(renewed, "an existing stream accepts its heartbeat");
+        assert!(kept_running, "renewal resets the idle deadline");
+        assert!(!while_stopping && !after_stopping, "heartbeat must never restart a stopped stream");
+        assert_eq!(opened, 1);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_does_not_reset_exhausted_retries() {
+        if cfg!(windows) {
+            return;
+        }
+        let (route, dir) = fake("exit 255");
+        let (sink, _) = events();
+        let live = Live::new(route.clone(), Opts { max_retries: 0, ..quick() }, sink);
+        live.start(&[node("fixture", "macos")], &[]);
+        until("retry limit", || state(&live, "fixture").0 == "stopped").await;
+        let renewed = live.heartbeat("fixture");
+        let opened = route.opened.load(Ordering::SeqCst);
+        live.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(!renewed);
+        assert_eq!(opened, 1, "heartbeat cannot reset the sampler retry budget");
     }
 
     #[tokio::test]

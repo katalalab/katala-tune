@@ -1,22 +1,31 @@
 //! Katala Tune のネイティブ画面（Rust + GPUI）。WebView も Node も使わず、tune-core の Engine を直接呼ぶ。
 //!
 //! 実行: `katala-tune-gpui [--config 台帳.json] [--data データdir] [--selftest]`
-//! `--selftest` は画面を開いて台帳と前回結果を読み、1 フレーム描いて終了する（E2E 用。分析は走らせない）。
+//! `--selftest` は保存データの全ルートを読み、終了する（収集はしない）。
+//! `--selftest --live <id>` だけは指定機体を一度ストリームし、3 CPU 点以上を確認する。
 
-use super::{model, startup};
+use crate::{
+    browser::{Reader, Request, Route},
+    input::{self, SearchInput, Submitted},
+    model,
+    panels::{LogLevel, Page, Panel, Tone},
+    startup,
+};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    App, Application, Bounds, Context, FontWeight, Hsla, MouseButton, Window, WindowBounds, WindowOptions, div, hsla, img, point, prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, MouseButton, UniformListScrollHandle, Window,
+    WindowBounds, WindowOptions, actions, div, hsla, img, point, prelude::*, px, rgb, size, uniform_list,
 };
 use model::{Finding, Health, NodeView, Severity};
 use tune_core::engine::{Engine, Host};
 use tune_core::live::{Live, ProcessRoute, Stop};
 use tune_core::nodes;
+
+actions!(tune, [Quit, CloseWindow, GoOverview, NextPage, PreviousPage, Refresh, FocusSearch, FocusContent, ToggleFocus, NextRow, PreviousRow, CopyRecord]);
 
 #[cfg(target_os = "macos")]
 const FONT: &str = ".SystemUIFont";
@@ -61,6 +70,18 @@ mod palette {
 struct DirtyHost(Arc<AtomicBool>);
 
 impl Host for DirtyHost {
+    fn logs_synced(&self, _: &serde_json::Value) {
+        self.0.store(true, Ordering::Release);
+    }
+    fn inventory_result(&self, _: &serde_json::Value) {
+        self.0.store(true, Ordering::Release);
+    }
+    fn ai_synced(&self, _: &serde_json::Value) {
+        self.0.store(true, Ordering::Release);
+    }
+    fn topology_updated(&self, _: &serde_json::Value) {
+        self.0.store(true, Ordering::Release);
+    }
     fn probe_result(&self, _: &serde_json::Value) {
         self.0.store(true, Ordering::Release);
     }
@@ -94,11 +115,11 @@ fn severity_color(s: Severity) -> Hsla {
 }
 
 /// 棒の推移グラフ。0〜`max` を高さにし、点が無ければ空の枠だけ描く
-fn trend(values: &[f64], max: f64, color: Hsla, height: f32, take: usize) -> gpui::Div {
+fn trend(values: &[f64], max: f64, color: Hsla, height: f32) -> gpui::Div {
     let mut bars = div().h(px(height)).flex().items_end().gap_px();
-    for v in values.iter().rev().take(take).rev() {
+    for v in values.iter().rev().take(model::LIVE_KEEP).rev() {
         let h = ((v / max).clamp(0.0, 1.0) as f32 * height).max(1.0);
-        bars = bars.child(div().w(px(3.0)).h(px(h)).rounded_sm().bg(color));
+        bars = bars.child(div().w(px(2.0)).h(px(h)).rounded_sm().bg(color));
     }
     bars
 }
@@ -113,76 +134,293 @@ struct LiveHandles {
     dirty: Arc<AtomicBool>,
 }
 
+struct LiveIntent {
+    generation: u64,
+    id: String,
+    started: bool,
+    pending: bool,
+    heartbeat: Instant,
+}
+
+#[derive(Default)]
+struct LiveState {
+    generation: u64,
+    active: bool,
+    intent: Option<LiveIntent>,
+    notice: Option<String>,
+}
+
+/// The short state lock serializes start/stop ownership. Ledger I/O happens before
+/// taking it, so navigation can invalidate an in-flight load without blocking GPUI.
+struct LiveControl {
+    live: Arc<Live>,
+    state: Mutex<LiveState>,
+}
+
+impl LiveControl {
+    fn new(live: Arc<Live>, active: bool) -> Self {
+        Self { live, state: Mutex::new(LiveState { active, ..LiveState::default() }) }
+    }
+
+    fn stop_locked(&self, state: &mut LiveState, why: Stop) {
+        state.generation = state.generation.wrapping_add(1);
+        if let Some(intent) = state.intent.take() {
+            self.live.stop(Some(&[intent.id]), why);
+        }
+    }
+
+    fn stop(&self, why: Stop) {
+        self.stop_locked(&mut self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner), why);
+    }
+
+    fn set_active(&self, active: bool) {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = active;
+        if !active {
+            self.stop_locked(&mut state, Stop::Hidden);
+        }
+    }
+
+    fn request(&self, id: &str) -> Option<(u64, String)> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.stop_locked(&mut state, Stop::User);
+        if !state.active {
+            state.notice = Some("ライブは前面のウィンドウから開始してください".into());
+            return None;
+        }
+        state.notice = None;
+        let generation = state.generation;
+        state.intent = Some(LiveIntent { generation, id: id.into(), started: false, pending: true, heartbeat: Instant::now() });
+        Some((generation, id.into()))
+    }
+
+    fn streaming(&self, id: &str) -> bool {
+        self.live.active().iter().any(|active| active == id) && self.live.brief(id).is_some_and(|brief| brief["streaming"].as_bool() == Some(true))
+    }
+
+    fn terminal_notice(&self, id: &str) -> String {
+        let brief = self.live.brief(id);
+        let detail = brief.as_ref().and_then(|b| b["detail"].as_str()).unwrap_or("接続が終了しました");
+        format!("ライブ停止: {detail}。続ける場合は手動で開始してください。")
+    }
+
+    /// Apply a fresh complete ledger only while this exact request still owns the
+    /// selected route. An obsolete load never starts or stops a newer stream.
+    fn complete(&self, generation: u64, id: &str, nodes: &[nodes::Node], config_error: Option<String>) {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(intent) = state.intent.as_ref().filter(|i| i.generation == generation && i.id == id) else { return };
+        if !state.active {
+            return;
+        }
+        if let Some(error) = config_error {
+            self.stop_locked(&mut state, Stop::Excluded);
+            state.notice = Some(format!("ライブ停止: 台帳を読み込めません: {error}"));
+            return;
+        }
+        let started = intent.started;
+        self.live.retain_active(nodes);
+        let target = nodes.iter().find(|node| node.id == id);
+        if started {
+            // This path may only renew an existing stream. The backend performs
+            // the presence check and renewal atomically, so terminal failure
+            // between observations cannot reset its retry budget.
+            let refusal = target.map_or_else(|| Some("台帳に無い機体".into()), nodes::Node::refusal);
+            if let Some(detail) = refusal {
+                self.stop_locked(&mut state, Stop::Excluded);
+                state.notice = Some(format!("ライブ停止: {detail}"));
+                return;
+            }
+            if !self.live.heartbeat(id) {
+                let notice = self.terminal_notice(id);
+                self.stop_locked(&mut state, Stop::User);
+                state.notice = Some(notice);
+                return;
+            }
+        } else {
+            let target: Vec<_> = target.cloned().into_iter().collect();
+            let unknown = if target.is_empty() { vec![id.to_string()] } else { Vec::new() };
+            let result = self.live.start(&target, &unknown);
+            if let Some(refusal) = result["refused"].as_array().and_then(|r| r.first()) {
+                let detail = refusal["detail"].as_str().unwrap_or("開始できません");
+                let notice = format!("ライブを開始できません: {detail}");
+                self.stop_locked(&mut state, Stop::User);
+                state.notice = Some(notice);
+                return;
+            }
+        }
+        if let Some(intent) = state.intent.as_mut() {
+            intent.started = true;
+            intent.pending = false;
+            intent.heartbeat = Instant::now();
+        }
+    }
+
+    /// Apply only the accepted Reader generation. Excluded findings are visible
+    /// immediately, so the matching owned stream must stop at that same boundary.
+    fn accept_nodes(&self, nodes: &[NodeView]) {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.intent.as_ref().is_some_and(|intent| nodes.iter().any(|node| node.id == intent.id && matches!(node.health, Health::Excluded(_)))) {
+            self.stop_locked(&mut state, Stop::Excluded);
+        }
+    }
+
+    /// Called by the small UI timer. Only in-memory backend state is read here.
+    fn poll(&self) -> Option<(u64, String)> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let intent = state.intent.as_ref()?;
+        if intent.started && !self.streaming(&intent.id) {
+            let notice = self.terminal_notice(&intent.id);
+            self.stop_locked(&mut state, Stop::User);
+            state.notice = Some(notice);
+            return None;
+        }
+        let active = state.active;
+        let intent = state.intent.as_mut()?;
+        if active && intent.started && !intent.pending && intent.heartbeat.elapsed() >= Duration::from_secs(30) {
+            intent.pending = true;
+            return Some((intent.generation, intent.id.clone()));
+        }
+        None
+    }
+
+    fn on(&self, id: &str) -> bool {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).intent.as_ref().is_some_and(|i| i.id == id)
+    }
+
+    fn take_notice(&self) -> Option<String> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).notice.take()
+    }
+}
+
 struct TuneApp {
     brand: Arc<gpui::Image>,
+    live: Arc<LiveControl>,
+    live_store: Arc<Mutex<model::LiveStore>>,
+    live_dirty: Arc<AtomicBool>,
     engine: Arc<Engine>,
     rt: Arc<tokio::runtime::Runtime>,
     dirty: Arc<AtomicBool>,
     nodes: Vec<NodeView>,
     selected: Option<String>,
+    page: Page,
+    reader: Reader,
+    generation: u64,
+    loading: bool,
+    panel: Option<Result<Panel, String>>,
+    query: String,
+    log_level: LogLevel,
+    search: Entity<SearchInput>,
+    focus: FocusHandle,
+    selected_row: Option<usize>,
+    scroll: UniformListScrollHandle,
     probing: bool,
     notice: Option<String>,
-    live: Arc<Live>,
-    live_store: Arc<Mutex<model::LiveStore>>,
-    live_dirty: Arc<AtomicBool>,
-    /// ライブを流している機体と、最後に合図（heartbeat）を送った時刻
-    live_on: Option<(String, Instant)>,
-    page_logs: bool,
-    page_topology: bool,
-    page_status: bool,
-    status: model::StatusView,
-    topology: model::TopologyView,
-    log_level: Option<&'static str>,
-    logs: Vec<model::LogRow>,
-    sigs: Vec<model::Signature>,
+    live_notice: Option<String>,
 }
 
 impl TuneApp {
-    fn new(engine: Arc<Engine>, rt: Arc<tokio::runtime::Runtime>, dirty: Arc<AtomicBool>, live: LiveHandles, cx: &mut Context<Self>) -> Self {
-        let brand = Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, include_bytes!("../../../build/mark.png").to_vec()));
+    fn new(
+        engine: Arc<Engine>,
+        rt: Arc<tokio::runtime::Runtime>,
+        dirty: Arc<AtomicBool>,
+        handles: LiveHandles,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let reader = Reader::new(engine.clone(), &rt);
+        let ledger: Vec<_> = engine.config().nodes.iter().map(nodes::Node::public).collect();
+        let search = cx.new(SearchInput::new);
+        cx.subscribe(&search, |app, field, _: &Submitted, cx| {
+            app.query = field.read(cx).text().to_owned();
+            app.selected_row = None;
+            app.scroll = UniformListScrollHandle::new();
+            app.reload(cx);
+        })
+        .detach();
+        let focus = cx.focus_handle();
+        focus.focus(window);
+        let live = Arc::new(LiveControl::new(handles.live, window.is_window_active()));
+        cx.on_release(|app, _| app.live.stop(Stop::Hidden)).detach();
+        cx.observe_window_activation(window, |app, window, cx| {
+            app.live.set_active(window.is_window_active());
+            cx.notify();
+        })
+        .detach();
         let mut app = Self {
-            brand,
+            brand: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, include_bytes!("../../../build/mark.png").to_vec())),
+            live,
+            live_store: handles.store,
+            live_dirty: handles.dirty,
             engine,
             rt,
             dirty,
-            nodes: Vec::new(),
+            nodes: model::build(&ledger, &[]),
             selected: None,
+            page: Page::Overview,
+            reader,
+            generation: 0,
+            loading: false,
+            panel: None,
+            query: String::new(),
+            log_level: LogLevel::All,
+            search,
+            focus,
+            selected_row: None,
+            scroll: UniformListScrollHandle::new(),
             probing: false,
             notice: None,
-            live: live.live,
-            live_store: live.store,
-            live_dirty: live.dirty,
-            live_on: None,
-            page_logs: false,
-            page_topology: false,
-            page_status: false,
-            status: Default::default(),
-            topology: Default::default(),
-            log_level: None,
-            logs: Vec::new(),
-            sigs: Vec::new(),
+            live_notice: None,
         };
-        app.reload();
-        app.load_status();
-        // 通知を待つ代わりに 0.4 秒ごとに旗を見る。変わったときだけ読み直して描き直す
+        app.reload(cx);
+        // Only poll small notification/mailbox state. All SQLite work is in Reader.
         cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(Duration::from_millis(400)).await;
-                let alive = this
+                cx.background_executor().timer(Duration::from_millis(150)).await;
+                if this
                     .update(cx, |app, cx| {
-                        let probing = app.engine.is_probing();
-                        app.live_heartbeat();
+                        if let Some(request) = app.live.poll() {
+                            app.refresh_live(request);
+                        }
+                        if let Some(notice) = app.live.take_notice() {
+                            app.live_notice = Some(notice);
+                            cx.notify();
+                        }
                         if app.live_dirty.swap(false, Ordering::AcqRel) {
                             cx.notify();
                         }
+                        let probing = app.engine.is_probing();
                         if app.dirty.swap(false, Ordering::AcqRel) || probing != app.probing {
                             app.probing = probing;
-                            app.reload();
-                            cx.notify();
+                            app.reload(cx);
+                        }
+                        if let Some(response) = app.reader.take() {
+                            // A late response belongs to its original navigation/query.
+                            if response.generation == app.generation {
+                                app.loading = false;
+                                if response.config_error.is_some() {
+                                    app.live.stop(Stop::Excluded);
+                                }
+                                app.notice = response.config_error;
+                                match response.nodes {
+                                    Ok(nodes) => {
+                                        app.live.accept_nodes(&nodes);
+                                        app.nodes = nodes;
+                                    }
+                                    Err(error) => app.notice = Some(error),
+                                }
+                                app.panel = response.panel;
+                                if app.selected.as_ref().is_some_and(|id| !app.nodes.iter().any(|n| &n.id == id)) {
+                                    app.navigate(Page::Overview, None, cx);
+                                }
+                                if app.selected_row.is_some_and(|i| app.panel.as_ref().and_then(|p| p.as_ref().ok()).is_none_or(|p| i >= p.rows.len())) {
+                                    app.selected_row = None;
+                                }
+                                cx.notify();
+                            }
                         }
                     })
-                    .is_ok();
-                if !alive {
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -191,121 +429,89 @@ impl TuneApp {
         app
     }
 
-    fn reload(&mut self) {
-        let cfg = self.engine.config();
-        let ledger: Vec<_> = cfg.nodes.iter().map(nodes::Node::public).collect();
-        match self.engine.last() {
-            Ok(last) => {
-                self.nodes = model::build(&ledger, &last);
-                for n in &mut self.nodes {
-                    if let Ok(rows) = self.engine.with_db(|d| d.history(&n.id, 60)) {
-                        n.score_trend = model::series(&rows, "score");
-                        n.cpu_trend = model::series(&rows, "cpu");
-                        n.mem_trend = model::series(&rows, "mem_avail");
-                    }
-                }
-                self.notice = self.engine.config_error();
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        self.generation = self.generation.wrapping_add(1);
+        self.loading = true;
+        let route = self.selected.clone().map_or(Route::Page(self.page), Route::Node);
+        if let Err(error) = self.reader.request(Request { generation: self.generation, route, query: self.query.clone(), log_level: self.log_level }) {
+            self.loading = false;
+            self.panel = Some(Err(error));
+        }
+        cx.notify();
+    }
+
+    fn navigate(&mut self, page: Page, selected: Option<String>, cx: &mut Context<Self>) {
+        if self.selected != selected {
+            self.live.stop(Stop::User);
+        }
+        self.live_notice = None;
+        self.live.take_notice();
+        self.page = page;
+        self.selected = selected;
+        self.query.clear();
+        self.panel = None;
+        self.selected_row = None;
+        self.scroll = UniformListScrollHandle::new();
+        self.search.update(cx, |field, cx| field.reset(page.search_hint(), cx));
+        self.reload(cx);
+    }
+
+    fn refresh_live(&self, (generation, id): (u64, String)) {
+        let engine = self.engine.clone();
+        let control = self.live.clone();
+        self.rt.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let cfg = engine.reload_config();
+                (cfg.nodes, engine.config_error())
+            })
+            .await;
+            match result {
+                Ok((nodes, error)) => control.complete(generation, &id, &nodes, error),
+                Err(_) => control.complete(generation, &id, &[], Some("台帳の読み込みタスクが停止しました".into())),
             }
-            Err(e) => self.notice = Some(e),
+        });
+    }
+
+    fn live_start(&mut self, id: &str, window: &Window) {
+        self.live_notice = None;
+        self.live.set_active(window.is_window_active());
+        if self.selected.as_deref() != Some(id) {
+            self.live_notice = Some("ライブを開始する機体を先に開いてください".into());
+            return;
         }
-        if self.selected.as_ref().is_some_and(|id| !self.nodes.iter().any(|n| &n.id == id)) {
-            self.selected = None;
-        }
-        if self.page_logs {
-            self.load_logs();
-        }
-        if self.page_status {
-            self.load_status();
+        if let Some(request) = self.live.request(id) {
+            self.refresh_live(request);
         }
     }
 
-    /// 直近 7 日。重い取り込みはせず、保存済みを読むだけ
-    fn load_logs(&mut self) {
-        let since = now_ms() - 7 * 86_400_000;
-        let mut f = serde_json::json!({ "since": since, "limit": 200 });
-        if let Some(l) = self.log_level {
-            f["level"] = l.into();
-        }
-        if let Ok(rows) = self.engine.logs_query(&f) {
-            self.logs = model::log_rows(&rows);
-        }
-        if let Ok(sigs) = self.engine.logs_signatures(&serde_json::json!({ "since": since, "limit": 15 })) {
-            self.sigs = model::signatures(&sigs);
-        }
-    }
-
-    /// 合図は 30 秒ごと。Engine 側は 2 分途切れると自動で止める
-    fn live_heartbeat(&mut self) {
-        if self.live_on.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(30)) {
-            let id = self.live_on.as_ref().map(|(id, _)| id.clone()).unwrap_or_default();
-            self.live_start(&id);
+    fn cycle_page(&mut self, direction: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let i = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.nodes.iter().position(|n| &n.id == id))
+            .map(|i| i + Page::ALL.len())
+            .unwrap_or_else(|| Page::ALL.iter().position(|p| *p == self.page).unwrap_or(0));
+        let next = (i as isize + direction).rem_euclid((Page::ALL.len() + self.nodes.len()) as isize) as usize;
+        self.focus.focus(window);
+        if next < Page::ALL.len() {
+            self.navigate(Page::ALL[next], None, cx);
+        } else {
+            self.navigate(Page::Overview, Some(self.nodes[next - Page::ALL.len()].id.clone()), cx);
         }
     }
 
-    fn live_start(&mut self, id: &str) {
-        let cfg = self.engine.reload_config();
-        let nodes: Vec<_> = cfg.nodes.iter().filter(|n| n.id == id).cloned().collect();
-        let _g = self.rt.enter();
-        self.live.start(&nodes, &[]);
-        self.live_on = Some((id.to_string(), Instant::now()));
-    }
-
-    fn live_stop(&mut self) {
-        if let Some((id, _)) = self.live_on.take() {
-            self.live.stop(Some(&[id]), Stop::User);
+    fn select_row(&mut self, direction: isize, cx: &mut Context<Self>) {
+        let Some(Ok(panel)) = self.panel.as_ref() else {
+            return;
+        };
+        if panel.rows.is_empty() {
+            return;
         }
-    }
-
-    fn select(&mut self, id: Option<String>, cx: &mut Context<Self>) {
-        // 画面を移ったらライブは止める（見ていない機体に流し続けない）
-        if self.live_on.as_ref().map(|(i, _)| i) != id.as_ref() {
-            self.live_stop();
-        }
-        self.selected = id;
-        self.clear_pages();
-        cx.notify();
-    }
-
-    fn clear_pages(&mut self) {
-        self.page_logs = false;
-        self.page_topology = false;
-        self.page_status = false;
-    }
-
-    fn open_status(&mut self, cx: &mut Context<Self>) {
-        self.live_stop();
-        self.selected = None;
-        self.clear_pages();
-        self.page_status = true;
-        self.load_status();
-        cx.notify();
-    }
-
-    /// 保存済みの現在状態を読むだけ（状態の再計算・通知はしない）
-    fn load_status(&mut self) {
-        if let Ok(v) = self.engine.status_snapshot() {
-            self.status = model::status(&v);
-        }
-    }
-
-    fn open_topology(&mut self, cx: &mut Context<Self>) {
-        self.live_stop();
-        self.selected = None;
-        self.clear_pages();
-        self.page_topology = true;
-        // 保存済みを読むだけ。更新（収集）は行わない
-        if let Ok(v) = self.engine.topology_ui_view(&Default::default()) {
-            self.topology = model::topology(&v);
-        }
-        cx.notify();
-    }
-
-    fn open_logs(&mut self, cx: &mut Context<Self>) {
-        self.live_stop();
-        self.selected = None;
-        self.clear_pages();
-        self.page_logs = true;
-        self.load_logs();
+        let next = self
+            .selected_row
+            .map_or(if direction > 0 { 0 } else { panel.rows.len() - 1 }, |i| (i as isize + direction).clamp(0, panel.rows.len() as isize - 1) as usize);
+        self.selected_row = Some(next);
+        self.scroll.scroll_to_item(next, gpui::ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -322,7 +528,7 @@ impl TuneApp {
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let row = |id: gpui::ElementId, label: String, dot: Hsla, tail: String, active: bool, target: Option<String>, cx: &mut Context<Self>| {
+        let row = |id: gpui::ElementId, label: String, dot: Hsla, tail: String, active: bool, page: Page, target: Option<String>, cx: &mut Context<Self>| {
             div()
                 .id(id)
                 .flex()
@@ -339,73 +545,27 @@ impl TuneApp {
                 .child(div().text_xs().text_color(palette::muted()).child(tail))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |app, _, _, cx| {
-                        app.select(target.clone(), cx);
+                    cx.listener(move |app, _, window, cx| {
+                        app.focus.focus(window);
+                        app.navigate(page, target.clone(), cx);
                     }),
                 )
         };
         let mut list = div().flex().flex_col().gap_0p5().p_2();
-        list = list.child(row(
-            ("nav", 0usize).into(),
-            "概要".into(),
-            palette::accent(),
-            String::new(),
-            self.selected.is_none() && !self.page_logs && !self.page_topology && !self.page_status,
-            None,
-            cx,
-        ));
-        list = list.child(
-            div()
-                .id(("nav", 9997usize))
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_1p5()
-                .rounded_md()
-                .cursor_pointer()
-                .when(self.page_status, |d| d.bg(palette::card()))
-                .hover(|d| d.bg(palette::card()))
-                .child(div().size_2().rounded_full().bg(if self.status.count(model::CheckStatus::Fail) > 0 { palette::crit() } else { palette::muted() }))
-                .child(div().flex_1().text_sm().child("状態"))
-                .child(div().text_xs().text_color(palette::muted()).child(match self.status.count(model::CheckStatus::Fail) {
-                    0 => String::new(),
-                    n => n.to_string(),
-                }))
-                .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.open_status(cx))),
-        );
-        list = list.child(
-            div()
-                .id(("nav", 9999usize))
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_1p5()
-                .rounded_md()
-                .cursor_pointer()
-                .when(self.page_logs, |d| d.bg(palette::card()))
-                .hover(|d| d.bg(palette::card()))
-                .child(div().size_2().rounded_full().bg(palette::muted()))
-                .child(div().flex_1().text_sm().child("ログ"))
-                .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.open_logs(cx))),
-        );
-        list = list.child(
-            div()
-                .id(("nav", 9998usize))
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_1p5()
-                .rounded_md()
-                .cursor_pointer()
-                .when(self.page_topology, |d| d.bg(palette::card()))
-                .hover(|d| d.bg(palette::card()))
-                .child(div().size_2().rounded_full().bg(palette::muted()))
-                .child(div().flex_1().text_sm().child("構成図"))
-                .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.open_topology(cx))),
-        );
+        list = list.child(div().px_3().pt_2().pb_1().text_xs().text_color(palette::muted()).child("ワークスペース"));
+        for (i, page) in Page::ALL.into_iter().enumerate() {
+            list = list.child(row(
+                ("page", i).into(),
+                page.label().into(),
+                palette::accent(),
+                String::new(),
+                self.selected.is_none() && self.page == page,
+                page,
+                None,
+                cx,
+            ));
+        }
+        list = list.child(div().px_3().pt_4().pb_1().text_xs().text_color(palette::muted()).child(format!("機体 · {}", self.nodes.len())));
         for (i, n) in self.nodes.iter().enumerate() {
             let tail = match &n.health {
                 Health::Scored(s) => s.to_string(),
@@ -419,6 +579,7 @@ impl TuneApp {
                 score_color(&n.health),
                 tail,
                 self.selected.as_deref() == Some(&n.id),
+                Page::Overview,
                 Some(n.id.clone()),
                 cx,
             ));
@@ -434,30 +595,20 @@ impl TuneApp {
             .border_color(palette::line())
             .child(
                 div()
-                    .px_4()
-                    .pt_4()
-                    .pb_2()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .text_sm()
-                    .font_weight(FontWeight::BOLD)
+                    .px_4()
+                    .pt_4()
+                    .pb_2()
                     .child(img(self.brand.clone()).size_8().flex_none())
-                    .child("Katala Tune"),
+                    .child(div().text_sm().font_weight(FontWeight::BOLD).child("Katala Tune")),
             )
             .child(div().flex_1().id("nodes").overflow_y_scroll().child(list))
     }
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = if self.page_status {
-            "状態".to_string()
-        } else if self.page_topology {
-            "構成図".to_string()
-        } else if self.page_logs {
-            "ログ".to_string()
-        } else {
-            self.selected.clone().unwrap_or_else(|| "概要".into())
-        };
+        let title = self.selected.clone().unwrap_or_else(|| self.page.label().into());
         let (crit, warn): (usize, usize) = self.nodes.iter().fold((0, 0), |a, n| (a.0 + n.count(Severity::Critical), a.1 + n.count(Severity::Warn)));
         let busy = self.probing;
         div()
@@ -500,9 +651,6 @@ impl TuneApp {
                 Health::Excluded(_) => "対象外".into(),
             };
             let mut foot = div().flex().flex_wrap().gap_1p5();
-            if let Health::Excluded(label) = &n.health {
-                foot = foot.child(chip(label.clone(), palette::muted()));
-            }
             if let Health::Failed(e) = &n.health {
                 foot = foot.child(
                     div()
@@ -512,6 +660,9 @@ impl TuneApp {
                         .text_ellipsis()
                         .child(chip(e.lines().next().unwrap_or("失敗").to_string(), palette::crit())),
                 );
+            }
+            if let Health::Excluded(label) = &n.health {
+                foot = foot.child(chip(label.clone(), palette::muted()));
             }
             for (sev, count) in [(Severity::Critical, n.count(Severity::Critical)), (Severity::Warn, n.count(Severity::Warn))] {
                 if count > 0 {
@@ -554,12 +705,13 @@ impl TuneApp {
                     )))
                     .child(metric("CPU", n.cpu_busy, "%"))
                     .child(metric("空きメモリ", n.mem_avail_pct, "%"))
-                    .when(!n.score_trend.is_empty(), |d| d.child(trend(&n.score_trend, 100.0, score_color(&n.health), 18.0, 60)))
+                    .when(!n.score_trend.is_empty(), |d| d.child(trend(&n.score_trend, 100.0, score_color(&n.health), 18.0)))
                     .child(foot)
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |app, _, _, cx| {
-                            app.select(Some(id.clone()), cx);
+                        cx.listener(move |app, _, window, cx| {
+                            app.focus.focus(window);
+                            app.navigate(Page::Overview, Some(id.clone()), cx);
                         }),
                     ),
             );
@@ -568,238 +720,6 @@ impl TuneApp {
             grid = grid.child(div().text_color(palette::muted()).child("台帳に機体がありません（~/.config/katala-tune/nodes.json）"));
         }
         div().id("overview-scroll").flex_1().overflow_y_scroll().child(grid)
-    }
-
-    fn logs_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let now = now_ms();
-        let level_color = |l: &str| match l {
-            "critical" | "error" => palette::crit(),
-            "warn" => palette::warn(),
-            _ => palette::muted(),
-        };
-        let mut filters = div().flex().gap_2();
-        for (i, (label, level)) in [("すべて", None), ("重大", Some("critical")), ("エラー", Some("error")), ("警告", Some("warn"))].into_iter().enumerate()
-        {
-            let active = self.log_level == level;
-            filters = filters.child(
-                div()
-                    .id(("lvl", i))
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .text_sm()
-                    .cursor_pointer()
-                    .bg(if active { palette::accent() } else { palette::card() })
-                    .child(label)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |app, _, _, cx| {
-                            app.log_level = level;
-                            app.load_logs();
-                            cx.notify();
-                        }),
-                    ),
-            );
-        }
-        let mut sigs = div().flex().flex_col().gap_1p5().w(px(360.0)).flex_none();
-        sigs = sigs.child(div().text_xs().text_color(palette::muted()).child("同種ログ（7 日）"));
-        for s in &self.sigs {
-            sigs = sigs.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .p_2()
-                    .rounded_md()
-                    .bg(palette::card())
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(chip(model::level_label(&s.level), level_color(&s.level)))
-                            .child(div().text_xs().text_color(palette::muted()).child(format!("{} 件 · {} 台", s.count, s.nodes))),
-                    )
-                    .child(div().text_xs().child(s.sample.clone())),
-            );
-        }
-        if self.sigs.is_empty() {
-            sigs = sigs.child(div().text_sm().text_color(palette::muted()).child("まだログを取り込んでいません"));
-        }
-        let mut rows = div().flex().flex_col().gap_1().flex_1().min_w_0();
-        rows = rows.child(div().text_xs().text_color(palette::muted()).child(format!("新しい順（{} 件）", self.logs.len().min(200))));
-        for l in &self.logs {
-            rows = rows.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(palette::card())
-                    .child(div().w(px(56.0)).flex_none().child(chip(model::level_label(&l.level), level_color(&l.level))))
-                    .child(div().text_xs().text_color(palette::muted()).w(px(84.0)).flex_none().truncate().child(l.node.clone()))
-                    .child(div().text_xs().text_color(palette::muted()).w(px(64.0)).flex_none().child(model::ago(now, l.ts_ms)))
-                    .child(div().flex_1().min_w_0().truncate().text_xs().child(l.message.clone())),
-            );
-        }
-        div().id("logs").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5().child(filters).child(div().flex().gap_4().child(sigs).child(rows))
-    }
-
-    fn topology_page(&self) -> impl IntoElement {
-        let t = &self.topology;
-        let now = now_ms();
-        let note = |title: &str, body: String| {
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .p_3()
-                .rounded_md()
-                .bg(palette::card())
-                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(title.to_string()))
-                .child(div().text_xs().text_color(palette::muted()).child(body))
-        };
-        let stat = |label: &str, v: String| {
-            div()
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .child(div().text_xs().text_color(palette::muted()).child(label.to_string()))
-                .child(div().text_lg().font_weight(FontWeight::BOLD).child(v))
-        };
-        let mut scopes = div().flex().flex_col().gap_1();
-        for s in &t.scopes {
-            let color = match s.status.as_str() {
-                "complete" => palette::ok(),
-                "failed" => palette::crit(),
-                "partial" => palette::warn(),
-                _ => palette::muted(),
-            };
-            scopes = scopes.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(palette::card())
-                    .child(div().w(px(72.0)).flex_none().child(chip(model::scope_status_label(&s.status), color)))
-                    .child(div().flex_1().min_w_0().truncate().text_xs().child(s.id.clone()))
-                    .child(div().text_xs().text_color(palette::muted()).child(s.observed_ms.map_or("未観測".to_string(), |a| model::ago(now, a)))),
-            );
-        }
-        let mut kinds = div().flex().flex_wrap().gap_2();
-        for (k, n) in &t.kind_counts {
-            kinds = kinds.child(chip(format!("{k} {n}"), palette::muted()));
-        }
-        let mut ents = div().flex().flex_col().gap_1();
-        for (k, label) in t.entities.iter().take(200) {
-            ents = ents.child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(palette::card())
-                    .child(div().w(px(140.0)).flex_none().truncate().text_xs().text_color(palette::muted()).child(k.clone()))
-                    .child(div().flex_1().min_w_0().truncate().text_xs().child(label.clone())),
-            );
-        }
-        div().id("topology").flex_1().overflow_y_scroll().flex().flex_col().gap_4().p_5()
-            .child(note(
-                "表示範囲と検査について",
-                format!(
-                    "表示中の項目だけを検査しています。表示外の項目と保存原本全体は未検査です。保存項目数: 実体 {} 件 / 関係 {} 件（全件を検査した件数ではありません）。表示は上限付きで、属性・履歴の一部を省略しています。",
-                    t.stored_entities, t.stored_edges
-                ),
-            ))
-            .child(note("観測時点の構成図です", "完了範囲でも、表示は最後に観測した時点の記録です。リアルタイムの存在判定ではありません。更新は read-only です。".into()))
-            .child(div().flex().gap_8().child(stat("範囲", t.scopes.len().to_string())).child(stat("履歴", t.history.to_string())).child(stat("実体（表示 / 保存）", format!("{} / {}", t.entities.len().min(200), t.stored_entities))).child(stat("関係（表示 / 保存）", format!("{} / {}", t.edges_shown, t.stored_edges))))
-            .child(div().text_xs().text_color(palette::muted()).child("収集の範囲"))
-            .child(scopes)
-            .child(div().text_xs().text_color(palette::muted()).child("実体の種類（表示中）"))
-            .child(kinds)
-            .child(div().text_xs().text_color(palette::muted()).child(format!("実体（表示 {} 件まで）", t.entities.len().min(200))))
-            .child(ents)
-    }
-
-    fn status_page(&self) -> impl IntoElement {
-        let st = &self.status;
-        let now = now_ms();
-        let color = |s: model::CheckStatus| match s {
-            model::CheckStatus::Fail => palette::crit(),
-            model::CheckStatus::Warn => palette::warn(),
-            model::CheckStatus::Ok => palette::ok(),
-            model::CheckStatus::Unknown => palette::muted(),
-        };
-        let mut counts = div().flex().gap_2();
-        for s in [model::CheckStatus::Fail, model::CheckStatus::Warn, model::CheckStatus::Unknown, model::CheckStatus::Ok] {
-            counts = counts.child(chip(format!("{} {}", s.label(), st.count(s)), color(s)));
-        }
-        let when = |label: &str, t: Option<i64>| format!("{label} {}", t.map_or("未実施".to_string(), |t| model::ago(now, t)));
-        let mut rows = div().flex().flex_col().gap_1();
-        for c in &st.checks {
-            rows = rows.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(palette::card())
-                    .child(div().w(px(56.0)).flex_none().child(chip(c.status.label(), color(c.status))))
-                    .child(div().w(px(110.0)).flex_none().truncate().text_xs().text_color(palette::muted()).child(c.scope.clone()))
-                    .child(div().w(px(150.0)).flex_none().truncate().text_xs().font_weight(FontWeight::SEMIBOLD).child(c.name.clone()))
-                    .child(div().flex_1().min_w_0().truncate().text_xs().text_color(palette::muted()).child(c.detail.clone())),
-            );
-        }
-        let mut events = div().flex().flex_col().gap_1();
-        for e in st.events.iter().take(30) {
-            events = events.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(palette::card())
-                    .child(div().w(px(64.0)).flex_none().text_xs().text_color(palette::muted()).child(model::ago(now, e.ts_ms)))
-                    .child(div().w(px(110.0)).flex_none().truncate().text_xs().text_color(palette::muted()).child(e.scope.clone()))
-                    .child(div().w(px(120.0)).flex_none().truncate().text_xs().child(e.name.clone()))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .flex_none()
-                            .child(chip(e.from.label(), color(e.from)))
-                            .child(div().text_xs().child("→"))
-                            .child(chip(e.to.label(), color(e.to))),
-                    )
-                    .child(div().flex_1().min_w_0().truncate().text_xs().text_color(palette::muted()).child(e.detail.clone())),
-            );
-        }
-        div()
-            .id("status")
-            .flex_1()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_5()
-            .child(div().flex().items_center().gap_4().child(counts).child(div().text_xs().text_color(palette::muted()).child(format!(
-                "{} · {}",
-                when("分析", st.last_probe_ms),
-                when("ログ取り込み", st.last_logs_ms)
-            ))))
-            .child(rows)
-            .child(div().text_xs().text_color(palette::muted()).child(format!("最近の変化（{} 件まで）", st.events.len().min(30))))
-            .child(events)
     }
 
     fn finding_row(f: &Finding) -> impl IntoElement {
@@ -843,7 +763,7 @@ impl TuneApp {
         if let Some(u) = n.uptime_h {
             facts = facts.child(chip(format!("稼働 {}", model::uptime(u)), palette::muted()));
         }
-        let on = self.live_on.as_ref().is_some_and(|(i, _)| i == id);
+        let on = self.live.on(id);
         let toggle = {
             let id = id.to_string();
             div()
@@ -859,20 +779,23 @@ impl TuneApp {
                 .child(if on { "ライブを止める" } else { "ライブ（1 秒ごと）" })
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |app, _, _, cx| {
-                        if app.live_on.is_some() {
-                            app.live_stop();
+                    cx.listener(move |app, _, window, cx| {
+                        if app.live.on(&id) {
+                            app.live.stop(Stop::User);
                         } else {
-                            app.live_start(&id);
+                            app.live_start(&id, window);
                         }
                         cx.notify();
                     }),
                 )
         };
+        facts = facts.child(toggle);
         let live_panel = if on {
-            let store = self.live_store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let l = store.0.get(id).cloned().unwrap_or_default();
-            let now = |v: &[f64]| v.last().map_or("–".to_string(), |x| format!("{x:.0}%"));
+            let l = {
+                let store = self.live_store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                store.0.get(id).cloned().unwrap_or_default()
+            };
+            let now = |v: Option<f64>| v.map_or("–".to_string(), |x| format!("{x:.0}%"));
             let status = if l.cpu.is_empty() { Some(format!("接続中… {}", l.detail.clone().unwrap_or_default())) } else { None };
             Some(
                 div()
@@ -884,37 +807,37 @@ impl TuneApp {
                     .bg(palette::card())
                     .border_1()
                     .border_color(palette::accent())
-                    .child(div().text_xs().text_color(palette::muted()).child(format!("ライブ（直近 {} 秒）· {}", l.cpu.len(), l.state)))
+                    .child(div().text_xs().text_color(palette::muted()).child(format!("ライブ（直近 {} 有効点まで）· {}", model::LIVE_KEEP, l.state)))
                     .when_some(status, |d, s| d.child(div().text_sm().text_color(palette::warn()).child(s)))
                     .child(
                         div()
                             .flex()
-                            .items_end()
-                            .gap_4()
+                            .flex_col()
+                            .gap_2()
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
                                     .gap_1()
                                     .child(div().text_xs().text_color(palette::muted()).child("CPU"))
-                                    .child(div().text_xl().font_weight(FontWeight::BOLD).child(now(&l.cpu))),
+                                    .child(div().text_xl().font_weight(FontWeight::BOLD).child(now(l.latest_cpu))),
                             )
-                            .child(trend(&l.cpu, 100.0, palette::accent(), 48.0, model::LIVE_KEEP)),
+                            .child(trend(&l.cpu, 100.0, palette::accent(), 48.0)),
                     )
                     .child(
                         div()
                             .flex()
-                            .items_end()
-                            .gap_4()
+                            .flex_col()
+                            .gap_2()
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
                                     .gap_1()
                                     .child(div().text_xs().text_color(palette::muted()).child("メモリ使用"))
-                                    .child(div().text_xl().font_weight(FontWeight::BOLD).child(now(&l.mem))),
+                                    .child(div().text_xl().font_weight(FontWeight::BOLD).child(now(l.latest_mem))),
                             )
-                            .child(trend(&l.mem, 100.0, palette::warn(), 48.0, model::LIVE_KEEP)),
+                            .child(trend(&l.mem, 100.0, palette::warn(), 48.0)),
                     ),
             )
         } else {
@@ -936,7 +859,7 @@ impl TuneApp {
                         .rounded_md()
                         .bg(palette::card())
                         .child(div().text_xs().text_color(palette::muted()).child(format!("{label}（直近 {} 回）", values.len().min(60))))
-                        .child(trend(values, max, color, 44.0, 60)),
+                        .child(trend(values, max, color, 44.0)),
                 );
             }
         }
@@ -959,33 +882,275 @@ impl TuneApp {
             .flex_col()
             .gap_4()
             .p_5()
-            .child(div().flex().items_center().gap_3().child(div().flex_1().child(facts)).child(toggle))
+            .child(facts)
             .when_some(live_panel, |d, p| d.child(p))
             .child(trends)
             .child(body)
+    }
+    fn record_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let toolbar = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_5()
+            .py_3()
+            .child(div().flex_1().min_w_0().child(self.search.clone()))
+            .child(div().id("search-submit").px_3().py_2().rounded_md().bg(palette::accent()).text_sm().cursor_pointer().child("検索").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|app, _, _, cx| {
+                    if app.search.read(cx).is_composing() {
+                        return;
+                    }
+                    app.query = app.search.read(cx).text().to_owned();
+                    app.selected_row = None;
+                    app.scroll = UniformListScrollHandle::new();
+                    app.reload(cx);
+                }),
+            ))
+            .child(
+                div()
+                    .id("refresh-view")
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(palette::card())
+                    .text_sm()
+                    .cursor_pointer()
+                    .child("再読込")
+                    .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.reload(cx))),
+            );
+        let mut body = div().flex_1().min_h_0().flex().flex_col().child(toolbar);
+        if self.page == Page::Logs {
+            let mut levels = div().flex().gap_2().px_5().pb_3();
+            for (i, level) in LogLevel::ALL.into_iter().enumerate() {
+                levels = levels.child(
+                    div()
+                        .id(("log-level", i))
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .text_sm()
+                        .bg(if self.log_level == level { palette::accent() } else { palette::card() })
+                        .cursor_pointer()
+                        .child(level.label())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |app, _, _, cx| {
+                                app.log_level = level;
+                                app.selected_row = None;
+                                app.scroll = UniformListScrollHandle::new();
+                                app.reload(cx);
+                            }),
+                        ),
+                );
+            }
+            body = body.child(levels);
+        }
+        let Some(panel) = self.panel.as_ref() else {
+            return body.child(div().p_5().text_sm().text_color(palette::muted()).child(if self.loading {
+                "保存データを読み込んでいます…"
+            } else {
+                "保存データを表示できません"
+            }));
+        };
+        let panel = match panel {
+            Ok(panel) => panel,
+            Err(error) => return body.child(div().px_5().py_3().text_sm().text_color(palette::crit()).child(format!("読み込みに失敗: {error}"))),
+        };
+        let mut facts = div().flex().flex_wrap().gap_2().px_5().pb_3();
+        for (label, value) in &panel.facts {
+            facts = facts.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(palette::card())
+                    .child(div().text_xs().text_color(palette::muted()).child(label.clone()))
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(value.clone())),
+            );
+        }
+        body = body.child(div().id("summary-facts").max_h(px(128.)).flex_none().overflow_y_scroll().child(facts)).child(
+            div()
+                .id("scope-note")
+                .max_h(px(80.))
+                .flex_none()
+                .overflow_y_scroll()
+                .px_5()
+                .pb_3()
+                .text_xs()
+                .text_color(palette::muted())
+                .child(panel.note.clone()),
+        );
+        if panel.rows.is_empty() {
+            body = body.child(div().flex_1().p_5().text_sm().text_color(palette::muted()).child("この表示範囲に該当する保存レコードはありません"));
+        } else {
+            body = body.child(
+                uniform_list(
+                    "records",
+                    panel.rows.len(),
+                    cx.processor(|app, range: std::ops::Range<usize>, _, cx| {
+                        let Some(Ok(panel)) = app.panel.as_ref() else {
+                            return Vec::new();
+                        };
+                        range
+                            .filter_map(|i| {
+                                panel.rows.get(i).map(|row| {
+                                    let color = match row.tone {
+                                        Tone::Normal => palette::text(),
+                                        Tone::Muted => palette::muted(),
+                                        Tone::Good => palette::ok(),
+                                        Tone::Warning => palette::warn(),
+                                        Tone::Error => palette::crit(),
+                                    };
+                                    div()
+                                        .id(("record", i))
+                                        .h(px(68.))
+                                        .px_5()
+                                        .py_2()
+                                        .border_b_1()
+                                        .border_color(palette::line())
+                                        .when(app.selected_row == Some(i), |d| d.bg(palette::card()))
+                                        .hover(|d| d.bg(palette::card()))
+                                        .cursor_pointer()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_3()
+                                                .child(div().flex_1().min_w_0().truncate().text_sm().font_weight(FontWeight::MEDIUM).child(row.title.clone()))
+                                                .child(chip(row.badge.clone(), color)),
+                                        )
+                                        .child(div().mt_1().truncate().text_xs().text_color(palette::muted()).child(row.detail.replace(['\n', '\r'], " ")))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |app, _, window, cx| {
+                                                app.selected_row = Some(i);
+                                                app.focus.focus(window);
+                                                cx.notify();
+                                            }),
+                                        )
+                                })
+                            })
+                            .collect()
+                    }),
+                )
+                .track_scroll(self.scroll.clone())
+                .flex_1()
+                .min_h_0(),
+            );
+        }
+        if let Some(row) = self.selected_row.and_then(|i| panel.rows.get(i)) {
+            body = body.child(
+                div()
+                    .max_h(px(180.))
+                    .flex_none()
+                    .border_t_1()
+                    .border_color(palette::accent())
+                    .bg(palette::panel())
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_5()
+                            .py_2()
+                            .child(div().flex_1().min_w_0().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(row.title.clone()))
+                            .child(
+                                div()
+                                    .id("copy-record")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(palette::card())
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .child("コピー")
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.copy_record(cx))),
+                            ),
+                    )
+                    .child(div().id("record-detail").overflow_y_scroll().px_5().pb_3().text_sm().child(format!("{}\n{}", row.title, row.detail))),
+            );
+        }
+        body.child(div().px_5().py_2().text_xs().text_color(palette::muted()).child(format!(
+            "{}表示行 · {}",
+            panel.rows.len(),
+            if self.loading { "読み込み中（前回の表示）" } else { "保存済みデータ · ↑↓で詳細 / Tabで検索へ" }
+        )))
+    }
+
+    fn copy_record(&self, cx: &mut Context<Self>) {
+        if let Some(row) = self.panel.as_ref().and_then(|p| p.as_ref().ok()).and_then(|p| self.selected_row.and_then(|i| p.rows.get(i))) {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(format!("{}\n{}\n{}", row.title, row.badge, row.detail)));
+        }
     }
 }
 
 impl Render for TuneApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match self.selected.clone() {
-            _ if self.page_status => self.status_page().into_any_element(),
-            _ if self.page_topology => self.topology_page().into_any_element(),
-            _ if self.page_logs => self.logs_page(cx).into_any_element(),
             Some(id) => self.detail(&id, cx).into_any_element(),
-            None => self.overview(cx).into_any_element(),
+            None if self.page == Page::Overview => self.overview(cx).into_any_element(),
+            None => self.record_panel(cx).into_any_element(),
         };
-        div().size_full().flex().font_family(FONT).bg(palette::bg()).text_color(palette::text()).child(self.sidebar(cx)).child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .child(self.header(cx))
-                .when_some(self.notice.clone(), |d, n| d.child(div().px_5().py_2().text_xs().text_color(palette::warn()).child(n)))
-                .child(main),
-        )
+        div()
+            .key_context("Browser")
+            .track_focus(&self.focus)
+            .on_action(|_: &Quit, _, cx| cx.quit())
+            .on_action(|_: &CloseWindow, window, _| window.remove_window())
+            .on_action(cx.listener(|app, _: &GoOverview, window, cx| {
+                app.focus.focus(window);
+                app.navigate(Page::Overview, None, cx);
+            }))
+            .on_action(cx.listener(|app, _: &NextPage, window, cx| app.cycle_page(1, window, cx)))
+            .on_action(cx.listener(|app, _: &PreviousPage, window, cx| app.cycle_page(-1, window, cx)))
+            .on_action(cx.listener(|app, _: &Refresh, _, cx| app.reload(cx)))
+            .on_action(cx.listener(|app, _: &FocusSearch, window, cx| {
+                if app.selected.is_none() && app.page != Page::Overview {
+                    app.search.focus_handle(cx).focus(window);
+                }
+            }))
+            .on_action(cx.listener(|app, _: &FocusContent, window, _| app.focus.focus(window)))
+            .on_action(cx.listener(|app, _: &ToggleFocus, window, cx| {
+                if app.selected.is_none() && app.page != Page::Overview && !app.search.focus_handle(cx).is_focused(window) {
+                    app.search.focus_handle(cx).focus(window);
+                } else {
+                    app.focus.focus(window);
+                }
+            }))
+            .on_action(cx.listener(|app, _: &NextRow, _, cx| app.select_row(1, cx)))
+            .on_action(cx.listener(|app, _: &PreviousRow, _, cx| app.select_row(-1, cx)))
+            .on_action(cx.listener(|app, _: &CopyRecord, _, cx| app.copy_record(cx)))
+            .size_full()
+            .flex()
+            .font_family(FONT)
+            .bg(palette::bg())
+            .text_color(palette::text())
+            .child(self.sidebar(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(self.header(cx))
+                    .when_some(self.notice.clone(), |d, n| d.child(div().px_5().py_2().text_xs().text_color(palette::warn()).child(n)))
+                    .when_some(self.live_notice.clone(), |d, n| d.child(div().px_5().py_2().text_xs().text_color(palette::warn()).child(n)))
+                    .child(main),
+            )
     }
+}
+
+fn open_route(target: &str, ledger: &[nodes::Node]) -> Result<Route, String> {
+    let keys = ["overview", "status", "resources", "processes", "jobs", "logs", "tools", "ai", "security", "specs", "power", "topology", "actions"];
+    if let Some((_, page)) = keys.into_iter().zip(Page::ALL).find(|(key, page)| *key == target || page.label() == target) {
+        return Ok(Route::Page(page));
+    }
+    if ledger.iter().any(|node| node.id == target) {
+        return Ok(Route::Node(target.into()));
+    }
+    Err(format!("--open の表示または機体が見つかりません: {target}"))
 }
 
 pub fn run(options: startup::Options) {
@@ -1009,22 +1174,27 @@ pub fn run(options: startup::Options) {
             }
         }
     };
-
     if let Some(error) = engine.config_error().or_else(|| engine.last().err()) {
         eprintln!("katala-tune-gpui: {error}");
         std::process::exit(1);
     }
 
+    let initial_route = match open.as_deref().map(|target| open_route(target, &engine.config().nodes)).transpose() {
+        Ok(route) => route,
+        Err(error) => {
+            eprintln!("katala-tune-gpui: {error}");
+            std::process::exit(1);
+        }
+    };
     let live_store = Arc::new(Mutex::new(model::LiveStore::default()));
     let live_dirty = Arc::new(AtomicBool::new(false));
     let live = {
         let (store, flag) = (live_store.clone(), live_dirty.clone());
-        let _g = rt.enter();
         let live = Live::new(
             Arc::new(ProcessRoute),
             tune_core::monitor::live_opts(engine.config().nodes.len()),
-            Box::new(move |ev| {
-                store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).merge(&ev);
+            Box::new(move |event| {
+                store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).merge(&event);
                 flag.store(true, Ordering::Release);
             }),
         );
@@ -1033,21 +1203,45 @@ pub fn run(options: startup::Options) {
     };
     let handles = LiveHandles { live: live.clone(), store: live_store, dirty: live_dirty };
     let rt_exit = rt.clone();
+    let failed = Arc::new(AtomicBool::new(false));
+    let failed_exit = failed.clone();
 
     Application::new().run(move |cx: &mut App| {
+        input::bind_keys(cx);
+        cx.bind_keys([
+            KeyBinding::new("alt-down", NextPage, Some("Browser")),
+            KeyBinding::new("alt-up", PreviousPage, Some("Browser")),
+            KeyBinding::new("f5", Refresh, Some("Browser")),
+            KeyBinding::new("escape", FocusContent, Some("Browser")),
+            KeyBinding::new("tab", ToggleFocus, Some("Browser")),
+            KeyBinding::new("shift-tab", ToggleFocus, Some("Browser")),
+            KeyBinding::new("down", NextRow, Some("Browser && !SearchInput")),
+            KeyBinding::new("up", PreviousRow, Some("Browser && !SearchInput")),
+        ]);
+        for modifier in ["cmd", "ctrl"] {
+            cx.bind_keys([
+                KeyBinding::new(format!("{modifier}-q").as_str(), Quit, None),
+                KeyBinding::new(format!("{modifier}-w").as_str(), CloseWindow, Some("Browser")),
+                KeyBinding::new(format!("{modifier}-1").as_str(), GoOverview, Some("Browser")),
+                KeyBinding::new(format!("{modifier}-r").as_str(), Refresh, Some("Browser")),
+                KeyBinding::new(format!("{modifier}-f").as_str(), FocusSearch, Some("Browser")),
+                KeyBinding::new(format!("{modifier}-c").as_str(), CopyRecord, Some("Browser && !SearchInput")),
+            ]);
+        }
         let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
         let window = cx
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(900.), px(640.))),
                     titlebar: Some(gpui::TitlebarOptions {
-                        title: Some("Katala Tune".into()),
+                        title: Some("Katala Tune GPUI Preview".into()),
                         appears_transparent: false,
                         traffic_light_position: Some(point(px(12.0), px(12.0))),
                     }),
                     ..Default::default()
                 },
-                move |_, cx| cx.new(|cx| TuneApp::new(engine, rt, dirty, handles, cx)),
+                move |window, cx| cx.new(|cx| TuneApp::new(engine, rt, dirty, handles, window, cx)),
             )
             .expect("window");
         cx.on_window_closed(|cx| {
@@ -1057,39 +1251,296 @@ pub fn run(options: startup::Options) {
         })
         .detach();
         cx.activate(true);
-        // --open logs|<機体 id>: 起動時に開く画面（画面確認・スクリーンショット用）
-        match open.as_deref() {
-            Some("logs") => drop(window.update(cx, |v, _, cx| v.open_logs(cx))),
-            Some("status") => drop(window.update(cx, |v, _, cx| v.open_status(cx))),
-            Some("topology") => drop(window.update(cx, |v, _, cx| v.open_topology(cx))),
-            Some(id) => drop(window.update(cx, |v, _, cx| v.select(Some(id.to_string()), cx))),
-            None => {}
+        if let Some(route) = initial_route {
+            window
+                .update(cx, |app, _, cx| match route {
+                    Route::Page(page) => app.navigate(page, None, cx),
+                    Route::Node(id) => app.navigate(Page::Overview, Some(id), cx),
+                })
+                .ok();
         }
         if selftest {
-            let view = window.update(cx, |v, _, _| v.nodes.len()).unwrap_or(0);
-            // --live <id>: その機体のライブを流し、点が届くまで確かめる（E2E 用）
-            if let Some(id) = &live_id {
-                window.update(cx, |v, _, _| v.live_start(id)).ok();
-            }
-            if logs {
-                window.update(cx, |v, _, cx| v.open_logs(cx)).ok();
-            }
             cx.spawn(async move |cx| {
-                cx.background_executor().timer(Duration::from_millis(if live_id.is_some() { 8000 } else { 1500 })).await;
-                println!("selftest ok nodes={view}");
-                if logs {
-                    let (r, g) = window.update(cx, |v, _, _| (v.logs.len(), v.sigs.len())).unwrap_or((0, 0));
-                    println!("selftest logs rows={r} sigs={g}");
+                let result: Result<(), String> = async {
+                    let mut count = 0;
+                    let mut nodes = 0;
+                    let mut log_counts = None;
+                    // All saved-data routes run before any explicit live diagnostic.
+                    for page in Page::ALL {
+                        window.update(cx, |app, _, cx| app.navigate(page, None, cx)).map_err(|_| "selftest window closed".to_string())?;
+                        let mut loaded = false;
+                        for _ in 0..100 {
+                            cx.background_executor().timer(Duration::from_millis(100)).await;
+                            let state = window
+                                .update(cx, |app, _, _| {
+                                    if app.loading {
+                                        return None;
+                                    }
+                                    if logs && page == Page::Logs {
+                                        log_counts = app.panel.as_ref().and_then(|p| p.as_ref().ok()).map(|p| {
+                                            (
+                                                p.rows.iter().filter(|r| r.title.starts_with("ログ · ")).count(),
+                                                p.rows.iter().filter(|r| r.title.starts_with("署名 · ")).count(),
+                                            )
+                                        });
+                                    }
+                                    Some((app.nodes.len(), app.notice.clone().or_else(|| app.panel.as_ref().and_then(|p| p.as_ref().err().cloned()))))
+                                })
+                                .map_err(|_| "selftest window closed".to_string())?;
+                            match state {
+                                Some((n, None)) => {
+                                    nodes = n;
+                                    loaded = true;
+                                    break;
+                                }
+                                Some((_, Some(error))) => return Err(format!("selftest failed view={page:?}: {error}")),
+                                None => {}
+                            }
+                        }
+                        if !loaded {
+                            return Err(format!("selftest timed out view={page:?}"));
+                        }
+                        count += 1;
+                    }
+                    if let Some(id) = live_id {
+                        // Select and start once. Subsequent iterations only inspect state.
+                        window
+                            .update(cx, |app, window, cx| {
+                                app.navigate(Page::Overview, Some(id.clone()), cx);
+                                app.live_start(&id, window);
+                                cx.notify();
+                            })
+                            .map_err(|_| "selftest window closed".to_string())?;
+                        let mut valid = 0;
+                        for _ in 0..80 {
+                            cx.background_executor().timer(Duration::from_millis(100)).await;
+                            let (on, points, notice) = window
+                                .update(cx, |app, _, _| {
+                                    (
+                                        app.live.on(&id),
+                                        app.live_store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0.get(&id).map_or(0, |node| node.cpu.len()),
+                                        app.live_notice.clone().or_else(|| app.notice.clone()),
+                                    )
+                                })
+                                .map_err(|_| "selftest window closed".to_string())?;
+                            valid = points;
+                            if !on {
+                                return Err(format!("selftest live failed: {}", notice.unwrap_or_else(|| "stream stopped or refused".into())));
+                            }
+                            if valid >= 3 {
+                                break;
+                            }
+                        }
+                        if valid < 3 {
+                            return Err(format!("selftest live failed: only {valid} valid CPU points within 8s (need 3)"));
+                        }
+                        println!("selftest live points={valid}");
+                    }
+                    if logs {
+                        let (rows, sigs) = log_counts.ok_or_else(|| "selftest logs did not load".to_string())?;
+                        println!("selftest logs rows={rows} sigs={sigs}");
+                    }
+                    println!("selftest ok nodes={nodes} views={count}");
+                    Ok(())
                 }
-                if let Some(id) = live_id {
-                    let n = window.update(cx, |v, _, _| v.live_store.lock().map_or(0, |s| s.0.get(&id).map_or(0, |l| l.cpu.len()))).unwrap_or(0);
-                    println!("selftest live points={n}");
+                .await;
+                if let Err(error) = result {
+                    failed.store(true, Ordering::Release);
+                    eprintln!("{error}");
                 }
                 cx.update(|cx| cx.quit()).ok();
             })
             .detach();
         }
     });
-    // 画面を閉じたら、流している調査の子プロセスを止めてから終わる
     rt_exit.block_on(live.shutdown(Duration::from_secs(3)));
+    if failed_exit.load(Ordering::Acquire) {
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
+    use tune_core::live::{Opts, Route as LiveRoute, Source};
+
+    /// Only transport is replaced: the real Live owns retries, stream state and stop.
+    #[derive(Default)]
+    struct FailingRoute(AtomicUsize);
+    impl LiveRoute for FailingRoute {
+        fn open(&self, _: &nodes::Node, _: &Opts) -> Result<Source, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err("synthetic transport unavailable".into())
+        }
+    }
+
+    fn controller() -> (LiveControl, Arc<FailingRoute>) {
+        let route = Arc::new(FailingRoute::default());
+        let live = Live::new(route.clone(), Opts { max_retries: 0, ..Opts::default() }, Box::new(|_| {}));
+        (LiveControl::new(live, true), route)
+    }
+
+    fn node(id: &str) -> nodes::Node {
+        nodes::Node::from_value(&json!({"id":id,"os":"macos"}), "synthetic-host")
+    }
+
+    #[tokio::test]
+    async fn live_hidden_invalidates_pending_start_and_focus_return_requires_manual_start() {
+        let (control, route) = controller();
+        let (generation, id) = control.request("a").unwrap();
+        control.set_active(false);
+        assert!(control.request("a").is_none());
+        control.set_active(true);
+        control.complete(generation, &id, &[node("a")], None);
+        assert!(!control.on("a"));
+        assert!(control.live.active().is_empty());
+        assert_eq!(route.0.load(Ordering::SeqCst), 0);
+        control.live.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn live_stale_start_cannot_stop_newer_intent_for_the_same_node() {
+        let (control, _) = controller();
+        let (old, id) = control.request("a").unwrap();
+        control.stop(Stop::User);
+        let (new, _) = control.request("a").unwrap();
+        control.complete(new, &id, &[node("a")], None);
+        // A stale disk load fails after the newer request has started.
+        control.complete(old, &id, &[], Some("stale invalid ledger".into()));
+        assert!(control.on("a"));
+        assert_eq!(control.live.active(), ["a"]);
+        assert!(control.take_notice().is_none());
+        control.live.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn live_invalid_ledger_stops_last_good_stream_and_clears_intent() {
+        let (control, _) = controller();
+        let (generation, id) = control.request("a").unwrap();
+        let last_good = [node("a")];
+        control.complete(generation, &id, &last_good, None);
+        assert_eq!(control.live.active(), ["a"]);
+        control.complete(generation, &id, &last_good, Some("invalid synthetic ledger".into()));
+        assert!(!control.on("a"));
+        assert!(control.live.active().is_empty());
+        assert!(control.take_notice().unwrap().contains("invalid synthetic ledger"));
+        control.complete(generation, &id, &last_good, None);
+        assert!(control.live.active().is_empty());
+        control.live.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn live_unknown_or_excluded_node_refuses_and_clears_intent() {
+        let (control, route) = controller();
+        for ledger in [Vec::new(), vec![nodes::Node::from_value(&json!({"id":"a","status":"paused"}), "synthetic-host")]] {
+            let (generation, id) = control.request("a").unwrap();
+            control.complete(generation, &id, &ledger, None);
+            assert!(!control.on("a"));
+            assert!(control.live.active().is_empty());
+            assert!(control.take_notice().is_some());
+        }
+        assert_eq!(route.0.load(Ordering::SeqCst), 0);
+        control.live.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn live_retains_against_the_full_ledger_and_stops_removed_nodes() {
+        let (control, _) = controller();
+        let a = node("a");
+        let b = node("b");
+        control.live.start(std::slice::from_ref(&b), &[]);
+        let (generation, id) = control.request("a").unwrap();
+        control.complete(generation, &id, &[a.clone(), b], None);
+        assert_eq!(control.live.active(), ["a", "b"]);
+        control.complete(generation, &id, &[a], None);
+        assert_eq!(control.live.active(), ["a"]);
+        control.live.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn live_terminal_backend_failure_never_resets_its_retry_budget() {
+        let (control, route) = controller();
+        let (generation, id) = control.request("a").unwrap();
+        control.complete(generation, &id, &[node("a")], None);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !control.live.active().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(route.0.load(Ordering::SeqCst), 1);
+        assert!(control.poll().is_none());
+        assert!(!control.on("a"));
+        assert!(control.take_notice().unwrap().contains("手動"));
+        // A delayed heartbeat cannot create a new backend stream after failure.
+        control.complete(generation, &id, &[node("a")], None);
+        assert!(control.live.active().is_empty());
+        assert_eq!(route.0.load(Ordering::SeqCst), 1);
+        control.live.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn live_accepted_exclusion_stops_owned_stream_before_the_next_heartbeat() {
+        for status in ["paused", "retired"] {
+            let (control, _) = controller();
+            let (generation, id) = control.request("a").unwrap();
+            control.complete(generation, &id, &[node("a")], None);
+            assert_eq!(control.live.active(), ["a"]);
+            let views = model::build(&[json!({"id":"a","status":status})], &[]);
+            control.accept_nodes(&views);
+            assert!(!control.on("a"), "accepted {status} ledger must clear intent immediately");
+            assert!(control.live.active().is_empty());
+            // In-flight renewal for the old online ledger cannot revive it.
+            control.complete(generation, &id, &[node("a")], None);
+            assert!(control.live.active().is_empty());
+            control.live.shutdown(Duration::from_secs(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn live_accepted_exclusion_for_another_node_preserves_the_owned_stream() {
+        let (control, _) = controller();
+        let (generation, id) = control.request("a").unwrap();
+        control.complete(generation, &id, &[node("a")], None);
+        let views = model::build(&[json!({"id":"a"}), json!({"id":"b","status":"paused"})], &[]);
+        control.accept_nodes(&views);
+        assert!(control.on("a"));
+        assert_eq!(control.live.active(), ["a"]);
+        control.live.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn live_delayed_heartbeat_after_terminal_failure_does_not_start_a_new_stream() {
+        let (control, route) = controller();
+        let (generation, id) = control.request("a").unwrap();
+        control.complete(generation, &id, &[node("a")], None);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !control.live.active().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(route.0.load(Ordering::SeqCst), 1);
+        // complete receives the already-issued heartbeat before the UI can poll
+        // the terminal state. Renewal must never become an initial start.
+        control.complete(generation, &id, &[node("a")], None);
+        assert!(!control.on("a"));
+        assert!(control.live.active().is_empty());
+        assert!(control.take_notice().unwrap().contains("手動"));
+        assert_eq!(route.0.load(Ordering::SeqCst), 1);
+        control.live.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[test]
+    fn open_route_resolves_saved_views_and_rejects_unknown_nodes() {
+        assert_eq!(open_route("logs", &[]).unwrap(), Route::Page(Page::Logs));
+        assert_eq!(open_route("resources", &[]).unwrap(), Route::Page(Page::Resources));
+        assert_eq!(open_route("構成図", &[]).unwrap(), Route::Page(Page::Topology));
+        assert_eq!(open_route("a", &[node("a")]).unwrap(), Route::Node("a".into()));
+        assert!(open_route("missing", &[node("a")]).is_err());
+    }
 }

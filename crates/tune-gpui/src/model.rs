@@ -159,204 +159,6 @@ pub fn uptime(h: f64) -> String {
     if h >= 48.0 { format!("{:.0} 日", h / 24.0) } else { format!("{h:.0} 時間") }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct LogRow {
-    pub node: String,
-    pub ts_ms: i64,
-    pub level: String,
-    pub message: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Signature {
-    pub level: String,
-    pub sample: String,
-    pub count: i64,
-    pub nodes: i64,
-}
-
-/// 1 行 1 画面行に収める（長いログは先頭の 1 行だけ、char 単位で切る）
-fn one_line(s: &str, max: usize) -> String {
-    let first = s.lines().next().unwrap_or("");
-    if first.chars().count() > max { first.chars().take(max).collect::<String>() + "…" } else { first.to_string() }
-}
-
-pub fn log_rows(rows: &[Value]) -> Vec<LogRow> {
-    rows.iter()
-        .map(|r| LogRow {
-            node: str_of(r.get("node_id")),
-            ts_ms: r.get("ts").and_then(Value::as_f64).map_or(0, |t| t as i64),
-            level: str_of(r.get("level")),
-            message: one_line(&str_of(r.get("message")), 200),
-        })
-        .collect()
-}
-
-pub fn signatures(rows: &[Value]) -> Vec<Signature> {
-    rows.iter()
-        .map(|r| Signature {
-            level: str_of(r.get("level")),
-            sample: one_line(&str_of(r.get("sample")), 160),
-            count: r.get("n").and_then(Value::as_i64).unwrap_or(0),
-            nodes: r.get("nodes").and_then(Value::as_i64).unwrap_or(0),
-        })
-        .collect()
-}
-
-pub fn level_label(l: &str) -> &'static str {
-    match l {
-        "critical" => "重大",
-        "error" => "エラー",
-        "warn" => "警告",
-        _ => "情報",
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ScopeRow {
-    pub id: String,
-    pub status: String,
-    pub observed_ms: Option<i64>,
-}
-
-/// 構成図の内部表示（`Engine::topology_ui_view`）を、表示に必要な分だけにしたもの。
-/// 表示は上限付きなので、保存されている件数（stored_*）と必ず並べて出す。
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct TopologyView {
-    pub scopes: Vec<ScopeRow>,
-    pub entities: Vec<(String, String)>,
-    pub kind_counts: Vec<(String, usize)>,
-    pub edges_shown: usize,
-    pub stored_entities: i64,
-    pub stored_edges: i64,
-    pub history: usize,
-}
-
-pub fn scope_status_label(s: &str) -> &'static str {
-    match s {
-        "complete" => "完了",
-        "partial" => "一部のみ",
-        "failed" => "失敗",
-        "excluded" => "対象外",
-        _ => "未取得",
-    }
-}
-
-pub fn topology(v: &Value) -> TopologyView {
-    let arr = |k: &str| v.get(k).and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
-    let entities: Vec<(String, String)> = arr("entities").iter().map(|e| (str_of(e.get("kind")), str_of(e.get("label")))).collect();
-    let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
-    for (k, _) in &entities {
-        *kinds.entry(k.clone()).or_default() += 1;
-    }
-    let totals = v.get("window").and_then(|w| w.get("stored_totals"));
-    let total = |k: &str| totals.and_then(|t| t.get(k)).and_then(Value::as_i64).unwrap_or(0);
-    TopologyView {
-        scopes: arr("scopes")
-            .iter()
-            .map(|s| ScopeRow { id: str_of(s.get("scope_id")), status: str_of(s.get("status")), observed_ms: s.get("observed_at").and_then(Value::as_i64) })
-            .collect(),
-        entities,
-        kind_counts: kinds.into_iter().collect(),
-        edges_shown: arr("edges").len(),
-        stored_entities: total("accepted_entities"),
-        stored_edges: total("accepted_edges"),
-        history: arr("history").len(),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum CheckStatus {
-    Fail,
-    Warn,
-    Unknown,
-    Ok,
-}
-
-impl CheckStatus {
-    fn parse(s: &str) -> Self {
-        match s {
-            "fail" => Self::Fail,
-            "warn" => Self::Warn,
-            "ok" => Self::Ok,
-            _ => Self::Unknown,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Fail => "異常",
-            Self::Warn => "注意",
-            Self::Unknown => "不明",
-            Self::Ok => "正常",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Check {
-    pub scope: String,
-    pub name: String,
-    pub status: CheckStatus,
-    pub detail: String,
-    pub checked_ms: Option<i64>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StatusEvent {
-    pub scope: String,
-    pub name: String,
-    pub from: CheckStatus,
-    pub to: CheckStatus,
-    pub detail: String,
-    pub ts_ms: i64,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct StatusView {
-    /// 異常 → 注意 → 不明 → 正常の順
-    pub checks: Vec<Check>,
-    /// 新しい順
-    pub events: Vec<StatusEvent>,
-    pub last_probe_ms: Option<i64>,
-    pub last_logs_ms: Option<i64>,
-}
-
-impl StatusView {
-    pub fn count(&self, s: CheckStatus) -> usize {
-        self.checks.iter().filter(|c| c.status == s).count()
-    }
-}
-
-/// `Engine::status_snapshot`（保存済みの現在状態。問い合わせだけでは状態を計算し直さない）を表示用にする
-pub fn status(v: &Value) -> StatusView {
-    let arr = |k: &str| v.get(k).and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
-    let mut checks: Vec<Check> = arr("checks")
-        .iter()
-        .map(|c| Check {
-            scope: str_of(c.get("scope")),
-            name: str_of(c.get("name")),
-            status: CheckStatus::parse(&str_of(c.get("status"))),
-            detail: one_line(&str_of(c.get("detail")), 160),
-            checked_ms: c.get("checked_at").and_then(Value::as_i64),
-        })
-        .collect();
-    checks.sort_by(|a, b| a.status.cmp(&b.status).then_with(|| a.scope.cmp(&b.scope)).then_with(|| a.name.cmp(&b.name)));
-    let mut events: Vec<StatusEvent> = arr("events")
-        .iter()
-        .map(|e| StatusEvent {
-            scope: str_of(e.get("scope")),
-            name: str_of(e.get("name")),
-            from: CheckStatus::parse(&str_of(e.get("from_status"))),
-            to: CheckStatus::parse(&str_of(e.get("to_status"))),
-            detail: one_line(&str_of(e.get("detail")), 140),
-            ts_ms: e.get("ts").and_then(Value::as_i64).unwrap_or(0),
-        })
-        .collect();
-    events.sort_by_key(|e| std::cmp::Reverse(e.ts_ms));
-    StatusView { checks, events, last_probe_ms: v.get("lastProbeAt").and_then(Value::as_i64), last_logs_ms: v.get("lastLogsAt").and_then(Value::as_i64) }
-}
-
 /// ライブ表示で貯める点（直近 3 分 = 1 秒ごとに 180 点）
 pub const LIVE_KEEP: usize = 180;
 
@@ -367,7 +169,9 @@ pub struct LiveNode {
     pub detail: Option<String>,
     pub cpu: Vec<f64>,
     pub mem: Vec<f64>,
-    last_t: i64,
+    pub latest_cpu: Option<f64>,
+    pub latest_mem: Option<f64>,
+    last_t: Option<i64>,
 }
 
 /// `Live` が送るイベント `{ nodes: { id: { state, detail, points: [{t, cpu, mem}] } } }` を貯める。
@@ -387,13 +191,19 @@ impl LiveStore {
                 s.detail = n.get("detail").and_then(Value::as_str).map(str::to_string);
             }
             for p in n.get("points").and_then(Value::as_array).into_iter().flatten() {
-                let t = p.get("t").and_then(Value::as_i64).unwrap_or(0);
-                if t <= s.last_t {
+                let Some(t) = p.get("t").and_then(Value::as_i64) else { continue };
+                if s.last_t.is_some_and(|last| t <= last) {
                     continue;
                 }
-                s.last_t = t;
-                s.cpu.push(p.get("cpu").and_then(Value::as_f64).unwrap_or(0.0));
-                s.mem.push(p.get("mem").and_then(Value::as_f64).unwrap_or(0.0));
+                s.last_t = Some(t);
+                s.latest_cpu = p.get("cpu").and_then(Value::as_f64);
+                s.latest_mem = p.get("mem").and_then(Value::as_f64);
+                if let Some(cpu) = s.latest_cpu {
+                    s.cpu.push(cpu);
+                }
+                if let Some(mem) = s.latest_mem {
+                    s.mem.push(mem);
+                }
             }
             for v in [&mut s.cpu, &mut s.mem] {
                 if v.len() > LIVE_KEEP {
@@ -416,6 +226,30 @@ mod tests {
         let rows = build(&nodes, &last);
         assert_eq!(rows[0].count(Severity::Critical), 0);
         assert!(!matches!(rows[0].health, Health::Scored(_) | Health::Unobserved));
+    }
+
+    #[test]
+    fn live_missing_metrics_stay_unknown_and_do_not_add_zero_samples() {
+        let mut store = LiveStore::default();
+        store.merge(&json!({"nodes":{"a":{"points":[{"t":1,"cpu":12,"mem":30},{"t":2,"mem":40}]}}}));
+        let a = &store.0["a"];
+        assert_eq!(a.cpu, [12.0]);
+        assert_eq!(a.mem, [30.0, 40.0]);
+        assert_eq!(a.latest_cpu, None);
+        assert_eq!(a.latest_mem, Some(40.0));
+    }
+
+    #[test]
+    fn live_store_ignores_overlap_and_caps_each_available_metric() {
+        let mut store = LiveStore::default();
+        store.merge(&json!({"nodes":{"a":{"state":"live","points":[{"t":1,"cpu":12}]}}}));
+        store.merge(&json!({"nodes":{"a":{"points":[{"t":1,"cpu":99},{"t":2,"cpu":0}]}}}));
+        assert_eq!(store.0["a"].cpu, [12.0, 0.0]);
+        let points: Vec<_> = (3..303).map(|t| json!({"t":t,"cpu":1})).collect();
+        store.merge(&json!({"nodes":{"a":{"points":points}}}));
+        assert_eq!(store.0["a"].cpu.len(), LIVE_KEEP);
+        assert!(store.0["a"].mem.is_empty());
+        assert_eq!(store.0["a"].state, "live");
     }
 
     fn ledger() -> Vec<Value> {
@@ -472,73 +306,6 @@ mod tests {
     fn series_skips_rows_without_the_value() {
         let rows = vec![json!({"score": 80}), json!({"score": null}), json!({"cpu": 3}), json!({"score": 60.5})];
         assert_eq!(series(&rows, "score"), [80.0, 60.5]);
-    }
-
-    #[test]
-    fn live_store_dedups_overlap_and_caps() {
-        let mut s = LiveStore::default();
-        s.merge(&json!({"nodes": {"a": {"state": "live", "points": [{"t": 1, "cpu": 10, "mem": 50}, {"t": 2, "cpu": 20, "mem": 51}]}}}));
-        // 開始時の全体（t=1,2 を含む）が後から届いても重ならない
-        s.merge(&json!({"nodes": {"a": {"points": [{"t": 2, "cpu": 99}, {"t": 3, "cpu": 30, "mem": 52}]}}}));
-        let a = &s.0["a"];
-        assert_eq!(a.cpu, [10.0, 20.0, 30.0]);
-        assert_eq!(a.state, "live");
-        let pts: Vec<_> = (10..10 + 300).map(|t| json!({"t": t, "cpu": 1})).collect();
-        s.merge(&json!({"nodes": {"a": {"points": pts}}}));
-        assert_eq!(s.0["a"].cpu.len(), LIVE_KEEP);
-        s.merge(&json!({"bad": 1}));
-    }
-
-    #[test]
-    fn log_rows_and_signatures_are_one_line_and_tolerant() {
-        let rows = log_rows(&[json!({"node_id": "a", "ts": 1700000000000.0, "level": "error", "message": "first\nsecond"}), json!({})]);
-        assert_eq!(rows[0].message, "first");
-        assert_eq!(rows[0].ts_ms, 1_700_000_000_000);
-        assert_eq!(rows[1].level, "");
-        let long = "あ".repeat(300);
-        assert_eq!(log_rows(&[json!({"message": long})])[0].message.chars().count(), 201);
-        let s = signatures(&[json!({"level": "warn", "sample": "x", "n": 5, "nodes": 2})]);
-        assert_eq!((s[0].count, s[0].nodes), (5, 2));
-        assert_eq!(level_label("warn"), "警告");
-    }
-
-    #[test]
-    fn topology_view_counts_kinds_and_keeps_stored_totals() {
-        let v = json!({
-            "scopes": [{"scope_id": "s1", "status": "partial", "observed_at": 5}, {}],
-            "entities": [{"kind": "host", "label": "a"}, {"kind": "package", "label": "b"}, {"kind": "package", "label": "c"}],
-            "edges": [{}, {}],
-            "history": [{}],
-            "window": {"stored_totals": {"accepted_entities": 81, "accepted_edges": 99}}
-        });
-        let t = topology(&v);
-        assert_eq!(t.kind_counts, [("host".to_string(), 1), ("package".to_string(), 2)]);
-        assert_eq!((t.stored_entities, t.stored_edges, t.edges_shown, t.history), (81, 99, 2, 1));
-        assert_eq!(t.scopes[0].observed_ms, Some(5));
-        assert_eq!(scope_status_label(&t.scopes[0].status), "一部のみ");
-        assert_eq!(scope_status_label(&t.scopes[1].status), "未取得");
-        assert_eq!(topology(&json!({})), TopologyView::default());
-    }
-
-    #[test]
-    fn status_sorts_worst_first_and_events_newest_first() {
-        let v = json!({
-            "checks": [
-                {"scope": "b", "name": "n1", "status": "ok"},
-                {"scope": "a", "name": "n2", "status": "fail", "detail": "x\ny"},
-                {"scope": "a", "name": "n3", "status": "warn"},
-                {"scope": "a", "name": "n4", "status": "???"}
-            ],
-            "events": [{"ts": 1, "from_status": "ok", "to_status": "fail"}, {"ts": 9, "from_status": "fail", "to_status": "ok"}],
-            "lastProbeAt": 7
-        });
-        let s = status(&v);
-        assert_eq!(s.checks.iter().map(|c| c.status).collect::<Vec<_>>(), [CheckStatus::Fail, CheckStatus::Warn, CheckStatus::Unknown, CheckStatus::Ok]);
-        assert_eq!(s.checks[0].detail, "x");
-        assert_eq!((s.count(CheckStatus::Fail), s.count(CheckStatus::Ok)), (1, 1));
-        assert_eq!(s.events[0].ts_ms, 9);
-        assert_eq!(s.last_probe_ms, Some(7));
-        assert_eq!(status(&json!({})), StatusView::default());
     }
 
     #[test]

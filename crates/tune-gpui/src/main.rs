@@ -4,17 +4,25 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+mod browser;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod input;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod model;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod native;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod panels;
 mod startup;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod text;
 
 fn main() {
     let options = match startup::parse(std::env::args_os().skip(1)) {
         Ok(Some(options)) => options,
         Ok(None) => {
             println!(
-                "katala-tune-gpui [--config <ledger.json>] [--data <directory>] [--open <logs|status|topology|node-id>] [--selftest [--live <node-id>] [--logs]]\nmacOS / Windows preview; data defaults to a separate gpui-preview directory. --selftest requires both paths and checks startup only."
+                "katala-tune-gpui [--config <ledger.json>] [--data <directory>] [--open <view|node-id>] [--selftest [--live <node-id>] [--logs]]\nmacOS / Windows preview; data defaults to a separate gpui-preview directory. --selftest requires both paths and checks startup and saved-data routes only."
             );
             return;
         }
