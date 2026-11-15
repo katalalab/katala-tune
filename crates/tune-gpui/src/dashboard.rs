@@ -123,7 +123,7 @@ fn series_chart(node: &DashboardNode, key: &str, label: &str, color: Hsla, since
     div().flex_1().min_w(px(100.)).child(div().text_xs().text_color(color).child(label.to_owned())).child(chart)
 }
 
-pub fn render_dashboard(view: &DashboardView, live: &Live, now: i64) -> gpui::Div {
+pub fn render_dashboard(view: &DashboardView, live: &Live, now: i64, details: bool) -> gpui::Div {
     let saved = &view.saved;
     let mut body = div().flex().flex_col().gap_4().p_5().child(div().text_sm().child(format!("{}台 · 過去{}分", view.nodes.len(), text(&saved["minutes"]))));
     if view.total_nodes > view.nodes.len() {
@@ -212,16 +212,26 @@ pub fn render_dashboard(view: &DashboardView, live: &Live, now: i64) -> gpui::Di
                 .child(series_chart(node, "gpu", "GPU 保存平均", palette::warn(), since, until)),
         );
         if let Some(b) = &brief {
-            card = card.child(div().text_xs().child(format!(
-                "Live {} · 理由 {} · {} · 実装 {} · 収集負荷 {} · RSS {} · {}",
-                text(&b["state"]),
-                text(&b["reason"]),
-                text(&b["detail"]),
-                text(&b["impl"]),
-                number(&b["load"], "%（1コア比）"),
-                number(&b["rss_mb"], " MB"),
-                crate::panels::time(&b["point"]["t"])
-            )));
+            let phase = match b["state"].as_str() {
+                Some("connecting") => "接続中",
+                Some("running") => "収集中",
+                Some("retrying") => "再接続待ち",
+                Some("stopped") => "停止",
+                _ => "未確認",
+            };
+            card = card.child(div().text_xs().child(format!("Live {phase}{}", b["detail"].as_str().map(|d| format!(" · {d}")).unwrap_or_default())));
+            if details {
+                card = card.child(div().text_xs().child(format!(
+                    "Live {} · 理由 {} · {} · 実装 {} · 収集負荷 {} · RSS {} · {}",
+                    text(&b["state"]),
+                    text(&b["reason"]),
+                    text(&b["detail"]),
+                    text(&b["impl"]),
+                    number(&b["load"], "%（1コア比）"),
+                    number(&b["rss_mb"], " MB"),
+                    crate::panels::time(&b["point"]["t"])
+                )));
+            }
         }
         for (key, label, unit) in [("top_cpu", "CPU上位", "%（1コア比）"), ("top_mem", "メモリ上位", " MB")] {
             let top = brief.as_ref().and_then(|b| b[key].as_array());

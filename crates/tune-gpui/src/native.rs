@@ -1590,6 +1590,7 @@ impl TuneApp {
                     view,
                     &self.live.live,
                     now_ms(),
+                    self.dashboard_details,
                 )),
             ),
             Some(Err(error)) => body.child(div().p_5().text_sm().text_color(palette::crit()).child(format!("保存Dashboardの読み込みに失敗: {error}"))),

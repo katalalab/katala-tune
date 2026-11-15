@@ -176,7 +176,7 @@ mod tests {
             if page == Page::Dashboard {
                 let view = response.dashboard.expect("Dashboard needs a dedicated Reader result").unwrap();
                 assert!(response.panel.is_none());
-                let _rendered = crate::dashboard::render_dashboard(&view, &live, now);
+                let _rendered = crate::dashboard::render_dashboard(&view, &live, now, false);
                 assert_eq!(view.saved["minutes"], 360);
                 assert_eq!(view.nodes[0].saved["latest"]["src"], "example-hub");
             } else if page != Page::Overview {
