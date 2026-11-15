@@ -5,6 +5,7 @@
 
 mod gate;
 mod model;
+mod review;
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -115,11 +116,12 @@ enum Page {
     Security,
     Network,
     Link,
+    Review,
 }
 
 impl Page {
     /// サイドバーに並べる順
-    const NAV: [Self; 14] = [Self::Status, Self::Resources, Self::Processes, Self::Security, Self::Network, Self::Link, Self::Power, Self::Specs, Self::Tools, Self::Ai, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
+    const NAV: [Self; 15] = [Self::Status, Self::Resources, Self::Processes, Self::Security, Self::Network, Self::Link, Self::Review, Self::Power, Self::Specs, Self::Tools, Self::Ai, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
 
     fn title(self) -> &'static str {
         match self {
@@ -138,6 +140,7 @@ impl Page {
             Self::Security => "セキュリティ",
             Self::Network => "ネットワーク",
             Self::Link => "接続",
+            Self::Review => "レビュー",
         }
     }
 
@@ -157,6 +160,7 @@ impl Page {
             "security" => Self::Security,
             "network" => Self::Network,
             "link" => Self::Link,
+            "review" => Self::Review,
             _ => return None,
         })
     }
@@ -189,6 +193,9 @@ struct TuneApp {
     specs: model::SpecsView,
     security: model::SecurityView,
     peers: Vec<model::PeerRow>,
+    review: Option<(review::Source, review::Document)>,
+    review_error: Option<String>,
+    review_page: usize,
     network: Arc<Mutex<Option<Vec<model::NetRow>>>>,
     network_busy: Arc<AtomicBool>,
     gate: Gate,
@@ -205,7 +212,7 @@ struct TuneApp {
 impl TuneApp {
     fn new(engine: Arc<Engine>, rt: Arc<tokio::runtime::Runtime>, dirty: Arc<AtomicBool>, live: LiveHandles, cx: &mut Context<Self>) -> Self {
         let live_dirty_for_gate = live.dirty.clone();
-        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page: Page::Overview, actions: Vec::new(), power: Default::default(), tools: Default::default(), ai: Default::default(), specs: Default::default(), security: Default::default(), peers: Vec::new(), network: Arc::new(Mutex::new(None)), network_busy: Arc::new(AtomicBool::new(false)), gate: { let f = live_dirty_for_gate; Gate::new(move || f.store(true, Ordering::Release)) }, result: Arc::new(Mutex::new(None)), schedule: Default::default(), status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
+        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page: Page::Overview, actions: Vec::new(), power: Default::default(), tools: Default::default(), ai: Default::default(), specs: Default::default(), security: Default::default(), peers: Vec::new(), review: None, review_error: None, review_page: 0, network: Arc::new(Mutex::new(None)), network_busy: Arc::new(AtomicBool::new(false)), gate: { let f = live_dirty_for_gate; Gate::new(move || f.store(true, Ordering::Release)) }, result: Arc::new(Mutex::new(None)), schedule: Default::default(), status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
         app.reload();
         app.load_status();
         // 通知を待つ代わりに 0.4 秒ごとに旗を見る。変わったときだけ読み直して描き直す
@@ -310,7 +317,7 @@ impl TuneApp {
                     self.peers = model::peers(&rows);
                 }
             }
-            Page::Overview | Page::Resources | Page::Processes | Page::Network => {}
+            Page::Overview | Page::Resources | Page::Processes | Page::Network | Page::Review => {}
         }
     }
 
@@ -416,6 +423,21 @@ impl TuneApp {
             dirty.store(true, Ordering::Release);
         });
         cx.notify();
+    }
+
+    /// 完了台帳 JSON を読む（保存しない・外部参照を取得しない）。読めなければ理由を出し、前の表示は消す
+    fn load_review(&mut self, path: &std::path::Path) {
+        self.review_page = 0;
+        match review::load(path, review::now_ms()) {
+            Ok(r) => {
+                self.review = Some(r);
+                self.review_error = None;
+            }
+            Err(e) => {
+                self.review = None;
+                self.review_error = Some(e);
+            }
+        }
     }
 
     fn probe_all(&mut self, cx: &mut Context<Self>) {
@@ -992,6 +1014,110 @@ impl TuneApp {
             .when(self.peers.is_empty(), |d| d.child(div().text_sm().text_color(palette::muted()).child("ペア済みの機体はありません")))
     }
 
+    /// 完了台帳（task-completion.v1）の申告の一時表示。ここでは検証・受入・完了を判定しない
+    fn review_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let none = || "未記載".to_string();
+        let t = |v: &Option<String>| v.clone().unwrap_or_else(none);
+        let warn_list = |ws: &[String]| {
+            let mut d = div().flex().flex_col().gap_0p5();
+            for w in ws {
+                d = d.child(div().text_xs().text_color(palette::warn()).child(format!("⚠ {w}")));
+            }
+            d
+        };
+        let mut body = div().flex().flex_col().gap_4();
+        if let Some((src, doc)) = &self.review {
+            let per = 25usize;
+            let pages = doc.tasks.len().div_ceil(per).max(1);
+            let page = self.review_page.min(pages - 1);
+            let (first, last) = (page * per, ((page + 1) * per).min(doc.tasks.len()));
+            body = body
+                .child(div().flex().flex_col().gap_1().p_3().rounded_md().bg(palette::card())
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("操作者の確認事項"))
+                    .child(div().text_xs().text_color(palette::muted()).child("依頼内容への合致、結果の実演、利用者・費用・権限・データへの影響、未確認事項、戻し方、PR head SHA と台帳の revision の一致を確認してください。")))
+                .child(div().text_xs().text_color(palette::muted()).child(format!("原本: {} · {} バイト · SHA-256 {}…", src.name, src.size, &src.sha256[..16])))
+                .child(div().flex().items_center().gap_2()
+                    .child(div().text_xs().child(format!("{}–{} / {} 件", first + 1, last, doc.tasks.len())))
+                    .child(div().id("rv-prev").px_2().py_0p5().rounded_md().text_xs().cursor_pointer().border_1().border_color(palette::line()).child("前へ")
+                        .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| { app.review_page = app.review_page.saturating_sub(1); cx.notify(); })))
+                    .child(div().id("rv-next").px_2().py_0p5().rounded_md().text_xs().cursor_pointer().border_1().border_color(palette::line()).child("次へ")
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| { app.review_page = (app.review_page + 1).min(pages - 1); cx.notify(); }))));
+            for task in &doc.tasks[first..last] {
+                let deploy_optional = matches!(task.delivery.as_deref(), Some("local" | "repository"));
+                let mut gates = div().flex().flex_col().gap_1();
+                for (key, g) in &task.gates {
+                    let status = if *key == "deployment" && deploy_optional && g.status_label.is_none() {
+                        format!("必須ではありません（依頼の終点: {}）", review::delivery_label(task.delivery.as_deref().unwrap_or("")))
+                    } else {
+                        t(&g.status_label)
+                    };
+                    let mut ev = div().flex().flex_col().gap_0p5();
+                    if g.evidence.is_empty() {
+                        ev = ev.child(div().text_xs().text_color(palette::muted()).child("証跡: 未記載"));
+                    }
+                    for e in &g.evidence {
+                        ev = ev.child(div().text_xs().text_color(palette::muted()).child(format!(
+                            "証跡 {} · 結果（台帳の申告）: {} · 日時: {} · revision: {} · 環境: {}",
+                            if e.link.is_some() { t(&e.reference) } else { format!("{}（リンクにしない）", t(&e.reference)) },
+                            t(&e.result), t(&e.observed_at), t(&e.revision), t(&e.environment)
+                        )));
+                    }
+                    gates = gates.child(
+                        div().flex().flex_col().gap_0p5().px_3().py_2().rounded_md().bg(palette::card())
+                            .child(div().flex().gap_3().child(div().w(px(72.0)).flex_none().text_sm().font_weight(FontWeight::SEMIBOLD).child(review::gate_label(key))).child(div().text_sm().child(status)))
+                            .child(ev)
+                            .child(warn_list(&g.warnings)),
+                    );
+                }
+                let rv = &task.review;
+                body = body.child(
+                    div().flex().flex_col().gap_2().p_3().rounded_lg().border_1().border_color(palette::line())
+                        .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(task.id.clone()))
+                        .child(div().flex().flex_wrap().gap_2()
+                            .child(chip(format!("目的 {}", t(&task.goal)), palette::muted()))
+                            .child(chip(format!("対象 {}", t(&task.target)), palette::muted()))
+                            .child(chip(format!("revision {}", t(&task.revision)), palette::muted()))
+                            .child(chip(format!("依頼の終点 {}", task.delivery.as_deref().map_or_else(none, |d| review::delivery_label(d).to_string())), palette::muted())))
+                        .child(gates)
+                        .child(div().flex().flex_col().gap_0p5().px_3().py_2().rounded_md().bg(palette::card())
+                            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(format!("レビュー: {}", t(&rv.accepted_label))))
+                            .child(div().text_xs().text_color(palette::muted()).child(format!("ref {} · 日時 {} · revision {} · 対象 {}", t(&rv.reference), t(&rv.observed_at), t(&rv.revision), t(&rv.target))))
+                            .child(warn_list(&rv.warnings))),
+                );
+            }
+            let c = &doc.coverage;
+            let count = |v: &[String], declared: bool| if declared { v.len().to_string() } else { "未設定".to_string() };
+            let mut cov = div().flex().flex_col().gap_1().p_3().rounded_md().bg(palette::card());
+            if !c.declared {
+                cov = cov.child(div().text_xs().text_color(palette::muted()).child("対象範囲未記載"));
+            } else {
+                cov = cov.child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(format!("対象範囲（想定 {}・観測 {}・未観測 {}）", count(&c.expected, c.expected_declared), count(&c.observed, c.observed_declared), count(&c.unobserved, c.unobserved_declared))));
+                for (label, v) in [("未観測", &c.missing), ("余分な観測", &c.extra), ("申告された未観測", &c.unobserved), ("観測と未観測が重複", &c.overlap), ("想定外の未観測", &c.unobserved_outside_expected), ("重複", &c.duplicates)] {
+                    if !v.is_empty() {
+                        cov = cov.child(div().text_xs().text_color(palette::warn()).child(format!("{label}: {}", v.join("、"))));
+                    }
+                }
+                for s in &c.insufficient {
+                    cov = cov.child(div().text_xs().text_color(palette::warn()).child(s.clone()));
+                }
+            }
+            body = body.child(cov);
+        } else if let Some(e) = &self.review_error {
+            body = body.child(div().text_sm().text_color(palette::crit()).child(e.clone()));
+        } else {
+            body = body.child(div().text_sm().text_color(palette::muted()).child("完了台帳の JSON ファイルをこの画面にドラッグしてください（2 MiB まで）。"));
+        }
+        div().id("review").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5()
+            .on_drop(cx.listener(|app, paths: &gpui::ExternalPaths, _, cx| {
+                if let Some(p) = paths.paths().first() {
+                    app.load_review(p);
+                }
+                cx.notify();
+            }))
+            .child(div().text_xs().text_color(palette::muted()).child("task-completion.v1 の申告を一時表示します。ここでは検証・受入・完了を判定せず、外部参照の取得も保存もしません。"))
+            .child(body)
+    }
+
     fn actions_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let now = now_ms();
         let mut rows = div().flex().flex_col().gap_1();
@@ -1238,6 +1364,7 @@ impl Render for TuneApp {
                 Page::Security => self.security_page().into_any_element(),
                 Page::Network => self.network_page(cx).into_any_element(),
                 Page::Link => self.link_page().into_any_element(),
+                Page::Review => self.review_page(cx).into_any_element(),
             },
         };
         div()
@@ -1334,6 +1461,12 @@ fn main() {
         .detach();
         cx.activate(true);
         // --open logs|<機体 id>: 起動時に開く画面（画面確認・スクリーンショット用）
+        if let Some(path) = arg("--review") {
+            drop(window.update(cx, |v, _, cx| {
+                v.load_review(std::path::Path::new(&path));
+                v.open_page(Page::Review, cx);
+            }));
+        }
         match arg("--open").as_deref() {
             Some(p) => match Page::from_arg(p) {
                 Some(page) => drop(window.update(cx, |v, _, cx| v.open_page(page, cx))),
@@ -1384,7 +1517,7 @@ fn main() {
                     println!("selftest confirm shown={shown} approved={:?}", demo_result.lock().map(|r| *r).unwrap_or(None));
                 }
                 // 開いた画面のデータが読めたか（画面ごとの件数）。--open <page> と併用する
-                let counts = window.update(cx, |v, _, _| format!("power={} actions={} status={} topology={} tools={} ai={} specs={} security={} procs={} peers={}", v.power.rows.len(), v.actions.len(), v.status.checks.len(), v.topology.entities.len(), v.tools.groups.len(), v.ai.sessions, v.specs.sections.len(), v.security.nodes.len(), v.nodes.iter().filter(|n| !n.apps.is_empty()).count(), v.peers.len())).unwrap_or_default();
+                let counts = window.update(cx, |v, _, _| format!("power={} actions={} status={} topology={} tools={} ai={} specs={} security={} procs={} peers={} review={}", v.power.rows.len(), v.actions.len(), v.status.checks.len(), v.topology.entities.len(), v.tools.groups.len(), v.ai.sessions, v.specs.sections.len(), v.security.nodes.len(), v.nodes.iter().filter(|n| !n.apps.is_empty()).count(), v.peers.len(), v.review.as_ref().map_or(0, |r| r.1.tasks.len()))).unwrap_or_default();
                 println!("selftest page {counts}");
                 if net_id.is_some() {
                     println!("selftest network ok_rows={}", net_result.lock().map_or(0, |n| n.unwrap_or(0)));

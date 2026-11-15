@@ -54,3 +54,9 @@ conf=$(./target/release/katala-tune --selftest --config config/nodes.example.jso
 echo "$conf"
 [ "$conf" = "selftest confirm shown=true approved=Some(false)" ] || { echo "E2E 失敗: 確認欄 ($conf)" >&2; exit 1; }
 echo "e2e-gpui confirm OK"
+
+# 常時: レビュー画面が見本の完了台帳（task-completion.v1）を読めること。壊れた入力は断る（単体テストで網羅）。
+rv=$(./target/release/katala-tune --selftest --config config/nodes.example.json --data "$tmp/review-data" --review test/fixtures/review/task-completion.json | grep "^selftest page" | grep -o "review=[0-9]*")
+echo "$rv"
+[ "$rv" = "review=2" ] || { echo "E2E 失敗: レビュー ($rv)" >&2; exit 1; }
+echo "e2e-gpui review OK"
