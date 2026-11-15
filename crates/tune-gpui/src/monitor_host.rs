@@ -31,6 +31,7 @@ struct State {
     worker: Option<JoinHandle<()>>,
     ticker: Option<JoinHandle<()>>,
     scheduler: Option<JoinHandle<()>>,
+    scheduler_in_flight: bool,
     exiting: bool,
 }
 /// These are local completion/commit acknowledgements, never proof that a
@@ -88,7 +89,7 @@ impl MonitorHost {
             request,
             status,
             started: AtomicBool::new(false),
-            state: Mutex::new(State { manual: None, worker: None, ticker: None, scheduler: None, exiting: false }),
+            state: Mutex::new(State { manual: None, worker: None, ticker: None, scheduler: None, scheduler_in_flight: false, exiting: false }),
             drain: tokio::sync::Mutex::new(None),
         }
     }
@@ -242,7 +243,7 @@ impl MonitorHost {
         }
         if !*self.schedule_request.borrow() {
             self.schedule_status.send_modify(|s| {
-                s.phase = SchedulePhase::Waiting;
+                s.phase = if state.scheduler_in_flight { SchedulePhase::Running } else { SchedulePhase::Waiting };
                 s.error = None;
             });
             self.schedule_request.send_replace(true);
@@ -281,7 +282,7 @@ impl MonitorHost {
                         // Admission and manual state share the host lock. A claimed
                         // cycle is owned work; Stop drains it instead of cancelling.
                         let admitted = {
-                            let state = host.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut state = host.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             if state.exiting {
                                 return;
                             }
@@ -291,6 +292,7 @@ impl MonitorHost {
                                 host.schedule_status.send_modify(|s| s.phase = SchedulePhase::ManualBusy);
                                 false
                             } else {
+                                state.scheduler_in_flight = true;
                                 host.schedule_status.send_modify(|s| s.phase = SchedulePhase::Running);
                                 true
                             }
@@ -304,6 +306,9 @@ impl MonitorHost {
                                 Ok(_) => Err("自動スキャン設定が無効になりました".into()),
                                 Err(error) => Err(error),
                             };
+                            // Serialize the actual completion boundary with Start/Stop.
+                            let mut state = host.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            state.scheduler_in_flight = false;
                             match result {
                                 Ok(()) => host.schedule_status.send_modify(|s| {
                                     s.cycles += 1;
@@ -323,12 +328,15 @@ impl MonitorHost {
                         }
                     }
                     let Some(host) = weak.upgrade() else { return };
-                    if host.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).exiting {
+                    let state = host.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if state.exiting {
                         return;
                     }
-                    if host.schedule_status.borrow().phase != SchedulePhase::Failed {
-                        host.schedule_status.send_modify(|s| s.phase = SchedulePhase::Idle);
-                    }
+                    host.schedule_status.send_modify(|s| {
+                        if s.phase != SchedulePhase::Failed {
+                            s.phase = if *host.schedule_request.borrow() { SchedulePhase::Waiting } else { SchedulePhase::Idle };
+                        }
+                    });
                 }
             }));
         }
@@ -340,7 +348,7 @@ impl MonitorHost {
             return Err("アプリを終了しています".into());
         }
         self.schedule_request.send_replace(false);
-        self.schedule_status.send_modify(|s| s.phase = if s.phase == SchedulePhase::Running { SchedulePhase::Stopping } else { SchedulePhase::Idle });
+        self.schedule_status.send_modify(|s| s.phase = if state.scheduler_in_flight { SchedulePhase::Stopping } else { SchedulePhase::Idle });
         Ok(())
     }
     /// Memory-only observation: no DB read, writer, pruning or notification.

@@ -210,3 +210,93 @@ async fn minute_cadence_never_overlaps_an_unfinished_tick() {
     assert_eq!(host.shutdown().await.scheduler_complete, Some(true));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn inflight_controls_restart_preserves_running_then_waiting_until_next_tick() {
+    let (dir, engine, host) = fixture("restart-phase");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let count = Arc::new(AtomicUsize::new(0));
+    let (g, c) = (gate.clone(), count.clone());
+    host.start_schedule_with(move |engine| {
+        let (g, c) = (g.clone(), c.clone());
+        async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            g.notified().await;
+            engine.checked_tick().await
+        }
+    })
+    .unwrap();
+    let task = host.state.lock().unwrap().scheduler.as_ref().unwrap().id();
+    advance(0).await;
+    advance(5).await;
+    host.stop_schedule().unwrap();
+    host.start_schedule().unwrap();
+    let running = host.schedule_snapshot();
+    advance(60).await;
+    assert_eq!(count.load(Ordering::SeqCst), 1, "restart cannot overlap the gated tick");
+    assert_eq!(running.1.cycles, 0);
+    gate.notify_one();
+    advance(0).await;
+    let waiting = host.schedule_snapshot();
+    assert_eq!(waiting.1.cycles, 1);
+    assert!(engine.with_db(|d| d.get_meta("lastProbeAt")).unwrap().is_some());
+    advance(4).await;
+    let before_next = host.schedule_snapshot();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    advance(1).await;
+    let next = host.schedule_snapshot();
+    assert_eq!(count.load(Ordering::SeqCst), 2, "restart keeps its five-second first deadline");
+    assert_eq!(host.state.lock().unwrap().scheduler.as_ref().unwrap().id(), task);
+    host.stop_schedule().unwrap();
+    gate.notify_one();
+    assert_eq!(host.shutdown().await.scheduler_complete, Some(true));
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(running.0 && waiting.0 && before_next.0 && next.0);
+    assert_eq!(
+        [running.1.phase, waiting.1.phase, before_next.1.phase, next.1.phase],
+        [SchedulePhase::Running, SchedulePhase::Waiting, SchedulePhase::Waiting, SchedulePhase::Running],
+        "phase follows unfinished work and authorized waiting, including the pending watch change"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn inflight_controls_repeated_stop_remains_stopping_until_completion() {
+    let (dir, engine, host) = fixture("repeated-stop-phase");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let count = Arc::new(AtomicUsize::new(0));
+    let (g, c) = (gate.clone(), count.clone());
+    host.start_schedule_with(move |engine| {
+        let (g, c) = (g.clone(), c.clone());
+        async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            g.notified().await;
+            engine.checked_tick().await
+        }
+    })
+    .unwrap();
+    advance(0).await;
+    advance(5).await;
+    host.stop_schedule().unwrap();
+    let first = host.schedule_snapshot();
+    host.stop_schedule().unwrap();
+    let repeated = host.schedule_snapshot();
+    advance(120).await;
+    let still_running = host.schedule_snapshot();
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(still_running.1.cycles, 0);
+    gate.notify_one();
+    advance(0).await;
+    let completed = host.schedule_snapshot();
+    assert_eq!(completed.1.cycles, 1);
+    assert!(engine.with_db(|d| d.get_meta("lastProbeAt")).unwrap().is_some());
+    advance(120).await;
+    assert_eq!(count.load(Ordering::SeqCst), 1, "stopped permission cannot schedule another tick");
+    assert_eq!(host.shutdown().await.scheduler_complete, Some(true));
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(!first.0 && !repeated.0 && !still_running.0 && !completed.0);
+    assert_eq!(
+        [first.1.phase, repeated.1.phase, still_running.1.phase, completed.1.phase],
+        [SchedulePhase::Stopping, SchedulePhase::Stopping, SchedulePhase::Stopping, SchedulePhase::Idle],
+        "repeated Stop must keep waiting for the actual completion boundary"
+    );
+}
