@@ -55,7 +55,59 @@ fn presentation(center: &UNUserNotificationCenter) {
 
 pub struct Mac {
     identity: Result<String, String>,
-    login_supported: bool,
+    login_paths: LoginPaths,
+}
+// Capture the resolved launch paths; only login enable needs reproducibility.
+struct LoginPaths {
+    home: PathBuf,
+    config: PathBuf,
+    data: PathBuf,
+    inherited_paths: bool,
+}
+impl LoginPaths {
+    fn check(&self, enabled: bool, account_home: impl FnOnce() -> Option<PathBuf>) -> Result<(), Effect> {
+        if !enabled {
+            return Ok(());
+        }
+        let home = account_home().filter(|path| path.is_absolute()).ok_or_else(|| Effect::Unsupported("OS アカウントの既定ホームを確認できません".into()))?;
+        if self.home == home
+            && !self.inherited_paths
+            && self.config == home.join(".config/katala-tune/nodes.json")
+            && self.data == home.join("Library/Application Support").join(tune_core::nodes::PRODUCT_NAME).join("data/gpui-preview")
+        {
+            Ok(())
+        } else {
+            Err(Effect::Unsupported("起動時の台帳・データパスを OS のログイン環境で再現できません".into()))
+        }
+    }
+}
+// Resolve the UID's account record independently of HOME/dirs. Called only
+// from the explicit enable action's background worker, never query/startup.
+fn account_home() -> Option<PathBuf> {
+    use std::{
+        ffi::{CStr, OsStr},
+        mem::MaybeUninit,
+        os::unix::ffi::OsStrExt,
+    };
+    let mut record = MaybeUninit::<libc::passwd>::uninit();
+    let mut result = std::ptr::null_mut();
+    // A bounded buffer is sufficient for ordinary records. Any lookup error,
+    // including ERANGE, fails closed rather than assuming the process HOME.
+    let mut buffer = vec![0_u8; 16 * 1024];
+    // SAFETY: Both output pointers and the byte buffer remain live for the
+    // call. getpwuid_r initializes the record/pointers only on success.
+    let status = unsafe { libc::getpwuid_r(libc::getuid(), record.as_mut_ptr(), buffer.as_mut_ptr().cast(), buffer.len(), &mut result) };
+    if status != 0 || result.is_null() {
+        return None;
+    }
+    // SAFETY: Success with a non-null result supplies a valid account record.
+    let directory = unsafe { (*result).pw_dir };
+    if directory.is_null() {
+        return None;
+    }
+    // SAFETY: pw_dir is a NUL-terminated string in our still-live buffer.
+    // Copy only the home path; no other account fields are retained or logged.
+    Some(PathBuf::from(OsStr::from_bytes(unsafe { CStr::from_ptr(directory) }.to_bytes())))
 }
 fn identity(bundle: &Path, executable: &Path, current: &Path, id: &str) -> Result<String, String> {
     if bundle.extension().is_none_or(|e| e != "app")
@@ -85,10 +137,7 @@ impl Mac {
         })();
         // mainAppService does not preserve this process's environment at login.
         let inherited_paths = ["KATALA_TUNE_CONFIG", "KATALA_TUNE_DATA_DIR"].iter().any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
-        Self {
-            identity: actual,
-            login_supported: !inherited_paths && config == tune_core::nodes::user_config_path() && data == tune_core::nodes::data_dir().join("gpui-preview"),
-        }
+        Self { identity: actual, login_paths: LoginPaths { home: tune_core::nodes::home(), config: config.into(), data: data.into(), inherited_paths } }
     }
     fn center(&self) -> Result<objc2::rc::Retained<UNUserNotificationCenter>, String> {
         self.identity.as_ref().map_err(Clone::clone)?;
@@ -184,8 +233,8 @@ impl Service for Mac {
             done(Effect::Unsupported(reason.clone()));
             return;
         }
-        if enabled && !self.login_supported {
-            done(Effect::Unsupported("引数付き起動は SMAppService の mainAppService で再現できません".into()));
+        if let Err(effect) = self.login_paths.check(enabled, account_home) {
+            done(effect);
             return;
         }
         let state = self.login_state();
@@ -251,6 +300,38 @@ impl Service for Mac {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn launch(home: &str) -> LoginPaths {
+        let home = PathBuf::from(home);
+        LoginPaths {
+            config: home.join(".config/katala-tune/nodes.json"),
+            data: home.join("Library/Application Support/Katala Tune/data/gpui-preview"),
+            home,
+            inherited_paths: false,
+        }
+    }
+    #[test]
+    fn login_reproducibility_accepts_normal_home_but_refuses_changed_or_unknown_account_home() {
+        let account = PathBuf::from("/fixture/account");
+        assert!(launch("/fixture/account").check(true, || Some(account.clone())).is_ok());
+        assert!(matches!(launch("/fixture/qa-home").check(true, || Some(account.clone())), Err(Effect::Unsupported(_))));
+        assert!(matches!(launch("/fixture/account").check(true, || None), Err(Effect::Unsupported(_))));
+        assert!(matches!(launch("/fixture/account").check(true, || Some(PathBuf::from("relative"))), Err(Effect::Unsupported(_))));
+    }
+    #[test]
+    fn login_reproducibility_preserves_explicit_path_and_environment_guards_and_allows_disable() {
+        let account = PathBuf::from("/fixture/account");
+        for field in ["config", "data", "environment"] {
+            let mut paths = launch("/fixture/account");
+            match field {
+                "config" => paths.config = PathBuf::from("/fixture/other/nodes.json"),
+                "data" => paths.data = PathBuf::from("/fixture/other/data"),
+                _ => paths.inherited_paths = true,
+            }
+            assert!(matches!(paths.check(true, || Some(account.clone())), Err(Effect::Unsupported(_))));
+            assert!(paths.check(false, || panic!("disable must not query the account database")).is_ok());
+        }
+        assert!(launch("/fixture/qa-home").check(false, || panic!("disable must remain available with unknown account home")).is_ok());
+    }
     #[test]
     fn identity_uses_running_bundle_including_qa_and_rejects_other_executable() {
         let bundle = Path::new("/fixture/Preview & QA.app");

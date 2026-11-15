@@ -7966,6 +7966,7 @@ version = "0.7.0-rc.1"
 dependencies = [
  "block2",
  "gpui",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-service-management",

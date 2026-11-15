@@ -24,6 +24,7 @@ sha2 = "0.11"
 tune-link.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 objc2 = "0.6.5"
 block2 = "0.6.2"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSBundle", "NSString", "NSError"] }
