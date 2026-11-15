@@ -8,6 +8,8 @@ pub struct Options {
     pub open: Option<String>,
     pub live_id: Option<String>,
     pub logs: bool,
+    /// --selftest 用: 確認欄を出して「やめる」で終える（何も実行しない）
+    pub confirm_demo: bool,
 }
 
 pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Options>, String> {
@@ -16,12 +18,13 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
         return Ok(None);
     }
     let (mut config, mut data, mut selftest) = (None, None, false);
-    let (mut open, mut live_id, mut logs) = (None, None, false);
+    let (mut open, mut live_id, mut logs, mut confirm_demo) = (None, None, false, false);
     let mut args = values.into_iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--selftest") if !selftest => selftest = true,
             Some("--logs") if !logs => logs = true,
+            Some("--confirm-demo") if !confirm_demo => confirm_demo = true,
             Some("--open" | "--live") => {
                 let name = arg.to_str().unwrap();
                 let value = args
@@ -48,8 +51,8 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
     if selftest && (config.is_none() || data.is_none()) {
         return Err("--selftest requires --config and --data".into());
     }
-    if (live_id.is_some() || logs) && !selftest {
-        return Err("--live and --logs require --selftest".into());
+    if (live_id.is_some() || logs || confirm_demo) && !selftest {
+        return Err("--live, --logs and --confirm-demo require --selftest".into());
     }
     Ok(Some(Options {
         config: config.unwrap_or_else(tune_core::nodes::user_config_path),
@@ -59,6 +62,7 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
         open,
         live_id,
         logs,
+        confirm_demo,
     }))
 }
 

@@ -32,3 +32,10 @@ if [ -n "${E2E_LOGS:-}" ]; then
   echo "$out" | grep -q "^selftest logs rows=" || { echo "E2E 失敗: ログの読み出し" >&2; exit 1; }
   echo "e2e-gpui logs OK"
 fi
+
+# 常時: 変更操作の確認欄が描け、「やめる」で進まないこと（何も実行しない）。
+# 承認の判定そのもの（承認・取り消し・時間切れ・置き換え、Engine との結合）は単体テスト（gate.rs）で確かめる。
+conf=$("${CARGO_TARGET_DIR:-$repo/target}/release/katala-tune-gpui" --selftest --confirm-demo --config "$repo/config/nodes.example.json" --data "$tmp/confirm-data" | grep "^selftest confirm")
+echo "$conf"
+[ "$conf" = "selftest confirm shown=true approved=false" ] || { echo "E2E 失敗: 確認欄 ($conf)" >&2; exit 1; }
+echo "e2e-gpui confirm OK"

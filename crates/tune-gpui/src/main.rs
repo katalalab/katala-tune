@@ -6,6 +6,8 @@
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod browser;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+mod gate;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod input;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod model;
@@ -22,7 +24,7 @@ fn main() {
         Ok(Some(options)) => options,
         Ok(None) => {
             println!(
-                "katala-tune-gpui [--config <ledger.json>] [--data <directory>] [--open <view|node-id>] [--selftest [--live <node-id>] [--logs]]\nmacOS / Windows preview; data defaults to a separate gpui-preview directory. --selftest requires both paths and checks startup and saved-data routes only."
+                "katala-tune-gpui [--config <ledger.json>] [--data <directory>] [--open <view|node-id>] [--selftest [--live <node-id>] [--logs] [--confirm-demo]]\nmacOS / Windows preview; data defaults to a separate gpui-preview directory. --selftest requires both paths and checks startup and saved-data routes only."
             );
             return;
         }
@@ -35,7 +37,7 @@ fn main() {
     native::run(options);
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        drop((options.config, options.data, options.selftest, options.open, options.live_id, options.logs));
+        drop((options.config, options.data, options.selftest, options.open, options.live_id, options.logs, options.confirm_demo));
         eprintln!("GPUI preview currently supports macOS and Windows; use tune for the CLI");
         std::process::exit(2);
     }
