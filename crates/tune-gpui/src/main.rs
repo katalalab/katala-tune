@@ -7,6 +7,7 @@
 mod browser;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod collection;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod gate;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod input;
