@@ -12,7 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gate::Gate;
 use gpui::{
-    App, Application, Bounds, Context, FontWeight, Hsla, MouseButton, Window, WindowBounds, WindowOptions, div, hsla, img, point, prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, FontWeight, Hsla, MouseButton, PathBuilder, Window, WindowBounds, WindowOptions, canvas, div, hsla, img, point,
+    prelude::*, px, rgb, size,
 };
 use model::{Finding, Health, NodeView, Severity};
 use tune_core::engine::{Engine, Host};
@@ -102,6 +103,57 @@ fn trend(values: &[f64], max: f64, color: Hsla, height: f32, take: usize) -> gpu
         bars = bars.child(div().w(px(3.0)).h(px(h)).rounded_sm().bg(color));
     }
     bars
+}
+
+/// スコアのリング。円弧の長さがスコア（0〜100）に比例する。値が無いときは円だけ
+fn score_ring(fraction: f32, color: Hsla, label: String) -> gpui::Div {
+    use std::f32::consts::{FRAC_PI_2, TAU};
+    let arc = |path: &mut PathBuilder, c: gpui::Point<gpui::Pixels>, r: gpui::Pixels, f: f32| {
+        let steps = ((96.0 * f) as usize).max(2);
+        for i in 0..=steps {
+            let a = -FRAC_PI_2 + TAU * f * (i as f32 / steps as f32);
+            let p = point(c.x + r * a.cos(), c.y + r * a.sin());
+            if i == 0 { path.move_to(p) } else { path.line_to(p) }
+        }
+    };
+    div()
+        .size(px(44.0))
+        .flex_none()
+        .relative()
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let c = bounds.center();
+                    let r = bounds.size.width.min(bounds.size.height) / 2.0 - px(3.0);
+                    for (f, col) in [(0.9999, palette::line()), (fraction.clamp(0.0, 1.0), color)] {
+                        if f <= 0.0 {
+                            continue;
+                        }
+                        let mut path = PathBuilder::stroke(px(4.0));
+                        arc(&mut path, c, r, f);
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, col);
+                        }
+                    }
+                },
+            )
+            .size_full(),
+        )
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .font_weight(FontWeight::BOLD)
+                .text_color(color)
+                .child(label),
+        )
 }
 
 fn chip(text: impl Into<gpui::SharedString>, color: Hsla) -> gpui::Div {
@@ -774,23 +826,16 @@ impl TuneApp {
                     .border_color(palette::line())
                     .cursor_pointer()
                     .hover(|d| d.border_color(palette::accent()))
-                    .child(
-                        div().flex().items_center().child(div().flex_1().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(n.id.clone())).child(
-                            div()
-                                .size(px(44.0))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .border_3()
-                                .border_color(score_color(&n.health))
-                                .text_base()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(score_color(&n.health))
-                                .child(score),
+                    .child(div().flex().items_center().child(div().flex_1().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(n.id.clone())).child(
+                        score_ring(
+                            match &n.health {
+                                Health::Scored(sc) => *sc as f32 / 100.0,
+                                _ => 0.0,
+                            },
+                            score_color(&n.health),
+                            score,
                         ),
-                    )
+                    ))
                     .child(div().text_xs().text_color(palette::muted()).child(format!(
                         "{}{}",
                         n.os,
