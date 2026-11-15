@@ -728,6 +728,11 @@ async fn run_loop(
             });
             continue;
         }
+        // A newly started pull must not keep collection that is already disallowed.
+        // The release after pull still handles a newly fresh hub response.
+        if control.is_some() && !collect {
+            release();
+        }
         if control.is_none() {
             record_policy(&journal, &mut previous_policy, policy);
         }

@@ -348,3 +348,65 @@ async fn controlled_hub_change_wakes_pull_and_uses_new_hub_freshness() {
     engine.finish_monitor_journal(Duration::from_secs(1)).await;
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn controlled_releases_monitor_before_new_noncollecting_pull_preserving_ui() {
+    // Both transitions start with real Local ownership; the hub gate makes the
+    // pre-pull boundary observable before any transport result can hide it.
+    for paused in [false, true] {
+        let (engine, live, dir) = fixture();
+        std::fs::write(dir.join("nodes.json"), r#"{"nodes":[{"id":"a","os":"macos"},{"id":"b","os":"macos"}]}"#).unwrap();
+        live.start_owned(Owner::Ui, &engine.reload_config().nodes[..1], &[]);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let runner = Arc::new(HubRunner { calls: AtomicUsize::new(0), fresh: true.into(), gate: Some(gate.clone()), more: false });
+        let (tx, rx, stx, mut status) = channels(RunMode::Run);
+        let (e, l, r) = (engine.clone(), live.clone(), runner.clone());
+        let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, stx)), r.as_ref()).await });
+        phase(&mut status, RunPhase::Running).await;
+        assert!(live.heartbeat_owned(Owner::Monitor, "a"));
+        assert!(live.heartbeat_owned(Owner::Monitor, "b"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while live.samples("a").is_empty() || live.samples("b").is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        engine.with_db(|d| d.set_meta("monitor", &json!({"enabled":paused,"hub":"a"}))).unwrap();
+        tx.send_modify(|request| {
+            if paused {
+                request.mode = RunMode::Paused;
+                request.pull_seq += 1;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runner.calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let monitor_a = live.heartbeat_owned(Owner::Monitor, "a");
+        let monitor_b = live.heartbeat_owned(Owner::Monitor, "b");
+        let ui = live.heartbeat_owned(Owner::Ui, "a");
+        let active = live.active();
+        let before = live.samples("a").len();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while live.samples("a").len() <= before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("UI samples must continue while the hub transport is blocked");
+        assert!(!worker.is_finished());
+        tx.send_modify(|request| request.mode = RunMode::Exit);
+        gate.notify_one();
+        worker.await.unwrap();
+        live.shutdown(Duration::from_secs(1)).await;
+        assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(!monitor_a && !monitor_b, "paused={paused}: release Monitor ownership before entering the new blocked hub pull");
+        assert!(ui, "paused={paused}: releasing Monitor must preserve the UI claim");
+        assert_eq!(active, ["a"], "paused={paused}: stop the Monitor-only stream before pull, without stopping the shared UI stream");
+    }
+}
