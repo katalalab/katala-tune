@@ -502,8 +502,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     async fn assert_malformed_monitor_refused(raw: &str) {
-        let dir = std::env::temp_dir().join(format!("monitor-malformed-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("monitor-malformed-{}-{id}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("nodes.json"), r#"{"nodes":[{"id":"fixture","os":"macos"}]}"#).unwrap();
         let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(tune_core::engine::NoHost)).unwrap();
         engine.with_db(|d| d.set_meta("monitor", &json!({"enabled":true}))).unwrap();
