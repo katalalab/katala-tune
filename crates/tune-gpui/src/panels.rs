@@ -24,6 +24,7 @@ impl LogLevel {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Page {
+    Dashboard,
     Overview,
     Status,
     Resources,
@@ -40,7 +41,8 @@ pub enum Page {
     Actions,
 }
 impl Page {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
+        Self::Dashboard,
         Self::Overview,
         Self::Status,
         Self::Resources,
@@ -58,6 +60,7 @@ impl Page {
     ];
     pub fn label(self) -> &'static str {
         match self {
+            Self::Dashboard => "Dashboard",
             Self::Overview => "概要",
             Self::Status => "状態",
             Self::Resources => "リソース",
@@ -293,7 +296,7 @@ pub fn load(engine: &Engine, page: Page, query: &str, log_level: LogLevel) -> Re
             facts: vec![], rows: vec![], note: "保存済み一覧を開く・再読込するだけでは収集しません。収集する場合は画面の実行ボタンを使います。".into()
         };
     match page {
-        Page::Overview => return Err("概要は機体の概要画面を使います".into()),
+        Page::Overview | Page::Dashboard => return Err("概要・Dashboard は専用画面を使います".into()),
         Page::Status => {
             let v = engine.status_snapshot()?;
             fact(&mut p, "現在チェック数", fields(&v["counts"], &["ok", "warn", "fail", "unknown"]));
@@ -1134,7 +1137,7 @@ mod tests {
     fn every_saved_page_loads_empty_without_recompute_or_collection() {
         let f = Fixture::new(json!([]));
         let before = f.engine.with_db(|d| Ok((d.checks()?, d.check_events(150)?, d.cursors()?))).unwrap();
-        for page in Page::ALL.into_iter().filter(|p| *p != Page::Overview) {
+        for page in Page::ALL.into_iter().filter(|p| !matches!(p, Page::Overview | Page::Dashboard)) {
             let p = load(&f.engine, page, "", LogLevel::All).unwrap_or_else(|e| panic!("{page:?}: {e}"));
             assert!(!p.note.is_empty(), "{page:?}");
         }

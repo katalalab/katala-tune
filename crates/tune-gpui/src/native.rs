@@ -7,6 +7,7 @@
 use crate::{
     browser::{Reader, Request, Route},
     collection::{self, Job, Kind},
+    dashboard::{self, DashboardView},
     input::{self, SearchInput, Submitted},
     model,
     panels::{LogLevel, Page, Panel, Tone},
@@ -33,7 +34,7 @@ const FONT: &str = ".SystemUIFont";
 #[cfg(not(target_os = "macos"))]
 const FONT: &str = "Segoe UI";
 
-mod palette {
+pub(crate) mod palette {
     use gpui::{Hsla, rgb};
     pub fn bg() -> Hsla {
         rgb(0x111318).into()
@@ -308,6 +309,9 @@ struct TuneApp {
     generation: u64,
     loading: bool,
     panel: Option<Result<Panel, String>>,
+    dashboard: Option<Result<DashboardView, String>>,
+    dashboard_minutes: i64,
+    dashboard_clock: Instant,
     query: String,
     log_level: LogLevel,
     search: Entity<SearchInput>,
@@ -363,6 +367,9 @@ impl TuneApp {
             generation: 0,
             loading: false,
             panel: None,
+            dashboard: None,
+            dashboard_minutes: 60,
+            dashboard_clock: Instant::now(),
             query: String::new(),
             log_level: LogLevel::All,
             search,
@@ -389,6 +396,12 @@ impl TuneApp {
                             cx.notify();
                         }
                         if app.live_dirty.swap(false, Ordering::AcqRel) {
+                            cx.notify();
+                        }
+                        // Age/source labels and brief() are memory-only. SQLite
+                        // reloads are explicit or follow saved-data dirty events.
+                        if app.page == Page::Dashboard && app.selected.is_none() && app.dashboard_clock.elapsed() >= Duration::from_secs(1) {
+                            app.dashboard_clock = Instant::now();
                             cx.notify();
                         }
                         if app.collection.poll() {
@@ -423,6 +436,7 @@ impl TuneApp {
                                 // Keep the previous diagnostic visible even if a read
                                 // fails; the current ledger error remains in notice.
                                 app.panel = app.collection.restore_network(app.page, response.panel);
+                                app.dashboard = response.dashboard;
                                 if app.selected.as_ref().is_some_and(|id| !app.nodes.iter().any(|n| &n.id == id)) {
                                     app.navigate(Page::Overview, None, cx);
                                 }
@@ -448,9 +462,19 @@ impl TuneApp {
         self.loading = true;
         self.panel = self.collection.restore_network(self.page, self.panel.take());
         let route = self.selected.clone().map_or(Route::Page(self.page), Route::Node);
-        if let Err(error) = self.reader.request(Request { generation: self.generation, route, query: self.query.clone(), log_level: self.log_level }) {
+        if let Err(error) = self.reader.request(Request {
+            generation: self.generation,
+            route,
+            query: self.query.clone(),
+            log_level: self.log_level,
+            minutes: self.dashboard_minutes,
+        }) {
             self.loading = false;
-            self.panel = Some(Err(error));
+            if self.page == Page::Dashboard && self.selected.is_none() {
+                self.dashboard = Some(Err(error));
+            } else {
+                self.panel = Some(Err(error));
+            }
         }
         cx.notify();
     }
@@ -465,6 +489,7 @@ impl TuneApp {
         self.selected = selected;
         self.query.clear();
         self.panel = None;
+        self.dashboard = None;
         self.selected_row = None;
         self.scroll = UniformListScrollHandle::new();
         self.search.update(cx, |field, cx| field.reset(page.search_hint(), cx));
@@ -978,6 +1003,53 @@ impl TuneApp {
             .child(trends)
             .child(body)
     }
+    fn dashboard_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let mut toolbar = div().flex().flex_wrap().gap_2().px_5().py_3();
+        for minutes in [60, 360, 1440] {
+            toolbar = toolbar.child(
+                div()
+                    .id(("dashboard-range", minutes as usize))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .text_sm()
+                    .cursor_pointer()
+                    .bg(if self.dashboard_minutes == minutes { palette::accent() } else { palette::card() })
+                    .child(format!("{}時間", minutes / 60))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |app, _, _, cx| {
+                            app.dashboard_minutes = minutes;
+                            app.reload(cx);
+                        }),
+                    ),
+            );
+        }
+        toolbar = toolbar.child(
+            div()
+                .id("dashboard-reload")
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(palette::card())
+                .text_sm()
+                .cursor_pointer()
+                .child("再読込")
+                .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.reload(cx))),
+        );
+        let mut body = div().flex_1().min_h_0().flex().flex_col().child(toolbar);
+        if self.loading {
+            body = body.child(div().px_5().text_xs().text_color(palette::muted()).child("保存集計を読込中…"));
+        }
+        match &self.dashboard {
+            Some(Ok(view)) => {
+                body.child(div().id("dashboard-saved").flex_1().overflow_y_scroll().child(dashboard::render_dashboard(view, &self.live.live, now_ms())))
+            }
+            Some(Err(error)) => body.child(div().p_5().text_sm().text_color(palette::crit()).child(format!("保存Dashboardの読み込みに失敗: {error}"))),
+            None => body.child(div().p_5().text_sm().text_color(palette::muted()).child("保存Dashboardを読み込んでいます…")),
+        }
+    }
+
     fn record_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
         let mut toolbar = div().flex().flex_wrap().flex_none().items_center().gap_2().px_5().py_3();
         if self.page != Page::Network {
@@ -1234,6 +1306,7 @@ impl Render for TuneApp {
         let main = match self.selected.clone() {
             Some(id) => self.detail(&id, cx).into_any_element(),
             None if self.page == Page::Overview => self.overview(cx).into_any_element(),
+            None if self.page == Page::Dashboard => self.dashboard_panel(cx).into_any_element(),
             None => self.record_panel(cx).into_any_element(),
         };
         div()
@@ -1249,13 +1322,16 @@ impl Render for TuneApp {
             .on_action(cx.listener(|app, _: &PreviousPage, window, cx| app.cycle_page(-1, window, cx)))
             .on_action(cx.listener(|app, _: &Refresh, _, cx| app.reload(cx)))
             .on_action(cx.listener(|app, _: &FocusSearch, window, cx| {
-                if app.selected.is_none() && !matches!(app.page, Page::Overview | Page::Network) {
+                if app.selected.is_none() && !matches!(app.page, Page::Overview | Page::Dashboard | Page::Network) {
                     app.search.focus_handle(cx).focus(window);
                 }
             }))
             .on_action(cx.listener(|app, _: &FocusContent, window, _| app.focus.focus(window)))
             .on_action(cx.listener(|app, _: &ToggleFocus, window, cx| {
-                if app.selected.is_none() && !matches!(app.page, Page::Overview | Page::Network) && !app.search.focus_handle(cx).is_focused(window) {
+                if app.selected.is_none()
+                    && !matches!(app.page, Page::Overview | Page::Dashboard | Page::Network)
+                    && !app.search.focus_handle(cx).is_focused(window)
+                {
                     app.search.focus_handle(cx).focus(window);
                 } else {
                     app.focus.focus(window);
@@ -1286,7 +1362,23 @@ impl Render for TuneApp {
 }
 
 fn open_route(target: &str, ledger: &[nodes::Node]) -> Result<Route, String> {
-    let keys = ["overview", "status", "resources", "processes", "jobs", "logs", "tools", "ai", "security", "network", "specs", "power", "topology", "actions"];
+    let keys = [
+        "dashboard",
+        "overview",
+        "status",
+        "resources",
+        "processes",
+        "jobs",
+        "logs",
+        "tools",
+        "ai",
+        "security",
+        "network",
+        "specs",
+        "power",
+        "topology",
+        "actions",
+    ];
     if let Some((_, page)) = keys.into_iter().zip(Page::ALL).find(|(key, page)| *key == target || page.label() == target) {
         return Ok(Route::Page(page));
     }
@@ -1409,14 +1501,20 @@ pub fn run(options: startup::Options) {
                     let mut nodes = 0;
                     let mut log_counts = None;
                     // All saved-data routes run before any explicit live diagnostic.
-                    for page in Page::ALL {
-                        window.update(cx, |app, _, cx| app.navigate(page, None, cx)).map_err(|_| "selftest window closed".to_string())?;
+                    for (visit, page) in Page::ALL.into_iter().flat_map(|p| [p, p]).enumerate() {
+                        window
+                            .update(cx, |app, _, cx| if visit % 2 == 0 { app.navigate(page, None, cx) } else { app.reload(cx) })
+                            .map_err(|_| "selftest window closed".to_string())?;
                         let mut loaded = false;
                         for _ in 0..100 {
                             cx.background_executor().timer(Duration::from_millis(100)).await;
                             let state = window
                                 .update(cx, |app, _, _| {
-                                    if app.collection.running.is_some() || app.collection.result.is_some() {
+                                    if app.collection.running.is_some()
+                                        || app.collection.result.is_some()
+                                        || !app.live.live.active().is_empty()
+                                        || app.engine.monitor_journal_health()["running"] == true
+                                    {
                                         return Some((app.nodes.len(), Some("保存画面の描画が収集を開始しました".into())));
                                     }
                                     if app.loading {
@@ -1430,7 +1528,16 @@ pub fn run(options: startup::Options) {
                                             )
                                         });
                                     }
-                                    Some((app.nodes.len(), app.notice.clone().or_else(|| app.panel.as_ref().and_then(|p| p.as_ref().err().cloned()))))
+                                    let view_error = if page == Page::Dashboard {
+                                        match &app.dashboard {
+                                            Some(Ok(_)) => None,
+                                            Some(Err(error)) => Some(error.clone()),
+                                            None => Some("専用Dashboard結果がありません".into()),
+                                        }
+                                    } else {
+                                        app.panel.as_ref().and_then(|p| p.as_ref().err().cloned())
+                                    };
+                                    Some((app.nodes.len(), app.notice.clone().or(view_error)))
                                 })
                                 .map_err(|_| "selftest window closed".to_string())?;
                             match state {
@@ -1446,7 +1553,9 @@ pub fn run(options: startup::Options) {
                         if !loaded {
                             return Err(format!("selftest timed out view={page:?}"));
                         }
-                        count += 1;
+                        if visit % 2 == 1 {
+                            count += 1;
+                        }
                     }
                     if let Some(id) = live_id {
                         // Select and start once. Subsequent iterations only inspect state.
@@ -1683,6 +1792,7 @@ mod tests {
 
     #[test]
     fn open_route_resolves_saved_views_and_rejects_unknown_nodes() {
+        assert_eq!(open_route("dashboard", &[]).unwrap(), Route::Page(Page::Dashboard));
         assert_eq!(open_route("network", &[]).unwrap(), Route::Page(Page::Network));
         assert_eq!(open_route("logs", &[]).unwrap(), Route::Page(Page::Logs));
         assert_eq!(open_route("resources", &[]).unwrap(), Route::Page(Page::Resources));

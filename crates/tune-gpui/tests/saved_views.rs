@@ -32,6 +32,10 @@ fn saved_state(db: &Store) -> Value {
         "checks": db.checks().unwrap(),
         "events": db.check_events(150).unwrap(),
         "actions": db.actions(100).unwrap(),
+        "metrics":db.metrics(None,0,i64::MAX).unwrap().iter().map(|r|r.json()).collect::<Vec<_>>(),
+        "observations":db.monitor_events(&Default::default()).unwrap(),
+        "monitor":db.get_meta("monitor").unwrap(),
+        "hubPull":db.get_meta("hubPull").unwrap(),
         "lastProbeAt": db.get_meta("lastProbeAt").unwrap(),
         "lastLogsAt": db.get_meta("lastLogsAt").unwrap()
     })
@@ -76,6 +80,15 @@ fn populated_saved_routes_do_not_collect_or_recompute() {
                 }),
                 &json!({}),
             )?;
+            d.add_metrics(&[tune_core::db::metrics::MinuteRow {
+                node_id: "example-active".into(),
+                minute: now - 60_000,
+                n: 60,
+                v: json!({"cpu":[95,99],"mem":[93,94],"gpu_0_vram_used_mib":[1024,1200],"gpu_0_vram_total_mib":[2048,2048]}),
+                src: Some("example-hub".into()),
+            }])?;
+            d.set_meta("monitor", &json!({"enabled":true,"hub":"example-failed"}))?;
+            d.set_meta("hubPull", &json!({"hub":"example-failed","at":now-3_600_000,"ok":false,"error":"synthetic unavailable"}))?;
             d.set_meta("probeFailure:example-failed", &json!({"at":now,"error":"synthetic unavailable"}))?;
             d.insert_logs(
                 "example-active",
@@ -90,7 +103,7 @@ fn populated_saved_routes_do_not_collect_or_recompute() {
     let before = engine.with_db(|d| Ok(saved_state(d))).unwrap();
     drop(engine);
     let mut child = Command::new(env!("CARGO_BIN_EXE_katala-tune-gpui"))
-        .args(["--selftest", "--logs", "--open", "network", "--config"])
+        .args(["--selftest", "--logs", "--open", "dashboard", "--config"])
         .arg(&config)
         .arg("--data")
         .arg(&data)
@@ -109,7 +122,7 @@ fn populated_saved_routes_do_not_collect_or_recompute() {
     }
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "selftest logs rows=1 sigs=1\nselftest ok nodes=4 views=14");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "selftest logs rows=1 sigs=1\nselftest ok nodes=4 views=15");
     let db = Store::open_read_only(&data).unwrap();
     assert_eq!(saved_state(&db), before, "view loading changed saved observations or health state");
 }

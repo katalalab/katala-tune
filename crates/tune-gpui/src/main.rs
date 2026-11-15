@@ -8,6 +8,8 @@ mod browser;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod collection;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+mod dashboard;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod input;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod model;
