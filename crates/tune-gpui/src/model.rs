@@ -354,6 +354,57 @@ pub fn status(v: &Value) -> StatusView {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActionRow {
+    pub at_ms: i64,
+    pub node: String,
+    pub label: String,
+    pub kind: String,
+    pub ok: bool,
+}
+
+/// 実行記録（`Store::actions`）。新しい順
+pub fn actions(rows: &[Value]) -> Vec<ActionRow> {
+    let mut v: Vec<ActionRow> = rows
+        .iter()
+        .map(|r| ActionRow {
+            at_ms: r.get("at").and_then(Value::as_i64).unwrap_or(0),
+            node: str_of(r.get("node_id")),
+            label: one_line(&str_of(r.get("label")), 160),
+            kind: str_of(r.get("type")),
+            ok: r.get("ok").and_then(Value::as_bool) == Some(true),
+        })
+        .collect();
+    v.sort_by_key(|a| std::cmp::Reverse(a.at_ms));
+    v
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScheduleView {
+    pub enabled: bool,
+    pub probe_minutes: Option<i64>,
+    pub logs_minutes: Option<i64>,
+    pub inventory_hours: Option<i64>,
+    pub ai_minutes: Option<i64>,
+    pub last_probe_ms: Option<i64>,
+    pub last_logs_ms: Option<i64>,
+}
+
+/// `status_snapshot` の schedule と前回の時刻
+pub fn schedule(v: &Value) -> ScheduleView {
+    let s = v.get("schedule");
+    let num = |k: &str| s.and_then(|s| s.get(k)).and_then(Value::as_i64);
+    ScheduleView {
+        enabled: s.and_then(|s| s.get("enabled")).and_then(Value::as_bool).unwrap_or(false),
+        probe_minutes: num("probe_minutes"),
+        logs_minutes: num("logs_minutes"),
+        inventory_hours: num("inventory_hours"),
+        ai_minutes: num("ai_minutes"),
+        last_probe_ms: v.get("lastProbeAt").and_then(Value::as_i64),
+        last_logs_ms: v.get("lastLogsAt").and_then(Value::as_i64),
+    }
+}
+
 /// ライブ表示で貯める点（直近 3 分 = 1 秒ごとに 180 点）
 pub const LIVE_KEEP: usize = 180;
 
@@ -518,6 +569,17 @@ mod tests {
         assert_eq!(s.events[0].ts_ms, 9);
         assert_eq!(s.last_probe_ms, Some(7));
         assert_eq!(status(&json!({})), StatusView::default());
+    }
+
+    #[test]
+    fn actions_newest_first_and_schedule_defaults() {
+        let a = actions(&[json!({"at": 1, "ok": true, "label": "a"}), json!({"at": 5, "ok": false, "type": "t"}), json!({})]);
+        assert_eq!(a.iter().map(|x| x.at_ms).collect::<Vec<_>>(), [5, 1, 0]);
+        assert!(a[1].ok && !a[0].ok);
+        let s = schedule(&json!({"schedule": {"enabled": true, "probe_minutes": 60, "inventory_hours": 24}, "lastProbeAt": 9}));
+        assert!(s.enabled);
+        assert_eq!((s.probe_minutes, s.logs_minutes, s.inventory_hours, s.last_probe_ms), (Some(60), None, Some(24), Some(9)));
+        assert_eq!(schedule(&json!({})), ScheduleView::default());
     }
 
     #[test]

@@ -95,6 +95,44 @@ fn chip(text: impl Into<gpui::SharedString>, color: Hsla) -> gpui::Div {
         .child(text.into())
 }
 
+/// 機体を選んでいないときに出す画面
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Overview,
+    Status,
+    Logs,
+    Topology,
+    Actions,
+    Schedule,
+}
+
+impl Page {
+    /// サイドバーに並べる順
+    const NAV: [Self; 5] = [Self::Status, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Overview => "概要",
+            Self::Status => "状態",
+            Self::Logs => "ログ",
+            Self::Topology => "構成図",
+            Self::Actions => "実行記録",
+            Self::Schedule => "スケジュール",
+        }
+    }
+
+    fn from_arg(s: &str) -> Option<Self> {
+        Some(match s {
+            "status" => Self::Status,
+            "logs" => Self::Logs,
+            "topology" => Self::Topology,
+            "actions" => Self::Actions,
+            "schedule" => Self::Schedule,
+            _ => return None,
+        })
+    }
+}
+
 struct LiveHandles {
     live: Arc<Live>,
     store: Arc<Mutex<model::LiveStore>>,
@@ -114,9 +152,9 @@ struct TuneApp {
     live_dirty: Arc<AtomicBool>,
     /// ライブを流している機体と、最後に合図（heartbeat）を送った時刻
     live_on: Option<(String, Instant)>,
-    page_logs: bool,
-    page_topology: bool,
-    page_status: bool,
+    page: Page,
+    actions: Vec<model::ActionRow>,
+    schedule: model::ScheduleView,
     status: model::StatusView,
     topology: model::TopologyView,
     log_level: Option<&'static str>,
@@ -126,7 +164,7 @@ struct TuneApp {
 
 impl TuneApp {
     fn new(engine: Arc<Engine>, rt: Arc<tokio::runtime::Runtime>, dirty: Arc<AtomicBool>, live: LiveHandles, cx: &mut Context<Self>) -> Self {
-        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page_logs: false, page_topology: false, page_status: false, status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
+        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page: Page::Overview, actions: Vec::new(), schedule: Default::default(), status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
         app.reload();
         app.load_status();
         // 通知を待つ代わりに 0.4 秒ごとに旗を見る。変わったときだけ読み直して描き直す
@@ -176,11 +214,30 @@ impl TuneApp {
         if self.selected.as_ref().is_some_and(|id| !self.nodes.iter().any(|n| &n.id == id)) {
             self.selected = None;
         }
-        if self.page_logs {
-            self.load_logs();
-        }
-        if self.page_status {
-            self.load_status();
+        self.load_page();
+    }
+
+    /// 開いている画面の分だけ、保存済みを読み直す（収集・更新・書き込みはしない）
+    fn load_page(&mut self) {
+        match self.page {
+            Page::Logs => self.load_logs(),
+            Page::Status => self.load_status(),
+            Page::Topology => {
+                if let Ok(v) = self.engine.topology_ui_view(&Default::default()) {
+                    self.topology = model::topology(&v);
+                }
+            }
+            Page::Actions => {
+                if let Ok(rows) = self.engine.with_db(|d| d.actions(100)) {
+                    self.actions = model::actions(&rows);
+                }
+            }
+            Page::Schedule => {
+                if let Ok(v) = self.engine.status_snapshot() {
+                    self.schedule = model::schedule(&v);
+                }
+            }
+            Page::Overview => {}
         }
     }
 
@@ -227,22 +284,15 @@ impl TuneApp {
             self.live_stop();
         }
         self.selected = id;
-        self.clear_pages();
+        self.page = Page::Overview;
         cx.notify();
     }
 
-    fn clear_pages(&mut self) {
-        self.page_logs = false;
-        self.page_topology = false;
-        self.page_status = false;
-    }
-
-    fn open_status(&mut self, cx: &mut Context<Self>) {
+    fn open_page(&mut self, page: Page, cx: &mut Context<Self>) {
         self.live_stop();
         self.selected = None;
-        self.clear_pages();
-        self.page_status = true;
-        self.load_status();
+        self.page = page;
+        self.load_page();
         cx.notify();
     }
 
@@ -251,27 +301,6 @@ impl TuneApp {
         if let Ok(v) = self.engine.status_snapshot() {
             self.status = model::status(&v);
         }
-    }
-
-    fn open_topology(&mut self, cx: &mut Context<Self>) {
-        self.live_stop();
-        self.selected = None;
-        self.clear_pages();
-        self.page_topology = true;
-        // 保存済みを読むだけ。更新（収集）は行わない
-        if let Ok(v) = self.engine.topology_ui_view(&Default::default()) {
-            self.topology = model::topology(&v);
-        }
-        cx.notify();
-    }
-
-    fn open_logs(&mut self, cx: &mut Context<Self>) {
-        self.live_stop();
-        self.selected = None;
-        self.clear_pages();
-        self.page_logs = true;
-        self.load_logs();
-        cx.notify();
     }
 
     fn probe_all(&mut self, cx: &mut Context<Self>) {
@@ -307,32 +336,19 @@ impl TuneApp {
                 }))
         };
         let mut list = div().flex().flex_col().gap_0p5().p_2();
-        list = list.child(row(("nav", 0usize).into(), "概要".into(), palette::accent(), String::new(), self.selected.is_none() && !self.page_logs && !self.page_topology && !self.page_status, None, cx));
-        list = list.child(
-            div().id(("nav", 9997usize)).flex().items_center().gap_2().px_3().py_1p5().rounded_md().cursor_pointer()
-                .when(self.page_status, |d| d.bg(palette::card()))
-                .hover(|d| d.bg(palette::card()))
-                .child(div().size_2().rounded_full().bg(if self.status.count(model::CheckStatus::Fail) > 0 { palette::crit() } else { palette::muted() }))
-                .child(div().flex_1().text_sm().child("状態"))
-                .child(div().text_xs().text_color(palette::muted()).child(match self.status.count(model::CheckStatus::Fail) { 0 => String::new(), n => n.to_string() }))
-                .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.open_status(cx))),
-        );
-        list = list.child(
-            div().id(("nav", 9999usize)).flex().items_center().gap_2().px_3().py_1p5().rounded_md().cursor_pointer()
-                .when(self.page_logs, |d| d.bg(palette::card()))
-                .hover(|d| d.bg(palette::card()))
-                .child(div().size_2().rounded_full().bg(palette::muted()))
-                .child(div().flex_1().text_sm().child("ログ"))
-                .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.open_logs(cx))),
-        );
-        list = list.child(
-            div().id(("nav", 9998usize)).flex().items_center().gap_2().px_3().py_1p5().rounded_md().cursor_pointer()
-                .when(self.page_topology, |d| d.bg(palette::card()))
-                .hover(|d| d.bg(palette::card()))
-                .child(div().size_2().rounded_full().bg(palette::muted()))
-                .child(div().flex_1().text_sm().child("構成図"))
-                .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.open_topology(cx))),
-        );
+        list = list.child(row(("nav", 0usize).into(), "概要".into(), palette::accent(), String::new(), self.selected.is_none() && self.page == Page::Overview, None, cx));
+        for (i, page) in Page::NAV.into_iter().enumerate() {
+            let fails = if page == Page::Status { self.status.count(model::CheckStatus::Fail) } else { 0 };
+            list = list.child(
+                div().id(("page", i)).flex().items_center().gap_2().px_3().py_1p5().rounded_md().cursor_pointer()
+                    .when(self.selected.is_none() && self.page == page, |d| d.bg(palette::card()))
+                    .hover(|d| d.bg(palette::card()))
+                    .child(div().size_2().rounded_full().bg(if fails > 0 { palette::crit() } else { palette::muted() }))
+                    .child(div().flex_1().text_sm().child(page.title()))
+                    .child(div().text_xs().text_color(palette::muted()).child(if fails > 0 { fails.to_string() } else { String::new() }))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| app.open_page(page, cx))),
+            );
+        }
         for (i, n) in self.nodes.iter().enumerate() {
             let tail = match &n.health {
                 Health::Scored(s) => s.to_string(),
@@ -355,7 +371,7 @@ impl TuneApp {
     }
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = if self.page_status { "状態".to_string() } else if self.page_topology { "構成図".to_string() } else if self.page_logs { "ログ".to_string() } else { self.selected.clone().unwrap_or_else(|| "概要".into()) };
+        let title = self.selected.clone().unwrap_or_else(|| self.page.title().to_string());
         let (crit, warn): (usize, usize) = self.nodes.iter().fold((0, 0), |a, n| (a.0 + n.count(Severity::Critical), a.1 + n.count(Severity::Warn)));
         let busy = self.probing;
         div()
@@ -589,6 +605,48 @@ impl TuneApp {
             .child(events)
     }
 
+    fn actions_page(&self) -> impl IntoElement {
+        let now = now_ms();
+        let mut rows = div().flex().flex_col().gap_1();
+        for a in &self.actions {
+            let color = if a.ok { palette::ok() } else { palette::crit() };
+            rows = rows.child(
+                div().flex().items_center().gap_2().px_2().py_1().rounded_md().bg(palette::card())
+                    .child(div().w(px(64.0)).flex_none().text_xs().text_color(palette::muted()).child(model::ago(now, a.at_ms)))
+                    .child(div().w(px(72.0)).flex_none().child(chip(if a.ok { "成功" } else { "失敗" }, color)))
+                    .child(div().w(px(110.0)).flex_none().truncate().text_xs().text_color(palette::muted()).child(a.node.clone()))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().child(a.label.clone()))
+                    .child(div().w(px(150.0)).flex_none().truncate().text_xs().text_color(palette::muted()).child(a.kind.clone())),
+            );
+        }
+        if self.actions.is_empty() {
+            rows = rows.child(div().text_sm().text_color(palette::muted()).child("実行記録はありません"));
+        }
+        div().id("actions").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5()
+            .child(div().text_xs().text_color(palette::muted()).child(format!("承認して実行した操作の記録（新しい順・{} 件まで）。この画面からは実行も取り消しもできません。", self.actions.len().min(100))))
+            .child(rows)
+    }
+
+    fn schedule_page(&self) -> impl IntoElement {
+        let now = now_ms();
+        let s = &self.schedule;
+        let every = |m: Option<i64>| m.map_or("–".to_string(), |m| if m % 60 == 0 { format!("{} 時間ごと", m / 60) } else { format!("{m} 分ごと") });
+        let row = |label: &str, v: String| {
+            div().flex().items_center().gap_3().px_3().py_2().rounded_md().bg(palette::card())
+                .child(div().w(px(180.0)).flex_none().text_sm().text_color(palette::muted()).child(label.to_string()))
+                .child(div().text_sm().child(v))
+        };
+        div().id("schedule").flex_1().overflow_y_scroll().flex().flex_col().gap_2().p_5()
+            .child(div().text_xs().text_color(palette::muted()).child("自動スキャンの設定と前回の実行（表示だけ。変更は旧画面か設定で行います）"))
+            .child(row("自動スキャン", if s.enabled { "有効".into() } else { "無効".into() }))
+            .child(row("分析", every(s.probe_minutes)))
+            .child(row("ログ取り込み", every(s.logs_minutes)))
+            .child(row("道具の棚卸し", s.inventory_hours.map_or("–".to_string(), |h| format!("{h} 時間ごと"))))
+            .child(row("AI セッション", every(s.ai_minutes)))
+            .child(row("前回の分析", s.last_probe_ms.map_or("未実施".to_string(), |t| model::ago(now, t))))
+            .child(row("前回のログ取り込み", s.last_logs_ms.map_or("未実施".to_string(), |t| model::ago(now, t))))
+    }
+
     fn finding_row(f: &Finding) -> impl IntoElement {
         let color = severity_color(f.severity);
         div()
@@ -696,11 +754,15 @@ impl TuneApp {
 impl Render for TuneApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match self.selected.clone() {
-            _ if self.page_status => self.status_page().into_any_element(),
-            _ if self.page_topology => self.topology_page().into_any_element(),
-            _ if self.page_logs => self.logs_page(cx).into_any_element(),
             Some(id) => self.detail(&id, cx).into_any_element(),
-            None => self.overview(cx).into_any_element(),
+            None => match self.page {
+                Page::Overview => self.overview(cx).into_any_element(),
+                Page::Status => self.status_page().into_any_element(),
+                Page::Logs => self.logs_page(cx).into_any_element(),
+                Page::Topology => self.topology_page().into_any_element(),
+                Page::Actions => self.actions_page().into_any_element(),
+                Page::Schedule => self.schedule_page().into_any_element(),
+            },
         };
         div()
             .size_full()
@@ -785,10 +847,10 @@ fn main() {
         cx.activate(true);
         // --open logs|<機体 id>: 起動時に開く画面（画面確認・スクリーンショット用）
         match arg("--open").as_deref() {
-            Some("logs") => drop(window.update(cx, |v, _, cx| v.open_logs(cx))),
-            Some("status") => drop(window.update(cx, |v, _, cx| v.open_status(cx))),
-            Some("topology") => drop(window.update(cx, |v, _, cx| v.open_topology(cx))),
-            Some(id) => drop(window.update(cx, |v, _, cx| v.select(Some(id.to_string()), cx))),
+            Some(p) => match Page::from_arg(p) {
+                Some(page) => drop(window.update(cx, |v, _, cx| v.open_page(page, cx))),
+                None => drop(window.update(cx, |v, _, cx| v.select(Some(p.to_string()), cx))),
+            },
             None => {}
         }
         if selftest {
@@ -800,7 +862,7 @@ fn main() {
             }
             let logs = std::env::args().any(|a| a == "--logs");
             if logs {
-                window.update(cx, |v, _, cx| v.open_logs(cx)).ok();
+                window.update(cx, |v, _, cx| v.open_page(Page::Logs, cx)).ok();
             }
             cx.spawn(async move |cx| {
                 cx.background_executor().timer(Duration::from_millis(if live_id.is_some() { 8000 } else { 1500 })).await;
