@@ -2267,7 +2267,15 @@ mod tests {
             drop(primary_thread);
             Ok(())
         }));
-        job.observe(&mut receipt).unwrap();
+        windows_io_diagnostic::clear_candidate();
+        job.observe(&mut receipt).unwrap_or_else(|error| {
+            panic!(
+                "accounting-race observation failed: kind={:?} raw_os_error={:?} diagnostic={:?}",
+                error.kind(),
+                error.raw_os_error(),
+                windows_io_diagnostic::candidate()
+            )
+        });
         let diagnostic_started = Instant::now();
         let final_observation_deadline = spawn_deadline.min(diagnostic_started + CLEANUP);
         assert!(!lingering_descendants(&receipt), "an exited observed root alone is not a live descendant: {receipt:?}");

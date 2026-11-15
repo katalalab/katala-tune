@@ -57,21 +57,61 @@ async fn read_complete(pipe: impl AsyncRead + Unpin, limit: usize) -> std::io::R
 
 /// Release parser input only after stdin, both EOFs and exit 0 before deadline.
 pub(super) async fn run(mut command: Command, input: &[u8], timeout: Duration) -> RunResult {
+    #[cfg(test)]
+    let trace = {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let invocation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        move |stage: &'static str, error: Option<&std::io::Error>| {
+            // Fixed stages and OS error metadata only: never commands, input,
+            // output, paths, process identities, or an error's arbitrary text.
+            eprintln!(
+                "log_transport invocation={invocation} elapsed_ms={} stage={stage} error_kind={:?} raw_os_error={:?}",
+                started.elapsed().as_millis(),
+                error.map(std::io::Error::kind),
+                error.and_then(std::io::Error::raw_os_error)
+            );
+        }
+    };
+    macro_rules! exchange_step {
+        ($stage:literal, $future:expr) => {{
+            let result = $future.await;
+            #[cfg(test)]
+            trace($stage, result.as_ref().err());
+            result
+        }};
+    }
     command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-    let Ok(mut child) = command.spawn() else { return failure() };
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_error) => {
+            #[cfg(test)]
+            trace("spawn", Some(&_error));
+            return failure();
+        }
+    };
+    #[cfg(test)]
+    trace("spawned", None);
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let deadline = tokio::time::Instant::now() + timeout;
     let exchange = async {
         let writer = async {
-            stdin.write_all(input).await?;
-            stdin.shutdown().await?;
+            exchange_step!("stdin_write", stdin.write_all(input))?;
+            exchange_step!("stdin_shutdown", stdin.shutdown())?;
             drop(stdin);
             Ok::<_, std::io::Error>(())
         };
-        let (_, out, err, status) = tokio::try_join!(writer, read_complete(stdout, MAX_STDOUT), read_complete(stderr, MAX_STDERR), child.wait())?;
+        let (_, out, err, status) = tokio::try_join!(
+            writer,
+            async { exchange_step!("stdout_eof", read_complete(stdout, MAX_STDOUT)) },
+            async { exchange_step!("stderr_eof", read_complete(stderr, MAX_STDERR)) },
+            async { exchange_step!("root_exit", child.wait()) }
+        )?;
         if !status.success() {
+            #[cfg(test)]
+            trace("nonzero_exit", None);
             return Err(std::io::Error::other(FAILURE));
         }
         let out = String::from_utf8(out).map_err(|_| std::io::Error::other(FAILURE))?;
@@ -82,10 +122,20 @@ pub(super) async fn run(mut command: Command, input: &[u8], timeout: Duration) -
             err: err.strip_prefix('\u{feff}').unwrap_or(&err).to_owned(),
         })
     };
-    if let Ok(Ok(result)) = tokio::time::timeout_at(deadline, exchange).await
-        && tokio::time::Instant::now() <= deadline
-    {
-        return result;
+    match tokio::time::timeout_at(deadline, exchange).await {
+        Ok(Ok(result)) if tokio::time::Instant::now() <= deadline => return result,
+        Ok(Ok(_)) => {
+            #[cfg(test)]
+            trace("completed_after_deadline", None);
+        }
+        Ok(Err(_error)) => {
+            #[cfg(test)]
+            trace("exchange_error", Some(&_error));
+        }
+        Err(_) => {
+            #[cfg(test)]
+            trace("deadline", None);
+        }
     }
     let _ = child.start_kill();
     let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
