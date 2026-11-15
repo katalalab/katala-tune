@@ -75,7 +75,7 @@ pub struct ScheduleStatus {
 }
 impl MonitorHost {
     pub fn new(engine: Arc<Engine>, live: Arc<Live>, rt: Handle, dirty: Arc<AtomicBool>) -> Self {
-        let (request, _) = watch::channel(RunRequest { mode: RunMode::Paused, pull_seq: 0 });
+        let (request, _) = watch::channel(RunRequest { mode: RunMode::Paused, pull_seq: 0, start_seq: 0 });
         let (status, _) = watch::channel(RunStatus { phase: RunPhase::Paused, policy: None, local_collecting: None, hub_configured: false });
         let (schedule_request, _) = watch::channel(false);
         let (schedule_status, _) = watch::channel(ScheduleStatus { phase: SchedulePhase::Idle, cycles: 0, last_completed: None, error: None });
@@ -120,7 +120,7 @@ impl MonitorHost {
                 move |_| {
                     dirty.store(true, Ordering::Release);
                 },
-                self.request.subscribe(),
+                self.request.clone(),
                 self.status.clone(),
                 None,
             )));
@@ -133,8 +133,11 @@ impl MonitorHost {
             self.request.send_modify(|r| r.mode = RunMode::Paused);
             return Err("監視設定が無効でハブもありません。設定を保存してから明示的に開始してください".into());
         }
-        self.status.send_replace(RunStatus { phase: RunPhase::Starting, policy: None, local_collecting: None, hub_configured: settings.hub.is_some() });
-        self.request.send_modify(|r| r.mode = RunMode::Run);
+        self.request.send_modify(|r| {
+            r.start_seq = r.start_seq.wrapping_add(1);
+            r.mode = RunMode::Run;
+            self.status.send_replace(RunStatus { phase: RunPhase::Starting, policy: None, local_collecting: None, hub_configured: settings.hub.is_some() });
+        });
         self.worker(&mut state);
         Ok(())
     }
@@ -496,6 +499,84 @@ mod tests {
         host.shutdown().await;
         assert_eq!(engine.monitor_journal_health()["running"], false);
         assert!(host.start_monitor().is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    async fn assert_malformed_monitor_refused(raw: &str) {
+        let dir = std::env::temp_dir().join(format!("monitor-malformed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("nodes.json"), r#"{"nodes":[{"id":"fixture","os":"macos"}]}"#).unwrap();
+        let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(tune_core::engine::NoHost)).unwrap();
+        engine.with_db(|d| d.set_meta("monitor", &json!({"enabled":true}))).unwrap();
+        engine.with_db(|d| d.conn().execute("UPDATE meta SET v=? WHERE k='monitor'", [raw])).unwrap();
+        let live = Live::new(Arc::new(Refused), Opts::default(), Box::new(|_| {}));
+        let host = MonitorHost::new(engine.clone(), live.clone(), Handle::current(), Arc::new(AtomicBool::new(false)));
+        let refused = host.start_monitor().is_err();
+        let snapshot = host.snapshot();
+        let inactive = live.active().is_empty();
+        let no_journal = engine.monitor_journal_health()["running"] == false;
+        host.save_monitor_settings(json!({"enabled":true,"hub":null})).expect("explicit valid repair remains possible");
+        let repaired_mode = host.snapshot().mode;
+        host.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(refused && !snapshot.started && inactive && no_journal, "malformed settings must refuse admission: {raw}");
+        assert_eq!(snapshot.status.phase, RunPhase::Failed, "malformed is unknown, not disabled: {raw}");
+        assert_eq!(snapshot.status.local_collecting, None);
+        assert_eq!(repaired_mode, RunMode::Paused);
+    }
+    #[tokio::test]
+    async fn malformed_monitor_json_rejects_start_without_worker() {
+        assert_malformed_monitor_refused("{broken").await;
+    }
+    #[tokio::test]
+    async fn malformed_monitor_hub_rejects_start_without_worker() {
+        assert_malformed_monitor_refused(r#"{"enabled":true,"hub":123}"#).await;
+    }
+    #[tokio::test]
+    async fn malformed_monitor_types_reject_start_without_worker() {
+        for raw in ["null", "[]", "true", r#"{"enabled":"invalid"}"#, r#"{"enabled":null}"#, r#"{"hub":false}"#] {
+            assert_malformed_monitor_refused(raw).await;
+        }
+    }
+    async fn monitor_phase(status: &mut watch::Receiver<RunStatus>, wanted: RunPhase) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while status.borrow_and_update().phase != wanted {
+                status.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("worker must acknowledge phase");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn worker_failure_revokes_host_permission_and_settings_save_does_not_restart() {
+        let dir = std::env::temp_dir().join(format!("monitor-host-repair-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("nodes.json"), r#"{"nodes":[]}"#).unwrap();
+        let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(tune_core::engine::NoHost)).unwrap();
+        engine.with_db(|d| d.set_meta("monitor", &json!({"enabled":true}))).unwrap();
+        let live = Live::new(Arc::new(Refused), Opts::default(), Box::new(|_| {}));
+        let host = MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false)));
+        let mut status = host.status.subscribe();
+        host.start_monitor().unwrap();
+        monitor_phase(&mut status, RunPhase::Running).await;
+        let worker_id = host.state.lock().unwrap().worker.as_ref().unwrap().id();
+        let ticker_id = host.state.lock().unwrap().ticker.as_ref().unwrap().id();
+        engine.with_db(|d| d.conn().execute("UPDATE meta SET v=? WHERE k='monitor'", ["{broken"])).unwrap();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        monitor_phase(&mut status, RunPhase::Failed).await;
+        assert_eq!(host.snapshot().mode, RunMode::Paused);
+        host.save_monitor_settings(json!({"enabled":true,"hub":null})).unwrap();
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(15)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(host.snapshot().mode, RunMode::Paused);
+        assert_eq!(host.snapshot().status.phase, RunPhase::Paused);
+        host.start_monitor().unwrap();
+        monitor_phase(&mut status, RunPhase::Running).await;
+        assert_eq!(host.snapshot().mode, RunMode::Run);
+        assert_eq!(host.state.lock().unwrap().worker.as_ref().unwrap().id(), worker_id);
+        assert_eq!(host.state.lock().unwrap().ticker.as_ref().unwrap().id(), ticker_id);
+        assert!(host.shutdown().await.confirmed());
         std::fs::remove_dir_all(dir).unwrap();
     }
     struct Notifications(Arc<AtomicBool>);

@@ -575,6 +575,8 @@ pub enum RunMode {
 pub struct RunRequest {
     pub mode: RunMode,
     pub pull_seq: u64,
+    /// Incremented only by an explicit accepted Start, never by settings/Pull wakes.
+    pub start_seq: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunPhase {
@@ -595,11 +597,31 @@ pub struct RunStatus {
 
 /// A checked input boundary for the native session. Never use the last-good ledger.
 pub fn controlled_inputs(engine: &Engine) -> Result<(Config, Settings), String> {
+    controlled_inputs_retaining(engine, None)
+}
+
+fn controlled_inputs_retaining(engine: &Engine, live: Option<&Live>) -> Result<(Config, Settings), String> {
     let cfg = engine.reload_config();
     if let Some(error) = engine.config_error() {
         return Err(error);
     }
-    let settings = engine.with_db(read_settings)?;
+    // A validated full ledger is authoritative even if settings later fail.
+    // An unreadable ledger must not revoke unrelated UI ownership from cached data.
+    if let Some(live) = live {
+        live.retain_active(&cfg.nodes);
+    }
+    let saved = engine.with_db(|d| d.get_meta_checked("monitor"))?;
+    if saved
+        .as_ref()
+        .is_some_and(|v| !v.is_object() || v.get("enabled").is_some_and(|v| !v.is_boolean()) || v.get("hub").is_some_and(|v| !v.is_null() && !v.is_string()))
+    {
+        return Err("監視設定を読み出せません".into());
+    }
+    let v = saved.unwrap_or(Value::Null);
+    let settings = Settings {
+        enabled: v.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+        hub: v.get("hub").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+    };
     if let Some(id) = &settings.hub {
         let node = cfg.node(id).ok_or("設定されたハブが台帳にありません")?;
         if let Some(error) = node.refusal() {
@@ -616,11 +638,11 @@ pub async fn run_controlled(
     engine: Arc<Engine>,
     live: Arc<Live>,
     event: impl Fn(Value) + Send + Sync + 'static,
-    request: tokio::sync::watch::Receiver<RunRequest>,
+    request: tokio::sync::watch::Sender<RunRequest>,
     status: tokio::sync::watch::Sender<RunStatus>,
     agent: Option<Arc<Vec<u8>>>,
 ) {
-    run_loop(engine, live, Arc::new(event), None, agent, Some((request, status)), &collect::System).await;
+    run_loop(engine, live, Arc::new(event), None, agent, Some((request.subscribe(), request, status)), &collect::System).await;
 }
 
 /// 15 秒ごとに: 常時監視が入っていてハブの数字が新しくなければ全機体のライブに合図を送って保ち、
@@ -644,7 +666,32 @@ fn record_policy(journal: &crate::monitor_journal::Journal, previous: &mut Optio
     }
 }
 
-type Control = (tokio::sync::watch::Receiver<RunRequest>, tokio::sync::watch::Sender<RunStatus>);
+type Control = (tokio::sync::watch::Receiver<RunRequest>, tokio::sync::watch::Sender<RunRequest>, tokio::sync::watch::Sender<RunStatus>);
+
+/// Revoke only the session that read the failed inputs. Serialize permission,
+/// owner release and Failed status with Start so stale work cannot undo it.
+fn fail_controlled(control: &Control, observed: RunRequest, live: &Live) {
+    control.1.send_if_modified(|current| {
+        if current.start_seq != observed.start_seq || current.mode == RunMode::Exit {
+            return false;
+        }
+        current.mode = RunMode::Paused;
+        live.release_owned(crate::live::Owner::Monitor, &live.active(), crate::live::Stop::User);
+        control.2.send_replace(RunStatus { phase: RunPhase::Failed, policy: None, local_collecting: None, hub_configured: false });
+        // No self-wake: preserve Failed until an external wake or the next period.
+        false
+    });
+}
+
+fn controlled_collect(engine: &Engine, settings: &Settings, now: i64) -> Result<bool, String> {
+    // The validated settings are the policy input; never reread permissive defaults.
+    engine.with_db(|d| {
+        let pull = d.get_meta_checked("hubPull")?;
+        let fresh = settings.hub.is_some()
+            && pull.is_some_and(|p| p["ok"] == true && p["at"].as_i64().is_some_and(|at| now - at <= HUB_STALE_MS) && p["fresh"] == true);
+        Ok(settings.enabled && !fresh)
+    })
+}
 
 async fn run_loop(
     engine: Arc<Engine>,
@@ -672,7 +719,7 @@ async fn run_loop(
         live.release_owned(crate::live::Owner::Monitor, &live.active(), crate::live::Stop::User);
     };
     loop {
-        if let Some((request, _)) = &mut control {
+        if let Some((request, _, _)) = &mut control {
             tokio::select! {
                 _ = iv.tick() => {},
                 changed = request.changed() => if changed.is_err() { release(); return; },
@@ -681,10 +728,10 @@ async fn run_loop(
             iv.tick().await;
         }
         let now = now_ms();
-        let requested = control.as_mut().map(|(r, _)| *r.borrow_and_update());
+        let requested = control.as_mut().map(|(r, _, _)| *r.borrow_and_update());
         if requested.is_some_and(|r| r.mode == RunMode::Exit) {
             release();
-            control.as_ref().unwrap().1.send_replace(RunStatus { phase: RunPhase::Exited, policy: None, local_collecting: Some(false), hub_configured: false });
+            control.as_ref().unwrap().2.send_replace(RunStatus { phase: RunPhase::Exited, policy: None, local_collecting: Some(false), hub_configured: false });
             return;
         }
         let running = requested.is_none_or(|r| r.mode == RunMode::Run);
@@ -692,16 +739,19 @@ async fn run_loop(
         if let Some(r) = requested {
             processed_pull = r.pull_seq;
         }
-        let inputs = if control.is_some() { Some(controlled_inputs(&engine)) } else { None };
-        let decision = engine.with_db(|d| collection_decision(d, now));
+        let inputs = if control.is_some() { Some(controlled_inputs_retaining(&engine, Some(&live))) } else { None };
+        let decision = match &inputs {
+            Some(Ok((_, settings))) => controlled_collect(&engine, settings, now).map(|collect| (settings.clone(), collect)),
+            Some(Err(error)) => Err(error.clone()),
+            None => engine.with_db(|d| collection_decision(d, now)),
+        };
         let unknown = decision.is_err() || inputs.as_ref().is_some_and(Result::is_err);
         let (s, mut collect) = decision.unwrap_or_default();
-        if let Some((_, status)) = &control
+        if let Some(control) = &control
             && unknown
         {
             record_policy(&journal, &mut previous_policy, Policy::SettingsUnknown);
-            release();
-            status.send_replace(RunStatus { phase: RunPhase::Failed, policy: None, local_collecting: None, hub_configured: false });
+            fail_controlled(control, requested.unwrap(), &live);
             continue;
         }
         let mut policy = if unknown {
@@ -714,13 +764,10 @@ async fn run_loop(
             Policy::Disabled
         };
         collect &= running;
-        if let Some(Ok((cfg, _))) = &inputs {
-            live.retain_active(&cfg.nodes);
-        }
         if !running && !explicit_pull {
             record_policy(&journal, &mut previous_policy, policy);
             release();
-            control.as_ref().unwrap().1.send_replace(RunStatus {
+            control.as_ref().unwrap().2.send_replace(RunStatus {
                 phase: RunPhase::Paused,
                 policy: Some(policy),
                 local_collecting: Some(false),
@@ -749,22 +796,21 @@ async fn run_loop(
         }
         // After a potentially long pull, recheck both permission and current inputs
         // before claiming streams or committing local data.
-        let cfg = if let Some((_, status)) = &control {
-            match controlled_inputs(&engine) {
+        let cfg = if let Some(control) = &control {
+            match controlled_inputs_retaining(&engine, Some(&live)) {
                 Ok((cfg, latest)) if latest == s => cfg,
                 _ => {
-                    release();
                     record_policy(&journal, &mut previous_policy, Policy::SettingsUnknown);
-                    status.send_replace(RunStatus { phase: RunPhase::Failed, policy: None, local_collecting: None, hub_configured: false });
+                    fail_controlled(control, requested.unwrap(), &live);
                     continue;
                 }
             }
         } else {
             engine.reload_config()
         };
-        if let Some((_, status)) = &control {
-            match engine.with_db(|d| collection_decision(d, now_ms())) {
-                Ok((latest, latest_collect)) if latest == s => {
+        if let Some(control) = &control {
+            match controlled_collect(&engine, &s, now_ms()) {
+                Ok(latest_collect) => {
                     collect = latest_collect;
                     policy = if collect {
                         Policy::Local
@@ -775,14 +821,20 @@ async fn run_loop(
                     };
                 }
                 _ => {
-                    release();
-                    status.send_replace(RunStatus { phase: RunPhase::Failed, policy: None, local_collecting: None, hub_configured: false });
+                    fail_controlled(control, requested.unwrap(), &live);
                     continue;
                 }
             }
         }
-        if let Some((request, status)) = &control {
-            let mode = request.borrow().mode;
+        // Hold the request read guard through the synchronous collection/commit
+        // boundary so a newer command cannot be overwritten by this cycle's status.
+        let current = control.as_ref().map(|(request, _, _)| request.borrow());
+        if let Some((_, _, status)) = &control {
+            let current = current.as_ref().unwrap();
+            let mode = current.mode;
+            if mode != RunMode::Exit && current.start_seq != requested.unwrap().start_seq {
+                continue;
+            }
             if mode != RunMode::Run {
                 release();
                 status.send_replace(RunStatus {
@@ -855,7 +907,7 @@ async fn run_loop(
             commit_minute_rows(&engine, &journal, &rows, &mut rolled, &mut pending_from, &*event);
         }
         maintain_retention(&engine, &journal, now, std::time::Instant::now(), &mut retention_schedule);
-        if let Some((_, status)) = &control {
+        if let Some((_, _, status)) = &control {
             status.send_replace(RunStatus { phase: RunPhase::Running, policy: Some(policy), local_collecting: Some(collect), hub_configured: s.hub.is_some() });
         }
         if until.is_some_and(|u| std::time::Instant::now() >= u) {
