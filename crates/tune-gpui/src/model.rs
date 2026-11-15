@@ -497,6 +497,125 @@ pub fn power_kind_label(k: &str) -> &'static str {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolGroup {
+    pub name: String,
+    pub node_count: i64,
+    /// 機体どうしで版が違う
+    pub drift: bool,
+    pub versions: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolEvent {
+    pub node: String,
+    pub name: String,
+    pub kind: String,
+    pub from: String,
+    pub to: String,
+    pub ts_ms: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InventoryView {
+    /// (機体, 件数, 最後の成功, 失敗理由)
+    pub nodes: Vec<(String, i64, Option<i64>, Option<String>)>,
+    /// 版差のあるものを先、次に台数の多い順
+    pub groups: Vec<ToolGroup>,
+    pub events: Vec<ToolEvent>,
+    pub last_at: Option<i64>,
+}
+
+/// `Engine::inventory_view`（保存済み）。棚卸しの実行はしない
+pub fn inventory(v: &Value) -> InventoryView {
+    let arr = |k: &str| v.get(k).and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let mut groups: Vec<ToolGroup> = arr("groups")
+        .iter()
+        .map(|g| {
+            let mut versions: Vec<String> = g
+                .get("nodes")
+                .and_then(Value::as_object)
+                .map(|n| n.values().flat_map(|x| x.get("versions").and_then(Value::as_array).into_iter().flatten().filter_map(|s| s.as_str().map(str::to_string))).collect())
+                .unwrap_or_default();
+            versions.sort();
+            versions.dedup();
+            ToolGroup {
+                name: str_of(g.get("name")),
+                node_count: g.get("node_count").and_then(Value::as_i64).unwrap_or(0),
+                drift: g.get("drift").and_then(Value::as_bool) == Some(true),
+                versions,
+            }
+        })
+        .collect();
+    groups.sort_by(|a, b| b.drift.cmp(&a.drift).then(b.node_count.cmp(&a.node_count)).then_with(|| a.name.cmp(&b.name)));
+    let mut events: Vec<ToolEvent> = arr("events")
+        .iter()
+        .map(|e| ToolEvent {
+            node: str_of(e.get("node_id")),
+            name: str_of(e.get("name")),
+            kind: str_of(e.get("kind")),
+            from: str_of(e.get("from_version")),
+            to: str_of(e.get("to_version")),
+            ts_ms: e.get("ts").and_then(Value::as_i64).unwrap_or(0),
+        })
+        .collect();
+    events.sort_by_key(|e| std::cmp::Reverse(e.ts_ms));
+    InventoryView {
+        nodes: arr("nodes")
+            .iter()
+            .map(|n| (str_of(n.get("id")), n.get("count").and_then(Value::as_i64).unwrap_or(0), n.get("last_ok_at").and_then(Value::as_i64), n.get("error").and_then(Value::as_str).map(str::to_string)))
+            .collect(),
+        groups,
+        events,
+        last_at: v.get("lastInventoryAt").and_then(Value::as_i64),
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AiView {
+    pub days: i64,
+    pub sessions: i64,
+    pub prompts: i64,
+    /// 料金表から求めた概算（請求額ではない）
+    pub cost_usd: f64,
+    pub tok_in: i64,
+    pub tok_out: i64,
+    pub models: Vec<(String, f64)>,
+    pub tools: Vec<(String, i64, i64)>,
+    pub prs: usize,
+    pub last_at: Option<i64>,
+}
+
+/// `Engine::ai_summary`（保存済み）。取り込みはしない
+pub fn ai(v: &Value) -> AiView {
+    let t = v.get("totals");
+    let n = |k: &str| t.and_then(|t| t.get(k)).and_then(Value::as_i64).unwrap_or(0);
+    let mut models: Vec<(String, f64)> = v
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(|m| (str_of(m.get("model")), m.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0))).collect())
+        .unwrap_or_default();
+    models.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut tools: Vec<(String, i64, i64)> = v
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(|x| (str_of(x.get("name")), x.get("calls").and_then(Value::as_i64).unwrap_or(0), x.get("errors").and_then(Value::as_i64).unwrap_or(0))).collect())
+        .unwrap_or_default();
+    tools.sort_by_key(|x| std::cmp::Reverse(x.1));
+    AiView {
+        days: v.get("days").and_then(Value::as_i64).unwrap_or(0),
+        sessions: n("sessions"),
+        prompts: n("prompts"),
+        cost_usd: t.and_then(|t| t.get("cost_usd")).and_then(Value::as_f64).unwrap_or(0.0),
+        tok_in: n("tok_in"),
+        tok_out: n("tok_out"),
+        models,
+        tools,
+        prs: v.get("prs").and_then(Value::as_array).map_or(0, Vec::len),
+        last_at: v.get("lastAiAt").and_then(Value::as_i64),
+    }
+}
+
 /// ライブ表示で貯める点（直近 3 分 = 1 秒ごとに 180 点）
 pub const LIVE_KEEP: usize = 180;
 
@@ -703,6 +822,38 @@ mod tests {
         assert_eq!(p.rows[1].missing, ["gpu_w", "cpu_w"]);
         assert_eq!(power_kind_label(&p.rows[2].kind), "不明");
         assert_eq!(power(&json!({})), PowerView::default());
+    }
+
+    #[test]
+    fn inventory_puts_drift_first_and_dedups_versions() {
+        let v = json!({
+            "groups": [
+                {"name": "b", "node_count": 8, "drift": false, "nodes": {"x": {"versions": ["1"]}}},
+                {"name": "a", "node_count": 2, "drift": true, "nodes": {"x": {"versions": ["2", "1"]}, "y": {"versions": ["1"]}}}
+            ],
+            "events": [{"ts": 1, "name": "p"}, {"ts": 5, "name": "q", "from_version": "1", "to_version": "2"}],
+            "nodes": [{"id": "x", "count": 3, "last_ok_at": 9}],
+            "lastInventoryAt": 7
+        });
+        let i = inventory(&v);
+        assert_eq!(i.groups[0].name, "a");
+        assert_eq!(i.groups[0].versions, ["1", "2"]);
+        assert_eq!(i.events[0].name, "q");
+        assert_eq!(i.nodes[0], ("x".to_string(), 3, Some(9), None));
+        assert_eq!(i.last_at, Some(7));
+        assert_eq!(inventory(&json!({})), InventoryView::default());
+    }
+
+    #[test]
+    fn ai_summary_sorts_by_cost_and_calls() {
+        let v = json!({"days": 30, "totals": {"sessions": 5, "prompts": 9, "cost_usd": 1.5, "tok_in": 10, "tok_out": 20},
+            "models": [{"model": "small", "cost_usd": 1.0}, {"model": "big", "cost_usd": 9.0}],
+            "tools": [{"name": "a", "calls": 1, "errors": 0}, {"name": "b", "calls": 7, "errors": 2}], "prs": [{}, {}]});
+        let a = ai(&v);
+        assert_eq!((a.sessions, a.prompts, a.prs), (5, 9, 2));
+        assert_eq!(a.models[0].0, "big");
+        assert_eq!(a.tools[0], ("b".to_string(), 7, 2));
+        assert_eq!(ai(&json!({})), AiView::default());
     }
 
     #[test]

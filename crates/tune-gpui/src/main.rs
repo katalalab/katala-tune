@@ -106,11 +106,13 @@ enum Page {
     Schedule,
     Resources,
     Power,
+    Tools,
+    Ai,
 }
 
 impl Page {
     /// サイドバーに並べる順
-    const NAV: [Self; 7] = [Self::Status, Self::Resources, Self::Power, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
+    const NAV: [Self; 9] = [Self::Status, Self::Resources, Self::Power, Self::Tools, Self::Ai, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
 
     fn title(self) -> &'static str {
         match self {
@@ -122,6 +124,8 @@ impl Page {
             Self::Schedule => "スケジュール",
             Self::Resources => "リソース",
             Self::Power => "電力・Clock",
+            Self::Tools => "道具",
+            Self::Ai => "AI",
         }
     }
 
@@ -134,6 +138,8 @@ impl Page {
             "schedule" => Self::Schedule,
             "resources" => Self::Resources,
             "power" => Self::Power,
+            "tools" => Self::Tools,
+            "ai" => Self::Ai,
             _ => return None,
         })
     }
@@ -161,6 +167,8 @@ struct TuneApp {
     page: Page,
     actions: Vec<model::ActionRow>,
     power: model::PowerView,
+    tools: model::InventoryView,
+    ai: model::AiView,
     schedule: model::ScheduleView,
     status: model::StatusView,
     topology: model::TopologyView,
@@ -171,7 +179,7 @@ struct TuneApp {
 
 impl TuneApp {
     fn new(engine: Arc<Engine>, rt: Arc<tokio::runtime::Runtime>, dirty: Arc<AtomicBool>, live: LiveHandles, cx: &mut Context<Self>) -> Self {
-        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page: Page::Overview, actions: Vec::new(), power: Default::default(), schedule: Default::default(), status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
+        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page: Page::Overview, actions: Vec::new(), power: Default::default(), tools: Default::default(), ai: Default::default(), schedule: Default::default(), status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
         app.reload();
         app.load_status();
         // 通知を待つ代わりに 0.4 秒ごとに旗を見る。変わったときだけ読み直して描き直す
@@ -247,6 +255,16 @@ impl TuneApp {
             Page::Power => {
                 if let Ok(v) = self.engine.power_report() {
                     self.power = model::power(&v);
+                }
+            }
+            Page::Tools => {
+                if let Ok(v) = self.engine.inventory_view(false) {
+                    self.tools = model::inventory(&v);
+                }
+            }
+            Page::Ai => {
+                if let Ok(v) = self.engine.ai_summary(&serde_json::json!({})) {
+                    self.ai = model::ai(&v);
                 }
             }
             Page::Overview | Page::Resources => {}
@@ -679,6 +697,77 @@ impl TuneApp {
             .child(rows)
     }
 
+    /// 道具の棚卸し（保存済み）。棚卸しの実行・公開・除外はこの画面からはしない
+    fn tools_page(&self) -> impl IntoElement {
+        let now = now_ms();
+        let t = &self.tools;
+        let mut nodes = div().flex().flex_wrap().gap_2();
+        for (id, count, ok, err) in &t.nodes {
+            nodes = nodes.child(chip(format!("{id} {count} 件{}", if err.is_some() { " ・失敗" } else { "" }), if err.is_some() { palette::crit() } else { palette::muted() }).when(ok.is_none(), |d| d.opacity(0.6)));
+        }
+        let mut groups = div().flex().flex_col().gap_1();
+        for g in t.groups.iter().take(150) {
+            groups = groups.child(
+                div().flex().items_center().gap_2().px_2().py_1().rounded_md().bg(palette::card())
+                    .child(div().w(px(64.0)).flex_none().child(if g.drift { chip("版差", palette::warn()) } else { chip("同一", palette::muted()) }))
+                    .child(div().w(px(220.0)).flex_none().truncate().text_xs().font_weight(FontWeight::SEMIBOLD).child(g.name.clone()))
+                    .child(div().w(px(56.0)).flex_none().text_xs().text_color(palette::muted()).child(format!("{} 台", g.node_count)))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().text_color(palette::muted()).child(g.versions.join(" / "))),
+            );
+        }
+        let mut events = div().flex().flex_col().gap_1();
+        for e in t.events.iter().take(20) {
+            events = events.child(
+                div().flex().items_center().gap_2().px_2().py_1().rounded_md().bg(palette::card())
+                    .child(div().w(px(64.0)).flex_none().text_xs().text_color(palette::muted()).child(model::ago(now, e.ts_ms)))
+                    .child(div().w(px(100.0)).flex_none().truncate().text_xs().text_color(palette::muted()).child(e.node.clone()))
+                    .child(div().w(px(180.0)).flex_none().truncate().text_xs().child(e.name.clone()))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().text_color(palette::muted()).child(format!("{} {} → {}", e.kind, e.from, e.to))),
+            );
+        }
+        div().id("tools").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5()
+            .child(div().text_xs().text_color(palette::muted()).child(format!("保存済みの棚卸し（前回 {}）。版差のあるものを先に並べます。実行や公開は旧画面から行います。", t.last_at.map_or("未実施".to_string(), |a| model::ago(now, a)))))
+            .child(nodes)
+            .child(div().text_xs().text_color(palette::muted()).child(format!("道具（表示 {} / {} 件）", t.groups.len().min(150), t.groups.len())))
+            .child(groups)
+            .child(div().text_xs().text_color(palette::muted()).child("最近の更新"))
+            .child(events)
+    }
+
+    /// AI の利用（保存済みの集計）。料金は料金表から求めた概算で、請求額ではない
+    fn ai_page(&self) -> impl IntoElement {
+        let a = &self.ai;
+        let now = now_ms();
+        let stat = |label: &str, v: String| div().flex().flex_col().gap_0p5().child(div().text_xs().text_color(palette::muted()).child(label.to_string())).child(div().text_lg().font_weight(FontWeight::BOLD).child(v));
+        let mil = |n: i64| format!("{:.1}M", n as f64 / 1e6);
+        let mut models = div().flex().flex_col().gap_1();
+        let max_cost = a.models.first().map_or(1.0, |m| m.1.max(0.01));
+        for (name, cost) in a.models.iter().take(12) {
+            models = models.child(
+                div().flex().items_center().gap_2().px_2().py_1().rounded_md().bg(palette::card())
+                    .child(div().w(px(200.0)).flex_none().truncate().text_xs().child(name.clone()))
+                    .child(div().w(px(90.0)).flex_none().text_xs().text_color(palette::muted()).child(format!("${cost:.2}")))
+                    .child(div().h(px(5.0)).rounded_full().bg(palette::accent()).w(px((cost / max_cost * 300.0) as f32))),
+            );
+        }
+        let mut tools = div().flex().flex_col().gap_1();
+        for (name, calls, errors) in a.tools.iter().take(12) {
+            tools = tools.child(
+                div().flex().items_center().gap_2().px_2().py_1().rounded_md().bg(palette::card())
+                    .child(div().w(px(240.0)).flex_none().truncate().text_xs().child(name.clone()))
+                    .child(div().w(px(90.0)).flex_none().text_xs().text_color(palette::muted()).child(format!("{calls} 回")))
+                    .child(div().text_xs().text_color(if *errors > 0 { palette::warn() } else { palette::muted() }).child(format!("失敗 {errors}"))),
+            );
+        }
+        div().id("ai").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5()
+            .child(div().text_xs().text_color(palette::muted()).child(format!("直近 {} 日の保存済みの集計（取り込み {}）。料金は料金表から求めた概算で、請求額ではありません。", a.days, a.last_at.map_or("未実施".to_string(), |t| model::ago(now, t)))))
+            .child(div().flex().gap_8().child(stat("セッション", a.sessions.to_string())).child(stat("プロンプト", a.prompts.to_string())).child(stat("概算料金", format!("${:.0}", a.cost_usd))).child(stat("入力 / 出力トークン", format!("{} / {}", mil(a.tok_in), mil(a.tok_out)))).child(stat("PR", a.prs.to_string())))
+            .child(div().text_xs().text_color(palette::muted()).child("モデル別（概算料金の多い順）"))
+            .child(models)
+            .child(div().text_xs().text_color(palette::muted()).child("ツール別（呼び出しの多い順）"))
+            .child(tools)
+    }
+
     fn actions_page(&self) -> impl IntoElement {
         let now = now_ms();
         let mut rows = div().flex().flex_col().gap_1();
@@ -838,6 +927,8 @@ impl Render for TuneApp {
                 Page::Schedule => self.schedule_page().into_any_element(),
                 Page::Resources => self.resources_page(cx).into_any_element(),
                 Page::Power => self.power_page().into_any_element(),
+                Page::Tools => self.tools_page().into_any_element(),
+                Page::Ai => self.ai_page().into_any_element(),
             },
         };
         div()
@@ -944,7 +1035,7 @@ fn main() {
                 cx.background_executor().timer(Duration::from_millis(if live_id.is_some() { 8000 } else { 1500 })).await;
                 println!("selftest ok nodes={view}");
                 // 開いた画面のデータが読めたか（画面ごとの件数）。--open <page> と併用する
-                let counts = window.update(cx, |v, _, _| format!("power={} actions={} status={} topology={}", v.power.rows.len(), v.actions.len(), v.status.checks.len(), v.topology.entities.len())).unwrap_or_default();
+                let counts = window.update(cx, |v, _, _| format!("power={} actions={} status={} topology={} tools={} ai={}", v.power.rows.len(), v.actions.len(), v.status.checks.len(), v.topology.entities.len(), v.tools.groups.len(), v.ai.sessions)).unwrap_or_default();
                 println!("selftest page {counts}");
                 if logs {
                     let (r, g) = window.update(cx, |v, _, _| (v.logs.len(), v.sigs.len())).unwrap_or((0, 0));
