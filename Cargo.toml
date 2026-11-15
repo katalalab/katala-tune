@@ -28,6 +28,7 @@ tokio = { version = "1", features = ["process", "time", "sync", "io-util", "macr
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(katala_ci_diagnostics)"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
