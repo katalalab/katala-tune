@@ -34,6 +34,9 @@ pub struct Finding {
     pub title: String,
     pub detail: String,
     pub advice: String,
+    /// 提案された変更操作（tune-core の許可リストの形）と表示名。共用機・保護対象の所見には付かない
+    pub action: Option<Value>,
+    pub action_label: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +92,24 @@ fn finding(v: &Value) -> Finding {
         title: str_of(v.get("title")),
         detail: str_of(v.get("detail")),
         advice: str_of(v.get("advice")),
+        action: v.get("action").filter(|a| a.get("type").is_some()).cloned(),
+        action_label: str_of(v.get("action").and_then(|a| a.get("label"))),
+    }
+}
+
+/// `confirm_and_run` / `undo` の結果を一行にする。取り消し・拒否・失敗・成功を取り違えない（取り消しが最優先）
+pub fn action_message(node: &str, r: Result<Value, String>) -> String {
+    let who = if node.is_empty() { String::new() } else { format!("{node}: ") };
+    let one_line = |s: &str| s.lines().next().unwrap_or("").chars().take(200).collect::<String>();
+    match r {
+        Err(e) => format!("{who}実行できませんでした: {e}"),
+        Ok(v) if v.get("cancelled").and_then(Value::as_bool) == Some(true) => format!("{who}取り消しました（何も実行していません）"),
+        Ok(v) if v.get("refused").is_some_and(|x| !x.is_null()) => format!("{who}実行しませんでした: {}", str_of(v.get("refused"))),
+        Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+            let o = str_of(v.get("outcome"));
+            format!("{who}{}", if o.is_empty() { "完了しました".to_string() } else { one_line(&o) })
+        }
+        Ok(v) => format!("{who}失敗しました: {}", one_line(&str_of(v.get("output")))),
     }
 }
 
@@ -295,7 +316,16 @@ mod tests {
             score_trend: vec![],
             cpu_trend: vec![],
             mem_trend: vec![],
-            findings: (0..crit).map(|_| Finding { severity: Severity::Critical, title: String::new(), detail: String::new(), advice: String::new() }).collect(),
+            findings: (0..crit)
+                .map(|_| Finding {
+                    severity: Severity::Critical,
+                    title: String::new(),
+                    detail: String::new(),
+                    advice: String::new(),
+                    action: None,
+                    action_label: String::new(),
+                })
+                .collect(),
         };
         let mut v = [mk(0, 10), mk(2, 90), mk(1, 50)];
         v.sort_by_key(NodeView::urgency);
@@ -315,5 +345,30 @@ mod tests {
         assert_eq!(ago(10_000_000, 10_000_000 - 7_200_000), "2 時間前");
         assert_eq!(uptime(100.0), "4 日");
         assert_eq!(uptime(5.0), "5 時間");
+    }
+
+    #[test]
+    fn findings_carry_actions_only_when_typed() {
+        let v = build(
+            &[json!({"id": "a"})],
+            &[json!({"node_id": "a", "ok": true, "findings": [
+                {"severity": "warn", "title": "t", "action": {"type": "kill-process", "label": "止める", "params": {}}},
+                {"severity": "warn", "title": "u"},
+                {"severity": "warn", "title": "v", "action": {"label": "型なし"}}
+            ]})],
+        );
+        let f = &v[0].findings;
+        assert_eq!(f[0].action_label, "止める");
+        assert!(f[0].action.is_some() && f[1].action.is_none() && f[2].action.is_none());
+    }
+
+    #[test]
+    fn action_messages_do_not_confuse_outcomes() {
+        assert!(action_message("a", Ok(json!({"cancelled": true}))).contains("取り消しました"));
+        assert!(action_message("a", Ok(json!({"refused": "共用機"}))).contains("実行しませんでした: 共用機"));
+        assert!(action_message("a", Ok(json!({"ok": true, "outcome": "完了"}))).ends_with("完了"));
+        assert!(action_message("a", Ok(json!({"ok": false, "output": "x"}))).contains("失敗しました"));
+        assert!(action_message("", Err("e".into())).starts_with("実行できませんでした"));
+        assert!(action_message("a", Ok(json!({"ok": true, "cancelled": true}))).contains("取り消しました"), "取り消しが成功より優先される");
     }
 }
