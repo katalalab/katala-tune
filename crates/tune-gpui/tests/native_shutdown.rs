@@ -77,7 +77,9 @@ import json, os, pathlib, sys, time
 root = pathlib.Path(os.environ['TUNE_SHUTDOWN_GATE'])
 parent = os.getppid()
 size = len(sys.stdin.buffer.read())
-(root / 'child-ready').write_text(json.dumps({'pid':os.getpid(),'parent':parent,'stdin_bytes':size}))
+ready = root / 'child-ready.tmp'
+ready.write_text(json.dumps({'pid':os.getpid(),'parent':parent,'stdin_bytes':size}))
+ready.replace(root / 'child-ready')
 end = time.monotonic() + 30
 while not (root / 'release').exists():
     if time.monotonic() >= end:

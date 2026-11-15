@@ -7,6 +7,9 @@ on:
       - Cargo.lock
       - crates/**
       - probes/**
+      - scripts/**
+      - test/**
+      - package.json
       - .github/workflows/gpui-preview.yml
   workflow_dispatch:
 
@@ -46,27 +49,13 @@ jobs:
             ~/.cargo/git/db
             target
           key: gpui-release-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
-      - name: Build native preview and CLI
-        run: cargo build --release --locked -p tune-gpui -p tune-cli
+      - name: Test artifact staging
+        run: node --test test/ci-gpui-artifact.test.js
+      - name: Build native preview, CLI and sampler
+        run: cargo build --release --locked -p tune-gpui -p tune-cli -p tune-agent
       - name: Stage binaries and their hashes
         shell: bash
-        run: |
-          node <<'JS'
-          const fs = require('node:fs');
-          const path = require('node:path');
-          const { createHash } = require('node:crypto');
-          const suffix = process.platform === 'win32' ? '.exe' : '';
-          const output = 'dist/gpui-preview';
-          fs.mkdirSync(output, { recursive: true });
-          const files = ['katala-tune-gpui', 'tune'].map(name => {
-            const file = name + suffix;
-            const bytes = fs.readFileSync(path.join('target', 'release', file));
-            fs.writeFileSync(path.join(output, file), bytes, { mode: 0o755 });
-            return { file, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
-          });
-          const manifest = { schema: 'katala_gpui_preview.v1', version: require('./package.json').version, revision: process.env.GITHUB_SHA, platform: process.platform, architecture: process.arch, files };
-          fs.writeFileSync(path.join(output, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
-          JS
+        run: node scripts/ci-gpui-artifact.js
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gpui-preview-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}

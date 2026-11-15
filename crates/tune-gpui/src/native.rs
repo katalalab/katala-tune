@@ -24,7 +24,7 @@ use gpui::{
     WindowBounds, WindowOptions, actions, canvas, div, hsla, img, point, prelude::*, px, rgb, size, uniform_list,
 };
 use model::{Finding, Health, NodeView, Severity};
-use tune_core::engine::{Engine, Host};
+use tune_core::engine::Engine;
 use tune_core::live::{Live, Owner, ProcessRoute, Stop};
 use tune_core::nodes;
 
@@ -66,33 +66,6 @@ pub(crate) mod palette {
     }
     pub fn crit() -> Hsla {
         rgb(0xe5584f).into()
-    }
-}
-
-/// 分析・取り込みの完了などを画面側に知らせるだけの Host（描画はここでは触らない）
-struct DirtyHost(Arc<AtomicBool>);
-
-impl Host for DirtyHost {
-    fn logs_synced(&self, _: &serde_json::Value) {
-        self.0.store(true, Ordering::Release);
-    }
-    fn inventory_result(&self, _: &serde_json::Value) {
-        self.0.store(true, Ordering::Release);
-    }
-    fn ai_synced(&self, _: &serde_json::Value) {
-        self.0.store(true, Ordering::Release);
-    }
-    fn topology_updated(&self, _: &serde_json::Value) {
-        self.0.store(true, Ordering::Release);
-    }
-    fn probe_result(&self, _: &serde_json::Value) {
-        self.0.store(true, Ordering::Release);
-    }
-    fn checks_updated(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-    fn state_changed(&self) {
-        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -263,7 +236,10 @@ fn page_desc(page: Page) -> &'static str {
     }
 }
 
+#[derive(Clone)]
 struct LiveHandles {
+    job: std::rc::Rc<std::cell::RefCell<Job>>,
+    os: Arc<crate::native_host::NativeHost>,
     monitor: Arc<crate::monitor_host::MonitorHost>,
     live: Arc<Live>,
     store: Arc<Mutex<model::LiveStore>>,
@@ -446,6 +422,7 @@ impl LiveControl {
 }
 
 struct TuneApp {
+    os: Arc<crate::native_host::NativeHost>,
     monitor: Arc<crate::monitor_host::MonitorHost>,
     monitor_command_tail: Option<tokio::task::JoinHandle<()>>,
     monitor_records: Arc<Mutex<Option<Result<serde_json::Value, String>>>>,
@@ -475,7 +452,7 @@ struct TuneApp {
     selected_row: Option<usize>,
     scroll: UniformListScrollHandle,
     probing: bool,
-    collection: Job,
+    collection: std::rc::Rc<std::cell::RefCell<Job>>,
     notice: Option<String>,
     live_notice: Option<String>,
     /// 読み込んだ完了台帳（画面へのドラッグか --review）。保存しない
@@ -487,7 +464,16 @@ struct TuneApp {
     action_result: Arc<Mutex<Option<String>>>,
 }
 
+fn revoke_ui(live: &LiveControl, gate: &gate::Gate) {
+    gate.close();
+    live.close();
+}
+
 impl TuneApp {
+    fn close_ui(&self) {
+        revoke_ui(&self.live, &self.gate);
+    }
+
     fn new(
         engine: Arc<Engine>,
         rt: Arc<tokio::runtime::Runtime>,
@@ -509,9 +495,12 @@ impl TuneApp {
         let focus = cx.focus_handle();
         focus.focus(window);
         let live = Arc::new(LiveControl::new(handles.live, window.is_window_active()));
-        cx.on_release(|app, _| app.live.stop(Stop::Hidden)).detach();
+        cx.on_release(|app, _| {
+            app.close_ui();
+        })
+        .detach();
         cx.on_app_quit(|app, _| {
-            app.live.close();
+            app.close_ui();
             app.monitor.request_exit();
             async {}
         })
@@ -524,6 +513,7 @@ impl TuneApp {
         // 確認欄が出た・消えたときの描き直しは、live_dirty の旗（cx.notify だけ）で知らせる
         let gate_dirty = handles.dirty.clone();
         let mut app = Self {
+            os: handles.os,
             monitor: handles.monitor,
             monitor_command_tail: None,
             monitor_records: Arc::new(Mutex::new(None)),
@@ -560,7 +550,7 @@ impl TuneApp {
             selected_row: None,
             scroll: UniformListScrollHandle::new(),
             probing: false,
-            collection: Job::default(),
+            collection: handles.job.clone(),
             notice: None,
             live_notice: None,
             review: None,
@@ -591,12 +581,13 @@ impl TuneApp {
                             app.dashboard_clock = Instant::now();
                             cx.notify();
                         }
-                        if app.collection.poll() {
+                        let collection_changed = app.collection.borrow_mut().poll();
+                        if collection_changed {
                             // Session diagnostics survive route/query changes and other jobs.
-                            if app.collection.running.is_none() {
+                            if app.collection.borrow().running.is_none() {
                                 app.reload(cx);
                             } else if app.page == Page::Network && app.selected.is_none() {
-                                app.panel = app.collection.network.clone().map(Ok);
+                                app.panel = app.collection.borrow().network.clone().map(Ok);
                                 cx.notify();
                             }
                         }
@@ -623,7 +614,7 @@ impl TuneApp {
                                 }
                                 // Keep the previous diagnostic visible even if a read
                                 // fails; the current ledger error remains in notice.
-                                app.panel = app.collection.restore_network(app.page, response.panel);
+                                app.panel = app.collection.borrow().restore_network(app.page, response.panel);
                                 app.dashboard = response.dashboard;
                                 if app.page == Page::Review && app.selected.is_none() {
                                     app.panel = Some(Ok(app.review_panel()));
@@ -651,7 +642,7 @@ impl TuneApp {
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.generation = self.generation.wrapping_add(1);
         self.loading = true;
-        self.panel = self.collection.restore_network(self.page, self.panel.take());
+        self.panel = self.collection.borrow().restore_network(self.page, self.panel.take());
         let route = self.selected.clone().map_or(Route::Page(self.page), Route::Node);
         if let Err(error) = self.reader.request(Request {
             generation: self.generation,
@@ -804,11 +795,12 @@ impl TuneApp {
     }
 
     fn collect(&mut self, kind: Kind, cx: &mut Context<Self>) {
-        if self.probing || self.collection.running.is_some() {
+        if self.probing || self.collection.borrow().running.is_some() {
             return;
         }
-        if let Err(error) = self.monitor.start_manual(&mut self.collection, kind) {
-            self.collection.result = Some(collection::Receipt::error(kind, &error));
+        let mut job = self.collection.borrow_mut();
+        if let Err(error) = self.monitor.start_manual(&mut job, kind) {
+            job.result = Some(collection::Receipt::error(kind, &error));
         }
         cx.notify();
     }
@@ -822,10 +814,10 @@ impl TuneApp {
             .px_5()
             .py_2()
             .text_xs();
-        if let Some(kind) = self.collection.running {
+        if let Some(kind) = self.collection.borrow().running {
             status = status.child(div().text_color(palette::accent()).child(format!("{}を実行中…（画面を移動しても継続します）", kind.label())));
         }
-        if let Some(result) = &self.collection.result {
+        if let Some(result) = &self.collection.borrow().result {
             status = status
                 .child(
                     div().flex().flex_wrap().items_center().gap_3().child(div().flex_1().min_w(px(200.)).child(result.summary())).child(
@@ -840,7 +832,7 @@ impl TuneApp {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|app, _, _, cx| {
-                                    if let Some(result) = &app.collection.result {
+                                    if let Some(result) = &app.collection.borrow().result {
                                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(result.copy_text()));
                                     }
                                 }),
@@ -981,7 +973,7 @@ impl TuneApp {
             None => (page_icon(self.page), page_desc(self.page).to_string()),
         };
         let (crit, warn): (usize, usize) = self.nodes.iter().fold((0, 0), |a, n| (a.0 + n.count(Severity::Critical), a.1 + n.count(Severity::Warn)));
-        let busy = self.probing || self.collection.running.is_some();
+        let busy = self.probing || self.collection.borrow().running.is_some();
         div()
             .flex()
             .flex_wrap()
@@ -1246,18 +1238,22 @@ impl TuneApp {
             (self.monitor.clone(), self.engine.clone(), self.action_result.clone(), self.monitor_records.clone(), self.live_dirty.clone());
         // Chain this UI's submissions before moving blocking settings IO off
         // the main thread. A fast Start→Pause keeps click order on Tokio too.
+        let admission = self.gate.clone();
         let previous = self.monitor_command_tail.take();
         self.monitor_command_tail = Some(self.rt.spawn(async move {
             if let Some(previous) = previous {
                 let _ = previous.await;
             }
             let _ = tokio::task::spawn_blocking(move || {
+                if admission.is_closed() {
+                    return;
+                }
                 let outcome = match command {
-                    "start" => host.start_monitor(),
+                    "start" => host.start_monitor_from_ui(&admission),
                     "pause" => host.pause_monitor(),
-                    "pull" => host.request_pull(),
+                    "pull" => host.request_pull_from_ui(&admission),
                     "save" => host.save_monitor_settings(patch.unwrap_or_default()),
-                    "scan-start" => host.start_schedule(),
+                    "scan-start" => host.start_schedule_from_ui(&admission),
                     "scan-stop" => host.stop_schedule(),
                     "scan-save" => host.save_schedule_settings(patch.unwrap_or_default()),
                     "records" => {
@@ -1544,6 +1540,49 @@ impl TuneApp {
                     cx.listener(move |app, _, _, _| app.monitor_command("records", Some(serde_json::json!({"before_id":before_id})))),
                 ));
         }
+        use crate::native_host::Action;
+        let os = self.os.snapshot();
+        let mut os_controls = div().px_5().flex().flex_wrap().gap_2();
+        for (id, label, action) in [
+            ("os-refresh", "OS 状態を照会", Action::Refresh),
+            ("os-permission", "通知の許可を要求", Action::Permission),
+            ("os-settings", "通知設定を開く", Action::Settings),
+            ("os-test", "合成テスト通知を送信", Action::Test),
+            ("os-login-on", "ログイン起動を有効にする", Action::Login(true)),
+            ("os-login-off", "ログイン起動を無効にする", Action::Login(false)),
+        ] {
+            os_controls = os_controls.child(
+                div()
+                    .id(id)
+                    .px_3()
+                    .py_2()
+                    .bg(palette::card())
+                    .text_xs()
+                    .child(if os.busy { format!("{label}（操作中）") } else { label.into() })
+                    .when(!os.busy, |d| d.cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, _| app.os.act(action)))),
+            );
+        }
+        details = details
+            .child(div().px_5().text_xs().child(format!(
+                "OS 前回照会 {} · {} · 通知許可 {} · ログイン起動 {}",
+                os.queried_at.map_or_else(|| "未照会".into(), |t| crate::panels::time(&serde_json::json!(t))),
+                os.observed.source,
+                os.observed.notification.label(),
+                os.observed.login.label()
+            )))
+            .child(os_controls)
+            .child(
+                div()
+                    .px_5()
+                    .text_xs()
+                    .text_color(palette::muted())
+                    .child("操作後は OS 状態を再照会してください。通知の受理は表示の証明ではありません。ログイン起動は収集を開始しません。"),
+            );
+        for (label, result) in [("OS 操作", os.action), ("変更通知", os.notification)] {
+            if let Some((at, effect)) = result {
+                details = details.child(div().px_5().text_xs().child(format!("{label} {} · {}", crate::panels::time(&serde_json::json!(at)), effect.label())));
+            }
+        }
         details = details.child(tools);
         let mut settings = div().id("monitor-settings").px_5().py_2().flex().flex_wrap().gap_2();
         if let Some(Ok(view)) = &self.dashboard {
@@ -1686,7 +1725,7 @@ impl TuneApp {
                     .child(crate::network::EXPLANATION),
             );
             for active in [false, true] {
-                let busy = self.probing || self.collection.running.is_some();
+                let busy = self.probing || self.collection.borrow().running.is_some();
                 toolbar = toolbar.child(
                     div()
                         .id(if active { "network-active" } else { "network-passive" })
@@ -1720,7 +1759,7 @@ impl TuneApp {
                 .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.reload(cx))),
         );
         if let Some(kind) = Kind::for_page(self.page) {
-            let busy = self.probing || self.collection.running.is_some();
+            let busy = self.probing || self.collection.borrow().running.is_some();
             toolbar = toolbar.child(
                 div()
                     .id("collect-page")
@@ -2032,7 +2071,7 @@ impl Render for TuneApp {
             .key_context("Browser")
             .track_focus(&self.focus)
             .on_action(cx.listener(|app, _: &Quit, _, cx| {
-                app.live.close();
+                app.close_ui();
                 app.monitor.request_exit();
                 cx.quit();
             }))
@@ -2125,6 +2164,155 @@ fn open_route(target: &str, ledger: &[nodes::Node]) -> Result<Route, String> {
     Err(format!("--open の表示または機体が見つかりません: {target}"))
 }
 
+/// All producers and manual receipts outlive windows. Only Reader, UI Live
+/// intent and confirmation gate are recreated. Access is on GPUI's main thread.
+struct Session {
+    windows: crate::resident::Windows<gpui::WindowHandle<TuneApp>>,
+    engine: Arc<Engine>,
+    rt: Arc<tokio::runtime::Runtime>,
+    dirty: Arc<AtomicBool>,
+    handles: LiveHandles,
+    initial: Option<Route>,
+    review: Option<std::path::PathBuf>,
+    admission: Option<(Arc<LiveControl>, gate::Gate)>,
+    keeper: Option<gpui::WindowId>,
+}
+struct NativeWindows<'a> {
+    cx: &'a mut App,
+    engine: Arc<Engine>,
+    rt: Arc<tokio::runtime::Runtime>,
+    dirty: Arc<AtomicBool>,
+    handles: LiveHandles,
+    initial: Option<Route>,
+}
+impl crate::resident::Backend<gpui::WindowHandle<TuneApp>> for NativeWindows<'_> {
+    type Target = Route;
+    type Error = String;
+    fn activate(&mut self, handle: gpui::WindowHandle<TuneApp>, target: Option<&Route>) -> bool {
+        let result = handle
+            .update(self.cx, |app, window, cx| {
+                if let Some(route) = target {
+                    app.route(route.clone(), cx);
+                }
+                window.activate_window();
+            })
+            .is_ok();
+        if result {
+            self.cx.activate(true);
+        }
+        result
+    }
+    fn create(&mut self, target: Option<&Route>) -> Result<gpui::WindowHandle<TuneApp>, String> {
+        let (engine, rt, dirty, handles) = (self.engine.clone(), self.rt.clone(), self.dirty.clone(), self.handles.clone());
+        let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), self.cx);
+        let handle = self
+            .cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(900.), px(640.))),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("Katala Tune GPUI Preview".into()),
+                        appears_transparent: false,
+                        traffic_light_position: Some(point(px(12.0), px(12.0))),
+                    }),
+                    ..Default::default()
+                },
+                move |window, cx| cx.new(|cx| TuneApp::new(engine, rt, dirty, handles, window, cx)),
+            )
+            .map_err(|e| e.to_string())?;
+        if let Some(route) = target.cloned().or_else(|| self.initial.clone()) {
+            handle.update(self.cx, |app, _, cx| app.route(route, cx)).map_err(|e| e.to_string())?;
+        }
+        self.cx.activate(true);
+        Ok(handle)
+    }
+}
+// This boundary is compiled on both desktop targets; only Windows residents
+// request an internal window. No application state is captured by its view.
+fn keeper_options(resident: bool, windows: bool) -> Option<WindowOptions> {
+    (resident && windows).then(|| WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds { origin: point(px(0.), px(0.)), size: size(px(1.), px(1.)) })),
+        titlebar: None,
+        show: false,
+        focus: false,
+        // GPUI Windows maps PopUp to WS_EX_TOOLWINDOW, excluding the taskbar.
+        kind: gpui::WindowKind::PopUp,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        ..Default::default()
+    })
+}
+
+impl Session {
+    fn windows_changed(&mut self, remaining: &[gpui::WindowId]) -> bool {
+        if self.windows.exiting {
+            return false;
+        }
+        if self.keeper.is_some_and(|id| !remaining.contains(&id)) {
+            // Losing the owned keeper makes the next native close unsafe. Drain
+            // through the normal quit observer rather than strand a resident.
+            self.close_ui();
+            return true;
+        }
+        if self.windows.current.is_some_and(|window| !remaining.contains(&window.window_id())) {
+            self.revoke_current_ui();
+            self.windows.current = None;
+        }
+        // Ignore exactly our internal window. Unknown/user windows still count.
+        remaining.iter().all(|id| Some(*id) == self.keeper) && self.window_closed()
+    }
+    fn open(&mut self, target: Option<&str>, cx: &mut App) -> Result<gpui::WindowHandle<TuneApp>, String> {
+        let requested = target.map(|v| open_route(v, &self.engine.config().nodes)).transpose()?;
+        let mut backend = NativeWindows {
+            cx,
+            engine: self.engine.clone(),
+            rt: self.rt.clone(),
+            dirty: self.dirty.clone(),
+            handles: self.handles.clone(),
+            initial: self.initial.clone(),
+        };
+        let window = self.windows.open(&mut backend, requested.as_ref())?.ok_or_else(|| "application is exiting".to_owned())?;
+        // GPUI notifies on_window_closed before dropping Window/root entity.
+        // Keep only its revocable controls, never a strong Entity, so close/quit
+        // can revoke immediately even when WindowHandle::update already fails.
+        self.admission = Some(window.update(cx, |app, _, _| (app.live.clone(), app.gate.clone())).map_err(|e| e.to_string())?);
+        if let Some(path) = self.review.take() {
+            window
+                .update(cx, |app, _, cx| {
+                    app.load_review(&path, cx);
+                    if requested.is_none() && self.initial.is_none() {
+                        app.navigate(Page::Review, None, cx);
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(window)
+    }
+    fn revoke_current_ui(&mut self) {
+        if let Some((live, gate)) = self.admission.take() {
+            revoke_ui(&live, &gate);
+        }
+    }
+    fn window_closed(&mut self) -> bool {
+        self.revoke_current_ui();
+        self.windows.closed()
+    }
+    fn close_ui(&mut self) {
+        self.windows.quit();
+        self.revoke_current_ui();
+    }
+}
+impl TuneApp {
+    fn route(&mut self, route: Route, cx: &mut Context<Self>) {
+        match route {
+            Route::Page(page) => self.navigate(page, None, cx),
+            Route::Node(id) => self.navigate(Page::Overview, Some(id), cx),
+        }
+    }
+}
+
 /// GPUI's native termination (notably NSApplication::terminate:) need not
 /// return from Application::run. Drain in the synchronous quit observer, before
 /// GPUI applies its 100ms allowance to returned futures. Workers use Tokio,
@@ -2143,7 +2331,20 @@ fn finish_shutdown(rt: &tokio::runtime::Runtime, host: &crate::monitor_host::Mon
 }
 
 pub fn run(options: startup::Options) {
-    let startup::Options { config, data, selftest, open, live_id, logs, confirm_demo, review: review_path, shutdown_check } = options;
+    let startup::Options { config, data, selftest, resident, hidden, open, live_id, logs, confirm_demo, review: review_path, shutdown_check } = options;
+    // No Engine, DB, runtime producer, OS permission or tray exists in a secondary.
+    let instance = if selftest {
+        None
+    } else {
+        match crate::instance::claim(&config, &data, open.as_deref(), review_path.is_some()) {
+            Ok(crate::instance::Claim::Primary(guard)) => Some(guard),
+            Ok(crate::instance::Claim::Forwarded) => return,
+            Err(error) => {
+                eprintln!("katala-tune-gpui: {error}");
+                std::process::exit(2);
+            }
+        }
+    };
     let shutdown_gate = data.join("shutdown-check");
     if (selftest || config.exists())
         && let Err(error) = nodes::load_config(&config)
@@ -2154,9 +2355,10 @@ pub fn run(options: startup::Options) {
     let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio"));
     // Engine の中の tokio 呼び出し（接続・子プロセス）が動くよう、ランタイムの文脈で開く
     let dirty = Arc::new(AtomicBool::new(true));
+    let os = Arc::new(crate::native_host::NativeHost::new(dirty.clone(), crate::os::platform(&config, &data, selftest), rt.handle().clone()));
     let engine = {
         let _g = rt.enter();
-        match Engine::open(config, data, Arc::new(DirtyHost(dirty.clone()))) {
+        match Engine::open(config, data, os.clone()) {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("katala-tune: {e}");
@@ -2191,7 +2393,7 @@ pub fn run(options: startup::Options) {
     };
     let monitor = Arc::new(crate::monitor_host::MonitorHost::new(engine.clone(), live.clone(), rt.handle().clone(), dirty.clone()));
     let monitor_exit = monitor.clone();
-    let handles = LiveHandles { monitor, live: live.clone(), store: live_store, dirty: live_dirty };
+    let handles = LiveHandles { os, monitor, live: live.clone(), store: live_store, dirty: live_dirty, job: Default::default() };
     let rt_exit = rt.clone();
     let failed = Arc::new(AtomicBool::new(false));
     let failed_exit = failed.clone();
@@ -2200,7 +2402,27 @@ pub fn run(options: startup::Options) {
     let quit_rt = rt_exit.clone();
     let quit_failed = failed_exit.clone();
     let shutdown_diagnostic = shutdown_check.is_some();
-    Application::new().run(move |cx: &mut App| {
+    let instance = instance.map(std::rc::Rc::new);
+    let _instance_exit = instance.clone();
+    let session = std::rc::Rc::new(std::cell::RefCell::new(Session {
+        windows: crate::resident::Windows::new(resident),
+        engine,
+        rt,
+        dirty,
+        handles,
+        initial: initial_route,
+        review: review_path.clone(),
+        admission: None,
+        keeper: None,
+    }));
+    let application = Application::new();
+    let reopen = session.clone();
+    application.on_reopen(move |cx| {
+        if let Err(error) = reopen.borrow_mut().open(None, cx) {
+            eprintln!("reopen: {error}");
+        }
+    });
+    application.run(move |cx: &mut App| {
         input::bind_keys(cx);
         cx.bind_keys([
             KeyBinding::new("alt-down", NextPage, Some("Browser")),
@@ -2222,28 +2444,38 @@ pub fn run(options: startup::Options) {
                 KeyBinding::new(format!("{modifier}-c").as_str(), CopyRecord, Some("Browser && !SearchInput")),
             ]);
         }
-        let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(900.), px(640.))),
-                    titlebar: Some(gpui::TitlebarOptions {
-                        title: Some("Katala Tune GPUI Preview".into()),
-                        appears_transparent: false,
-                        traffic_light_position: Some(point(px(12.0), px(12.0))),
-                    }),
-                    ..Default::default()
-                },
-                move |window, cx| cx.new(|cx| TuneApp::new(engine, rt, dirty, handles, window, cx)),
-            )
-            .expect("window");
+        // Failure to provide a tray is fatal for resident/hidden mode: never
+        // strand a zero-window process with no usable Open/Quit surface.
+        let mut tray = if resident {
+            match crate::tray::Tray::new() {
+                Ok(tray) => Some(tray),
+                Err(error) => {
+                    eprintln!("tray: {error}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            None
+        };
+        // GPUI Windows unconditionally quits after the last raw native window
+        // closes. EmptyView owns no UI controls/Reader/Engine or producers. Keep
+        // this window until App::shutdown has run the synchronous drain observer.
+        if let Some(options) = keeper_options(resident, cfg!(target_os = "windows")) {
+            let keeper = cx
+                .open_window(options, |window, cx| {
+                    // Hidden Windows placement is deferred; size this owned
+                    // window's content explicitly without showing it.
+                    window.resize(size(px(1.), px(1.)));
+                    cx.new(|_| gpui::EmptyView)
+                })
+                .expect("resident keeper");
+            session.borrow_mut().keeper = Some(keeper.window_id());
+        }
+        let window = if hidden { None } else { Some(session.borrow_mut().open(None, cx).expect("window")) };
         let host = quit_host.clone();
-        cx.on_app_quit(move |cx| {
-            // Close the UI admission gate before blocking, independently of
-            // entity observer order. Last-window release already invalidates
-            // pending UI intent when the handle can no longer be updated.
-            window.update(cx, |app, _, _| app.live.close()).ok();
+        let quitting = session.clone();
+        cx.on_app_quit(move |_| {
+            quitting.borrow_mut().close_ui();
             let report = finish_shutdown(&quit_rt, &host, &quit_failed);
             if shutdown_diagnostic {
                 println!("selftest shutdown: {report:?}");
@@ -2251,31 +2483,63 @@ pub fn run(options: startup::Options) {
             async {}
         })
         .detach();
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        let closing = session.clone();
         cx.on_window_closed(move |cx| {
-            if cx.windows().is_empty() {
+            let remaining: Vec<_> = cx.windows().iter().map(|window| window.window_id()).collect();
+            let quit = closing.borrow_mut().windows_changed(&remaining);
+            if quit {
                 quit_host.request_exit();
                 cx.quit();
             }
         })
         .detach();
-        cx.activate(true);
-        if let Some(path) = &review_path {
-            window
-                .update(cx, |app, _, cx| {
-                    app.load_review(path, cx);
-                    app.navigate(Page::Review, None, cx);
-                })
-                .ok();
-        }
-        if let Some(route) = initial_route {
-            window
-                .update(cx, |app, _, cx| match route {
-                    Route::Page(page) => app.navigate(page, None, cx),
-                    Route::Node(id) => app.navigate(Page::Overview, Some(id), cx),
-                })
-                .ok();
-        }
+        let events = session.clone();
+        // This app-owned task and instance guard survive zero user windows. Polls
+        // bounded event queues + memory only; no DB or OS status polling.
+        cx.spawn(async move |cx| {
+            let _instance_lifetime = instance;
+            loop {
+                cx.background_executor().timer(Duration::from_millis(150)).await;
+                if !cx
+                    .update(|cx| {
+                        let mut session = events.borrow_mut();
+                        if session.windows.exiting {
+                            return false;
+                        }
+                        if let Some(tray) = &mut tray {
+                            tray.refresh(&session.handles.monitor);
+                            while let Some(command) = tray.next() {
+                                match command {
+                                    crate::tray::Command::Open(target) => {
+                                        session.open(target, cx).ok();
+                                    }
+                                    crate::tray::Command::Quit => {
+                                        // Drop the RefCell borrow before GPUI quit observers run.
+                                        drop(session);
+                                        cx.quit();
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(instance) = &_instance_lifetime {
+                            for request in instance.requests.try_iter().take(8) {
+                                let result = session.open(request.open.as_deref(), cx).map(|_| ());
+                                let _ = request.reply.send(result);
+                            }
+                        }
+                        true
+                    })
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         if let Some(mode) = shutdown_check {
+            let window = window.expect("diagnostics require a window");
             // Explicit synthetic desktop diagnostic only. The parent fixture
             // injects fake SSH and controls readiness/release outside GPUI.
             cx.spawn(async move |cx| {
@@ -2314,6 +2578,7 @@ pub fn run(options: startup::Options) {
             })
             .detach();
         } else if selftest {
+            let window = window.expect("diagnostics require a window");
             cx.spawn(async move |cx| {
                 let result: Result<(), String> = async {
                     let mut count = 0;
@@ -2335,8 +2600,8 @@ pub fn run(options: startup::Options) {
                             cx.background_executor().timer(Duration::from_millis(100)).await;
                             let state = window
                                 .update(cx, |app, _, _| {
-                                    if app.collection.running.is_some()
-                                        || app.collection.result.is_some()
+                                    if app.collection.borrow().running.is_some()
+                                        || app.collection.borrow().result.is_some()
                                         || !app.live.live.active().is_empty()
                                         || app.engine.monitor_journal_health()["running"] == true
                                         || app.monitor.schedule_snapshot().0
@@ -2491,7 +2756,7 @@ mod tests {
 
     /// Synthetic transport only; Live parses samples and owns all lifecycle state.
     #[derive(Default)]
-    struct SteadyRoute(AtomicUsize);
+    pub(super) struct SteadyRoute(pub(super) AtomicUsize);
     impl LiveRoute for SteadyRoute {
         fn open(&self, _: &nodes::Node, _: &Opts) -> Result<Source, String> {
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -2522,7 +2787,7 @@ mod tests {
         (LiveControl::new(live, true), route)
     }
 
-    async fn samples_after(live: &Live, before: usize) {
+    pub(super) async fn samples_after(live: &Live, before: usize) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while live.samples("a").len() <= before {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2849,3 +3114,7 @@ mod tests {
         assert!(open_route("missing", &[node("a")]).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "resident_tests.rs"]
+mod resident_tests;

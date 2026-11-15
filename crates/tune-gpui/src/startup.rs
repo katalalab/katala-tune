@@ -1,10 +1,12 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct Options {
     pub config: PathBuf,
     pub data: PathBuf,
     pub selftest: bool,
+    pub resident: bool,
+    pub hidden: bool,
     pub open: Option<String>,
     pub live_id: Option<String>,
     pub logs: bool,
@@ -16,6 +18,42 @@ pub struct Options {
     pub shutdown_check: Option<String>,
 }
 
+pub fn prepare(mut options: Options) -> Result<Options, String> {
+    // Freeze paths before IPC/runtime threads. Every normal/diagnostic entry
+    // shares these exact paths with Engine, OS integration and helper lookup.
+    options.config = resolved(&options.config)?;
+    options.data = resolved(&options.data)?;
+    tune_core::helpers::bind_process_data_dir(&options.data)?;
+    Ok(options)
+}
+
+/// Canonicalize existing ancestors too, so missing and later-created paths
+/// have the same identity. Resolve symlinks before `..`; never create state.
+pub(super) fn resolved(path: &Path) -> Result<PathBuf, String> {
+    let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
+    let mut result = PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            std::path::Component::Prefix(_) => {
+                // A Windows prefix such as \\?\C: is not a complete root yet.
+                // Wait for RootDir before any filesystem query/canonicalize.
+                result.push(part.as_os_str());
+                continue;
+            }
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            std::path::Component::CurDir => {}
+            part => result.push(part.as_os_str()),
+        }
+        // Missing tails are valid; other filesystem errors must fail closed.
+        if result.try_exists().map_err(|e| e.to_string())? {
+            result = result.canonicalize().map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(result)
+}
+
 pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Options>, String> {
     let values: Vec<_> = arguments.into_iter().collect();
     if values.len() == 1 && matches!(values[0].to_str(), Some("--help" | "-h")) {
@@ -23,12 +61,15 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
     }
     let (mut config, mut data, mut selftest) = (None, None, false);
     let (mut open, mut live_id, mut logs, mut confirm_demo) = (None, None, false, false);
+    let (mut resident, mut hidden) = (false, false);
     let mut review: Option<PathBuf> = None;
     let mut shutdown_check = None;
     let mut args = values.into_iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--selftest") if !selftest => selftest = true,
+            Some("--resident") if !resident => resident = true,
+            Some("--hidden") if !hidden => hidden = true,
             Some("--shutdown-check") => {
                 let mode = args
                     .next()
@@ -70,6 +111,15 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
             _ => return Err("unknown option; use --help".into()),
         }
     }
+    if hidden && !resident {
+        return Err("--hidden requires --resident".into());
+    }
+    if (resident || hidden) && (selftest || shutdown_check.is_some() || live_id.is_some() || logs || confirm_demo) {
+        return Err("--resident/--hidden cannot be combined with diagnostics".into());
+    }
+    if open.as_deref().is_some_and(|s| s.len() > 256 || s.chars().any(char::is_control)) {
+        return Err("--open must be at most 256 bytes without control characters".into());
+    }
     if selftest && (config.is_none() || data.is_none()) {
         return Err("--selftest requires --config and --data".into());
     }
@@ -84,6 +134,8 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
         // Preview data stays separate from the existing application by default.
         data: data.unwrap_or_else(|| tune_core::nodes::data_dir().join("gpui-preview")),
         selftest,
+        resident,
+        hidden,
         open,
         live_id,
         logs,
@@ -96,6 +148,55 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolver_accepts_owned_absolute_and_canonical_paths_and_missing_tails() {
+        let dir = std::env::temp_dir().join(format!("kt-startup-resolve-{}-{}", std::process::id(), tune_core::db::now_ms()));
+        std::fs::create_dir(&dir).unwrap();
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = Fixture(dir);
+        let canonical = fixture.0.canonicalize().unwrap();
+        #[cfg(windows)]
+        assert!(
+            matches!(canonical.components().next(), Some(std::path::Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_) | std::path::Prefix::VerbatimUNC(..)))
+        );
+        for path in [fixture.0.clone(), canonical.clone()] {
+            assert_eq!(resolved(&path).unwrap(), canonical);
+            assert_eq!(resolved(&path.join("missing/preview-data")).unwrap(), canonical.join("missing/preview-data"));
+        }
+        std::fs::write(canonical.join("file"), b"owned path error fixture").unwrap();
+        assert_eq!(resolved(&canonical.join("file")).unwrap(), canonical.join("file"));
+        // Windows reports a descendant of a regular file as missing rather than
+        // Unix ENOTDIR; only Unix promises a real error for this fixture.
+        #[cfg(unix)]
+        assert!(resolved(&canonical.join("file/child")).is_err(), "real filesystem errors must still propagate");
+    }
+
+    #[test]
+    fn resident_hidden_are_explicit_and_diagnostics_are_disjoint() {
+        let ordinary = parse([]).unwrap().unwrap();
+        assert!(!ordinary.resident && !ordinary.hidden);
+        let hidden = parse(["--resident", "--hidden", "--open", "status"].map(OsString::from)).unwrap().unwrap();
+        assert!(hidden.resident && hidden.hidden);
+        assert_eq!(hidden.open.as_deref(), Some("status"));
+        for args in [
+            vec!["--hidden"],
+            vec!["--resident", "--selftest"],
+            vec!["--resident", "--shutdown-check", "close"],
+            vec!["--resident", "--logs"],
+            vec!["--resident", "--live", "fixture"],
+            vec!["--resident", "--confirm-demo"],
+            vec!["--resident", "--resident"],
+        ] {
+            assert!(parse(args.into_iter().map(OsString::from)).is_err());
+        }
+        assert!(parse(["--open", &"x".repeat(257)].map(OsString::from)).is_err());
+    }
 
     #[test]
     fn preview_and_selftest_modes_keep_all_explicit_options() {

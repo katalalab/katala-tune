@@ -705,10 +705,14 @@ fn native_args(o: &Opts) -> Vec<String> {
     .to_vec()
 }
 
-/// この機体のネイティブのサンプラー: アプリの隣、無ければ helpers の namespace。
-/// `KATALA_TUNE_DATA_DIR` を明示した QA では `data/bin` に閉じ、通常は従来の HOME を使う。
+/// GPUI は束縛済み data/bin だけ。未束縛の CLI/Tauri は従来どおり
+/// アプリの隣、無ければ helpers の namespace を探す。
 fn local_native() -> Option<PathBuf> {
     let name = crate::helpers::exe("tune-agent");
+    if let Some(bin) = crate::helpers::bound_bin_dir() {
+        let native = bin.join(&name);
+        return native.is_file().then_some(native);
+    }
     let beside = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(&name)));
     let managed = crate::helpers::bin_dir().join(&name);
     [beside, Some(managed)].into_iter().flatten().find(|p| p.is_file())
