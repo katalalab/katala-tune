@@ -1,19 +1,21 @@
 //! Katala Tune のネイティブ画面（Rust + GPUI）。WebView も Node も使わず、tune-core の Engine を直接呼ぶ。
 //!
 //! 実行: `katala-tune-gpui [--config 台帳.json] [--data データdir] [--selftest]`
-//! `--selftest` は画面を開いて台帳と前回結果を読み、一定時間後に終了する起動smoke（分析は走らせない）。
+//! `--selftest` は画面を開いて台帳と前回結果を読み、1 フレーム描いて終了する（E2E 用。分析は走らせない）。
 
-use crate::{model, startup};
+use super::{model, startup};
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    App, Application, Bounds, Context, FontWeight, Hsla, MouseButton, Window, WindowBounds, WindowOptions, div, hsla, point, prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, FontWeight, Hsla, MouseButton, Window, WindowBounds, WindowOptions, div, hsla, img, point, prelude::*, px, rgb, size,
 };
 use model::{Finding, Health, NodeView, Severity};
 use tune_core::engine::{Engine, Host};
+use tune_core::live::{Live, ProcessRoute, Stop};
 use tune_core::nodes;
 
 #[cfg(target_os = "macos")]
@@ -92,9 +94,9 @@ fn severity_color(s: Severity) -> Hsla {
 }
 
 /// 棒の推移グラフ。0〜`max` を高さにし、点が無ければ空の枠だけ描く
-fn trend(values: &[f64], max: f64, color: Hsla, height: f32) -> gpui::Div {
+fn trend(values: &[f64], max: f64, color: Hsla, height: f32, take: usize) -> gpui::Div {
     let mut bars = div().h(px(height)).flex().items_end().gap_px();
-    for v in values.iter().rev().take(60).rev() {
+    for v in values.iter().rev().take(take).rev() {
         let h = ((v / max).clamp(0.0, 1.0) as f32 * height).max(1.0);
         bars = bars.child(div().w(px(3.0)).h(px(h)).rounded_sm().bg(color));
     }
@@ -105,7 +107,14 @@ fn chip(text: impl Into<gpui::SharedString>, color: Hsla) -> gpui::Div {
     div().px_2().py_0p5().rounded_md().text_xs().text_color(color).bg(hsla(color.h, color.s, color.l, 0.14)).child(text.into())
 }
 
+struct LiveHandles {
+    live: Arc<Live>,
+    store: Arc<Mutex<model::LiveStore>>,
+    dirty: Arc<AtomicBool>,
+}
+
 struct TuneApp {
+    brand: Arc<gpui::Image>,
     engine: Arc<Engine>,
     rt: Arc<tokio::runtime::Runtime>,
     dirty: Arc<AtomicBool>,
@@ -113,12 +122,48 @@ struct TuneApp {
     selected: Option<String>,
     probing: bool,
     notice: Option<String>,
+    live: Arc<Live>,
+    live_store: Arc<Mutex<model::LiveStore>>,
+    live_dirty: Arc<AtomicBool>,
+    /// ライブを流している機体と、最後に合図（heartbeat）を送った時刻
+    live_on: Option<(String, Instant)>,
+    page_logs: bool,
+    page_topology: bool,
+    page_status: bool,
+    status: model::StatusView,
+    topology: model::TopologyView,
+    log_level: Option<&'static str>,
+    logs: Vec<model::LogRow>,
+    sigs: Vec<model::Signature>,
 }
 
 impl TuneApp {
-    fn new(engine: Arc<Engine>, rt: Arc<tokio::runtime::Runtime>, dirty: Arc<AtomicBool>, cx: &mut Context<Self>) -> Self {
-        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None };
+    fn new(engine: Arc<Engine>, rt: Arc<tokio::runtime::Runtime>, dirty: Arc<AtomicBool>, live: LiveHandles, cx: &mut Context<Self>) -> Self {
+        let brand = Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, include_bytes!("../../../build/mark.png").to_vec()));
+        let mut app = Self {
+            brand,
+            engine,
+            rt,
+            dirty,
+            nodes: Vec::new(),
+            selected: None,
+            probing: false,
+            notice: None,
+            live: live.live,
+            live_store: live.store,
+            live_dirty: live.dirty,
+            live_on: None,
+            page_logs: false,
+            page_topology: false,
+            page_status: false,
+            status: Default::default(),
+            topology: Default::default(),
+            log_level: None,
+            logs: Vec::new(),
+            sigs: Vec::new(),
+        };
         app.reload();
+        app.load_status();
         // 通知を待つ代わりに 0.4 秒ごとに旗を見る。変わったときだけ読み直して描き直す
         cx.spawn(async move |this, cx| {
             loop {
@@ -126,6 +171,10 @@ impl TuneApp {
                 let alive = this
                     .update(cx, |app, cx| {
                         let probing = app.engine.is_probing();
+                        app.live_heartbeat();
+                        if app.live_dirty.swap(false, Ordering::AcqRel) {
+                            cx.notify();
+                        }
                         if app.dirty.swap(false, Ordering::AcqRel) || probing != app.probing {
                             app.probing = probing;
                             app.reload();
@@ -162,6 +211,102 @@ impl TuneApp {
         if self.selected.as_ref().is_some_and(|id| !self.nodes.iter().any(|n| &n.id == id)) {
             self.selected = None;
         }
+        if self.page_logs {
+            self.load_logs();
+        }
+        if self.page_status {
+            self.load_status();
+        }
+    }
+
+    /// 直近 7 日。重い取り込みはせず、保存済みを読むだけ
+    fn load_logs(&mut self) {
+        let since = now_ms() - 7 * 86_400_000;
+        let mut f = serde_json::json!({ "since": since, "limit": 200 });
+        if let Some(l) = self.log_level {
+            f["level"] = l.into();
+        }
+        if let Ok(rows) = self.engine.logs_query(&f) {
+            self.logs = model::log_rows(&rows);
+        }
+        if let Ok(sigs) = self.engine.logs_signatures(&serde_json::json!({ "since": since, "limit": 15 })) {
+            self.sigs = model::signatures(&sigs);
+        }
+    }
+
+    /// 合図は 30 秒ごと。Engine 側は 2 分途切れると自動で止める
+    fn live_heartbeat(&mut self) {
+        if self.live_on.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(30)) {
+            let id = self.live_on.as_ref().map(|(id, _)| id.clone()).unwrap_or_default();
+            self.live_start(&id);
+        }
+    }
+
+    fn live_start(&mut self, id: &str) {
+        let cfg = self.engine.reload_config();
+        let nodes: Vec<_> = cfg.nodes.iter().filter(|n| n.id == id).cloned().collect();
+        let _g = self.rt.enter();
+        self.live.start(&nodes, &[]);
+        self.live_on = Some((id.to_string(), Instant::now()));
+    }
+
+    fn live_stop(&mut self) {
+        if let Some((id, _)) = self.live_on.take() {
+            self.live.stop(Some(&[id]), Stop::User);
+        }
+    }
+
+    fn select(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        // 画面を移ったらライブは止める（見ていない機体に流し続けない）
+        if self.live_on.as_ref().map(|(i, _)| i) != id.as_ref() {
+            self.live_stop();
+        }
+        self.selected = id;
+        self.clear_pages();
+        cx.notify();
+    }
+
+    fn clear_pages(&mut self) {
+        self.page_logs = false;
+        self.page_topology = false;
+        self.page_status = false;
+    }
+
+    fn open_status(&mut self, cx: &mut Context<Self>) {
+        self.live_stop();
+        self.selected = None;
+        self.clear_pages();
+        self.page_status = true;
+        self.load_status();
+        cx.notify();
+    }
+
+    /// 保存済みの現在状態を読むだけ（状態の再計算・通知はしない）
+    fn load_status(&mut self) {
+        if let Ok(v) = self.engine.status_snapshot() {
+            self.status = model::status(&v);
+        }
+    }
+
+    fn open_topology(&mut self, cx: &mut Context<Self>) {
+        self.live_stop();
+        self.selected = None;
+        self.clear_pages();
+        self.page_topology = true;
+        // 保存済みを読むだけ。更新（収集）は行わない
+        if let Ok(v) = self.engine.topology_ui_view(&Default::default()) {
+            self.topology = model::topology(&v);
+        }
+        cx.notify();
+    }
+
+    fn open_logs(&mut self, cx: &mut Context<Self>) {
+        self.live_stop();
+        self.selected = None;
+        self.clear_pages();
+        self.page_logs = true;
+        self.load_logs();
+        cx.notify();
     }
 
     fn probe_all(&mut self, cx: &mut Context<Self>) {
@@ -195,13 +340,72 @@ impl TuneApp {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |app, _, _, cx| {
-                        app.selected = target.clone();
-                        cx.notify();
+                        app.select(target.clone(), cx);
                     }),
                 )
         };
         let mut list = div().flex().flex_col().gap_0p5().p_2();
-        list = list.child(row(("nav", 0usize).into(), "概要".into(), palette::accent(), String::new(), self.selected.is_none(), None, cx));
+        list = list.child(row(
+            ("nav", 0usize).into(),
+            "概要".into(),
+            palette::accent(),
+            String::new(),
+            self.selected.is_none() && !self.page_logs && !self.page_topology && !self.page_status,
+            None,
+            cx,
+        ));
+        list = list.child(
+            div()
+                .id(("nav", 9997usize))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1p5()
+                .rounded_md()
+                .cursor_pointer()
+                .when(self.page_status, |d| d.bg(palette::card()))
+                .hover(|d| d.bg(palette::card()))
+                .child(div().size_2().rounded_full().bg(if self.status.count(model::CheckStatus::Fail) > 0 { palette::crit() } else { palette::muted() }))
+                .child(div().flex_1().text_sm().child("状態"))
+                .child(div().text_xs().text_color(palette::muted()).child(match self.status.count(model::CheckStatus::Fail) {
+                    0 => String::new(),
+                    n => n.to_string(),
+                }))
+                .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.open_status(cx))),
+        );
+        list = list.child(
+            div()
+                .id(("nav", 9999usize))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1p5()
+                .rounded_md()
+                .cursor_pointer()
+                .when(self.page_logs, |d| d.bg(palette::card()))
+                .hover(|d| d.bg(palette::card()))
+                .child(div().size_2().rounded_full().bg(palette::muted()))
+                .child(div().flex_1().text_sm().child("ログ"))
+                .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.open_logs(cx))),
+        );
+        list = list.child(
+            div()
+                .id(("nav", 9998usize))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1p5()
+                .rounded_md()
+                .cursor_pointer()
+                .when(self.page_topology, |d| d.bg(palette::card()))
+                .hover(|d| d.bg(palette::card()))
+                .child(div().size_2().rounded_full().bg(palette::muted()))
+                .child(div().flex_1().text_sm().child("構成図"))
+                .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.open_topology(cx))),
+        );
         for (i, n) in self.nodes.iter().enumerate() {
             let tail = match &n.health {
                 Health::Scored(s) => s.to_string(),
@@ -228,12 +432,32 @@ impl TuneApp {
             .bg(palette::panel())
             .border_r_1()
             .border_color(palette::line())
-            .child(div().px_4().pt_4().pb_2().text_sm().font_weight(FontWeight::BOLD).child("Katala Tune"))
+            .child(
+                div()
+                    .px_4()
+                    .pt_4()
+                    .pb_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .font_weight(FontWeight::BOLD)
+                    .child(img(self.brand.clone()).size_8().flex_none())
+                    .child("Katala Tune"),
+            )
             .child(div().flex_1().id("nodes").overflow_y_scroll().child(list))
     }
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = self.selected.clone().unwrap_or_else(|| "概要".into());
+        let title = if self.page_status {
+            "状態".to_string()
+        } else if self.page_topology {
+            "構成図".to_string()
+        } else if self.page_logs {
+            "ログ".to_string()
+        } else {
+            self.selected.clone().unwrap_or_else(|| "概要".into())
+        };
         let (crit, warn): (usize, usize) = self.nodes.iter().fold((0, 0), |a, n| (a.0 + n.count(Severity::Critical), a.1 + n.count(Severity::Warn)));
         let busy = self.probing;
         div()
@@ -276,6 +500,9 @@ impl TuneApp {
                 Health::Excluded(_) => "対象外".into(),
             };
             let mut foot = div().flex().flex_wrap().gap_1p5();
+            if let Health::Excluded(label) = &n.health {
+                foot = foot.child(chip(label.clone(), palette::muted()));
+            }
             if let Health::Failed(e) = &n.health {
                 foot = foot.child(
                     div()
@@ -285,9 +512,6 @@ impl TuneApp {
                         .text_ellipsis()
                         .child(chip(e.lines().next().unwrap_or("失敗").to_string(), palette::crit())),
                 );
-            }
-            if let Health::Excluded(label) = &n.health {
-                foot = foot.child(chip(label.clone(), palette::muted()));
             }
             for (sev, count) in [(Severity::Critical, n.count(Severity::Critical)), (Severity::Warn, n.count(Severity::Warn))] {
                 if count > 0 {
@@ -330,13 +554,12 @@ impl TuneApp {
                     )))
                     .child(metric("CPU", n.cpu_busy, "%"))
                     .child(metric("空きメモリ", n.mem_avail_pct, "%"))
-                    .when(!n.score_trend.is_empty(), |d| d.child(trend(&n.score_trend, 100.0, score_color(&n.health), 18.0)))
+                    .when(!n.score_trend.is_empty(), |d| d.child(trend(&n.score_trend, 100.0, score_color(&n.health), 18.0, 60)))
                     .child(foot)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |app, _, _, cx| {
-                            app.selected = Some(id.clone());
-                            cx.notify();
+                            app.select(Some(id.clone()), cx);
                         }),
                     ),
             );
@@ -345,6 +568,238 @@ impl TuneApp {
             grid = grid.child(div().text_color(palette::muted()).child("台帳に機体がありません（~/.config/katala-tune/nodes.json）"));
         }
         div().id("overview-scroll").flex_1().overflow_y_scroll().child(grid)
+    }
+
+    fn logs_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = now_ms();
+        let level_color = |l: &str| match l {
+            "critical" | "error" => palette::crit(),
+            "warn" => palette::warn(),
+            _ => palette::muted(),
+        };
+        let mut filters = div().flex().gap_2();
+        for (i, (label, level)) in [("すべて", None), ("重大", Some("critical")), ("エラー", Some("error")), ("警告", Some("warn"))].into_iter().enumerate()
+        {
+            let active = self.log_level == level;
+            filters = filters.child(
+                div()
+                    .id(("lvl", i))
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .text_sm()
+                    .cursor_pointer()
+                    .bg(if active { palette::accent() } else { palette::card() })
+                    .child(label)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |app, _, _, cx| {
+                            app.log_level = level;
+                            app.load_logs();
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        let mut sigs = div().flex().flex_col().gap_1p5().w(px(360.0)).flex_none();
+        sigs = sigs.child(div().text_xs().text_color(palette::muted()).child("同種ログ（7 日）"));
+        for s in &self.sigs {
+            sigs = sigs.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .p_2()
+                    .rounded_md()
+                    .bg(palette::card())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(chip(model::level_label(&s.level), level_color(&s.level)))
+                            .child(div().text_xs().text_color(palette::muted()).child(format!("{} 件 · {} 台", s.count, s.nodes))),
+                    )
+                    .child(div().text_xs().child(s.sample.clone())),
+            );
+        }
+        if self.sigs.is_empty() {
+            sigs = sigs.child(div().text_sm().text_color(palette::muted()).child("まだログを取り込んでいません"));
+        }
+        let mut rows = div().flex().flex_col().gap_1().flex_1().min_w_0();
+        rows = rows.child(div().text_xs().text_color(palette::muted()).child(format!("新しい順（{} 件）", self.logs.len().min(200))));
+        for l in &self.logs {
+            rows = rows.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(palette::card())
+                    .child(div().w(px(56.0)).flex_none().child(chip(model::level_label(&l.level), level_color(&l.level))))
+                    .child(div().text_xs().text_color(palette::muted()).w(px(84.0)).flex_none().truncate().child(l.node.clone()))
+                    .child(div().text_xs().text_color(palette::muted()).w(px(64.0)).flex_none().child(model::ago(now, l.ts_ms)))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().child(l.message.clone())),
+            );
+        }
+        div().id("logs").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5().child(filters).child(div().flex().gap_4().child(sigs).child(rows))
+    }
+
+    fn topology_page(&self) -> impl IntoElement {
+        let t = &self.topology;
+        let now = now_ms();
+        let note = |title: &str, body: String| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_3()
+                .rounded_md()
+                .bg(palette::card())
+                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(title.to_string()))
+                .child(div().text_xs().text_color(palette::muted()).child(body))
+        };
+        let stat = |label: &str, v: String| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(div().text_xs().text_color(palette::muted()).child(label.to_string()))
+                .child(div().text_lg().font_weight(FontWeight::BOLD).child(v))
+        };
+        let mut scopes = div().flex().flex_col().gap_1();
+        for s in &t.scopes {
+            let color = match s.status.as_str() {
+                "complete" => palette::ok(),
+                "failed" => palette::crit(),
+                "partial" => palette::warn(),
+                _ => palette::muted(),
+            };
+            scopes = scopes.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(palette::card())
+                    .child(div().w(px(72.0)).flex_none().child(chip(model::scope_status_label(&s.status), color)))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().child(s.id.clone()))
+                    .child(div().text_xs().text_color(palette::muted()).child(s.observed_ms.map_or("未観測".to_string(), |a| model::ago(now, a)))),
+            );
+        }
+        let mut kinds = div().flex().flex_wrap().gap_2();
+        for (k, n) in &t.kind_counts {
+            kinds = kinds.child(chip(format!("{k} {n}"), palette::muted()));
+        }
+        let mut ents = div().flex().flex_col().gap_1();
+        for (k, label) in t.entities.iter().take(200) {
+            ents = ents.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(palette::card())
+                    .child(div().w(px(140.0)).flex_none().truncate().text_xs().text_color(palette::muted()).child(k.clone()))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().child(label.clone())),
+            );
+        }
+        div().id("topology").flex_1().overflow_y_scroll().flex().flex_col().gap_4().p_5()
+            .child(note(
+                "表示範囲と検査について",
+                format!(
+                    "表示中の項目だけを検査しています。表示外の項目と保存原本全体は未検査です。保存項目数: 実体 {} 件 / 関係 {} 件（全件を検査した件数ではありません）。表示は上限付きで、属性・履歴の一部を省略しています。",
+                    t.stored_entities, t.stored_edges
+                ),
+            ))
+            .child(note("観測時点の構成図です", "完了範囲でも、表示は最後に観測した時点の記録です。リアルタイムの存在判定ではありません。更新は read-only です。".into()))
+            .child(div().flex().gap_8().child(stat("範囲", t.scopes.len().to_string())).child(stat("履歴", t.history.to_string())).child(stat("実体（表示 / 保存）", format!("{} / {}", t.entities.len().min(200), t.stored_entities))).child(stat("関係（表示 / 保存）", format!("{} / {}", t.edges_shown, t.stored_edges))))
+            .child(div().text_xs().text_color(palette::muted()).child("収集の範囲"))
+            .child(scopes)
+            .child(div().text_xs().text_color(palette::muted()).child("実体の種類（表示中）"))
+            .child(kinds)
+            .child(div().text_xs().text_color(palette::muted()).child(format!("実体（表示 {} 件まで）", t.entities.len().min(200))))
+            .child(ents)
+    }
+
+    fn status_page(&self) -> impl IntoElement {
+        let st = &self.status;
+        let now = now_ms();
+        let color = |s: model::CheckStatus| match s {
+            model::CheckStatus::Fail => palette::crit(),
+            model::CheckStatus::Warn => palette::warn(),
+            model::CheckStatus::Ok => palette::ok(),
+            model::CheckStatus::Unknown => palette::muted(),
+        };
+        let mut counts = div().flex().gap_2();
+        for s in [model::CheckStatus::Fail, model::CheckStatus::Warn, model::CheckStatus::Unknown, model::CheckStatus::Ok] {
+            counts = counts.child(chip(format!("{} {}", s.label(), st.count(s)), color(s)));
+        }
+        let when = |label: &str, t: Option<i64>| format!("{label} {}", t.map_or("未実施".to_string(), |t| model::ago(now, t)));
+        let mut rows = div().flex().flex_col().gap_1();
+        for c in &st.checks {
+            rows = rows.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(palette::card())
+                    .child(div().w(px(56.0)).flex_none().child(chip(c.status.label(), color(c.status))))
+                    .child(div().w(px(110.0)).flex_none().truncate().text_xs().text_color(palette::muted()).child(c.scope.clone()))
+                    .child(div().w(px(150.0)).flex_none().truncate().text_xs().font_weight(FontWeight::SEMIBOLD).child(c.name.clone()))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().text_color(palette::muted()).child(c.detail.clone())),
+            );
+        }
+        let mut events = div().flex().flex_col().gap_1();
+        for e in st.events.iter().take(30) {
+            events = events.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(palette::card())
+                    .child(div().w(px(64.0)).flex_none().text_xs().text_color(palette::muted()).child(model::ago(now, e.ts_ms)))
+                    .child(div().w(px(110.0)).flex_none().truncate().text_xs().text_color(palette::muted()).child(e.scope.clone()))
+                    .child(div().w(px(120.0)).flex_none().truncate().text_xs().child(e.name.clone()))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .flex_none()
+                            .child(chip(e.from.label(), color(e.from)))
+                            .child(div().text_xs().child("→"))
+                            .child(chip(e.to.label(), color(e.to))),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().text_xs().text_color(palette::muted()).child(e.detail.clone())),
+            );
+        }
+        div()
+            .id("status")
+            .flex_1()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_5()
+            .child(div().flex().items_center().gap_4().child(counts).child(div().text_xs().text_color(palette::muted()).child(format!(
+                "{} · {}",
+                when("分析", st.last_probe_ms),
+                when("ログ取り込み", st.last_logs_ms)
+            ))))
+            .child(rows)
+            .child(div().text_xs().text_color(palette::muted()).child(format!("最近の変化（{} 件まで）", st.events.len().min(30))))
+            .child(events)
     }
 
     fn finding_row(f: &Finding) -> impl IntoElement {
@@ -370,7 +825,7 @@ impl TuneApp {
             .when(!f.advice.is_empty(), |d| d.child(div().text_xs().child(f.advice.clone())))
     }
 
-    fn detail(&self, id: &str) -> impl IntoElement {
+    fn detail(&self, id: &str, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(n) = self.nodes.iter().find(|n| n.id == id) else {
             return div().id("detail").p_5().child("機体が見つかりません");
         };
@@ -388,6 +843,83 @@ impl TuneApp {
         if let Some(u) = n.uptime_h {
             facts = facts.child(chip(format!("稼働 {}", model::uptime(u)), palette::muted()));
         }
+        let on = self.live_on.as_ref().is_some_and(|(i, _)| i == id);
+        let toggle = {
+            let id = id.to_string();
+            div()
+                .id("live-toggle")
+                .px_3()
+                .py_1p5()
+                .rounded_md()
+                .text_sm()
+                .cursor_pointer()
+                .bg(if on { palette::crit() } else { palette::card() })
+                .border_1()
+                .border_color(palette::line())
+                .child(if on { "ライブを止める" } else { "ライブ（1 秒ごと）" })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |app, _, _, cx| {
+                        if app.live_on.is_some() {
+                            app.live_stop();
+                        } else {
+                            app.live_start(&id);
+                        }
+                        cx.notify();
+                    }),
+                )
+        };
+        let live_panel = if on {
+            let store = self.live_store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let l = store.0.get(id).cloned().unwrap_or_default();
+            let now = |v: &[f64]| v.last().map_or("–".to_string(), |x| format!("{x:.0}%"));
+            let status = if l.cpu.is_empty() { Some(format!("接続中… {}", l.detail.clone().unwrap_or_default())) } else { None };
+            Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .rounded_md()
+                    .bg(palette::card())
+                    .border_1()
+                    .border_color(palette::accent())
+                    .child(div().text_xs().text_color(palette::muted()).child(format!("ライブ（直近 {} 秒）· {}", l.cpu.len(), l.state)))
+                    .when_some(status, |d, s| d.child(div().text_sm().text_color(palette::warn()).child(s)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_end()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_xs().text_color(palette::muted()).child("CPU"))
+                                    .child(div().text_xl().font_weight(FontWeight::BOLD).child(now(&l.cpu))),
+                            )
+                            .child(trend(&l.cpu, 100.0, palette::accent(), 48.0, model::LIVE_KEEP)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_end()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_xs().text_color(palette::muted()).child("メモリ使用"))
+                                    .child(div().text_xl().font_weight(FontWeight::BOLD).child(now(&l.mem))),
+                            )
+                            .child(trend(&l.mem, 100.0, palette::warn(), 48.0, model::LIVE_KEEP)),
+                    ),
+            )
+        } else {
+            None
+        };
         let mut trends = div().flex().flex_wrap().gap_5();
         for (label, values, max, color) in [
             ("スコア", &n.score_trend, 100.0, palette::ok()),
@@ -404,7 +936,7 @@ impl TuneApp {
                         .rounded_md()
                         .bg(palette::card())
                         .child(div().text_xs().text_color(palette::muted()).child(format!("{label}（直近 {} 回）", values.len().min(60))))
-                        .child(trend(values, max, color, 44.0)),
+                        .child(trend(values, max, color, 44.0, 60)),
                 );
             }
         }
@@ -419,14 +951,28 @@ impl TuneApp {
             Health::Scored(_) if n.findings.is_empty() => div().text_sm().text_color(palette::ok()).child("所見はありません"),
             Health::Scored(_) => list,
         };
-        div().id("detail").flex_1().overflow_y_scroll().flex().flex_col().gap_4().p_5().child(facts).child(trends).child(body)
+        div()
+            .id("detail")
+            .flex_1()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .p_5()
+            .child(div().flex().items_center().gap_3().child(div().flex_1().child(facts)).child(toggle))
+            .when_some(live_panel, |d, p| d.child(p))
+            .child(trends)
+            .child(body)
     }
 }
 
 impl Render for TuneApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match self.selected.clone() {
-            Some(id) => self.detail(&id).into_any_element(),
+            _ if self.page_status => self.status_page().into_any_element(),
+            _ if self.page_topology => self.topology_page().into_any_element(),
+            _ if self.page_logs => self.logs_page(cx).into_any_element(),
+            Some(id) => self.detail(&id, cx).into_any_element(),
             None => self.overview(cx).into_any_element(),
         };
         div().size_full().flex().font_family(FONT).bg(palette::bg()).text_color(palette::text()).child(self.sidebar(cx)).child(
@@ -443,7 +989,7 @@ impl Render for TuneApp {
 }
 
 pub fn run(options: startup::Options) {
-    let startup::Options { config, data, selftest } = options;
+    let startup::Options { config, data, selftest, open, live_id, logs } = options;
     if (selftest || config.exists())
         && let Err(error) = nodes::load_config(&config)
     {
@@ -463,13 +1009,33 @@ pub fn run(options: startup::Options) {
             }
         }
     };
+
     if let Some(error) = engine.config_error().or_else(|| engine.last().err()) {
         eprintln!("katala-tune-gpui: {error}");
         std::process::exit(1);
     }
 
+    let live_store = Arc::new(Mutex::new(model::LiveStore::default()));
+    let live_dirty = Arc::new(AtomicBool::new(false));
+    let live = {
+        let (store, flag) = (live_store.clone(), live_dirty.clone());
+        let _g = rt.enter();
+        let live = Live::new(
+            Arc::new(ProcessRoute),
+            tune_core::monitor::live_opts(engine.config().nodes.len()),
+            Box::new(move |ev| {
+                store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).merge(&ev);
+                flag.store(true, Ordering::Release);
+            }),
+        );
+        rt.spawn(live.clone().run_ticker());
+        live
+    };
+    let handles = LiveHandles { live: live.clone(), store: live_store, dirty: live_dirty };
+    let rt_exit = rt.clone();
+
     Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1120.0), px(720.0)), cx);
+        let bounds = Bounds::centered(None, size(px(960.0), px(640.0)), cx);
         let window = cx
             .open_window(
                 WindowOptions {
@@ -481,7 +1047,7 @@ pub fn run(options: startup::Options) {
                     }),
                     ..Default::default()
                 },
-                move |_, cx| cx.new(|cx| TuneApp::new(engine, rt, dirty, cx)),
+                move |_, cx| cx.new(|cx| TuneApp::new(engine, rt, dirty, handles, cx)),
             )
             .expect("window");
         cx.on_window_closed(|cx| {
@@ -491,14 +1057,39 @@ pub fn run(options: startup::Options) {
         })
         .detach();
         cx.activate(true);
+        // --open logs|<機体 id>: 起動時に開く画面（画面確認・スクリーンショット用）
+        match open.as_deref() {
+            Some("logs") => drop(window.update(cx, |v, _, cx| v.open_logs(cx))),
+            Some("status") => drop(window.update(cx, |v, _, cx| v.open_status(cx))),
+            Some("topology") => drop(window.update(cx, |v, _, cx| v.open_topology(cx))),
+            Some(id) => drop(window.update(cx, |v, _, cx| v.select(Some(id.to_string()), cx))),
+            None => {}
+        }
         if selftest {
             let view = window.update(cx, |v, _, _| v.nodes.len()).unwrap_or(0);
+            // --live <id>: その機体のライブを流し、点が届くまで確かめる（E2E 用）
+            if let Some(id) = &live_id {
+                window.update(cx, |v, _, _| v.live_start(id)).ok();
+            }
+            if logs {
+                window.update(cx, |v, _, cx| v.open_logs(cx)).ok();
+            }
             cx.spawn(async move |cx| {
-                cx.background_executor().timer(Duration::from_millis(1500)).await;
+                cx.background_executor().timer(Duration::from_millis(if live_id.is_some() { 8000 } else { 1500 })).await;
                 println!("selftest ok nodes={view}");
+                if logs {
+                    let (r, g) = window.update(cx, |v, _, _| (v.logs.len(), v.sigs.len())).unwrap_or((0, 0));
+                    println!("selftest logs rows={r} sigs={g}");
+                }
+                if let Some(id) = live_id {
+                    let n = window.update(cx, |v, _, _| v.live_store.lock().map_or(0, |s| s.0.get(&id).map_or(0, |l| l.cpu.len()))).unwrap_or(0);
+                    println!("selftest live points={n}");
+                }
                 cx.update(|cx| cx.quit()).ok();
             })
             .detach();
         }
     });
+    // 画面を閉じたら、流している調査の子プロセスを止めてから終わる
+    rt_exit.block_on(live.shutdown(Duration::from_secs(3)));
 }
