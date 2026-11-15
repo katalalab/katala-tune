@@ -54,6 +54,14 @@ pub struct Disk {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct AppUse {
+    pub app: String,
+    pub count: i64,
+    pub cpu: f64,
+    pub mem_mb: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct NodeView {
     pub id: String,
     pub os: String,
@@ -67,6 +75,9 @@ pub struct NodeView {
     pub cores: Option<i64>,
     pub cpu_name: String,
     pub disks: Vec<Disk>,
+    /// 直近の分析時点のアプリ別の使用量（メモリの多い順に Engine が並べたもの）
+    pub apps: Vec<AppUse>,
+    pub agent_processes: Option<i64>,
     pub findings: Vec<Finding>,
     /// 直近の履歴（古い順）。画面の推移グラフ用
     pub score_trend: Vec<f64>,
@@ -147,6 +158,22 @@ pub fn build(ledger_nodes: &[Value], last: &[Value]) -> Vec<NodeView> {
                             .collect()
                     })
                     .unwrap_or_default(),
+                apps: data
+                    .and_then(|d| d.get("processes"))
+                    .and_then(|p| p.get("apps"))
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .map(|x| AppUse {
+                                app: one_line(&str_of(x.get("app")), 60),
+                                count: x.get("count").and_then(Value::as_i64).unwrap_or(0),
+                                cpu: x.get("cpu").and_then(Value::as_f64).unwrap_or(0.0),
+                                mem_mb: x.get("mem_mb").and_then(Value::as_f64).unwrap_or(0.0),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                agent_processes: data.and_then(|d| d.get("processes")).and_then(|p| p.get("agent_processes")).and_then(Value::as_i64),
                 findings,
                 score_trend: Vec::new(),
                 cpu_trend: Vec::new(),
@@ -672,6 +699,50 @@ pub fn specs(v: &Value) -> SpecsView {
     SpecsView { nodes, sections: sections.into_values().collect() }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SecNode {
+    pub node: String,
+    pub enabled: bool,
+    pub checks: usize,
+    pub shared: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SecurityView {
+    pub nodes: Vec<SecNode>,
+    pub events: usize,
+    pub peers: usize,
+    pub logins: usize,
+    pub keep_days: i64,
+    pub learn_days: i64,
+}
+
+/// `Engine::netsec_view`（読み取りだけ。遮断や設定変更はしない）
+pub fn security(v: &Value) -> SecurityView {
+    let len = |k: &str| v.get(k).and_then(Value::as_array).map_or(0, Vec::len);
+    SecurityView {
+        nodes: v
+            .get("nodes")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|n| SecNode {
+                        node: str_of(n.get("id")),
+                        enabled: n.get("enabled").and_then(Value::as_bool) == Some(true),
+                        checks: n.get("checks").and_then(Value::as_array).map_or(0, Vec::len),
+                        shared: n.get("shared").and_then(Value::as_bool) == Some(true),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        events: len("events"),
+        peers: len("peers"),
+        logins: len("logins"),
+        keep_days: v.get("keep_days").and_then(Value::as_i64).unwrap_or(0),
+        learn_days: v.get("learn_days").and_then(Value::as_i64).unwrap_or(0),
+    }
+}
+
 /// ライブ表示で貯める点（直近 3 分 = 1 秒ごとに 180 点）
 pub const LIVE_KEEP: usize = 180;
 
@@ -772,7 +843,7 @@ mod tests {
         let mk = |crit: usize, score| NodeView {
             id: String::new(), os: String::new(), role: String::new(), health: Health::Scored(score), at_ms: None,
             cpu_busy: None, mem_avail_pct: None, uptime_h: None, score_trend: vec![], cpu_trend: vec![], mem_trend: vec![],
-            swap_gb: None, cores: None, cpu_name: String::new(), disks: vec![],
+            swap_gb: None, cores: None, cpu_name: String::new(), disks: vec![], apps: vec![], agent_processes: None,
             findings: (0..crit).map(|_| Finding { severity: Severity::Critical, title: String::new(), detail: String::new(), advice: String::new() }).collect(),
         };
         let mut v = vec![mk(0, 10), mk(2, 90), mk(1, 50)];
@@ -927,6 +998,18 @@ mod tests {
         assert_eq!((s.sections[0].components, s.sections[0].unverified), (2, 1));
         assert_eq!(s.sections[0].rows[0].1, ["G1", "G2"]);
         assert_eq!(specs(&json!({})), SpecsView::default());
+    }
+
+    #[test]
+    fn apps_and_security_parse_with_missing_fields() {
+        let v = build(&[json!({"id": "a"})], &[json!({"node_id": "a", "ok": true, "data": {"processes": {"agent_processes": 3, "apps": [{"app": "x", "count": 2, "cpu": 1.5, "mem_mb": 100}, {}]}}})]);
+        assert_eq!(v[0].agent_processes, Some(3));
+        assert_eq!(v[0].apps.len(), 2);
+        assert_eq!((v[0].apps[0].count, v[0].apps[0].mem_mb), (2, 100.0));
+        let s = security(&json!({"nodes": [{"id": "a", "enabled": true, "checks": [{}, {}]}, {"id": "b"}], "events": [{}], "keep_days": 30}));
+        assert_eq!((s.nodes[0].enabled, s.nodes[0].checks, s.nodes[1].enabled), (true, 2, false));
+        assert_eq!((s.events, s.peers, s.keep_days), (1, 0, 30));
+        assert_eq!(security(&json!({})), SecurityView::default());
     }
 
     #[test]

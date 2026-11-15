@@ -109,11 +109,13 @@ enum Page {
     Tools,
     Ai,
     Specs,
+    Processes,
+    Security,
 }
 
 impl Page {
     /// サイドバーに並べる順
-    const NAV: [Self; 10] = [Self::Status, Self::Resources, Self::Power, Self::Specs, Self::Tools, Self::Ai, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
+    const NAV: [Self; 12] = [Self::Status, Self::Resources, Self::Processes, Self::Security, Self::Power, Self::Specs, Self::Tools, Self::Ai, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
 
     fn title(self) -> &'static str {
         match self {
@@ -128,6 +130,8 @@ impl Page {
             Self::Tools => "道具",
             Self::Ai => "AI",
             Self::Specs => "スペック比較",
+            Self::Processes => "プロセス",
+            Self::Security => "セキュリティ",
         }
     }
 
@@ -143,6 +147,8 @@ impl Page {
             "tools" => Self::Tools,
             "ai" => Self::Ai,
             "specs" => Self::Specs,
+            "processes" => Self::Processes,
+            "security" => Self::Security,
             _ => return None,
         })
     }
@@ -173,6 +179,7 @@ struct TuneApp {
     tools: model::InventoryView,
     ai: model::AiView,
     specs: model::SpecsView,
+    security: model::SecurityView,
     schedule: model::ScheduleView,
     status: model::StatusView,
     topology: model::TopologyView,
@@ -183,7 +190,7 @@ struct TuneApp {
 
 impl TuneApp {
     fn new(engine: Arc<Engine>, rt: Arc<tokio::runtime::Runtime>, dirty: Arc<AtomicBool>, live: LiveHandles, cx: &mut Context<Self>) -> Self {
-        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page: Page::Overview, actions: Vec::new(), power: Default::default(), tools: Default::default(), ai: Default::default(), specs: Default::default(), schedule: Default::default(), status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
+        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page: Page::Overview, actions: Vec::new(), power: Default::default(), tools: Default::default(), ai: Default::default(), specs: Default::default(), security: Default::default(), schedule: Default::default(), status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
         app.reload();
         app.load_status();
         // 通知を待つ代わりに 0.4 秒ごとに旗を見る。変わったときだけ読み直して描き直す
@@ -276,7 +283,12 @@ impl TuneApp {
                     self.specs = model::specs(&v);
                 }
             }
-            Page::Overview | Page::Resources => {}
+            Page::Security => {
+                if let Ok(v) = self.engine.netsec_view(&serde_json::json!({})) {
+                    self.security = model::security(&v);
+                }
+            }
+            Page::Overview | Page::Resources | Page::Processes => {}
         }
     }
 
@@ -814,6 +826,55 @@ impl TuneApp {
             .child(body)
     }
 
+    /// 直近の分析時点のアプリ別の使用量（メモリの多い順の上位）。常時の監視ではなく、スナップショット
+    fn processes_page(&self) -> impl IntoElement {
+        let now = now_ms();
+        let mut body = div().flex().flex_col().gap_4();
+        for n in &self.nodes {
+            if n.apps.is_empty() {
+                continue;
+            }
+            let mut rows = div().flex().flex_col().gap_0p5();
+            for a in n.apps.iter().take(8) {
+                rows = rows.child(
+                    div().flex().items_center().gap_2().px_2().py_0p5().rounded_md().bg(palette::card())
+                        .child(div().flex_1().min_w_0().truncate().text_xs().child(a.app.clone()))
+                        .child(div().w(px(56.0)).flex_none().text_xs().text_color(palette::muted()).child(format!("{} 個", a.count)))
+                        .child(div().w(px(64.0)).flex_none().text_xs().text_color(if a.cpu >= 25.0 { palette::warn() } else { palette::muted() }).child(format!("CPU {:.1}%", a.cpu)))
+                        .child(div().w(px(84.0)).flex_none().text_xs().child(format!("{:.1} GB", a.mem_mb / 1024.0))),
+                );
+            }
+            body = body.child(
+                div().flex().flex_col().gap_1().w(px(480.0))
+                    .child(div().flex().items_center().gap_2().child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(n.id.clone())).child(div().text_xs().text_color(palette::muted()).child(format!("{} · AI エージェント {} 個", n.at_ms.map_or("未分析".to_string(), |a| model::ago(now, a)), n.agent_processes.map_or("–".to_string(), |c| c.to_string())))))
+                    .child(rows),
+            );
+        }
+        div().id("processes").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5()
+            .child(div().text_xs().text_color(palette::muted()).child("直近の分析時点のアプリ別の使用量（メモリの多い上位 8 件）。1 秒ごとの様子は機体の詳細のライブで見られます。"))
+            .child(div().flex().flex_wrap().gap_6().child(body))
+    }
+
+    /// ネットワークとセキュリティの監視状態。読み取りだけで、遮断や設定変更はしない
+    fn security_page(&self) -> impl IntoElement {
+        let s = &self.security;
+        let mut rows = div().flex().flex_col().gap_1();
+        for n in &s.nodes {
+            rows = rows.child(
+                div().flex().items_center().gap_2().px_3().py_2().rounded_md().bg(palette::card())
+                    .child(div().w(px(120.0)).flex_none().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(n.node.clone()))
+                    .child(div().w(px(80.0)).flex_none().child(if n.enabled { chip("監視中", palette::ok()) } else { chip("無効", palette::muted()) }))
+                    .child(div().text_xs().text_color(palette::muted()).child(if n.shared { "共用機（変更操作は出ない）".to_string() } else { format!("確認項目 {} 件", n.checks) })),
+            );
+        }
+        let enabled = s.nodes.iter().filter(|n| n.enabled).count();
+        div().id("security").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5()
+            .child(div().text_xs().text_color(palette::muted()).child(format!("監視は読み取りだけで、遮断や設定の変更は行いません。有効 {enabled} / {} 台。学習 {} 日・保存 {} 日。", s.nodes.len(), s.learn_days, s.keep_days)))
+            .child(div().flex().gap_2().child(chip(format!("通知対象のイベント {}", s.events), palette::muted())).child(chip(format!("接続先 {}", s.peers), palette::muted())).child(chip(format!("ログイン {}", s.logins), palette::muted())))
+            .child(rows)
+            .when(enabled == 0, |d| d.child(div().text_sm().text_color(palette::warn()).child("どの機体でも有効になっていません。台帳の設定で機体ごとに有効にします。")))
+    }
+
     fn actions_page(&self) -> impl IntoElement {
         let now = now_ms();
         let mut rows = div().flex().flex_col().gap_1();
@@ -976,6 +1037,8 @@ impl Render for TuneApp {
                 Page::Tools => self.tools_page().into_any_element(),
                 Page::Ai => self.ai_page().into_any_element(),
                 Page::Specs => self.specs_page().into_any_element(),
+                Page::Processes => self.processes_page().into_any_element(),
+                Page::Security => self.security_page().into_any_element(),
             },
         };
         div()
@@ -1082,7 +1145,7 @@ fn main() {
                 cx.background_executor().timer(Duration::from_millis(if live_id.is_some() { 8000 } else { 1500 })).await;
                 println!("selftest ok nodes={view}");
                 // 開いた画面のデータが読めたか（画面ごとの件数）。--open <page> と併用する
-                let counts = window.update(cx, |v, _, _| format!("power={} actions={} status={} topology={} tools={} ai={} specs={}", v.power.rows.len(), v.actions.len(), v.status.checks.len(), v.topology.entities.len(), v.tools.groups.len(), v.ai.sessions, v.specs.sections.len())).unwrap_or_default();
+                let counts = window.update(cx, |v, _, _| format!("power={} actions={} status={} topology={} tools={} ai={} specs={} security={} procs={}", v.power.rows.len(), v.actions.len(), v.status.checks.len(), v.topology.entities.len(), v.tools.groups.len(), v.ai.sessions, v.specs.sections.len(), v.security.nodes.len(), v.nodes.iter().filter(|n| !n.apps.is_empty()).count())).unwrap_or_default();
                 println!("selftest page {counts}");
                 if logs {
                     let (r, g) = window.update(cx, |v, _, _| (v.logs.len(), v.sigs.len())).unwrap_or((0, 0));
