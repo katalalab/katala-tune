@@ -72,18 +72,14 @@ fn actual_endpoint_rejects_foreign_malformed_oversized_and_accepts_fragmented_fr
     oversized.write_all(&[1]).unwrap();
     assert!(answer.unwrap_err().contains("limit"));
     drop(oversized);
-    // A trickling peer cannot extend the whole-frame budget indefinitely.
+    // Consume and ACK the rejection promptly. Deliberately writing/sleeping
+    // past the frame deadline could also outlive the bounded reply/ACK window;
+    // a closed peer no longer promises a readable structured reply.
     let mut slow = platform::connect(&namespace).unwrap();
-    let began = Instant::now();
     slow.write_all(&200u32.to_le_bytes()).unwrap();
-    for _ in 0..4 {
-        std::thread::sleep(Duration::from_millis(150));
-        let _ = slow.write_all(b" ");
-    }
     let answer: Result<(), String> = serde_json::from_slice(&read_frame(&mut slow).unwrap()).unwrap();
-    let _ = slow.write_all(&[1]);
-    assert!(answer.is_err());
-    assert!(began.elapsed() < Duration::from_secs(1), "frame deadline must not restart for each byte");
+    slow.write_all(&[1]).unwrap();
+    assert_eq!(answer.unwrap_err(), "incomplete activation frame");
     assert!(primary.requests.try_recv().is_err());
     drop(slow);
     let key = namespace.clone();
@@ -102,6 +98,49 @@ fn actual_endpoint_rejects_foreign_malformed_oversized_and_accepts_fragmented_fr
     request.reply.send(Ok(())).unwrap();
     fragmented.join().unwrap();
     drop(primary);
+}
+
+#[test]
+fn trickling_frame_uses_one_server_read_deadline() {
+    let namespace = name();
+    let platform::Claim::Primary(listener) = platform::claim(&namespace).unwrap() else { panic!() };
+    let (ready, start) = mpsc::channel();
+    let (done, finish) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let mut stream = platform::connect(&namespace).unwrap();
+        stream.write_all(&200u32.to_le_bytes()).unwrap();
+        start.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Intentionally span the 500ms budget with individually timely bytes.
+        // Retaining the accepted stream below makes every write observable,
+        // independently of the production reply/ACK deadline.
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(150));
+            stream.write_all(b" ").unwrap();
+        }
+        // Do not let EOF masquerade as the server's whole-frame deadline.
+        finish.recv_timeout(Duration::from_secs(2)).unwrap();
+    });
+    let accept_deadline = Instant::now() + Duration::from_secs(2);
+    let mut stream = loop {
+        if let Some(stream) = listener.accept().unwrap() {
+            break stream;
+        }
+        assert!(Instant::now() < accept_deadline, "owned client did not connect");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let began = Instant::now();
+    // Start the read budget after accept/coordination, not during client setup.
+    stream.read_budget(IO_TIMEOUT);
+    ready.send(()).unwrap();
+    let result = read_frame(&mut stream);
+    let elapsed = began.elapsed();
+    // The server owns this measurement; client scheduling after rejection
+    // cannot turn a successful timeout into a late response-read error.
+    done.send(()).unwrap();
+    writer.join().unwrap();
+    assert_eq!(result.unwrap_err(), "incomplete activation frame");
+    assert!(elapsed >= IO_TIMEOUT.saturating_sub(Duration::from_millis(100)), "frame must wait for its missing bytes");
+    assert!(elapsed < Duration::from_secs(1), "frame deadline must not restart for each byte: {elapsed:?}");
 }
 
 #[test]
