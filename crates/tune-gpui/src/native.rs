@@ -702,11 +702,21 @@ impl TuneApp {
                     .cursor_pointer()
                     .hover(|d| d.border_color(palette::accent()))
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .child(div().flex_1().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(n.id.clone()))
-                            .child(div().text_xl().font_weight(FontWeight::BOLD).text_color(score_color(&n.health)).child(score)),
+                        div().flex().items_center().child(div().flex_1().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(n.id.clone())).child(
+                            div()
+                                .size(px(44.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .border_3()
+                                .border_color(score_color(&n.health))
+                                .text_base()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(score_color(&n.health))
+                                .child(score),
+                        ),
                     )
                     .child(div().text_xs().text_color(palette::muted()).child(format!(
                         "{}{}",
