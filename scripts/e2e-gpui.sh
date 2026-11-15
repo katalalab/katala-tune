@@ -7,7 +7,7 @@ cargo test -p tune-gpui --release
 cargo build -p tune-gpui --release
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 n=$(python3 -c 'import json,sys;print(len(json.load(open("config/nodes.example.json"))["nodes"]))')
-out=$(./target/release/katala-tune --selftest --config config/nodes.example.json --data "$tmp/data")
+out=$(./target/release/katala-tune --selftest --config config/nodes.example.json --data "$tmp/data" | grep "^selftest ok")
 echo "$out"
 [ "$out" = "selftest ok nodes=$n" ] || { echo "E2E 失敗: 期待 nodes=$n" >&2; exit 1; }
 echo "e2e-gpui OK"
@@ -34,7 +34,7 @@ fi
 if [ -n "${E2E_PAGES:-}" ]; then
   for pair in power:power actions:actions status:status topology:topology; do
     pg=${pair%%:*}; key=${pair##*:}
-    n=$(./target/release/katala-tune --selftest --open "$pg" | sed -n "s/.*selftest page .*\b$key=\([0-9]*\).*/\1/p")
+    n=$(./target/release/katala-tune --selftest --open "$pg" | grep "^selftest page" | grep -o "$key=[0-9]*" | cut -d= -f2)
     [ "${n:-0}" -ge 1 ] || { echo "E2E 失敗: $pg のデータが読めない（$n）" >&2; exit 1; }
     echo "page $pg rows=$n"
   done
