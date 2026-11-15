@@ -1931,8 +1931,26 @@ fn open_route(target: &str, ledger: &[nodes::Node]) -> Result<Route, String> {
     Err(format!("--open の表示または機体が見つかりません: {target}"))
 }
 
+/// GPUI's native termination (notably NSApplication::terminate:) need not
+/// return from Application::run. Drain in the synchronous quit observer, before
+/// GPUI applies its 100ms allowance to returned futures. Workers use Tokio,
+/// atomic dirty flags and channels; none waits for GPUI or a confirmation UI.
+fn finish_shutdown(rt: &tokio::runtime::Runtime, host: &crate::monitor_host::MonitorHost, failed: &AtomicBool) -> crate::monitor_host::ShutdownReport {
+    let report = rt.block_on(host.shutdown());
+    if !report.confirmed() {
+        eprintln!("katala-tune-gpui: 終了または収集記録の保存ACKを確認できませんでした: {report:?}");
+        failed.store(true, Ordering::Release);
+    }
+    // Native termination can bypass the outer exit-status check as well.
+    if failed.load(Ordering::Acquire) {
+        std::process::exit(1);
+    }
+    report
+}
+
 pub fn run(options: startup::Options) {
-    let startup::Options { config, data, selftest, open, live_id, logs, confirm_demo, review: review_path } = options;
+    let startup::Options { config, data, selftest, open, live_id, logs, confirm_demo, review: review_path, shutdown_check } = options;
+    let shutdown_gate = data.join("shutdown-check");
     if (selftest || config.exists())
         && let Err(error) = nodes::load_config(&config)
     {
@@ -1985,13 +2003,10 @@ pub fn run(options: startup::Options) {
     let failed_exit = failed.clone();
 
     let quit_host = monitor_exit.clone();
+    let quit_rt = rt_exit.clone();
+    let quit_failed = failed_exit.clone();
+    let shutdown_diagnostic = shutdown_check.is_some();
     Application::new().run(move |cx: &mut App| {
-        let host = quit_host.clone();
-        cx.on_app_quit(move |_| {
-            host.request_exit();
-            async {}
-        })
-        .detach();
         input::bind_keys(cx);
         cx.bind_keys([
             KeyBinding::new("alt-down", NextPage, Some("Browser")),
@@ -2029,6 +2044,19 @@ pub fn run(options: startup::Options) {
                 move |window, cx| cx.new(|cx| TuneApp::new(engine, rt, dirty, handles, window, cx)),
             )
             .expect("window");
+        let host = quit_host.clone();
+        cx.on_app_quit(move |cx| {
+            // Close the UI admission gate before blocking, independently of
+            // entity observer order. Last-window release already invalidates
+            // pending UI intent when the handle can no longer be updated.
+            window.update(cx, |app, _, _| app.live.close()).ok();
+            let report = finish_shutdown(&quit_rt, &host, &quit_failed);
+            if shutdown_diagnostic {
+                println!("selftest shutdown: {report:?}");
+            }
+            async {}
+        })
+        .detach();
         cx.on_window_closed(move |cx| {
             if cx.windows().is_empty() {
                 quit_host.request_exit();
@@ -2053,7 +2081,45 @@ pub fn run(options: startup::Options) {
                 })
                 .ok();
         }
-        if selftest {
+        if let Some(mode) = shutdown_check {
+            // Explicit synthetic desktop diagnostic only. The parent fixture
+            // injects fake SSH and controls readiness/release outside GPUI.
+            cx.spawn(async move |cx| {
+                let result: Result<(), String> = async {
+                    window
+                        .update(cx, |app, _, cx| {
+                            {
+                                let _runtime = app.rt.enter();
+                                app.engine.start_monitor_journal();
+                            }
+                            app.collect(Kind::Probe, cx);
+                        })
+                        .map_err(|e| e.to_string())?;
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    while !shutdown_gate.join("child-ready").exists() {
+                        if Instant::now() >= deadline {
+                            return Err("shutdown fixture child was not ready".into());
+                        }
+                        cx.background_executor().timer(Duration::from_millis(25)).await;
+                    }
+                    std::fs::write(shutdown_gate.join("closing"), mode.as_bytes()).map_err(|e| e.to_string())?;
+                    match mode.as_str() {
+                        "close" => window.update(cx, |_, window, _| window.remove_window()).map_err(|e| e.to_string())?,
+                        "quit" => window.update(cx, |_, window, cx| window.dispatch_action(Box::new(Quit), cx)).map_err(|e| e.to_string())?,
+                        "native-quit" => cx.update(|cx| cx.quit()).map_err(|e| e.to_string())?,
+                        _ => unreachable!(),
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = result {
+                    failed.store(true, Ordering::Release);
+                    eprintln!("selftest shutdown: {error}");
+                    cx.update(|cx| cx.quit()).ok();
+                }
+            })
+            .detach();
+        } else if selftest {
             cx.spawn(async move |cx| {
                 let result: Result<(), String> = async {
                     let mut count = 0;
@@ -2190,14 +2256,9 @@ pub fn run(options: startup::Options) {
             .detach();
         }
     });
-    let shutdown = rt_exit.block_on(monitor_exit.shutdown());
-    if !shutdown.confirmed() {
-        eprintln!("katala-tune-gpui: 終了または収集記録の保存ACKを確認できませんでした: {shutdown:?}");
-        failed_exit.store(true, Ordering::Release);
-    }
-    if failed_exit.load(Ordering::Acquire) {
-        std::process::exit(1);
-    }
+    // Some platforms return from run; the same idempotent report also protects
+    // that fallback path. macOS normally terminates inside the native callback.
+    finish_shutdown(&rt_exit, &monitor_exit, &failed_exit);
 }
 
 #[cfg(test)]

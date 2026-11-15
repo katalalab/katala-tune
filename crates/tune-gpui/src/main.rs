@@ -34,7 +34,7 @@ fn main() {
         Ok(Some(options)) => options,
         Ok(None) => {
             println!(
-                "katala-tune-gpui [--config <ledger.json>] [--data <directory>] [--open <view|node-id>] [--review <file.json>] [--selftest [--live <node-id>] [--logs] [--confirm-demo]]\nmacOS / Windows preview; data defaults to a separate gpui-preview directory. --selftest requires both paths and checks startup and saved-data routes only."
+                "katala-tune-gpui [--config <ledger.json>] [--data <directory>] [--open <view|node-id>] [--review <file.json>] [--selftest [--live <node-id>] [--logs] [--confirm-demo] [--shutdown-check close|quit|native-quit]]\nmacOS / Windows preview; data defaults to a separate gpui-preview directory. --selftest requires both paths; without explicit diagnostics it checks startup and saved-data routes only. --shutdown-check starts a Probe job and expects an injected synthetic transport plus parent markers under <data>/shutdown-check."
             );
             return;
         }
@@ -47,7 +47,17 @@ fn main() {
     native::run(options);
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        drop((options.config, options.data, options.selftest, options.open, options.live_id, options.logs, options.confirm_demo, options.review));
+        drop((
+            options.config,
+            options.data,
+            options.selftest,
+            options.open,
+            options.live_id,
+            options.logs,
+            options.confirm_demo,
+            options.review,
+            options.shutdown_check,
+        ));
         eprintln!("GPUI preview currently supports macOS and Windows; use tune for the CLI");
         std::process::exit(2);
     }
