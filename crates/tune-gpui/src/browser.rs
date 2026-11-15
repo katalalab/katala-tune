@@ -114,7 +114,7 @@ mod tests {
     // Catches generic-panel fallback, missing range propagation, or any saved
     // route that mutates observations, metrics, cursors or computed health.
     #[test]
-    fn saved_reader_reloads_all_fifteen_routes_without_collection_or_writes() {
+    fn saved_reader_reloads_all_routes_without_collection_or_writes() {
         let dir = std::env::temp_dir().join(format!("tune-dashboard-reader-{}-{}", std::process::id(), tune_core::db::now_ms()));
         std::fs::create_dir(&dir).unwrap();
         let config = dir.join("nodes.json");
@@ -152,8 +152,9 @@ mod tests {
         let reader = Reader::new(engine.clone(), &rt);
         let route = Arc::new(CountingRoute(std::sync::atomic::AtomicUsize::new(0)));
         let live = tune_core::live::Live::new(route.clone(), Default::default(), Box::new(|_| {}));
-        assert_eq!(Page::ALL.len(), 15);
-        for (i, page) in Page::ALL.into_iter().cycle().take(30).enumerate() {
+        assert_eq!(Page::ALL.len(), 17);
+        let route_reads = Page::ALL.len() * 2;
+        for (i, page) in Page::ALL.into_iter().cycle().take(route_reads).enumerate() {
             let generation = i as u64 + 1;
             reader.request(Request { generation, route: Route::Page(page), query: String::new(), log_level: LogLevel::All, minutes: 360 }).unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -186,7 +187,16 @@ mod tests {
         // A rejected current ledger must reach the dedicated Dashboard error
         // result too, rather than falling back to a generic record panel.
         std::fs::write(engine.config_path(), "invalid synthetic ledger").unwrap();
-        reader.request(Request { generation: 31, route: Route::Page(Page::Dashboard), query: String::new(), log_level: LogLevel::All, minutes: 60 }).unwrap();
+        let rejected_generation = route_reads as u64 + 1;
+        reader
+            .request(Request {
+                generation: rejected_generation,
+                route: Route::Page(Page::Dashboard),
+                query: String::new(),
+                log_level: LogLevel::All,
+                minutes: 60,
+            })
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let rejected = loop {
             if let Some(r) = reader.take() {
@@ -195,7 +205,7 @@ mod tests {
             assert!(Instant::now() < deadline, "Reader timed out on invalid ledger");
             std::thread::sleep(Duration::from_millis(5));
         };
-        assert_eq!(rejected.generation, 31);
+        assert_eq!(rejected.generation, rejected_generation);
         assert!(rejected.config_error.is_some());
         assert!(rejected.dashboard.unwrap().is_err());
         assert!(rejected.panel.is_none(), "Dashboard errors belong to the dedicated result");
