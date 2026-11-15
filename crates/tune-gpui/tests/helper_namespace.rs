@@ -23,6 +23,7 @@ fn startup_helper_namespace_is_isolated_from_ambient_and_legacy_paths() {
     let home = root.join("home");
     let stale = root.join("stale-data");
     let chosen = root.join("chosen-data");
+    std::fs::write(root.join("blocked-data"), b"inert file, not a data directory").unwrap();
     for dir in [&app, &home, &stale.join("bin"), &chosen.join("bin"), &home.join(".katala-tune/bin")] {
         std::fs::create_dir_all(dir).unwrap();
     }
@@ -40,6 +41,7 @@ fn startup_helper_namespace_is_isolated_from_ambient_and_legacy_paths() {
         "resident",
         "hidden",
         "diagnostic",
+        "parse-only",
         "default-env",
         // Windows Known Folders ignore HOME/APPDATA overrides. Never consult
         // the real profile just to test the no-env legacy/default branch.
@@ -87,6 +89,15 @@ fn namespace_child() {
     let case = std::env::var("KT_NAMESPACE_CASE").unwrap();
     let stale = root.join("stale-data");
     let inherited = std::env::var_os("KATALA_TUNE_DATA_DIR");
+    if case == "parse-only" {
+        let blocked = root.join("blocked-data/child");
+        let options = startup::parse(["--config".into(), "unresolved-ledger.json".into(), "--data".into(), blocked.clone().into_os_string()]).unwrap().unwrap();
+        assert_eq!(options.config, PathBuf::from("unresolved-ledger.json"), "pure validation must not resolve paths before the platform guard");
+        assert_eq!(options.data, blocked);
+        assert!(tune_core::helpers::bound_bin_dir().is_none(), "pure validation must not bind helpers");
+        assert_eq!(std::fs::read(root.join("blocked-data")).unwrap(), b"inert file, not a data directory");
+        return;
+    }
     if case == "invalid" {
         assert!(tune_core::helpers::bind_process_data_dir(std::path::Path::new("relative-data")).is_err());
         assert!(tune_core::helpers::bind_process_data_dir(&root.join("parent/../other-data")).is_err());
@@ -131,7 +142,7 @@ fn namespace_child() {
         "diagnostic" => args.extend(["--selftest".into(), "--config".into(), root.join("unused-ledger.json").into_os_string()]),
         _ => {}
     }
-    let options = startup::parse(args).unwrap().unwrap();
+    let options = startup::prepare(startup::parse(args).unwrap().unwrap()).unwrap();
     assert_eq!(options.data, expected, "the DB and helper must share the resolved data path");
     assert_eq!(tune_core::helpers::bin_dir(), expected.join("bin"), "startup must override inherited/canonical helper selection");
     assert_eq!(std::env::var_os("KATALA_TUNE_DATA_DIR"), inherited, "binding must not mutate ambient environment");
@@ -143,8 +154,9 @@ fn namespace_child() {
         assert_eq!(launch.program, "powershell.exe", "missing bound sampler must not use sibling or canonical sampler");
     }
     if case == "immutable" {
-        assert!(startup::parse(["--data".into(), expected.clone().into_os_string()]).is_ok(), "same binding is idempotent");
-        assert!(startup::parse(["--data".into(), root.join("other-data").into_os_string()]).is_err(), "a different binding must fail");
+        let prepare = |data: PathBuf| startup::prepare(startup::parse(["--data".into(), data.into_os_string()]).unwrap().unwrap());
+        assert!(prepare(expected.clone()).is_ok(), "same binding is idempotent");
+        assert!(prepare(root.join("other-data")).is_err(), "a different binding must fail");
         assert_eq!(tune_core::helpers::bin_dir(), expected.join("bin"));
     }
     if case == "relative" {

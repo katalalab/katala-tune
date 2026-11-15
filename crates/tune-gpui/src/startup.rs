@@ -18,14 +18,13 @@ pub struct Options {
     pub shutdown_check: Option<String>,
 }
 
-pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Options>, String> {
-    let Some(mut options) = parse_options(arguments)? else { return Ok(None) };
+pub fn prepare(mut options: Options) -> Result<Options, String> {
     // Freeze paths before IPC/runtime threads. Every normal/diagnostic entry
     // shares these exact paths with Engine, OS integration and helper lookup.
     options.config = resolved(&options.config)?;
     options.data = resolved(&options.data)?;
     tune_core::helpers::bind_process_data_dir(&options.data)?;
-    Ok(Some(options))
+    Ok(options)
 }
 
 /// Canonicalize existing ancestors too, so missing and later-created paths
@@ -35,6 +34,12 @@ pub(super) fn resolved(path: &Path) -> Result<PathBuf, String> {
     let mut result = PathBuf::new();
     for part in absolute.components() {
         match part {
+            std::path::Component::Prefix(_) => {
+                // A Windows prefix such as \\?\C: is not a complete root yet.
+                // Wait for RootDir before any filesystem query/canonicalize.
+                result.push(part.as_os_str());
+                continue;
+            }
             std::path::Component::ParentDir => {
                 result.pop();
             }
@@ -49,7 +54,7 @@ pub(super) fn resolved(path: &Path) -> Result<PathBuf, String> {
     Ok(result)
 }
 
-fn parse_options(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Options>, String> {
+pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Options>, String> {
     let values: Vec<_> = arguments.into_iter().collect();
     if values.len() == 1 && matches!(values[0].to_str(), Some("--help" | "-h")) {
         return Ok(None);
@@ -142,8 +147,35 @@ fn parse_options(arguments: impl IntoIterator<Item = OsString>) -> Result<Option
 
 #[cfg(test)]
 mod tests {
-    use super::parse_options as parse;
     use super::*;
+
+    #[test]
+    fn resolver_accepts_owned_absolute_and_canonical_paths_and_missing_tails() {
+        let dir = std::env::temp_dir().join(format!("kt-startup-resolve-{}-{}", std::process::id(), tune_core::db::now_ms()));
+        std::fs::create_dir(&dir).unwrap();
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = Fixture(dir);
+        let canonical = fixture.0.canonicalize().unwrap();
+        #[cfg(windows)]
+        assert!(
+            matches!(canonical.components().next(), Some(std::path::Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_) | std::path::Prefix::VerbatimUNC(..)))
+        );
+        for path in [fixture.0.clone(), canonical.clone()] {
+            assert_eq!(resolved(&path).unwrap(), canonical);
+            assert_eq!(resolved(&path.join("missing/preview-data")).unwrap(), canonical.join("missing/preview-data"));
+        }
+        std::fs::write(canonical.join("file"), b"owned path error fixture").unwrap();
+        assert_eq!(resolved(&canonical.join("file")).unwrap(), canonical.join("file"));
+        // Windows reports a descendant of a regular file as missing rather than
+        // Unix ENOTDIR; only Unix promises a real error for this fixture.
+        #[cfg(unix)]
+        assert!(resolved(&canonical.join("file/child")).is_err(), "real filesystem errors must still propagate");
+    }
 
     #[test]
     fn resident_hidden_are_explicit_and_diagnostics_are_disjoint() {
