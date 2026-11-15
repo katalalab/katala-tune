@@ -22,7 +22,9 @@ pub fn load_saved(engine: &Engine, minutes: i64) -> Result<DashboardView, String
     }
     let ledger: Vec<_> = cfg.nodes.iter().map(tune_core::nodes::Node::public).collect();
     let observations = model::build(&ledger, &engine.last()?);
+    let schedule = engine.checked_schedule()?;
     let mut saved = tune_core::monitor::dashboard(engine, None, minutes)?;
+    saved["schedule"] = schedule;
     let rows = saved["nodes"].take().as_array().cloned().unwrap_or_default();
     let total_nodes = rows.len();
     // Only the displayed node set is bounded; core reads and series are intact.
@@ -121,18 +123,16 @@ fn series_chart(node: &DashboardNode, key: &str, label: &str, color: Hsla, since
     div().flex_1().min_w(px(100.)).child(div().text_xs().text_color(color).child(label.to_owned())).child(chart)
 }
 
-pub fn render_dashboard(view: &DashboardView, live: &Live, now: i64) -> gpui::Div {
+pub fn render_dashboard(view: &DashboardView, live: &Live, now: i64, details: bool) -> gpui::Div {
     let saved = &view.saved;
-    let mut body = div().flex().flex_col().gap_4().p_5()
-        .child(div().text_sm().child(format!("{}台表示 / 全{}台 · 省略{}台（UI表示上限200台） · 過去{}分",view.nodes.len(),view.total_nodes,view.total_nodes.saturating_sub(view.nodes.len()),text(&saved["minutes"]))))
-        .child(div().text_xs().text_color(palette::muted()).child("保存済み集計と、明示開始された同じ Live の現在値。閲覧・再読込では収集しません。monitor・詳細schedulerの稼働はこのpreviewでは未接続です。200台はUIの表示上限です。coreの読取台数・応答byte数の上限ではありません。"))
-        .child(div().flex().flex_wrap().gap_2()
-            .child(field("保存済みmonitor設定",format!("enabled {} · hub {}",text(&saved["monitor"]["enabled"]),text(&saved["monitor"]["hub"]))))
-            .child(field("core採取方針（稼働証明ではありません）",text(&saved["collecting"])))
-            .child(field("収集保守記録 health",format!("{} · running {} · {}",text(&saved["journal"]["status"]),text(&saved["journal"]["running"]),text(&saved["journal"]["summary"]))))
-            .child(field("保存済み詳細scheduler",format!("enabled {} · 分析 {}分 · ログ {}分 · 道具 {}時間 · AI {}分",text(&saved["schedule"]["enabled"]),text(&saved["schedule"]["probe_minutes"]),text(&saved["schedule"]["logs_minutes"]),text(&saved["schedule"]["inventory_hours"]),text(&saved["schedule"]["ai_minutes"]))))
-            .child(field("hub取込の保存結果",format!("成功 {} · 最終試行 {} · metric fresh {} · snapshot fresh {} · error {}",text(&saved["hub_pull"]["ok"]),crate::panels::time(&saved["hub_pull"]["at"]),text(&saved["hub_pull"]["fresh"]),text(&saved["hub_pull"]["snapshot_fresh"]),text(&saved["hub_pull"]["error"])))))
-        .child(div().text_xs().text_color(palette::muted()).child(format!("保存集計の読込 {} · アプリ {} · 記録healthのunknownは過去の欠落ゼロを意味しません",crate::panels::time(&saved["at"]),text(&saved["app"]["version"]))));
+    let mut body = div().flex().flex_col().gap_4().p_5().child(div().text_sm().child(format!("{}台 · 過去{}分", view.nodes.len(), text(&saved["minutes"]))));
+    if view.total_nodes > view.nodes.len() {
+        body = body.child(div().text_xs().text_color(palette::muted()).child(format!(
+            "全{}台中200台を表示 · 省略{}台",
+            view.total_nodes,
+            view.total_nodes - view.nodes.len()
+        )));
+    }
     let until = saved["at"].as_i64().unwrap_or(now);
     let since = until - saved["minutes"].as_i64().unwrap_or(60) * 60_000;
     for node in &view.nodes {
@@ -159,7 +159,7 @@ pub fn render_dashboard(view: &DashboardView, live: &Live, now: i64) -> gpui::Di
             .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(format!("{} · {}", node.observation.id, node.observation.os)))
             .child(div().text_sm().text_color(palette::muted()).child(observation))
             .child(div().text_xs().text_color(palette::muted()).child(format!(
-                "{} · 値の時刻 {} · 保存元 {} · 保存minute {}",
+                "{} · 値の時刻 {} · 保存元 {} · 保存時刻 {}",
                 current.source,
                 crate::panels::time(&current.at.into()),
                 text(&node.saved["latest"]["src"]),
@@ -192,7 +192,7 @@ pub fn render_dashboard(view: &DashboardView, live: &Live, now: i64) -> gpui::Di
             if ["used_mib", "total_mib", "free_mib", "pct"].iter().any(|s| current.values.get(key(s)).is_some()) {
                 vram = true;
                 card = card.child(div().text_xs().child(format!(
-                    "GPU 保存slot {slot} · VRAM {} / {} · 空き {} · {}",
+                    "GPU 保存番号 {slot} · VRAM {} / {} · 空き {} · {}",
                     number(&current.values[key("used_mib")], " MiB"),
                     number(&current.values[key("total_mib")], " MiB"),
                     number(&current.values[key("free_mib")], " MiB"),
@@ -212,16 +212,26 @@ pub fn render_dashboard(view: &DashboardView, live: &Live, now: i64) -> gpui::Di
                 .child(series_chart(node, "gpu", "GPU 保存平均", palette::warn(), since, until)),
         );
         if let Some(b) = &brief {
-            card = card.child(div().text_xs().child(format!(
-                "Live {} · reason {} · {} · 実装 {} · sampler負荷 {} · RSS {} · {}",
-                text(&b["state"]),
-                text(&b["reason"]),
-                text(&b["detail"]),
-                text(&b["impl"]),
-                number(&b["load"], "%（1コア比）"),
-                number(&b["rss_mb"], " MB"),
-                crate::panels::time(&b["point"]["t"])
-            )));
+            let phase = match b["state"].as_str() {
+                Some("connecting") => "接続中",
+                Some("running") => "収集中",
+                Some("retrying") => "再接続待ち",
+                Some("stopped") => "停止",
+                _ => "未確認",
+            };
+            card = card.child(div().text_xs().child(format!("Live {phase}{}", b["detail"].as_str().map(|d| format!(" · {d}")).unwrap_or_default())));
+            if details {
+                card = card.child(div().text_xs().child(format!(
+                    "Live {} · 理由 {} · {} · 実装 {} · 収集負荷 {} · RSS {} · {}",
+                    text(&b["state"]),
+                    text(&b["reason"]),
+                    text(&b["detail"]),
+                    text(&b["impl"]),
+                    number(&b["load"], "%（1コア比）"),
+                    number(&b["rss_mb"], " MB"),
+                    crate::panels::time(&b["point"]["t"])
+                )));
+            }
         }
         for (key, label, unit) in [("top_cpu", "CPU上位", "%（1コア比）"), ("top_mem", "メモリ上位", " MB")] {
             let top = brief.as_ref().and_then(|b| b[key].as_array());
@@ -256,6 +266,65 @@ pub fn render_dashboard(view: &DashboardView, live: &Live, now: i64) -> gpui::Di
         body = body.child(card);
     }
     body
+}
+
+pub fn render_details(view: &DashboardView) -> gpui::Div {
+    let saved = &view.saved;
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .px_5()
+        .py_2()
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(field("保存した監視設定", format!("有効 {} · ハブ {}", text(&saved["monitor"]["enabled"]), text(&saved["monitor"]["hub"]))))
+                .child(field("採取方針（実測ではありません）", text(&saved["collecting"])))
+                .child(field(
+                    "収集記録",
+                    format!(
+                        "状態 {} · 記録処理 {} · {}",
+                        text(&saved["journal"]["status"]),
+                        text(&saved["journal"]["running"]),
+                        text(&saved["journal"]["summary"])
+                    ),
+                ))
+                .child(field(
+                    "保存した自動スキャン設定",
+                    format!(
+                        "有効 {} · 分析 {}分 · ログ {}分 · 道具 {}時間 · AI {}分",
+                        text(&saved["schedule"]["enabled"]),
+                        text(&saved["schedule"]["probe_minutes"]),
+                        text(&saved["schedule"]["logs_minutes"]),
+                        text(&saved["schedule"]["inventory_hours"]),
+                        text(&saved["schedule"]["ai_minutes"])
+                    ),
+                ))
+                .child(field(
+                    "ハブ取込の保存結果",
+                    format!(
+                        "成功 {} · 最終試行 {} · メトリクス鮮度 {} · 分析鮮度 {} · 続き {} · カーソル {} · エラー {}",
+                        text(&saved["hub_pull"]["ok"]),
+                        crate::panels::time(&saved["hub_pull"]["at"]),
+                        text(&saved["hub_pull"]["fresh"]),
+                        text(&saved["hub_pull"]["snapshot_fresh"]),
+                        text(&saved["hub_pull"]["more"]),
+                        text(&saved["hub_pull"]["next"]),
+                        text(&saved["hub_pull"]["error"])
+                    ),
+                )),
+        )
+        .child(div().text_xs().text_color(palette::muted()).child(format!(
+            "保存集計の読込 {} · アプリ {} · 記録状態が不明のとき、過去の欠落なしとは判断できません。",
+            crate::panels::time(&saved["at"]),
+            text(&saved["app"]["version"])
+        )))
+        .child(
+            div().text_xs().text_color(palette::muted()).child("表示は最大200台。保存系列の読取範囲は変更しません。設定保存や閲覧だけでは収集を開始しません。"),
+        )
 }
 
 #[cfg(test)]

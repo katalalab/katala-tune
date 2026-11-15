@@ -457,7 +457,7 @@ pub async fn run(engine: Arc<Engine>, kind: Kind, ids: Option<Vec<String>>, prog
     Receipt::from_result(kind, &value, excluded)
 }
 
-async fn run_network<F, Fut>(ids: Vec<String>, active: bool, progress: Progress, mut check: F) -> Receipt
+pub(crate) async fn run_network<F, Fut>(ids: Vec<String>, active: bool, progress: Progress, mut check: F) -> Receipt
 where
     F: FnMut(String, bool) -> Fut,
     Fut: std::future::Future<Output = Result<Value, String>>,

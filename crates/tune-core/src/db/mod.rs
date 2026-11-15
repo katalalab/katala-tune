@@ -167,6 +167,13 @@ impl Store {
         Ok(v.flatten().and_then(|s| serde_json::from_str(&s).ok()))
     }
 
+    /// Settings admission distinguishes malformed saved JSON from an absent key.
+    pub fn get_meta_checked(&self, k: &str) -> Result<Option<Value>> {
+        let raw: Option<String> = self.conn.query_row("SELECT v FROM meta WHERE k = ?", [k], |r| r.get(0)).optional()?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))))
+            .transpose()
+    }
+
     pub fn set_meta(&self, k: &str, v: &Value) -> Result<()> {
         self.conn.execute("INSERT OR REPLACE INTO meta (k, v, updated_at) VALUES (?, ?, ?)", params![k, v.to_string(), now_ms()])?;
         Ok(())

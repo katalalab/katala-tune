@@ -25,7 +25,7 @@ use gpui::{
 };
 use model::{Finding, Health, NodeView, Severity};
 use tune_core::engine::{Engine, Host};
-use tune_core::live::{Live, ProcessRoute, Stop};
+use tune_core::live::{Live, Owner, ProcessRoute, Stop};
 use tune_core::nodes;
 
 actions!(tune, [Quit, CloseWindow, GoOverview, NextPage, PreviousPage, Refresh, FocusSearch, FocusContent, ToggleFocus, NextRow, PreviousRow, CopyRecord]);
@@ -118,10 +118,6 @@ fn severity_color(s: Severity) -> Hsla {
 }
 
 /// 棒の推移グラフ。0〜`max` を高さにし、点が無ければ空の枠だけ描く
-fn chips_key(id: &str) -> usize {
-    id.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize))
-}
-
 fn trend(values: &[f64], max: f64, color: Hsla, height: f32) -> gpui::Div {
     let mut bars = div().h(px(height)).flex().items_end().gap_px();
     for v in values.iter().rev().take(model::LIVE_KEEP).rev() {
@@ -268,6 +264,7 @@ fn page_desc(page: Page) -> &'static str {
 }
 
 struct LiveHandles {
+    monitor: Arc<crate::monitor_host::MonitorHost>,
     live: Arc<Live>,
     store: Arc<Mutex<model::LiveStore>>,
     dirty: Arc<AtomicBool>,
@@ -285,6 +282,7 @@ struct LiveIntent {
 struct LiveState {
     generation: u64,
     active: bool,
+    closing: bool,
     intent: Option<LiveIntent>,
     notice: Option<String>,
 }
@@ -304,12 +302,26 @@ impl LiveControl {
     fn stop_locked(&self, state: &mut LiveState, why: Stop) {
         state.generation = state.generation.wrapping_add(1);
         if let Some(intent) = state.intent.take() {
-            self.live.stop(Some(&[intent.id]), why);
+            self.live.release_owned(Owner::Ui, &[intent.id], why);
         }
     }
 
     fn stop(&self, why: Stop) {
-        self.stop_locked(&mut self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner), why);
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A failed current ledger read remains an administrative stop of the
+        // selected target; normal navigation/focus/manual stops only release UI.
+        if why == Stop::Excluded
+            && let Some(intent) = state.intent.as_ref()
+        {
+            self.live.stop(Some(std::slice::from_ref(&intent.id)), why.clone());
+        }
+        self.stop_locked(&mut state, why);
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.closing = true;
+        self.stop_locked(&mut state, Stop::AppExit);
     }
 
     fn set_active(&self, active: bool) {
@@ -323,7 +335,7 @@ impl LiveControl {
     fn request(&self, id: &str) -> Option<(u64, String)> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.stop_locked(&mut state, Stop::User);
-        if !state.active {
+        if state.closing || !state.active {
             state.notice = Some("ライブは前面のウィンドウから開始してください".into());
             return None;
         }
@@ -348,10 +360,11 @@ impl LiveControl {
     fn complete(&self, generation: u64, id: &str, nodes: &[nodes::Node], config_error: Option<String>) {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(intent) = state.intent.as_ref().filter(|i| i.generation == generation && i.id == id) else { return };
-        if !state.active {
+        if state.closing || !state.active {
             return;
         }
         if let Some(error) = config_error {
+            self.live.stop(Some(&[id.to_string()]), Stop::Excluded);
             self.stop_locked(&mut state, Stop::Excluded);
             state.notice = Some(format!("ライブ停止: 台帳を読み込めません: {error}"));
             return;
@@ -369,7 +382,7 @@ impl LiveControl {
                 state.notice = Some(format!("ライブ停止: {detail}"));
                 return;
             }
-            if !self.live.heartbeat(id) {
+            if !self.live.heartbeat_owned(Owner::Ui, id) {
                 let notice = self.terminal_notice(id);
                 self.stop_locked(&mut state, Stop::User);
                 state.notice = Some(notice);
@@ -378,7 +391,7 @@ impl LiveControl {
         } else {
             let target: Vec<_> = target.cloned().into_iter().collect();
             let unknown = if target.is_empty() { vec![id.to_string()] } else { Vec::new() };
-            let result = self.live.start(&target, &unknown);
+            let result = self.live.start_owned(Owner::Ui, &target, &unknown);
             if let Some(refusal) = result["refused"].as_array().and_then(|r| r.first()) {
                 let detail = refusal["detail"].as_str().unwrap_or("開始できません");
                 let notice = format!("ライブを開始できません: {detail}");
@@ -394,11 +407,12 @@ impl LiveControl {
         }
     }
 
-    /// Apply only the accepted Reader generation. Excluded findings are visible
-    /// immediately, so the matching owned stream must stop at that same boundary.
-    fn accept_nodes(&self, nodes: &[NodeView]) {
+    /// Apply the complete ledger only for an accepted Reader generation. Removal
+    /// and explicit exclusion administratively stop every owner under Live's lock.
+    fn accept_nodes(&self, nodes: &[nodes::Node]) {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.intent.as_ref().is_some_and(|intent| nodes.iter().any(|node| node.id == intent.id && matches!(node.health, Health::Excluded(_)))) {
+        self.live.retain_active(nodes);
+        if state.intent.as_ref().is_some_and(|intent| !nodes.iter().any(|node| node.id == intent.id && node.is_active())) {
             self.stop_locked(&mut state, Stop::Excluded);
         }
     }
@@ -432,6 +446,9 @@ impl LiveControl {
 }
 
 struct TuneApp {
+    monitor: Arc<crate::monitor_host::MonitorHost>,
+    monitor_command_tail: Option<tokio::task::JoinHandle<()>>,
+    monitor_records: Arc<Mutex<Option<Result<serde_json::Value, String>>>>,
     brand: Arc<gpui::Image>,
     icons: Vec<(&'static str, Arc<gpui::Image>)>,
     live: Arc<LiveControl>,
@@ -449,6 +466,7 @@ struct TuneApp {
     panel: Option<Result<Panel, String>>,
     dashboard: Option<Result<DashboardView, String>>,
     dashboard_minutes: i64,
+    dashboard_details: bool,
     dashboard_clock: Instant,
     query: String,
     log_level: LogLevel,
@@ -492,6 +510,12 @@ impl TuneApp {
         focus.focus(window);
         let live = Arc::new(LiveControl::new(handles.live, window.is_window_active()));
         cx.on_release(|app, _| app.live.stop(Stop::Hidden)).detach();
+        cx.on_app_quit(|app, _| {
+            app.live.close();
+            app.monitor.request_exit();
+            async {}
+        })
+        .detach();
         cx.observe_window_activation(window, |app, window, cx| {
             app.live.set_active(window.is_window_active());
             cx.notify();
@@ -500,6 +524,9 @@ impl TuneApp {
         // 確認欄が出た・消えたときの描き直しは、live_dirty の旗（cx.notify だけ）で知らせる
         let gate_dirty = handles.dirty.clone();
         let mut app = Self {
+            monitor: handles.monitor,
+            monitor_command_tail: None,
+            monitor_records: Arc::new(Mutex::new(None)),
             brand: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, include_bytes!("../../../build/mark.png").to_vec())),
             icons: Page::ALL
                 .into_iter()
@@ -524,6 +551,7 @@ impl TuneApp {
             panel: None,
             dashboard: None,
             dashboard_minutes: 60,
+            dashboard_details: false,
             dashboard_clock: Instant::now(),
             query: String::new(),
             log_level: LogLevel::All,
@@ -583,11 +611,12 @@ impl TuneApp {
                                 app.loading = false;
                                 if response.config_error.is_some() {
                                     app.live.stop(Stop::Excluded);
+                                } else if let Some(ledger) = response.ledger {
+                                    app.live.accept_nodes(&ledger);
                                 }
                                 app.notice = response.config_error;
                                 match response.nodes {
                                     Ok(nodes) => {
-                                        app.live.accept_nodes(&nodes);
                                         app.nodes = nodes;
                                     }
                                     Err(error) => app.notice = Some(error),
@@ -686,6 +715,9 @@ impl TuneApp {
     }
 
     fn refresh_live(&self, (generation, id): (u64, String)) {
+        if !self.monitor.ensure_ticker() {
+            return;
+        }
         let engine = self.engine.clone();
         let control = self.live.clone();
         self.rt.spawn(async move {
@@ -772,23 +804,12 @@ impl TuneApp {
     }
 
     fn collect(&mut self, kind: Kind, cx: &mut Context<Self>) {
-        if self.probing {
+        if self.probing || self.collection.running.is_some() {
             return;
         }
-        let Some(sender) = self.collection.begin(kind) else {
-            return;
-        };
-        let engine = self.engine.clone();
-        let progress = self.collection.progress.clone();
-        let handle = self.rt.handle().clone();
-        self.rt.spawn(async move {
-            // Engine entry points also do synchronous ledger/SQLite work. Keep
-            // the entire invocation off GPUI, including the immediate reread.
-            let result = tokio::task::spawn_blocking(move || handle.block_on(collection::run(engine, kind, None, progress)))
-                .await
-                .unwrap_or_else(|_| collection::Receipt::error(kind, "収集タスクが停止しました"));
-            let _ = sender.send(result);
-        });
+        if let Err(error) = self.monitor.start_manual(&mut self.collection, kind) {
+            self.collection.result = Some(collection::Receipt::error(kind, &error));
+        }
         cx.notify();
     }
 
@@ -1220,6 +1241,45 @@ impl TuneApp {
             .child(trends)
             .child(body)
     }
+    fn monitor_command(&mut self, command: &'static str, patch: Option<serde_json::Value>) {
+        let (host, engine, result, records, dirty) =
+            (self.monitor.clone(), self.engine.clone(), self.action_result.clone(), self.monitor_records.clone(), self.live_dirty.clone());
+        // Chain this UI's submissions before moving blocking settings IO off
+        // the main thread. A fast Start→Pause keeps click order on Tokio too.
+        let previous = self.monitor_command_tail.take();
+        self.monitor_command_tail = Some(self.rt.spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let _ = tokio::task::spawn_blocking(move || {
+                let outcome = match command {
+                    "start" => host.start_monitor(),
+                    "pause" => host.pause_monitor(),
+                    "pull" => host.request_pull(),
+                    "save" => host.save_monitor_settings(patch.unwrap_or_default()),
+                    "scan-start" => host.start_schedule(),
+                    "scan-stop" => host.stop_schedule(),
+                    "scan-save" => host.save_schedule_settings(patch.unwrap_or_default()),
+                    "records" => {
+                        *records.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(engine.monitor_events(&tune_core::monitor_journal::Filter {
+                            limit: Some(50),
+                            before_id: patch.as_ref().and_then(|p| p["before_id"].as_i64()),
+                            ..Default::default()
+                        }));
+                        Ok(())
+                    }
+                    _ => unreachable!(),
+                };
+                *result.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(match outcome {
+                    Ok(()) => "操作を受け付けました。状態欄で完了を確認できます".into(),
+                    Err(error) => error,
+                });
+                dirty.store(true, Ordering::Release);
+            })
+            .await;
+        }));
+    }
+
     /// 機体のライブ値（CPU・メモリ）の枠。詳細画面とリソース画面で共有する。
     fn live_panel(&self, id: &str) -> gpui::Div {
         let l = {
@@ -1297,7 +1357,7 @@ impl TuneApp {
             let on = self.live.on(&id);
             chips = chips.child(
                 div()
-                    .id(("resources-live", chips_key(&id)))
+                    .id(gpui::SharedString::from(format!("resources-live:{id}")))
                     .px_3()
                     .py_1p5()
                     .rounded_md()
@@ -1365,14 +1425,233 @@ impl TuneApp {
                 .child("再読込")
                 .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.reload(cx))),
         );
-        let mut body = div().flex_1().min_h_0().flex().flex_col().child(toolbar);
+        for (command, label) in [("start", "監視開始"), ("pause", "監視停止"), ("scan-start", "自動スキャン開始"), ("scan-stop", "スキャン停止")]
+        {
+            toolbar = toolbar.child(
+                div()
+                    .id(command)
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(palette::card())
+                    .text_sm()
+                    .cursor_pointer()
+                    .child(label)
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, _| app.monitor_command(command, None))),
+            );
+        }
+        toolbar = toolbar.child(
+            div()
+                .id("dashboard-details")
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(palette::card())
+                .text_sm()
+                .cursor_pointer()
+                .child(if self.dashboard_details { "詳細を閉じる" } else { "詳細" })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|app, _, _, cx| {
+                        app.dashboard_details = !app.dashboard_details;
+                        cx.notify();
+                    }),
+                ),
+        );
+        let observed = self.monitor.snapshot();
+        let active = self.live.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).active;
+        let (scan_enabled, scan) = self.monitor.schedule_snapshot();
+        use crate::monitor_host::SchedulePhase;
+        use tune_core::monitor::{RunMode, RunPhase};
+        let phase = match observed.status.phase {
+            RunPhase::Starting => "開始待ち",
+            RunPhase::Running => "監視中",
+            RunPhase::Paused => "停止中",
+            RunPhase::Stopping => "停止待ち",
+            RunPhase::Failed => "失敗",
+            RunPhase::Exited => "終了",
+        };
+        let scan_phase = match scan.phase {
+            SchedulePhase::Idle => "停止中",
+            SchedulePhase::Waiting => "次回待ち",
+            SchedulePhase::Running => "実行中",
+            SchedulePhase::ManualBusy => "手動収集のため見送り",
+            SchedulePhase::Stopping => "完了後に停止",
+            SchedulePhase::Failed => "失敗",
+            SchedulePhase::Exited => "終了",
+        };
+        let status = div().px_5().py_1().text_xs().child(format!(
+            "監視 {phase} · 観測中 {}台 ｜ 自動スキャン {scan_phase}{}",
+            observed.streams,
+            scan.error.as_ref().map(|e| format!(" · {e}")).unwrap_or_default()
+        ));
+        let mut details = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().px_5().text_xs().child(format!(
+                "監視の開始許可 {} · 処理 {} · 採取方針 {} · ローカル採取 {} · 最新サンプル {}（最大200台で確認） · ウィンドウ表示 未観測 / 操作中 {}",
+                match observed.mode {
+                    RunMode::Run => "あり",
+                    RunMode::Paused => "なし",
+                    RunMode::Exit => "終了",
+                },
+                if observed.started { "開始済" } else { "未開始" },
+                match observed.status.policy {
+                    Some(tune_core::monitor_journal::Policy::Local) => "この操作卓で採取",
+                    Some(tune_core::monitor_journal::Policy::Hub) => "ハブから取得",
+                    Some(tune_core::monitor_journal::Policy::Disabled) => "無効",
+                    Some(tune_core::monitor_journal::Policy::StreamBackoff) => "再接続待ち",
+                    Some(tune_core::monitor_journal::Policy::PlannedRecycle) => "定期再接続",
+                    Some(tune_core::monitor_journal::Policy::MonitorDisconnected) => "切断",
+                    Some(tune_core::monitor_journal::Policy::SettingsUnknown) | None => "未確認",
+                },
+                observed.status.local_collecting.map(|b| if b { "はい" } else { "いいえ" }).unwrap_or("未観測"),
+                observed.latest_sample.map_or_else(|| "未確認".into(), |t| crate::panels::time(&serde_json::json!(t))),
+                if active { "はい" } else { "いいえ" }
+            )))
+            .child(div().px_5().text_xs().child(format!(
+                "自動スキャンの開始許可 {} · 完了 {}回 · 最終完了 {}",
+                if scan_enabled { "あり" } else { "なし" },
+                scan.cycles,
+                scan.last_completed.map_or_else(|| "未実行".into(), |t| crate::panels::time(&serde_json::json!(t)))
+            )));
+        let mut tools = div().px_5().flex().flex_wrap().gap_2();
+        for (command, label) in [("pull", "ハブ取得"), ("records", "記録50件")] {
+            tools = tools.child(
+                div()
+                    .id(command)
+                    .px_3()
+                    .py_2()
+                    .bg(palette::card())
+                    .text_xs()
+                    .cursor_pointer()
+                    .child(label)
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, _| app.monitor_command(command, None))),
+            );
+        }
+        let before_id = self
+            .monitor_records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|v| v["next_before_id"].as_i64());
+        if let Some(before_id) = before_id {
+            tools =
+                tools.child(div().id("monitor-older-records").px_3().py_2().bg(palette::card()).text_sm().cursor_pointer().child("前の50件").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |app, _, _, _| app.monitor_command("records", Some(serde_json::json!({"before_id":before_id})))),
+                ));
+        }
+        details = details.child(tools);
+        let mut settings = div().id("monitor-settings").px_5().py_2().flex().flex_wrap().gap_2();
+        if let Some(Ok(view)) = &self.dashboard {
+            let enabled = view.saved["monitor"]["enabled"].as_bool().unwrap_or(false);
+            settings = settings.child(
+                div()
+                    .id("monitor-enabled")
+                    .px_3()
+                    .py_2()
+                    .bg(palette::card())
+                    .text_xs()
+                    .cursor_pointer()
+                    .child(if enabled { "監視設定を無効にして保存" } else { "監視設定を有効にして保存" })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |app, _, _, _| app.monitor_command("save", Some(serde_json::json!({"enabled":!enabled})))),
+                    ),
+            );
+            let scan_saved = view.saved["schedule"]["enabled"].as_bool();
+            if let Some(enabled) = scan_saved {
+                settings = settings.child(
+                    div()
+                        .id("schedule-enabled")
+                        .px_3()
+                        .py_2()
+                        .bg(palette::card())
+                        .text_xs()
+                        .cursor_pointer()
+                        .child(if enabled { "自動スキャン設定を無効にして保存" } else { "自動スキャン設定を有効にして保存" })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |app, _, _, _| app.monitor_command("scan-save", Some(serde_json::json!({"enabled":!enabled})))),
+                        ),
+                );
+            }
+            for (key, label, choices) in [
+                ("probe_minutes", "分析（分）", [15, 60, 240]),
+                ("logs_minutes", "ログ（分）", [15, 60, 240]),
+                ("inventory_hours", "道具（時間）", [6, 24, 168]),
+                ("ai_minutes", "AI（分）", [15, 30, 60]),
+            ] {
+                let mut row = div().flex().flex_wrap().gap_2().child(div().text_xs().child(format!("{label} · 保存 {}", view.saved["schedule"][key])));
+                for value in choices {
+                    row = row.child(
+                        div().id((key, value as usize)).px_2().bg(palette::card()).text_xs().cursor_pointer().child(format!("{value}に保存")).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |app, _, _, _| app.monitor_command("scan-save", Some(serde_json::json!({key:value})))),
+                        ),
+                    );
+                }
+                settings = settings.child(row);
+            }
+            let hubs = std::iter::once(None).chain(
+                self.engine.config().nodes.into_iter().filter(|n| n.is_active() && !n.local && (n.is_mac() || n.is_windows())).take(200).map(|n| Some(n.id)),
+            );
+            for (i, hub) in hubs.enumerate() {
+                let label = hub.as_ref().map_or_else(|| "ハブなしを保存".into(), |id| format!("ハブ {id} を保存"));
+                settings =
+                    settings.child(
+                        div().id(("monitor-hub", i)).px_3().py_2().bg(palette::card()).text_xs().cursor_pointer().child(label).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |app, _, _, _| app.monitor_command("save", Some(serde_json::json!({"hub":hub})))),
+                        ),
+                    );
+            }
+        }
+        details = details
+            .child(settings)
+            .child(div().px_5().text_xs().text_color(palette::muted()).child("保存だけでは開始しません。停止は実行中の処理の完了を待ちます。"));
+        if let Some(Ok(view)) = &self.dashboard {
+            details = details.child(dashboard::render_details(view));
+        }
+        let mut body = div().flex_1().min_h_0().flex().flex_col().child(toolbar).child(status);
+        if let Some(records) = &*self.monitor_records.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+            let text = match records {
+                Err(error) => error.clone(),
+                Ok(value) => {
+                    let rows = value["events"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .take(50)
+                        .map(|e| {
+                            format!("{} {} commit={} category={}", crate::panels::time(&e["ts"]), e["kind"], e["data"]["committed"], e["data"]["category"])
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    format!(
+                        "明示照会のみ · health {} · 未確認ACKは成功を意味しません · {}",
+                        value["health"],
+                        if rows.is_empty() { "記録なし".into() } else { rows }
+                    )
+                }
+            };
+            details = details.child(div().id("monitor-records").max_h(px(100.)).overflow_y_scroll().px_5().text_xs().child(text));
+        }
         if self.loading {
             body = body.child(div().px_5().text_xs().text_color(palette::muted()).child("保存集計を読込中…"));
         }
         match &self.dashboard {
-            Some(Ok(view)) => {
-                body.child(div().id("dashboard-saved").flex_1().overflow_y_scroll().child(dashboard::render_dashboard(view, &self.live.live, now_ms())))
-            }
+            Some(Ok(view)) => body.child(
+                div().id("dashboard-saved").flex_1().overflow_y_scroll().when(self.dashboard_details, |d| d.child(details)).child(dashboard::render_dashboard(
+                    view,
+                    &self.live.live,
+                    now_ms(),
+                    self.dashboard_details,
+                )),
+            ),
             Some(Err(error)) => body.child(div().p_5().text_sm().text_color(palette::crit()).child(format!("保存Dashboardの読み込みに失敗: {error}"))),
             None => body.child(div().p_5().text_sm().text_color(palette::muted()).child("保存Dashboardを読み込んでいます…")),
         }
@@ -1752,7 +2031,11 @@ impl Render for TuneApp {
         div()
             .key_context("Browser")
             .track_focus(&self.focus)
-            .on_action(|_: &Quit, _, cx| cx.quit())
+            .on_action(cx.listener(|app, _: &Quit, _, cx| {
+                app.live.close();
+                app.monitor.request_exit();
+                cx.quit();
+            }))
             .on_action(|_: &CloseWindow, window, _| window.remove_window())
             .on_action(cx.listener(|app, _: &GoOverview, window, cx| {
                 app.focus.focus(window);
@@ -1842,8 +2125,26 @@ fn open_route(target: &str, ledger: &[nodes::Node]) -> Result<Route, String> {
     Err(format!("--open の表示または機体が見つかりません: {target}"))
 }
 
+/// GPUI's native termination (notably NSApplication::terminate:) need not
+/// return from Application::run. Drain in the synchronous quit observer, before
+/// GPUI applies its 100ms allowance to returned futures. Workers use Tokio,
+/// atomic dirty flags and channels; none waits for GPUI or a confirmation UI.
+fn finish_shutdown(rt: &tokio::runtime::Runtime, host: &crate::monitor_host::MonitorHost, failed: &AtomicBool) -> crate::monitor_host::ShutdownReport {
+    let report = rt.block_on(host.shutdown());
+    if !report.confirmed() {
+        eprintln!("katala-tune-gpui: 終了または収集記録の保存ACKを確認できませんでした: {report:?}");
+        failed.store(true, Ordering::Release);
+    }
+    // Native termination can bypass the outer exit-status check as well.
+    if failed.load(Ordering::Acquire) {
+        std::process::exit(1);
+    }
+    report
+}
+
 pub fn run(options: startup::Options) {
-    let startup::Options { config, data, selftest, open, live_id, logs, confirm_demo, review: review_path } = options;
+    let startup::Options { config, data, selftest, open, live_id, logs, confirm_demo, review: review_path, shutdown_check } = options;
+    let shutdown_gate = data.join("shutdown-check");
     if (selftest || config.exists())
         && let Err(error) = nodes::load_config(&config)
     {
@@ -1879,22 +2180,26 @@ pub fn run(options: startup::Options) {
     let live_dirty = Arc::new(AtomicBool::new(false));
     let live = {
         let (store, flag) = (live_store.clone(), live_dirty.clone());
-        let live = Live::new(
+        Live::new(
             Arc::new(ProcessRoute),
             tune_core::monitor::live_opts(engine.config().nodes.len()),
             Box::new(move |event| {
                 store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).merge(&event);
                 flag.store(true, Ordering::Release);
             }),
-        );
-        rt.spawn(live.clone().run_ticker());
-        live
+        )
     };
-    let handles = LiveHandles { live: live.clone(), store: live_store, dirty: live_dirty };
+    let monitor = Arc::new(crate::monitor_host::MonitorHost::new(engine.clone(), live.clone(), rt.handle().clone(), dirty.clone()));
+    let monitor_exit = monitor.clone();
+    let handles = LiveHandles { monitor, live: live.clone(), store: live_store, dirty: live_dirty };
     let rt_exit = rt.clone();
     let failed = Arc::new(AtomicBool::new(false));
     let failed_exit = failed.clone();
 
+    let quit_host = monitor_exit.clone();
+    let quit_rt = rt_exit.clone();
+    let quit_failed = failed_exit.clone();
+    let shutdown_diagnostic = shutdown_check.is_some();
     Application::new().run(move |cx: &mut App| {
         input::bind_keys(cx);
         cx.bind_keys([
@@ -1933,8 +2238,22 @@ pub fn run(options: startup::Options) {
                 move |window, cx| cx.new(|cx| TuneApp::new(engine, rt, dirty, handles, window, cx)),
             )
             .expect("window");
-        cx.on_window_closed(|cx| {
+        let host = quit_host.clone();
+        cx.on_app_quit(move |cx| {
+            // Close the UI admission gate before blocking, independently of
+            // entity observer order. Last-window release already invalidates
+            // pending UI intent when the handle can no longer be updated.
+            window.update(cx, |app, _, _| app.live.close()).ok();
+            let report = finish_shutdown(&quit_rt, &host, &quit_failed);
+            if shutdown_diagnostic {
+                println!("selftest shutdown: {report:?}");
+            }
+            async {}
+        })
+        .detach();
+        cx.on_window_closed(move |cx| {
             if cx.windows().is_empty() {
+                quit_host.request_exit();
                 cx.quit();
             }
         })
@@ -1956,7 +2275,45 @@ pub fn run(options: startup::Options) {
                 })
                 .ok();
         }
-        if selftest {
+        if let Some(mode) = shutdown_check {
+            // Explicit synthetic desktop diagnostic only. The parent fixture
+            // injects fake SSH and controls readiness/release outside GPUI.
+            cx.spawn(async move |cx| {
+                let result: Result<(), String> = async {
+                    window
+                        .update(cx, |app, _, cx| {
+                            {
+                                let _runtime = app.rt.enter();
+                                app.engine.start_monitor_journal();
+                            }
+                            app.collect(Kind::Probe, cx);
+                        })
+                        .map_err(|e| e.to_string())?;
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    while !shutdown_gate.join("child-ready").exists() {
+                        if Instant::now() >= deadline {
+                            return Err("shutdown fixture child was not ready".into());
+                        }
+                        cx.background_executor().timer(Duration::from_millis(25)).await;
+                    }
+                    std::fs::write(shutdown_gate.join("closing"), mode.as_bytes()).map_err(|e| e.to_string())?;
+                    match mode.as_str() {
+                        "close" => window.update(cx, |_, window, _| window.remove_window()).map_err(|e| e.to_string())?,
+                        "quit" => window.update(cx, |_, window, cx| window.dispatch_action(Box::new(Quit), cx)).map_err(|e| e.to_string())?,
+                        "native-quit" => cx.update(|cx| cx.quit()).map_err(|e| e.to_string())?,
+                        _ => unreachable!(),
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = result {
+                    failed.store(true, Ordering::Release);
+                    eprintln!("selftest shutdown: {error}");
+                    cx.update(|cx| cx.quit()).ok();
+                }
+            })
+            .detach();
+        } else if selftest {
             cx.spawn(async move |cx| {
                 let result: Result<(), String> = async {
                     let mut count = 0;
@@ -1966,7 +2323,12 @@ pub fn run(options: startup::Options) {
                     // All saved-data routes run before any explicit live diagnostic.
                     for (visit, page) in Page::ALL.into_iter().flat_map(|p| [p, p]).enumerate() {
                         window
-                            .update(cx, |app, _, cx| if visit % 2 == 0 { app.navigate(page, None, cx) } else { app.reload(cx) })
+                            .update(cx, |app, _, cx| {
+                                if page == Page::Dashboard {
+                                    app.dashboard_details = visit % 2 != 0;
+                                }
+                                if visit % 2 == 0 { app.navigate(page, None, cx) } else { app.reload(cx) }
+                            })
                             .map_err(|_| "selftest window closed".to_string())?;
                         let mut loaded = false;
                         for _ in 0..100 {
@@ -1977,6 +2339,8 @@ pub fn run(options: startup::Options) {
                                         || app.collection.result.is_some()
                                         || !app.live.live.active().is_empty()
                                         || app.engine.monitor_journal_health()["running"] == true
+                                        || app.monitor.schedule_snapshot().0
+                                        || app.monitor.schedule_snapshot().1.cycles != 0
                                     {
                                         return Some((app.nodes.len(), Some("保存画面の描画が収集を開始しました".into())));
                                     }
@@ -2093,10 +2457,9 @@ pub fn run(options: startup::Options) {
             .detach();
         }
     });
-    rt_exit.block_on(live.shutdown(Duration::from_secs(3)));
-    if failed_exit.load(Ordering::Acquire) {
-        std::process::exit(1);
-    }
+    // Some platforms return from run; the same idempotent report also protects
+    // that fallback path. macOS normally terminates inside the native callback.
+    finish_shutdown(&rt_exit, &monitor_exit, &failed_exit);
 }
 
 #[cfg(test)]
@@ -2124,6 +2487,206 @@ mod tests {
 
     fn node(id: &str) -> nodes::Node {
         nodes::Node::from_value(&json!({"id":id,"os":"macos"}), "synthetic-host")
+    }
+
+    /// Synthetic transport only; Live parses samples and owns all lifecycle state.
+    #[derive(Default)]
+    struct SteadyRoute(AtomicUsize);
+    impl LiveRoute for SteadyRoute {
+        fn open(&self, _: &nodes::Node, _: &Opts) -> Result<Source, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let (lines, receive) = tokio::sync::mpsc::channel(4);
+            let (stop, mut stopped) = tokio::sync::oneshot::channel();
+            let (done, finished) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_millis(10));
+                loop {
+                    tokio::select! {
+                        _ = &mut stopped => break,
+                        _ = interval.tick() => {
+                            if lines.send(r#"{"type":"s","cpu":5}"#.into()).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = done.send(tune_core::live::Ended::default());
+            });
+            Ok(Source::new(receive, stop, finished))
+        }
+    }
+
+    fn shared_controller() -> (LiveControl, Arc<SteadyRoute>) {
+        let route = Arc::new(SteadyRoute::default());
+        let live = Live::new(route.clone(), Opts::default(), Box::new(|_| {}));
+        (LiveControl::new(live, true), route)
+    }
+
+    async fn samples_after(live: &Live, before: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while live.samples("a").len() <= before {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the existing shared sampler must continue delivering samples");
+    }
+
+    #[tokio::test]
+    async fn quit_rejects_pending_live_completion_and_reactivation() {
+        let (control, route) = controller();
+        let (generation, id) = control.request("a").unwrap();
+        control.close();
+        control.set_active(true);
+        control.complete(generation, &id, &[node("a")], None);
+        assert!(control.request("a").is_none());
+        assert!(control.live.active().is_empty());
+        assert_eq!(route.0.load(Ordering::SeqCst), 0);
+        control.live.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn live_ui_stop_navigation_inactivity_and_release_preserve_monitor_samples() {
+        for action in ["manual", "navigation", "inactive", "release", "pending_hidden"] {
+            let (control, route) = shared_controller();
+            control.live.start_owned(Owner::Monitor, &[node("a")], &[]);
+            let (generation, id) = control.request("a").unwrap();
+            if action != "pending_hidden" {
+                control.complete(generation, &id, &[node("a")], None);
+            }
+            samples_after(&control.live, 0).await;
+            match action {
+                "manual" | "navigation" => control.stop(Stop::User),
+                "inactive" | "pending_hidden" => control.set_active(false),
+                "release" => control.stop(Stop::Hidden),
+                _ => unreachable!(),
+            }
+            let active = control.live.active();
+            if active == ["a"] {
+                samples_after(&control.live, control.live.samples("a").len()).await;
+            }
+            let monitor_renewed = control.live.heartbeat_owned(Owner::Monitor, "a");
+            let released = control.live.release_owned(Owner::Monitor, &["a".into()], Stop::User);
+            control.live.shutdown(Duration::from_secs(1)).await;
+            assert!(!control.on("a"));
+            assert_eq!(active, ["a"], "{action} may release only UI intent");
+            assert!(monitor_renewed, "{action} must preserve the monitor claim");
+            assert_eq!(released["stopped"], json!(["a"]));
+            assert_eq!(route.0.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn live_accepted_reader_removal_stops_both_owners_before_navigation() {
+        let dir = std::env::temp_dir().join(format!("tune-owner-removal-{}-{}", std::process::id(), tune_core::db::now_ms()));
+        std::fs::create_dir(&dir).unwrap();
+        let config = dir.join("nodes.json");
+        std::fs::write(&config, json!({"nodes":[{"id":"a","os":"macos"},{"id":"b","os":"macos"}]}).to_string()).unwrap();
+        let engine = Engine::open(config.clone(), dir.join("data"), Arc::new(tune_core::engine::NoHost)).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let reader = Reader::new(engine.clone(), &rt);
+        rt.block_on(async {
+            let (control, route) = shared_controller();
+            let (generation, id) = control.request("a").unwrap();
+            control.complete(generation, &id, &[node("a"), node("b")], None);
+            control.live.start_owned(Owner::Monitor, &[node("a"), node("b")], &[]);
+            samples_after(&control.live, 0).await;
+            std::fs::write(&config, json!({"nodes":[{"id":"b","os":"macos"}]}).to_string()).unwrap();
+            reader.request(Request { generation: 1, route: Route::Node("a".into()), query: "a".into(), log_level: LogLevel::All, minutes: 60 }).unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(response) = reader.take() {
+                        break response;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(response.generation, 1);
+            assert!(response.config_error.is_none());
+            let views = response.nodes.unwrap();
+            assert_eq!(views.iter().map(|node| node.id.as_str()).collect::<Vec<_>>(), ["b"]);
+            control.accept_nodes(&response.ledger.unwrap());
+            control.stop(Stop::User); // The selected removed route navigates away.
+            let active = control.live.active();
+            let ui_renewed = control.live.heartbeat_owned(Owner::Ui, "a");
+            let monitor_renewed = control.live.heartbeat_owned(Owner::Monitor, "a");
+            let retained = control.live.heartbeat_owned(Owner::Monitor, "b");
+            if active == ["b"] {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while control.live.brief("a").unwrap()["state"] != "stopped" {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            let stopped = control.live.brief("a").unwrap()["state"] == "stopped";
+            control.live.shutdown(Duration::from_secs(1)).await;
+            assert_eq!(active, ["b"], "accepted full-ledger removal is an administrative stop before UI navigation");
+            assert!(!ui_renewed && !monitor_renewed, "neither owner may renew a removed node");
+            assert!(stopped, "the removed sampler must finish");
+            assert!(retained, "the complete Reader ledger preserves the remaining monitor stream");
+            assert_eq!(route.0.load(Ordering::SeqCst), 2);
+        });
+        drop(reader);
+        drop(rt);
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_accepted_exclusion_stops_monitor_owned_nodes_without_ui_intent() {
+        let (control, _) = shared_controller();
+        control.live.start_owned(Owner::Monitor, &[node("a")], &[]);
+        let ledger = [nodes::Node::from_value(&json!({"id":"a","status":"paused"}), "synthetic-host")];
+        control.accept_nodes(&ledger);
+        let active = control.live.active();
+        let renewed = control.live.heartbeat_owned(Owner::Monitor, "a");
+        control.live.shutdown(Duration::from_secs(1)).await;
+        assert!(active.is_empty(), "accepted exclusion is administrative, regardless of UI intent");
+        assert!(!renewed);
+    }
+
+    #[tokio::test]
+    async fn live_current_ledger_read_failure_stops_both_owners() {
+        for from_reader in [false, true] {
+            let (control, _) = shared_controller();
+            let (generation, id) = control.request("a").unwrap();
+            control.complete(generation, &id, &[node("a")], None);
+            control.live.start_owned(Owner::Monitor, &[node("a")], &[]);
+            if from_reader {
+                control.stop(Stop::Excluded);
+            } else {
+                control.complete(generation, &id, &[], Some("invalid synthetic ledger".into()));
+            }
+            assert!(control.live.active().is_empty());
+            assert!(!control.on("a"));
+            assert!(!control.live.heartbeat_owned(Owner::Monitor, "a"));
+            control.live.shutdown(Duration::from_secs(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn live_monitor_release_preserves_the_ui_claim_and_samples() {
+        let (control, route) = shared_controller();
+        let (generation, id) = control.request("a").unwrap();
+        control.complete(generation, &id, &[node("a")], None);
+        control.live.start_owned(Owner::Monitor, &[node("a")], &[]);
+        samples_after(&control.live, 0).await;
+        let stopped = control.live.release_owned(Owner::Monitor, &["a".into()], Stop::User);
+        let active = control.live.active();
+        if active == ["a"] {
+            samples_after(&control.live, control.live.samples("a").len()).await;
+        }
+        let renewed = control.live.heartbeat_owned(Owner::Ui, "a");
+        control.stop(Stop::User);
+        control.live.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(stopped["stopped"], json!([]));
+        assert_eq!(active, ["a"]);
+        assert!(renewed);
+        assert_eq!(route.0.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -2229,8 +2792,8 @@ mod tests {
             let (generation, id) = control.request("a").unwrap();
             control.complete(generation, &id, &[node("a")], None);
             assert_eq!(control.live.active(), ["a"]);
-            let views = model::build(&[json!({"id":"a","status":status})], &[]);
-            control.accept_nodes(&views);
+            let ledger = [nodes::Node::from_value(&json!({"id":"a","status":status}), "synthetic-host")];
+            control.accept_nodes(&ledger);
             assert!(!control.on("a"), "accepted {status} ledger must clear intent immediately");
             assert!(control.live.active().is_empty());
             // In-flight renewal for the old online ledger cannot revive it.
@@ -2245,8 +2808,8 @@ mod tests {
         let (control, _) = controller();
         let (generation, id) = control.request("a").unwrap();
         control.complete(generation, &id, &[node("a")], None);
-        let views = model::build(&[json!({"id":"a"}), json!({"id":"b","status":"paused"})], &[]);
-        control.accept_nodes(&views);
+        let ledger = [node("a"), nodes::Node::from_value(&json!({"id":"b","status":"paused"}), "synthetic-host")];
+        control.accept_nodes(&ledger);
         assert!(control.on("a"));
         assert_eq!(control.live.active(), ["a"]);
         control.live.shutdown(Duration::from_secs(1)).await;

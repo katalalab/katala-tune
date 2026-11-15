@@ -24,6 +24,9 @@ pub struct Request {
 }
 pub struct Response {
     pub generation: u64,
+    /// Complete validated ledger for administrative Live retention; never a
+    /// search/page projection. None means the reader could not load a ledger.
+    pub ledger: Option<Vec<nodes::Node>>,
     pub nodes: Result<Vec<NodeView>, String>,
     pub panel: Option<Result<Panel, String>>,
     pub dashboard: Option<Result<DashboardView, String>>,
@@ -51,6 +54,7 @@ impl Reader {
                     if let Some(error) = engine.config_error() {
                         return Response {
                             generation,
+                            ledger: None,
                             nodes: Err(error.clone()),
                             panel: (!dashboard_requested).then(|| Err(error.clone())),
                             dashboard: dashboard_requested.then(|| Err(error.clone())),
@@ -75,11 +79,12 @@ impl Reader {
                         }
                         _ => None,
                     };
-                    Response { generation, nodes, panel, dashboard, config_error: engine.config_error() }
+                    Response { generation, ledger: Some(cfg.nodes), nodes, panel, dashboard, config_error: engine.config_error() }
                 })
                 .await
                 .unwrap_or_else(|_| Response {
                     generation,
+                    ledger: None,
                     nodes: Err("保存データの読み込みタスクが停止しました".into()),
                     panel: None,
                     dashboard: dashboard_requested.then(|| Err("保存データの読み込みタスクが停止しました".into())),
@@ -171,7 +176,7 @@ mod tests {
             if page == Page::Dashboard {
                 let view = response.dashboard.expect("Dashboard needs a dedicated Reader result").unwrap();
                 assert!(response.panel.is_none());
-                let _rendered = crate::dashboard::render_dashboard(&view, &live, now);
+                let _rendered = crate::dashboard::render_dashboard(&view, &live, now, false);
                 assert_eq!(view.saved["minutes"], 360);
                 assert_eq!(view.nodes[0].saved["latest"]["src"], "example-hub");
             } else if page != Page::Overview {
@@ -207,6 +212,7 @@ mod tests {
         };
         assert_eq!(rejected.generation, rejected_generation);
         assert!(rejected.config_error.is_some());
+        assert!(rejected.ledger.is_none(), "an invalid ledger is not an accepted empty ledger");
         assert!(rejected.dashboard.unwrap().is_err());
         assert!(rejected.panel.is_none(), "Dashboard errors belong to the dedicated result");
         drop(reader);

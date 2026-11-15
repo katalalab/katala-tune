@@ -53,6 +53,8 @@ pub const DEFAULT_PROBE_MINUTES: i64 = 60;
 /// 詳細なログは 1 時間ごと（数字は常時監視で毎分、分析も 1 時間ごと）
 pub const DEFAULT_LOGS_MINUTES: i64 = 60;
 pub const DEFAULT_INVENTORY_HOURS: i64 = 24;
+const SCHEDULE_INTERVALS: [(&str, f64, f64); 4] =
+    [("probe_minutes", 5., 1440.), ("logs_minutes", 5., 1440.), ("inventory_hours", 1., 168.), ("ai_minutes", 5., 1440.)];
 
 pub struct Engine {
     host: Arc<dyn Host>,
@@ -216,20 +218,40 @@ impl Engine {
 
     /// 自動スキャンの設定（既定 → 台帳の schedule → 画面で変えた値 の順に上書き）
     pub fn schedule(&self) -> Value {
-        let mut m = Map::new();
-        m.insert("enabled".into(), Value::Bool(true));
-        m.insert("probe_minutes".into(), Value::from(DEFAULT_PROBE_MINUTES));
-        m.insert("logs_minutes".into(), Value::from(DEFAULT_LOGS_MINUTES));
-        // 道具の棚卸しの間隔（main.js と同じ既定）と、AI エージェントのセッションの取り込みの間隔（engine_tools.rs）
-        m.insert("inventory_hours".into(), Value::from(DEFAULT_INVENTORY_HOURS));
-        m.insert("ai_minutes".into(), Value::from(crate::ai_sessions::DEFAULT_AI_MINUTES));
-        if let Some(Value::Object(c)) = self.config().schedule {
-            m.extend(c);
+        self.schedule_values(self.config().schedule, self.with_db(|d| d.get_meta("schedule")).ok().flatten())
+    }
+
+    /// Native scheduler boundary: never replace failed current inputs with defaults.
+    pub fn checked_schedule(&self) -> Result<Value, String> {
+        let cfg = self.reload_config();
+        if let Some(error) = self.config_error() {
+            return Err(error);
         }
-        if let Ok(Some(Value::Object(s))) = self.with_db(|d| d.get_meta("schedule")) {
-            m.extend(s);
+        let saved = self.with_db(|d| d.get_meta_checked("schedule"))?;
+        for value in [cfg.schedule.as_ref(), saved.as_ref()].into_iter().flatten() {
+            if !value.is_object()
+                || value.get("enabled").is_some_and(|v| !v.is_boolean())
+                || SCHEDULE_INTERVALS
+                    .iter()
+                    .any(|(key, lo, hi)| value.get(*key).is_some_and(|v| !v.as_f64().is_some_and(|n| n.fract() == 0. && (*lo..=*hi).contains(&n))))
+            {
+                return Err("自動スキャン設定を読み出せません".into());
+            }
         }
-        Value::Object(m)
+        // Compose with the same defaults and precedence as the legacy accessor.
+        Ok(self.schedule_values(cfg.schedule, saved))
+    }
+
+    fn schedule_values(&self, config: Option<Value>, saved: Option<Value>) -> Value {
+        let mut value = json!({"enabled":true,"probe_minutes":DEFAULT_PROBE_MINUTES,
+            "logs_minutes":DEFAULT_LOGS_MINUTES,"inventory_hours":DEFAULT_INVENTORY_HOURS,
+            "ai_minutes":crate::ai_sessions::DEFAULT_AI_MINUTES});
+        for source in [config, saved].into_iter().flatten() {
+            if let Value::Object(fields) = source {
+                value.as_object_mut().unwrap().extend(fields);
+            }
+        }
+        value
     }
 
     /// snapshot に所見（probe 由来＋ログ由来）と前回比を付ける（main.js の enrich）
@@ -423,7 +445,7 @@ impl Engine {
         if let Some(Value::Bool(b)) = patch.get("enabled") {
             s.insert("enabled".into(), Value::Bool(*b));
         }
-        for (k, lo, hi) in [("probe_minutes", 5.0, 1440.0), ("logs_minutes", 5.0, 1440.0), ("inventory_hours", 1.0, 168.0), ("ai_minutes", 5.0, 1440.0)] {
+        for (k, lo, hi) in SCHEDULE_INTERVALS {
             if let Some(v) = patch.get(k).and_then(Value::as_f64).filter(|v| v.fract() == 0.0 && (lo..=hi).contains(v)) {
                 s.insert(k.into(), Value::from(v as i64));
             }
@@ -537,7 +559,16 @@ impl Engine {
 
     /// 1分ごとに呼ぶ。期限が来たものだけ動かす（スリープ明けでも溜まった分を1回で済ませる）
     pub async fn tick(self: &Arc<Self>) {
-        let s = self.schedule();
+        self.tick_schedule(self.schedule()).await;
+    }
+
+    pub async fn checked_tick(self: &Arc<Self>) -> Result<(), String> {
+        let schedule = self.checked_schedule()?;
+        self.tick_schedule(schedule).await;
+        Ok(())
+    }
+
+    async fn tick_schedule(self: &Arc<Self>, s: Value) {
         let schedule_enabled = js::truthy(s.get("enabled"));
         let topology_due = schedule_enabled
             && self.config().topology.enabled
@@ -787,6 +818,58 @@ fn rand36(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn checked_scheduler_refuses_corrupt_settings_and_current_ledger() {
+        let dir = std::env::temp_dir().join(format!("checked-schedule-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("nodes.json");
+        std::fs::write(&config, r#"{"nodes":[]}"#).unwrap();
+        let engine = Engine::open(config.clone(), dir.join("data"), Arc::new(NoHost)).unwrap();
+        engine.set_schedule(&json!({"enabled":true,"probe_minutes":5})).unwrap();
+        assert_eq!(engine.checked_schedule().unwrap()["probe_minutes"], 5);
+        engine.with_db(|d| d.set_meta("schedule", &json!({"probe_minutes":"broken"}))).unwrap();
+        assert!(engine.checked_tick().await.is_err(), "corrupt settings must not authorize a tick");
+        engine.with_db(|d| d.conn().execute("UPDATE meta SET v = 'broken-json' WHERE k = 'schedule'", [])).unwrap();
+        assert!(engine.checked_schedule().is_err(), "malformed JSON is not an absent enabled setting");
+        engine.with_db(|d| d.set_meta("schedule", &json!({"enabled":true}))).unwrap();
+        std::fs::write(&config, "broken").unwrap();
+        assert!(engine.checked_tick().await.is_err(), "current ledger failure must not reuse last-good permission");
+        std::fs::write(&config, r#"{"nodes":[]}"#).unwrap();
+        engine.with_db(|d| d.conn().execute_batch("DROP TABLE meta")).unwrap();
+        assert!(engine.checked_schedule().is_err());
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn checked_tick_reuses_busy_and_fresh_hub_guards() {
+        let dir = std::env::temp_dir().join(format!("checked-guards-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("nodes.json"), r#"{"nodes":[]}"#).unwrap();
+        let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(NoHost)).unwrap();
+        engine.probing.store(true, Ordering::SeqCst);
+        engine.checked_tick().await.unwrap();
+        assert_eq!(engine.with_db(|d| d.get_meta("lastProbeAt")).unwrap(), None);
+        engine.probing.store(false, Ordering::SeqCst);
+        engine.syncing.store(true, Ordering::SeqCst);
+        engine.checked_tick().await.unwrap();
+        assert_eq!(engine.with_db(|d| d.get_meta("lastProbeAt")).unwrap(), None);
+        engine.syncing.store(false, Ordering::SeqCst);
+        engine
+            .with_db(|d| {
+                d.set_meta("monitor", &json!({"hub":"synthetic-hub"}))?;
+                d.set_meta("hubPull", &json!({"ok":true,"snapshot_fresh":true,"at":now_ms()}))
+            })
+            .unwrap();
+        engine.checked_tick().await.unwrap();
+        assert_eq!(engine.with_db(|d| d.get_meta("lastProbeAt")).unwrap(), None);
+        engine.with_db(|d| d.set_meta("hubPull", &json!({"ok":true,"snapshot_fresh":false,"at":now_ms()}))).unwrap();
+        engine.checked_tick().await.unwrap();
+        assert!(engine.with_db(|d| d.get_meta("lastProbeAt")).unwrap().is_some());
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[tokio::test]
     async fn topology_schedule_consumes_cadence_after_partial_runs_but_not_busy_or_held_leases() {

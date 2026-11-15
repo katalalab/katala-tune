@@ -35,6 +35,7 @@ fn saved_state(db: &Store) -> Value {
         "metrics":db.metrics(None,0,i64::MAX).unwrap().iter().map(|r|r.json()).collect::<Vec<_>>(),
         "observations":db.monitor_events(&Default::default()).unwrap(),
         "monitor":db.get_meta("monitor").unwrap(),
+        "schedule":db.get_meta("schedule").unwrap(),
         "hubPull":db.get_meta("hubPull").unwrap(),
         "lastProbeAt": db.get_meta("lastProbeAt").unwrap(),
         "lastLogsAt": db.get_meta("lastLogsAt").unwrap()
@@ -87,6 +88,7 @@ fn populated_saved_routes_do_not_collect_or_recompute() {
                 v: json!({"cpu":[95,99],"mem":[93,94],"gpu_0_vram_used_mib":[1024,1200],"gpu_0_vram_total_mib":[2048,2048]}),
                 src: Some("example-hub".into()),
             }])?;
+            d.set_meta("schedule", &json!({"enabled":true}))?;
             d.set_meta("monitor", &json!({"enabled":true,"hub":"example-failed"}))?;
             d.set_meta("hubPull", &json!({"hub":"example-failed","at":now-3_600_000,"ok":false,"error":"synthetic unavailable"}))?;
             d.set_meta("probeFailure:example-failed", &json!({"at":now,"error":"synthetic unavailable"}))?;
