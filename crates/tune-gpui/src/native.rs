@@ -108,6 +108,41 @@ fn chip(text: impl Into<gpui::SharedString>, color: Hsla) -> gpui::Div {
     div().px_2().py_0p5().rounded_md().text_xs().text_color(color).bg(hsla(color.h, color.s, color.l, 0.14)).child(text.into())
 }
 
+/// ナビのアイコン。旧画面（renderer/ui.js ほか）の 20x20 の線画をそのまま使い、色だけ指定して SVG にする
+fn icon_body(name: &str) -> &'static str {
+    match name {
+        "overview" => {
+            r#"<rect x="3" y="3" width="6" height="6" rx="1.5"/><rect x="11" y="3" width="6" height="6" rx="1.5"/><rect x="3" y="11" width="6" height="6" rx="1.5"/><rect x="11" y="11" width="6" height="6" rx="1.5"/>"#
+        }
+        "status" => r#"<path d="M2.5 10.5h3.2l2-5.2 4 10 2.2-4.8h3.6"/>"#,
+        "resources" => {
+            r#"<rect x="3" y="11" width="3" height="6" rx="1"/><rect x="8.5" y="7" width="3" height="10" rx="1"/><rect x="14" y="3" width="3" height="14" rx="1"/>"#
+        }
+        "procs" => r#"<rect x="3" y="3" width="14" height="14" rx="2"/><path d="M7 7h6M7 10h6M7 13h4"/>"#,
+        "jobs" => r#"<rect x="3" y="4" width="14" height="13" rx="2"/><path d="M3 8h14M7 2.5v3M13 2.5v3"/>"#,
+        "logs" => r#"<path d="M4 5h12M4 10h12M4 15h8"/>"#,
+        "actions" => r#"<circle cx="10" cy="10" r="7"/><path d="M10 6v4l2.5 2"/>"#,
+        "sync" => r#"<path d="M4 10a6 6 0 0 1 10.2-4.3M16 10a6 6 0 0 1-10.2 4.3M14.5 2.5v3.5H11M5.5 17.5V14H9"/>"#,
+        "link" => r#"<path d="M8.5 11.5l3-3M7 9l-1.8 1.8a2.8 2.8 0 0 0 4 4L11 13M9 7l1.8-1.8a2.8 2.8 0 0 1 4 4L13 11"/>"#,
+        "tool" => r#"<path d="M12.6 3.2a4 4 0 0 0-4.9 5.3l-4.6 4.6a1.6 1.6 0 0 0 2.3 2.3l4.6-4.6a4 4 0 0 0 5.3-4.9l-2.4 2.4-2.1-.6-.6-2.1z"/>"#,
+        "shield" => r#"<path d="M10 2.75l6 2.25v4.5c0 3.8-2.6 6.6-6 7.75-3.4-1.15-6-3.95-6-7.75V5z"/><path d="M7.4 10l1.9 1.9 3.4-3.6"/>"#,
+        "agent" => r#"<rect x="3.5" y="5.5" width="13" height="10" rx="3"/><path d="M10 2.75v2.75M7.5 10h.01M12.5 10h.01M7.75 13h4.5"/>"#,
+        "review" => r#"<path d="M5 2.75h7l3 3v11.5H5z"/><path d="M12 2.75v3h3M7.5 10h5M7.5 13h5"/>"#,
+        "topology" => {
+            r#"<circle cx="4" cy="10" r="1.8"/><circle cx="15.5" cy="4" r="1.8"/><circle cx="15.5" cy="16" r="1.8"/><path d="M5.7 9.1 13.8 4.9M5.7 10.9l8.1 4.2"/>"#
+        }
+        _ => "",
+    }
+}
+
+fn icon_image(name: &str, color: &str) -> Arc<gpui::Image> {
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" width="40" height="40" fill="none" stroke="{color}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">{}</svg>"#,
+        icon_body(name)
+    );
+    Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Svg, svg.into_bytes()))
+}
+
 /// 機体を選んでいないときに出す画面
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -170,6 +205,26 @@ impl Page {
         }
     }
 
+    /// 旧画面と同じアイコン名
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Status => "status",
+            Self::Logs => "logs",
+            Self::Topology => "topology",
+            Self::Actions => "actions",
+            Self::Schedule => "jobs",
+            Self::Resources | Self::Power | Self::Specs => "resources",
+            Self::Tools => "tool",
+            Self::Ai => "agent",
+            Self::Processes => "procs",
+            Self::Security => "shield",
+            Self::Network => "sync",
+            Self::Link => "link",
+            Self::Review => "review",
+        }
+    }
+
     fn from_arg(s: &str) -> Option<Self> {
         Some(match s {
             "status" => Self::Status,
@@ -200,6 +255,7 @@ struct LiveHandles {
 
 struct TuneApp {
     brand: Arc<gpui::Image>,
+    icons: Vec<(&'static str, Arc<gpui::Image>)>,
     engine: Arc<Engine>,
     rt: Arc<tokio::runtime::Runtime>,
     dirty: Arc<AtomicBool>,
@@ -242,6 +298,14 @@ impl TuneApp {
         let live_dirty_for_gate = live.dirty.clone();
         let mut app = Self {
             brand,
+            icons: [Page::Overview]
+                .into_iter()
+                .chain(Page::NAV)
+                .map(Page::icon)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(|n| (n, icon_image(n, "#8b93a3")))
+                .collect(),
             engine,
             rt,
             dirty,
@@ -520,6 +584,15 @@ impl TuneApp {
         cx.notify();
     }
 
+    fn icon_view(&self, name: &str, alert: bool) -> gpui::Div {
+        let found = self.icons.iter().find(|(n, _)| *n == name).map(|(_, i)| i.clone());
+        div()
+            .size(px(16.0))
+            .flex_none()
+            .when_some(found, |d, i| d.child(img(i).size(px(16.0))))
+            .when(alert, |d| d.opacity(1.0).border_b_2().border_color(palette::crit()))
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let row = |id: gpui::ElementId, label: String, dot: Hsla, tail: String, active: bool, target: Option<String>, cx: &mut Context<Self>| {
             div()
@@ -568,7 +641,7 @@ impl TuneApp {
                     .cursor_pointer()
                     .when(self.selected.is_none() && self.page == page, |d| d.bg(palette::card()))
                     .hover(|d| d.bg(palette::card()))
-                    .child(div().size_2().rounded_full().bg(if fails > 0 { palette::crit() } else { palette::muted() }))
+                    .child(self.icon_view(page.icon(), fails > 0))
                     .child(div().flex_1().text_sm().child(page.title()))
                     .child(div().text_xs().text_color(palette::muted()).child(if fails > 0 { fails.to_string() } else { String::new() }))
                     .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| app.open_page(page, cx))),
