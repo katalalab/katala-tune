@@ -1385,7 +1385,10 @@ mod tests {
         assert!(!control.stopped());
         let mut fast = Command::new("/usr/bin/printf");
         fast.arg("1 0:00.25 4 fixture\n");
-        assert_eq!(ps_output(&mut fast, &control, Duration::from_secs(1)).unwrap(), b"1 0:00.25 4 fixture\n");
+        let remaining = control.deadline.saturating_duration_since(Instant::now());
+        let output = ps_output(&mut fast, &control, remaining).expect("follow-up query must succeed within the original session deadline");
+        assert_eq!(output, b"1 0:00.25 4 fixture\n");
+        assert!(!control.stopped(), "follow-up query must preserve the session");
     }
 
     #[test]
