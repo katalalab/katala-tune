@@ -1,6 +1,8 @@
 //! Native preview supports the same desktop targets as the existing app.
 //! Linux continues to test the core and CLI without pulling in the GPUI stack.
 
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod model;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
