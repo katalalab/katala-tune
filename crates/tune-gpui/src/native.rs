@@ -466,6 +466,7 @@ struct TuneApp {
     panel: Option<Result<Panel, String>>,
     dashboard: Option<Result<DashboardView, String>>,
     dashboard_minutes: i64,
+    dashboard_details: bool,
     dashboard_clock: Instant,
     query: String,
     log_level: LogLevel,
@@ -550,6 +551,7 @@ impl TuneApp {
             panel: None,
             dashboard: None,
             dashboard_minutes: 60,
+            dashboard_details: false,
             dashboard_clock: Instant::now(),
             query: String::new(),
             log_level: LogLevel::All,
@@ -1307,6 +1309,9 @@ impl TuneApp {
                     "pause" => host.pause_monitor(),
                     "pull" => host.request_pull(),
                     "save" => host.save_monitor_settings(patch.unwrap_or_default()),
+                    "scan-start" => host.start_schedule(),
+                    "scan-stop" => host.stop_schedule(),
+                    "scan-save" => host.save_schedule_settings(patch.unwrap_or_default()),
                     "records" => {
                         *records.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(engine.monitor_events(&tune_core::monitor_journal::Filter {
                             limit: Some(50),
@@ -1318,7 +1323,7 @@ impl TuneApp {
                     _ => unreachable!(),
                 };
                 *result.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(match outcome {
-                    Ok(()) => "監視操作を受け付けました。状態欄で完了を確認してください".into(),
+                    Ok(()) => "操作を受け付けました。状態欄で完了を確認できます".into(),
                     Err(error) => error,
                 });
                 dirty.store(true, Ordering::Release);
@@ -1361,7 +1366,8 @@ impl TuneApp {
                 .child("再読込")
                 .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.reload(cx))),
         );
-        for (command, label) in [("start", "監視開始 / 再開"), ("pause", "一時停止"), ("pull", "ハブ取得"), ("records", "記録50件")] {
+        for (command, label) in [("start", "監視開始"), ("pause", "監視停止"), ("scan-start", "自動スキャン開始"), ("scan-stop", "スキャン停止")]
+        {
             toolbar = toolbar.child(
                 div()
                     .id(command)
@@ -1375,6 +1381,96 @@ impl TuneApp {
                     .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, _| app.monitor_command(command, None))),
             );
         }
+        toolbar = toolbar.child(
+            div()
+                .id("dashboard-details")
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(palette::card())
+                .text_sm()
+                .cursor_pointer()
+                .child(if self.dashboard_details { "詳細を閉じる" } else { "詳細" })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|app, _, _, cx| {
+                        app.dashboard_details = !app.dashboard_details;
+                        cx.notify();
+                    }),
+                ),
+        );
+        let observed = self.monitor.snapshot();
+        let active = self.live.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).active;
+        let (scan_enabled, scan) = self.monitor.schedule_snapshot();
+        use crate::monitor_host::SchedulePhase;
+        use tune_core::monitor::{RunMode, RunPhase};
+        let phase = match observed.status.phase {
+            RunPhase::Starting => "開始待ち",
+            RunPhase::Running => "監視中",
+            RunPhase::Paused => "停止中",
+            RunPhase::Stopping => "停止待ち",
+            RunPhase::Failed => "失敗",
+            RunPhase::Exited => "終了",
+        };
+        let scan_phase = match scan.phase {
+            SchedulePhase::Idle => "停止中",
+            SchedulePhase::Waiting => "次回待ち",
+            SchedulePhase::Running => "実行中",
+            SchedulePhase::ManualBusy => "手動収集のため見送り",
+            SchedulePhase::Stopping => "完了後に停止",
+            SchedulePhase::Failed => "失敗",
+            SchedulePhase::Exited => "終了",
+        };
+        let status = div().px_5().py_1().text_xs().child(format!(
+            "監視 {phase} · 観測中 {}台 ｜ 自動スキャン {scan_phase}{}",
+            observed.streams,
+            scan.error.as_ref().map(|e| format!(" · {e}")).unwrap_or_default()
+        ));
+        let mut details = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().px_5().text_xs().child(format!(
+                "監視の開始許可 {} · 処理 {} · 採取方針 {} · ローカル採取 {} · 最新サンプル {}（最大200台で確認） · ウィンドウ表示 未観測 / 操作中 {}",
+                match observed.mode {
+                    RunMode::Run => "あり",
+                    RunMode::Paused => "なし",
+                    RunMode::Exit => "終了",
+                },
+                if observed.started { "開始済" } else { "未開始" },
+                match observed.status.policy {
+                    Some(tune_core::monitor_journal::Policy::Local) => "この操作卓で採取",
+                    Some(tune_core::monitor_journal::Policy::Hub) => "ハブから取得",
+                    Some(tune_core::monitor_journal::Policy::Disabled) => "無効",
+                    Some(tune_core::monitor_journal::Policy::StreamBackoff) => "再接続待ち",
+                    Some(tune_core::monitor_journal::Policy::PlannedRecycle) => "定期再接続",
+                    Some(tune_core::monitor_journal::Policy::MonitorDisconnected) => "切断",
+                    Some(tune_core::monitor_journal::Policy::SettingsUnknown) | None => "未確認",
+                },
+                observed.status.local_collecting.map(|b| if b { "はい" } else { "いいえ" }).unwrap_or("未観測"),
+                observed.latest_sample.map_or_else(|| "未確認".into(), |t| crate::panels::time(&serde_json::json!(t))),
+                if active { "はい" } else { "いいえ" }
+            )))
+            .child(div().px_5().text_xs().child(format!(
+                "自動スキャンの開始許可 {} · 完了 {}回 · 最終完了 {}",
+                if scan_enabled { "あり" } else { "なし" },
+                scan.cycles,
+                scan.last_completed.map_or_else(|| "未実行".into(), |t| crate::panels::time(&serde_json::json!(t)))
+            )));
+        let mut tools = div().px_5().flex().flex_wrap().gap_2();
+        for (command, label) in [("pull", "ハブ取得"), ("records", "記録50件")] {
+            tools = tools.child(
+                div()
+                    .id(command)
+                    .px_3()
+                    .py_2()
+                    .bg(palette::card())
+                    .text_xs()
+                    .cursor_pointer()
+                    .child(label)
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, _| app.monitor_command(command, None))),
+            );
+        }
         let before_id = self
             .monitor_records
             .lock()
@@ -1383,21 +1479,14 @@ impl TuneApp {
             .and_then(|r| r.as_ref().ok())
             .and_then(|v| v["next_before_id"].as_i64());
         if let Some(before_id) = before_id {
-            toolbar =
-                toolbar.child(div().id("monitor-older-records").px_3().py_2().bg(palette::card()).text_sm().cursor_pointer().child("前の50件").on_mouse_down(
+            tools =
+                tools.child(div().id("monitor-older-records").px_3().py_2().bg(palette::card()).text_sm().cursor_pointer().child("前の50件").on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |app, _, _, _| app.monitor_command("records", Some(serde_json::json!({"before_id":before_id})))),
                 ));
         }
-        let observed = self.monitor.snapshot();
-        let active = self.live.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).active;
-        let status = div().px_5().text_xs().child(format!(
-            "session {:?} · worker {} / {:?} · core policy {:?} · local_collecting {:?} · stream {} · 稼働streamの最新sample {}（観測200台まで） · window visible 未観測 / active {}",
-            observed.mode, if observed.started { "開始済" } else { "未開始" }, observed.status.phase, observed.status.policy,
-            observed.status.local_collecting, observed.streams, observed.latest_sample.map_or_else(|| "未確認".into(), |t| crate::panels::time(&serde_json::json!(t))),
-            active,
-        ));
-        let mut settings = div().id("monitor-settings").max_h(px(100.)).overflow_y_scroll().px_5().py_2().flex().flex_wrap().gap_2();
+        details = details.child(tools);
+        let mut settings = div().id("monitor-settings").px_5().py_2().flex().flex_wrap().gap_2();
         if let Some(Ok(view)) = &self.dashboard {
             let enabled = view.saved["monitor"]["enabled"].as_bool().unwrap_or(false);
             settings = settings.child(
@@ -1408,12 +1497,46 @@ impl TuneApp {
                     .bg(palette::card())
                     .text_xs()
                     .cursor_pointer()
-                    .child(if enabled { "設定を無効にして保存" } else { "設定を有効にして保存" })
+                    .child(if enabled { "監視設定を無効にして保存" } else { "監視設定を有効にして保存" })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |app, _, _, _| app.monitor_command("save", Some(serde_json::json!({"enabled":!enabled})))),
                     ),
             );
+            let scan_saved = view.saved["schedule"]["enabled"].as_bool();
+            if let Some(enabled) = scan_saved {
+                settings = settings.child(
+                    div()
+                        .id("schedule-enabled")
+                        .px_3()
+                        .py_2()
+                        .bg(palette::card())
+                        .text_xs()
+                        .cursor_pointer()
+                        .child(if enabled { "自動スキャン設定を無効にして保存" } else { "自動スキャン設定を有効にして保存" })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |app, _, _, _| app.monitor_command("scan-save", Some(serde_json::json!({"enabled":!enabled})))),
+                        ),
+                );
+            }
+            for (key, label, choices) in [
+                ("probe_minutes", "分析（分）", [15, 60, 240]),
+                ("logs_minutes", "ログ（分）", [15, 60, 240]),
+                ("inventory_hours", "道具（時間）", [6, 24, 168]),
+                ("ai_minutes", "AI（分）", [15, 30, 60]),
+            ] {
+                let mut row = div().flex().flex_wrap().gap_2().child(div().text_xs().child(format!("{label} · 保存 {}", view.saved["schedule"][key])));
+                for value in choices {
+                    row = row.child(
+                        div().id((key, value as usize)).px_2().bg(palette::card()).text_xs().cursor_pointer().child(format!("{value}に保存")).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |app, _, _, _| app.monitor_command("scan-save", Some(serde_json::json!({key:value})))),
+                        ),
+                    );
+                }
+                settings = settings.child(row);
+            }
             let hubs = std::iter::once(None).chain(
                 self.engine.config().nodes.into_iter().filter(|n| n.is_active() && !n.local && (n.is_mac() || n.is_windows())).take(200).map(|n| Some(n.id)),
             );
@@ -1428,9 +1551,13 @@ impl TuneApp {
                     );
             }
         }
-        let mut body = div().flex_1().min_h_0().flex().flex_col().child(toolbar).child(status).child(settings).child(
-            div().px_5().text_xs().text_color(palette::muted()).child("設定保存だけでは開始しません。一時停止・終了は実行中の取得が完了してから反映されます。"),
-        );
+        details = details
+            .child(settings)
+            .child(div().px_5().text_xs().text_color(palette::muted()).child("保存だけでは開始しません。停止は実行中の処理の完了を待ちます。"));
+        if let Some(Ok(view)) = &self.dashboard {
+            details = details.child(dashboard::render_details(view));
+        }
+        let mut body = div().flex_1().min_h_0().flex().flex_col().child(toolbar).child(status);
         if let Some(records) = &*self.monitor_records.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             let text = match records {
                 Err(error) => error.clone(),
@@ -1452,15 +1579,19 @@ impl TuneApp {
                     )
                 }
             };
-            body = body.child(div().id("monitor-records").max_h(px(100.)).overflow_y_scroll().px_5().text_xs().child(text));
+            details = details.child(div().id("monitor-records").max_h(px(100.)).overflow_y_scroll().px_5().text_xs().child(text));
         }
         if self.loading {
             body = body.child(div().px_5().text_xs().text_color(palette::muted()).child("保存集計を読込中…"));
         }
         match &self.dashboard {
-            Some(Ok(view)) => {
-                body.child(div().id("dashboard-saved").flex_1().overflow_y_scroll().child(dashboard::render_dashboard(view, &self.live.live, now_ms())))
-            }
+            Some(Ok(view)) => body.child(
+                div().id("dashboard-saved").flex_1().overflow_y_scroll().when(self.dashboard_details, |d| d.child(details)).child(dashboard::render_dashboard(
+                    view,
+                    &self.live.live,
+                    now_ms(),
+                )),
+            ),
             Some(Err(error)) => body.child(div().p_5().text_sm().text_color(palette::crit()).child(format!("保存Dashboardの読み込みに失敗: {error}"))),
             None => body.child(div().p_5().text_sm().text_color(palette::muted()).child("保存Dashboardを読み込んでいます…")),
         }
@@ -2063,7 +2194,12 @@ pub fn run(options: startup::Options) {
                     // All saved-data routes run before any explicit live diagnostic.
                     for (visit, page) in Page::ALL.into_iter().flat_map(|p| [p, p]).enumerate() {
                         window
-                            .update(cx, |app, _, cx| if visit % 2 == 0 { app.navigate(page, None, cx) } else { app.reload(cx) })
+                            .update(cx, |app, _, cx| {
+                                if page == Page::Dashboard {
+                                    app.dashboard_details = visit % 2 != 0;
+                                }
+                                if visit % 2 == 0 { app.navigate(page, None, cx) } else { app.reload(cx) }
+                            })
                             .map_err(|_| "selftest window closed".to_string())?;
                         let mut loaded = false;
                         for _ in 0..100 {
@@ -2074,6 +2210,8 @@ pub fn run(options: startup::Options) {
                                         || app.collection.result.is_some()
                                         || !app.live.live.active().is_empty()
                                         || app.engine.monitor_journal_health()["running"] == true
+                                        || app.monitor.schedule_snapshot().0
+                                        || app.monitor.schedule_snapshot().1.cycles != 0
                                     {
                                         return Some((app.nodes.len(), Some("保存画面の描画が収集を開始しました".into())));
                                     }
