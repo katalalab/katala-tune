@@ -244,7 +244,7 @@ pub struct RawSample {
 #[serde(tag = "type")]
 enum Line {
     #[serde(rename = "hello")]
-    Hello(Hello),
+    Hello(Box<Hello>),
     #[serde(rename = "s")]
     Sample(Box<RawSample>),
     #[serde(rename = "end")]
@@ -257,7 +257,7 @@ enum Line {
 /// 解析した 1 行
 #[derive(Clone, Debug)]
 pub enum Msg {
-    Hello(Hello),
+    Hello(Box<Hello>),
     Sample(Box<RawSample>),
     /// サンプラーが自分から終わる（max_age: 長く動いたので区切る、count: 確認用）
     End(String),
@@ -1592,7 +1592,7 @@ async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Re
                             Ok(Some(line)) => match parse_line(&line) {
                                 Some(Msg::Hello(h)) => {
                                     live.record(&node.id, epoch, attempt, Kind::Hello, Data { native_rust: match h.implementation.as_deref() { Some("rust") => Some(true), _ => None }, reported_version: crate::monitor_journal::reported_version(h.agent.as_deref()), ..Data::default() });
-                                    live.on_hello(&node.id, epoch, h);
+                                    live.on_hello(&node.id, epoch, *h);
                                 }
                                 Some(Msg::Sample(s)) => {
                                     got += 1;
@@ -1728,6 +1728,10 @@ async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Re
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parsed_live_messages_keep_the_event_size_bounded() {
+        assert!(std::mem::size_of::<super::Msg>() <= 64);
+    }
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

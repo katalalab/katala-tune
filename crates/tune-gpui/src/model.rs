@@ -38,6 +38,8 @@ pub struct Finding {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Health {
+    /// 台帳で運用対象外。過去の分析と現在の対象範囲を混同しない。
+    Excluded(String),
     /// まだ一度も分析していない
     Unobserved,
     /// 直近の分析が失敗した
@@ -68,12 +70,12 @@ impl NodeView {
     }
 
     /// 並べ替えの鍵。要対応が多い順、次に注意、次にスコアの低い順
-    pub fn urgency(&self) -> (std::cmp::Reverse<usize>, std::cmp::Reverse<usize>, u32) {
+    pub fn urgency(&self) -> (bool, std::cmp::Reverse<usize>, std::cmp::Reverse<usize>, u32) {
         let score = match self.health {
             Health::Scored(s) => s,
             _ => 0,
         };
-        (std::cmp::Reverse(self.count(Severity::Critical)), std::cmp::Reverse(self.count(Severity::Warn)), score)
+        (matches!(self.health, Health::Excluded(_)), std::cmp::Reverse(self.count(Severity::Critical)), std::cmp::Reverse(self.count(Severity::Warn)), score)
     }
 }
 
@@ -98,13 +100,27 @@ pub fn build(ledger_nodes: &[Value], last: &[Value]) -> Vec<NodeView> {
         .map(|n| {
             let id = str_of(n.get("id"));
             let r = last.iter().find(|r| r.get("node_id").and_then(Value::as_str) == Some(id.as_str()));
-            let data = r.and_then(|r| r.get("data"));
-            let health = match r {
-                None => Health::Unobserved,
-                Some(r) if r.get("ok").and_then(Value::as_bool) != Some(true) => Health::Failed(str_of(r.get("error"))),
-                Some(r) => Health::Scored(r.get("score").and_then(Value::as_u64).map_or(0, |s| s.min(100) as u32)),
+            let state = tune_core::nodes::op_state(n);
+            let data = state.active.then(|| r.and_then(|r| r.get("data"))).flatten();
+            let health = if !state.active {
+                Health::Excluded(format!(
+                    "{}{}",
+                    tune_core::nodes::state_label(&state.state),
+                    if state.reason.is_empty() { String::new() } else { format!(": {}", state.reason) }
+                ))
+            } else {
+                match r {
+                    None => Health::Unobserved,
+                    Some(r) if r.get("ok").and_then(Value::as_bool) != Some(true) => Health::Failed(str_of(r.get("error"))),
+                    Some(r) => Health::Scored(r.get("score").and_then(Value::as_u64).map_or(0, |s| s.min(100) as u32)),
+                }
             };
-            let findings = r.and_then(|r| r.get("findings")).and_then(Value::as_array).map(|a| a.iter().map(finding).collect()).unwrap_or_default();
+            let findings = r
+                .filter(|_| state.active)
+                .and_then(|r| r.get("findings"))
+                .and_then(Value::as_array)
+                .map(|a| a.iter().map(finding).collect())
+                .unwrap_or_default();
             NodeView {
                 id,
                 os: str_of(n.get("os")),
@@ -248,6 +264,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn excluded_nodes_do_not_look_unobserved_or_contribute_old_findings() {
+        let nodes = vec![json!({"id":"paused","os":"macos","status":"paused","status_reason":"maintenance"})];
+        let last = vec![json!({"node_id":"paused","ok":true,"score":100,"findings":[{"severity":"critical","title":"old"}]})];
+        let rows = build(&nodes, &last);
+        assert_eq!(rows[0].count(Severity::Critical), 0);
+        assert!(!matches!(rows[0].health, Health::Scored(_) | Health::Unobserved));
+    }
+
     fn ledger() -> Vec<Value> {
         vec![json!({"id": "a", "os": "macOS"}), json!({"id": "b", "os": "Windows"}), json!({"id": "c"})]
     }
@@ -293,7 +318,7 @@ mod tests {
             mem_trend: vec![],
             findings: (0..crit).map(|_| Finding { severity: Severity::Critical, title: String::new(), detail: String::new(), advice: String::new() }).collect(),
         };
-        let mut v = vec![mk(0, 10), mk(2, 90), mk(1, 50)];
+        let mut v = [mk(0, 10), mk(2, 90), mk(1, 50)];
         v.sort_by_key(NodeView::urgency);
         assert_eq!(v.iter().map(|n| n.count(Severity::Critical)).collect::<Vec<_>>(), [2, 1, 0]);
     }

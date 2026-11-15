@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# tune-gpui の E2E: 単体テスト → 隔離したデータで画面を起動（selftest）→ 台帳の機体数と一致を確かめる。
+# tune-gpui の起動smoke: 単体テスト → 隔離データで起動 → 台帳の機体数を確かめる。
+# 描画完了、画面操作、収集から保存までのGUI受入は別に行う。
 # 実機の台帳・DB には触れない（--config / --data で一時領域を使う）。
 set -euo pipefail
-cd "$(dirname "$0")/.."
-cargo test -p tune-gpui --release
-cargo build -p tune-gpui --release
+repo=$(dirname "$(dirname "$(realpath "$0")")")
+cargo test --manifest-path "$repo/Cargo.toml" -p tune-gpui --release --locked
+cargo build --manifest-path "$repo/Cargo.toml" -p tune-gpui --release --locked
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-n=$(python3 -c 'import json,sys;print(len(json.load(open("config/nodes.example.json"))["nodes"]))')
-out=$(./target/release/katala-tune --selftest --config config/nodes.example.json --data "$tmp/data")
+n=$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))["nodes"]))' "$repo/config/nodes.example.json")
+out=$("${CARGO_TARGET_DIR:-$repo/target}/release/katala-tune-gpui" --selftest --config "$repo/config/nodes.example.json" --data "$tmp/data")
 echo "$out"
 [ "$out" = "selftest ok nodes=$n" ] || { echo "E2E 失敗: 期待 nodes=$n" >&2; exit 1; }
 echo "e2e-gpui OK"
@@ -15,16 +16,16 @@ echo "e2e-gpui OK"
 # 任意: E2E_LIVE_NODE=<id> を付けると、その機体のライブ（1 秒ごとのサンプル）が 8 秒で数点届くことも確かめる。
 # 台帳は実機のものを読むだけで、データは一時領域。
 if [ -n "${E2E_LIVE_NODE:-}" ]; then
-  live=$(./target/release/katala-tune --selftest --live "$E2E_LIVE_NODE" --data "$tmp/live-data")
+  live=$("${CARGO_TARGET_DIR:-$repo/target}/release/katala-tune-gpui" --selftest --live "$E2E_LIVE_NODE" --config "${E2E_CONFIG:?set E2E_CONFIG to an explicit ledger}" --data "$tmp/live-data")
   echo "$live"
   pts=$(echo "$live" | sed -n 's/^selftest live points=//p')
   [ "${pts:-0}" -ge 3 ] || { echo "E2E 失敗: ライブの点が $pts 点（3 点以上が必要）" >&2; exit 1; }
   echo "e2e-gpui live OK"
 fi
 
-# 任意: E2E_LOGS=1 で、保存済みログの読み出し（実機のデータを読むだけ）が画面モデルまで届くことを確かめる。
+# 任意: E2E_LOGS=1 で、明示したプレビューDBの保存済みログが画面モデルまで届くことを確かめる。
 if [ -n "${E2E_LOGS:-}" ]; then
-  out=$(./target/release/katala-tune --selftest --logs)
+  out=$("${CARGO_TARGET_DIR:-$repo/target}/release/katala-tune-gpui" --selftest --logs --config "${E2E_CONFIG:?set E2E_CONFIG to an explicit ledger}" --data "${E2E_DATA:?set E2E_DATA to a preview database directory}")
   echo "$out"
   echo "$out" | grep -q "^selftest logs rows=" || { echo "E2E 失敗: ログの読み出し" >&2; exit 1; }
   echo "e2e-gpui logs OK"

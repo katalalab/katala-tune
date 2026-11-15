@@ -1,9 +1,10 @@
 //! Katala Tune のネイティブ画面（Rust + GPUI）。WebView も Node も使わず、tune-core の Engine を直接呼ぶ。
 //!
-//! 実行: `katala-tune [--config 台帳.json] [--data データdir] [--selftest]`
+//! 実行: `katala-tune-gpui [--config 台帳.json] [--data データdir] [--selftest]`
 //! `--selftest` は画面を開いて台帳と前回結果を読み、1 フレーム描いて終了する（E2E 用。分析は走らせない）。
 
 mod model;
+mod startup;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -81,7 +82,7 @@ fn score_color(h: &Health) -> Hsla {
         Health::Scored(s) if *s >= 80 => palette::ok(),
         Health::Scored(s) if *s >= 55 => palette::warn(),
         Health::Scored(_) | Health::Failed(_) => palette::crit(),
-        Health::Unobserved => palette::muted(),
+        Health::Unobserved | Health::Excluded(_) => palette::muted(),
     }
 }
 
@@ -320,6 +321,7 @@ impl TuneApp {
                 Health::Scored(s) => s.to_string(),
                 Health::Failed(_) => "失敗".into(),
                 Health::Unobserved => "未".into(),
+                Health::Excluded(_) => "対象外".into(),
             };
             list = list.child(row(
                 ("nav", i + 1).into(),
@@ -397,8 +399,12 @@ impl TuneApp {
                 Health::Scored(s) => s.to_string(),
                 Health::Failed(_) => "!".into(),
                 Health::Unobserved => "–".into(),
+                Health::Excluded(_) => "対象外".into(),
             };
             let mut foot = div().flex().flex_wrap().gap_1p5();
+            if let Health::Excluded(label) = &n.health {
+                foot = foot.child(chip(label.clone(), palette::muted()));
+            }
             if let Health::Failed(e) = &n.health {
                 foot = foot.child(
                     div()
@@ -686,6 +692,7 @@ impl TuneApp {
             list = list.child(Self::finding_row(f));
         }
         let body = match &n.health {
+            Health::Excluded(reason) => div().text_sm().text_color(palette::muted()).child(format!("対象外: {reason}。接続や分析は実行しません。")),
             Health::Failed(e) => div().text_sm().text_color(palette::crit()).child(format!("直近の分析に失敗: {e}")),
             Health::Unobserved => div().text_sm().text_color(palette::muted()).child("まだ分析していません。「全機を分析」を押してください。"),
             Health::Scored(_) if n.findings.is_empty() => div().text_sm().text_color(palette::ok()).child("所見はありません"),
@@ -726,20 +733,27 @@ impl Render for TuneApp {
     }
 }
 
-fn arg(name: &str) -> Option<String> {
-    let mut it = std::env::args().skip(1);
-    while let Some(a) = it.next() {
-        if a == name {
-            return it.next();
-        }
-    }
-    None
-}
-
 fn main() {
-    let selftest = std::env::args().any(|a| a == "--selftest");
-    let config = arg("--config").map_or_else(nodes::user_config_path, Into::into);
-    let data = arg("--data").map_or_else(nodes::data_dir, Into::into);
+    let options = match startup::parse(std::env::args_os().skip(1)) {
+        Ok(Some(options)) => options,
+        Ok(None) => {
+            println!(
+                "katala-tune-gpui [--config <ledger.json>] [--data <directory>] [--open <logs|node-id>] [--selftest [--live <node-id>] [--logs]]\nPreview data defaults to a separate gpui-preview directory. --selftest requires both paths and checks startup only."
+            );
+            return;
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    let startup::Options { config, data, selftest, open, live_id, logs } = options;
+    if (selftest || config.exists())
+        && let Err(error) = nodes::load_config(&config)
+    {
+        eprintln!("katala-tune-gpui: {error}");
+        std::process::exit(1);
+    }
     let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio"));
     // Engine の中の tokio 呼び出し（接続・子プロセス）が動くよう、ランタイムの文脈で開く
     let dirty = Arc::new(AtomicBool::new(true));
@@ -753,6 +767,11 @@ fn main() {
             }
         }
     };
+
+    if let Some(error) = engine.config_error().or_else(|| engine.last().err()) {
+        eprintln!("katala-tune-gpui: {error}");
+        std::process::exit(1);
+    }
 
     let live_store = Arc::new(Mutex::new(model::LiveStore::default()));
     let live_dirty = Arc::new(AtomicBool::new(false));
@@ -797,7 +816,7 @@ fn main() {
         .detach();
         cx.activate(true);
         // --open logs|<機体 id>: 起動時に開く画面（画面確認・スクリーンショット用）
-        match arg("--open").as_deref() {
+        match open.as_deref() {
             Some("logs") => drop(window.update(cx, |v, _, cx| v.open_logs(cx))),
             Some(id) => drop(window.update(cx, |v, _, cx| v.select(Some(id.to_string()), cx))),
             None => {}
@@ -805,11 +824,9 @@ fn main() {
         if selftest {
             let view = window.update(cx, |v, _, _| v.nodes.len()).unwrap_or(0);
             // --live <id>: その機体のライブを流し、点が届くまで確かめる（E2E 用）
-            let live_id = arg("--live");
             if let Some(id) = &live_id {
                 window.update(cx, |v, _, _| v.live_start(id)).ok();
             }
-            let logs = std::env::args().any(|a| a == "--logs");
             if logs {
                 window.update(cx, |v, _, cx| v.open_logs(cx)).ok();
             }
