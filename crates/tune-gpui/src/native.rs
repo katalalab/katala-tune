@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    App, Application, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, MouseButton, UniformListScrollHandle, Window,
-    WindowBounds, WindowOptions, actions, div, hsla, img, point, prelude::*, px, rgb, size, uniform_list,
+    App, Application, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, MouseButton, PathBuilder, UniformListScrollHandle, Window,
+    WindowBounds, WindowOptions, actions, canvas, div, hsla, img, point, prelude::*, px, rgb, size, uniform_list,
 };
 use model::{Finding, Health, NodeView, Severity};
 use tune_core::engine::{Engine, Host};
@@ -127,8 +127,140 @@ fn trend(values: &[f64], max: f64, color: Hsla, height: f32) -> gpui::Div {
     bars
 }
 
+/// スコアのリング。円弧の長さがスコア（0〜100）に比例する。値が無いときは円だけ
+fn score_ring(fraction: f32, color: Hsla, label: String) -> gpui::Div {
+    use std::f32::consts::{FRAC_PI_2, TAU};
+    let arc = |path: &mut PathBuilder, c: gpui::Point<gpui::Pixels>, r: gpui::Pixels, f: f32| {
+        let steps = ((96.0 * f) as usize).max(2);
+        for i in 0..=steps {
+            let a = -FRAC_PI_2 + TAU * f * (i as f32 / steps as f32);
+            let p = point(c.x + r * a.cos(), c.y + r * a.sin());
+            if i == 0 { path.move_to(p) } else { path.line_to(p) }
+        }
+    };
+    div()
+        .size(px(44.0))
+        .flex_none()
+        .relative()
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let c = bounds.center();
+                    let r = bounds.size.width.min(bounds.size.height) / 2.0 - px(3.0);
+                    for (f, col) in [(0.9999, palette::line()), (fraction.clamp(0.0, 1.0), color)] {
+                        if f <= 0.0 {
+                            continue;
+                        }
+                        let mut path = PathBuilder::stroke(px(4.0));
+                        arc(&mut path, c, r, f);
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, col);
+                        }
+                    }
+                },
+            )
+            .size_full(),
+        )
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .font_weight(FontWeight::BOLD)
+                .text_color(color)
+                .child(label),
+        )
+}
+
+/// ナビのアイコン。旧画面（renderer/ui.js ほか）の 20x20 の線画をそのまま使い、色だけ指定して SVG にする
+fn icon_body(name: &str) -> &'static str {
+    match name {
+        "overview" => {
+            r#"<rect x="3" y="3" width="6" height="6" rx="1.5"/><rect x="11" y="3" width="6" height="6" rx="1.5"/><rect x="3" y="11" width="6" height="6" rx="1.5"/><rect x="11" y="11" width="6" height="6" rx="1.5"/>"#
+        }
+        "status" => r#"<path d="M2.5 10.5h3.2l2-5.2 4 10 2.2-4.8h3.6"/>"#,
+        "resources" => {
+            r#"<rect x="3" y="11" width="3" height="6" rx="1"/><rect x="8.5" y="7" width="3" height="10" rx="1"/><rect x="14" y="3" width="3" height="14" rx="1"/>"#
+        }
+        "procs" => r#"<rect x="3" y="3" width="14" height="14" rx="2"/><path d="M7 7h6M7 10h6M7 13h4"/>"#,
+        "jobs" => r#"<rect x="3" y="4" width="14" height="13" rx="2"/><path d="M3 8h14M7 2.5v3M13 2.5v3"/>"#,
+        "logs" => r#"<path d="M4 5h12M4 10h12M4 15h8"/>"#,
+        "actions" => r#"<circle cx="10" cy="10" r="7"/><path d="M10 6v4l2.5 2"/>"#,
+        "sync" => r#"<path d="M4 10a6 6 0 0 1 10.2-4.3M16 10a6 6 0 0 1-10.2 4.3M14.5 2.5v3.5H11M5.5 17.5V14H9"/>"#,
+        "link" => r#"<path d="M8.5 11.5l3-3M7 9l-1.8 1.8a2.8 2.8 0 0 0 4 4L11 13M9 7l1.8-1.8a2.8 2.8 0 0 1 4 4L13 11"/>"#,
+        "tool" => r#"<path d="M12.6 3.2a4 4 0 0 0-4.9 5.3l-4.6 4.6a1.6 1.6 0 0 0 2.3 2.3l4.6-4.6a4 4 0 0 0 5.3-4.9l-2.4 2.4-2.1-.6-.6-2.1z"/>"#,
+        "shield" => r#"<path d="M10 2.75l6 2.25v4.5c0 3.8-2.6 6.6-6 7.75-3.4-1.15-6-3.95-6-7.75V5z"/><path d="M7.4 10l1.9 1.9 3.4-3.6"/>"#,
+        "agent" => r#"<rect x="3.5" y="5.5" width="13" height="10" rx="3"/><path d="M10 2.75v2.75M7.5 10h.01M12.5 10h.01M7.75 13h4.5"/>"#,
+        "review" => r#"<path d="M5 2.75h7l3 3v11.5H5z"/><path d="M12 2.75v3h3M7.5 10h5M7.5 13h5"/>"#,
+        "topology" => {
+            r#"<circle cx="4" cy="10" r="1.8"/><circle cx="15.5" cy="4" r="1.8"/><circle cx="15.5" cy="16" r="1.8"/><path d="M5.7 9.1 13.8 4.9M5.7 10.9l8.1 4.2"/>"#
+        }
+        "mac" => r#"<rect x="3" y="4" width="14" height="9.5" rx="1.5"/><path d="M7.5 16.5h5M10 13.5v3"/>"#,
+        "win" => r#"<rect x="3" y="3.5" width="14" height="13" rx="1.5"/><path d="M10 3.5v13M3 10h14"/>"#,
+        _ => "",
+    }
+}
+
+fn icon_image(name: &str, color: &str) -> Arc<gpui::Image> {
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" width="40" height="40" fill="none" stroke="{color}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">{}</svg>"#,
+        icon_body(name)
+    );
+    Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Svg, svg.into_bytes()))
+}
+
 fn chip(text: impl Into<gpui::SharedString>, color: Hsla) -> gpui::Div {
     div().px_2().py_0p5().rounded_md().text_xs().text_color(color).bg(hsla(color.h, color.s, color.l, 0.14)).child(text.into())
+}
+
+/// 旧画面と同じアイコン名
+fn page_icon(page: Page) -> &'static str {
+    match page {
+        Page::Dashboard => "status",
+        Page::Overview => "overview",
+        Page::Status => "status",
+        Page::Logs => "logs",
+        Page::Topology => "topology",
+        Page::Actions => "actions",
+        Page::Jobs => "jobs",
+        Page::Resources | Page::Power | Page::Specs => "resources",
+        Page::Tools => "tool",
+        Page::Ai => "agent",
+        Page::Processes => "procs",
+        Page::Security => "shield",
+        Page::Network => "sync",
+        Page::Link => "link",
+        Page::Review => "review",
+    }
+}
+
+/// 見出しの下の説明。どの画面も保存済みの値を読むだけで、押したときだけ収集や実行をする
+fn page_desc(page: Page) -> &'static str {
+    match page {
+        Page::Dashboard => "保存済みの監視データ。収集済みの Live があれば最新の値を表示します。表示だけでは収集を開始しません。",
+        Page::Overview => "全機体の状態と、優先して見るもの。直近の分析の結果です。",
+        Page::Status => "保存済みの現在状態と、最近の変化。ここで状態を計算し直すことはしません。",
+        Page::Resources => "全機体の CPU・メモリ・ディスク・swap を、直近の分析の値で並べます。",
+        Page::Processes => "直近の分析時点の、アプリ別の使用量。メモリの多い上位を機体ごとに出します。",
+        Page::Security => "ネットワークとセキュリティの監視の状態。読み取りだけで、遮断や設定の変更はしません。",
+        Page::Network => "設定確認と外部到達診断。選んだボタンを押したときだけ実行します。",
+        Page::Link => "ペア済みの tune-agent の一覧。ペアリングと解除は、鍵を扱うためここではしません。",
+        Page::Review => "task-completion.v1 の申告を一時表示します。検証・受入・完了は判定しません。",
+        Page::Power => "機体ごとの電力。計測できていない値は 0 ではなく「–」と不足項目で示します。",
+        Page::Specs => "保存済みのスペック報告を、部品の区分ごとに機体を並べて比べます。",
+        Page::Tools => "保存済みの道具の棚卸し。版差のあるものを先に並べます。",
+        Page::Ai => "AI の利用の集計。料金は料金表から求めた概算で、請求額ではありません。",
+        Page::Logs => "各機体のイベントログ。同じ形のものを「同種ログ」にまとめて数えます。",
+        Page::Topology => "観測時点の構成図（読み取り専用）。表示は上限付きで、全件ではありません。",
+        Page::Actions => "承認して実行した操作の記録。元に戻せるものは「元に戻す…」から戻せます。",
+        Page::Jobs => "自動スキャンの設定と、前回の実行。表示だけです。",
+    }
 }
 
 struct LiveHandles {
@@ -297,6 +429,7 @@ impl LiveControl {
 
 struct TuneApp {
     brand: Arc<gpui::Image>,
+    icons: Vec<(&'static str, Arc<gpui::Image>)>,
     live: Arc<LiveControl>,
     live_store: Arc<Mutex<model::LiveStore>>,
     live_dirty: Arc<AtomicBool>,
@@ -364,6 +497,14 @@ impl TuneApp {
         let gate_dirty = handles.dirty.clone();
         let mut app = Self {
             brand: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, include_bytes!("../../../build/mark.png").to_vec())),
+            icons: Page::ALL
+                .into_iter()
+                .map(page_icon)
+                .chain(["mac", "win"])
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(|n| (n, icon_image(n, "#8b93a3")))
+                .collect(),
             live,
             live_store: handles.store,
             live_dirty: handles.dirty,
@@ -713,8 +854,20 @@ impl TuneApp {
         status
     }
 
+    fn icon_view(&self, name: &str, alert: bool) -> gpui::Div {
+        let found = self.icons.iter().find(|(n, _)| *n == name).map(|(_, i)| i.clone());
+        div().size(px(16.0)).flex_none().when_some(found, |d, i| d.child(img(i).size_full())).when(alert, |d| d.border_b_2().border_color(palette::crit()))
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let row = |id: gpui::ElementId, label: String, dot: Hsla, tail: String, active: bool, page: Page, target: Option<String>, cx: &mut Context<Self>| {
+        let row = |id: gpui::ElementId,
+                   label: String,
+                   lead: gpui::AnyElement,
+                   tail: String,
+                   active: bool,
+                   page: Page,
+                   target: Option<String>,
+                   cx: &mut Context<Self>| {
             div()
                 .id(id)
                 .flex()
@@ -726,7 +879,7 @@ impl TuneApp {
                 .cursor_pointer()
                 .when(active, |d| d.bg(palette::card()))
                 .hover(|d| d.bg(palette::card()))
-                .child(div().size_2().rounded_full().bg(dot))
+                .child(lead)
                 .child(div().flex_1().truncate().text_sm().child(label))
                 .child(div().text_xs().text_color(palette::muted()).child(tail))
                 .on_mouse_down(
@@ -743,7 +896,7 @@ impl TuneApp {
             list = list.child(row(
                 ("page", i).into(),
                 page.label().into(),
-                palette::accent(),
+                self.icon_view(page_icon(page), false).into_any_element(),
                 String::new(),
                 self.selected.is_none() && self.page == page,
                 page,
@@ -762,7 +915,7 @@ impl TuneApp {
             list = list.child(row(
                 ("nav", i + 1).into(),
                 n.id.clone(),
-                score_color(&n.health),
+                div().size_2().rounded_full().bg(score_color(&n.health)).into_any_element(),
                 tail,
                 self.selected.as_deref() == Some(&n.id),
                 Page::Overview,
@@ -795,6 +948,13 @@ impl TuneApp {
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.selected.clone().unwrap_or_else(|| self.page.label().into());
+        let (icon_name, desc) = match self.selected.as_ref().and_then(|id| self.nodes.iter().find(|n| &n.id == id)) {
+            Some(n) => (
+                if n.os.eq_ignore_ascii_case("macos") { "mac" } else { "win" },
+                format!("{} · {}", n.os, if n.role.is_empty() { "機体の詳細" } else { n.role.as_str() }),
+            ),
+            None => (page_icon(self.page), page_desc(self.page).to_string()),
+        };
         let (crit, warn): (usize, usize) = self.nodes.iter().fold((0, 0), |a, n| (a.0 + n.count(Severity::Critical), a.1 + n.count(Severity::Warn)));
         let busy = self.probing || self.collection.running.is_some();
         div()
@@ -806,7 +966,16 @@ impl TuneApp {
             .py_3()
             .border_b_1()
             .border_color(palette::line())
-            .child(div().flex_1().min_w(px(150.)).text_lg().font_weight(FontWeight::SEMIBOLD).child(title))
+            .child(
+                div().flex_1().min_w(px(150.)).flex().items_center().gap_3().child(self.icon_view(icon_name, false).size(px(22.0))).child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w_0()
+                        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(title))
+                        .child(div().text_xs().text_color(palette::muted()).truncate().child(desc)),
+                ),
+            )
             .child(chip(format!("要対応 {crit}"), if crit > 0 { palette::crit() } else { palette::muted() }))
             .child(chip(format!("注意 {warn}"), if warn > 0 { palette::warn() } else { palette::muted() }))
             .child(
@@ -882,8 +1051,17 @@ impl TuneApp {
                         div()
                             .flex()
                             .items_center()
+                            .gap_2()
+                            .child(self.icon_view(if n.os.eq_ignore_ascii_case("macos") { "mac" } else { "win" }, false))
                             .child(div().flex_1().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(n.id.clone()))
-                            .child(div().text_xl().font_weight(FontWeight::BOLD).text_color(score_color(&n.health)).child(score)),
+                            .child(score_ring(
+                                match &n.health {
+                                    Health::Scored(sc) => *sc as f32 / 100.0,
+                                    _ => 0.0,
+                                },
+                                score_color(&n.health),
+                                score,
+                            )),
                     )
                     .child(div().text_xs().text_color(palette::muted()).child(format!(
                         "{}{}",
