@@ -146,6 +146,25 @@ test('a copy failure leaves no manifest and the partial directory cannot be reus
   assert.throws(() => build(f.options), /exist/);
   assert.equal(fs.existsSync(path.join(f.dist, 'manifest.json')), false);
 });
+for (const failure of ['partial write', 'close']) {
+  test(`manifest ${failure} failure leaves no published manifest and refuses directory reuse`, t => {
+    const f = fixture(t), original = fs.writeFileSync;
+    fs.writeFileSync = (file, data, ...args) => {
+      if (path.dirname(file) !== f.dist || !path.basename(file).includes('manifest')) return original(file, data, ...args);
+      // Real fixture bytes reach disk. A close failure is reported by the writer
+      // after all bytes; neither writer error may publish the final filename.
+      original(file, failure === 'partial write' ? data.slice(0, 24) : data, ...args);
+      const error = new Error(`fixture manifest ${failure} failure`);
+      error.code = 'EIO';
+      throw error;
+    };
+    try { assert.throws(() => build(f.options), { code: 'EIO' }); }
+    finally { fs.writeFileSync = original; }
+    assert.equal(fs.existsSync(path.join(f.dist, 'manifest.json')), false);
+    assert.throws(() => build(f.options), /exist/);
+    assert.equal(fs.existsSync(path.join(f.dist, 'manifest.json')), false);
+  });
+}
 test('oversized required binary is rejected before copying any bytes', t => {
   const f = fixture(t), file = path.join(f.release, 'tune-agent');
   fs.truncateSync(file, 256 * 1024 * 1024 + 1);

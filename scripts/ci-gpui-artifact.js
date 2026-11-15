@@ -90,7 +90,10 @@ function createArtifact({ root = process.cwd(), env = process.env, platform = pr
   fs.mkdirSync(dist);
   const files = inputs.map(input => copyBinary(input, dist));
   const manifest = { schema: 'katala_gpui_preview.v2', version, revision, sourceTree, platform, architecture: arch, build: { profile: 'release', target }, ci: { repository, workflowRef, workflowSha, eventName, runId, runAttempt }, files };
-  fs.writeFileSync(path.join(dist, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' });
+  // Publish only after the complete write and close succeed in our new directory.
+  const pendingManifest = path.join(dist, '.manifest.json.tmp');
+  fs.writeFileSync(pendingManifest, `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' });
+  fs.renameSync(pendingManifest, path.join(dist, 'manifest.json'));
   return manifest;
 }
 if (require.main === module) {
