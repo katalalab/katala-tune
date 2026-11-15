@@ -264,6 +264,7 @@ fn page_desc(page: Page) -> &'static str {
 }
 
 struct LiveHandles {
+    monitor: Arc<crate::monitor_host::MonitorHost>,
     live: Arc<Live>,
     store: Arc<Mutex<model::LiveStore>>,
     dirty: Arc<AtomicBool>,
@@ -438,6 +439,9 @@ impl LiveControl {
 }
 
 struct TuneApp {
+    monitor: Arc<crate::monitor_host::MonitorHost>,
+    monitor_command_tail: Option<tokio::task::JoinHandle<()>>,
+    monitor_records: Arc<Mutex<Option<Result<serde_json::Value, String>>>>,
     brand: Arc<gpui::Image>,
     icons: Vec<(&'static str, Arc<gpui::Image>)>,
     live: Arc<LiveControl>,
@@ -506,6 +510,9 @@ impl TuneApp {
         // 確認欄が出た・消えたときの描き直しは、live_dirty の旗（cx.notify だけ）で知らせる
         let gate_dirty = handles.dirty.clone();
         let mut app = Self {
+            monitor: handles.monitor,
+            monitor_command_tail: None,
+            monitor_records: Arc::new(Mutex::new(None)),
             brand: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, include_bytes!("../../../build/mark.png").to_vec())),
             icons: Page::ALL
                 .into_iter()
@@ -693,6 +700,7 @@ impl TuneApp {
     }
 
     fn refresh_live(&self, (generation, id): (u64, String)) {
+        self.monitor.ensure_ticker();
         let engine = self.engine.clone();
         let control = self.live.clone();
         self.rt.spawn(async move {
@@ -1279,6 +1287,45 @@ impl TuneApp {
             .child(trends)
             .child(body)
     }
+    fn monitor_command(&mut self, command: &'static str, patch: Option<serde_json::Value>) {
+        let (host, engine, result, records, dirty) =
+            (self.monitor.clone(), self.engine.clone(), self.action_result.clone(), self.monitor_records.clone(), self.live_dirty.clone());
+        // Chain this UI's submissions before moving blocking settings IO off
+        // the main thread. A fast Start→Pause keeps click order on Tokio too.
+        let previous = self.monitor_command_tail.take();
+        self.monitor_command_tail = Some(self.rt.spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let _ = tokio::task::spawn_blocking(move || {
+                let outcome = match command {
+                    "start" => host.start_monitor(),
+                    "pause" => {
+                        host.pause_monitor();
+                        Ok(())
+                    }
+                    "pull" => host.request_pull(),
+                    "save" => host.save_monitor_settings(patch.unwrap_or_default()),
+                    "records" => {
+                        *records.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(engine.monitor_events(&tune_core::monitor_journal::Filter {
+                            limit: Some(50),
+                            before_id: patch.as_ref().and_then(|p| p["before_id"].as_i64()),
+                            ..Default::default()
+                        }));
+                        Ok(())
+                    }
+                    _ => unreachable!(),
+                };
+                *result.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(match outcome {
+                    Ok(()) => "監視操作を受け付けました。状態欄で完了を確認してください".into(),
+                    Err(error) => error,
+                });
+                dirty.store(true, Ordering::Release);
+            })
+            .await;
+        }));
+    }
+
     fn dashboard_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
         let mut toolbar = div().flex().flex_wrap().gap_2().px_5().py_3();
         for minutes in [60, 360, 1440] {
@@ -1313,7 +1360,99 @@ impl TuneApp {
                 .child("再読込")
                 .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.reload(cx))),
         );
-        let mut body = div().flex_1().min_h_0().flex().flex_col().child(toolbar);
+        for (command, label) in [("start", "監視開始 / 再開"), ("pause", "一時停止"), ("pull", "ハブ取得"), ("records", "記録50件")] {
+            toolbar = toolbar.child(
+                div()
+                    .id(command)
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(palette::card())
+                    .text_sm()
+                    .cursor_pointer()
+                    .child(label)
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, _| app.monitor_command(command, None))),
+            );
+        }
+        let before_id = self
+            .monitor_records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|v| v["next_before_id"].as_i64());
+        if let Some(before_id) = before_id {
+            toolbar =
+                toolbar.child(div().id("monitor-older-records").px_3().py_2().bg(palette::card()).text_sm().cursor_pointer().child("前の50件").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |app, _, _, _| app.monitor_command("records", Some(serde_json::json!({"before_id":before_id})))),
+                ));
+        }
+        let observed = self.monitor.snapshot();
+        let active = self.live.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).active;
+        let status = div().px_5().text_xs().child(format!(
+            "session {:?} · worker {} / {:?} · core policy {:?} · local_collecting {:?} · stream {} · 稼働streamの最新sample {}（観測200台まで） · window visible 未観測 / active {}",
+            observed.mode, if observed.started { "開始済" } else { "未開始" }, observed.status.phase, observed.status.policy,
+            observed.status.local_collecting, observed.streams, observed.latest_sample.map_or_else(|| "未確認".into(), |t| crate::panels::time(&serde_json::json!(t))),
+            active,
+        ));
+        let mut settings = div().id("monitor-settings").max_h(px(100.)).overflow_y_scroll().px_5().py_2().flex().flex_wrap().gap_2();
+        if let Some(Ok(view)) = &self.dashboard {
+            let enabled = view.saved["monitor"]["enabled"].as_bool().unwrap_or(false);
+            settings = settings.child(
+                div()
+                    .id("monitor-enabled")
+                    .px_3()
+                    .py_2()
+                    .bg(palette::card())
+                    .text_xs()
+                    .cursor_pointer()
+                    .child(if enabled { "設定を無効にして保存" } else { "設定を有効にして保存" })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |app, _, _, _| app.monitor_command("save", Some(serde_json::json!({"enabled":!enabled})))),
+                    ),
+            );
+            let hubs = std::iter::once(None).chain(
+                self.engine.config().nodes.into_iter().filter(|n| n.is_active() && !n.local && (n.is_mac() || n.is_windows())).take(200).map(|n| Some(n.id)),
+            );
+            for (i, hub) in hubs.enumerate() {
+                let label = hub.as_ref().map_or_else(|| "ハブなしを保存".into(), |id| format!("ハブ {id} を保存"));
+                settings =
+                    settings.child(
+                        div().id(("monitor-hub", i)).px_3().py_2().bg(palette::card()).text_xs().cursor_pointer().child(label).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |app, _, _, _| app.monitor_command("save", Some(serde_json::json!({"hub":hub})))),
+                        ),
+                    );
+            }
+        }
+        let mut body = div().flex_1().min_h_0().flex().flex_col().child(toolbar).child(status).child(settings).child(
+            div().px_5().text_xs().text_color(palette::muted()).child("設定保存だけでは開始しません。一時停止・終了は実行中の取得が完了してから反映されます。"),
+        );
+        if let Some(records) = &*self.monitor_records.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
+            let text = match records {
+                Err(error) => error.clone(),
+                Ok(value) => {
+                    let rows = value["events"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .take(50)
+                        .map(|e| {
+                            format!("{} {} commit={} category={}", crate::panels::time(&e["ts"]), e["kind"], e["data"]["committed"], e["data"]["category"])
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    format!(
+                        "明示照会のみ · health {} · 未確認ACKは成功を意味しません · {}",
+                        value["health"],
+                        if rows.is_empty() { "記録なし".into() } else { rows }
+                    )
+                }
+            };
+            body = body.child(div().id("monitor-records").max_h(px(100.)).overflow_y_scroll().px_5().text_xs().child(text));
+        }
         if self.loading {
             body = body.child(div().px_5().text_xs().text_color(palette::muted()).child("保存集計を読込中…"));
         }
@@ -1824,18 +1963,18 @@ pub fn run(options: startup::Options) {
     let live_dirty = Arc::new(AtomicBool::new(false));
     let live = {
         let (store, flag) = (live_store.clone(), live_dirty.clone());
-        let live = Live::new(
+        Live::new(
             Arc::new(ProcessRoute),
             tune_core::monitor::live_opts(engine.config().nodes.len()),
             Box::new(move |event| {
                 store.lock().unwrap_or_else(std::sync::PoisonError::into_inner).merge(&event);
                 flag.store(true, Ordering::Release);
             }),
-        );
-        rt.spawn(live.clone().run_ticker());
-        live
+        )
     };
-    let handles = LiveHandles { live: live.clone(), store: live_store, dirty: live_dirty };
+    let monitor = Arc::new(crate::monitor_host::MonitorHost::new(engine.clone(), live.clone(), rt.handle().clone(), dirty.clone()));
+    let monitor_exit = monitor.clone();
+    let handles = LiveHandles { monitor, live: live.clone(), store: live_store, dirty: live_dirty };
     let rt_exit = rt.clone();
     let failed = Arc::new(AtomicBool::new(false));
     let failed_exit = failed.clone();
@@ -2038,7 +2177,10 @@ pub fn run(options: startup::Options) {
             .detach();
         }
     });
-    rt_exit.block_on(live.shutdown(Duration::from_secs(3)));
+    if !rt_exit.block_on(monitor_exit.shutdown()) {
+        eprintln!("katala-tune-gpui: 監視workerの終了または収集記録の保存ACKを確認できませんでした");
+        failed_exit.store(true, Ordering::Release);
+    }
     if failed_exit.load(Ordering::Acquire) {
         std::process::exit(1);
     }

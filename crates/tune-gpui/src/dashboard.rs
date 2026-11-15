@@ -125,13 +125,13 @@ pub fn render_dashboard(view: &DashboardView, live: &Live, now: i64) -> gpui::Di
     let saved = &view.saved;
     let mut body = div().flex().flex_col().gap_4().p_5()
         .child(div().text_sm().child(format!("{}台表示 / 全{}台 · 省略{}台（UI表示上限200台） · 過去{}分",view.nodes.len(),view.total_nodes,view.total_nodes.saturating_sub(view.nodes.len()),text(&saved["minutes"]))))
-        .child(div().text_xs().text_color(palette::muted()).child("保存済み集計と、明示開始された同じ Live の現在値。閲覧・再読込では収集しません。monitor・詳細schedulerの稼働はこのpreviewでは未接続です。200台はUIの表示上限です。coreの読取台数・応答byte数の上限ではありません。"))
+        .child(div().text_xs().text_color(palette::muted()).child("保存済み集計と、明示開始された同じ Live の現在値。閲覧・再読込では収集しません。監視は上の明示操作で開始します。詳細schedulerは未接続です。200台はUIの表示上限です。coreの読取台数・応答byte数の上限ではありません。"))
         .child(div().flex().flex_wrap().gap_2()
             .child(field("保存済みmonitor設定",format!("enabled {} · hub {}",text(&saved["monitor"]["enabled"]),text(&saved["monitor"]["hub"]))))
             .child(field("core採取方針（稼働証明ではありません）",text(&saved["collecting"])))
             .child(field("収集保守記録 health",format!("{} · running {} · {}",text(&saved["journal"]["status"]),text(&saved["journal"]["running"]),text(&saved["journal"]["summary"]))))
             .child(field("保存済み詳細scheduler",format!("enabled {} · 分析 {}分 · ログ {}分 · 道具 {}時間 · AI {}分",text(&saved["schedule"]["enabled"]),text(&saved["schedule"]["probe_minutes"]),text(&saved["schedule"]["logs_minutes"]),text(&saved["schedule"]["inventory_hours"]),text(&saved["schedule"]["ai_minutes"]))))
-            .child(field("hub取込の保存結果",format!("成功 {} · 最終試行 {} · metric fresh {} · snapshot fresh {} · error {}",text(&saved["hub_pull"]["ok"]),crate::panels::time(&saved["hub_pull"]["at"]),text(&saved["hub_pull"]["fresh"]),text(&saved["hub_pull"]["snapshot_fresh"]),text(&saved["hub_pull"]["error"])))))
+            .child(field("hub取込の保存結果",format!("成功 {} · 最終試行 {} · metric fresh {} · snapshot fresh {} · more {} · cursor {} · error {}",text(&saved["hub_pull"]["ok"]),crate::panels::time(&saved["hub_pull"]["at"]),text(&saved["hub_pull"]["fresh"]),text(&saved["hub_pull"]["snapshot_fresh"]),text(&saved["hub_pull"]["more"]),text(&saved["hub_pull"]["next"]),text(&saved["hub_pull"]["error"])))))
         .child(div().text_xs().text_color(palette::muted()).child(format!("保存集計の読込 {} · アプリ {} · 記録healthのunknownは過去の欠落ゼロを意味しません",crate::panels::time(&saved["at"]),text(&saved["app"]["version"]))));
     let until = saved["at"].as_i64().unwrap_or(now);
     let since = until - saved["minutes"].as_i64().unwrap_or(60) * 60_000;

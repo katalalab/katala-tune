@@ -16,6 +16,8 @@ mod input;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod model;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+mod monitor_host;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod native;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod network;
