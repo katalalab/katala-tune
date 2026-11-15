@@ -446,7 +446,7 @@ pub fn load(engine: &Engine, page: Page, query: &str, log_level: LogLevel) -> Re
         Page::Network => {
             let eligible = engine.config().nodes.iter().filter(|n| crate::collection::network_refusal(n).is_none()).count();
             fact(&mut p, "到達性を確認できる機体", eligible);
-            p.note.push_str(
+            p.note = String::from(
                 "各機体のネットワークの到達性を、受動的に（外へ探りを入れずに）確認します。結果は真偽だけで、IP アドレスは含みません。保存はせず、上の「全対象のネットワーク確認」を押したときだけ各機体へ接続して、結果を上の欄に出します。共用機・保護対象・台帳で接続診断を止めた機体は対象外です。",
             );
         }
