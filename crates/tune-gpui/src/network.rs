@@ -15,6 +15,7 @@ pub fn initial(nodes: &[Node]) -> Panel {
                 title: node.id.clone(),
                 badge: "未実行".into(),
                 tone: Tone::Muted,
+                undo: None,
                 detail: "明示ボタンで全対象を順番に診断します。実行直前の台帳とconnectivity許可を確認します。sharedやnetwork:falseだけでは拒否しません。"
                     .into(),
             })
@@ -137,6 +138,7 @@ pub fn row(value: &Value, active: bool) -> Row {
         })
         .into(),
         detail: detail.join("\n"),
+        undo: None,
         tone: if skipped {
             Tone::Muted
         } else if !ok {

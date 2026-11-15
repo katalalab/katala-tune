@@ -97,6 +97,8 @@ pub struct Row {
     pub detail: String,
     pub badge: String,
     pub tone: Tone,
+    /// 実行記録の行で、元に戻せるときの記録の id（元に戻す操作を持ち、まだ戻されていない成功の記録）
+    pub undo: Option<String>,
 }
 #[derive(Debug, Clone)]
 pub struct Panel {
@@ -267,7 +269,7 @@ fn timestamp_or_text(v: &Value) -> String {
     if v.is_number() { time(v) } else { scalar(v) }
 }
 fn row(p: &mut Panel, title: impl Into<String>, detail: impl Into<String>, badge: impl Into<String>, tone: Tone) {
-    p.rows.push(Row { title: title.into(), detail: detail.into(), badge: badge.into(), tone });
+    p.rows.push(Row { title: title.into(), detail: detail.into(), badge: badge.into(), tone, undo: None });
 }
 fn fact(p: &mut Panel, label: &str, value: impl ToString) {
     p.facts.push((label.into(), value.to_string()));
@@ -440,8 +442,12 @@ pub fn load(engine: &Engine, page: Page, query: &str, log_level: LogLevel) -> Re
         Page::Actions => {
             let actions = engine.with_db(|d| d.actions(100))?;
             fact(&mut p, "取得窓の操作記録数（最大100）", actions.len());
+            // 戻し済みの記録（成功した undo_of）は、もう一度戻せない
+            let undone: std::collections::HashSet<String> =
+                actions.iter().filter(|a| a["ok"] == json!(true)).filter_map(|a| a["undo_of"].as_str().map(str::to_string)).collect();
             for a in actions {
                 let status = a["state"].as_str().unwrap_or("incomplete");
+                let undoable = a["ok"] == json!(true) && !a["undo"].is_null() && a["id"].as_str().is_some_and(|id| !undone.contains(id));
                 row(
                     &mut p,
                     format!("操作 · {} · {}", field(&a, "node_id"), field(&a, "label")),
@@ -453,9 +459,12 @@ pub fn load(engine: &Engine, page: Page, query: &str, log_level: LogLevel) -> Re
                     },
                     state(&json!(status)),
                 );
+                if undoable && let Some(r) = p.rows.last_mut() {
+                    r.undo = a["id"].as_str().map(str::to_string);
+                }
             }
             p.note.push_str(
-                " 保存済みの最新100件。未完了は失敗とは別です。AI handoffはターミナル起動要求でありCLI起動確認ではありません。元に戻す操作は表示のみです。",
+                " 保存済みの最新100件。未完了は失敗とは別です。AI handoffはターミナル起動要求でありCLI起動確認ではありません。元に戻せる記録は、選んだ行の「元に戻す…」から戻せます（確認欄を通したときだけ実行します）。",
             );
         }
     }

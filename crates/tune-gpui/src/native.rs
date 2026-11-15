@@ -7,6 +7,7 @@
 use crate::{
     browser::{Reader, Request, Route},
     collection::{self, Job, Kind},
+    gate,
     input::{self, SearchInput, Submitted},
     model,
     panels::{LogLevel, Page, Panel, Tone},
@@ -318,6 +319,10 @@ struct TuneApp {
     collection: Job,
     notice: Option<String>,
     live_notice: Option<String>,
+    /// 変更操作の承認の関門（確認欄）。進むのは「実行する」を押したときだけ
+    gate: gate::Gate,
+    /// 変更操作の結果（画面上部に一行で出す）
+    action_result: Arc<Mutex<Option<String>>>,
 }
 
 impl TuneApp {
@@ -348,6 +353,8 @@ impl TuneApp {
             cx.notify();
         })
         .detach();
+        // 確認欄が出た・消えたときの描き直しは、live_dirty の旗（cx.notify だけ）で知らせる
+        let gate_dirty = handles.dirty.clone();
         let mut app = Self {
             brand: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, include_bytes!("../../../build/mark.png").to_vec())),
             live,
@@ -373,6 +380,8 @@ impl TuneApp {
             collection: Job::default(),
             notice: None,
             live_notice: None,
+            gate: gate::Gate::new(move || gate_dirty.store(true, Ordering::Release)),
+            action_result: Arc::new(Mutex::new(None)),
         };
         app.reload(cx);
         // Only poll small notification/mailbox state. All SQLite work is in Reader.
@@ -527,6 +536,33 @@ impl TuneApp {
             .map_or(if direction > 0 { 0 } else { panel.rows.len() - 1 }, |i| (i as isize + direction).clamp(0, panel.rows.len() as isize - 1) as usize);
         self.selected_row = Some(next);
         self.scroll.scroll_to_item(next, gpui::ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// 提案された変更操作を実行する。確認（承認の関門）を通り、許可リスト・共用機や保護対象の拒否・
+    /// 確認後の台帳の読み直し・実行記録はすべて tune-core の `confirm_and_run` が行う
+    fn run_action(&mut self, node_id: String, action: serde_json::Value, label: String, cx: &mut Context<Self>) {
+        let (engine, gate, result, flag, dirty) =
+            (self.engine.clone(), self.gate.clone(), self.action_result.clone(), self.live_dirty.clone(), self.dirty.clone());
+        self.rt.spawn(async move {
+            let r = engine.confirm_and_run(&node_id, &action, &format!("{node_id}: {label}"), None, gate.confirm()).await;
+            *result.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(model::action_message(&node_id, r));
+            dirty.store(true, Ordering::Release);
+            flag.store(true, Ordering::Release);
+        });
+        cx.notify();
+    }
+
+    /// 実行記録から元に戻す（戻すときも確認する）
+    fn undo_action(&mut self, entry_id: String, cx: &mut Context<Self>) {
+        let (engine, gate, result, flag, dirty) =
+            (self.engine.clone(), self.gate.clone(), self.action_result.clone(), self.live_dirty.clone(), self.dirty.clone());
+        self.rt.spawn(async move {
+            let r = engine.undo(&entry_id, gate.confirm()).await;
+            *result.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(model::action_message("", r));
+            dirty.store(true, Ordering::Release);
+            flag.store(true, Ordering::Release);
+        });
         cx.notify();
     }
 
@@ -813,8 +849,23 @@ impl TuneApp {
         div().id("overview-scroll").flex_1().overflow_y_scroll().child(grid)
     }
 
-    fn finding_row(f: &Finding) -> impl IntoElement {
+    fn finding_row(f: &Finding, node_id: &str, idx: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let color = severity_color(f.severity);
+        let proposal = f.action.clone().map(|action| {
+            let (node, title) = (node_id.to_string(), format!("{}（{}）", f.action_label, f.title));
+            div()
+                .id(("act", idx))
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .text_xs()
+                .cursor_pointer()
+                .border_1()
+                .border_color(palette::line())
+                .hover(|d| d.border_color(palette::warn()))
+                .child(format!("提案: {}…", f.action_label))
+                .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| app.run_action(node.clone(), action.clone(), title.clone(), cx)))
+        });
         div()
             .flex()
             .flex_col()
@@ -834,6 +885,7 @@ impl TuneApp {
             )
             .when(!f.detail.is_empty(), |d| d.child(div().text_xs().text_color(palette::muted()).child(f.detail.clone())))
             .when(!f.advice.is_empty(), |d| d.child(div().text_xs().child(f.advice.clone())))
+            .when_some(proposal, |d, p| d.child(div().flex().child(p)))
     }
 
     fn detail(&self, id: &str, cx: &mut Context<Self>) -> impl IntoElement {
@@ -955,8 +1007,8 @@ impl TuneApp {
             }
         }
         let mut list = div().flex().flex_col().gap_2();
-        for f in &n.findings {
-            list = list.child(Self::finding_row(f));
+        for (i, f) in n.findings.iter().enumerate() {
+            list = list.child(Self::finding_row(f, id, i, cx));
         }
         let body = match &n.health {
             Health::Excluded(reason) => div().text_sm().text_color(palette::muted()).child(format!("対象外: {reason}。接続や分析は実行しません。")),
@@ -1204,7 +1256,23 @@ impl TuneApp {
                                     .cursor_pointer()
                                     .child("コピー")
                                     .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.copy_record(cx))),
-                            ),
+                            )
+                            .when_some(row.undo.clone(), |d, id| {
+                                d.child(
+                                    div()
+                                        .id("undo-record")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(palette::line())
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .hover(|d| d.border_color(palette::warn()))
+                                        .child("元に戻す…")
+                                        .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| app.undo_action(id.clone(), cx))),
+                                )
+                            }),
                     )
                     .child(div().id("record-detail").overflow_y_scroll().px_5().pb_3().text_sm().child(format!("{}\n{}", row.title, row.detail))),
             );
@@ -1220,6 +1288,91 @@ impl TuneApp {
                 "保存済みデータ · ↑↓で詳細 / Tabで検索へ"
             }
         )))
+    }
+
+    /// 変更操作の確認。1 番目（既定）は「やめる」。「実行する」を押したときだけ進む。背景を押しても進まない
+    fn confirm_modal(&self, p: gate::Pending, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("confirm-overlay")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(hsla(0.0, 0.0, 0.0, 0.6))
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|app, _, _, cx| {
+                    app.gate.answer(false);
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .id("confirm-card")
+                    .w(px(520.0))
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .rounded_lg()
+                    .bg(palette::panel())
+                    .border_1()
+                    .border_color(palette::warn())
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(div().text_xs().text_color(palette::warn()).child("変更を伴う操作です。確認してください"))
+                    .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(p.title))
+                    .child(div().text_sm().text_color(palette::muted()).child(p.detail))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("confirm-cancel")
+                                    .px_4()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .bg(palette::accent())
+                                    .text_color(rgb(0xffffff))
+                                    .child("やめる")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|app, _, _, cx| {
+                                            app.gate.answer(false);
+                                            cx.notify();
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("confirm-run")
+                                    .px_4()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(palette::crit())
+                                    .text_color(palette::crit())
+                                    .child("実行する")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|app, _, _, cx| {
+                                            app.gate.answer(true);
+                                            cx.notify();
+                                        }),
+                                    ),
+                            ),
+                    ),
+            )
     }
 
     fn copy_record(&self, cx: &mut Context<Self>) {
@@ -1280,8 +1433,20 @@ impl Render for TuneApp {
                     .child(self.collection_status(cx))
                     .when_some(self.notice.clone(), |d, n| d.child(div().px_5().py_2().text_xs().text_color(palette::warn()).child(n)))
                     .when_some(self.live_notice.clone(), |d, n| d.child(div().px_5().py_2().text_xs().text_color(palette::warn()).child(n)))
+                    .when_some(self.action_result.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(), |d, r| {
+                        d.child(div().flex().items_center().gap_3().px_5().py_2().bg(palette::card()).child(div().flex_1().text_sm().child(r)).child(
+                            div().id("result-close").px_2().text_xs().text_color(palette::muted()).cursor_pointer().child("閉じる").on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|app, _, _, cx| {
+                                    *app.action_result.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                                    cx.notify();
+                                }),
+                            ),
+                        ))
+                    })
                     .child(main),
             )
+            .when_some(self.gate.pending(), |d, p| d.child(self.confirm_modal(p, cx)))
     }
 }
 
@@ -1297,7 +1462,7 @@ fn open_route(target: &str, ledger: &[nodes::Node]) -> Result<Route, String> {
 }
 
 pub fn run(options: startup::Options) {
-    let startup::Options { config, data, selftest, open, live_id, logs } = options;
+    let startup::Options { config, data, selftest, open, live_id, logs, confirm_demo } = options;
     if (selftest || config.exists())
         && let Err(error) = nodes::load_config(&config)
     {
@@ -1485,6 +1650,22 @@ pub fn run(options: startup::Options) {
                     if logs {
                         let (rows, sigs) = log_counts.ok_or_else(|| "selftest logs did not load".to_string())?;
                         println!("selftest logs rows={rows} sigs={sigs}");
+                    }
+                    if confirm_demo {
+                        // 確認欄が出て描かれ、「やめる」で進まないこと（何も実行しない）
+                        let (gate, rt) = window.update(cx, |app, _, _| (app.gate.clone(), app.rt.clone())).map_err(|_| "selftest window closed".to_string())?;
+                        let g = gate.clone();
+                        let task = rt.spawn(async move {
+                            (g.confirm())("確認欄の表示テスト".into(), "これは表示の確認です。何も実行しません。".into()).await
+                        });
+                        cx.background_executor().timer(Duration::from_millis(1000)).await;
+                        let shown = gate.pending().is_some();
+                        gate.answer(false);
+                        let approved = task.await.map_err(|e| format!("selftest confirm task: {e}"))?;
+                        if !shown || approved {
+                            return Err(format!("selftest confirm failed: shown={shown} approved={approved}"));
+                        }
+                        println!("selftest confirm shown={shown} approved={approved}");
                     }
                     println!("selftest ok nodes={nodes} views={count}");
                     Ok(())
