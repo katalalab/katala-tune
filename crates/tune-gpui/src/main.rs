@@ -31,7 +31,17 @@ fn main() {
     native::run(options);
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        drop(options);
+        drop((
+            options.config,
+            options.data,
+            options.selftest,
+            options.open,
+            options.live_id,
+            options.logs,
+            options.network_id,
+            options.confirm_demo,
+            options.review,
+        ));
         eprintln!("GPUI preview currently supports macOS and Windows; use tune for the CLI");
         std::process::exit(2);
     }
