@@ -282,6 +282,7 @@ struct LiveIntent {
 struct LiveState {
     generation: u64,
     active: bool,
+    closing: bool,
     intent: Option<LiveIntent>,
     notice: Option<String>,
 }
@@ -317,6 +318,12 @@ impl LiveControl {
         self.stop_locked(&mut state, why);
     }
 
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.closing = true;
+        self.stop_locked(&mut state, Stop::AppExit);
+    }
+
     fn set_active(&self, active: bool) {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.active = active;
@@ -328,7 +335,7 @@ impl LiveControl {
     fn request(&self, id: &str) -> Option<(u64, String)> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.stop_locked(&mut state, Stop::User);
-        if !state.active {
+        if state.closing || !state.active {
             state.notice = Some("ライブは前面のウィンドウから開始してください".into());
             return None;
         }
@@ -353,7 +360,7 @@ impl LiveControl {
     fn complete(&self, generation: u64, id: &str, nodes: &[nodes::Node], config_error: Option<String>) {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(intent) = state.intent.as_ref().filter(|i| i.generation == generation && i.id == id) else { return };
-        if !state.active {
+        if state.closing || !state.active {
             return;
         }
         if let Some(error) = config_error {
@@ -502,6 +509,12 @@ impl TuneApp {
         focus.focus(window);
         let live = Arc::new(LiveControl::new(handles.live, window.is_window_active()));
         cx.on_release(|app, _| app.live.stop(Stop::Hidden)).detach();
+        cx.on_app_quit(|app, _| {
+            app.live.close();
+            app.monitor.request_exit();
+            async {}
+        })
+        .detach();
         cx.observe_window_activation(window, |app, window, cx| {
             app.live.set_active(window.is_window_active());
             cx.notify();
@@ -700,7 +713,9 @@ impl TuneApp {
     }
 
     fn refresh_live(&self, (generation, id): (u64, String)) {
-        self.monitor.ensure_ticker();
+        if !self.monitor.ensure_ticker() {
+            return;
+        }
         let engine = self.engine.clone();
         let control = self.live.clone();
         self.rt.spawn(async move {
@@ -787,23 +802,12 @@ impl TuneApp {
     }
 
     fn collect(&mut self, kind: Kind, cx: &mut Context<Self>) {
-        if self.probing {
+        if self.probing || self.collection.running.is_some() {
             return;
         }
-        let Some(sender) = self.collection.begin(kind) else {
-            return;
-        };
-        let engine = self.engine.clone();
-        let progress = self.collection.progress.clone();
-        let handle = self.rt.handle().clone();
-        self.rt.spawn(async move {
-            // Engine entry points also do synchronous ledger/SQLite work. Keep
-            // the entire invocation off GPUI, including the immediate reread.
-            let result = tokio::task::spawn_blocking(move || handle.block_on(collection::run(engine, kind, None, progress)))
-                .await
-                .unwrap_or_else(|_| collection::Receipt::error(kind, "収集タスクが停止しました"));
-            let _ = sender.send(result);
-        });
+        if let Err(error) = self.monitor.start_manual(&mut self.collection, kind) {
+            self.collection.result = Some(collection::Receipt::error(kind, &error));
+        }
         cx.notify();
     }
 
@@ -1300,10 +1304,7 @@ impl TuneApp {
             let _ = tokio::task::spawn_blocking(move || {
                 let outcome = match command {
                     "start" => host.start_monitor(),
-                    "pause" => {
-                        host.pause_monitor();
-                        Ok(())
-                    }
+                    "pause" => host.pause_monitor(),
                     "pull" => host.request_pull(),
                     "save" => host.save_monitor_settings(patch.unwrap_or_default()),
                     "records" => {
@@ -1836,7 +1837,11 @@ impl Render for TuneApp {
         div()
             .key_context("Browser")
             .track_focus(&self.focus)
-            .on_action(|_: &Quit, _, cx| cx.quit())
+            .on_action(cx.listener(|app, _: &Quit, _, cx| {
+                app.live.close();
+                app.monitor.request_exit();
+                cx.quit();
+            }))
             .on_action(|_: &CloseWindow, window, _| window.remove_window())
             .on_action(cx.listener(|app, _: &GoOverview, window, cx| {
                 app.focus.focus(window);
@@ -1979,7 +1984,14 @@ pub fn run(options: startup::Options) {
     let failed = Arc::new(AtomicBool::new(false));
     let failed_exit = failed.clone();
 
+    let quit_host = monitor_exit.clone();
     Application::new().run(move |cx: &mut App| {
+        let host = quit_host.clone();
+        cx.on_app_quit(move |_| {
+            host.request_exit();
+            async {}
+        })
+        .detach();
         input::bind_keys(cx);
         cx.bind_keys([
             KeyBinding::new("alt-down", NextPage, Some("Browser")),
@@ -2017,8 +2029,9 @@ pub fn run(options: startup::Options) {
                 move |window, cx| cx.new(|cx| TuneApp::new(engine, rt, dirty, handles, window, cx)),
             )
             .expect("window");
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(move |cx| {
             if cx.windows().is_empty() {
+                quit_host.request_exit();
                 cx.quit();
             }
         })
@@ -2177,8 +2190,9 @@ pub fn run(options: startup::Options) {
             .detach();
         }
     });
-    if !rt_exit.block_on(monitor_exit.shutdown()) {
-        eprintln!("katala-tune-gpui: 監視workerの終了または収集記録の保存ACKを確認できませんでした");
+    let shutdown = rt_exit.block_on(monitor_exit.shutdown());
+    if !shutdown.confirmed() {
+        eprintln!("katala-tune-gpui: 終了または収集記録の保存ACKを確認できませんでした: {shutdown:?}");
         failed_exit.store(true, Ordering::Release);
     }
     if failed_exit.load(Ordering::Acquire) {
@@ -2254,6 +2268,19 @@ mod tests {
         })
         .await
         .expect("the existing shared sampler must continue delivering samples");
+    }
+
+    #[tokio::test]
+    async fn quit_rejects_pending_live_completion_and_reactivation() {
+        let (control, route) = controller();
+        let (generation, id) = control.request("a").unwrap();
+        control.close();
+        control.set_active(true);
+        control.complete(generation, &id, &[node("a")], None);
+        assert!(control.request("a").is_none());
+        assert!(control.live.active().is_empty());
+        assert_eq!(route.0.load(Ordering::SeqCst), 0);
+        control.live.shutdown(Duration::from_secs(1)).await;
     }
 
     #[tokio::test]

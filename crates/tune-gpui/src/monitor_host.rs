@@ -1,4 +1,5 @@
-//! Native session permission, independent from persisted collection settings.
+//! App-owned collection workers and native session permission.
+use crate::collection::{self, Job, Kind, Receipt};
 use serde_json::Value;
 use std::sync::{
     Arc, Mutex,
@@ -21,11 +22,26 @@ pub struct MonitorHost {
     request: watch::Sender<RunRequest>,
     status: watch::Sender<RunStatus>,
     started: AtomicBool,
+    drain: tokio::sync::Mutex<Option<ShutdownReport>>,
 }
 struct State {
+    manual: Option<JoinHandle<bool>>,
     worker: Option<JoinHandle<()>>,
     ticker: Option<JoinHandle<()>>,
     exiting: bool,
+}
+/// These are local completion/commit acknowledgements, never proof that a
+/// remote producer no longer exists. None means that worker was never started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShutdownReport {
+    pub manual_complete: Option<bool>,
+    pub monitor_complete: Option<bool>,
+    pub journal_ack: Option<bool>,
+}
+impl ShutdownReport {
+    pub fn confirmed(self) -> bool {
+        self.manual_complete != Some(false) && self.monitor_complete != Some(false) && self.journal_ack == Some(true)
+    }
 }
 #[derive(Clone, Debug)]
 pub struct Snapshot {
@@ -47,7 +63,8 @@ impl MonitorHost {
             request,
             status,
             started: AtomicBool::new(false),
-            state: Mutex::new(State { worker: None, ticker: None, exiting: false }),
+            state: Mutex::new(State { manual: None, worker: None, ticker: None, exiting: false }),
+            drain: tokio::sync::Mutex::new(None),
         }
     }
     fn fail(&self) {
@@ -95,15 +112,16 @@ impl MonitorHost {
         self.worker(&mut state);
         Ok(())
     }
-    pub fn pause_monitor(&self) {
+    pub fn pause_monitor(&self) -> Result<(), String> {
         let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.exiting {
-            return;
+            return Err("アプリを終了しています".into());
         }
         if state.worker.is_some() {
             self.status.send_modify(|s| s.phase = RunPhase::Stopping);
         }
         self.request.send_modify(|r| r.mode = RunMode::Paused);
+        Ok(())
     }
     pub fn request_pull(&self) -> Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -162,32 +180,82 @@ impl MonitorHost {
         }
     }
     /// Manual Live and the monitor share the same lazy ticker.
-    pub fn ensure_ticker(&self) {
+    pub fn ensure_ticker(&self) -> bool {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.exiting {
-            self.ticker(&mut state);
+        if state.exiting {
+            return false;
+        }
+        self.ticker(&mut state);
+        true
+    }
+    pub fn start_manual(&self, job: &mut Job, kind: Kind) -> Result<(), String> {
+        let engine = self.engine.clone();
+        let progress = job.progress.clone();
+        let handle = self.rt.clone();
+        self.start_manual_with(job, kind, move || handle.block_on(collection::run(engine, kind, None, progress)))
+    }
+    fn start_manual_with(&self, job: &mut Job, kind: Kind, work: impl FnOnce() -> Receipt + Send + 'static) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.exiting {
+            return Err("アプリを終了しています".into());
+        }
+        if state.manual.as_ref().is_some_and(|task| !task.is_finished()) {
+            return Err("別の収集が実行中です".into());
+        }
+        let sender = job.begin(kind).ok_or("別の収集が実行中です")?;
+        state.manual = Some(self.rt.spawn(async move {
+            // Started blocking work is not abortable. Keep both task scopes
+            // alive through result delivery, even if the UI receiver is gone.
+            let result = tokio::task::spawn_blocking(work).await;
+            let completed = result.is_ok();
+            let receipt = result.unwrap_or_else(|_| Receipt::error(kind, "収集タスクが停止しました"));
+            let _ = sender.send(receipt);
+            completed
+        }));
+        Ok(())
+    }
+    /// Close admission synchronously, including queued UI submissions. The
+    /// preview invokes this on last-window close and on every app Quit path.
+    /// Window release alone continues to release only UI Live ownership.
+    pub fn request_exit(&self) {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.exiting = true;
+        self.request.send_modify(|r| r.mode = RunMode::Exit);
+        if let Some(ticker) = &state.ticker {
+            ticker.abort();
         }
     }
-    /// Called after Application::run returns, while Tokio is still alive. A pull
-    /// finishes at its existing transport boundary; this has no overall deadline.
-    pub async fn shutdown(&self) -> bool {
-        let (worker, ticker) = {
+    /// Called outside Application::run, while Tokio is still alive. In-flight
+    /// producers finish at their existing transport/DB boundary with no overall
+    /// deadline. Only the subsequent Live/journal phase shares a three-second
+    /// budget. GPUI's 100ms on_app_quit allowance is not a drain guarantee.
+    pub async fn shutdown(&self) -> ShutdownReport {
+        self.request_exit();
+        let mut drained = self.drain.lock().await;
+        if let Some(report) = *drained {
+            return report;
+        }
+        let (manual, worker, ticker) = {
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.exiting = true;
-            self.request.send_modify(|r| r.mode = RunMode::Exit);
-            (state.worker.take(), state.ticker.take())
+            (state.manual.take(), state.worker.take(), state.ticker.take())
         };
-        let joined = match worker {
-            Some(worker) => worker.await.is_ok(),
-            None => true,
-        };
-        self.live.shutdown(Duration::from_secs(3)).await;
         if let Some(ticker) = ticker {
-            ticker.abort();
             let _ = ticker.await;
         }
-        let acknowledged = self.engine.finish_monitor_journal(Duration::from_secs(3)).await;
-        joined && acknowledged
+        let manual_complete = match manual {
+            Some(task) => Some(task.await.unwrap_or(false)),
+            None => None,
+        };
+        let monitor_complete = match worker {
+            Some(task) => Some(task.await.is_ok()),
+            None => None,
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        self.live.shutdown(deadline.saturating_duration_since(tokio::time::Instant::now())).await;
+        let journal_ack = Some(self.engine.finish_monitor_journal(deadline.saturating_duration_since(tokio::time::Instant::now())).await);
+        let report = ShutdownReport { manual_complete, monitor_complete, journal_ack };
+        *drained = Some(report);
+        report
     }
 }
 #[cfg(test)]
@@ -223,7 +291,7 @@ mod tests {
         let worker_id = host.state.lock().unwrap().worker.as_ref().unwrap().id();
         let ticker_id = host.state.lock().unwrap().ticker.as_ref().unwrap().id();
         host.start_monitor().unwrap();
-        host.pause_monitor();
+        host.pause_monitor().unwrap();
         host.start_monitor().unwrap();
         assert_eq!(host.state.lock().unwrap().worker.as_ref().unwrap().id(), worker_id);
         assert_eq!(host.state.lock().unwrap().ticker.as_ref().unwrap().id(), ticker_id);
@@ -307,8 +375,12 @@ mod tests {
         .await
         .unwrap();
         engine.with_db(|d| d.conn().execute_batch("DROP TABLE monitor_events")).unwrap();
-        assert!(!host.shutdown().await, "final shutdown must not report an unconfirmed journal commit as success");
+        assert_eq!(host.shutdown().await.journal_ack, Some(false), "final shutdown must not report an unconfirmed journal commit as success");
         assert!(engine.monitor_journal_health()["unconfirmed_acks"].as_u64().unwrap() > 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "shutdown_tests.rs"]
+mod shutdown_tests;
