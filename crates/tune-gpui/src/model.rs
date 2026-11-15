@@ -56,6 +56,10 @@ pub struct NodeView {
     pub mem_avail_pct: Option<f64>,
     pub uptime_h: Option<f64>,
     pub findings: Vec<Finding>,
+    /// 直近の履歴（古い順）。画面の推移グラフ用
+    pub score_trend: Vec<f64>,
+    pub cpu_trend: Vec<f64>,
+    pub mem_trend: Vec<f64>,
 }
 
 impl NodeView {
@@ -115,9 +119,17 @@ pub fn build(ledger_nodes: &[Value], last: &[Value]) -> Vec<NodeView> {
                 mem_avail_pct: data.and_then(|d| d.get("memory")).and_then(|m| m.get("available_pct")).and_then(Value::as_f64),
                 uptime_h: data.and_then(|d| d.get("host")).and_then(|h| h.get("uptime_h")).and_then(Value::as_f64),
                 findings,
+                score_trend: Vec::new(),
+                cpu_trend: Vec::new(),
+                mem_trend: Vec::new(),
             }
         })
         .collect()
+}
+
+/// 履歴の行（`Store::history`）から 1 つの列を取り出す。値の無い行は飛ばす
+pub fn series(rows: &[Value], key: &str) -> Vec<f64> {
+    rows.iter().filter_map(|r| r.get(key).and_then(Value::as_f64)).collect()
 }
 
 /// 「3 分前」のような相対表示
@@ -173,12 +185,18 @@ mod tests {
     fn urgency_puts_critical_first() {
         let mk = |crit: usize, score| NodeView {
             id: String::new(), os: String::new(), role: String::new(), health: Health::Scored(score), at_ms: None,
-            cpu_busy: None, mem_avail_pct: None, uptime_h: None,
+            cpu_busy: None, mem_avail_pct: None, uptime_h: None, score_trend: vec![], cpu_trend: vec![], mem_trend: vec![],
             findings: (0..crit).map(|_| Finding { severity: Severity::Critical, title: String::new(), detail: String::new(), advice: String::new() }).collect(),
         };
         let mut v = vec![mk(0, 10), mk(2, 90), mk(1, 50)];
         v.sort_by_key(NodeView::urgency);
         assert_eq!(v.iter().map(|n| n.count(Severity::Critical)).collect::<Vec<_>>(), [2, 1, 0]);
+    }
+
+    #[test]
+    fn series_skips_rows_without_the_value() {
+        let rows = vec![json!({"score": 80}), json!({"score": null}), json!({"cpu": 3}), json!({"score": 60.5})];
+        assert_eq!(series(&rows, "score"), [80.0, 60.5]);
     }
 
     #[test]

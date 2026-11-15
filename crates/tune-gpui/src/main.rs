@@ -72,6 +72,16 @@ fn severity_color(s: Severity) -> Hsla {
     }
 }
 
+/// 棒の推移グラフ。0〜`max` を高さにし、点が無ければ空の枠だけ描く
+fn trend(values: &[f64], max: f64, color: Hsla, height: f32) -> gpui::Div {
+    let mut bars = div().h(px(height)).flex().items_end().gap_px();
+    for v in values.iter().rev().take(60).rev() {
+        let h = ((v / max).clamp(0.0, 1.0) as f32 * height).max(1.0);
+        bars = bars.child(div().w(px(3.0)).h(px(h)).rounded_sm().bg(color));
+    }
+    bars
+}
+
 fn chip(text: impl Into<gpui::SharedString>, color: Hsla) -> gpui::Div {
     div()
         .px_2()
@@ -126,6 +136,13 @@ impl TuneApp {
         match self.engine.last() {
             Ok(last) => {
                 self.nodes = model::build(&ledger, &last);
+                for n in &mut self.nodes {
+                    if let Ok(rows) = self.engine.with_db(|d| d.history(&n.id, 60)) {
+                        n.score_trend = model::series(&rows, "score");
+                        n.cpu_trend = model::series(&rows, "cpu");
+                        n.mem_trend = model::series(&rows, "mem_avail");
+                    }
+                }
                 self.notice = self.engine.config_error();
             }
             Err(e) => self.notice = Some(e),
@@ -273,6 +290,7 @@ impl TuneApp {
                     )))
                     .child(metric("CPU", n.cpu_busy, "%"))
                     .child(metric("空きメモリ", n.mem_avail_pct, "%"))
+                    .when(!n.score_trend.is_empty(), |d| d.child(trend(&n.score_trend, 100.0, score_color(&n.health), 18.0)))
                     .child(foot)
                     .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| {
                         app.selected = Some(id.clone());
@@ -320,6 +338,20 @@ impl TuneApp {
         if let Some(u) = n.uptime_h {
             facts = facts.child(chip(format!("稼働 {}", model::uptime(u)), palette::muted()));
         }
+        let mut trends = div().flex().flex_wrap().gap_5();
+        for (label, values, max, color) in [
+            ("スコア", &n.score_trend, 100.0, palette::ok()),
+            ("CPU 使用率", &n.cpu_trend, 100.0, palette::accent()),
+            ("空きメモリ", &n.mem_trend, 100.0, palette::warn()),
+        ] {
+            if !values.is_empty() {
+                trends = trends.child(
+                    div().flex().flex_col().gap_1().p_3().rounded_md().bg(palette::card())
+                        .child(div().text_xs().text_color(palette::muted()).child(format!("{label}（直近 {} 回）", values.len().min(60))))
+                        .child(trend(values, max, color, 44.0)),
+                );
+            }
+        }
         let mut list = div().flex().flex_col().gap_2();
         for f in &n.findings {
             list = list.child(Self::finding_row(f));
@@ -330,7 +362,7 @@ impl TuneApp {
             Health::Scored(_) if n.findings.is_empty() => div().text_sm().text_color(palette::ok()).child("所見はありません"),
             Health::Scored(_) => list,
         };
-        div().id("detail").flex_1().overflow_y_scroll().flex().flex_col().gap_4().p_5().child(facts).child(body)
+        div().id("detail").flex_1().overflow_y_scroll().flex().flex_col().gap_4().p_5().child(facts).child(trends).child(body)
     }
 }
 
