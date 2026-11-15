@@ -48,3 +48,9 @@ if [ -n "${E2E_NETWORK_NODE:-}" ]; then
   [ "$out" = "selftest network ok_rows=1" ] || { echo "E2E 失敗: ネットワーク確認 ($out)" >&2; exit 1; }
   echo "e2e-gpui network OK"
 fi
+
+# 常時: 変更操作の確認欄が描け、「やめる」で進まないこと（何も実行しない）。承認の判定そのものは単体テスト（gate.rs）で確かめる。
+conf=$(./target/release/katala-tune --selftest --config config/nodes.example.json --data "$tmp/confirm-data" --confirm-demo | grep "^selftest confirm")
+echo "$conf"
+[ "$conf" = "selftest confirm shown=true approved=Some(false)" ] || { echo "E2E 失敗: 確認欄 ($conf)" >&2; exit 1; }
+echo "e2e-gpui confirm OK"

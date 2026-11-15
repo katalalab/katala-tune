@@ -34,6 +34,9 @@ pub struct Finding {
     pub title: String,
     pub detail: String,
     pub advice: String,
+    /// 提案された変更操作（tune-core の許可リストの形）と、その表示名。共用機の所見には付かない
+    pub action: Option<Value>,
+    pub action_label: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -110,6 +113,8 @@ fn finding(v: &Value) -> Finding {
         title: str_of(v.get("title")),
         detail: str_of(v.get("detail")),
         advice: str_of(v.get("advice")),
+        action: v.get("action").filter(|a| a.get("type").is_some()).cloned(),
+        action_label: str_of(v.get("action").and_then(|a| a.get("label"))),
     }
 }
 
@@ -412,6 +417,9 @@ pub fn status(v: &Value) -> StatusView {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActionRow {
+    pub id: String,
+    /// 元に戻せる（元に戻す操作を持ち、まだ戻されていない）
+    pub can_undo: bool,
     pub at_ms: i64,
     pub node: String,
     pub label: String,
@@ -421,9 +429,16 @@ pub struct ActionRow {
 
 /// 実行記録（`Store::actions`）。新しい順
 pub fn actions(rows: &[Value]) -> Vec<ActionRow> {
+    let undone: std::collections::HashSet<String> = rows
+        .iter()
+        .filter(|r| r.get("ok").and_then(Value::as_bool) == Some(true))
+        .filter_map(|r| r.get("undo_of").and_then(Value::as_str).map(str::to_string))
+        .collect();
     let mut v: Vec<ActionRow> = rows
         .iter()
         .map(|r| ActionRow {
+            id: str_of(r.get("id")),
+            can_undo: r.get("undo").is_some_and(|u| !u.is_null()) && r.get("ok").and_then(Value::as_bool) == Some(true) && !undone.contains(&str_of(r.get("id"))),
             at_ms: r.get("at").and_then(Value::as_i64).unwrap_or(0),
             node: str_of(r.get("node_id")),
             label: one_line(&str_of(r.get("label")), 160),
@@ -780,6 +795,21 @@ pub fn network(v: &Value) -> Vec<NetRow> {
         .unwrap_or_default()
 }
 
+/// `confirm_and_run` / `undo` の結果を一行にする。取り消し・拒否・失敗・成功を取り違えない
+pub fn action_message(node: &str, r: Result<Value, String>) -> String {
+    let who = if node.is_empty() { String::new() } else { format!("{node}: ") };
+    match r {
+        Err(e) => format!("{who}実行できませんでした: {e}"),
+        Ok(v) if v.get("cancelled").and_then(Value::as_bool) == Some(true) => format!("{who}取り消しました（何も実行していません）"),
+        Ok(v) if v.get("refused").is_some_and(|x| !x.is_null()) => format!("{who}実行しませんでした: {}", str_of(v.get("refused"))),
+        Ok(v) if v.get("ok").and_then(Value::as_bool) == Some(true) => {
+            let o = str_of(v.get("outcome"));
+            format!("{who}{}", if o.is_empty() { "完了しました".to_string() } else { one_line(&o, 200) })
+        }
+        Ok(v) => format!("{who}失敗しました: {}", one_line(&str_of(v.get("output")), 200)),
+    }
+}
+
 /// ライブ表示で貯める点（直近 3 分 = 1 秒ごとに 180 点）
 pub const LIVE_KEEP: usize = 180;
 
@@ -881,7 +911,7 @@ mod tests {
             id: String::new(), os: String::new(), role: String::new(), health: Health::Scored(score), at_ms: None,
             cpu_busy: None, mem_avail_pct: None, uptime_h: None, score_trend: vec![], cpu_trend: vec![], mem_trend: vec![],
             swap_gb: None, cores: None, cpu_name: String::new(), disks: vec![], apps: vec![], agent_processes: None,
-            findings: (0..crit).map(|_| Finding { severity: Severity::Critical, title: String::new(), detail: String::new(), advice: String::new() }).collect(),
+            findings: (0..crit).map(|_| Finding { severity: Severity::Critical, title: String::new(), detail: String::new(), advice: String::new(), action: None, action_label: String::new() }).collect(),
         };
         let mut v = vec![mk(0, 10), mk(2, 90), mk(1, 50)];
         v.sort_by_key(NodeView::urgency);
@@ -959,6 +989,42 @@ mod tests {
         assert_eq!(s.events[0].ts_ms, 9);
         assert_eq!(s.last_probe_ms, Some(7));
         assert_eq!(status(&json!({})), StatusView::default());
+    }
+
+    #[test]
+    fn findings_carry_actions_and_undo_state_is_derived() {
+        let v = build(
+            &[json!({"id": "a"})],
+            &[json!({"node_id": "a", "ok": true, "findings": [
+                {"severity": "warn", "title": "t", "action": {"type": "kill-process", "label": "止める", "params": {}}},
+                {"severity": "warn", "title": "u"},
+                {"severity": "warn", "title": "v", "action": {"label": "型なし"}}
+            ]})],
+        );
+        let f = &v[0].findings;
+        assert_eq!(f[0].action_label, "止める");
+        assert!(f[0].action.is_some() && f[1].action.is_none() && f[2].action.is_none());
+        let a = actions(&[
+            json!({"id": "1", "at": 1, "ok": true, "undo": {"type": "x"}}),
+            json!({"id": "2", "at": 2, "ok": true, "undo": {"type": "x"}}),
+            json!({"id": "3", "at": 3, "ok": true, "undo_of": "1"}),
+            json!({"id": "4", "at": 4, "ok": false, "undo": {"type": "x"}}),
+        ]);
+        let by = |id: &str| a.iter().find(|r| r.id == id).unwrap().can_undo;
+        assert!(!by("1"), "戻し済み");
+        assert!(by("2"));
+        assert!(!by("3") && !by("4"), "戻しの記録・失敗した記録は戻せない");
+    }
+
+    #[test]
+    fn action_messages_do_not_confuse_outcomes() {
+        assert!(action_message("a", Ok(json!({"cancelled": true}))).contains("取り消しました"));
+        assert!(action_message("a", Ok(json!({"refused": "共用機"}))).contains("実行しませんでした: 共用機"));
+        assert!(action_message("a", Ok(json!({"ok": true, "outcome": "完了"}))).ends_with("完了"));
+        assert!(action_message("a", Ok(json!({"ok": false, "output": "x"}))).contains("失敗しました"));
+        assert!(action_message("", Err("e".into())).starts_with("実行できませんでした"));
+        // cancelled が ok より優先される
+        assert!(action_message("a", Ok(json!({"ok": true, "cancelled": true}))).contains("取り消しました"));
     }
 
     #[test]
