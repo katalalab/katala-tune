@@ -20,6 +20,8 @@ unicode-segmentation = "1.12"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 gpui = "0.2.2"
+sha2 = "0.11"
+tune-link.workspace = true
 
 [lints]
 workspace = true
