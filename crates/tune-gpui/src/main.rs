@@ -108,11 +108,12 @@ enum Page {
     Power,
     Tools,
     Ai,
+    Specs,
 }
 
 impl Page {
     /// サイドバーに並べる順
-    const NAV: [Self; 9] = [Self::Status, Self::Resources, Self::Power, Self::Tools, Self::Ai, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
+    const NAV: [Self; 10] = [Self::Status, Self::Resources, Self::Power, Self::Specs, Self::Tools, Self::Ai, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
 
     fn title(self) -> &'static str {
         match self {
@@ -126,6 +127,7 @@ impl Page {
             Self::Power => "電力・Clock",
             Self::Tools => "道具",
             Self::Ai => "AI",
+            Self::Specs => "スペック比較",
         }
     }
 
@@ -140,6 +142,7 @@ impl Page {
             "power" => Self::Power,
             "tools" => Self::Tools,
             "ai" => Self::Ai,
+            "specs" => Self::Specs,
             _ => return None,
         })
     }
@@ -169,6 +172,7 @@ struct TuneApp {
     power: model::PowerView,
     tools: model::InventoryView,
     ai: model::AiView,
+    specs: model::SpecsView,
     schedule: model::ScheduleView,
     status: model::StatusView,
     topology: model::TopologyView,
@@ -179,7 +183,7 @@ struct TuneApp {
 
 impl TuneApp {
     fn new(engine: Arc<Engine>, rt: Arc<tokio::runtime::Runtime>, dirty: Arc<AtomicBool>, live: LiveHandles, cx: &mut Context<Self>) -> Self {
-        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page: Page::Overview, actions: Vec::new(), power: Default::default(), tools: Default::default(), ai: Default::default(), schedule: Default::default(), status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
+        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page: Page::Overview, actions: Vec::new(), power: Default::default(), tools: Default::default(), ai: Default::default(), specs: Default::default(), schedule: Default::default(), status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
         app.reload();
         app.load_status();
         // 通知を待つ代わりに 0.4 秒ごとに旗を見る。変わったときだけ読み直して描き直す
@@ -265,6 +269,11 @@ impl TuneApp {
             Page::Ai => {
                 if let Ok(v) = self.engine.ai_summary(&serde_json::json!({})) {
                     self.ai = model::ai(&v);
+                }
+            }
+            Page::Specs => {
+                if let Ok(v) = self.engine.specs_view() {
+                    self.specs = model::specs(&v);
                 }
             }
             Page::Overview | Page::Resources => {}
@@ -768,6 +777,43 @@ impl TuneApp {
             .child(tools)
     }
 
+    /// 部品の一覧を機体ごとに並べる（保存済みの報告）。取得に失敗した機体は前回の報告を出し、その旨を示す
+    fn specs_page(&self) -> impl IntoElement {
+        let now = now_ms();
+        let sp = &self.specs;
+        let mut meta = div().flex().flex_wrap().gap_2();
+        for n in &sp.nodes {
+            let (text, color) = if !n.eligible {
+                (format!("{} 対象外", n.node), palette::muted())
+            } else if n.last_failed {
+                (format!("{} 取得失敗（前回 {}）", n.node, n.at_ms.map_or("なし".to_string(), |a| model::ago(now, a))), palette::warn())
+            } else {
+                (format!("{} {} · {}", n.node, n.collector, n.at_ms.map_or("未取得".to_string(), |a| model::ago(now, a))), palette::muted())
+            };
+            meta = meta.child(chip(text, color));
+        }
+        let mut body = div().flex().flex_col().gap_4();
+        for sec in &sp.sections {
+            let mut rows = div().flex().flex_col().gap_1();
+            for (node, names) in &sec.rows {
+                rows = rows.child(
+                    div().flex().gap_2().px_2().py_1().rounded_md().bg(palette::card())
+                        .child(div().w(px(110.0)).flex_none().truncate().text_xs().text_color(palette::muted()).child(node.clone()))
+                        .child(div().flex_1().min_w_0().text_xs().child(names.join(" / "))),
+                );
+            }
+            body = body.child(
+                div().flex().flex_col().gap_1()
+                    .child(div().flex().items_center().gap_2().child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(sec.name.clone())).child(div().text_xs().text_color(palette::muted()).child(format!("{} 部品 · 公式情報で未確認 {}", sec.components, sec.unverified))))
+                    .child(rows),
+            );
+        }
+        div().id("specs").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5()
+            .child(div().text_xs().text_color(palette::muted()).child("保存済みのスペック報告。収集は旧画面か CLI で行います。公式情報と照合できていない部品は「未確認」として数えます。"))
+            .child(meta)
+            .child(body)
+    }
+
     fn actions_page(&self) -> impl IntoElement {
         let now = now_ms();
         let mut rows = div().flex().flex_col().gap_1();
@@ -929,6 +975,7 @@ impl Render for TuneApp {
                 Page::Power => self.power_page().into_any_element(),
                 Page::Tools => self.tools_page().into_any_element(),
                 Page::Ai => self.ai_page().into_any_element(),
+                Page::Specs => self.specs_page().into_any_element(),
             },
         };
         div()
@@ -1035,7 +1082,7 @@ fn main() {
                 cx.background_executor().timer(Duration::from_millis(if live_id.is_some() { 8000 } else { 1500 })).await;
                 println!("selftest ok nodes={view}");
                 // 開いた画面のデータが読めたか（画面ごとの件数）。--open <page> と併用する
-                let counts = window.update(cx, |v, _, _| format!("power={} actions={} status={} topology={} tools={} ai={}", v.power.rows.len(), v.actions.len(), v.status.checks.len(), v.topology.entities.len(), v.tools.groups.len(), v.ai.sessions)).unwrap_or_default();
+                let counts = window.update(cx, |v, _, _| format!("power={} actions={} status={} topology={} tools={} ai={} specs={}", v.power.rows.len(), v.actions.len(), v.status.checks.len(), v.topology.entities.len(), v.tools.groups.len(), v.ai.sessions, v.specs.sections.len())).unwrap_or_default();
                 println!("selftest page {counts}");
                 if logs {
                     let (r, g) = window.update(cx, |v, _, _| (v.logs.len(), v.sigs.len())).unwrap_or((0, 0));

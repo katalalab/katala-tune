@@ -32,7 +32,7 @@ fi
 
 # 任意: E2E_PAGES=1 で、各画面（電力・実行記録・状態・構成図・道具・AI）のデータが実機の保存済みから読めることを確かめる（読み取りだけ）。
 if [ -n "${E2E_PAGES:-}" ]; then
-  for pair in power:power actions:actions status:status topology:topology tools:tools ai:ai; do
+  for pair in power:power actions:actions status:status topology:topology tools:tools ai:ai specs:specs; do
     pg=${pair%%:*}; key=${pair##*:}
     n=$(./target/release/katala-tune --selftest --open "$pg" | grep "^selftest page" | grep -o "$key=[0-9]*" | cut -d= -f2)
     [ "${n:-0}" -ge 1 ] || { echo "E2E 失敗: $pg のデータが読めない（$n）" >&2; exit 1; }

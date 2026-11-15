@@ -616,6 +616,62 @@ pub fn ai(v: &Value) -> AiView {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpecNode {
+    pub node: String,
+    pub eligible: bool,
+    pub collector: String,
+    pub at_ms: Option<i64>,
+    /// 直近の取得が失敗したか（失敗しても前回の報告は残る）
+    pub last_failed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpecSection {
+    pub name: String,
+    /// (機体, 部品名)。部品が無い機体は出さない
+    pub rows: Vec<(String, Vec<String>)>,
+    pub components: usize,
+    /// 公式情報と照合できなかった部品の数
+    pub unverified: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SpecsView {
+    pub nodes: Vec<SpecNode>,
+    pub sections: Vec<SpecSection>,
+}
+
+/// `Engine::specs_view`（保存済みの報告）。収集は走らせない
+pub fn specs(v: &Value) -> SpecsView {
+    let nodes_json = v.get("nodes").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let mut sections: std::collections::BTreeMap<String, SpecSection> = Default::default();
+    let mut nodes = Vec::new();
+    for n in nodes_json {
+        let id = str_of(n.get("node_id"));
+        let report = n.get("report").filter(|r| r.is_object());
+        nodes.push(SpecNode {
+            node: id.clone(),
+            eligible: n.get("eligible").and_then(Value::as_bool) == Some(true),
+            collector: str_of(report.and_then(|r| r.get("collector_version"))),
+            at_ms: report.and_then(|r| r.get("at")).and_then(Value::as_i64),
+            last_failed: n.get("last_attempt").and_then(|a| a.get("ok")).and_then(Value::as_bool) == Some(false),
+        });
+        let Some(secs) = report.and_then(|r| r.get("sections")).and_then(Value::as_object) else { continue };
+        for (name, sec) in secs {
+            let comps = sec.get("components").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+            if comps.is_empty() {
+                continue;
+            }
+            let e = sections.entry(name.clone()).or_insert_with(|| SpecSection { name: name.clone(), rows: Vec::new(), components: 0, unverified: 0 });
+            e.components += comps.len();
+            e.unverified += comps.iter().filter(|c| c.get("official").and_then(|o| o.get("status")).and_then(Value::as_str) != Some("verified")).count();
+            e.rows.push((id.clone(), comps.iter().map(|c| one_line(&str_of(c.get("name")), 60)).collect()));
+        }
+    }
+    SpecsView { nodes, sections: sections.into_values().collect() }
+}
+
 /// ライブ表示で貯める点（直近 3 分 = 1 秒ごとに 180 点）
 pub const LIVE_KEEP: usize = 180;
 
@@ -854,6 +910,23 @@ mod tests {
         assert_eq!(a.models[0].0, "big");
         assert_eq!(a.tools[0], ("b".to_string(), 7, 2));
         assert_eq!(ai(&json!({})), AiView::default());
+    }
+
+    #[test]
+    fn specs_groups_by_section_and_counts_unverified() {
+        let v = json!({"nodes": [
+            {"node_id": "a", "eligible": true, "last_attempt": {"ok": false}, "report": {"collector_version": "1", "at": 5, "sections": {
+                "gpu": {"components": [{"name": "G1", "official": {"status": "verified"}}, {"name": "G2", "official": {"status": "unverified"}}]},
+                "audio": {"components": []}}}},
+            {"node_id": "b", "eligible": false}
+        ]});
+        let s = specs(&v);
+        assert_eq!(s.nodes.len(), 2);
+        assert!(s.nodes[0].last_failed && !s.nodes[1].eligible);
+        assert_eq!(s.sections.len(), 1);
+        assert_eq!((s.sections[0].components, s.sections[0].unverified), (2, 1));
+        assert_eq!(s.sections[0].rows[0].1, ["G1", "G2"]);
+        assert_eq!(specs(&json!({})), SpecsView::default());
     }
 
     #[test]
