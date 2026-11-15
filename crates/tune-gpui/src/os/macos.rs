@@ -83,7 +83,12 @@ impl Mac {
             let id = bundle.bundleIdentifier().ok_or("bundle identifier がありません")?;
             identity(&path, &executable, &current, &id.to_string())
         })();
-        Self { identity: actual, login_supported: config == tune_core::nodes::user_config_path() && data == tune_core::nodes::data_dir().join("gpui-preview") }
+        // mainAppService does not preserve this process's environment at login.
+        let inherited_paths = ["KATALA_TUNE_CONFIG", "KATALA_TUNE_DATA_DIR"].iter().any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
+        Self {
+            identity: actual,
+            login_supported: !inherited_paths && config == tune_core::nodes::user_config_path() && data == tune_core::nodes::data_dir().join("gpui-preview"),
+        }
     }
     fn center(&self) -> Result<objc2::rc::Retained<UNUserNotificationCenter>, String> {
         self.identity.as_ref().map_err(Clone::clone)?;
