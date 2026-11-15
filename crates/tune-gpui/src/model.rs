@@ -192,6 +192,9 @@ pub struct LiveNode {
     pub mem: Vec<f64>,
     pub latest_cpu: Option<f64>,
     pub latest_mem: Option<f64>,
+    /// GPU 使用率（複数 GPU は最大値）。センサーのない機体では空のまま
+    pub gpu: Vec<f64>,
+    pub latest_gpu: Option<f64>,
     last_t: Option<i64>,
 }
 
@@ -219,14 +222,18 @@ impl LiveStore {
                 s.last_t = Some(t);
                 s.latest_cpu = p.get("cpu").and_then(Value::as_f64);
                 s.latest_mem = p.get("mem").and_then(Value::as_f64);
+                s.latest_gpu = p.get("gpu").and_then(Value::as_f64);
                 if let Some(cpu) = s.latest_cpu {
                     s.cpu.push(cpu);
                 }
                 if let Some(mem) = s.latest_mem {
                     s.mem.push(mem);
                 }
+                if let Some(gpu) = s.latest_gpu {
+                    s.gpu.push(gpu);
+                }
             }
-            for v in [&mut s.cpu, &mut s.mem] {
+            for v in [&mut s.cpu, &mut s.mem, &mut s.gpu] {
                 if v.len() > LIVE_KEEP {
                     v.drain(..v.len() - LIVE_KEEP);
                 }
@@ -271,6 +278,17 @@ mod tests {
         assert_eq!(store.0["a"].cpu.len(), LIVE_KEEP);
         assert!(store.0["a"].mem.is_empty());
         assert_eq!(store.0["a"].state, "live");
+    }
+
+    #[test]
+    fn live_gpu_is_kept_only_when_the_sensor_reports_it() {
+        let mut store = LiveStore::default();
+        store.merge(&json!({"nodes":{"a":{"points":[{"t":1,"cpu":5,"gpu":40},{"t":2,"cpu":6},{"t":3,"cpu":7,"gpu":55}]}}}));
+        let a = &store.0["a"];
+        assert_eq!(a.gpu, [40.0, 55.0]);
+        assert_eq!(a.latest_gpu, Some(55.0));
+        store.merge(&json!({"nodes":{"b":{"points":[{"t":1,"cpu":5}]}}}));
+        assert!(store.0["b"].gpu.is_empty() && store.0["b"].latest_gpu.is_none());
     }
 
     fn ledger() -> Vec<Value> {

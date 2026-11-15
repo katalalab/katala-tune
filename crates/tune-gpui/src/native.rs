@@ -1329,6 +1329,23 @@ impl TuneApp {
                     )
                     .child(trend(&l.mem, 100.0, palette::warn(), 48.0)),
             )
+            .when(!l.gpu.is_empty(), |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().text_xs().text_color(palette::muted()).child("GPU 使用率"))
+                                .child(div().text_xl().font_weight(FontWeight::BOLD).child(now(l.latest_gpu))),
+                        )
+                        .child(trend(&l.gpu, 100.0, palette::ok(), 48.0)),
+                )
+            })
     }
 
     /// リソース画面の上部。台帳で観測できる機体を選んでライブ（1 秒ごと）を一つだけ開始する。
