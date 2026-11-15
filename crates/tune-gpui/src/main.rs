@@ -1,17 +1,17 @@
 //! Katala Tune のネイティブ画面（Rust + GPUI）。WebView も Node も使わず、tune-core の Engine を直接呼ぶ。
 //!
-//! 実行: `katala-tune [--config 台帳.json] [--data データdir] [--selftest]`
+//! 実行: `katala-tune-gpui [--config 台帳.json] [--data データdir] [--selftest]`
 //! `--selftest` は画面を開いて台帳と前回結果を読み、1 フレーム描いて終了する（E2E 用。分析は走らせない）。
 
 mod model;
+mod startup;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    App, Application, Bounds, Context, FontWeight, Hsla, MouseButton, Window, WindowBounds, WindowOptions, div, hsla, point,
-    prelude::*, px, rgb, size,
+    App, Application, Bounds, Context, FontWeight, Hsla, MouseButton, Window, WindowBounds, WindowOptions, div, hsla, point, prelude::*, px, rgb, size,
 };
 use model::{Finding, Health, NodeView, Severity};
 use tune_core::engine::{Engine, Host};
@@ -24,16 +24,36 @@ const FONT: &str = "Segoe UI";
 
 mod palette {
     use gpui::{Hsla, rgb};
-    pub fn bg() -> Hsla { rgb(0x111318).into() }
-    pub fn panel() -> Hsla { rgb(0x181b22).into() }
-    pub fn card() -> Hsla { rgb(0x1e222b).into() }
-    pub fn line() -> Hsla { rgb(0x2a2f3a).into() }
-    pub fn text() -> Hsla { rgb(0xe8eaef).into() }
-    pub fn muted() -> Hsla { rgb(0x8b93a3).into() }
-    pub fn accent() -> Hsla { rgb(0x4f8cff).into() }
-    pub fn ok() -> Hsla { rgb(0x3fbf7f).into() }
-    pub fn warn() -> Hsla { rgb(0xe5a93d).into() }
-    pub fn crit() -> Hsla { rgb(0xe5584f).into() }
+    pub fn bg() -> Hsla {
+        rgb(0x111318).into()
+    }
+    pub fn panel() -> Hsla {
+        rgb(0x181b22).into()
+    }
+    pub fn card() -> Hsla {
+        rgb(0x1e222b).into()
+    }
+    pub fn line() -> Hsla {
+        rgb(0x2a2f3a).into()
+    }
+    pub fn text() -> Hsla {
+        rgb(0xe8eaef).into()
+    }
+    pub fn muted() -> Hsla {
+        rgb(0x8b93a3).into()
+    }
+    pub fn accent() -> Hsla {
+        rgb(0x4f8cff).into()
+    }
+    pub fn ok() -> Hsla {
+        rgb(0x3fbf7f).into()
+    }
+    pub fn warn() -> Hsla {
+        rgb(0xe5a93d).into()
+    }
+    pub fn crit() -> Hsla {
+        rgb(0xe5584f).into()
+    }
 }
 
 /// 分析・取り込みの完了などを画面側に知らせるだけの Host（描画はここでは触らない）
@@ -60,7 +80,7 @@ fn score_color(h: &Health) -> Hsla {
         Health::Scored(s) if *s >= 80 => palette::ok(),
         Health::Scored(s) if *s >= 55 => palette::warn(),
         Health::Scored(_) | Health::Failed(_) => palette::crit(),
-        Health::Unobserved => palette::muted(),
+        Health::Unobserved | Health::Excluded(_) => palette::muted(),
     }
 }
 
@@ -83,14 +103,7 @@ fn trend(values: &[f64], max: f64, color: Hsla, height: f32) -> gpui::Div {
 }
 
 fn chip(text: impl Into<gpui::SharedString>, color: Hsla) -> gpui::Div {
-    div()
-        .px_2()
-        .py_0p5()
-        .rounded_md()
-        .text_xs()
-        .text_color(color)
-        .bg(hsla(color.h, color.s, color.l, 0.14))
-        .child(text.into())
+    div().px_2().py_0p5().rounded_md().text_xs().text_color(color).bg(hsla(color.h, color.s, color.l, 0.14)).child(text.into())
 }
 
 struct TuneApp {
@@ -180,10 +193,13 @@ impl TuneApp {
                 .child(div().size_2().rounded_full().bg(dot))
                 .child(div().flex_1().truncate().text_sm().child(label))
                 .child(div().text_xs().text_color(palette::muted()).child(tail))
-                .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| {
-                    app.selected = target.clone();
-                    cx.notify();
-                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |app, _, _, cx| {
+                        app.selected = target.clone();
+                        cx.notify();
+                    }),
+                )
         };
         let mut list = div().flex().flex_col().gap_0p5().p_2();
         list = list.child(row(("nav", 0usize).into(), "概要".into(), palette::accent(), String::new(), self.selected.is_none(), None, cx));
@@ -192,8 +208,17 @@ impl TuneApp {
                 Health::Scored(s) => s.to_string(),
                 Health::Failed(_) => "失敗".into(),
                 Health::Unobserved => "未".into(),
+                Health::Excluded(_) => "対象外".into(),
             };
-            list = list.child(row(("nav", i + 1).into(), n.id.clone(), score_color(&n.health), tail, self.selected.as_deref() == Some(&n.id), Some(n.id.clone()), cx));
+            list = list.child(row(
+                ("nav", i + 1).into(),
+                n.id.clone(),
+                score_color(&n.health),
+                tail,
+                self.selected.as_deref() == Some(&n.id),
+                Some(n.id.clone()),
+                cx,
+            ));
         }
         div()
             .w(px(232.0))
@@ -249,10 +274,21 @@ impl TuneApp {
                 Health::Scored(s) => s.to_string(),
                 Health::Failed(_) => "!".into(),
                 Health::Unobserved => "–".into(),
+                Health::Excluded(_) => "対象外".into(),
             };
             let mut foot = div().flex().flex_wrap().gap_1p5();
             if let Health::Failed(e) = &n.health {
-                foot = foot.child(div().max_w(px(212.0)).overflow_hidden().whitespace_nowrap().text_ellipsis().child(chip(e.lines().next().unwrap_or("失敗").to_string(), palette::crit())));
+                foot = foot.child(
+                    div()
+                        .max_w(px(212.0))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(chip(e.lines().next().unwrap_or("失敗").to_string(), palette::crit())),
+                );
+            }
+            if let Health::Excluded(label) = &n.health {
+                foot = foot.child(chip(label.clone(), palette::muted()));
             }
             for (sev, count) in [(Severity::Critical, n.count(Severity::Critical)), (Severity::Warn, n.count(Severity::Warn))] {
                 if count > 0 {
@@ -260,7 +296,12 @@ impl TuneApp {
                 }
             }
             let metric = |label: &str, v: Option<f64>, unit: &str| {
-                div().flex().justify_between().text_xs().child(div().text_color(palette::muted()).child(label.to_string())).child(v.map_or("–".to_string(), |v| format!("{v:.0}{unit}")))
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_xs()
+                    .child(div().text_color(palette::muted()).child(label.to_string()))
+                    .child(v.map_or("–".to_string(), |v| format!("{v:.0}{unit}")))
             };
             grid = grid.child(
                 div()
@@ -292,10 +333,13 @@ impl TuneApp {
                     .child(metric("空きメモリ", n.mem_avail_pct, "%"))
                     .when(!n.score_trend.is_empty(), |d| d.child(trend(&n.score_trend, 100.0, score_color(&n.health), 18.0)))
                     .child(foot)
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| {
-                        app.selected = Some(id.clone());
-                        cx.notify();
-                    })),
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |app, _, _, cx| {
+                            app.selected = Some(id.clone());
+                            cx.notify();
+                        }),
+                    ),
             );
         }
         if self.nodes.is_empty() {
@@ -315,7 +359,14 @@ impl TuneApp {
             .bg(palette::card())
             .border_l_2()
             .border_color(color)
-            .child(div().flex().items_center().gap_2().child(chip(f.severity.label(), color)).child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(f.title.clone())))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(chip(f.severity.label(), color))
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(f.title.clone())),
+            )
             .when(!f.detail.is_empty(), |d| d.child(div().text_xs().text_color(palette::muted()).child(f.detail.clone())))
             .when(!f.advice.is_empty(), |d| d.child(div().text_xs().child(f.advice.clone())))
     }
@@ -346,7 +397,13 @@ impl TuneApp {
         ] {
             if !values.is_empty() {
                 trends = trends.child(
-                    div().flex().flex_col().gap_1().p_3().rounded_md().bg(palette::card())
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .p_3()
+                        .rounded_md()
+                        .bg(palette::card())
                         .child(div().text_xs().text_color(palette::muted()).child(format!("{label}（直近 {} 回）", values.len().min(60))))
                         .child(trend(values, max, color, 44.0)),
                 );
@@ -357,6 +414,7 @@ impl TuneApp {
             list = list.child(Self::finding_row(f));
         }
         let body = match &n.health {
+            Health::Excluded(reason) => div().text_sm().text_color(palette::muted()).child(format!("対象外: {reason}。接続や分析は実行しません。")),
             Health::Failed(e) => div().text_sm().text_color(palette::crit()).child(format!("直近の分析に失敗: {e}")),
             Health::Unobserved => div().text_sm().text_color(palette::muted()).child("まだ分析していません。「全機を分析」を押してください。"),
             Health::Scored(_) if n.findings.is_empty() => div().text_sm().text_color(palette::ok()).child("所見はありません"),
@@ -372,40 +430,40 @@ impl Render for TuneApp {
             Some(id) => self.detail(&id).into_any_element(),
             None => self.overview(cx).into_any_element(),
         };
-        div()
-            .size_full()
-            .flex()
-            .font_family(FONT)
-            .bg(palette::bg())
-            .text_color(palette::text())
-            .child(self.sidebar(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(self.header(cx))
-                    .when_some(self.notice.clone(), |d, n| d.child(div().px_5().py_2().text_xs().text_color(palette::warn()).child(n)))
-                    .child(main),
-            )
+        div().size_full().flex().font_family(FONT).bg(palette::bg()).text_color(palette::text()).child(self.sidebar(cx)).child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(self.header(cx))
+                .when_some(self.notice.clone(), |d, n| d.child(div().px_5().py_2().text_xs().text_color(palette::warn()).child(n)))
+                .child(main),
+        )
     }
-}
-
-fn arg(name: &str) -> Option<String> {
-    let mut it = std::env::args().skip(1);
-    while let Some(a) = it.next() {
-        if a == name {
-            return it.next();
-        }
-    }
-    None
 }
 
 fn main() {
-    let selftest = std::env::args().any(|a| a == "--selftest");
-    let config = arg("--config").map_or_else(nodes::user_config_path, Into::into);
-    let data = arg("--data").map_or_else(nodes::data_dir, Into::into);
+    let options = match startup::parse(std::env::args_os().skip(1)) {
+        Ok(Some(options)) => options,
+        Ok(None) => {
+            println!(
+                "katala-tune-gpui [--config <ledger.json>] [--data <directory>] [--selftest]\nPreview data defaults to a separate gpui-preview directory. --selftest requires both paths and checks startup only."
+            );
+            return;
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    let startup::Options { config, data, selftest } = options;
+    if (selftest || config.exists())
+        && let Err(error) = nodes::load_config(&config)
+    {
+        eprintln!("katala-tune-gpui: {error}");
+        std::process::exit(1);
+    }
     let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio"));
     // Engine の中の tokio 呼び出し（接続・子プロセス）が動くよう、ランタイムの文脈で開く
     let dirty = Arc::new(AtomicBool::new(true));
@@ -419,13 +477,26 @@ fn main() {
             }
         }
     };
+    if let Some(error) = engine.config_error().or_else(|| engine.last().err()) {
+        eprintln!("katala-tune-gpui: {error}");
+        std::process::exit(1);
+    }
 
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1120.0), px(720.0)), cx);
         let window = cx
-            .open_window(WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), titlebar: Some(gpui::TitlebarOptions { title: Some("Katala Tune".into()), appears_transparent: false, traffic_light_position: Some(point(px(12.0), px(12.0))) }), ..Default::default() }, move |_, cx| {
-                cx.new(|cx| TuneApp::new(engine, rt, dirty, cx))
-            })
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("Katala Tune".into()),
+                        appears_transparent: false,
+                        traffic_light_position: Some(point(px(12.0), px(12.0))),
+                    }),
+                    ..Default::default()
+                },
+                move |_, cx| cx.new(|cx| TuneApp::new(engine, rt, dirty, cx)),
+            )
             .expect("window");
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
