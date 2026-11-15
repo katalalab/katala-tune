@@ -28,6 +28,7 @@ struct Slot {
 #[derive(Default)]
 struct State {
     next_id: u64,
+    closed: bool,
     slot: Option<Slot>,
 }
 
@@ -59,6 +60,17 @@ impl Gate {
         self.lock().slot.as_ref().map(|s| s.pending.clone())
     }
 
+    /// Permanently revoke this window, including confirmations queued on Tokio.
+    pub fn close(&self) {
+        let mut state = self.lock();
+        state.closed = true;
+        state.slot.take();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.lock().closed
+    }
+
     /// 操作者の答え。確認が出ていなければ何もしない
     pub fn answer(&self, ok: bool) {
         let slot = self.lock().slot.take();
@@ -77,6 +89,9 @@ impl Gate {
                 let (tx, rx) = oneshot::channel();
                 let id = {
                     let mut st = this.lock();
+                    if st.closed {
+                        return false;
+                    }
                     st.next_id += 1;
                     let id = st.next_id;
                     st.slot = Some(Slot { id, pending: Pending { title, detail }, tx });
@@ -92,7 +107,7 @@ impl Gate {
                     }
                 }
                 (this.on_change)();
-                matches!(answer, Ok(Ok(true)))
+                matches!(answer, Ok(Ok(true))) && !this.is_closed()
             })
         })
     }
@@ -117,6 +132,20 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("確認が出なかった");
+    }
+
+    #[tokio::test]
+    async fn close_revokes_pending_approved_and_late_confirmation_intents() {
+        let (g, _) = gate();
+        let pending = tokio::spawn((g.confirm())("t".into(), "d".into()));
+        wait_pending(&g).await;
+        // Even an answer queued just before close must not become permission
+        // when the confirmation future resumes on Tokio after its UI is gone.
+        g.answer(true);
+        g.close();
+        assert!(!pending.await.unwrap());
+        assert!(!((g.confirm())("late".into(), "late".into()).await));
+        assert!(g.pending().is_none());
     }
 
     #[tokio::test]
