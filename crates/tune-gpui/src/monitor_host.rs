@@ -22,12 +22,15 @@ pub struct MonitorHost {
     request: watch::Sender<RunRequest>,
     status: watch::Sender<RunStatus>,
     started: AtomicBool,
+    schedule_request: watch::Sender<bool>,
+    schedule_status: watch::Sender<ScheduleStatus>,
     drain: tokio::sync::Mutex<Option<ShutdownReport>>,
 }
 struct State {
     manual: Option<JoinHandle<bool>>,
     worker: Option<JoinHandle<()>>,
     ticker: Option<JoinHandle<()>>,
+    scheduler: Option<JoinHandle<()>>,
     exiting: bool,
 }
 /// These are local completion/commit acknowledgements, never proof that a
@@ -36,11 +39,12 @@ struct State {
 pub struct ShutdownReport {
     pub manual_complete: Option<bool>,
     pub monitor_complete: Option<bool>,
+    pub scheduler_complete: Option<bool>,
     pub journal_ack: Option<bool>,
 }
 impl ShutdownReport {
     pub fn confirmed(self) -> bool {
-        self.manual_complete != Some(false) && self.monitor_complete != Some(false) && self.journal_ack == Some(true)
+        self.scheduler_complete != Some(false) && self.manual_complete != Some(false) && self.monitor_complete != Some(false) && self.journal_ack == Some(true)
     }
 }
 #[derive(Clone, Debug)]
@@ -51,11 +55,32 @@ pub struct Snapshot {
     pub streams: usize,
     pub latest_sample: Option<i64>,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SchedulePhase {
+    Idle,
+    Waiting,
+    Running,
+    ManualBusy,
+    Stopping,
+    Failed,
+    Exited,
+}
+#[derive(Clone, Debug)]
+pub struct ScheduleStatus {
+    pub phase: SchedulePhase,
+    pub cycles: u64,
+    pub last_completed: Option<i64>,
+    pub error: Option<String>,
+}
 impl MonitorHost {
     pub fn new(engine: Arc<Engine>, live: Arc<Live>, rt: Handle, dirty: Arc<AtomicBool>) -> Self {
         let (request, _) = watch::channel(RunRequest { mode: RunMode::Paused, pull_seq: 0 });
         let (status, _) = watch::channel(RunStatus { phase: RunPhase::Paused, policy: None, local_collecting: None, hub_configured: false });
+        let (schedule_request, _) = watch::channel(false);
+        let (schedule_status, _) = watch::channel(ScheduleStatus { phase: SchedulePhase::Idle, cycles: 0, last_completed: None, error: None });
         Self {
+            schedule_request,
+            schedule_status,
             engine,
             live,
             rt,
@@ -63,7 +88,7 @@ impl MonitorHost {
             request,
             status,
             started: AtomicBool::new(false),
-            state: Mutex::new(State { manual: None, worker: None, ticker: None, exiting: false }),
+            state: Mutex::new(State { manual: None, worker: None, ticker: None, scheduler: None, exiting: false }),
             drain: tokio::sync::Mutex::new(None),
         }
     }
@@ -167,6 +192,157 @@ impl MonitorHost {
             }
         }
     }
+    fn schedule_failure(&self, error: String) {
+        self.schedule_request.send_replace(false);
+        self.schedule_status.send_modify(|s| {
+            s.phase = SchedulePhase::Failed;
+            s.error = Some(error);
+        });
+        self.dirty.store(true, Ordering::Release);
+    }
+    pub fn save_schedule_settings(&self, patch: Value) -> Result<(), String> {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.exiting {
+            return Err("アプリを終了しています".into());
+        }
+        let result = self.engine.checked_schedule().and_then(|_| self.engine.set_schedule(&patch));
+        match result {
+            Ok(settings) => {
+                if settings["enabled"] == false {
+                    self.schedule_request.send_replace(false);
+                }
+                self.dirty.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                self.schedule_failure(error.clone());
+                Err(error)
+            }
+        }
+    }
+    pub fn schedule_snapshot(&self) -> (bool, ScheduleStatus) {
+        (*self.schedule_request.borrow(), self.schedule_status.borrow().clone())
+    }
+    pub fn start_schedule(self: &Arc<Self>) -> Result<(), String> {
+        self.start_schedule_with(|engine| async move { engine.checked_tick().await })
+    }
+    fn start_schedule_with<F, Fut>(self: &Arc<Self>, tick: F) -> Result<(), String>
+    where
+        F: Fn(Arc<Engine>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send,
+    {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.exiting {
+            return Err("アプリを終了しています".into());
+        }
+        let settings = self.engine.checked_schedule().inspect_err(|e| self.schedule_failure(e.clone()))?;
+        if settings["enabled"] != true {
+            self.schedule_failure("自動スキャン設定は無効です。保存後に開始してください".into());
+            return Err("自動スキャン設定は無効です。保存後に開始してください".into());
+        }
+        if !*self.schedule_request.borrow() {
+            self.schedule_status.send_modify(|s| {
+                s.phase = SchedulePhase::Waiting;
+                s.error = None;
+            });
+            self.schedule_request.send_replace(true);
+        }
+        if state.scheduler.is_none() {
+            let weak = Arc::downgrade(self);
+            let mut request = self.schedule_request.subscribe();
+            state.scheduler = Some(self.rt.spawn(async move {
+                loop {
+                    let Some(host) = weak.upgrade() else { return };
+                    if host.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).exiting {
+                        return;
+                    }
+                    drop(host);
+                    while !*request.borrow_and_update() {
+                        if request.changed().await.is_err() {
+                            return;
+                        }
+                        let Some(host) = weak.upgrade() else { return };
+                        if host.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).exiting {
+                            return;
+                        }
+                    }
+                    let mut cadence = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(5), Duration::from_secs(60));
+                    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            result = request.changed() => {
+                                if result.is_err() { return; }
+                                break;
+                            }
+                            _ = cadence.tick() => {}
+                        }
+                        let Some(host) = weak.upgrade() else { return };
+                        // Admission and manual state share the host lock. A claimed
+                        // cycle is owned work; Stop drains it instead of cancelling.
+                        let admitted = {
+                            let state = host.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if state.exiting {
+                                return;
+                            }
+                            if !*host.schedule_request.borrow() {
+                                false
+                            } else if state.manual.as_ref().is_some_and(|t| !t.is_finished()) {
+                                host.schedule_status.send_modify(|s| s.phase = SchedulePhase::ManualBusy);
+                                false
+                            } else {
+                                host.schedule_status.send_modify(|s| s.phase = SchedulePhase::Running);
+                                true
+                            }
+                        };
+                        if admitted {
+                            // Checked current ledger/settings on every cycle, even
+                            // with injected synthetic work. No last-good admission.
+                            let checked = host.engine.checked_schedule();
+                            let result = match checked {
+                                Ok(settings) if settings["enabled"] == true => tick(host.engine.clone()).await,
+                                Ok(_) => Err("自動スキャン設定が無効になりました".into()),
+                                Err(error) => Err(error),
+                            };
+                            match result {
+                                Ok(()) => host.schedule_status.send_modify(|s| {
+                                    s.cycles += 1;
+                                    s.last_completed = Some(tune_core::db::now_ms());
+                                    s.phase = if *host.schedule_request.borrow() { SchedulePhase::Waiting } else { SchedulePhase::Idle };
+                                }),
+                                Err(error) => host.schedule_failure(error),
+                            }
+                        }
+                        host.dirty.store(true, Ordering::Release);
+                        if host.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).exiting {
+                            host.schedule_status.send_modify(|s| s.phase = SchedulePhase::Exited);
+                            return;
+                        }
+                        if !*host.schedule_request.borrow() {
+                            break;
+                        }
+                    }
+                    let Some(host) = weak.upgrade() else { return };
+                    if host.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).exiting {
+                        return;
+                    }
+                    if host.schedule_status.borrow().phase != SchedulePhase::Failed {
+                        host.schedule_status.send_modify(|s| s.phase = SchedulePhase::Idle);
+                    }
+                }
+            }));
+        }
+        Ok(())
+    }
+    pub fn stop_schedule(&self) -> Result<(), String> {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.exiting {
+            return Err("アプリを終了しています".into());
+        }
+        self.schedule_request.send_replace(false);
+        self.schedule_status.send_modify(|s| s.phase = if s.phase == SchedulePhase::Running { SchedulePhase::Stopping } else { SchedulePhase::Idle });
+        Ok(())
+    }
     /// Memory-only observation: no DB read, writer, pruning or notification.
     pub fn snapshot(&self) -> Snapshot {
         let active = self.live.active();
@@ -220,6 +396,7 @@ impl MonitorHost {
     pub fn request_exit(&self) {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.exiting = true;
+        self.schedule_request.send_replace(false);
         self.request.send_modify(|r| r.mode = RunMode::Exit);
         if let Some(ticker) = &state.ticker {
             ticker.abort();
@@ -235,9 +412,9 @@ impl MonitorHost {
         if let Some(report) = *drained {
             return report;
         }
-        let (manual, worker, ticker) = {
+        let (manual, worker, ticker, scheduler) = {
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            (state.manual.take(), state.worker.take(), state.ticker.take())
+            (state.manual.take(), state.worker.take(), state.ticker.take(), state.scheduler.take())
         };
         if let Some(ticker) = ticker {
             let _ = ticker.await;
@@ -250,10 +427,14 @@ impl MonitorHost {
             Some(task) => Some(task.await.is_ok()),
             None => None,
         };
+        let scheduler_complete = match scheduler {
+            Some(task) => Some(task.await.is_ok()),
+            None => None,
+        };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         self.live.shutdown(deadline.saturating_duration_since(tokio::time::Instant::now())).await;
         let journal_ack = Some(self.engine.finish_monitor_journal(deadline.saturating_duration_since(tokio::time::Instant::now())).await);
-        let report = ShutdownReport { manual_complete, monitor_complete, journal_ack };
+        let report = ShutdownReport { manual_complete, monitor_complete, scheduler_complete, journal_ack };
         *drained = Some(report);
         report
     }
@@ -384,3 +565,7 @@ mod tests {
 #[cfg(test)]
 #[path = "shutdown_tests.rs"]
 mod shutdown_tests;
+
+#[cfg(test)]
+#[path = "schedule_tests.rs"]
+mod schedule_tests;
