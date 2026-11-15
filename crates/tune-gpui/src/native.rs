@@ -267,13 +267,12 @@ impl LiveControl {
         }
     }
 
-    /// Apply only the accepted Reader generation. Excluded findings are visible
-    /// immediately, so the matching owned stream must stop at that same boundary.
-    fn accept_nodes(&self, nodes: &[NodeView]) {
+    /// Apply the complete ledger only for an accepted Reader generation. Removal
+    /// and explicit exclusion administratively stop every owner under Live's lock.
+    fn accept_nodes(&self, nodes: &[nodes::Node]) {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let excluded: Vec<String> = nodes.iter().filter(|node| matches!(node.health, Health::Excluded(_))).map(|node| node.id.clone()).collect();
-        self.live.stop(Some(&excluded), Stop::Excluded);
-        if state.intent.as_ref().is_some_and(|intent| excluded.contains(&intent.id)) {
+        self.live.retain_active(nodes);
+        if state.intent.as_ref().is_some_and(|intent| !nodes.iter().any(|node| node.id == intent.id && node.is_active())) {
             self.stop_locked(&mut state, Stop::Excluded);
         }
     }
@@ -449,11 +448,12 @@ impl TuneApp {
                                 app.loading = false;
                                 if response.config_error.is_some() {
                                     app.live.stop(Stop::Excluded);
+                                } else if let Some(ledger) = response.ledger {
+                                    app.live.accept_nodes(&ledger);
                                 }
                                 app.notice = response.config_error;
                                 match response.nodes {
                                     Ok(nodes) => {
-                                        app.live.accept_nodes(&nodes);
                                         app.nodes = nodes;
                                     }
                                     Err(error) => app.notice = Some(error),
@@ -1967,12 +1967,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_accepted_reader_removal_stops_both_owners_before_navigation() {
+        let dir = std::env::temp_dir().join(format!("tune-owner-removal-{}-{}", std::process::id(), tune_core::db::now_ms()));
+        std::fs::create_dir(&dir).unwrap();
+        let config = dir.join("nodes.json");
+        std::fs::write(&config, json!({"nodes":[{"id":"a","os":"macos"},{"id":"b","os":"macos"}]}).to_string()).unwrap();
+        let engine = Engine::open(config.clone(), dir.join("data"), Arc::new(tune_core::engine::NoHost)).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let reader = Reader::new(engine.clone(), &rt);
+        rt.block_on(async {
+            let (control, route) = shared_controller();
+            let (generation, id) = control.request("a").unwrap();
+            control.complete(generation, &id, &[node("a"), node("b")], None);
+            control.live.start_owned(Owner::Monitor, &[node("a"), node("b")], &[]);
+            samples_after(&control.live, 0).await;
+            std::fs::write(&config, json!({"nodes":[{"id":"b","os":"macos"}]}).to_string()).unwrap();
+            reader.request(Request { generation: 1, route: Route::Node("a".into()), query: "a".into(), log_level: LogLevel::All, minutes: 60 }).unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(response) = reader.take() {
+                        break response;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(response.generation, 1);
+            assert!(response.config_error.is_none());
+            let views = response.nodes.unwrap();
+            assert_eq!(views.iter().map(|node| node.id.as_str()).collect::<Vec<_>>(), ["b"]);
+            control.accept_nodes(&response.ledger.unwrap());
+            control.stop(Stop::User); // The selected removed route navigates away.
+            let active = control.live.active();
+            let ui_renewed = control.live.heartbeat_owned(Owner::Ui, "a");
+            let monitor_renewed = control.live.heartbeat_owned(Owner::Monitor, "a");
+            let retained = control.live.heartbeat_owned(Owner::Monitor, "b");
+            if active == ["b"] {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while control.live.brief("a").unwrap()["state"] != "stopped" {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            let stopped = control.live.brief("a").unwrap()["state"] == "stopped";
+            control.live.shutdown(Duration::from_secs(1)).await;
+            assert_eq!(active, ["b"], "accepted full-ledger removal is an administrative stop before UI navigation");
+            assert!(!ui_renewed && !monitor_renewed, "neither owner may renew a removed node");
+            assert!(stopped, "the removed sampler must finish");
+            assert!(retained, "the complete Reader ledger preserves the remaining monitor stream");
+            assert_eq!(route.0.load(Ordering::SeqCst), 2);
+        });
+        drop(reader);
+        drop(rt);
+        drop(engine);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn live_accepted_exclusion_stops_monitor_owned_nodes_without_ui_intent() {
         let (control, _) = shared_controller();
         control.live.start_owned(Owner::Monitor, &[node("a")], &[]);
-        let views = model::build(&[json!({"id":"a","status":"paused"})], &[]);
-        control.accept_nodes(&views);
+        let ledger = [nodes::Node::from_value(&json!({"id":"a","status":"paused"}), "synthetic-host")];
+        control.accept_nodes(&ledger);
         let active = control.live.active();
         let renewed = control.live.heartbeat_owned(Owner::Monitor, "a");
         control.live.shutdown(Duration::from_secs(1)).await;
@@ -2123,8 +2183,8 @@ mod tests {
             let (generation, id) = control.request("a").unwrap();
             control.complete(generation, &id, &[node("a")], None);
             assert_eq!(control.live.active(), ["a"]);
-            let views = model::build(&[json!({"id":"a","status":status})], &[]);
-            control.accept_nodes(&views);
+            let ledger = [nodes::Node::from_value(&json!({"id":"a","status":status}), "synthetic-host")];
+            control.accept_nodes(&ledger);
             assert!(!control.on("a"), "accepted {status} ledger must clear intent immediately");
             assert!(control.live.active().is_empty());
             // In-flight renewal for the old online ledger cannot revive it.
@@ -2139,8 +2199,8 @@ mod tests {
         let (control, _) = controller();
         let (generation, id) = control.request("a").unwrap();
         control.complete(generation, &id, &[node("a")], None);
-        let views = model::build(&[json!({"id":"a"}), json!({"id":"b","status":"paused"})], &[]);
-        control.accept_nodes(&views);
+        let ledger = [node("a"), nodes::Node::from_value(&json!({"id":"b","status":"paused"}), "synthetic-host")];
+        control.accept_nodes(&ledger);
         assert!(control.on("a"));
         assert_eq!(control.live.active(), ["a"]);
         control.live.shutdown(Duration::from_secs(1)).await;
