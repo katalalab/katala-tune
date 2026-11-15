@@ -47,10 +47,10 @@ fn populated_saved_routes_do_not_collect_or_recompute() {
     std::fs::write(
         &config,
         json!({"nodes":[
-            {"id":"example-active","os":"windows","alias":"unused","network":false},
-            {"id":"example-failed","os":"macos","alias":"unused","network":false},
-            {"id":"example-paused","os":"macos","alias":"unused","status":"paused"},
-            {"id":"example-unobserved","os":"windows","alias":"unused"}
+            {"id":"example-active","os":"windows","alias":"unused","network":false,"connectivity":false},
+            {"id":"example-failed","os":"macos","alias":"unused","network":false,"connectivity":false},
+            {"id":"example-paused","os":"macos","alias":"unused","status":"paused","connectivity":false},
+            {"id":"example-unobserved","os":"windows","alias":"unused","connectivity":false}
         ]})
         .to_string(),
     )
@@ -90,7 +90,7 @@ fn populated_saved_routes_do_not_collect_or_recompute() {
     let before = engine.with_db(|d| Ok(saved_state(d))).unwrap();
     drop(engine);
     let mut child = Command::new(env!("CARGO_BIN_EXE_katala-tune-gpui"))
-        .args(["--selftest", "--logs", "--open", "logs", "--config"])
+        .args(["--selftest", "--logs", "--open", "network", "--config"])
         .arg(&config)
         .arg("--data")
         .arg(&data)
@@ -109,7 +109,7 @@ fn populated_saved_routes_do_not_collect_or_recompute() {
     }
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "selftest logs rows=1 sigs=1\nselftest ok nodes=4 views=13");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "selftest logs rows=1 sigs=1\nselftest ok nodes=4 views=14");
     let db = Store::open_read_only(&data).unwrap();
     assert_eq!(saved_state(&db), before, "view loading changed saved observations or health state");
 }

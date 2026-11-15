@@ -14,6 +14,8 @@ mod model;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod native;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
+mod network;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod panels;
 mod startup;
 #[cfg(any(target_os = "macos", target_os = "windows"))]

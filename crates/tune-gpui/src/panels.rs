@@ -33,13 +33,14 @@ pub enum Page {
     Tools,
     Ai,
     Security,
+    Network,
     Specs,
     Power,
     Topology,
     Actions,
 }
 impl Page {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Overview,
         Self::Status,
         Self::Resources,
@@ -49,6 +50,7 @@ impl Page {
         Self::Tools,
         Self::Ai,
         Self::Security,
+        Self::Network,
         Self::Specs,
         Self::Power,
         Self::Topology,
@@ -65,6 +67,7 @@ impl Page {
             Self::Tools => "道具",
             Self::Ai => "AI",
             Self::Security => "セキュリティ",
+            Self::Network => "ネットワーク",
             Self::Specs => "スペック",
             Self::Power => "電力・Clock",
             Self::Topology => "構成図",
@@ -244,7 +247,7 @@ fn state(v: &Value) -> Tone {
         _ => Tone::Normal,
     }
 }
-fn time(v: &Value) -> String {
+pub(crate) fn time(v: &Value) -> String {
     let Some(ms) = v.as_i64().filter(|n| *n >= 0) else { return "未取得".into() };
     let sec = ms / 1000;
     // Gregorian civil date, with epoch days shifted to the March-based era.
@@ -285,9 +288,10 @@ pub fn load(engine: &Engine, page: Page, query: &str, log_level: LogLevel) -> Re
             return Err(error);
         }
     }
-    let mut p = Panel {
-        facts: vec![], rows: vec![], note: "保存済みデータの読み取り専用表示。取得・再計算・変更操作は行いません。".into()
-    };
+    let mut p =
+        Panel {
+            facts: vec![], rows: vec![], note: "保存済み一覧を開く・再読込するだけでは収集しません。収集する場合は画面の実行ボタンを使います。".into()
+        };
     match page {
         Page::Overview => return Err("概要は機体の概要画面を使います".into()),
         Page::Status => {
@@ -426,6 +430,7 @@ pub fn load(engine: &Engine, page: Page, query: &str, log_level: LogLevel) -> Re
             p.note.push_str(" 集計はUTC基準30日・検索非連動。費用はAPI単価による推定で実請求ではなく、未知単価分を含みません。セッションは検索一致の最新100件（全期間）、重複除去集計と同じ量ではありません。残り枠は保存値で、失敗後に古い窓が残る場合があります。");
         }
         Page::Security => security(&engine.netsec_view(&json!({}))?, &mut p),
+        Page::Network => return Ok(crate::network::initial(&engine.config().nodes)),
         Page::Specs => specs(&engine.specs_view()?, &mut p),
         Page::Power => power(engine, &mut p)?,
         Page::Topology => {

@@ -392,8 +392,13 @@ impl TuneApp {
                             cx.notify();
                         }
                         if app.collection.poll() {
-                            // Receipt ownership is independent of route/query generations.
-                            app.reload(cx);
+                            // Session diagnostics survive route/query changes and other jobs.
+                            if app.collection.running.is_none() {
+                                app.reload(cx);
+                            } else if app.page == Page::Network && app.selected.is_none() {
+                                app.panel = app.collection.network.clone().map(Ok);
+                                cx.notify();
+                            }
                         }
                         let probing = app.engine.is_probing();
                         if app.dirty.swap(false, Ordering::AcqRel) || probing != app.probing {
@@ -415,7 +420,9 @@ impl TuneApp {
                                     }
                                     Err(error) => app.notice = Some(error),
                                 }
-                                app.panel = response.panel;
+                                // Keep the previous diagnostic visible even if a read
+                                // fails; the current ledger error remains in notice.
+                                app.panel = app.collection.restore_network(app.page, response.panel);
                                 if app.selected.as_ref().is_some_and(|id| !app.nodes.iter().any(|n| &n.id == id)) {
                                     app.navigate(Page::Overview, None, cx);
                                 }
@@ -439,6 +446,7 @@ impl TuneApp {
     fn reload(&mut self, cx: &mut Context<Self>) {
         self.generation = self.generation.wrapping_add(1);
         self.loading = true;
+        self.panel = self.collection.restore_network(self.page, self.panel.take());
         let route = self.selected.clone().map_or(Route::Page(self.page), Route::Node);
         if let Err(error) = self.reader.request(Request { generation: self.generation, route, query: self.query.clone(), log_level: self.log_level }) {
             self.loading = false;
@@ -523,18 +531,19 @@ impl TuneApp {
     }
 
     fn collect(&mut self, kind: Kind, cx: &mut Context<Self>) {
-        if kind == Kind::Probe && self.probing {
+        if self.probing {
             return;
         }
         let Some(sender) = self.collection.begin(kind) else {
             return;
         };
         let engine = self.engine.clone();
+        let progress = self.collection.progress.clone();
         let handle = self.rt.handle().clone();
         self.rt.spawn(async move {
             // Engine entry points also do synchronous ledger/SQLite work. Keep
             // the entire invocation off GPUI, including the immediate reread.
-            let result = tokio::task::spawn_blocking(move || handle.block_on(collection::run(engine, kind, None)))
+            let result = tokio::task::spawn_blocking(move || handle.block_on(collection::run(engine, kind, None, progress)))
                 .await
                 .unwrap_or_else(|_| collection::Receipt::error(kind, "収集タスクが停止しました"));
             let _ = sender.send(result);
@@ -543,36 +552,44 @@ impl TuneApp {
     }
 
     fn collection_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut status = div().id("collection-status").flex_none().max_h(px(190.)).overflow_y_scroll().px_5().py_2().text_xs();
+        let mut status = div()
+            .id("collection-status")
+            .flex_none()
+            .max_h(px(if self.page == Page::Network { 80. } else { 190. }))
+            .overflow_y_scroll()
+            .px_5()
+            .py_2()
+            .text_xs();
         if let Some(kind) = self.collection.running {
             status = status.child(div().text_color(palette::accent()).child(format!("{}を実行中…（画面を移動しても継続します）", kind.label())));
         }
         if let Some(result) = &self.collection.result {
-            status =
-                status
-                    .child(
-                        div().flex().items_center().gap_3().child(div().flex_1().child(result.summary())).child(
-                            div()
-                                .id("copy-collection-result")
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .bg(palette::card())
-                                .cursor_pointer()
-                                .child("収集結果の詳細をコピー")
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|app, _, _, cx| {
-                                        if let Some(result) = &app.collection.result {
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(result.copy_text()));
-                                        }
-                                    }),
-                                ),
-                        ),
-                    )
-                    .child(div().text_color(palette::muted()).child(
-                        "直近の明示収集の結果。最大24行・詳細は各2048文字。部分成功と対象外を完全成功へ含めません。保存画面の検索・再読込では消えません。",
-                    ));
+            status = status
+                .child(
+                    div().flex().flex_wrap().items_center().gap_3().child(div().flex_1().min_w(px(200.)).child(result.summary())).child(
+                        div()
+                            .id("copy-collection-result")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(palette::card())
+                            .cursor_pointer()
+                            .child("収集結果の詳細をコピー")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|app, _, _, cx| {
+                                    if let Some(result) = &app.collection.result {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(result.copy_text()));
+                                    }
+                                }),
+                            ),
+                    ),
+                )
+                .child(
+                    div()
+                        .text_color(palette::muted())
+                        .child("直近に実行した収集の結果です。部分成功・失敗・対象外を区別して表示します。画面を移動・再読込しても結果は残ります。"),
+                );
             for row in &result.rows {
                 let color = match row.tone {
                     Tone::Error => palette::crit(),
@@ -587,8 +604,9 @@ impl TuneApp {
                         .border_color(palette::line())
                         .child(div().text_color(color).child(format!("{} · {}", row.title, row.badge)))
                         .child(div().text_color(palette::muted()).child({
-                            let mut preview: String = row.detail.chars().take(240).collect();
-                            if row.detail.chars().count() > 240 {
+                            let reason = row.detail.lines().next().unwrap_or_default();
+                            let mut preview: String = reason.chars().take(240).collect();
+                            if reason.chars().count() > 240 {
                                 preview.push_str("…（続きは詳細コピー）");
                             }
                             preview
@@ -685,13 +703,14 @@ impl TuneApp {
         let busy = self.probing || self.collection.running.is_some();
         div()
             .flex()
+            .flex_wrap()
             .items_center()
             .gap_3()
             .px_5()
             .py_3()
             .border_b_1()
             .border_color(palette::line())
-            .child(div().flex_1().text_lg().font_weight(FontWeight::SEMIBOLD).child(title))
+            .child(div().flex_1().min_w(px(150.)).text_lg().font_weight(FontWeight::SEMIBOLD).child(title))
             .child(chip(format!("要対応 {crit}"), if crit > 0 { palette::crit() } else { palette::muted() }))
             .child(chip(format!("注意 {warn}"), if warn > 0 { palette::warn() } else { palette::muted() }))
             .child(
@@ -960,39 +979,69 @@ impl TuneApp {
             .child(body)
     }
     fn record_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let mut toolbar = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_5()
-            .py_3()
-            .child(div().flex_1().min_w_0().child(self.search.clone()))
-            .child(div().id("search-submit").px_3().py_2().rounded_md().bg(palette::accent()).text_sm().cursor_pointer().child("検索").on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|app, _, _, cx| {
-                    if app.search.read(cx).is_composing() {
-                        return;
-                    }
-                    app.query = app.search.read(cx).text().to_owned();
-                    app.selected_row = None;
-                    app.scroll = UniformListScrollHandle::new();
-                    app.reload(cx);
-                }),
-            ))
-            .child(
-                div()
-                    .id("refresh-view")
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .bg(palette::card())
-                    .text_sm()
-                    .cursor_pointer()
-                    .child("再読込")
-                    .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.reload(cx))),
+        let mut toolbar = div().flex().flex_wrap().flex_none().items_center().gap_2().px_5().py_3();
+        if self.page != Page::Network {
+            toolbar = toolbar.child(div().flex_1().min_w(px(180.)).child(self.search.clone())).child(
+                div().id("search-submit").px_3().py_2().rounded_md().bg(palette::accent()).text_sm().cursor_pointer().child("検索").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|app, _, _, cx| {
+                        if app.search.read(cx).is_composing() {
+                            return;
+                        }
+                        app.query = app.search.read(cx).text().to_owned();
+                        app.selected_row = None;
+                        app.scroll = UniformListScrollHandle::new();
+                        app.reload(cx);
+                    }),
+                ),
             );
+        } else {
+            toolbar = toolbar.child(
+                div()
+                    .id("network-explanation")
+                    .w_full()
+                    .max_h(px(80.))
+                    .overflow_y_scroll()
+                    .text_xs()
+                    .text_color(palette::muted())
+                    .child(crate::network::EXPLANATION),
+            );
+            for active in [false, true] {
+                let busy = self.probing || self.collection.running.is_some();
+                toolbar = toolbar.child(
+                    div()
+                        .id(if active { "network-active" } else { "network-passive" })
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .text_sm()
+                        .bg(if busy { palette::line() } else { palette::accent() })
+                        .when(!busy, |d| d.cursor_pointer())
+                        .child(if busy {
+                            "収集実行中…"
+                        } else if active {
+                            "全対象の外部到達診断"
+                        } else {
+                            "全対象の設定確認（HTTPSなし）"
+                        })
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| app.collect(Kind::Network(active), cx))),
+                );
+            }
+        }
+        toolbar = toolbar.child(
+            div()
+                .id("refresh-view")
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(palette::card())
+                .text_sm()
+                .cursor_pointer()
+                .child("再読込")
+                .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.reload(cx))),
+        );
         if let Some(kind) = Kind::for_page(self.page) {
-            let busy = self.collection.running.is_some();
+            let busy = self.probing || self.collection.running.is_some();
             toolbar = toolbar.child(
                 div()
                     .id("collect-page")
@@ -1163,7 +1212,13 @@ impl TuneApp {
         body.child(div().px_5().py_2().text_xs().text_color(palette::muted()).child(format!(
             "{}表示行 · {}",
             panel.rows.len(),
-            if self.loading { "読み込み中（前回の表示）" } else { "保存済みデータ · ↑↓で詳細 / Tabで検索へ" }
+            if self.loading {
+                "読み込み中（前回の表示）"
+            } else if self.page == Page::Network {
+                "セッション内の診断 · ↑↓で詳細"
+            } else {
+                "保存済みデータ · ↑↓で詳細 / Tabで検索へ"
+            }
         )))
     }
 
@@ -1194,13 +1249,13 @@ impl Render for TuneApp {
             .on_action(cx.listener(|app, _: &PreviousPage, window, cx| app.cycle_page(-1, window, cx)))
             .on_action(cx.listener(|app, _: &Refresh, _, cx| app.reload(cx)))
             .on_action(cx.listener(|app, _: &FocusSearch, window, cx| {
-                if app.selected.is_none() && app.page != Page::Overview {
+                if app.selected.is_none() && !matches!(app.page, Page::Overview | Page::Network) {
                     app.search.focus_handle(cx).focus(window);
                 }
             }))
             .on_action(cx.listener(|app, _: &FocusContent, window, _| app.focus.focus(window)))
             .on_action(cx.listener(|app, _: &ToggleFocus, window, cx| {
-                if app.selected.is_none() && app.page != Page::Overview && !app.search.focus_handle(cx).is_focused(window) {
+                if app.selected.is_none() && !matches!(app.page, Page::Overview | Page::Network) && !app.search.focus_handle(cx).is_focused(window) {
                     app.search.focus_handle(cx).focus(window);
                 } else {
                     app.focus.focus(window);
@@ -1231,7 +1286,7 @@ impl Render for TuneApp {
 }
 
 fn open_route(target: &str, ledger: &[nodes::Node]) -> Result<Route, String> {
-    let keys = ["overview", "status", "resources", "processes", "jobs", "logs", "tools", "ai", "security", "specs", "power", "topology", "actions"];
+    let keys = ["overview", "status", "resources", "processes", "jobs", "logs", "tools", "ai", "security", "network", "specs", "power", "topology", "actions"];
     if let Some((_, page)) = keys.into_iter().zip(Page::ALL).find(|(key, page)| *key == target || page.label() == target) {
         return Ok(Route::Page(page));
     }
@@ -1361,6 +1416,9 @@ pub fn run(options: startup::Options) {
                             cx.background_executor().timer(Duration::from_millis(100)).await;
                             let state = window
                                 .update(cx, |app, _, _| {
+                                    if app.collection.running.is_some() || app.collection.result.is_some() {
+                                        return Some((app.nodes.len(), Some("保存画面の描画が収集を開始しました".into())));
+                                    }
                                     if app.loading {
                                         return None;
                                     }
@@ -1625,6 +1683,7 @@ mod tests {
 
     #[test]
     fn open_route_resolves_saved_views_and_rejects_unknown_nodes() {
+        assert_eq!(open_route("network", &[]).unwrap(), Route::Page(Page::Network));
         assert_eq!(open_route("logs", &[]).unwrap(), Route::Page(Page::Logs));
         assert_eq!(open_route("resources", &[]).unwrap(), Route::Page(Page::Resources));
         assert_eq!(open_route("構成図", &[]).unwrap(), Route::Page(Page::Topology));
