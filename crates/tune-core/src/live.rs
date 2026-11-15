@@ -1070,6 +1070,22 @@ impl Stop {
     }
 }
 
+/// Shared native-host stream consumers. Legacy callers keep their existing API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Owner {
+    Ui,
+    Monitor,
+}
+
+impl Owner {
+    fn bit(self) -> u8 {
+        match self {
+            Self::Ui => 1,
+            Self::Monitor => 2,
+        }
+    }
+}
+
 /// 機体ごとの流れの段階
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -1188,6 +1204,7 @@ impl NodeLive {
 
 struct Stream {
     epoch: u64,
+    owners: u8,
     last_hb: Instant,
     stop: watch::Sender<Option<Stop>>,
     task: Option<JoinHandle<()>>,
@@ -1263,10 +1280,20 @@ impl Live {
     /// 戻り値: `{ started, running, refused: [{ id, reason, detail }], limit, snapshot: { id: 画面へ渡す形 } }`。
     /// unknown は台帳に無かった id（理由つきで断る）。非同期の実行環境（tokio）の中から呼ぶ
     pub fn start(self: &Arc<Self>, nodes: &[Node], unknown: &[String]) -> Value {
+        self.start_with_owner(None, nodes, unknown)
+    }
+
+    /// Atomically claim and start/renew only the nodes accepted as started/running.
+    pub fn start_owned(self: &Arc<Self>, owner: Owner, nodes: &[Node], unknown: &[String]) -> Value {
+        self.start_with_owner(Some(owner), nodes, unknown)
+    }
+
+    fn start_with_owner(self: &Arc<Self>, owner: Option<Owner>, nodes: &[Node], unknown: &[String]) -> Value {
         let excluded: Vec<String> = nodes.iter().filter(|n| !n.is_active()).map(|n| n.id.clone()).chain(unknown.iter().cloned()).collect();
-        self.stop(Some(&excluded), Stop::Excluded);
-        let now = Instant::now();
         let mut st = self.lock();
+        Self::stop_locked(&mut st, Some(&excluded), Stop::Excluded);
+        let now = Instant::now();
+        let owners = owner.map_or(0, Owner::bit);
         let (mut started, mut running, mut refused) = (Vec::new(), Vec::new(), Vec::new());
         for id in unknown {
             refused.push(json!({ "id": id, "reason": "unknown", "detail": "台帳に無い機体" }));
@@ -1283,6 +1310,7 @@ impl Live {
                 continue;
             }
             if let Some(s) = st.streams.get_mut(&n.id).filter(|s| !s.stopping) {
+                s.owners |= owners;
                 s.last_hb = now;
                 running.push(n.id.clone());
                 continue;
@@ -1297,7 +1325,7 @@ impl Live {
             let epoch = st.epoch;
             let (tx, rx) = watch::channel(None);
             let task = tokio::spawn(run_stream(self.clone(), n.clone(), epoch, rx));
-            st.streams.insert(n.id.clone(), Stream { epoch, last_hb: now, stop: tx, task: Some(task), stopping: false });
+            st.streams.insert(n.id.clone(), Stream { epoch, owners, last_hb: now, stop: tx, task: Some(task), stopping: false });
             let nl = self.node(&mut st, &n.id);
             nl.set(Phase::Connecting, None, None, 0);
             nl.me_prev = None;
@@ -1326,14 +1354,49 @@ impl Live {
         true
     }
 
-    /// 止める（ids が None なら全部）。戻り値は `{ stopped: [id] }`。止まり終わったら画面へ state: stopped を送る
-    pub fn stop(&self, ids: Option<&[String]>, why: Stop) -> Value {
+    /// Renew an existing claim only. This cannot claim, start or reset retries.
+    pub fn heartbeat_owned(&self, owner: Owner, id: &str) -> bool {
         let mut st = self.lock();
+        if st.closed {
+            return false;
+        }
+        let Some(stream) = st.streams.get_mut(id).filter(|s| !s.stopping && s.owners & owner.bit() != 0) else { return false };
+        stream.last_hb = Instant::now();
+        true
+    }
+
+    /// Release only this consumer. Last-owner detection and stop share the lock.
+    /// Returns `{ stopped: [id] }` for samplers stopped by this release.
+    pub fn release_owned(&self, owner: Owner, ids: &[String], why: Stop) -> Value {
+        let mut st = self.lock();
+        let mut stopped = Vec::new();
+        for (id, s) in st.streams.iter_mut() {
+            if s.stopping || !ids.contains(id) || s.owners & owner.bit() == 0 {
+                continue;
+            }
+            s.owners &= !owner.bit();
+            if s.owners == 0 {
+                s.stopping = true;
+                let _ = s.stop.send(Some(why.clone()));
+                stopped.push(id.clone());
+            }
+        }
+        stopped.sort();
+        json!({ "stopped": stopped })
+    }
+
+    /// 止める（ids が None なら全部）。所有者に優先する管理操作。戻り値は `{ stopped: [id] }`。
+    pub fn stop(&self, ids: Option<&[String]>, why: Stop) -> Value {
+        Self::stop_locked(&mut self.lock(), ids, why)
+    }
+
+    fn stop_locked(st: &mut Shared, ids: Option<&[String]>, why: Stop) -> Value {
         let mut stopped = Vec::new();
         for (id, s) in st.streams.iter_mut() {
             if s.stopping || ids.is_some_and(|ids| !ids.contains(id)) {
                 continue;
             }
+            s.owners = 0;
             s.stopping = true;
             let _ = s.stop.send(Some(why.clone()));
             stopped.push(id.clone());
@@ -1351,8 +1414,9 @@ impl Live {
 
     /// 最新の全件台帳から外れた既存ストリームも止める（常時監視・画面の合図で再確認）
     pub fn retain_active(&self, nodes: &[Node]) {
-        let excluded: Vec<String> = self.active().into_iter().filter(|id| !nodes.iter().any(|n| n.id == *id && n.is_active())).collect();
-        self.stop(Some(&excluded), Stop::Excluded);
+        let mut st = self.lock();
+        let excluded: Vec<String> = st.streams.keys().filter(|id| !nodes.iter().any(|n| n.id == **id && n.is_active())).cloned().collect();
+        Self::stop_locked(&mut st, Some(&excluded), Stop::Excluded);
     }
 
     /// 機体ごとの段階と保持している点の数（確認用）
@@ -2297,6 +2361,165 @@ mod tests {
     fn state(l: &Live, id: &str) -> (String, String) {
         let s = l.status();
         (s[id]["state"].as_str().unwrap_or("").into(), s[id]["reason"].as_str().unwrap_or("").into())
+    }
+
+    #[tokio::test]
+    async fn owned_release_preserves_the_other_owner_and_stops_the_last() {
+        if cfg!(windows) {
+            return;
+        }
+        for (first, last) in [(Owner::Ui, Owner::Monitor), (Owner::Monitor, Owner::Ui)] {
+            let (route, dir) = fake(STEADY);
+            let live = Live::new(route.clone(), quick(), Box::new(|_| {}));
+            let nodes = [node("a", "macos")];
+            assert_eq!(live.start_owned(first, &nodes, &[])["started"], json!(["a"]));
+            assert_eq!(live.start_owned(last, &nodes, &[])["running"], json!(["a"]));
+            assert_eq!(live.start_owned(first, &nodes, &[])["running"], json!(["a"]), "repeated claim is idempotent");
+            until("initial samples", || live.samples("a").len() >= 2).await;
+            let before = live.samples("a").len();
+            let released = live.release_owned(first, &["a".into()], Stop::Hidden);
+            let still_active = live.active();
+            let renewed = live.heartbeat_owned(last, "a");
+            assert!(!live.heartbeat_owned(first, "a"));
+            assert_eq!(live.release_owned(first, &["a".into()], Stop::User)["stopped"], json!([]));
+            if still_active == ["a"] {
+                until("samples after owner release", || live.samples("a").len() > before).await;
+            }
+            let final_release = live.release_owned(last, &["a".into()], Stop::User);
+            until("last owner stopped", || state(&live, "a").0 == "stopped").await;
+            let opened = route.opened.load(Ordering::SeqCst);
+            let reason = state(&live, "a").1;
+            live.shutdown(Duration::from_secs(1)).await;
+            let _ = std::fs::remove_dir_all(dir);
+            assert_eq!(released["stopped"], json!([]), "one owner cannot stop the other");
+            assert_eq!(still_active, ["a"]);
+            assert!(renewed);
+            assert_eq!(final_release["stopped"], json!(["a"]));
+            assert_eq!(reason, "user");
+            assert_eq!(opened, 1, "owners share the same sampler");
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_heartbeat_and_unclaimed_release_cannot_acquire_or_stop_a_stream() {
+        if cfg!(windows) {
+            return;
+        }
+        let (route, dir) = fake(STEADY);
+        let live = Live::new(route.clone(), quick(), Box::new(|_| {}));
+        assert!(!live.heartbeat_owned(Owner::Ui, "missing"));
+        live.start_owned(Owner::Monitor, &[node("a", "macos")], &[]);
+        until("initial sample", || !live.samples("a").is_empty()).await;
+        let renewed_without_claim = live.heartbeat_owned(Owner::Ui, "a");
+        let released_without_claim = live.release_owned(Owner::Ui, &["a".into()], Stop::User);
+        let active = live.active();
+        live.release_owned(Owner::Monitor, &["a".into()], Stop::User);
+        live.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(!renewed_without_claim, "renewal must not claim another owner's stream");
+        assert_eq!(released_without_claim["stopped"], json!([]));
+        assert_eq!(active, ["a"]);
+        assert_eq!(route.opened.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn owned_refused_start_never_claims_a_later_legacy_stream() {
+        if cfg!(windows) {
+            return;
+        }
+        let (route, dir) = fake(STEADY);
+        let live = Live::new(route, Opts { max_streams: 1, ..quick() }, Box::new(|_| {}));
+        live.start_owned(Owner::Monitor, &[node("a", "macos")], &[]);
+        let refused = live.start_owned(Owner::Ui, &[node("b", "macos")], &["missing".into()]);
+        assert_eq!(refused["started"], json!([]));
+        assert_eq!(refused["running"], json!([]));
+        assert_eq!(refused["refused"][0]["reason"], "unknown");
+        assert_eq!(refused["refused"][1]["reason"], "limit");
+        live.release_owned(Owner::Monitor, &["a".into()], Stop::User);
+        assert_eq!(live.start(&[node("b", "macos")], &[])["started"], json!(["b"]));
+        assert!(!live.heartbeat_owned(Owner::Ui, "b"));
+        assert_eq!(live.release_owned(Owner::Ui, &["b".into()], Stop::User)["stopped"], json!([]));
+        assert_eq!(live.active(), ["b"]);
+        assert!(live.heartbeat("b"), "legacy heartbeat still renews a legacy stream");
+        assert_eq!(live.stop(None, Stop::User)["stopped"], json!(["b"]));
+        live.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn owned_administrative_stop_exclusion_restart_and_shutdown_override_both_owners() {
+        if cfg!(windows) {
+            return;
+        }
+        for reason in [Stop::User, Stop::Excluded, Stop::Restart, Stop::AppExit] {
+            let (route, dir) = fake(STEADY);
+            let live = Live::new(route, quick(), Box::new(|_| {}));
+            let nodes = [node("a", "macos")];
+            live.start_owned(Owner::Ui, &nodes, &[]);
+            live.start_owned(Owner::Monitor, &nodes, &[]);
+            assert_eq!(live.stop(None, reason)["stopped"], json!(["a"]));
+            assert!(!live.heartbeat_owned(Owner::Ui, "a"));
+            assert!(!live.heartbeat_owned(Owner::Monitor, "a"));
+            live.shutdown(Duration::from_secs(1)).await;
+            assert_eq!(live.start_owned(Owner::Monitor, &nodes, &[])["refused"][0]["reason"], "app_exit");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        for excluded in [Vec::new(), vec![Node::from_value(&json!({"id":"a","status":"paused"}), "synthetic-host")]] {
+            let (route, dir) = fake(STEADY);
+            let live = Live::new(route, quick(), Box::new(|_| {}));
+            live.start_owned(Owner::Ui, &[node("a", "macos")], &[]);
+            live.start_owned(Owner::Monitor, &[node("a", "macos")], &[]);
+            live.retain_active(&excluded);
+            assert!(live.active().is_empty(), "the full ledger removes both claims");
+            live.shutdown(Duration::from_secs(1)).await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_heartbeat_renews_deadline_but_never_restarts_exhausted_retries() {
+        if cfg!(windows) {
+            return;
+        }
+        let (route, dir) = fake(STEADY);
+        let live = Live::new(route, quick(), Box::new(|_| {}));
+        live.start_owned(Owner::Monitor, &[node("a", "macos")], &[]);
+        live.lock().streams.get_mut("a").unwrap().last_hb = Instant::now() - quick().idle_stop - Duration::from_secs(1);
+        assert!(live.heartbeat_owned(Owner::Monitor, "a"));
+        live.tick();
+        assert_eq!(live.active(), ["a"]);
+        live.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+
+        let (route, dir) = fake("exit 255");
+        let live = Live::new(route.clone(), Opts { max_retries: 0, ..quick() }, Box::new(|_| {}));
+        live.start_owned(Owner::Ui, &[node("a", "macos")], &[]);
+        until("retry exhaustion", || state(&live, "a").0 == "stopped").await;
+        assert!(!live.heartbeat_owned(Owner::Ui, "a"));
+        assert!(!live.heartbeat_owned(Owner::Monitor, "a"));
+        assert_eq!(route.opened.load(Ordering::SeqCst), 1);
+        live.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn owned_stale_finish_cannot_erase_the_replacement_stream_or_its_owner() {
+        if cfg!(windows) {
+            return;
+        }
+        let (route, dir) = fake(STEADY);
+        let live = Live::new(route, quick(), Box::new(|_| {}));
+        live.start_owned(Owner::Monitor, &[node("a", "macos")], &[]);
+        let old = live.lock().streams["a"].epoch;
+        live.release_owned(Owner::Monitor, &["a".into()], Stop::User);
+        live.start_owned(Owner::Ui, &[node("a", "macos")], &[]);
+        live.finish("a", old, Stop::Disconnected("old transport".into()));
+        assert!(live.heartbeat_owned(Owner::Ui, "a"));
+        assert!(!live.heartbeat_owned(Owner::Monitor, "a"));
+        assert_eq!(live.release_owned(Owner::Monitor, &["a".into()], Stop::User)["stopped"], json!([]));
+        assert_eq!(live.active(), ["a"]);
+        live.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
