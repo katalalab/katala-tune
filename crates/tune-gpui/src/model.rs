@@ -104,11 +104,7 @@ pub fn build(ledger_nodes: &[Value], last: &[Value]) -> Vec<NodeView> {
                 Some(r) if r.get("ok").and_then(Value::as_bool) != Some(true) => Health::Failed(str_of(r.get("error"))),
                 Some(r) => Health::Scored(r.get("score").and_then(Value::as_u64).map_or(0, |s| s.min(100) as u32)),
             };
-            let findings = r
-                .and_then(|r| r.get("findings"))
-                .and_then(Value::as_array)
-                .map(|a| a.iter().map(finding).collect())
-                .unwrap_or_default();
+            let findings = r.and_then(|r| r.get("findings")).and_then(Value::as_array).map(|a| a.iter().map(finding).collect()).unwrap_or_default();
             NodeView {
                 id,
                 os: str_of(n.get("os")),
@@ -231,8 +227,17 @@ mod tests {
     #[test]
     fn urgency_puts_critical_first() {
         let mk = |crit: usize, score| NodeView {
-            id: String::new(), os: String::new(), role: String::new(), health: Health::Scored(score), at_ms: None,
-            cpu_busy: None, mem_avail_pct: None, uptime_h: None, score_trend: vec![], cpu_trend: vec![], mem_trend: vec![],
+            id: String::new(),
+            os: String::new(),
+            role: String::new(),
+            health: Health::Scored(score),
+            at_ms: None,
+            cpu_busy: None,
+            mem_avail_pct: None,
+            uptime_h: None,
+            score_trend: vec![],
+            cpu_trend: vec![],
+            mem_trend: vec![],
             findings: (0..crit).map(|_| Finding { severity: Severity::Critical, title: String::new(), detail: String::new(), advice: String::new() }).collect(),
         };
         let mut v = vec![mk(0, 10), mk(2, 90), mk(1, 50)];

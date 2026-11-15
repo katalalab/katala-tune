@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <title>Katala Tune</title>
+  <!-- Three modules form one K: a stable spine and two converging paths. -->
+  <rect x="10" y="10" width="11" height="44" rx="5.5" fill="#e4f0ff"/>
+  <path d="M28 26 42.2 11.8A6.2 6.2 0 0 1 46.6 10H52a2 2 0 0 1 1.4 3.4L36.8 30H29.6a2.34 2.34 0 0 1-1.6-4Z" fill="#a4ceff"/>
+  <path d="M29.6 34h7.2l16.6 16.6A2 2 0 0 1 52 54h-5.4a6.2 6.2 0 0 1-4.4-1.8L28 38a2.34 2.34 0 0 1 1.6-4Z" fill="#5b9bff"/>
+</svg>
