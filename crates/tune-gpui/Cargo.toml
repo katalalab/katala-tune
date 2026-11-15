@@ -18,5 +18,10 @@ serde_json.workspace = true
 tokio.workspace = true
 gpui = "0.2.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# GPUI's HTTP client still uses xattr 0.2.3, which needs libc::ENOATTR.
+# libc 0.2.190 removed that Linux alias. Remove this pin when GPUI updates xattr.
+libc = "=0.2.189"
+
 [lints]
 workspace = true

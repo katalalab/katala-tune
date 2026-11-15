@@ -16,3 +16,5 @@ cargo run -p tune-gpui --release --locked -- --config /path/to/ledger.json --dat
 既存版のセキュリティ、AI、Topology、承認付き変更操作、常駐・通知・自動更新はまだ移植していない。既存版を置換する正式リリースとしては扱わず、別DBで試す。Windowsではreleaseビルド、DirectXと実画面の起動を別途確認する。LinuxのGPUIリンクには`libxkbcommon-x11-dev`等の開発ライブラリが必要。
 
 容量は実行ファイル単体とapp bundleを分けて測る。WebViewを使わなくても、機能範囲・画面・台帳・DBが違う状態のRSSを一律の軽量化率として比較しない。
+
+GPUI 0.2.2のHTTPクライアントは `zed-async-tar` 経由で `xattr 0.2.3` を使う。この依存がLinuxで削除された `libc::ENOATTR` を参照するため、GPUIのLinux依存とlockfileは `libc 0.2.189` に固定する。GPUI側のxattr更新時に解除し、3 OSのCIで確認する。
