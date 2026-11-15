@@ -46,6 +46,14 @@ pub enum Health {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Disk {
+    pub mount: String,
+    pub free_gb: f64,
+    pub total_gb: f64,
+    pub free_pct: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct NodeView {
     pub id: String,
     pub os: String,
@@ -55,6 +63,10 @@ pub struct NodeView {
     pub cpu_busy: Option<f64>,
     pub mem_avail_pct: Option<f64>,
     pub uptime_h: Option<f64>,
+    pub swap_gb: Option<f64>,
+    pub cores: Option<i64>,
+    pub cpu_name: String,
+    pub disks: Vec<Disk>,
     pub findings: Vec<Finding>,
     /// 直近の履歴（古い順）。画面の推移グラフ用
     pub score_trend: Vec<f64>,
@@ -118,6 +130,23 @@ pub fn build(ledger_nodes: &[Value], last: &[Value]) -> Vec<NodeView> {
                 cpu_busy: data.and_then(|d| d.get("cpu_busy")).and_then(Value::as_f64),
                 mem_avail_pct: data.and_then(|d| d.get("memory")).and_then(|m| m.get("available_pct")).and_then(Value::as_f64),
                 uptime_h: data.and_then(|d| d.get("host")).and_then(|h| h.get("uptime_h")).and_then(Value::as_f64),
+                swap_gb: data.and_then(|d| d.get("memory")).and_then(|m| m.get("swap_used_gb")).and_then(Value::as_f64),
+                cores: data.and_then(|d| d.get("host")).and_then(|h| h.get("cores")).and_then(Value::as_i64),
+                cpu_name: str_of(data.and_then(|d| d.get("host")).and_then(|h| h.get("cpu"))),
+                disks: data
+                    .and_then(|d| d.get("disk"))
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .map(|d| Disk {
+                                mount: str_of(d.get("mount")),
+                                free_gb: d.get("free_gb").and_then(Value::as_f64).unwrap_or(0.0),
+                                total_gb: d.get("total_gb").and_then(Value::as_f64).unwrap_or(0.0),
+                                free_pct: d.get("free_pct").and_then(Value::as_f64).unwrap_or(0.0),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 findings,
                 score_trend: Vec::new(),
                 cpu_trend: Vec::new(),
@@ -480,6 +509,20 @@ mod tests {
     }
 
     #[test]
+    fn resources_come_from_snapshot_data() {
+        let last = vec![json!({"node_id": "a", "ok": true, "score": 90, "data": {
+            "host": {"cores": 8, "cpu": "X", "uptime_h": 1.0},
+            "memory": {"swap_used_gb": 2.5},
+            "disk": [{"mount": "/", "free_gb": 10, "total_gb": 100, "free_pct": 10.0}, {"mount": "/x"}]
+        }})];
+        let v = build(&[json!({"id": "a"})], &last);
+        assert_eq!((v[0].cores, v[0].swap_gb, v[0].cpu_name.as_str()), (Some(8), Some(2.5), "X"));
+        assert_eq!(v[0].disks.len(), 2);
+        assert_eq!(v[0].disks[0].free_pct, 10.0);
+        assert_eq!(v[0].disks[1].total_gb, 0.0);
+    }
+
+    #[test]
     fn score_is_clamped_and_missing_fields_are_empty() {
         let v = build(&[json!({"id": "a"})], &[json!({"node_id": "a", "ok": true, "score": 250})]);
         assert_eq!(v[0].health, Health::Scored(100));
@@ -491,6 +534,7 @@ mod tests {
         let mk = |crit: usize, score| NodeView {
             id: String::new(), os: String::new(), role: String::new(), health: Health::Scored(score), at_ms: None,
             cpu_busy: None, mem_avail_pct: None, uptime_h: None, score_trend: vec![], cpu_trend: vec![], mem_trend: vec![],
+            swap_gb: None, cores: None, cpu_name: String::new(), disks: vec![],
             findings: (0..crit).map(|_| Finding { severity: Severity::Critical, title: String::new(), detail: String::new(), advice: String::new() }).collect(),
         };
         let mut v = vec![mk(0, 10), mk(2, 90), mk(1, 50)];

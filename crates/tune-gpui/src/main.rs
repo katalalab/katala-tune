@@ -104,11 +104,12 @@ enum Page {
     Topology,
     Actions,
     Schedule,
+    Resources,
 }
 
 impl Page {
     /// サイドバーに並べる順
-    const NAV: [Self; 5] = [Self::Status, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
+    const NAV: [Self; 6] = [Self::Status, Self::Resources, Self::Logs, Self::Topology, Self::Actions, Self::Schedule];
 
     fn title(self) -> &'static str {
         match self {
@@ -118,6 +119,7 @@ impl Page {
             Self::Topology => "構成図",
             Self::Actions => "実行記録",
             Self::Schedule => "スケジュール",
+            Self::Resources => "リソース",
         }
     }
 
@@ -128,6 +130,7 @@ impl Page {
             "topology" => Self::Topology,
             "actions" => Self::Actions,
             "schedule" => Self::Schedule,
+            "resources" => Self::Resources,
             _ => return None,
         })
     }
@@ -237,7 +240,7 @@ impl TuneApp {
                     self.schedule = model::schedule(&v);
                 }
             }
-            Page::Overview => {}
+            Page::Overview | Page::Resources => {}
         }
     }
 
@@ -605,6 +608,44 @@ impl TuneApp {
             .child(events)
     }
 
+    /// 全機のリソースを並べる（直近の分析の値。ライブは機体の詳細で見る）
+    fn resources_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = now_ms();
+        let meter = |label: &str, pct: Option<f64>, bad_high: bool| {
+            let color = match pct {
+                None => palette::muted(),
+                Some(p) => {
+                    let load = if bad_high { p } else { 100.0 - p };
+                    if load >= 90.0 { palette::crit() } else if load >= 70.0 { palette::warn() } else { palette::ok() }
+                }
+            };
+            div().w(px(150.0)).flex_none().flex().flex_col().gap_1()
+                .child(div().flex().justify_between().text_xs().child(div().text_color(palette::muted()).child(label.to_string())).child(pct.map_or("–".to_string(), |p| format!("{p:.0}%"))))
+                .child(div().h(px(5.0)).rounded_full().bg(palette::line()).child(div().h(px(5.0)).rounded_full().bg(color).w(px(pct.map_or(0.0, |p| p.clamp(0.0, 100.0) as f32 * 1.5)))))
+        };
+        let mut rows = div().flex().flex_col().gap_2();
+        for (i, n) in self.nodes.iter().enumerate() {
+            let id = n.id.clone();
+            let mem_used = n.mem_avail_pct.map(|a| 100.0 - a);
+            let disk = n.disks.iter().min_by(|a, b| a.free_pct.total_cmp(&b.free_pct));
+            let hw = format!("{}{}{}", n.cpu_name, n.cores.map_or(String::new(), |c| format!(" · {c} コア")), n.uptime_h.map_or(String::new(), |u| format!(" · 稼働 {}", model::uptime(u))));
+            rows = rows.child(
+                div().id(("res", i)).flex().items_center().gap_4().px_3().py_2().rounded_md().bg(palette::card()).cursor_pointer()
+                    .hover(|d| d.bg(palette::line()))
+                    .child(div().w(px(120.0)).flex_none().flex().flex_col().child(div().text_sm().font_weight(FontWeight::SEMIBOLD).truncate().child(n.id.clone())).child(div().text_xs().text_color(palette::muted()).child(n.at_ms.map_or("未分析".to_string(), |a| model::ago(now, a)))))
+                    .child(meter("CPU", n.cpu_busy, true))
+                    .child(meter("メモリ使用", mem_used, true))
+                    .child(meter(&format!("ディスク使用{}", disk.map_or(String::new(), |d| format!(" {}", d.mount))), disk.map(|d| 100.0 - d.free_pct), true))
+                    .child(div().w(px(104.0)).flex_none().text_xs().text_color(palette::muted()).child(n.swap_gb.map_or("swap –".to_string(), |s| format!("swap {s:.1}GB"))))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().text_color(palette::muted()).child(hw))
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |app, _, _, cx| app.select(Some(id.clone()), cx))),
+            );
+        }
+        div().id("resources").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5()
+            .child(div().text_xs().text_color(palette::muted()).child("直近の分析の値です。1 秒ごとの様子は機体の詳細の「ライブ」で見られます。行を押すと機体の詳細に移ります。"))
+            .child(rows)
+    }
+
     fn actions_page(&self) -> impl IntoElement {
         let now = now_ms();
         let mut rows = div().flex().flex_col().gap_1();
@@ -762,6 +803,7 @@ impl Render for TuneApp {
                 Page::Topology => self.topology_page().into_any_element(),
                 Page::Actions => self.actions_page().into_any_element(),
                 Page::Schedule => self.schedule_page().into_any_element(),
+                Page::Resources => self.resources_page(cx).into_any_element(),
             },
         };
         div()
