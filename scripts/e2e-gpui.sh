@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tune-gpui の保存データsmoke: 単体テスト → 隔離データで起動 → 機体数と全16画面の読込を確かめる。
+# tune-gpui の保存データsmoke: 単体テスト → 隔離データで起動 → 機体数と全17画面の読込を確かめる。
 # 画面操作・IME・収集から保存までのGUI受入は別に行う。
 # 実機の台帳・DB には触れない（--config / --data で一時領域を使う）。
 set -euo pipefail
@@ -7,10 +7,21 @@ repo=$(dirname "$(dirname "$(realpath "$0")")")
 cargo test --manifest-path "$repo/Cargo.toml" -p tune-gpui --release --locked
 cargo build --manifest-path "$repo/Cargo.toml" -p tune-gpui --release --locked
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-n=$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))["nodes"]))' "$repo/config/nodes.example.json")
-out=$("${CARGO_TARGET_DIR:-$repo/target}/release/katala-tune-gpui" --selftest --config "$repo/config/nodes.example.json" --data "$tmp/data")
+# Disable connectivity in the smoke ledger as a second guard against accidental
+# diagnostics; the executable also rejects any collection Job started by render.
+python3 - "$repo/config/nodes.example.json" "$tmp/nodes.json" <<'PYFIXTURE'
+import json, sys
+with open(sys.argv[1]) as source:
+    value = json.load(source)
+for node in value["nodes"]:
+    node["connectivity"] = False
+with open(sys.argv[2], "w") as target:
+    json.dump(value, target)
+PYFIXTURE
+n=$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))["nodes"]))' "$tmp/nodes.json")
+out=$("${CARGO_TARGET_DIR:-$repo/target}/release/katala-tune-gpui" --selftest --config "$tmp/nodes.json" --data "$tmp/data")
 echo "$out"
-[ "$out" = "selftest ok nodes=$n views=16" ] || { echo "E2E 失敗: 期待 nodes=$n" >&2; exit 1; }
+[ "$out" = "selftest ok nodes=$n views=17" ] || { echo "E2E 失敗: 期待 nodes=$n" >&2; exit 1; }
 # 合成保存データがある状態でも全ルートを開き、観測値・状態が不変なことを検証。
 cargo test --manifest-path "$repo/Cargo.toml" -p tune-gpui --release --locked --test saved_views -- --ignored
 echo "e2e-gpui OK"
@@ -35,14 +46,14 @@ fi
 
 # 常時: 変更操作の確認欄が描け、「やめる」で進まないこと（何も実行しない）。
 # 承認の判定そのもの（承認・取り消し・時間切れ・置き換え、Engine との結合）は単体テスト（gate.rs）で確かめる。
-conf=$("${CARGO_TARGET_DIR:-$repo/target}/release/katala-tune-gpui" --selftest --confirm-demo --config "$repo/config/nodes.example.json" --data "$tmp/confirm-data" | grep "^selftest confirm")
+conf=$("${CARGO_TARGET_DIR:-$repo/target}/release/katala-tune-gpui" --selftest --confirm-demo --config "$tmp/nodes.json" --data "$tmp/confirm-data" | grep "^selftest confirm")
 echo "$conf"
 [ "$conf" = "selftest confirm shown=true approved=false" ] || { echo "E2E 失敗: 確認欄 ($conf)" >&2; exit 1; }
 echo "e2e-gpui confirm OK"
 
 # 常時: レビュー画面が見本の完了台帳（task-completion.v1）を読み、画面の表になること（タスク 2 件＋対象範囲 1 行）。
 # 壊れた入力を断ること・検証の詳細は単体テスト（review.rs）で確かめる。
-rv=$("${CARGO_TARGET_DIR:-$repo/target}/release/katala-tune-gpui" --selftest --review "$repo/test/fixtures/review/task-completion.json" --config "$repo/config/nodes.example.json" --data "$tmp/review-data" | grep "^selftest review")
+rv=$("${CARGO_TARGET_DIR:-$repo/target}/release/katala-tune-gpui" --selftest --review "$repo/test/fixtures/review/task-completion.json" --config "$tmp/nodes.json" --data "$tmp/review-data" | grep "^selftest review")
 echo "$rv"
 [ "$rv" = "selftest review rows=3" ] || { echo "E2E 失敗: レビュー ($rv)" >&2; exit 1; }
 echo "e2e-gpui review OK"

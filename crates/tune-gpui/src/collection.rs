@@ -1,7 +1,12 @@
 //! Explicit collection jobs. Saved-data navigation never starts this worker.
-use crate::panels::{Page, Row, Tone};
+use crate::{
+    network,
+    panels::{Page, Panel, Row, Tone},
+};
 use serde_json::{Value, json};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
+
+pub type Progress = Arc<Mutex<Option<Panel>>>;
 use tune_core::{engine::Engine, nodes::Node};
 
 const MAX_ROWS: usize = 24;
@@ -14,7 +19,7 @@ pub enum Kind {
     Inventory,
     Ai,
     Specs,
-    Network,
+    Network(bool),
 }
 impl Kind {
     pub fn label(self) -> &'static str {
@@ -24,7 +29,8 @@ impl Kind {
             Self::Inventory => "道具の棚卸し",
             Self::Ai => "AI取り込み",
             Self::Specs => "詳細仕様の収集",
-            Self::Network => "ネットワーク確認",
+            Self::Network(false) => "接続設定の確認",
+            Self::Network(true) => "外部到達の診断",
         }
     }
     pub fn for_page(page: Page) -> Option<Self> {
@@ -33,13 +39,14 @@ impl Kind {
             Page::Tools => Some(Self::Inventory),
             Page::Ai => Some(Self::Ai),
             Page::Specs => Some(Self::Specs),
-            Page::Network => Some(Self::Network),
             _ => None,
         }
     }
 }
 pub struct Receipt {
     pub kind: Kind,
+    pub network: Option<Panel>,
+    pub diagnosis_warnings: usize,
     pub complete: usize,
     pub partial: usize,
     pub failed: usize,
@@ -50,12 +57,23 @@ pub struct Receipt {
 }
 impl Receipt {
     fn from_result(kind: Kind, value: &Value, excluded: Vec<Value>) -> Self {
-        let mut out = Self { kind, complete: 0, partial: 0, failed: 0, skipped: 0, omitted: 0, busy: value["busy"] == true, rows: Vec::new() };
+        let mut out = Self {
+            kind,
+            network: None,
+            diagnosis_warnings: 0,
+            complete: 0,
+            partial: 0,
+            failed: 0,
+            skipped: 0,
+            omitted: 0,
+            busy: value["busy"] == true,
+            rows: Vec::new(),
+        };
         let mut skipped_ids = std::collections::HashSet::new();
         if problem(&value["error"]) {
             out.add(value, Outcome::Failed, "収集を開始・完了できません");
         } else if !out.busy {
-            let key = if matches!(kind, Kind::Specs | Kind::Network) { "nodes" } else { "results" };
+            let key = if kind == Kind::Specs { "nodes" } else { "results" };
             if let Some(rows) = value[key].as_array() {
                 for row in rows {
                     let (state, reason) = classify(kind, row);
@@ -112,7 +130,46 @@ impl Receipt {
             undo: None,
         });
     }
+    fn network_result(rows: &[Value], active: bool, total: usize) -> Self {
+        let mut result = Self {
+            kind: Kind::Network(active),
+            network: Some(network::panel(rows, active, total, false)),
+            diagnosis_warnings: 0,
+            complete: 0,
+            partial: 0,
+            failed: 0,
+            skipped: 0,
+            omitted: rows.len().saturating_sub(MAX_ROWS),
+            busy: false,
+            rows: vec![],
+        };
+        for value in rows {
+            if value["skipped"] == true {
+                result.skipped += 1;
+            } else if value["ok"] == true {
+                result.complete += 1;
+            } else {
+                result.failed += 1;
+            }
+            result.diagnosis_warnings += usize::from(network::warnings(value));
+            if result.rows.len() < MAX_ROWS {
+                result.rows.push(network::row(value, active));
+            }
+        }
+        result
+    }
     pub fn summary(&self) -> String {
+        if matches!(self.kind, Kind::Network(_)) {
+            return format!(
+                "{}: report取得成功 {} · 取得失敗 {} · 対象外 {} · 診断の注意・欠測 {}（成功の内数） · 表示省略 {}",
+                self.kind.label(),
+                self.complete,
+                self.failed,
+                self.skipped,
+                self.diagnosis_warnings,
+                self.omitted
+            );
+        }
         if self.busy {
             return format!("{}: 別の収集が実行中のため開始されませんでした", self.kind.label());
         }
@@ -130,6 +187,9 @@ impl Receipt {
         std::iter::once(self.summary()).chain(self.rows.iter().map(|r| format!("{} · {}\n{}", r.title, r.badge, r.detail))).collect::<Vec<_>>().join("\n\n")
     }
     pub fn error(kind: Kind, error: &str) -> Self {
+        if let Kind::Network(active) = kind {
+            return Self::network_result(&[json!({"ok":false,"error":"request_failed"})], active, 1);
+        }
         Self::from_result(kind, &json!({"error":error}), vec![])
     }
 }
@@ -137,27 +197,43 @@ impl Receipt {
 pub struct Job {
     pub running: Option<Kind>,
     pub result: Option<Receipt>,
+    pub network: Option<Panel>,
+    pub progress: Progress,
     receiver: Option<mpsc::Receiver<Receipt>>,
 }
 impl Job {
+    pub fn restore_network(&self, page: Page, loaded: Option<Result<Panel, String>>) -> Option<Result<Panel, String>> {
+        if page == Page::Network { self.network.clone().map(Ok).or(loaded) } else { loaded }
+    }
+
     pub fn begin(&mut self, kind: Kind) -> Option<mpsc::Sender<Receipt>> {
         if self.running.is_some() {
             return None;
         }
         let (sender, receiver) = mpsc::channel();
+        self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         self.receiver = Some(receiver);
         self.running = Some(kind);
         Some(sender)
     }
     pub fn poll(&mut self) -> bool {
+        let changed = if let Some(panel) = self.progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+            self.network = Some(panel);
+            true
+        } else {
+            false
+        };
         let Some(receiver) = &self.receiver else {
-            return false;
+            return changed;
         };
         let result = match receiver.try_recv() {
             Ok(result) => result,
-            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Empty) => return changed,
             Err(mpsc::TryRecvError::Disconnected) => Receipt::error(self.running.unwrap_or(Kind::Probe), "収集タスクが停止しました"),
         };
+        if let Some(panel) = &result.network {
+            self.network = Some(panel.clone());
+        }
         self.result = Some(result);
         self.running = None;
         self.receiver = None;
@@ -258,16 +334,6 @@ fn classify(kind: Kind, row: &Value) -> (Outcome, String) {
     if row["ok"] != true {
         return (Outcome::Failed, "成功を確認できません".into());
     }
-    if kind == Kind::Network {
-        // 到達性の × や未取得は、ネットワークの所見であって収集の失敗ではない。成功とは分けて「部分」に数える
-        let flags = NET_FLAGS.map(|(key, label)| match row["data"][key].as_bool() {
-            Some(true) => format!("{label} ○"),
-            Some(false) => format!("{label} ×"),
-            None => format!("{label} –"),
-        });
-        let all_ok = NET_FLAGS.iter().all(|(key, _)| row["data"][key] == true);
-        return (if all_ok { Outcome::Complete } else { Outcome::Partial }, flags.join(" · "));
-    }
     let mut issues = Vec::new();
     match kind {
         Kind::Probe => {
@@ -304,27 +370,6 @@ fn classify(kind: Kind, row: &Value) -> (Outcome, String) {
     )
 }
 
-const NET_FLAGS: [(&str, &str); 5] = [
-    ("interface_up", "インターフェース"),
-    ("link_active", "リンク"),
-    ("ip_address_present", "IP"),
-    ("default_route_present", "既定経路"),
-    ("dns_configured", "DNS"),
-];
-
-/// 受動の到達性確認の対象外の理由（tune-core の選択と同じ条件。選べない機体が一台でもあると全体が拒否されるので、先に外す）
-pub fn network_refusal(node: &Node) -> Option<String> {
-    node.refusal().or_else(|| {
-        if node.get("connectivity") == Some(&Value::Bool(false)) {
-            Some("台帳で接続診断を止めています".into())
-        } else if !node.is_mac() && !node.is_windows() {
-            Some("接続診断は macOS / Windows に対応しています".into())
-        } else {
-            None
-        }
-    })
-}
-
 fn select(kind: Kind, nodes: &[Node], ids: Option<&[String]>) -> Result<(Vec<Node>, Vec<Value>), String> {
     if ids.is_some_and(|ids| ids.iter().any(|id| !nodes.iter().any(|n| &n.id == id))) {
         return Err("未知の機体です".into());
@@ -334,8 +379,8 @@ fn select(kind: Kind, nodes: &[Node], ids: Option<&[String]>) -> Result<(Vec<Nod
     for node in nodes.iter().filter(|n| ids.is_none_or(|ids| ids.is_empty() || ids.contains(&n.id))) {
         let reason = node.refusal().or_else(|| match kind {
             Kind::Ai if !tune_core::ai_sessions::enabled(node) => Some("現在の台帳でAI取り込みが許可されていません（共用機は明示opt-inが必要）".into()),
+            Kind::Network(_) => tune_core::network::select(std::slice::from_ref(node), std::slice::from_ref(&node.id)).err(),
             Kind::Specs => tune_core::specs::select(std::slice::from_ref(node), std::slice::from_ref(&node.id)).err(),
-            Kind::Network => network_refusal(node),
             _ => None,
         });
         if let Some(reason) = reason {
@@ -348,7 +393,7 @@ fn select(kind: Kind, nodes: &[Node], ids: Option<&[String]>) -> Result<(Vec<Nod
 }
 
 /// Called on the job's background thread, never from navigation or rendering.
-pub async fn run(engine: Arc<Engine>, kind: Kind, ids: Option<Vec<String>>) -> Receipt {
+pub async fn run(engine: Arc<Engine>, kind: Kind, ids: Option<Vec<String>>, progress: Progress) -> Receipt {
     let cfg = engine.reload_config();
     if let Some(error) = engine.config_error() {
         return Receipt::error(kind, &error);
@@ -357,18 +402,31 @@ pub async fn run(engine: Arc<Engine>, kind: Kind, ids: Option<Vec<String>>) -> R
         Ok(v) => v,
         Err(error) => return Receipt::error(kind, &error),
     };
+    if let Kind::Network(active) = kind {
+        let ids = targets.iter().map(|n| n.id.clone()).chain(excluded.iter().filter_map(|v| v["node_id"].as_str().map(str::to_owned))).collect();
+        return run_network(ids, active, progress, move |id, active| {
+            let engine = engine.clone();
+            let skipped = excluded.iter().any(|v| v["node_id"] == id);
+            async move {
+                if skipped {
+                    return Ok(json!({"nodes":[{"node_id":id,"ok":false,"skipped":true,"error":"policy_refused"}]}));
+                }
+                // The core API reads the ledger again immediately before every
+                // node; one error never suppresses the remaining targets.
+                engine.network_check(&[id], active).await
+            }
+        })
+        .await;
+    }
     if targets.is_empty() {
-        return Receipt::from_result(kind, &json!({if matches!(kind, Kind::Specs | Kind::Network) { "nodes" } else { "results" }: []}), excluded);
+        return Receipt::from_result(kind, &json!({if kind == Kind::Specs { "nodes" } else { "results" }: []}), excluded);
     }
     let mut value = match kind {
+        Kind::Network(_) => unreachable!("network jobs return through the sequential worker"),
         Kind::Probe => engine.run_probe(ids, false).await,
         Kind::Logs => engine.sync_logs(targets.clone()).await,
         Kind::Inventory => engine.run_inventory(ids).await,
         Kind::Ai => engine.ai_sync(ids).await,
-        Kind::Network => match engine.network_check(&targets.iter().map(|n| n.id.clone()).collect::<Vec<_>>(), false).await {
-            Ok(value) => value,
-            Err(error) => return Receipt::error(kind, &error),
-        },
         Kind::Specs => match engine.specs_refresh(targets.iter().map(|n| n.id.clone()).collect()).await {
             Ok(value) => value,
             Err(error) => return Receipt::error(kind, &error),
@@ -391,7 +449,7 @@ pub async fn run(engine: Arc<Engine>, kind: Kind, ids: Option<Vec<String>>) -> R
             }
         }
     }
-    if matches!(kind, Kind::Specs | Kind::Network)
+    if kind == Kind::Specs
         && let Some(rows) = value["nodes"].as_array_mut()
     {
         rows.retain(|row| targets.iter().any(|node| row["node_id"] == node.id));
@@ -399,33 +457,33 @@ pub async fn run(engine: Arc<Engine>, kind: Kind, ids: Option<Vec<String>>) -> R
     Receipt::from_result(kind, &value, excluded)
 }
 
+async fn run_network<F, Fut>(ids: Vec<String>, active: bool, progress: Progress, mut check: F) -> Receipt
+where
+    F: FnMut(String, bool) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, String>>,
+{
+    let total = ids.len();
+    let mut rows = Vec::new();
+    for id in ids {
+        let value = match check(id.clone(), active).await {
+            Ok(value) => value["nodes"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["node_id"] == id))
+                .cloned()
+                .unwrap_or_else(|| json!({"node_id":id,"ok":false,"error":"invalid_report"})),
+            Err(_) => json!({"node_id":id,"at":tune_core::db::now_ms(),"ok":false,"error":"request_failed"}),
+        };
+        rows.push(value);
+        // A single replaceable slot bounds pending UI work even for slow frames.
+        *progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(network::panel(&rows, active, total, true));
+    }
+    Receipt::network_result(&rows, active, total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tune_core::engine::NoHost;
-
-    #[test]
-    fn network_false_and_missing_flags_are_partial_not_failed() {
-        let all = json!({"interface_up":true,"link_active":true,"ip_address_present":true,"default_route_present":true,"dns_configured":true});
-        let mut no_route = all.clone();
-        no_route["default_route_present"] = json!(false);
-        let mut unknown = all.clone();
-        unknown.as_object_mut().unwrap().remove("dns_configured");
-        let r = Receipt::from_result(
-            Kind::Network,
-            &json!({"nodes":[
-                {"node_id":"good","ok":true,"data":all},
-                {"node_id":"no-route","ok":true,"data":no_route},
-                {"node_id":"unknown","ok":true,"data":unknown},
-                {"node_id":"down","ok":false,"error":"ssh failed"},
-                {"node_id":"off","skipped":true}
-            ]}),
-            vec![],
-        );
-        assert_eq!((r.complete, r.partial, r.failed, r.skipped), (1, 2, 1, 1));
-        assert!(r.rows[1].detail.contains("既定経路 ×"));
-        assert!(r.rows[2].detail.contains("DNS –"));
-    }
 
     #[test]
     fn source_errors_and_null_slots_are_not_complete_log_results() {
@@ -564,21 +622,128 @@ mod tests {
         let config = f.0.join("nodes.json");
         std::fs::write(&config, json!({"nodes":[{"id":"paused","os":"macos","status":"paused"}]}).to_string()).unwrap();
         let engine = Engine::open(config.clone(), f.0.join("data"), Arc::new(NoHost)).unwrap();
-        let unknown = run(engine.clone(), Kind::Logs, Some(vec!["unknown".into()])).await;
+        let unknown = run(engine.clone(), Kind::Logs, Some(vec!["unknown".into()]), Progress::default()).await;
         assert_eq!(unknown.failed, 1);
         for kind in [Kind::Probe, Kind::Logs, Kind::Inventory, Kind::Ai, Kind::Specs] {
-            let r = run(engine.clone(), kind, None).await;
+            let r = run(engine.clone(), kind, None, Progress::default()).await;
             assert_eq!((r.complete, r.failed, r.skipped), (0, 0, 1), "excluded nodes must not start {kind:?}");
         }
         std::fs::write(&config, "{broken synthetic ledger").unwrap();
         for kind in [Kind::Probe, Kind::Logs, Kind::Inventory, Kind::Ai, Kind::Specs] {
-            let r = run(engine.clone(), kind, None).await;
+            let r = run(engine.clone(), kind, None, Progress::default()).await;
             assert_eq!(r.failed, 1, "must fail closed for {kind:?}");
             assert_eq!(r.complete, 0);
         }
         for marker in ["lastProbeAt", "lastLogsAt", "lastInventoryAt", "lastAiAt"] {
             assert_eq!(engine.with_db(|d| d.get_meta(marker)).unwrap(), None);
         }
+    }
+    struct NetworkFake;
+    impl tune_core::collect::Runner for NetworkFake {
+        fn run<'a>(&'a self, _cmd: &'a str, args: &'a [String], _input: Option<&'a [u8]>, _timeout: std::time::Duration) -> tune_core::collect::RunFuture<'a> {
+            let active = args.iter().any(|a| a == "--probe");
+            Box::pin(async move {
+                tune_core::collect::RunResult {
+                    code: Some(0),
+                    err: "fixture-private-body".into(),
+                    out: json!({
+                        "schema":"katala_network_check.v1","platform":"darwin","active_probes":active,
+                        "default_route_present":true,"ip_address_present":true,"dns_configured":true,"interface_up":true,"link_active":true,
+                        "https":{"named":{"state":"reachable","http_status":403,"timings":{"total_ms":12.5}},"fixed_ip":{"state":"tls_failed"}},
+                        "private_ip":"192.0.2.33","body":"fixture-private-body"
+                    })
+                    .to_string(),
+                }
+            })
+        }
+    }
+    #[tokio::test]
+    async fn network_worker_continues_after_request_failure_and_preserves_active_choice() {
+        for active in [false, true] {
+            let progress = Progress::default();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let observed = calls.clone();
+            let result = run_network(vec!["first".into(), "second".into(), "third".into()], active, progress.clone(), move |id, requested_active| {
+                observed.lock().unwrap().push((id.clone(), requested_active));
+                async move {
+                    if id == "first" {
+                        return Err("192.0.2.33 fixture-private-body".into());
+                    }
+                    let node = Node::from_value(&json!({"id":id,"os":"macos","local_hostname":"synthetic","shared":true,"network":false}), "synthetic");
+                    Ok(json!({"nodes":[tune_core::network::check_one(&NetworkFake,&node,requested_active).await]}))
+                }
+            })
+            .await;
+            assert_eq!(*calls.lock().unwrap(), [("first".into(), active), ("second".into(), active), ("third".into(), active)]);
+            assert_eq!((result.complete, result.failed, result.diagnosis_warnings), (2, 1, if active { 2 } else { 0 }));
+            assert!(!result.copy_text().contains("fixture-private") && !result.copy_text().contains("192.0.2.33"));
+            let page = result.network.unwrap();
+            assert_eq!(page.rows.len(), 3);
+            assert!(page.rows[1].detail.contains(if active { "HTTP 403" } else { "HTTPS未実行" }));
+            assert_eq!(progress.lock().unwrap().as_ref().unwrap().rows.len(), 3);
+        }
+    }
+    #[test]
+    fn network_cache_survives_other_jobs_and_progress_is_coalesced() {
+        let mut job = Job::default();
+        let sender = job.begin(Kind::Network(false)).unwrap();
+        assert!(job.begin(Kind::Probe).is_none());
+        for i in 1..=100 {
+            *job.progress.lock().unwrap() = Some(network::panel(&[json!({"node_id":format!("example-{i}"),"ok":false})], false, 100, true));
+        }
+        assert!(job.poll());
+        assert_eq!(job.network.as_ref().unwrap().rows[0].title, "example-100");
+        assert!(job.progress.lock().unwrap().is_none());
+        let mut result = Receipt::from_result(Kind::Network(false), &json!({"results":[]}), vec![]);
+        result.network = job.network.clone();
+        sender.send(result).ok().unwrap();
+        assert!(job.poll());
+        let sender = job.begin(Kind::Logs).unwrap();
+        sender.send(Receipt::error(Kind::Logs, "synthetic failure")).ok().unwrap();
+        assert!(job.poll());
+        assert_eq!(job.result.as_ref().unwrap().kind, Kind::Logs);
+        assert_eq!(job.network.as_ref().unwrap().rows[0].title, "example-100");
+        assert!(job.restore_network(Page::Logs, None).is_none());
+        let restored = job.restore_network(Page::Network, Some(Ok(network::initial(&[])))).unwrap().unwrap();
+        assert_eq!(restored.rows[0].title, "example-100");
+        let offline = job.restore_network(Page::Network, Some(Err("synthetic unavailable ledger".into()))).unwrap().unwrap();
+        assert_eq!(offline.rows[0].title, "example-100");
+    }
+
+    #[test]
+    fn network_selection_uses_connectivity_independently_of_shared_and_network() {
+        let nodes = vec![
+            node(json!({"id":"shared","os":"macos","shared":true,"network":false})),
+            node(json!({"id":"disabled","os":"macos","connectivity":false})),
+            node(json!({"id":"paused","os":"macos","status":"paused"})),
+            node(json!({"id":"unsupported","os":"linux"})),
+        ];
+        let (targets, excluded) = select(Kind::Network(false), &nodes, None).unwrap();
+        assert_eq!(targets.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), ["shared"]);
+        assert_eq!(excluded.len(), 3);
+        assert!(select(Kind::Network(true), &nodes, Some(&["unknown".into()])).is_err());
+    }
+    #[tokio::test]
+    async fn network_engine_and_worker_recheck_latest_ledger_and_fail_closed() {
+        let f = Fixture(std::env::temp_dir().join(format!("tune-ui-network-{}-{}", std::process::id(), tune_core::db::now_ms())));
+        std::fs::create_dir_all(&f.0).unwrap();
+        let config = f.0.join("nodes.json");
+        std::fs::write(&config, json!({"nodes":[{"id":"example","os":"macos","connectivity":false}]}).to_string()).unwrap();
+        let engine = Engine::open(config.clone(), f.0.join("data"), Arc::new(NoHost)).unwrap();
+        for active in [false, true] {
+            assert!(engine.network_check(&["unknown".into()], active).await.is_err());
+            assert!(engine.network_check(&["example".into()], active).await.is_err());
+            let result = run(engine.clone(), Kind::Network(active), None, Progress::default()).await;
+            assert_eq!((result.complete, result.failed, result.skipped), (0, 0, 1));
+        }
+        std::fs::write(&config, json!({"nodes":[{"id":"example","os":"macos","status":"paused"}]}).to_string()).unwrap();
+        assert!(engine.network_check(&["example".into()], true).await.is_err());
+        std::fs::write(&config, "{broken synthetic ledger").unwrap();
+        assert!(engine.network_check(&["example".into()], false).await.is_err());
+        let result = run(engine.clone(), Kind::Network(false), None, Progress::default()).await;
+        assert_eq!((result.complete, result.failed), (0, 1));
+        assert!(engine.config_error().is_some());
+        assert!(!result.copy_text().contains("nodes.json"));
     }
     /// この機体だけを対象に、実際に受動の到達性確認を走らせる（手動: `cargo test -p tune-gpui -- --ignored network_runs`）。
     /// 外部へは何も送らず、結果は真偽だけ。CI では走らせない（ネットワークの状態に依存するため）。
@@ -592,7 +757,7 @@ mod tests {
         let config = f.0.join("nodes.json");
         std::fs::write(&config, json!({"nodes":[{"id":"this-machine","os":os,"local_hostname":host}]}).to_string()).unwrap();
         let engine = Engine::open(config, f.0.join("data"), Arc::new(NoHost)).unwrap();
-        let r = run(engine, Kind::Network, None).await;
+        let r = run(engine, Kind::Network(false), None, Progress::default()).await;
         eprintln!("{}", r.copy_text());
         assert_eq!((r.failed, r.skipped), (0, 0));
         assert_eq!(r.complete + r.partial, 1);

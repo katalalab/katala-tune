@@ -24,6 +24,7 @@ impl LogLevel {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Page {
+    Dashboard,
     Overview,
     Status,
     Resources,
@@ -33,16 +34,17 @@ pub enum Page {
     Tools,
     Ai,
     Security,
+    Network,
     Specs,
     Power,
     Topology,
     Actions,
-    Network,
     Link,
     Review,
 }
 impl Page {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
+        Self::Dashboard,
         Self::Overview,
         Self::Status,
         Self::Resources,
@@ -52,16 +54,17 @@ impl Page {
         Self::Tools,
         Self::Ai,
         Self::Security,
+        Self::Network,
         Self::Specs,
         Self::Power,
         Self::Topology,
         Self::Actions,
-        Self::Network,
         Self::Link,
         Self::Review,
     ];
     pub fn label(self) -> &'static str {
         match self {
+            Self::Dashboard => "Dashboard",
             Self::Overview => "概要",
             Self::Status => "状態",
             Self::Resources => "リソース",
@@ -71,11 +74,11 @@ impl Page {
             Self::Tools => "道具",
             Self::Ai => "AI",
             Self::Security => "セキュリティ",
+            Self::Network => "ネットワーク",
             Self::Specs => "スペック",
             Self::Power => "電力・Clock",
             Self::Topology => "構成図",
             Self::Actions => "実行記録",
-            Self::Network => "ネットワーク",
             Self::Link => "接続",
             Self::Review => "レビュー",
         }
@@ -255,7 +258,7 @@ fn state(v: &Value) -> Tone {
         _ => Tone::Normal,
     }
 }
-fn time(v: &Value) -> String {
+pub(crate) fn time(v: &Value) -> String {
     let Some(ms) = v.as_i64().filter(|n| *n >= 0) else { return "未取得".into() };
     let sec = ms / 1000;
     // Gregorian civil date, with epoch days shifted to the March-based era.
@@ -296,11 +299,12 @@ pub fn load(engine: &Engine, page: Page, query: &str, log_level: LogLevel) -> Re
             return Err(error);
         }
     }
-    let mut p = Panel {
-        facts: vec![], rows: vec![], note: "保存済みデータの読み取り専用表示。取得・再計算・変更操作は行いません。".into()
-    };
+    let mut p =
+        Panel {
+            facts: vec![], rows: vec![], note: "保存済み一覧を開く・再読込するだけでは収集しません。収集する場合は画面の実行ボタンを使います。".into()
+        };
     match page {
-        Page::Overview => return Err("概要は機体の概要画面を使います".into()),
+        Page::Overview | Page::Dashboard => return Err("概要・Dashboard は専用画面を使います".into()),
         Page::Status => {
             let v = engine.status_snapshot()?;
             fact(&mut p, "現在チェック数", fields(&v["counts"], &["ok", "warn", "fail", "unknown"]));
@@ -437,18 +441,12 @@ pub fn load(engine: &Engine, page: Page, query: &str, log_level: LogLevel) -> Re
             p.note.push_str(" 集計はUTC基準30日・検索非連動。費用はAPI単価による推定で実請求ではなく、未知単価分を含みません。セッションは検索一致の最新100件（全期間）、重複除去集計と同じ量ではありません。残り枠は保存値で、失敗後に古い窓が残る場合があります。");
         }
         Page::Security => security(&engine.netsec_view(&json!({}))?, &mut p),
+        Page::Network => return Ok(crate::network::initial(&engine.config().nodes)),
         Page::Specs => specs(&engine.specs_view()?, &mut p),
         Page::Power => power(engine, &mut p)?,
         Page::Topology => {
             let request = TopologyUiRequest { filter: query.into(), ..Default::default() };
             topology(&engine.topology_ui_view(&request)?, &mut p);
-        }
-        Page::Network => {
-            let eligible = engine.config().nodes.iter().filter(|n| crate::collection::network_refusal(n).is_none()).count();
-            fact(&mut p, "到達性を確認できる機体", eligible);
-            p.note = String::from(
-                "各機体のネットワークの到達性を、受動的に（外へ探りを入れずに）確認します。結果は真偽だけで、IP アドレスは含みません。保存はせず、上の「全対象のネットワーク確認」を押したときだけ各機体へ接続して、結果を上の欄に出します。共用機・保護対象・台帳で接続診断を止めた機体は対象外です。",
-            );
         }
         Page::Link => link(engine, &mut p)?,
         // 読み込んだ完了台帳は画面側の状態。何も読み込んでいないときの表だけをここで返す
@@ -1179,7 +1177,7 @@ mod tests {
     fn every_saved_page_loads_empty_without_recompute_or_collection() {
         let f = Fixture::new(json!([]));
         let before = f.engine.with_db(|d| Ok((d.checks()?, d.check_events(150)?, d.cursors()?))).unwrap();
-        for page in Page::ALL.into_iter().filter(|p| *p != Page::Overview) {
+        for page in Page::ALL.into_iter().filter(|p| !matches!(p, Page::Overview | Page::Dashboard)) {
             let p = load(&f.engine, page, "", LogLevel::All).unwrap_or_else(|e| panic!("{page:?}: {e}"));
             assert!(!p.note.is_empty(), "{page:?}");
         }
