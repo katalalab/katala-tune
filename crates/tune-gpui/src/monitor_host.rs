@@ -499,6 +499,7 @@ mod tests {
         host.shutdown().await;
         assert_eq!(engine.monitor_journal_health()["running"], false);
         assert!(host.start_monitor().is_err());
+        drop((host, engine));
         std::fs::remove_dir_all(dir).unwrap();
     }
     async fn assert_malformed_monitor_refused(raw: &str) {
@@ -519,6 +520,7 @@ mod tests {
         host.save_monitor_settings(json!({"enabled":true,"hub":null})).expect("explicit valid repair remains possible");
         let repaired_mode = host.snapshot().mode;
         host.shutdown().await;
+        drop((host, engine));
         std::fs::remove_dir_all(dir).unwrap();
         assert!(refused && !snapshot.started && inactive && no_journal, "malformed settings must refuse admission: {raw}");
         assert_eq!(snapshot.status.phase, RunPhase::Failed, "malformed is unknown, not disabled: {raw}");
@@ -579,6 +581,7 @@ mod tests {
         assert_eq!(host.state.lock().unwrap().worker.as_ref().unwrap().id(), worker_id);
         assert_eq!(host.state.lock().unwrap().ticker.as_ref().unwrap().id(), ticker_id);
         assert!(host.shutdown().await.confirmed());
+        drop((host, engine));
         std::fs::remove_dir_all(dir).unwrap();
     }
     struct Notifications(Arc<AtomicBool>);
@@ -625,6 +628,7 @@ mod tests {
         assert!(start.join().unwrap().is_err());
         observe.join().unwrap();
         host.shutdown().await;
+        drop((host, engine));
         std::fs::remove_dir_all(dir).unwrap();
         assert!(result.is_ok(), "status observation must not wait on settings IO");
     }
@@ -649,6 +653,7 @@ mod tests {
         engine.with_db(|d| d.conn().execute_batch("DROP TABLE monitor_events")).unwrap();
         assert_eq!(host.shutdown().await.journal_ack, Some(false), "final shutdown must not report an unconfirmed journal commit as success");
         assert!(engine.monitor_journal_health()["unconfirmed_acks"].as_u64().unwrap() > 0);
+        drop((host, engine));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

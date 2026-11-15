@@ -48,6 +48,7 @@ async fn passive_saved_enabled_and_rejected_start_never_authorize_work() {
     assert!(host.start_schedule().is_err());
     assert!(host.stop_schedule().is_err());
     assert!(host.save_schedule_settings(json!({"enabled":false})).is_err());
+    drop((host, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
 #[tokio::test(start_paused = true)]
@@ -71,6 +72,7 @@ async fn explicit_start_one_task_five_then_sixty_seconds_with_actual_engine_tick
     advance(120).await;
     assert_eq!(host.schedule_snapshot().1.cycles, 2);
     assert_eq!(host.shutdown().await.scheduler_complete, Some(true));
+    drop((host, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
 #[tokio::test(start_paused = true)]
@@ -94,8 +96,8 @@ async fn ticks_wait_for_completion_and_stop_close_drain_inflight() {
         advance(120).await;
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert_eq!(host.schedule_snapshot().1.cycles, 0);
-        let h = host.clone();
         let drain = if close {
+            let h = host.clone();
             host.request_exit();
             Some(tokio::spawn(async move { h.shutdown().await }))
         } else {
@@ -116,6 +118,7 @@ async fn ticks_wait_for_completion_and_stop_close_drain_inflight() {
         };
         assert_eq!(report.scheduler_complete, Some(true));
         assert!(report.confirmed());
+        drop((host, engine));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -156,6 +159,7 @@ async fn active_manual_skips_cycle_and_latest_input_failure_revokes_permission()
     assert!(!host.schedule_snapshot().0);
     assert!(host.start_schedule().is_err());
     host.shutdown().await;
+    drop((host, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -166,6 +170,7 @@ async fn close_before_first_poll_and_failed_producer_completion_are_truthful() {
     let report = host.shutdown().await;
     assert_eq!(report.scheduler_complete, Some(true));
     assert_eq!(host.schedule_snapshot().1.cycles, 0);
+    drop(host);
     std::fs::remove_dir_all(dir).unwrap();
     let (dir, _, host) = fixture("failed-producer");
     host.start_schedule_with(|_| async { panic!("synthetic failed scheduler") }).unwrap();
@@ -174,6 +179,7 @@ async fn close_before_first_poll_and_failed_producer_completion_are_truthful() {
     let report = host.shutdown().await;
     assert_eq!(report.scheduler_complete, Some(false));
     assert!(!report.confirmed());
+    drop(host);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -208,6 +214,7 @@ async fn minute_cadence_never_overlaps_an_unfinished_tick() {
     host.stop_schedule().unwrap();
     gate.notify_one();
     assert_eq!(host.shutdown().await.scheduler_complete, Some(true));
+    drop(host);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -250,6 +257,7 @@ async fn inflight_controls_restart_preserves_running_then_waiting_until_next_tic
     host.stop_schedule().unwrap();
     gate.notify_one();
     assert_eq!(host.shutdown().await.scheduler_complete, Some(true));
+    drop((host, engine));
     std::fs::remove_dir_all(dir).unwrap();
     assert!(running.0 && waiting.0 && before_next.0 && next.0);
     assert_eq!(
@@ -292,6 +300,7 @@ async fn inflight_controls_repeated_stop_remains_stopping_until_completion() {
     advance(120).await;
     assert_eq!(count.load(Ordering::SeqCst), 1, "stopped permission cannot schedule another tick");
     assert_eq!(host.shutdown().await.scheduler_complete, Some(true));
+    drop((host, engine));
     std::fs::remove_dir_all(dir).unwrap();
     assert!(!first.0 && !repeated.0 && !still_running.0 && !completed.0);
     assert_eq!(

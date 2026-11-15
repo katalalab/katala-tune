@@ -274,6 +274,7 @@ async fn exit_rejects_queued_requests_and_drains_without_ui_receiver() {
     assert_eq!(engine.with_db(|d| d.get_meta("manual-saved")).unwrap(), Some(json!(true)));
     assert_eq!(engine.with_db(|d| d.get_meta("monitor")).unwrap(), Some(json!({"enabled":true})));
     assert!(host.state.lock().unwrap().ticker.is_none());
+    drop((host, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -289,6 +290,7 @@ async fn manual_panic_is_an_unconfirmed_completion_with_a_failure_receipt() {
     assert_eq!(job.result.as_ref().unwrap().failed, 1);
     assert_eq!(job.result.as_ref().unwrap().complete, 0);
     assert_eq!(host.shutdown().await, report);
+    drop((job, host));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -314,7 +316,7 @@ fn live_and_journal_share_one_final_budget_and_missing_ack_is_not_success() {
     // One occupied blocking slot holds the real journal writer's final commit.
     // This avoids adding a product test hook or changing SQLite busy handling.
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().max_blocking_threads(1).build().unwrap();
-    rt.block_on(async {
+    let dir = rt.block_on(async {
         let (dir, engine, _) = host_fixture("budget");
         let opened = Arc::new(tokio::sync::Notify::new());
         let live = Live::new(Arc::new(DelayedClose(opened.clone())), Opts::default(), Box::new(|_| {}));
@@ -349,6 +351,10 @@ fn live_and_journal_share_one_final_budget_and_missing_ack_is_not_success() {
         assert!(elapsed >= Duration::from_millis(2900));
         assert!(elapsed < Duration::from_millis(3800), "two independent budgets would take five seconds: {elapsed:?}");
         eprintln!("shared_live_journal_budget_ms={} report={report:?}", elapsed.as_millis());
-        std::fs::remove_dir_all(dir).unwrap();
+        drop((host, engine));
+        dir
     });
+    // Release runtime-owned task state before deleting the fixture's SQLite files.
+    drop(rt);
+    std::fs::remove_dir_all(dir).unwrap();
 }
