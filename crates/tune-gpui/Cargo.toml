@@ -19,7 +19,7 @@ tokio.workspace = true
 unicode-segmentation = "1.12"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
-gpui = "0.2.2"
+gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "windows-manifest"] }
 sha2 = "0.11"
 tune-link.workspace = true
 
