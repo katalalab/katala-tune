@@ -183,6 +183,8 @@ fn icon_body(name: &str) -> &'static str {
         "topology" => {
             r#"<circle cx="4" cy="10" r="1.8"/><circle cx="15.5" cy="4" r="1.8"/><circle cx="15.5" cy="16" r="1.8"/><path d="M5.7 9.1 13.8 4.9M5.7 10.9l8.1 4.2"/>"#
         }
+        "mac" => r#"<rect x="3" y="4" width="14" height="9.5" rx="1.5"/><path d="M7.5 16.5h5M10 13.5v3"/>"#,
+        "win" => r#"<rect x="3" y="3.5" width="14" height="13" rx="1.5"/><path d="M10 3.5v13M3 10h14"/>"#,
         _ => "",
     }
 }
@@ -254,6 +256,28 @@ impl Page {
             Self::Network => "ネットワーク",
             Self::Link => "接続",
             Self::Review => "レビュー",
+        }
+    }
+
+    /// 見出しの下の説明（旧画面の趣旨）。どの画面も保存済みの値を読むだけ
+    fn desc(self) -> &'static str {
+        match self {
+            Self::Overview => "全機体の状態と、優先して見るもの。直近の分析の結果です。",
+            Self::Status => "保存済みの現在状態と、最近の変化。ここで状態を計算し直すことはしません。",
+            Self::Resources => "全機体の CPU・メモリ・ディスク・swap を、直近の分析の値で並べます。",
+            Self::Processes => "直近の分析時点の、アプリ別の使用量。メモリの多い上位を機体ごとに出します。",
+            Self::Security => "ネットワークとセキュリティの監視の状態。読み取りだけで、遮断や設定の変更はしません。",
+            Self::Network => "各機体のネットワークの到達性を、受動的に確認します。押したときだけ接続します。",
+            Self::Link => "ペア済みの tune-agent の一覧。ペアリングと解除は、鍵を扱うためここではしません。",
+            Self::Review => "task-completion.v1 の申告を一時表示します。検証・受入・完了は判定しません。",
+            Self::Power => "機体ごとの電力。計測できていない値は 0 ではなく「–」と不足項目で示します。",
+            Self::Specs => "保存済みのスペック報告を、部品の区分ごとに機体を並べて比べます。",
+            Self::Tools => "保存済みの道具の棚卸し。版差のあるものを先に並べます。",
+            Self::Ai => "AI の利用の集計。料金は料金表から求めた概算で、請求額ではありません。",
+            Self::Logs => "各機体のイベントログ。同じ形のものを「同種ログ」にまとめて数えます。",
+            Self::Topology => "観測時点の構成図（読み取り専用）。表示は上限付きで、全件ではありません。",
+            Self::Actions => "承認して実行した操作の記録。元に戻せるものは「元に戻す…」から戻せます。",
+            Self::Schedule => "自動スキャンの設定と、前回の実行。表示だけです。",
         }
     }
 
@@ -354,6 +378,7 @@ impl TuneApp {
                 .into_iter()
                 .chain(Page::NAV)
                 .map(Page::icon)
+                .chain(["mac", "win"])
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .map(|n| (n, icon_image(n, "#8b93a3")))
@@ -641,7 +666,7 @@ impl TuneApp {
         div()
             .size(px(16.0))
             .flex_none()
-            .when_some(found, |d, i| d.child(img(i).size(px(16.0))))
+            .when_some(found, |d, i| d.child(img(i).size_full()))
             .when(alert, |d| d.opacity(1.0).border_b_2().border_color(palette::crit()))
     }
 
@@ -744,6 +769,13 @@ impl TuneApp {
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.selected.clone().unwrap_or_else(|| self.page.title().to_string());
+        let (icon_name, desc) = match self.selected.as_ref().and_then(|id| self.nodes.iter().find(|n| &n.id == id)) {
+            Some(n) => (
+                if n.os.eq_ignore_ascii_case("macos") { "mac" } else { "win" },
+                format!("{} · {}", n.os, if n.role.is_empty() { "機体の詳細" } else { n.role.as_str() }),
+            ),
+            None => (self.page.icon(), self.page.desc().to_string()),
+        };
         let (crit, warn): (usize, usize) = self.nodes.iter().fold((0, 0), |a, n| (a.0 + n.count(Severity::Critical), a.1 + n.count(Severity::Warn)));
         let busy = self.probing;
         div()
@@ -754,7 +786,16 @@ impl TuneApp {
             .py_3()
             .border_b_1()
             .border_color(palette::line())
-            .child(div().flex_1().text_lg().font_weight(FontWeight::SEMIBOLD).child(title))
+            .child(
+                div().flex_1().min_w_0().flex().items_center().gap_3().child(self.icon_view(icon_name, false).size(px(22.0))).child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w_0()
+                        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(title))
+                        .child(div().text_xs().text_color(palette::muted()).truncate().child(desc)),
+                ),
+            )
             .child(chip(format!("要対応 {crit}"), if crit > 0 { palette::crit() } else { palette::muted() }))
             .child(chip(format!("注意 {warn}"), if warn > 0 { palette::warn() } else { palette::muted() }))
             .child(
@@ -826,16 +867,22 @@ impl TuneApp {
                     .border_color(palette::line())
                     .cursor_pointer()
                     .hover(|d| d.border_color(palette::accent()))
-                    .child(div().flex().items_center().child(div().flex_1().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(n.id.clone())).child(
-                        score_ring(
-                            match &n.health {
-                                Health::Scored(sc) => *sc as f32 / 100.0,
-                                _ => 0.0,
-                            },
-                            score_color(&n.health),
-                            score,
-                        ),
-                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(self.icon_view(if n.os.eq_ignore_ascii_case("macos") { "mac" } else { "win" }, false))
+                            .child(div().flex_1().truncate().text_sm().font_weight(FontWeight::SEMIBOLD).child(n.id.clone()))
+                            .child(score_ring(
+                                match &n.health {
+                                    Health::Scored(sc) => *sc as f32 / 100.0,
+                                    _ => 0.0,
+                                },
+                                score_color(&n.health),
+                                score,
+                            )),
+                    )
                     .child(div().text_xs().text_color(palette::muted()).child(format!(
                         "{}{}",
                         n.os,
