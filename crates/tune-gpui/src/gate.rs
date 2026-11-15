@@ -106,7 +106,7 @@ mod tests {
     fn gate() -> (Gate, Arc<AtomicUsize>) {
         let n = Arc::new(AtomicUsize::new(0));
         let c = n.clone();
-        (Gate::new(move || drop(c.fetch_add(1, Ordering::SeqCst))), n)
+        (Gate::new(move || _ = c.fetch_add(1, Ordering::SeqCst)), n)
     }
 
     async fn wait_pending(g: &Gate) -> Pending {

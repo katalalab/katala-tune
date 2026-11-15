@@ -41,6 +41,8 @@ pub struct Finding {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Health {
+    /// 台帳で運用対象外。過去の分析と現在の対象範囲を混同しない。
+    Excluded(String),
     /// まだ一度も分析していない
     Unobserved,
     /// 直近の分析が失敗した
@@ -94,12 +96,12 @@ impl NodeView {
     }
 
     /// 並べ替えの鍵。要対応が多い順、次に注意、次にスコアの低い順
-    pub fn urgency(&self) -> (std::cmp::Reverse<usize>, std::cmp::Reverse<usize>, u32) {
+    pub fn urgency(&self) -> (bool, std::cmp::Reverse<usize>, std::cmp::Reverse<usize>, u32) {
         let score = match self.health {
             Health::Scored(s) => s,
             _ => 0,
         };
-        (std::cmp::Reverse(self.count(Severity::Critical)), std::cmp::Reverse(self.count(Severity::Warn)), score)
+        (matches!(self.health, Health::Excluded(_)), std::cmp::Reverse(self.count(Severity::Critical)), std::cmp::Reverse(self.count(Severity::Warn)), score)
     }
 }
 
@@ -126,13 +128,23 @@ pub fn build(ledger_nodes: &[Value], last: &[Value]) -> Vec<NodeView> {
         .map(|n| {
             let id = str_of(n.get("id"));
             let r = last.iter().find(|r| r.get("node_id").and_then(Value::as_str) == Some(id.as_str()));
-            let data = r.and_then(|r| r.get("data"));
-            let health = match r {
-                None => Health::Unobserved,
-                Some(r) if r.get("ok").and_then(Value::as_bool) != Some(true) => Health::Failed(str_of(r.get("error"))),
-                Some(r) => Health::Scored(r.get("score").and_then(Value::as_u64).map_or(0, |s| s.min(100) as u32)),
+            let state = tune_core::nodes::op_state(n);
+            let data = state.active.then(|| r.and_then(|r| r.get("data"))).flatten();
+            let health = if !state.active {
+                Health::Excluded(format!(
+                    "{}{}",
+                    tune_core::nodes::state_label(&state.state),
+                    if state.reason.is_empty() { String::new() } else { format!(": {}", state.reason) }
+                ))
+            } else {
+                match r {
+                    None => Health::Unobserved,
+                    Some(r) if r.get("ok").and_then(Value::as_bool) != Some(true) => Health::Failed(str_of(r.get("error"))),
+                    Some(r) => Health::Scored(r.get("score").and_then(Value::as_u64).map_or(0, |s| s.min(100) as u32)),
+                }
             };
             let findings = r
+                .filter(|_| state.active)
                 .and_then(|r| r.get("findings"))
                 .and_then(Value::as_array)
                 .map(|a| a.iter().map(finding).collect())
@@ -303,11 +315,7 @@ pub fn topology(v: &Value) -> TopologyView {
     TopologyView {
         scopes: arr("scopes")
             .iter()
-            .map(|s| ScopeRow {
-                id: str_of(s.get("scope_id")),
-                status: str_of(s.get("status")),
-                observed_ms: s.get("observed_at").and_then(Value::as_i64),
-            })
+            .map(|s| ScopeRow { id: str_of(s.get("scope_id")), status: str_of(s.get("status")), observed_ms: s.get("observed_at").and_then(Value::as_i64) })
             .collect(),
         entities,
         kind_counts: kinds.into_iter().collect(),
@@ -407,12 +415,7 @@ pub fn status(v: &Value) -> StatusView {
         })
         .collect();
     events.sort_by_key(|e| std::cmp::Reverse(e.ts_ms));
-    StatusView {
-        checks,
-        events,
-        last_probe_ms: v.get("lastProbeAt").and_then(Value::as_i64),
-        last_logs_ms: v.get("lastLogsAt").and_then(Value::as_i64),
-    }
+    StatusView { checks, events, last_probe_ms: v.get("lastProbeAt").and_then(Value::as_i64), last_logs_ms: v.get("lastLogsAt").and_then(Value::as_i64) }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -438,7 +441,9 @@ pub fn actions(rows: &[Value]) -> Vec<ActionRow> {
         .iter()
         .map(|r| ActionRow {
             id: str_of(r.get("id")),
-            can_undo: r.get("undo").is_some_and(|u| !u.is_null()) && r.get("ok").and_then(Value::as_bool) == Some(true) && !undone.contains(&str_of(r.get("id"))),
+            can_undo: r.get("undo").is_some_and(|u| !u.is_null())
+                && r.get("ok").and_then(Value::as_bool) == Some(true)
+                && !undone.contains(&str_of(r.get("id"))),
             at_ms: r.get("at").and_then(Value::as_i64).unwrap_or(0),
             node: str_of(r.get("node_id")),
             label: one_line(&str_of(r.get("label")), 160),
@@ -514,7 +519,11 @@ pub fn power(v: &Value) -> PowerView {
                         wall_w: f(&s, "wall_w"),
                         cpu_w: f(&s, "cpu_w"),
                         gpu_w: f(&s, "gpu_w"),
-                        missing: s.get("missing").and_then(Value::as_array).map(|m| m.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+                        missing: s
+                            .get("missing")
+                            .and_then(Value::as_array)
+                            .map(|m| m.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                            .unwrap_or_default(),
                         projected_kwh: f(&s, "projected_kwh"),
                     }
                 })
@@ -577,7 +586,11 @@ pub fn inventory(v: &Value) -> InventoryView {
             let mut versions: Vec<String> = g
                 .get("nodes")
                 .and_then(Value::as_object)
-                .map(|n| n.values().flat_map(|x| x.get("versions").and_then(Value::as_array).into_iter().flatten().filter_map(|s| s.as_str().map(str::to_string))).collect())
+                .map(|n| {
+                    n.values()
+                        .flat_map(|x| x.get("versions").and_then(Value::as_array).into_iter().flatten().filter_map(|s| s.as_str().map(str::to_string)))
+                        .collect()
+                })
                 .unwrap_or_default();
             versions.sort();
             versions.dedup();
@@ -605,7 +618,14 @@ pub fn inventory(v: &Value) -> InventoryView {
     InventoryView {
         nodes: arr("nodes")
             .iter()
-            .map(|n| (str_of(n.get("id")), n.get("count").and_then(Value::as_i64).unwrap_or(0), n.get("last_ok_at").and_then(Value::as_i64), n.get("error").and_then(Value::as_str).map(str::to_string)))
+            .map(|n| {
+                (
+                    str_of(n.get("id")),
+                    n.get("count").and_then(Value::as_i64).unwrap_or(0),
+                    n.get("last_ok_at").and_then(Value::as_i64),
+                    n.get("error").and_then(Value::as_str).map(str::to_string),
+                )
+            })
             .collect(),
         groups,
         events,
@@ -641,7 +661,11 @@ pub fn ai(v: &Value) -> AiView {
     let mut tools: Vec<(String, i64, i64)> = v
         .get("tools")
         .and_then(Value::as_array)
-        .map(|a| a.iter().map(|x| (str_of(x.get("name")), x.get("calls").and_then(Value::as_i64).unwrap_or(0), x.get("errors").and_then(Value::as_i64).unwrap_or(0))).collect())
+        .map(|a| {
+            a.iter()
+                .map(|x| (str_of(x.get("name")), x.get("calls").and_then(Value::as_i64).unwrap_or(0), x.get("errors").and_then(Value::as_i64).unwrap_or(0)))
+                .collect()
+        })
         .unwrap_or_default();
     tools.sort_by_key(|x| std::cmp::Reverse(x.1));
     AiView {
@@ -884,6 +908,15 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn excluded_nodes_do_not_look_unobserved_or_contribute_old_findings() {
+        let nodes = vec![json!({"id":"paused","os":"macos","status":"paused","status_reason":"maintenance"})];
+        let last = vec![json!({"node_id":"paused","ok":true,"score":100,"findings":[{"severity":"critical","title":"old"}]})];
+        let rows = build(&nodes, &last);
+        assert_eq!(rows[0].count(Severity::Critical), 0);
+        assert!(!matches!(rows[0].health, Health::Scored(_) | Health::Unobserved));
+    }
+
     fn ledger() -> Vec<Value> {
         vec![json!({"id": "a", "os": "macOS"}), json!({"id": "b", "os": "Windows"}), json!({"id": "c"})]
     }
@@ -930,12 +963,35 @@ mod tests {
     #[test]
     fn urgency_puts_critical_first() {
         let mk = |crit: usize, score| NodeView {
-            id: String::new(), os: String::new(), role: String::new(), health: Health::Scored(score), at_ms: None,
-            cpu_busy: None, mem_avail_pct: None, uptime_h: None, score_trend: vec![], cpu_trend: vec![], mem_trend: vec![],
-            swap_gb: None, cores: None, cpu_name: String::new(), disks: vec![], apps: vec![], agent_processes: None,
-            findings: (0..crit).map(|_| Finding { severity: Severity::Critical, title: String::new(), detail: String::new(), advice: String::new(), action: None, action_label: String::new() }).collect(),
+            id: String::new(),
+            os: String::new(),
+            role: String::new(),
+            health: Health::Scored(score),
+            at_ms: None,
+            cpu_busy: None,
+            mem_avail_pct: None,
+            uptime_h: None,
+            score_trend: vec![],
+            cpu_trend: vec![],
+            mem_trend: vec![],
+            swap_gb: None,
+            cores: None,
+            cpu_name: String::new(),
+            disks: vec![],
+            apps: vec![],
+            agent_processes: None,
+            findings: (0..crit)
+                .map(|_| Finding {
+                    severity: Severity::Critical,
+                    title: String::new(),
+                    detail: String::new(),
+                    advice: String::new(),
+                    action: None,
+                    action_label: String::new(),
+                })
+                .collect(),
         };
-        let mut v = vec![mk(0, 10), mk(2, 90), mk(1, 50)];
+        let mut v = [mk(0, 10), mk(2, 90), mk(1, 50)];
         v.sort_by_key(NodeView::urgency);
         assert_eq!(v.iter().map(|n| n.count(Severity::Critical)).collect::<Vec<_>>(), [2, 1, 0]);
     }
@@ -1127,7 +1183,12 @@ mod tests {
 
     #[test]
     fn apps_and_security_parse_with_missing_fields() {
-        let v = build(&[json!({"id": "a"})], &[json!({"node_id": "a", "ok": true, "data": {"processes": {"agent_processes": 3, "apps": [{"app": "x", "count": 2, "cpu": 1.5, "mem_mb": 100}, {}]}}})]);
+        let v = build(
+            &[json!({"id": "a"})],
+            &[
+                json!({"node_id": "a", "ok": true, "data": {"processes": {"agent_processes": 3, "apps": [{"app": "x", "count": 2, "cpu": 1.5, "mem_mb": 100}, {}]}}}),
+            ],
+        );
         assert_eq!(v[0].agent_processes, Some(3));
         assert_eq!(v[0].apps.len(), 2);
         assert_eq!((v[0].apps[0].count, v[0].apps[0].mem_mb), (2, 100.0));

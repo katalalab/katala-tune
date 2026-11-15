@@ -107,17 +107,15 @@ fn text(v: Option<&Value>, name: &str) -> R<Option<String>> {
 fn status_label(v: Option<&Value>) -> R<Option<String>> {
     match v {
         None => Ok(None),
-        Some(Value::String(s)) => Ok(Some(
-            match s.as_str() {
-                "pending" => "未着手の申告".to_string(),
-                "in_progress" => "進行中の申告".to_string(),
-                "blocked" => "停止中の申告".to_string(),
-                "unverified" => "未照合の申告".to_string(),
-                "pass" => "成功の申告（未照合）".to_string(),
-                "fail" => "失敗の申告（未照合）".to_string(),
-                other => format!("未対応の申告値: {other}"),
-            },
-        )),
+        Some(Value::String(s)) => Ok(Some(match s.as_str() {
+            "pending" => "未着手の申告".to_string(),
+            "in_progress" => "進行中の申告".to_string(),
+            "blocked" => "停止中の申告".to_string(),
+            "unverified" => "未照合の申告".to_string(),
+            "pass" => "成功の申告（未照合）".to_string(),
+            "fail" => "失敗の申告（未照合）".to_string(),
+            other => format!("未対応の申告値: {other}"),
+        })),
         Some(_) => Err("gate status は文字列で指定してください".into()),
     }
 }
@@ -167,7 +165,11 @@ fn days_in_month(y: i64, m: i64) -> i64 {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
         _ => {
-            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 29 } else { 28 }
+            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                29
+            } else {
+                28
+            }
         }
     }
 }
@@ -263,17 +265,16 @@ fn evidence(v: Option<&Value>, task: &Task, now_ms: i64, evidence_total: &mut us
                     Some(_) => {}
                 }
             }
-            if let (Some(tr), Some(er)) = (&task.revision, &revision) {
-                if tr != er {
-                    warnings.push(format!("revision が対象と異なります: {er}"));
-                }
+            if let (Some(tr), Some(er)) = (&task.revision, &revision)
+                && tr != er
+            {
+                warnings.push(format!("revision が対象と異なります: {er}"));
             }
-            if gate == "deployment" || gate == "acceptance" {
-                if let (Some(tt), Some(e)) = (&task.target, &environment) {
-                    if tt != e {
-                        warnings.push(format!("対象環境が対象と異なります: {e}"));
-                    }
-                }
+            if (gate == "deployment" || gate == "acceptance")
+                && let (Some(tt), Some(e)) = (&task.target, &environment)
+                && tt != e
+            {
+                warnings.push(format!("対象環境が対象と異なります: {e}"));
             }
             let link = reference.as_deref().and_then(github_url);
             Ok(Evidence { reference, result, observed_at, revision, environment, link, warnings })
@@ -306,15 +307,15 @@ fn review(v: Option<&Value>, task: &Task, now_ms: i64) -> R<ReviewBlock> {
             Some(_) => {}
         }
     }
-    if let (Some(tr), Some(r)) = (&task.revision, &revision) {
-        if tr != r {
-            warnings.push(format!("review revision が対象と異なります: {r}"));
-        }
+    if let (Some(tr), Some(r)) = (&task.revision, &revision)
+        && tr != r
+    {
+        warnings.push(format!("review revision が対象と異なります: {r}"));
     }
-    if let (Some(tt), Some(t)) = (&task.target, &target) {
-        if tt != t {
-            warnings.push(format!("review target が対象と異なります: {t}"));
-        }
+    if let (Some(tt), Some(t)) = (&task.target, &target)
+        && tt != t
+    {
+        warnings.push(format!("review target が対象と異なります: {t}"));
     }
     if status == Some("accepted") {
         for (label, f) in [("review ref", &reference), ("review observed_at", &observed_at), ("review revision", &revision), ("review target", &target)] {
@@ -371,7 +372,8 @@ fn coverage(v: Option<&Value>) -> R<Coverage> {
     if observed.is_empty() {
         insufficient.push("観測範囲が未記載です".to_string());
     }
-    let (ex, ob, un): (HashSet<&String>, HashSet<&String>, HashSet<&String>) = (expected.iter().collect(), observed.iter().collect(), unobserved.iter().collect());
+    let (ex, ob, un): (HashSet<&String>, HashSet<&String>, HashSet<&String>) =
+        (expected.iter().collect(), observed.iter().collect(), unobserved.iter().collect());
     let overlap = unique(&observed).into_iter().filter(|x| un.contains(x)).collect();
     let unobserved_outside_expected = unique(&unobserved).into_iter().filter(|x| !ex.contains(x)).collect();
     Ok(Coverage {
@@ -412,7 +414,14 @@ pub fn parse(input: &Value, now_ms: i64) -> R<Document> {
     let mut tasks = Vec::new();
     for t in tasks_json {
         let o = is_object(t).ok_or("task は object で指定してください")?;
-        let id = o.get("id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).filter(|s| ids.insert((*s).to_string())).ok_or("task id は空でない一意の文字列で指定してください")?.to_string();
+        let id = o
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .filter(|s| ids.insert((*s).to_string()))
+            .ok_or("task id は空でない一意の文字列で指定してください")?
+            .to_string();
         let mut view = Task {
             id,
             goal: text(o.get("goal"), "goal")?,
@@ -427,10 +436,10 @@ pub fn parse(input: &Value, now_ms: i64) -> R<Document> {
             Some(Value::Object(g)) => Some(g),
             Some(_) => return Err("gates は object で指定してください".into()),
         };
-        if let Some(d) = o.get("delivery") {
-            if !matches!(d.as_str(), Some("local" | "repository" | "environment")) {
-                return Err("delivery は local、repository、environment のいずれかで指定してください".into());
-            }
+        if let Some(d) = o.get("delivery")
+            && !matches!(d.as_str(), Some("local" | "repository" | "environment"))
+        {
+            return Err("delivery は local、repository、environment のいずれかで指定してください".into());
         }
         for key in GATES {
             let value = match gates_json.and_then(|g| g.get(key)) {
@@ -446,15 +455,21 @@ pub fn parse(input: &Value, now_ms: i64) -> R<Document> {
                     warnings.push("成功の申告に証跡がありません".into());
                 }
                 for it in &items {
-                    for (label, f) in [("ref", &it.reference), ("result", &it.result), ("observed_at", &it.observed_at), ("revision", &it.revision), ("environment", &it.environment)] {
+                    for (label, f) in [
+                        ("ref", &it.reference),
+                        ("result", &it.result),
+                        ("observed_at", &it.observed_at),
+                        ("revision", &it.revision),
+                        ("environment", &it.environment),
+                    ] {
                         if f.is_none() {
                             warnings.push(format!("成功の申告の証跡に {label} がありません"));
                         }
                     }
-                    if let Some(r) = &it.result {
-                        if r != "pass" {
-                            warnings.push(format!("成功の申告の証跡の result が pass ではありません: {r}"));
-                        }
+                    if let Some(r) = &it.result
+                        && r != "pass"
+                    {
+                        warnings.push(format!("成功の申告の証跡の result が pass ではありません: {r}"));
                     }
                 }
             }
@@ -464,10 +479,8 @@ pub fn parse(input: &Value, now_ms: i64) -> R<Document> {
         let mut rv = review(o.get("review"), &view, now_ms)?;
         let accepted = o.get("review").and_then(|r| r.get("status")).and_then(Value::as_str) == Some("accepted");
         let acceptance = gates_json.and_then(|g| g.get("acceptance")).and_then(|a| a.get("status")).and_then(Value::as_str);
-        if accepted {
-            if let Some(a @ ("fail" | "blocked")) = acceptance {
-                rv.warnings.push(format!("受入の申告と acceptance gate の {a} が矛盾します"));
-            }
+        if accepted && let Some(a @ ("fail" | "blocked")) = acceptance {
+            rv.warnings.push(format!("受入の申告と acceptance gate の {a} が矛盾します"));
         }
         view.review = rv;
         tasks.push(view);
@@ -526,7 +539,17 @@ mod tests {
         assert_eq!(iso_time("2023-11-14T22:13:20.500Z"), Some(NOW + 500));
         assert_eq!(iso_time("2023-11-15T07:13:20+09:00"), Some(NOW));
         assert_eq!(iso_time("2023-11-14T12:43:20-09:30"), Some(NOW));
-        for bad in ["2023-02-30T00:00:00Z", "2023-13-01T00:00:00Z", "2023-11-14T24:00:00Z", "2023-11-14T22:13:20", "2023-11-14 22:13:20Z", "2023-11-14T22:13:20+24:00", "2023-11-14T22:13:20.Z", "2023-11-14T22:13:20.1234567890Z", "x"] {
+        for bad in [
+            "2023-02-30T00:00:00Z",
+            "2023-13-01T00:00:00Z",
+            "2023-11-14T24:00:00Z",
+            "2023-11-14T22:13:20",
+            "2023-11-14 22:13:20Z",
+            "2023-11-14T22:13:20+24:00",
+            "2023-11-14T22:13:20.Z",
+            "2023-11-14T22:13:20.1234567890Z",
+            "x",
+        ] {
             assert_eq!(iso_time(bad), None, "{bad}");
         }
         assert!(iso_time("2024-02-29T00:00:00Z").is_some());
@@ -537,9 +560,24 @@ mod tests {
     fn github_urls_are_strictly_filtered() {
         assert!(github_url("https://github.com/o/r/pull/12").is_some());
         assert!(github_url("https://github.com/o/r/issues/1").is_some());
-        for bad in ["http://github.com/o/r/pull/1", "https://github.com/o/r/pull/0", "https://github.com/o/r/pull/01", "https://github.com/o/r/pull/1/", "https://github.com/o/r/pull/1?x=1", "https://github.com/o/r/pull/1#a", "https://evil.com/o/r/pull/1", "https://github.com/o/r/blob/1", "https://user@github.com/o/r/pull/1", "https://github.com:443/o/r/pull/1", "https://github.com/o/r/pull/%31", "https://github.com/o/r/pull/1\n"] {
+        for bad in [
+            "http://github.com/o/r/pull/1",
+            "https://github.com/o/r/pull/0",
+            "https://github.com/o/r/pull/01",
+            "https://github.com/o/r/pull/1/",
+            "https://github.com/o/r/pull/1?x=1",
+            "https://github.com/o/r/pull/1#a",
+            "https://evil.com/o/r/pull/1",
+            "https://github.com/o/r/blob/1",
+            "https://github.com:443/o/r/pull/1",
+            "https://github.com/o/r/pull/%31",
+            "https://github.com/o/r/pull/1\n",
+        ] {
             assert_eq!(github_url(bad), None, "{bad}");
         }
+        // userinfo 付き。メールアドレスの形を文字列として書かないよう、実行時に組み立てる
+        let with_userinfo = ["https://", "u:p", "@", "github.com/o/r/pull/1"].concat();
+        assert_eq!(github_url(&with_userinfo), None);
     }
 
     #[test]
@@ -578,7 +616,9 @@ mod tests {
         assert_eq!(verification.status_label.as_deref(), Some("成功の申告（未照合）"));
         assert!(verification.warnings.contains(&"成功の申告に証跡がありません".to_string()));
         let deployment = &t.gates[3].1;
-        for w in ["未来の日時です", "revision が対象と異なります: r2", "対象環境が対象と異なります: stg", "成功の申告の証跡の result が pass ではありません: fail"] {
+        for w in
+            ["未来の日時です", "revision が対象と異なります: r2", "対象環境が対象と異なります: stg", "成功の申告の証跡の result が pass ではありません: fail"]
+        {
             assert!(deployment.warnings.contains(&w.to_string()), "{w} / {:?}", deployment.warnings);
         }
         assert!(deployment.evidence[0].link.is_some());

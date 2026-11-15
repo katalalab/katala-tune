@@ -1045,7 +1045,8 @@ pub async fn probe_node_with(runner: &dyn Runner, node: &Node) -> Value {
         Some((m, b)) => (m, Some(b)),
         None => (res.out.as_str(), None),
     };
-    let Some(mut data) = last_json_line(main) else {
+    let Some(mut data) = (res.code == Some(0)).then(|| last_json_line(main)).flatten().filter(|data| data.as_object().is_some_and(|object| !object.is_empty()))
+    else {
         let e = if !res.err.is_empty() {
             res.err.clone()
         } else if !res.out.is_empty() {
@@ -1233,6 +1234,22 @@ mod tests {
     #[derive(Default)]
     struct CaptureRunner {
         calls: Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_failed_commands_with_json_and_empty_snapshots() {
+        struct FixtureRunner(Option<i32>, &'static str);
+        impl Runner for FixtureRunner {
+            fn run<'a>(&'a self, _cmd: &'a str, _args: &'a [String], _input: Option<&'a [u8]>, _timeout: Duration) -> RunFuture<'a> {
+                Box::pin(async move { RunResult { code: self.0, out: self.1.into(), err: "fixture collection failure".into() } })
+            }
+        }
+        let node = Node::from_value(&json!({"id":"dev","os":"macos","network":false,"benchmark":false}), "test-host");
+        for (code, text) in [(Some(255), r#"{"probe":"macos"}"#), (None, r#"{"probe":"macos"}"#), (Some(0), "{}")] {
+            let result = probe_node_with(&FixtureRunner(code, text), &node).await;
+            assert_eq!(result["ok"], false, "code={code:?}, text={text}");
+            assert!(result.get("data").is_none());
+        }
     }
 
     impl Runner for CaptureRunner {
