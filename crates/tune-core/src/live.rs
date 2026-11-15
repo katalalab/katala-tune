@@ -2540,8 +2540,9 @@ echo '{\"type\":\"hello\",\"os\":\"macos\",\"impl\":\"rust\"}'
     async fn mac_sampler_runs_here() {
         use std::os::unix::fs::PermissionsExt;
         for with_sensor in [false, true] {
-            // センサーの最初の値は別の python の起動を待つ。負荷が高いと 1 秒近くかかるので、センサーありは標本を多めに取る
-            let count = if with_sensor { 10 } else { 3 };
+            // センサーの最初の値は別の python の起動を待つ。負荷が高いと数秒かかる（全テストの並列実行や他のビルドと重なると
+            // 10 点 = 約 3 秒では最後の標本にも値が届かない）ので、センサーありは標本を多めに取る
+            let count = if with_sensor { 30 } else { 3 };
             let (_, dir) = fake("");
             if with_sensor {
                 let sensor = dir.join("macmon");
