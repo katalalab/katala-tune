@@ -200,6 +200,63 @@ pub fn level_label(l: &str) -> &'static str {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScopeRow {
+    pub id: String,
+    pub status: String,
+    pub observed_ms: Option<i64>,
+}
+
+/// 構成図の内部表示（`Engine::topology_ui_view`）を、表示に必要な分だけにしたもの。
+/// 表示は上限付きなので、保存されている件数（stored_*）と必ず並べて出す。
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TopologyView {
+    pub scopes: Vec<ScopeRow>,
+    pub entities: Vec<(String, String)>,
+    pub kind_counts: Vec<(String, usize)>,
+    pub edges_shown: usize,
+    pub stored_entities: i64,
+    pub stored_edges: i64,
+    pub history: usize,
+}
+
+pub fn scope_status_label(s: &str) -> &'static str {
+    match s {
+        "complete" => "完了",
+        "partial" => "一部のみ",
+        "failed" => "失敗",
+        "excluded" => "対象外",
+        _ => "未取得",
+    }
+}
+
+pub fn topology(v: &Value) -> TopologyView {
+    let arr = |k: &str| v.get(k).and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let entities: Vec<(String, String)> = arr("entities").iter().map(|e| (str_of(e.get("kind")), str_of(e.get("label")))).collect();
+    let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+    for (k, _) in &entities {
+        *kinds.entry(k.clone()).or_default() += 1;
+    }
+    let totals = v.get("window").and_then(|w| w.get("stored_totals"));
+    let total = |k: &str| totals.and_then(|t| t.get(k)).and_then(Value::as_i64).unwrap_or(0);
+    TopologyView {
+        scopes: arr("scopes")
+            .iter()
+            .map(|s| ScopeRow {
+                id: str_of(s.get("scope_id")),
+                status: str_of(s.get("status")),
+                observed_ms: s.get("observed_at").and_then(Value::as_i64),
+            })
+            .collect(),
+        entities,
+        kind_counts: kinds.into_iter().collect(),
+        edges_shown: arr("edges").len(),
+        stored_entities: total("accepted_entities"),
+        stored_edges: total("accepted_edges"),
+        history: arr("history").len(),
+    }
+}
+
 /// ライブ表示で貯める点（直近 3 分 = 1 秒ごとに 180 点）
 pub const LIVE_KEEP: usize = 180;
 
@@ -325,6 +382,24 @@ mod tests {
         let s = signatures(&[json!({"level": "warn", "sample": "x", "n": 5, "nodes": 2})]);
         assert_eq!((s[0].count, s[0].nodes), (5, 2));
         assert_eq!(level_label("warn"), "警告");
+    }
+
+    #[test]
+    fn topology_view_counts_kinds_and_keeps_stored_totals() {
+        let v = json!({
+            "scopes": [{"scope_id": "s1", "status": "partial", "observed_at": 5}, {}],
+            "entities": [{"kind": "host", "label": "a"}, {"kind": "package", "label": "b"}, {"kind": "package", "label": "c"}],
+            "edges": [{}, {}],
+            "history": [{}],
+            "window": {"stored_totals": {"accepted_entities": 81, "accepted_edges": 99}}
+        });
+        let t = topology(&v);
+        assert_eq!(t.kind_counts, [("host".to_string(), 1), ("package".to_string(), 2)]);
+        assert_eq!((t.stored_entities, t.stored_edges, t.edges_shown, t.history), (81, 99, 2, 1));
+        assert_eq!(t.scopes[0].observed_ms, Some(5));
+        assert_eq!(scope_status_label(&t.scopes[0].status), "一部のみ");
+        assert_eq!(scope_status_label(&t.scopes[1].status), "未取得");
+        assert_eq!(topology(&json!({})), TopologyView::default());
     }
 
     #[test]
