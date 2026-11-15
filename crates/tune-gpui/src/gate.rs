@@ -71,6 +71,16 @@ impl Gate {
         self.lock().closed
     }
 
+    /// Serialize final producer permission with window close. Call only after
+    /// blocking validation; retain this guard over the IO-free host commit.
+    pub(crate) fn admit(&self) -> Result<impl Drop + '_, String> {
+        let state = self.lock();
+        if state.closed {
+            return Err("画面は閉じられています。再表示して開始してください".into());
+        }
+        Ok(state)
+    }
+
     /// 操作者の答え。確認が出ていなければ何もしない
     pub fn answer(&self, ok: bool) {
         let slot = self.lock().slot.take();
@@ -132,6 +142,23 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("確認が出なかった");
+    }
+
+    #[test]
+    fn final_admission_serializes_close_without_reopening_a_closed_gate() {
+        let (gate, _) = gate();
+        let commit = gate.admit().unwrap();
+        let (closed, response) = std::sync::mpsc::channel();
+        let closing = gate.clone();
+        let close = std::thread::spawn(move || {
+            closing.close();
+            closed.send(()).unwrap();
+        });
+        assert!(response.recv_timeout(Duration::from_millis(30)).is_err(), "close cannot overtake an already admitted memory commit");
+        drop(commit);
+        response.recv_timeout(Duration::from_secs(1)).unwrap();
+        close.join().unwrap();
+        assert!(gate.admit().is_err());
     }
 
     #[tokio::test]

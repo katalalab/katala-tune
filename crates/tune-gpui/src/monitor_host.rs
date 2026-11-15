@@ -126,13 +126,30 @@ impl MonitorHost {
             )));
         }
     }
+    pub fn start_monitor_from_ui(&self, gate: &crate::gate::Gate) -> Result<(), String> {
+        self.start_monitor_admitted(Some(gate))
+    }
+    pub fn request_pull_from_ui(&self, gate: &crate::gate::Gate) -> Result<(), String> {
+        self.request_pull_admitted(Some(gate))
+    }
+    pub fn start_schedule_from_ui(self: &Arc<Self>, gate: &crate::gate::Gate) -> Result<(), String> {
+        self.start_schedule_admitted(Some(gate), |engine| async move { engine.checked_tick().await })
+    }
+    // Preserve app-owned callers; per-window UI uses the gated entry point.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn start_monitor(&self) -> Result<(), String> {
+        self.start_monitor_admitted(None)
+    }
+    fn start_monitor_admitted(&self, gate: Option<&crate::gate::Gate>) -> Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_, settings) = self.inputs(&state)?;
         if !settings.enabled && settings.hub.is_none() {
             self.request.send_modify(|r| r.mode = RunMode::Paused);
             return Err("監視設定が無効でハブもありません。設定を保存してから明示的に開始してください".into());
         }
+        // Host state -> blocking validation -> Gate -> memory-only permission.
+        // close() never takes Host state, and no Gate lock spans the DB wait.
+        let _admission = gate.map(crate::gate::Gate::admit).transpose()?;
         self.request.send_modify(|r| {
             r.start_seq = r.start_seq.wrapping_add(1);
             r.mode = RunMode::Run;
@@ -152,12 +169,18 @@ impl MonitorHost {
         self.request.send_modify(|r| r.mode = RunMode::Paused);
         Ok(())
     }
+    // Preserve app-owned callers; per-window UI uses the gated entry point.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn request_pull(&self) -> Result<(), String> {
+        self.request_pull_admitted(None)
+    }
+    fn request_pull_admitted(&self, gate: Option<&crate::gate::Gate>) -> Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_, settings) = self.inputs(&state)?;
         if settings.hub.is_none() {
             return Err("取得するハブが設定されていません".into());
         }
+        let _admission = gate.map(crate::gate::Gate::admit).transpose()?;
         if self.request.borrow().mode == RunMode::Paused {
             self.status.send_modify(|s| s.phase = RunPhase::Starting);
         }
@@ -227,10 +250,20 @@ impl MonitorHost {
     pub fn schedule_snapshot(&self) -> (bool, ScheduleStatus) {
         (*self.schedule_request.borrow(), self.schedule_status.borrow().clone())
     }
+    // Preserve app-owned callers; per-window UI uses the gated entry point.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn start_schedule(self: &Arc<Self>) -> Result<(), String> {
-        self.start_schedule_with(|engine| async move { engine.checked_tick().await })
+        self.start_schedule_admitted(None, |engine| async move { engine.checked_tick().await })
     }
+    #[cfg(test)]
     fn start_schedule_with<F, Fut>(self: &Arc<Self>, tick: F) -> Result<(), String>
+    where
+        F: Fn(Arc<Engine>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send,
+    {
+        self.start_schedule_admitted(None, tick)
+    }
+    fn start_schedule_admitted<F, Fut>(self: &Arc<Self>, gate: Option<&crate::gate::Gate>, tick: F) -> Result<(), String>
     where
         F: Fn(Arc<Engine>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<(), String>> + Send,
@@ -244,6 +277,7 @@ impl MonitorHost {
             self.schedule_failure("自動スキャン設定は無効です。保存後に開始してください".into());
             return Err("自動スキャン設定は無効です。保存後に開始してください".into());
         }
+        let _admission = gate.map(crate::gate::Gate::admit).transpose()?;
         if !*self.schedule_request.borrow() {
             self.schedule_status.send_modify(|s| {
                 s.phase = if state.scheduler_in_flight { SchedulePhase::Running } else { SchedulePhase::Waiting };
@@ -664,3 +698,7 @@ mod shutdown_tests;
 #[cfg(test)]
 #[path = "schedule_tests.rs"]
 mod schedule_tests;
+
+#[cfg(test)]
+#[path = "admission_tests.rs"]
+mod admission_tests;

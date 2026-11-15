@@ -1249,11 +1249,11 @@ impl TuneApp {
                     return;
                 }
                 let outcome = match command {
-                    "start" => host.start_monitor(),
+                    "start" => host.start_monitor_from_ui(&admission),
                     "pause" => host.pause_monitor(),
-                    "pull" => host.request_pull(),
+                    "pull" => host.request_pull_from_ui(&admission),
                     "save" => host.save_monitor_settings(patch.unwrap_or_default()),
-                    "scan-start" => host.start_schedule(),
+                    "scan-start" => host.start_schedule_from_ui(&admission),
                     "scan-stop" => host.stop_schedule(),
                     "scan-save" => host.save_schedule_settings(patch.unwrap_or_default()),
                     "records" => {
