@@ -37,11 +37,12 @@ pub enum Page {
     Power,
     Topology,
     Actions,
+    Network,
     Link,
     Review,
 }
 impl Page {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Overview,
         Self::Status,
         Self::Resources,
@@ -55,6 +56,7 @@ impl Page {
         Self::Power,
         Self::Topology,
         Self::Actions,
+        Self::Network,
         Self::Link,
         Self::Review,
     ];
@@ -73,6 +75,7 @@ impl Page {
             Self::Power => "電力・Clock",
             Self::Topology => "構成図",
             Self::Actions => "実行記録",
+            Self::Network => "ネットワーク",
             Self::Link => "接続",
             Self::Review => "レビュー",
         }
@@ -439,6 +442,13 @@ pub fn load(engine: &Engine, page: Page, query: &str, log_level: LogLevel) -> Re
         Page::Topology => {
             let request = TopologyUiRequest { filter: query.into(), ..Default::default() };
             topology(&engine.topology_ui_view(&request)?, &mut p);
+        }
+        Page::Network => {
+            let eligible = engine.config().nodes.iter().filter(|n| crate::collection::network_refusal(n).is_none()).count();
+            fact(&mut p, "到達性を確認できる機体", eligible);
+            p.note = String::from(
+                "各機体のネットワークの到達性を、受動的に（外へ探りを入れずに）確認します。結果は真偽だけで、IP アドレスは含みません。保存はせず、上の「全対象のネットワーク確認」を押したときだけ各機体へ接続して、結果を上の欄に出します。共用機・保護対象・台帳で接続診断を止めた機体は対象外です。",
+            );
         }
         Page::Link => link(engine, &mut p)?,
         // 読み込んだ完了台帳は画面側の状態。何も読み込んでいないときの表だけをここで返す
