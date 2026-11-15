@@ -257,6 +257,103 @@ pub fn topology(v: &Value) -> TopologyView {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CheckStatus {
+    Fail,
+    Warn,
+    Unknown,
+    Ok,
+}
+
+impl CheckStatus {
+    fn parse(s: &str) -> Self {
+        match s {
+            "fail" => Self::Fail,
+            "warn" => Self::Warn,
+            "ok" => Self::Ok,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fail => "異常",
+            Self::Warn => "注意",
+            Self::Unknown => "不明",
+            Self::Ok => "正常",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Check {
+    pub scope: String,
+    pub name: String,
+    pub status: CheckStatus,
+    pub detail: String,
+    pub checked_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatusEvent {
+    pub scope: String,
+    pub name: String,
+    pub from: CheckStatus,
+    pub to: CheckStatus,
+    pub detail: String,
+    pub ts_ms: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StatusView {
+    /// 異常 → 注意 → 不明 → 正常の順
+    pub checks: Vec<Check>,
+    /// 新しい順
+    pub events: Vec<StatusEvent>,
+    pub last_probe_ms: Option<i64>,
+    pub last_logs_ms: Option<i64>,
+}
+
+impl StatusView {
+    pub fn count(&self, s: CheckStatus) -> usize {
+        self.checks.iter().filter(|c| c.status == s).count()
+    }
+}
+
+/// `Engine::status_snapshot`（保存済みの現在状態。問い合わせだけでは状態を計算し直さない）を表示用にする
+pub fn status(v: &Value) -> StatusView {
+    let arr = |k: &str| v.get(k).and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    let mut checks: Vec<Check> = arr("checks")
+        .iter()
+        .map(|c| Check {
+            scope: str_of(c.get("scope")),
+            name: str_of(c.get("name")),
+            status: CheckStatus::parse(&str_of(c.get("status"))),
+            detail: one_line(&str_of(c.get("detail")), 160),
+            checked_ms: c.get("checked_at").and_then(Value::as_i64),
+        })
+        .collect();
+    checks.sort_by(|a, b| a.status.cmp(&b.status).then_with(|| a.scope.cmp(&b.scope)).then_with(|| a.name.cmp(&b.name)));
+    let mut events: Vec<StatusEvent> = arr("events")
+        .iter()
+        .map(|e| StatusEvent {
+            scope: str_of(e.get("scope")),
+            name: str_of(e.get("name")),
+            from: CheckStatus::parse(&str_of(e.get("from_status"))),
+            to: CheckStatus::parse(&str_of(e.get("to_status"))),
+            detail: one_line(&str_of(e.get("detail")), 140),
+            ts_ms: e.get("ts").and_then(Value::as_i64).unwrap_or(0),
+        })
+        .collect();
+    events.sort_by_key(|e| std::cmp::Reverse(e.ts_ms));
+    StatusView {
+        checks,
+        events,
+        last_probe_ms: v.get("lastProbeAt").and_then(Value::as_i64),
+        last_logs_ms: v.get("lastLogsAt").and_then(Value::as_i64),
+    }
+}
+
 /// ライブ表示で貯める点（直近 3 分 = 1 秒ごとに 180 点）
 pub const LIVE_KEEP: usize = 180;
 
@@ -400,6 +497,27 @@ mod tests {
         assert_eq!(scope_status_label(&t.scopes[0].status), "一部のみ");
         assert_eq!(scope_status_label(&t.scopes[1].status), "未取得");
         assert_eq!(topology(&json!({})), TopologyView::default());
+    }
+
+    #[test]
+    fn status_sorts_worst_first_and_events_newest_first() {
+        let v = json!({
+            "checks": [
+                {"scope": "b", "name": "n1", "status": "ok"},
+                {"scope": "a", "name": "n2", "status": "fail", "detail": "x\ny"},
+                {"scope": "a", "name": "n3", "status": "warn"},
+                {"scope": "a", "name": "n4", "status": "???"}
+            ],
+            "events": [{"ts": 1, "from_status": "ok", "to_status": "fail"}, {"ts": 9, "from_status": "fail", "to_status": "ok"}],
+            "lastProbeAt": 7
+        });
+        let s = status(&v);
+        assert_eq!(s.checks.iter().map(|c| c.status).collect::<Vec<_>>(), [CheckStatus::Fail, CheckStatus::Warn, CheckStatus::Unknown, CheckStatus::Ok]);
+        assert_eq!(s.checks[0].detail, "x");
+        assert_eq!((s.count(CheckStatus::Fail), s.count(CheckStatus::Ok)), (1, 1));
+        assert_eq!(s.events[0].ts_ms, 9);
+        assert_eq!(s.last_probe_ms, Some(7));
+        assert_eq!(status(&json!({})), StatusView::default());
     }
 
     #[test]

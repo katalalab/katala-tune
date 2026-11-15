@@ -116,6 +116,8 @@ struct TuneApp {
     live_on: Option<(String, Instant)>,
     page_logs: bool,
     page_topology: bool,
+    page_status: bool,
+    status: model::StatusView,
     topology: model::TopologyView,
     log_level: Option<&'static str>,
     logs: Vec<model::LogRow>,
@@ -124,8 +126,9 @@ struct TuneApp {
 
 impl TuneApp {
     fn new(engine: Arc<Engine>, rt: Arc<tokio::runtime::Runtime>, dirty: Arc<AtomicBool>, live: LiveHandles, cx: &mut Context<Self>) -> Self {
-        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page_logs: false, page_topology: false, topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
+        let mut app = Self { engine, rt, dirty, nodes: Vec::new(), selected: None, probing: false, notice: None, live: live.live, live_store: live.store, live_dirty: live.dirty, live_on: None, page_logs: false, page_topology: false, page_status: false, status: Default::default(), topology: Default::default(), log_level: None, logs: Vec::new(), sigs: Vec::new() };
         app.reload();
+        app.load_status();
         // 通知を待つ代わりに 0.4 秒ごとに旗を見る。変わったときだけ読み直して描き直す
         cx.spawn(async move |this, cx| {
             loop {
@@ -176,6 +179,9 @@ impl TuneApp {
         if self.page_logs {
             self.load_logs();
         }
+        if self.page_status {
+            self.load_status();
+        }
     }
 
     /// 直近 7 日。重い取り込みはせず、保存済みを読むだけ
@@ -221,15 +227,36 @@ impl TuneApp {
             self.live_stop();
         }
         self.selected = id;
+        self.clear_pages();
+        cx.notify();
+    }
+
+    fn clear_pages(&mut self) {
         self.page_logs = false;
         self.page_topology = false;
+        self.page_status = false;
+    }
+
+    fn open_status(&mut self, cx: &mut Context<Self>) {
+        self.live_stop();
+        self.selected = None;
+        self.clear_pages();
+        self.page_status = true;
+        self.load_status();
         cx.notify();
+    }
+
+    /// 保存済みの現在状態を読むだけ（状態の再計算・通知はしない）
+    fn load_status(&mut self) {
+        if let Ok(v) = self.engine.status_snapshot() {
+            self.status = model::status(&v);
+        }
     }
 
     fn open_topology(&mut self, cx: &mut Context<Self>) {
         self.live_stop();
         self.selected = None;
-        self.page_logs = false;
+        self.clear_pages();
         self.page_topology = true;
         // 保存済みを読むだけ。更新（収集）は行わない
         if let Ok(v) = self.engine.topology_ui_view(&Default::default()) {
@@ -241,7 +268,7 @@ impl TuneApp {
     fn open_logs(&mut self, cx: &mut Context<Self>) {
         self.live_stop();
         self.selected = None;
-        self.page_topology = false;
+        self.clear_pages();
         self.page_logs = true;
         self.load_logs();
         cx.notify();
@@ -280,7 +307,16 @@ impl TuneApp {
                 }))
         };
         let mut list = div().flex().flex_col().gap_0p5().p_2();
-        list = list.child(row(("nav", 0usize).into(), "概要".into(), palette::accent(), String::new(), self.selected.is_none() && !self.page_logs && !self.page_topology, None, cx));
+        list = list.child(row(("nav", 0usize).into(), "概要".into(), palette::accent(), String::new(), self.selected.is_none() && !self.page_logs && !self.page_topology && !self.page_status, None, cx));
+        list = list.child(
+            div().id(("nav", 9997usize)).flex().items_center().gap_2().px_3().py_1p5().rounded_md().cursor_pointer()
+                .when(self.page_status, |d| d.bg(palette::card()))
+                .hover(|d| d.bg(palette::card()))
+                .child(div().size_2().rounded_full().bg(if self.status.count(model::CheckStatus::Fail) > 0 { palette::crit() } else { palette::muted() }))
+                .child(div().flex_1().text_sm().child("状態"))
+                .child(div().text_xs().text_color(palette::muted()).child(match self.status.count(model::CheckStatus::Fail) { 0 => String::new(), n => n.to_string() }))
+                .on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.open_status(cx))),
+        );
         list = list.child(
             div().id(("nav", 9999usize)).flex().items_center().gap_2().px_3().py_1p5().rounded_md().cursor_pointer()
                 .when(self.page_logs, |d| d.bg(palette::card()))
@@ -319,7 +355,7 @@ impl TuneApp {
     }
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = if self.page_topology { "構成図".to_string() } else if self.page_logs { "ログ".to_string() } else { self.selected.clone().unwrap_or_else(|| "概要".into()) };
+        let title = if self.page_status { "状態".to_string() } else if self.page_topology { "構成図".to_string() } else if self.page_logs { "ログ".to_string() } else { self.selected.clone().unwrap_or_else(|| "概要".into()) };
         let (crit, warn): (usize, usize) = self.nodes.iter().fold((0, 0), |a, n| (a.0 + n.count(Severity::Critical), a.1 + n.count(Severity::Warn)));
         let busy = self.probing;
         div()
@@ -511,6 +547,48 @@ impl TuneApp {
             .child(ents)
     }
 
+    fn status_page(&self) -> impl IntoElement {
+        let st = &self.status;
+        let now = now_ms();
+        let color = |s: model::CheckStatus| match s {
+            model::CheckStatus::Fail => palette::crit(),
+            model::CheckStatus::Warn => palette::warn(),
+            model::CheckStatus::Ok => palette::ok(),
+            model::CheckStatus::Unknown => palette::muted(),
+        };
+        let mut counts = div().flex().gap_2();
+        for s in [model::CheckStatus::Fail, model::CheckStatus::Warn, model::CheckStatus::Unknown, model::CheckStatus::Ok] {
+            counts = counts.child(chip(format!("{} {}", s.label(), st.count(s)), color(s)));
+        }
+        let when = |label: &str, t: Option<i64>| format!("{label} {}", t.map_or("未実施".to_string(), |t| model::ago(now, t)));
+        let mut rows = div().flex().flex_col().gap_1();
+        for c in &st.checks {
+            rows = rows.child(
+                div().flex().items_center().gap_2().px_2().py_1().rounded_md().bg(palette::card())
+                    .child(div().w(px(56.0)).flex_none().child(chip(c.status.label(), color(c.status))))
+                    .child(div().w(px(110.0)).flex_none().truncate().text_xs().text_color(palette::muted()).child(c.scope.clone()))
+                    .child(div().w(px(150.0)).flex_none().truncate().text_xs().font_weight(FontWeight::SEMIBOLD).child(c.name.clone()))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().text_color(palette::muted()).child(c.detail.clone())),
+            );
+        }
+        let mut events = div().flex().flex_col().gap_1();
+        for e in st.events.iter().take(30) {
+            events = events.child(
+                div().flex().items_center().gap_2().px_2().py_1().rounded_md().bg(palette::card())
+                    .child(div().w(px(64.0)).flex_none().text_xs().text_color(palette::muted()).child(model::ago(now, e.ts_ms)))
+                    .child(div().w(px(110.0)).flex_none().truncate().text_xs().text_color(palette::muted()).child(e.scope.clone()))
+                    .child(div().w(px(120.0)).flex_none().truncate().text_xs().child(e.name.clone()))
+                    .child(div().flex().gap_1().flex_none().child(chip(e.from.label(), color(e.from))).child(div().text_xs().child("→")).child(chip(e.to.label(), color(e.to))))
+                    .child(div().flex_1().min_w_0().truncate().text_xs().text_color(palette::muted()).child(e.detail.clone())),
+            );
+        }
+        div().id("status").flex_1().overflow_y_scroll().flex().flex_col().gap_3().p_5()
+            .child(div().flex().items_center().gap_4().child(counts).child(div().text_xs().text_color(palette::muted()).child(format!("{} · {}", when("分析", st.last_probe_ms), when("ログ取り込み", st.last_logs_ms)))))
+            .child(rows)
+            .child(div().text_xs().text_color(palette::muted()).child(format!("最近の変化（{} 件まで）", st.events.len().min(30))))
+            .child(events)
+    }
+
     fn finding_row(f: &Finding) -> impl IntoElement {
         let color = severity_color(f.severity);
         div()
@@ -618,6 +696,7 @@ impl TuneApp {
 impl Render for TuneApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let main = match self.selected.clone() {
+            _ if self.page_status => self.status_page().into_any_element(),
             _ if self.page_topology => self.topology_page().into_any_element(),
             _ if self.page_logs => self.logs_page(cx).into_any_element(),
             Some(id) => self.detail(&id, cx).into_any_element(),
@@ -707,6 +786,7 @@ fn main() {
         // --open logs|<機体 id>: 起動時に開く画面（画面確認・スクリーンショット用）
         match arg("--open").as_deref() {
             Some("logs") => drop(window.update(cx, |v, _, cx| v.open_logs(cx))),
+            Some("status") => drop(window.update(cx, |v, _, cx| v.open_status(cx))),
             Some("topology") => drop(window.update(cx, |v, _, cx| v.open_topology(cx))),
             Some(id) => drop(window.update(cx, |v, _, cx| v.select(Some(id.to_string()), cx))),
             None => {}
