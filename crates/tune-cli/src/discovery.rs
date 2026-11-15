@@ -90,6 +90,14 @@ const COMMANDS: &[Command] = &[
         notes: "省略時は全運用対象。DBへ保存しない。機体ごとの失敗は結果内に含む。",
     },
     Command {
+        name: "e2e",
+        arguments: &["--db <new-directory>", "[node ...]"],
+        summary: "収集・分析・保存・再読込・ログ同期を検証",
+        format: "json",
+        effects: CONFIG | DB | WRITE_DB | CONNECT,
+        notes: "新規DB専用。省略時は全運用対象。除外数を別に報告し、対象0台・収集や保存・取り込み元の失敗は終了コード1。台帳と既存DBを変更せず、監視・更新・helper配布を開始しない。GUI操作・配布・更新受入は別途確認する。",
+    },
+    Command {
         name: "logs",
         arguments: &["[--db <dir>]", "[node ...]"],
         summary: "ログを DB に取り込む",

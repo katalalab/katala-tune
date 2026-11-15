@@ -39,7 +39,7 @@ fn catalog_describes_all_public_commands_and_their_effects() {
     assert_eq!(info["cli_version"], env!("CARGO_PKG_VERSION"));
     let commands = info["commands"].as_array().unwrap();
     // Reviewed against the public main dispatch and agent::run, excluding native protocols.
-    let expected = "version versions specs-local specs help cli-info paths probe logs ledger last power capabilities maintenance-plan network status analyze inventory ai ai-summary ai-provenance ai-trace ai-verify ai-limits netsec hygiene ssh export hub-pull monitor schedule metrics dashboard update monitor-run agent-push live agent-pair agent-peers agent-probe agent-unpair topology-refresh topology-watch topology-export";
+    let expected = "version versions specs-local specs help cli-info paths probe e2e logs ledger last power capabilities maintenance-plan network status analyze inventory ai ai-summary ai-provenance ai-trace ai-verify ai-limits netsec hygiene ssh export hub-pull monitor schedule metrics dashboard update monitor-run agent-push live agent-pair agent-peers agent-probe agent-unpair topology-refresh topology-watch topology-export";
     let names: BTreeSet<_> = commands.iter().map(|c| c["name"].as_str().unwrap()).collect();
     assert_eq!(names, expected.split_whitespace().collect());
     assert_eq!(commands.len(), names.len());
@@ -63,6 +63,10 @@ fn catalog_describes_all_public_commands_and_their_effects() {
     assert_eq!(entry("monitor-run")["effects"]["may_deploy_helper"], true);
     assert_eq!(entry("agent-pair")["effects"]["writes_link_state"], true);
     assert_eq!(entry("probe")["effects"]["connects_to_nodes"], true);
+    assert_eq!(entry("e2e")["effects"]["writes_db"], true);
+    assert_eq!(entry("e2e")["effects"]["writes_config"], false);
+    assert_eq!(entry("e2e")["effects"]["connects_to_nodes"], true);
+    assert_eq!(entry("e2e")["effects"]["may_deploy_helper"], false);
     assert_eq!(entry("logs")["output"]["default"], "none");
     assert_eq!(entry("topology-watch")["output"]["default"], "json-lines");
     assert!(!root.exists());

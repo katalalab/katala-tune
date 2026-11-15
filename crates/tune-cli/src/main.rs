@@ -2,6 +2,7 @@
 //!
 //!   tune paths                       台帳と DB の場所
 //!   tune probe [機体 ...]            調査して JSON を標準出力へ（保存しない。npm run probe と同じ）
+//!   tune e2e --db <新規dir> [機体 ...] 収集・分析・保存・再読込・ログ同期を検証（失敗時は非ゼロ終了）
 //!   tune logs [--db <dir>] [機体 ...] ログを取り込む（既定は一時ディレクトリの DB。npm run logs と同じ）
 //!   tune ledger [--json]             対象台帳（対象・除外・未観測とその理由）。台帳の status（online / retired / no-ssh / paused / out-of-scope）を見る。
 //!                                    読み取りだけで、台帳も DB も書き換えず、機体へ接続もしない
@@ -51,6 +52,7 @@
 
 mod agent;
 mod discovery;
+mod e2e;
 mod specs;
 mod topology_native;
 mod topology_reader;
@@ -70,7 +72,7 @@ use tune_core::{
 
 fn usage() -> ExitCode {
     eprintln!(
-        "使い方: tune <paths|probe|hygiene|ssh|logs|ledger|last|power|network|capabilities|specs-local|specs|maintenance-plan|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|agent-push|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
+        "使い方: tune <paths|probe|e2e|hygiene|ssh|logs|ledger|last|power|network|capabilities|specs-local|specs|maintenance-plan|status|analyze|inventory|ai|ai-summary|ai-provenance|ai-trace|ai-verify|ai-limits|netsec|live|export|hub-pull|monitor|schedule|metrics|dashboard|monitor-run|agent-push|update|topology-refresh|topology-watch|topology-export> [...]（詳しくは crates/tune-cli/src/main.rs の先頭）"
     );
     ExitCode::from(2)
 }
@@ -494,6 +496,7 @@ async fn async_main(args: Vec<String>) -> ExitCode {
         "hygiene" => hygiene(rest).await,
         "ssh" => ssh_audit(rest).await,
         "agent-push" => agent_push(rest).await.map(|v| print(&v)),
+        "e2e" => e2e::run(rest).await,
         "probe" => match targets(rest) {
             Ok(t) => {
                 let rs = collect::probe_all(&t, |r| {
