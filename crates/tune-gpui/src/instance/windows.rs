@@ -116,20 +116,27 @@ pub fn claim(namespace: &str) -> Result<Claim, String> {
         Ok(Claim::Primary(Listener { pipe: Arc::new(OwnedHandle::from_raw_handle(pipe)) }))
     }
 }
+struct Connect<'a>(&'a OwnedHandle);
+impl super::pipe_accept::Api for Connect<'_> {
+    const CONNECTED: u32 = ERROR_PIPE_CONNECTED;
+    const LISTENING: u32 = ERROR_PIPE_LISTENING;
+    const NO_DATA: u32 = ERROR_NO_DATA;
+    fn connect(&self) -> (bool, u32) {
+        let ready = unsafe { ConnectNamedPipe(self.0.as_raw_handle(), null_mut()) } != 0;
+        (ready, if ready { 0 } else { unsafe { GetLastError() } })
+    }
+    fn disconnect(&self) {
+        unsafe {
+            DisconnectNamedPipe(self.0.as_raw_handle());
+        }
+    }
+}
 impl Listener {
     pub fn accept(&self) -> Result<Option<Stream>, String> {
-        unsafe {
-            if ConnectNamedPipe(self.pipe.as_raw_handle(), null_mut()) != 0 || GetLastError() == ERROR_PIPE_CONNECTED {
-                return Ok(Some(Stream { pipe: self.pipe.clone(), server: true, deadline: Instant::now() + IO_TIMEOUT }));
-            }
-            match GetLastError() {
-                ERROR_PIPE_LISTENING => Ok(None),
-                ERROR_NO_DATA => {
-                    DisconnectNamedPipe(self.pipe.as_raw_handle());
-                    Ok(None)
-                }
-                _ => Err(err()),
-            }
+        if super::pipe_accept::poll(&Connect(&self.pipe)).map_err(|e| io::Error::from_raw_os_error(e as i32).to_string())? {
+            Ok(Some(Stream { pipe: self.pipe.clone(), server: true, deadline: Instant::now() + IO_TIMEOUT }))
+        } else {
+            Ok(None)
         }
     }
 }

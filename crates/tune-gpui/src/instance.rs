@@ -19,6 +19,9 @@ mod platform;
 #[path = "instance/windows.rs"]
 mod platform;
 
+#[cfg(any(target_os = "windows", test))]
+mod pipe_accept;
+
 const MAX_MESSAGE: usize = 1024;
 const IO_TIMEOUT: Duration = Duration::from_millis(500);
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
