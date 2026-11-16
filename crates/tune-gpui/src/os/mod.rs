@@ -6,7 +6,11 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(any(target_os = "windows", test))]
+pub(crate) mod windows_activation;
+#[cfg(any(target_os = "windows", test))]
 mod windows_login;
+#[cfg(any(target_os = "windows", test))]
+mod windows_notifications;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {

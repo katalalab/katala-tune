@@ -40,7 +40,23 @@ mod text;
 mod tray;
 
 fn main() {
-    let options = match startup::parse(std::env::args_os().skip(1)) {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    #[cfg(target_os = "windows")]
+    match os::windows_activation::mode(&args) {
+        Ok(os::windows_activation::Mode::Ordinary) => {}
+        Ok(os::windows_activation::Mode::Server) => {
+            if let Err(error) = os::windows_activation::native::run() {
+                eprintln!("{}", error.label());
+                std::process::exit(1);
+            }
+            return;
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    }
+    let options = match startup::parse(args) {
         Ok(Some(options)) => options,
         Ok(None) => {
             println!(
