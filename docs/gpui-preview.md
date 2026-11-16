@@ -31,6 +31,21 @@ GPUIは起動引数の検証後、config/dataの相対パスと既存の親デ�
 
 このmanifestは出所とファイルの照合材料であり、CI全体の成功や導入の承認を証明しない。操作者はGitHub runの実際の成功、ZIPのdigest、レビュー済みsourceTree、対象機のOS/arch、展開した三ファイルの名前・サイズ・SHA-256を別途照合する。過去の`katala_gpui_preview.v1`はGUIとCLIの二ファイルの記録として保持し、v2として読み替えない。
 
+展開済みのv2配布元は、Node 24で明示的に読み取り検査できる。`--source`には展開したディレクトリの絶対パスを指定し、検査したいmanifestのOS/archを両方指定する。
+
+```sh
+node scripts/inspect-gpui-artifact.js --source /absolute/extracted/gpui-preview --platform darwin --architecture arm64
+node scripts/inspect-gpui-artifact.js --source C:/absolute/extracted/gpui-preview --platform win32 --architecture x64
+```
+
+引数は三つとも必須で、未知・重複引数や相対sourceは拒否する。moduleからは`inspectArtifact({source, platform, architecture})`を呼ぶ。対応する宣言は`darwin/arm64/aarch64-apple-darwin`と`win32/x64/x86_64-pc-windows-msvc`だけで、検査ホストと異なる宣言も照合できる。実行形式やCPU互換性を検証する機能ではない。
+
+検査はv2の必須キー・型、SemVer、commit/tree/workflowのSHA、workflow/repository/eventの関係、1〜32桁の正のrun/attempt文字列、release target、三つの固定名とroleを照合する。manifestは64 KiB以下、各バイナリは1 byte〜256 MiBの通常ファイルに限る。開いたファイルのidentity・link数・サイズ・読取前後の更新情報と、実際に読み取ったbyte数・SHA-256を確認する。バイナリのhashは最大1 MiBずつ計算し、manifestのhashは整形し直さず元のbytesから求める。三つのうち一つでも失敗すれば部分成功を返さず、stderrに固定roleと段階だけを出して非ゼロで終了する。
+
+成功JSONは`status: "integrity-checked"`と整合確認・出所/承認/導入未確認の文言、正規化した`source`、`manifestSha256`、検証済みmetadataの`manifest`、三つの`files`、唯一の`nativeSampler`を返す。入力ディレクトリ自体のsymlinkは正規化するが、その下のmanifest/binaryの検出可能なsymlink・junction・realpath逸脱、複数hardlink、非通常ファイルは拒否する。Node標準APIはWindowsの任意reparse tagを公開しないため、その全種類を網羅して拒否したとは扱わない。同じuserによる悪意ある並行namespace置換を防ぐ保証もない。この結果は検査時の情報で、後日のcopy許可や永続的な承認tokenには使えない。
+
+検査はdownload・展開・外部問い合わせ・実行・署名検査・DB操作・配置を行わず、余分なdirectory entryも読んだり変更したりしない。sourceや配置先へbytesを書き込まない。CI全成功、配布元とsourceTreeの出所、OS/arch、Mac署名・quarantine・実行、Windows Defender・実行の確認は操作者の別ゲートとして残る。通常起動時のdata/bin限定探索とWindows専用helper承認の契約も変わらない。
+
 検証したnative samplerの対象Preview `data/bin`への配置は手動で行う。GPUI用installerと自動同期は未実装。CIのstagingは通常のbin、Preview data、DB、台帳を変更しない。特に同梱releaseの`tune.exe`は診断用で、Windowsの固定Probe・承認付き操作に使うhelperとして自動承認されない。それらには[Windows helperの導入・更新](windows-helper-approval.md)の専用all-success CI release CLI artifactと非公開の`action_helper` v2承認記録を別途使う。native samplerの出所確認は、そのaction helperの承認を兼ねない。
 
 `scripts/e2e-gpui.sh`はモデル・保存データ・入力編集・起動引数のテストを実行し、見本台帳と一時DBで全17画面の読み込みsmokeを行う。続いて合成の分析・ログ・操作記録を持つDBでも実行ファイルから全画面を開き、前後の観測・収集カーソル・状態・操作記録が不変であることを確認する。この追加テストはdesktop GPUセッションが必要なため、通常の`cargo test`ではignoreし、このスクリプトから明示実行する。
