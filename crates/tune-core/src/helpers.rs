@@ -22,6 +22,7 @@ use crate::db::{now_ms, sha256_hex};
 use crate::nodes::Node;
 
 mod binary;
+pub mod native_install;
 
 /// この版（アプリ・CLI・サンプラーはワークスペースで同じ版）
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

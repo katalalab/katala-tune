@@ -46,7 +46,17 @@ node scripts/inspect-gpui-artifact.js --source C:/absolute/extracted/gpui-previe
 
 検査はdownload・展開・外部問い合わせ・実行・署名検査・DB操作・配置を行わず、余分なdirectory entryも読んだり変更したりしない。sourceや配置先へbytesを書き込まない。CI全成功、配布元とsourceTreeの出所、OS/arch、Mac署名・quarantine・実行、Windows Defender・実行の確認は操作者の別ゲートとして残る。通常起動時のdata/bin限定探索とWindows専用helper承認の契約も変わらない。
 
-検証したnative samplerの対象Preview `data/bin`への配置は手動で行う。GPUI用installerと自動同期は未実装。CIのstagingは通常のbin、Preview data、DB、台帳を変更しない。特に同梱releaseの`tune.exe`は診断用で、Windowsの固定Probe・承認付き操作に使うhelperとして自動承認されない。それらには[Windows helperの導入・更新](windows-helper-approval.md)の専用all-success CI release CLI artifactと非公開の`action_helper` v2承認記録を別途使う。native samplerの出所確認は、そのaction helperの承認を兼ねない。
+検証したnative samplerの対象Preview `data/bin`への配置は手動で行う。GPUIから使う導入UIと自動同期は未実装。CIのstagingは通常のbin、Preview data、DB、台帳を変更しない。特に同梱releaseの`tune.exe`は診断用で、Windowsの固定Probe・承認付き操作に使うhelperとして自動承認されない。それらには[Windows helperの導入・更新](windows-helper-approval.md)の専用all-success CI release CLI artifactと非公開の`action_helper` v2承認記録を別途使う。native samplerの出所確認は、そのaction helperの承認を兼ねない。
+
+Rust coreには、明示導入のための `helpers::native_install` を用意している。`prepare_native_sampler(absolute_source)` はNodeの結果を受け取らず、raw v2 manifestと三つのファイルを自身で開いて検証する。未知・重複field、リンク・reparse・複数hardlink、読取・close・identity・hashの不一致を拒否し、既存の構造検査を通したsamplerのbytesだけを最大256 MiB保持する。宣言可能なOS/archは実ビルドのmacOS arm64またはWindows x64に固定し、他の組合せは未対応とする。
+
+`inspect_bound_target()` は束縛済みdata/binのsamplerだけを観測し、未束縛や読取失敗をMissingとしない。`install_native_sampler(prepared, snapshot)` は確認済みbytesと配置直前のsnapshot照合を使い、同じbin内に排他的に作成した一意stageから配置する。dataを再帰作成せず、binが無い場合だけ明示導入内で一つ作成する。同hashでも安全性と実行permissionを確認し、権限を暗黙修復しない。action helper、設定、無関係な `.new` / `.old-*` は変更しない。
+
+旧samplerの退避と新samplerの配置には上書きしないnative renameを使い、配置後の検証まで今回のbackupを保持する。失敗結果は `Rejected`、`RolledBack`、回復用pathを持つ `RecoveryRequired` を区別する。未知の置換先を上書きして復元せず、backup削除だけの失敗は配置済み・backup保持のreceiptになる。receiptやhelper metadataをDB・ファイルへ保存しない。
+
+この公開core API自体は導入承認や収集停止を保証しない。呼出側にmaintenance所有と静止状態の確立が必要であり、まだGUI/CLIから接続していない。GUIへ導入操作を出す前に、全収集開始とpending Liveを含む開始受付の直列化、および終了時に受理済み導入workerを待つ処理を別途実装する。起動・表示・再読込・設定読取だけで配置や収集を始める動作は加えない。
+
+これは電源断に対してatomicなupdaterではなく、同userによる悪意あるnamespace置換を完全には防がない。署名・quarantine・Defender・CPU/プロトコル適合・CI出所・remote orphan不在の保証も含まない。Windowsはlocal NTFSのheld handleとno-replace操作を使用し、稼働ファイルのsharing拒否を回避するためのprocess停止やlease緩和は行わない。Windows native CIとOS上の実行受入は別の検証ゲートである。
 
 `scripts/e2e-gpui.sh`はモデル・保存データ・入力編集・起動引数のテストを実行し、見本台帳と一時DBで全17画面の読み込みsmokeを行う。続いて合成の分析・ログ・操作記録を持つDBでも実行ファイルから全画面を開き、前後の観測・収集カーソル・状態・操作記録が不変であることを確認する。この追加テストはdesktop GPUセッションが必要なため、通常の`cargo test`ではignoreし、このスクリプトから明示実行する。
 
