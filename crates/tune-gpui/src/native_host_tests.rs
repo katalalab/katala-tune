@@ -6,7 +6,9 @@ use tune_core::{db::Check, engine::Engine};
 struct Fake {
     queries: AtomicUsize,
     permission: AtomicUsize,
+    settings: AtomicUsize,
     login: AtomicUsize,
+    login_requests: Mutex<Vec<bool>>,
     state: Mutex<State>,
     result: Mutex<Effect>,
     sent: Mutex<Vec<(String, String)>>,
@@ -18,7 +20,9 @@ impl Fake {
         Arc::new(Self {
             queries: AtomicUsize::new(0),
             permission: AtomicUsize::new(0),
+            settings: AtomicUsize::new(0),
             login: AtomicUsize::new(0),
+            login_requests: Mutex::new(vec![]),
             state: Mutex::new(State::Disabled),
             result: Mutex::new(Effect::Accepted),
             sent: Mutex::new(vec![]),
@@ -38,10 +42,12 @@ impl Service for Fake {
         done(self.result.lock().unwrap().clone());
     }
     fn settings(&self, done: os::Completion<Effect>) {
+        self.settings.fetch_add(1, Ordering::SeqCst);
         done(self.result.lock().unwrap().clone());
     }
-    fn login(&self, _: bool, done: os::Completion<Effect>) {
+    fn login(&self, enabled: bool, done: os::Completion<Effect>) {
         self.login.fetch_add(1, Ordering::SeqCst);
+        self.login_requests.lock().unwrap().push(enabled);
         done(self.result.lock().unwrap().clone());
     }
     fn notify(&self, title: String, body: String, done: os::Completion<Effect>) {
@@ -98,7 +104,9 @@ async fn startup_reads_reload_saved_data_and_dirty_callbacks_have_no_os_effects(
     assert_eq!(engine.status_snapshot().unwrap()["checks"], before);
     assert_eq!(fake.queries.load(Ordering::SeqCst), 0);
     assert_eq!(fake.permission.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.settings.load(Ordering::SeqCst), 0);
     assert_eq!(fake.login.load(Ordering::SeqCst), 0);
+    assert!(fake.login_requests.lock().unwrap().is_empty());
     assert!(fake.sent.lock().unwrap().is_empty());
     assert_eq!(engine.monitor_journal_health()["running"], false);
     drop(engine);
@@ -192,4 +200,46 @@ async fn pending_os_callback_times_out_without_ui_and_does_not_claim_success() {
     assert_eq!(host.open_at_login_state(), None);
     fake.held.lock().unwrap().take().unwrap()(Effect::Accepted);
     assert!(matches!(host.snapshot().action.unwrap().1, Effect::Failed(_)));
+}
+
+#[tokio::test]
+async fn pending_operation_rejects_settings_and_login_until_completion_without_implicit_query() {
+    let fake = Fake::new();
+    let host = NativeHost::new(Arc::new(AtomicBool::new(false)), fake.clone(), Handle::current());
+    host.act(Action::Refresh);
+    completed(&host).await;
+    let before = host.snapshot();
+    fake.hold.store(true, Ordering::SeqCst);
+    host.act(Action::Test);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while fake.held.lock().unwrap().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(host.snapshot().busy);
+    host.act(Action::Settings);
+    host.act(Action::Login(false));
+    assert!(host.snapshot().busy);
+    assert_eq!(fake.settings.load(Ordering::SeqCst), 0);
+    assert!(fake.login_requests.lock().unwrap().is_empty());
+    fake.held.lock().unwrap().take().unwrap()(Effect::Accepted);
+    completed(&host).await;
+
+    host.act(Action::Settings);
+    completed(&host).await;
+    assert_eq!(fake.settings.load(Ordering::SeqCst), 1);
+    host.act(Action::Login(false));
+    completed(&host).await;
+    assert_eq!(*fake.login_requests.lock().unwrap(), vec![false]);
+    assert_eq!(fake.login.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.permission.load(Ordering::SeqCst), 0);
+    assert_eq!(fake.sent.lock().unwrap().len(), 1);
+    assert_eq!(fake.queries.load(Ordering::SeqCst), 1);
+    let after = host.snapshot();
+    assert_eq!(after.queried_at, before.queried_at);
+    assert_eq!(after.observed.notification, before.observed.notification);
+    assert_eq!(after.observed.login, before.observed.login);
+    assert_eq!(after.action.unwrap().1, Effect::Accepted);
 }

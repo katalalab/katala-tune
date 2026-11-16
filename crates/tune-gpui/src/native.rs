@@ -31,6 +31,9 @@ use tune_core::nodes;
 actions!(tune, [Quit, CloseWindow, GoOverview, NextPage, PreviousPage, Refresh, FocusSearch, FocusContent, ToggleFocus, NextRow, PreviousRow, CopyRecord]);
 
 #[cfg(target_os = "macos")]
+actions!(tune, [OsQuery, OsRequestPermission, OsOpenSettings, OsSendSyntheticTest, OsEnableLogin, OsDisableLogin]);
+
+#[cfg(target_os = "macos")]
 const FONT: &str = ".SystemUIFont";
 #[cfg(not(target_os = "macos"))]
 const FONT: &str = "Segoe UI";
@@ -2071,7 +2074,7 @@ impl Render for TuneApp {
             }
             None => self.record_panel(cx).into_any_element(),
         };
-        div()
+        let root = div()
             .key_context("Browser")
             .track_focus(&self.focus)
             .on_action(cx.listener(|app, _: &Quit, _, cx| {
@@ -2105,8 +2108,38 @@ impl Render for TuneApp {
             }))
             .on_action(cx.listener(|app, _: &NextRow, _, cx| app.select_row(1, cx)))
             .on_action(cx.listener(|app, _: &PreviousRow, _, cx| app.select_row(-1, cx)))
-            .on_action(cx.listener(|app, _: &CopyRecord, _, cx| app.copy_record(cx)))
-            .size_full()
+            .on_action(cx.listener(|app, _: &CopyRecord, _, cx| app.copy_record(cx)));
+        // Window-scoped handlers let the native menu validate availability.
+        // NativeHost's mutex remains the final guard if dispatch races a render.
+        #[cfg(target_os = "macos")]
+        let root = root.when(!self.os.snapshot().busy, |root| {
+            use crate::native_host::Action;
+            root.on_action(cx.listener(|app, _: &OsQuery, _, cx| {
+                app.os.act(Action::Refresh);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|app, _: &OsRequestPermission, _, cx| {
+                app.os.act(Action::Permission);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|app, _: &OsOpenSettings, _, cx| {
+                app.os.act(Action::Settings);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|app, _: &OsSendSyntheticTest, _, cx| {
+                app.os.act(Action::Test);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|app, _: &OsEnableLogin, _, cx| {
+                app.os.act(Action::Login(true));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|app, _: &OsDisableLogin, _, cx| {
+                app.os.act(Action::Login(false));
+                cx.notify();
+            }))
+        });
+        root.size_full()
             .flex()
             .font_family(FONT)
             .bg(palette::bg())
@@ -2446,6 +2479,25 @@ pub fn run(options: startup::Options) {
                 KeyBinding::new(format!("{modifier}-r").as_str(), Refresh, Some("Browser")),
                 KeyBinding::new(format!("{modifier}-f").as_str(), FocusSearch, Some("Browser")),
                 KeyBinding::new(format!("{modifier}-c").as_str(), CopyRecord, Some("Browser && !SearchInput")),
+            ]);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use gpui::{Menu, MenuItem};
+            // set_menus replaces the entire bar, so preserve the existing Quit.
+            cx.set_menus(vec![
+                Menu { name: "Katala Tune".into(), items: vec![MenuItem::action("Katala Tune を終了", Quit)] },
+                Menu {
+                    name: "OS 連携".into(),
+                    items: vec![
+                        MenuItem::action("OS 状態を照会", OsQuery),
+                        MenuItem::action("通知の許可を要求", OsRequestPermission),
+                        MenuItem::action("通知設定を開く", OsOpenSettings),
+                        MenuItem::action("合成テスト通知を送信", OsSendSyntheticTest),
+                        MenuItem::action("ログイン起動を有効にする", OsEnableLogin),
+                        MenuItem::action("ログイン起動を無効にする", OsDisableLogin),
+                    ],
+                },
             ]);
         }
         // Failure to provide a tray is fatal for resident/hidden mode: never
