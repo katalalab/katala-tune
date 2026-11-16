@@ -18,6 +18,22 @@ pub struct Options {
     pub shutdown_check: Option<String>,
 }
 
+/// Dispatch is closed before any installation IO or process data binding.
+#[cfg(any(target_os = "windows", test))]
+pub fn installed(arguments: &[OsString], resolve: impl FnOnce(&str) -> Result<Options, String>) -> Result<Option<Options>, String> {
+    if !arguments.iter().any(|arg| arg == "--installed-startup") {
+        return Ok(None);
+    }
+    if arguments.len() != 2 || arguments[0] != "--installed-startup" {
+        return Err("--installed-startup requires only one profile digest".into());
+    }
+    let digest = arguments[1]
+        .to_str()
+        .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        .ok_or("--installed-startup requires a lower-case SHA-256 digest")?;
+    resolve(digest).map(Some)
+}
+
 pub fn prepare(mut options: Options) -> Result<Options, String> {
     // Freeze paths before IPC/runtime threads. Every normal/diagnostic entry
     // shares these exact paths with Engine, OS integration and helper lookup.
@@ -126,6 +142,44 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_entry_is_closed_before_resolver_and_restores_three_modes() {
+        let digest = "a".repeat(64);
+        let mut calls = 0;
+        for args in [
+            vec!["--installed-startup"],
+            vec!["--installed-startup", "../profile"],
+            vec!["--installed-startup", &digest, "--selftest"],
+            vec!["--config", "other", "--installed-startup", &digest],
+            vec!["--installed-startup", &digest, "--notification-com-server"],
+            vec!["--installed-startup", &digest, "-Embedding"],
+        ] {
+            assert!(
+                installed(&args.into_iter().map(OsString::from).collect::<Vec<_>>(), |_| {
+                    calls += 1;
+                    parse([]).map(Option::unwrap)
+                })
+                .is_err()
+            );
+        }
+        assert_eq!(calls, 0, "invalid entry must not reach filesystem, prepare, helper binding or Engine");
+        for (resident, hidden) in [(false, false), (true, false), (true, true)] {
+            let result = installed(&["--installed-startup".into(), digest.clone().into()], |token| {
+                assert_eq!(token, digest);
+                let mut options = parse(["--config", "exact-config", "--data", "exact-data"].map(OsString::from))?.unwrap();
+                options.resident = resident;
+                options.hidden = hidden;
+                Ok(options)
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!((result.resident, result.hidden), (resident, hidden));
+            assert_eq!(result.config, PathBuf::from("exact-config"));
+            assert_eq!(result.data, PathBuf::from("exact-data"));
+        }
+        assert!(installed(&[], |_| panic!("ordinary launch must not resolve installation")).unwrap().is_none());
+    }
 
     #[test]
     fn resolver_accepts_owned_absolute_and_canonical_paths_and_missing_tails() {
