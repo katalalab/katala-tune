@@ -149,10 +149,10 @@ fn close_releases_ui_only_keeps_monitor_manual_job_and_journal_then_quit_drains(
         let mut windows = Windows::new(true);
         windows.open(&mut ui, None).unwrap();
         let old = ui.view.as_ref().unwrap().live.clone();
-        let (generation, id) = old.request("a").unwrap();
+        let gate = ui.view.as_ref().unwrap().gate.clone();
+        let (generation, id) = old.request(&host, &gate, "a").unwrap();
         old.complete(generation, &id, &nodes, None);
         tests::samples_after(&ui.live, 0).await;
-        let gate = ui.view.as_ref().unwrap().gate.clone();
         let mut session = native_session(&rt, &engine, &host, &ui, fake, true);
         let keeper = session.keeper.unwrap();
         session.windows.current = Some(gpui::WindowHandle::new(gpui::WindowId::from(1)));
@@ -184,7 +184,7 @@ fn close_releases_ui_only_keeps_monitor_manual_job_and_journal_then_quit_drains(
         assert!(!windows.closed());
         assert!(!confirmation.await.unwrap());
         old.complete(generation, &id, &nodes, None);
-        assert!(old.request("a").is_none());
+        assert!(old.request(&host, &gate, "a").is_none());
         assert!(!ui.live.heartbeat_owned(Owner::Ui, "a"));
         assert!(ui.live.heartbeat_owned(Owner::Monitor, "a"));
         let count = ui.live.samples("a").len();
@@ -192,6 +192,7 @@ fn close_releases_ui_only_keeps_monitor_manual_job_and_journal_then_quit_drains(
         windows.open(&mut ui, None).unwrap();
         windows.open(&mut ui, None).unwrap();
         assert!(Rc::ptr_eq(&ui.job, &ui.view.as_ref().unwrap().job));
+        assert!(host.native_install_snapshot().ever_collection_admitted, "Reopen preserves accepted collection history");
         assert!(ui.job.borrow().running.is_some());
         assert_eq!(route.0.load(Ordering::SeqCst), 1);
         assert_eq!(host.snapshot().mode, tune_core::monitor::RunMode::Run);
@@ -200,7 +201,7 @@ fn close_releases_ui_only_keeps_monitor_manual_job_and_journal_then_quit_drains(
         session.admission = Some((current.live.clone(), current.gate.clone()));
         session.close_ui();
         assert!(current.gate.is_closed());
-        assert!(current.live.request("a").is_none());
+        assert!(current.live.request(&host, &current.gate, "a").is_none());
         ui.quit(&mut windows);
         let shutting = host.clone();
         let drain = tokio::spawn(async move { shutting.shutdown().await });
@@ -263,7 +264,7 @@ fn removed_window_revokes_before_entity_release_and_quit_uses_reopened_controls(
     let mut session = native_session(&rt, &engine, &host, &ui, fake, true);
     let first = Arc::new(LiveControl::new(ui.live.clone(), true));
     let first_gate = gate::Gate::new(|| {});
-    let late = first.request("a").unwrap();
+    let late = first.request(&host, &first_gate, "a").unwrap();
     session.admission = Some((first.clone(), first_gate.clone()));
     let waiting = rt.spawn((first_gate.confirm())("first".into(), "first".into()));
     rt.block_on(until(|| first_gate.pending().is_some()));
@@ -274,7 +275,7 @@ fn removed_window_revokes_before_entity_release_and_quit_uses_reopened_controls(
     assert!(!rt.block_on(async { tokio::time::timeout(Duration::from_secs(2), waiting).await.expect("close revokes pending gate") }).unwrap());
     let node = nodes::Node::from_value(&json!({"id":"a","os":"macos"}), "synthetic-host");
     first.complete(late.0, &late.1, &[node], None);
-    assert!(first.request("a").is_none());
+    assert!(first.request(&host, &first_gate, "a").is_none());
     let reopened = Arc::new(LiveControl::new(ui.live.clone(), true));
     let reopened_gate = gate::Gate::new(|| {});
     session.admission = Some((reopened.clone(), reopened_gate.clone()));
@@ -282,7 +283,7 @@ fn removed_window_revokes_before_entity_release_and_quit_uses_reopened_controls(
     rt.block_on(until(|| reopened_gate.pending().is_some()));
     session.close_ui();
     assert!(!rt.block_on(async { tokio::time::timeout(Duration::from_secs(2), waiting).await.expect("close revokes pending gate") }).unwrap());
-    assert!(reopened.request("a").is_none());
+    assert!(reopened.request(&host, &reopened_gate, "a").is_none());
     assert_eq!(route.0.load(Ordering::SeqCst), 0);
     assert!(rt.block_on(host.shutdown()).confirmed());
     drop((session, ui, host, engine, first, reopened));
@@ -370,7 +371,7 @@ fn close_observer_counts_unknown_windows_releases_current_ui_and_quits_on_keeper
             remaining.retain(|window| *window != id);
             assert!(!session.windows_changed(&remaining), "unknown window prevents last-window quit");
             assert!(gate.is_closed(), "closed current UI is revoked even while other windows exist");
-            assert!(live.request("a").is_none());
+            assert!(live.request(&host, &gate, "a").is_none());
             assert!(session.windows.current.is_none());
             assert!(!session.windows.exiting);
             remaining.retain(|window| *window != unknown);
@@ -387,12 +388,62 @@ fn close_observer_counts_unknown_windows_releases_current_ui_and_quits_on_keeper
             assert!(session.windows_changed(&[unknown]));
             assert!(session.windows.exiting);
             assert!(gate.is_closed());
-            assert!(live.request("a").is_none());
+            assert!(live.request(&host, &gate, "a").is_none());
             assert!(!session.windows_changed(&[]), "quit callbacks must not recurse");
         }
     }
     assert!(rt.block_on(host.shutdown()).confirmed());
     drop((ui, host, engine));
+    drop(rt);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn resident_reopen_retains_install_and_native_shutdown_joins_the_same_host() {
+    let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap());
+    let (dir, engine, host, mut ui, _, fake) = rt.block_on(async { fixture("install-reopen") });
+    let mut session = native_session(&rt, &engine, &host, &ui, fake, true);
+    let mut windows = Windows::new(true);
+    windows.open(&mut ui, None).unwrap();
+    let gate = ui.view.as_ref().unwrap().gate.clone();
+    let old_live = ui.view.as_ref().unwrap().live.clone();
+    session.admission = Some((old_live, gate.clone()));
+    session.windows.current = Some(gpui::WindowHandle::new(gpui::WindowId::from(1)));
+    let (entered, ready) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    host.start_fixture_install(&gate, move || {
+        entered.send(()).unwrap();
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        Err(tune_core::helpers::native_install::prepare_native_sampler(std::path::Path::new("relative-source")).unwrap_err())
+    })
+    .unwrap();
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(!session.windows_changed(&[session.keeper.unwrap()]));
+    ui.close();
+    assert!(gate.is_closed());
+    assert!(host.native_install_snapshot().busy);
+    windows.open(&mut ui, None).unwrap();
+    assert!(Arc::ptr_eq(&session.handles.monitor, &host));
+    assert!(session.handles.monitor.native_install_snapshot().busy);
+    let reopened = ui.view.as_ref().unwrap();
+    session.windows.current = Some(gpui::WindowHandle::new(gpui::WindowId::from(2)));
+    session.admission = Some((reopened.live.clone(), reopened.gate.clone()));
+    session.close_ui();
+    assert!(reopened.gate.is_closed());
+    host.request_exit();
+    let draining = host.clone();
+    let runtime = rt.clone();
+    let (done, result) = mpsc::channel();
+    let join = std::thread::spawn(move || done.send(finish_shutdown(&runtime, &draining, &AtomicBool::new(false))).unwrap());
+    assert!(result.recv_timeout(Duration::from_millis(150)).is_err());
+    release.send(()).unwrap();
+    let report = result.recv_timeout(Duration::from_secs(2)).unwrap();
+    join.join().unwrap();
+    assert_eq!(report.install_complete, Some(true));
+    assert!(report.confirmed());
+    assert!(matches!(session.handles.monitor.native_install_snapshot().result.as_deref(), Some(crate::monitor_host::NativeInstallResult::Completed(Err(_)))));
+    assert_eq!(finish_shutdown(&rt, &host, &AtomicBool::new(false)), report);
+    drop((session, ui, host, engine));
     drop(rt);
     std::fs::remove_dir_all(dir).unwrap();
 }

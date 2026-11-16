@@ -1,4 +1,4 @@
-//! Explicit local native-sampler preparation and placement. No caller is connected.
+//! Explicit local native-sampler preparation and placement for the GPUI installer.
 //!
 //! Callers must establish maintenance ownership and collection quiescence before
 //! installation. These values are integrity observations, not authorization,
@@ -259,6 +259,17 @@ fn bound_bin() -> Result<&'static Path, InstallError> {
 /// executable-adjacent source, and never creates a missing bin directory.
 pub fn inspect_bound_target() -> Result<NativeTargetSnapshot, InstallError> {
     inspect_at(bound_bin()?)
+}
+/// Recheck the original confirmation observation without creating a directory or file.
+pub fn revalidate_bound_target(expected: &NativeTargetSnapshot) -> Result<(), InstallError> {
+    revalidate_at(bound_bin()?, expected)
+}
+fn revalidate_at(bin: &Path, expected: &NativeTargetSnapshot) -> Result<(), InstallError> {
+    let current = inspect_at(bin)?;
+    if current.target != expected.target || current.data != expected.data || current.bin != expected.bin || current.observed != expected.observed {
+        return Err(target_changed());
+    }
+    Ok(())
 }
 fn inspect_at(bin: &Path) -> Result<NativeTargetSnapshot, InstallError> {
     artifact::tuple()?;
