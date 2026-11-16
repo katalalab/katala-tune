@@ -95,3 +95,11 @@ Windows専用`--notification-com-server`（後ろにOSの`-Embedding`を一つ�
 brokerは起動直前に導入先を再照合し、解決済みの同一exeへ`--config <verified config> --data <verified data> --open dashboard`だけを`std::process::Command`のargvで渡す。通常起動のsingle-instanceがDBより前に既存GUIへforwardし、hiddenなら既存session.open、終了済みなら通常primaryへ進む。collectorは自動開始しない。spawnやcallbackの受理はforeground表示の証明ではない。通常GUIはCOMfactoryを登録せず、warm/coldの両方で同じbrokerを使う。
 
 brokerは最後のReopenから30秒のidleで参照・lockがなければ終了し、外部参照・繰返しcallbackがあっても120秒のlifetimeで新規受付を閉じる。これらは製品上の待機方針で、Windows APIのtimeout保証ではない。同期の登録読取り・spawn中の遅延はこの時間を超え得る。終了時はqueueを閉じ、factory cookieをrevokeし、保持interfaceをdropして同じworkerでapartmentを解放する。期限に残った外部interfaceは以後の利用が失敗し得るため、実機での再activationも受入対象とする。OS foreground制限や権限保護を迂回しない。
+
+## 参加GUIの収集予約
+
+新版TauriとGPUIは、同じローカルOSユーザーにつき収集できるプロセスを一つに制限する。別の実行ファイル・台帳・データ保存先でも共通で、対象機体が重ならない場合も同時収集はできない。GPUIの起動、保存画面の表示・再読込、設定保存、Reopenだけでは予約を取得しない。Live、監視、ハブ取得、自動スキャン、全手動収集（Networkの設定確認と外部到達診断を含む）の明示開始時に取得する。`--selftest --live`と収集を伴う終了診断も同じ制限を受ける。Tauriは起動時に自動処理を開始するため、primary setupのEngine準備より先に予約する。
+
+拒否されたGPUIでは保存済み画面を利用でき、開始要求は無効のままになる。所有側のPause、Stop、手動処理の完了、ウィンドウを隠す操作、常駐中の最後のウィンドウ終了では予約を返さない。別GUIへ譲るには所有側のアプリを終了し、利用側で明示的に再試行する。失敗後の自動再開、PIDや時間による強制解除はない。異常終了時もOSがハンドルを閉じた後の明示再試行で取得する。ロックファイル自体は削除しない。
+
+この予約は同じ保存先のEngineを保護するdata claimとは独立している。旧stable、未参加CLI/raw core、別OSユーザーや別hub、remote orphanの不在は保証しない。旧stableを止めたり設定を書き換えたりする移行処理ではない。

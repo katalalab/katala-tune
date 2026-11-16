@@ -320,8 +320,28 @@ impl LiveControl {
         }
         state.notice = None;
         let generation = state.generation;
+        // OS admission may block on local metadata; close/stop must still revoke
+        // this generation while it runs. No pending intent or ticker exists yet.
+        drop(state);
+        let claim = tune_core::gui_collection::ensure_gui_collection_owner();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation != generation || state.closing || !state.active {
+            return None;
+        }
+        if let Err(error) = claim {
+            state.notice = Some(error.to_string());
+            return None;
+        }
         state.intent = Some(LiveIntent { generation, id: id.into(), started: false, pending: true, heartbeat: Instant::now() });
         Some((generation, id.into()))
+    }
+
+    fn refuse_request(&self, generation: u64, error: String) {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.intent.as_ref().is_some_and(|i| i.generation == generation) {
+            self.stop_locked(&mut state, Stop::User);
+            state.notice = Some(error);
+        }
     }
 
     fn streaming(&self, id: &str) -> bool {
@@ -709,7 +729,8 @@ impl TuneApp {
     }
 
     fn refresh_live(&self, (generation, id): (u64, String)) {
-        if !self.monitor.ensure_ticker() {
+        if let Err(error) = self.monitor.ensure_ticker_from_ui(&self.gate) {
+            self.live.refuse_request(generation, error);
             return;
         }
         let engine = self.engine.clone();
@@ -802,7 +823,7 @@ impl TuneApp {
             return;
         }
         let mut job = self.collection.borrow_mut();
-        if let Err(error) = self.monitor.start_manual(&mut job, kind) {
+        if let Err(error) = self.monitor.start_manual_from_ui(&mut job, kind, &self.gate) {
             job.result = Some(collection::Receipt::error(kind, &error));
         }
         cx.notify();
@@ -2602,13 +2623,11 @@ pub fn run(options: startup::Options) {
                 let result: Result<(), String> = async {
                     window
                         .update(cx, |app, _, cx| {
-                            {
-                                let _runtime = app.rt.enter();
-                                app.engine.start_monitor_journal();
-                            }
+                            app.monitor.start_diagnostic_journal_from_ui(&app.gate)?;
                             app.collect(Kind::Probe, cx);
+                            Ok::<(), String>(())
                         })
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| e.to_string())??;
                     let deadline = Instant::now() + Duration::from_secs(15);
                     while !shutdown_gate.join("child-ready").exists() {
                         if Instant::now() >= deadline {
@@ -2784,7 +2803,7 @@ pub fn run(options: startup::Options) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
@@ -2798,6 +2817,36 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Err("synthetic transport unavailable".into())
         }
+    }
+
+    pub(crate) fn assert_passive_live_does_not_start() {
+        let (control, route) = controller();
+        control.accept_nodes(&[node("fixture-b")]);
+        control.set_active(false);
+        control.set_active(true);
+        assert!(control.poll().is_none());
+        assert_eq!(route.0.load(Ordering::SeqCst), 0);
+        control.close();
+    }
+
+    pub(crate) fn assert_collection_refuses_live() {
+        let (control, route) = controller();
+        assert!(control.request("fixture-b").is_none());
+        let state = control.state.lock().unwrap();
+        assert!(state.intent.is_none(), "refusal must clear pending intent");
+        assert!(state.notice.as_ref().is_some_and(|s| !s.is_empty() && s.len() < 512));
+        let generation = state.generation;
+        drop(state);
+        // Obsolete async completion and periodic polls cannot revive refusal.
+        control.complete(generation, "fixture-b", &[node("fixture-b")], None);
+        for _ in 0..3 {
+            assert!(control.poll().is_none());
+        }
+        control.set_active(false);
+        control.set_active(true);
+        assert!(control.poll().is_none());
+        assert!(control.live.active().is_empty());
+        assert_eq!(route.0.load(Ordering::SeqCst), 0);
     }
 
     fn controller() -> (LiveControl, Arc<FailingRoute>) {

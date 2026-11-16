@@ -230,7 +230,7 @@ fn host_fixture(label: &str) -> (PathBuf, Arc<Engine>, Arc<MonitorHost>) {
 async fn exit_rejects_queued_requests_and_drains_without_ui_receiver() {
     let (dir, engine, host) = host_fixture("closing");
     engine.with_db(|d| d.set_meta("monitor", &json!({"enabled":true}))).unwrap();
-    assert!(host.ensure_ticker());
+    assert!(host.ensure_ticker().is_ok());
     let mut job = Job::default();
     let (started_send, started_recv) = tokio::sync::oneshot::channel();
     let (release_send, release_recv) = mpsc::channel();
@@ -260,7 +260,7 @@ async fn exit_rejects_queued_requests_and_drains_without_ui_receiver() {
     assert!(host.pause_monitor().is_err());
     assert!(host.request_pull().is_err());
     assert!(host.save_monitor_settings(json!({"enabled":false})).is_err());
-    assert!(!host.ensure_ticker());
+    assert!(host.ensure_ticker().is_err());
     assert_eq!(host.snapshot().mode, RunMode::Exit);
     let drain_host = host.clone();
     let mut drain = tokio::spawn(async move { drain_host.shutdown().await });

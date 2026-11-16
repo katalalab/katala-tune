@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::{runtime::Handle, sync::watch, task::JoinHandle};
 use tune_core::{
     engine::Engine,
+    gui_collection::ensure_gui_collection_owner,
     live::Live,
     monitor::{self, RunMode, RunPhase, RunRequest, RunStatus},
 };
@@ -149,6 +150,7 @@ impl MonitorHost {
         }
         // Host state -> blocking validation -> Gate -> memory-only permission.
         // close() never takes Host state, and no Gate lock spans the DB wait.
+        ensure_gui_collection_owner().map_err(|e| e.to_string())?;
         let _admission = gate.map(crate::gate::Gate::admit).transpose()?;
         self.request.send_modify(|r| {
             r.start_seq = r.start_seq.wrapping_add(1);
@@ -180,6 +182,7 @@ impl MonitorHost {
         if settings.hub.is_none() {
             return Err("取得するハブが設定されていません".into());
         }
+        ensure_gui_collection_owner().map_err(|e| e.to_string())?;
         let _admission = gate.map(crate::gate::Gate::admit).transpose()?;
         if self.request.borrow().mode == RunMode::Paused {
             self.status.send_modify(|s| s.phase = RunPhase::Starting);
@@ -277,6 +280,7 @@ impl MonitorHost {
             self.schedule_failure("自動スキャン設定は無効です。保存後に開始してください".into());
             return Err("自動スキャン設定は無効です。保存後に開始してください".into());
         }
+        ensure_gui_collection_owner().map_err(|e| e.to_string())?;
         let _admission = gate.map(crate::gate::Gate::admit).transpose()?;
         if !*self.schedule_request.borrow() {
             self.schedule_status.send_modify(|s| {
@@ -401,14 +405,43 @@ impl MonitorHost {
         }
     }
     /// Manual Live and the monitor share the same lazy ticker.
-    pub fn ensure_ticker(&self) -> bool {
+    #[cfg(test)]
+    pub fn ensure_ticker(&self) -> Result<(), String> {
+        self.ensure_ticker_admitted(None)
+    }
+    pub fn ensure_ticker_from_ui(&self, gate: &crate::gate::Gate) -> Result<(), String> {
+        self.ensure_ticker_admitted(Some(gate))
+    }
+    fn ensure_ticker_admitted(&self, gate: Option<&crate::gate::Gate>) -> Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.exiting {
-            return false;
+            return Err("アプリを終了しています".into());
         }
+        ensure_gui_collection_owner().map_err(|e| e.to_string())?;
+        let _admission = gate.map(crate::gate::Gate::admit).transpose()?;
         self.ticker(&mut state);
-        true
+        Ok(())
     }
+    /// The explicit shutdown diagnostic also owns a journal producer. It uses
+    /// the same admission and shutdown ACK path; ordinary preview never calls it.
+    pub fn start_diagnostic_journal_from_ui(&self, gate: &crate::gate::Gate) -> Result<(), String> {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.exiting {
+            return Err("アプリを終了しています".into());
+        }
+        ensure_gui_collection_owner().map_err(|e| e.to_string())?;
+        let _admission = gate.admit()?;
+        let _runtime = self.rt.enter();
+        self.engine.start_monitor_journal();
+        Ok(())
+    }
+    pub fn start_manual_from_ui(&self, job: &mut Job, kind: Kind, gate: &crate::gate::Gate) -> Result<(), String> {
+        let engine = self.engine.clone();
+        let progress = job.progress.clone();
+        let handle = self.rt.clone();
+        self.start_manual_admitted(job, kind, Some(gate), move || handle.block_on(collection::run(engine, kind, None, progress)))
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn start_manual(&self, job: &mut Job, kind: Kind) -> Result<(), String> {
         let engine = self.engine.clone();
         let progress = job.progress.clone();
@@ -420,13 +453,24 @@ impl MonitorHost {
         self.start_manual_with(job, Kind::Probe, work)
     }
     fn start_manual_with(&self, job: &mut Job, kind: Kind, work: impl FnOnce() -> Receipt + Send + 'static) -> Result<(), String> {
+        self.start_manual_admitted(job, kind, None, work)
+    }
+    fn start_manual_admitted(
+        &self,
+        job: &mut Job,
+        kind: Kind,
+        gate: Option<&crate::gate::Gate>,
+        work: impl FnOnce() -> Receipt + Send + 'static,
+    ) -> Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.exiting {
             return Err("アプリを終了しています".into());
         }
-        if state.manual.as_ref().is_some_and(|task| !task.is_finished()) {
+        if job.running.is_some() || state.manual.as_ref().is_some_and(|task| !task.is_finished()) {
             return Err("別の収集が実行中です".into());
         }
+        ensure_gui_collection_owner().map_err(|e| e.to_string())?;
+        let _admission = gate.map(crate::gate::Gate::admit).transpose()?;
         let sender = job.begin(kind).ok_or("別の収集が実行中です")?;
         state.manual = Some(self.rt.spawn(async move {
             // Started blocking work is not abortable. Keep both task scopes

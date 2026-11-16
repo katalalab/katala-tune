@@ -14,6 +14,7 @@
 
 mod accent;
 mod agent;
+mod collection_admission;
 mod commands;
 mod commands_netsec;
 mod commands_specs;
@@ -169,8 +170,10 @@ pub fn run() {
             agent::agent_pair,
         ])
         .setup(move |app| {
+            // Detached helper/scheduler tasks require reservation through process exit.
+            // Ordinary single-instance secondaries never reach primary setup.
             let handle = app.handle().clone();
-            let engine = Engine::open(nodes::user_config_path(), nodes::data_dir(), Arc::new(TauriHost { app: handle.clone() }))?;
+            let engine = collection_admission::open_primary_engine(nodes::user_config_path(), nodes::data_dir(), Arc::new(TauriHost { app: handle.clone() }))?;
             app.manage(engine.clone());
             app.manage(window::Pending::default());
             app.manage(handoff_review::Review::default());
