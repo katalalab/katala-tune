@@ -56,7 +56,14 @@ fn main() {
             std::process::exit(2);
         }
     }
-    let options = match startup::parse(args) {
+    #[cfg(target_os = "windows")]
+    let parsed = os::windows_startup::launch(&args).and_then(|installed| match installed {
+        Some(options) => Ok(Some(options)),
+        None => startup::parse(args),
+    });
+    #[cfg(not(target_os = "windows"))]
+    let parsed = startup::parse(args);
+    let options = match parsed {
         Ok(Some(options)) => options,
         Ok(None) => {
             println!(
