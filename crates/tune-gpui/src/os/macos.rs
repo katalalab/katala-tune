@@ -57,17 +57,22 @@ pub struct Mac {
     identity: Result<String, String>,
     login_paths: LoginPaths,
 }
-// Capture the resolved launch paths; only login enable needs reproducibility.
+// Capture the launch mode and resolved paths; only login enable needs reproducibility.
 struct LoginPaths {
     home: PathBuf,
     config: PathBuf,
     data: PathBuf,
     inherited_paths: bool,
+    resident: bool,
 }
 impl LoginPaths {
     fn check(&self, enabled: bool, account_home: impl FnOnce() -> Option<PathBuf>) -> Result<(), Effect> {
         if !enabled {
             return Ok(());
+        }
+        // mainAppService cannot carry this session's resident/hidden arguments.
+        if self.resident {
+            return Err(Effect::Unsupported("ログイン起動は通常表示での起動にのみ対応しています。常駐・非表示の起動方法は引き継げません。".into()));
         }
         let home = account_home().filter(|path| path.is_absolute()).ok_or_else(|| Effect::Unsupported("OS アカウントの既定ホームを確認できません".into()))?;
         let unsupported = || Effect::Unsupported("起動時の台帳・データパスを OS のログイン環境で再現できません".into());
@@ -122,7 +127,7 @@ fn identity(bundle: &Path, executable: &Path, current: &Path, id: &str) -> Resul
     Ok(id.into())
 }
 impl Mac {
-    pub fn new(config: &Path, data: &Path, diagnostic: bool) -> Self {
+    pub fn new(config: &Path, data: &Path, diagnostic: bool, resident: bool) -> Self {
         let bundle = NSBundle::mainBundle();
         let actual = (|| {
             if diagnostic {
@@ -137,7 +142,10 @@ impl Mac {
         })();
         // mainAppService does not preserve this process's environment at login.
         let inherited_paths = ["KATALA_TUNE_CONFIG", "KATALA_TUNE_DATA_DIR"].iter().any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
-        Self { identity: actual, login_paths: LoginPaths { home: tune_core::nodes::home(), config: config.into(), data: data.into(), inherited_paths } }
+        Self {
+            identity: actual,
+            login_paths: LoginPaths { home: tune_core::nodes::home(), config: config.into(), data: data.into(), inherited_paths, resident },
+        }
     }
     fn center(&self) -> Result<objc2::rc::Retained<UNUserNotificationCenter>, String> {
         self.identity.as_ref().map_err(Clone::clone)?;
@@ -307,6 +315,7 @@ mod tests {
             data: home.join("Library/Application Support/Katala Tune/data/gpui-preview"),
             home,
             inherited_paths: false,
+            resident: false,
         }
     }
     struct Fixture(PathBuf);
@@ -322,6 +331,43 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn assert_resident_login_enable_refused(arguments: &[&str]) {
+        let fixture = Fixture::new(if arguments.len() == 1 { "resident" } else { "hidden" });
+        let home = fixture.0.join("home");
+        let options = crate::startup::parse(arguments.iter().map(std::ffi::OsString::from)).unwrap().unwrap();
+        let mut paths = launch(&home);
+        paths.resident = options.resident;
+        let account_called = std::cell::Cell::new(false);
+        let result = paths.check(true, || {
+            account_called.set(true);
+            Some(home.clone())
+        });
+        assert!(matches!(result, Err(Effect::Unsupported(_))), "resident login enable must be refused: {result:?}");
+        assert!(!account_called.get(), "mode refusal must precede account lookup");
+    }
+    #[test]
+    fn login_reproducibility_refuses_resident_enable_before_account_lookup() {
+        assert_resident_login_enable_refused(&["--resident"]);
+    }
+    #[test]
+    fn login_reproducibility_refuses_hidden_enable_before_account_lookup() {
+        assert_resident_login_enable_refused(&["--resident", "--hidden"]);
+    }
+    #[test]
+    fn login_reproducibility_disable_skips_checks_in_every_launch_mode() {
+        let fixture = Fixture::new("disable-modes");
+        for arguments in [vec![], vec!["--resident"], vec!["--resident", "--hidden"]] {
+            let options = crate::startup::parse(arguments.iter().map(std::ffi::OsString::from)).unwrap().unwrap();
+            let mut paths = launch(fixture.0.join("home"));
+            paths.resident = options.resident;
+            // Each obstacle must remain irrelevant to an explicit disable.
+            paths.home = fixture.0.join("other-home");
+            paths.config = fixture.0.join("custom/nodes.json");
+            paths.data = fixture.0.join("custom/data");
+            paths.inherited_paths = true;
+            assert!(paths.check(false, || panic!("disable must skip account lookup in every mode")).is_ok());
         }
     }
     #[test]

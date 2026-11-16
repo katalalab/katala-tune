@@ -2413,7 +2413,7 @@ pub fn run(options: startup::Options) {
     let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio"));
     // Engine の中の tokio 呼び出し（接続・子プロセス）が動くよう、ランタイムの文脈で開く
     let dirty = Arc::new(AtomicBool::new(true));
-    let os = Arc::new(crate::native_host::NativeHost::new(dirty.clone(), crate::os::platform(&config, &data, selftest), rt.handle().clone()));
+    let os = Arc::new(crate::native_host::NativeHost::new(dirty.clone(), crate::os::platform(&config, &data, selftest, resident), rt.handle().clone()));
     let engine = {
         let _g = rt.enter();
         match Engine::open(config, data, os.clone()) {
