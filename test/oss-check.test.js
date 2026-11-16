@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { ledgerTerms, scanText, scanFileText } = require('../scripts/oss-check');
+const { ledgerTerms, runtimeTerms, scanText, scanFileText } = require('../scripts/oss-check');
 
 test('台帳から探す語を作る（短すぎる語・一般的な語は除く）', () => {
   const cfg = { nodes: [{ id: 'gpu-box-7', alias: 'gpu-box-7', local_hostname: 'Office-PC.local' }, { id: 'mac', alias: 'pc' }], fleet: { repo: '~/src/fleet-x', env_file: 'secret.tpl' } };
@@ -13,6 +13,38 @@ test('台帳の語は単語の境目でだけ一致する', () => {
   const rules = (t) => scanText(t, ['gpu-box-7']).map((x) => x.rule);
   assert.deepEqual(rules('ssh GPU-BOX-7 uptime'), ['ledger']);
   assert.deepEqual(rules('gpu-box-70 と my-gpu-box-7'), []);
+});
+
+test('公開 Windows Actions ユーザーの自動追加だけを分類し台帳とホスト名は残す', () => {
+  const username = ['runner', 'admin'].join('');
+  const identity = { platform: 'win32', githubActions: 'true', username, hostname: 'ci-machine-7' };
+  assert.deepEqual(runtimeTerms(null, identity), ['ci-machine-7']);
+  assert.deepEqual(runtimeTerms(null, { ...identity, username: username.toUpperCase() }), ['ci-machine-7']);
+  assert.deepEqual(runtimeTerms(null, { ...identity, hostname: username }), [username]);
+  for (const cfg of [
+    { nodes: [{ id: username }] },
+    { nodes: [{ alias: username }] },
+    { nodes: [{ local_hostname: username }] },
+    { fleet: { repo: username } },
+    { fleet: { env_file: username } },
+  ]) {
+    const terms = runtimeTerms(cfg, identity);
+    assert.ok(terms.includes(username));
+    assert.deepEqual(scanText(username, terms).map((x) => x.rule), ['ledger']);
+  }
+});
+
+test('他の OS・Actions 値・ユーザーでは実行時の語を変えない', () => {
+  const username = ['runner', 'admin'].join('');
+  const identity = { platform: 'win32', githubActions: 'true', username, hostname: 'ci-machine-7' };
+  for (const changed of [
+    { platform: 'linux' }, { platform: 'darwin' },
+    { githubActions: 'false' }, { githubActions: 'TRUE' }, { githubActions: '' },
+    { username: 'ci-private-user' }, { username: username + '-other' },
+  ]) {
+    const actual = { ...identity, ...changed };
+    assert.deepEqual(runtimeTerms(null, actual), [actual.username, actual.hostname]);
+  }
 });
 
 test('一般的な目印を見つけ、例示用の名前は見逃す', () => {
@@ -132,5 +164,121 @@ test('同じ blob を Taffy manifest と別のパスに置いても例外を広�
     assert.equal(result?.status, 1);
     assert.match(result.stdout, /NG email\s+zz-app\.txt(?:@[0-9a-f]{7})?:1/);
     assert.doesNotMatch(result.stdout, /NG email\s+vendor\//);
+  }
+});
+
+test('GLib の公開 CI パスは正確なパスとコメント行だけで home-path を許可する', () => {
+  const file = 'vendor/glib-0.18.5/src/translate.rs';
+  const home = ['C:', 'Users', 'runneradmin'].join('\\\\');
+  const shortHome = ['C:', 'Users', 'RUNNER~1'].join('\\\\');
+  const comments = [
+    `        // This currently fails on Windows because ${home}`,
+    `        // gets shortened to ${shortHome}`,
+  ];
+  for (const comment of comments) {
+    assert.deepEqual(scanFileText(file, comment), []);
+    assert.deepEqual(scanFileText(file, comment, ['Users']).map((x) => x.rule), ['ledger']);
+    for (const changed of [comment + ' suffix', comment + ' ', comment.replace('// ', '// changed ')]) {
+      assert.deepEqual(scanFileText(file, changed).map((x) => x.rule), ['home-path']);
+    }
+    for (const other of ['vendor/glib-0.18.5/src/other.rs', 'src/translate.rs']) {
+      assert.deepEqual(scanFileText(other, comment).map((x) => x.rule), ['home-path']);
+    }
+  }
+  const privateHome = ['C:', 'Users', 'private-user'].join('\\\\');
+  const bad = [
+    comments[0].replace(home, privateHome),
+    comments[1].replace(shortHome, shortHome + 'extra'),
+    ['100', '101', '2', '3'].join('.'),
+    ['box.tail', '1234.ts', '.net'].join(''),
+    ['op:', '//Vault/item/field'].join(''),
+    ['person', '@corp.example', '.jp'].join(''),
+  ];
+  assert.deepEqual(scanFileText(file, bad.join('\n')).map((x) => x.rule),
+    ['home-path', 'home-path', 'tailscale-ip', 'tailnet-host', 'op-ref', 'email']);
+});
+
+test('同じ GLib コメント blob も通常パスでは HEAD と履歴の両方で検出する', (t) => {
+  const { execFileSync } = require('node:child_process');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-oss-glib-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const vcs = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com',
+    '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=' + path.join(dir, 'no-hooks'), ...args], { cwd: dir });
+  vcs('init', '-q');
+  fs.writeFileSync(path.join(dir, 'LICENSE'), 'MIT');
+  fs.writeFileSync(path.join(dir, 'package.json'), '{ "license": "MIT" }');
+  fs.mkdirSync(path.join(dir, 'vendor', 'glib-0.18.5', 'src'), { recursive: true });
+  const comment = '// This currently fails on Windows because ' + ['C:', 'Users', 'runneradmin'].join('\\\\');
+  fs.writeFileSync(path.join(dir, 'vendor', 'glib-0.18.5', 'src', 'translate.rs'), comment);
+  fs.writeFileSync(path.join(dir, 'zz-app.txt'), comment);
+  vcs('add', '.');
+  vcs('commit', '-q', '-m', 'init');
+  const script = path.join(__dirname, '..', 'scripts', 'oss-check.js');
+  for (const args of [[], ['--history']]) {
+    let result;
+    try { execFileSync(process.execPath, [script, ...args], { cwd: dir, encoding: 'utf8',
+      env: { ...process.env, KATALA_TUNE_NODES: path.join(dir, 'none.json') } }); }
+    catch (e) { result = e; }
+    assert.equal(result?.status, 1);
+    assert.match(result.stdout, /NG home-path\s+zz-app\.txt(?:@[0-9a-f]{7})?:1/);
+    assert.doesNotMatch(result.stdout, /NG home-path\s+vendor\//);
+  }
+});
+
+test('実 CLI の HEAD と履歴で公開実行時ユーザーを分類し明示台帳の同名は検出する', (t) => {
+  const { spawnSync, execFileSync } = require('node:child_process');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-oss-identity-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const vcs = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com',
+    '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=' + path.join(dir, 'no-hooks'), ...args], { cwd: dir });
+  const username = ['runner', 'admin'].join('');
+  const identity = { platform: 'win32', githubActions: 'true', username, hostname: 'ci-machine-7' };
+  const ledger = path.join(dir, 'nodes.json');
+  fs.writeFileSync(ledger, JSON.stringify({ nodes: [] }));
+  vcs('init', '-q');
+  fs.writeFileSync(path.join(dir, 'LICENSE'), 'MIT');
+  fs.writeFileSync(path.join(dir, 'package.json'), '{ "license": "MIT" }');
+  fs.writeFileSync(path.join(dir, 'identity.txt'), username);
+  fs.writeFileSync(path.join(dir, 'context.txt'), 'ci-private-user\nci-private-host');
+  fs.mkdirSync(path.join(dir, 'vendor', 'glib-0.18.5', 'src'), { recursive: true });
+  const comment = '// This currently fails on Windows because ' + ['C:', 'Users', username].join('\\\\');
+  fs.writeFileSync(path.join(dir, 'vendor', 'glib-0.18.5', 'src', 'translate.rs'), comment);
+  vcs('add', 'LICENSE', 'package.json', 'identity.txt', 'context.txt', 'vendor');
+  vcs('commit', '-q', '-m', username);
+  const script = path.join(__dirname, '..', 'scripts', 'oss-check.js');
+  const driver = 'process.exitCode = require(process.argv[1]).main(process.argv.slice(3), JSON.parse(process.argv[2]));';
+  const run = (args, runtime = identity) => spawnSync(process.execPath,
+    ['-e', driver, script, JSON.stringify(runtime), ...args], {
+      cwd: dir, encoding: 'utf8', env: { ...process.env, KATALA_TUNE_NODES: ledger },
+    });
+  for (const args of [[], ['--history']]) {
+    const publicRuntime = run(args);
+    assert.equal(publicRuntime.status, 0, publicRuntime.stdout + publicRuntime.stderr);
+    assert.match(publicRuntime.stdout, /OK 個人・環境の情報は見つからない/);
+    for (const cfg of [{ nodes: [{ id: username }] }, { fleet: { env_file: username } }]) {
+      fs.writeFileSync(ledger, JSON.stringify(cfg));
+      const explicit = run(args);
+      assert.equal(explicit.status, 1, explicit.stdout + explicit.stderr);
+      assert.match(explicit.stdout, /NG ledger\s+identity\.txt(?:@[0-9a-f]{7})?:1/);
+      assert.match(explicit.stdout, /NG ledger\s+vendor\/glib-0\.18\.5\/src\/translate\.rs(?:@[0-9a-f]{7})?:1/);
+      if (args.length) assert.match(explicit.stdout, /NG ledger\s+commit [0-9a-f]{7} message:1/);
+    }
+    fs.writeFileSync(ledger, JSON.stringify({ nodes: [] }));
+    for (const changed of [{ githubActions: 'false' }, { platform: 'linux' }, { hostname: username },
+      { username: 'ci-private-user' }, { hostname: 'ci-private-host' }]) {
+      const privateRuntime = run(args, { ...identity, ...changed });
+      assert.equal(privateRuntime.status, 1, privateRuntime.stdout + privateRuntime.stderr);
+      if (changed.username || changed.hostname === 'ci-private-host') {
+        assert.match(privateRuntime.stdout, /NG ledger\s+context\.txt(?:@[0-9a-f]{7})?:[12]/);
+      } else {
+        assert.match(privateRuntime.stdout, /NG ledger\s+identity\.txt(?:@[0-9a-f]{7})?:1/);
+      }
+    }
   }
 });
