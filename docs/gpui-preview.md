@@ -25,7 +25,7 @@ GPUIは起動引数の検証後、config/dataの相対パスと既存の親デ�
 
 このmanifestは出所とファイルの照合材料であり、CI全体の成功や導入の承認を証明しない。操作者はGitHub runの実際の成功、ZIPのdigest、レビュー済みsourceTree、対象機のOS/arch、展開した三ファイルの名前・サイズ・SHA-256を別途照合する。過去の`katala_gpui_preview.v1`はGUIとCLIの二ファイルの記録として保持し、v2として読み替えない。
 
-検証したnative samplerの対象Preview `data/bin`への配置は手動で行う。GPUI用installerと自動同期は未実装。CIのstagingは通常のbin、Preview data、DB、台帳を変更しない。特に同梱releaseの`tune.exe`は診断用で、Windowsの固定Probe・承認付き操作に使うhelperとして自動承認されない。それらには[Windows helperの導入・更新](windows-helper-approval.md)の専用all-success CI debug CLI artifactと非公開の`action_helper` v2承認記録を別途使う。native samplerの出所確認は、そのaction helperの承認を兼ねない。
+検証したnative samplerの対象Preview `data/bin`への配置は手動で行う。GPUI用installerと自動同期は未実装。CIのstagingは通常のbin、Preview data、DB、台帳を変更しない。特に同梱releaseの`tune.exe`は診断用で、Windowsの固定Probe・承認付き操作に使うhelperとして自動承認されない。それらには[Windows helperの導入・更新](windows-helper-approval.md)の専用all-success CI release CLI artifactと非公開の`action_helper` v2承認記録を別途使う。native samplerの出所確認は、そのaction helperの承認を兼ねない。
 
 `scripts/e2e-gpui.sh`はモデル・保存データ・入力編集・起動引数のテストを実行し、見本台帳と一時DBで全17画面の読み込みsmokeを行う。続いて合成の分析・ログ・操作記録を持つDBでも実行ファイルから全画面を開き、前後の観測・収集カーソル・状態・操作記録が不変であることを確認する。この追加テストはdesktop GPUセッションが必要なため、通常の`cargo test`ではignoreし、このスクリプトから明示実行する。
 

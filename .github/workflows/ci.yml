@@ -103,7 +103,7 @@ jobs:
       - name: Windows CLI artifact build
         if: runner.os == 'Windows'
         timeout-minutes: 20
-        run: cargo build --locked -p tune-cli
+        run: cargo build --release --locked -p tune-cli
       - name: Windows CLI artifact manifest
         if: runner.os == 'Windows'
         timeout-minutes: 1
