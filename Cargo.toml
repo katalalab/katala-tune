@@ -39,3 +39,7 @@ lto = true
 opt-level = "s"
 panic = "abort"
 strip = true
+
+# GPUI pins Taffy 0.9.0; retain its source while requiring the fixed registry grid.
+[patch.crates-io]
+taffy = { path = "vendor/taffy-0.9.0" }
