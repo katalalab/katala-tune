@@ -39,6 +39,7 @@ pub mod engine_power;
 pub mod engine_specs;
 pub mod engine_tools;
 pub mod engine_topology;
+pub mod gui_collection;
 pub mod handoff;
 pub mod health;
 pub mod helpers;
