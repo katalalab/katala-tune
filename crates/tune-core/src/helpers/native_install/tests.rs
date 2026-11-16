@@ -662,6 +662,7 @@ fn public_bound_api_roundtrip_in_subprocess() {
     crate::helpers::bind_process_data_dir(f.bin.parent().unwrap()).unwrap();
     let snapshot = inspect_bound_target().unwrap();
     assert_eq!(snapshot.target(), f.target());
+    revalidate_bound_target(&snapshot).unwrap();
     let result = install_native_sampler(prepare_native_sampler(&f.source).unwrap(), snapshot).unwrap();
     assert!(result.changed());
     assert_eq!(fs::read(f.target()).unwrap(), f.bytes);
@@ -744,4 +745,35 @@ fn windows_directory_opens_check_type_and_creation_remains_exclusive() {
     fs::rename(&f.bin, &moved).unwrap();
     fs::rename(&moved, &f.bin).unwrap();
     f.sentinels();
+}
+
+#[test]
+fn revalidation_rejects_replaced_identity_even_with_identical_bytes() {
+    let f = Fixture::new(true);
+    let expected = inspect_at(&f.bin).unwrap();
+    fs::rename(f.target(), f.bin.join("original")).unwrap();
+    fs::write(f.target(), b"old sampler").unwrap();
+    executable(&f.target());
+    let error = revalidate_at(&f.bin, &expected).unwrap_err();
+    assert_eq!((error.operation(), error.cause()), (Operation::Target, Cause::TargetChanged));
+    assert_eq!(fs::read(f.target()).unwrap(), b"old sampler");
+    assert_eq!(fs::read(f.bin.join("original")).unwrap(), b"old sampler");
+}
+
+#[test]
+fn revalidation_checks_missing_bin_and_data_without_creating_anything() {
+    let f = Fixture::new(false);
+    fs::remove_dir_all(&f.bin).unwrap();
+    let missing = inspect_at(&f.bin).unwrap();
+    revalidate_at(&f.bin, &missing).unwrap();
+    assert!(!f.bin.exists());
+    fs::create_dir(&f.bin).unwrap();
+    assert_eq!(revalidate_at(&f.bin, &missing).unwrap_err().cause(), Cause::TargetChanged);
+    let present = inspect_at(&f.bin).unwrap();
+    fs::remove_dir(&f.bin).unwrap();
+    assert_eq!(revalidate_at(&f.bin, &present).unwrap_err().cause(), Cause::TargetChanged);
+    fs::rename(f.root.join("data"), f.root.join("previous-data")).unwrap();
+    fs::create_dir(f.root.join("data")).unwrap();
+    assert_eq!(revalidate_at(&f.bin, &missing).unwrap_err().cause(), Cause::TargetChanged);
+    assert!(!f.bin.exists());
 }
