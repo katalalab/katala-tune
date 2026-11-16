@@ -1925,7 +1925,11 @@ mod tests {
 
         fn new() -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
-            Self::create(std::env::temp_dir().join(format!("kt-live-launch-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)))).unwrap()
+            #[cfg(target_os = "linux")]
+            let parent = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+            #[cfg(not(target_os = "linux"))]
+            let parent = std::env::temp_dir();
+            Self::create(parent.join(format!("kt-live-launch-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)))).unwrap()
         }
     }
 
@@ -2024,6 +2028,11 @@ mod tests {
         std::fs::create_dir(&app).unwrap();
         std::fs::create_dir(&home).unwrap();
         let executable = app.join(crate::helpers::exe("live-test"));
+        // Linux links the already-running inode, avoiding a writable executable
+        // copy while parallel tests spawn children. The owned root is on its FS.
+        #[cfg(target_os = "linux")]
+        std::fs::hard_link(std::env::current_exe().unwrap(), &executable).unwrap();
+        #[cfg(not(target_os = "linux"))]
         std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
         let mut child = std::process::Command::new(&executable);
         child
@@ -2053,6 +2062,37 @@ mod tests {
         let path = owner.path.clone();
         drop(owner);
         assert!(!path.exists(), "successful exclusive owner cleans its own fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_test_links_the_running_inode_and_cleans_only_owned_names() {
+        use std::os::unix::fs::MetadataExt as _;
+        let source = std::env::current_exe().unwrap();
+        let identity = |path: &std::path::Path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            (metadata.dev(), metadata.ino())
+        };
+        let source_identity = identity(&source);
+        let first = LaunchTestDir::new();
+        let second = LaunchTestDir::new();
+        assert_ne!(first.path, second.path);
+        assert_eq!(first.path.parent(), source.parent());
+        assert_eq!(second.path.parent(), source.parent());
+        let first_command = launch_test_command(&first.path, "live::tests::launch_follows_the_probe_conventions", "absent");
+        let second_command = launch_test_command(&second.path, "live::tests::launch_follows_the_probe_conventions", "absent");
+        let first_executable = std::path::Path::new(first_command.get_program());
+        let second_executable = std::path::Path::new(second_command.get_program());
+        assert_ne!(first_executable, second_executable);
+        assert_eq!(identity(first_executable), source_identity);
+        assert_eq!(identity(second_executable), source_identity);
+        drop(first);
+        assert!(!first_executable.exists());
+        assert_eq!(identity(&source), source_identity);
+        assert_eq!(identity(second_executable), source_identity);
+        drop(second);
+        assert!(!second_executable.exists());
+        assert_eq!(identity(&source), source_identity);
     }
 
     // Invoked only as an exact child with the test-only case environment set.
@@ -2125,8 +2165,8 @@ mod tests {
         watchdog_case("normal", None);
     }
 
-    // Only child processes receive this HOME/data namespace. Copying the test
-    // executable also confines the beside-app search; no installed helper runs.
+    // Only child processes receive this HOME/data namespace. Placing the test
+    // executable here also confines the beside-app search; no installed helper runs.
     fn isolated_launch_child(test: &str, cases: &[&str]) -> Option<(PathBuf, String)> {
         const ROOT: &str = "KT_LIVE_LAUNCH_TEST_ROOT";
         const CASE: &str = "KT_LIVE_LAUNCH_TEST_CASE";
