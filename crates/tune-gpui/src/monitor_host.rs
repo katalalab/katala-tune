@@ -1,6 +1,7 @@
 //! App-owned collection workers and native session permission.
 use crate::collection::{self, Job, Kind, Receipt};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -10,7 +11,7 @@ use tokio::{runtime::Handle, sync::watch, task::JoinHandle};
 use tune_core::{
     engine::Engine,
     gui_collection::ensure_gui_collection_owner,
-    helpers::native_install::{self, InstallError, InstallOutcome, LocalInstallReceipt, NativeTargetSnapshot, Operation, PreparedNativeSampler},
+    helpers::native_install::{self, Cause, InstallError, InstallOutcome, LocalInstallReceipt, NativeTargetSnapshot, Operation, PreparedNativeSampler},
     live::Live,
     monitor::{self, RunMode, RunPhase, RunRequest, RunStatus},
 };
@@ -47,16 +48,55 @@ enum InstallPhase {
     Running,
     RecoveryRequired,
 }
+/// Immutable host-facing completion facts, projected only from core errors in
+/// production. This is an observation, never authority to place or retry files.
+/// Keeping the fields private lets host tests exercise uncertainty without
+/// constructing core's opaque transaction error or adding a public test API.
+#[derive(Debug)]
+pub(crate) struct NativeInstallFailure {
+    outcome: InstallOutcome,
+    operation: Operation,
+    cause: Cause,
+    rollback_cause: Option<Cause>,
+    recovery_paths: Vec<PathBuf>,
+}
+impl From<&InstallError> for NativeInstallFailure {
+    fn from(error: &InstallError) -> Self {
+        Self {
+            outcome: error.outcome(),
+            operation: error.operation(),
+            cause: error.cause(),
+            rollback_cause: error.rollback_cause(),
+            recovery_paths: error.recovery_paths().to_vec(),
+        }
+    }
+}
+impl NativeInstallFailure {
+    fn confirmed(&self) -> bool {
+        self.outcome != InstallOutcome::RecoveryRequired && self.operation != Operation::Close
+    }
+    pub(crate) fn detail(&self) -> String {
+        let mut detail =
+            format!("native sampler {:?}/{:?}: {:?}\n処理: {:?} / 原因: {:?}", self.outcome, self.operation, self.cause, self.operation, self.cause);
+        if let Some(cause) = self.rollback_cause {
+            detail.push_str(&format!("\n復元時の原因: {cause:?}"));
+        }
+        for path in &self.recovery_paths {
+            detail.push_str(&format!("\n回復用ファイル: {}", path.display()));
+        }
+        detail
+    }
+}
 #[derive(Debug)]
 pub(crate) enum NativeInstallResult {
-    Completed(Result<LocalInstallReceipt, InstallError>),
+    Completed(Result<LocalInstallReceipt, NativeInstallFailure>),
     WorkerFailed,
 }
 impl NativeInstallResult {
     fn confirmed(&self) -> bool {
         match self {
             Self::Completed(Ok(_)) => true,
-            Self::Completed(Err(error)) => error.outcome() != InstallOutcome::RecoveryRequired && error.operation() != Operation::Close,
+            Self::Completed(Err(error)) => error.confirmed(),
             Self::WorkerFailed => false,
         }
     }
@@ -220,7 +260,7 @@ impl MonitorHost {
             // Registration and Gate admission finish before any transaction IO.
             drop(host.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
             let result = match tokio::task::spawn_blocking(work).await {
-                Ok(result) => NativeInstallResult::Completed(result),
+                Ok(result) => NativeInstallResult::Completed(result.map_err(|error| NativeInstallFailure::from(&error))),
                 Err(_) => NativeInstallResult::WorkerFailed,
             };
             Self::record_install(&mut host.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner), result);

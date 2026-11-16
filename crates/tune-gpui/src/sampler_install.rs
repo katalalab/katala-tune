@@ -150,19 +150,12 @@ pub(super) async fn run_selection(
     result
 }
 fn error_detail(error: &InstallError) -> String {
-    let mut detail = format!("{error}\n処理: {:?} / 原因: {:?}", error.operation(), error.cause());
-    if let Some(cause) = error.rollback_cause() {
-        detail.push_str(&format!("\n復元時の原因: {cause:?}"));
-    }
-    for path in error.recovery_paths() {
-        detail.push_str(&format!("\n回復用ファイル: {}", path.display()));
-    }
-    detail
+    crate::monitor_host::NativeInstallFailure::from(error).detail()
 }
 pub(super) fn receipt_text(result: &NativeInstallResult) -> String {
     match result {
         NativeInstallResult::WorkerFailed => "導入処理の完了を確認できません。収集と再導入を停止しています。導入先の状態を確認してください。".into(),
-        NativeInstallResult::Completed(Err(error)) => error_detail(error),
+        NativeInstallResult::Completed(Err(error)) => error.detail(),
         NativeInstallResult::Completed(Ok(receipt)) => {
             let mut detail = format!(
                 "{}\n導入先: {}\n旧 SHA-256: {}\nSHA-256: {}\nManifest SHA-256: {}",

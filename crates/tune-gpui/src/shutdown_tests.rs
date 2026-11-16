@@ -436,3 +436,100 @@ async fn registered_install_still_runs_when_quit_precedes_first_worker_poll() {
     drop((host, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+async fn uncertain_install_completion(failure: NativeInstallFailure, label: &str) {
+    let (dir, engine, host) = host_fixture(label);
+    let gate = crate::gate::Gate::new(|| {});
+    {
+        let mut state = host.state.lock().unwrap();
+        MonitorHost::record_install(&mut state, NativeInstallResult::Completed(Err(failure)));
+    }
+    let snapshot = host.native_install_snapshot();
+    assert!(snapshot.recovery_required, "uncertain completion must latch before any new request");
+    assert!(!snapshot.busy);
+    assert!(!snapshot.ever_collection_admitted);
+    assert!(snapshot.unavailable.is_some());
+    let result = snapshot.result.as_deref().expect("terminal detail must survive without a UI receiver");
+    let NativeInstallResult::Completed(Err(retained)) = result else { panic!("core failure facts cannot become worker loss or success") };
+    assert_eq!(retained.cause, native_install::Cause::Io);
+    match label {
+        "completion-recovery" => {
+            assert_eq!(retained.outcome, InstallOutcome::RecoveryRequired);
+            assert_eq!(retained.operation, Operation::Rollback);
+            assert_eq!(retained.rollback_cause, Some(native_install::Cause::PermissionDenied));
+            assert_eq!(retained.recovery_paths, [PathBuf::from("synthetic-owned-backup")]);
+            assert!(retained.detail().contains("synthetic-owned-backup"));
+            assert!(retained.detail().contains("PermissionDenied"));
+        }
+        "completion-close" => {
+            assert_eq!(retained.outcome, InstallOutcome::Rejected);
+            assert_eq!(retained.operation, Operation::Close);
+            assert_eq!(retained.rollback_cause, None);
+            assert!(retained.recovery_paths.is_empty());
+            assert!(retained.detail().contains("Close"));
+        }
+        _ => unreachable!(),
+    }
+    // None of these refusals may be attributed to exiting, busy, or ever=true.
+    assert!(!host.state.lock().unwrap().exiting);
+    assert!(host.start_monitor_from_ui(&gate).is_err());
+    assert!(host.request_pull_from_ui(&gate).is_err());
+    assert!(host.start_schedule_from_ui(&gate).is_err());
+    assert!(host.ensure_ticker().is_err());
+    assert!(host.start_diagnostic_journal_from_ui(&gate).is_err());
+    assert!(host.admit_live_request(&gate, || panic!("recovery cannot admit Live")).is_err());
+    assert!(host.start_manual_with(&mut Job::default(), Kind::Network(false), || panic!("recovery cannot admit manual work")).is_err());
+    assert!(host.admit_install_work(&gate, || panic!("recovery cannot admit another install")).is_err());
+
+    // A later confirmed completion must not erase the earlier uncertainty.
+    // Rejected is a confirmed end of a transaction, even though it is not an install success.
+    let definite = native_install::prepare_native_sampler(Path::new("relative-source")).unwrap_err();
+    {
+        let mut state = host.state.lock().unwrap();
+        MonitorHost::record_install(&mut state, NativeInstallResult::Completed(Err(NativeInstallFailure::from(&definite))));
+        assert_eq!(state.install_confirmed, Some(false));
+    }
+    assert!(host.native_install_snapshot().recovery_required);
+    assert!(host.admit_install_work(&gate, || panic!("a confirmed later completion cannot clear recovery")).is_err());
+    assert!(host.ensure_ticker().is_err());
+    let report = host.shutdown().await;
+    assert_eq!(report.install_complete, Some(false));
+    assert!(report.install_recovery_required);
+    assert_eq!(report.journal_ack, Some(true));
+    assert!(!report.confirmed());
+    assert_eq!(host.shutdown().await, report);
+    // The original typed snapshot remains readable after later results and shutdown.
+    assert!(matches!(snapshot.result.as_deref(), Some(NativeInstallResult::Completed(Err(_)))));
+    drop((snapshot, host, engine));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn install_recovery_completion_retains_details_and_refuses_reuse() {
+    uncertain_install_completion(
+        NativeInstallFailure {
+            outcome: InstallOutcome::RecoveryRequired,
+            operation: Operation::Rollback,
+            cause: native_install::Cause::Io,
+            rollback_cause: Some(native_install::Cause::PermissionDenied),
+            recovery_paths: vec![PathBuf::from("synthetic-owned-backup")],
+        },
+        "completion-recovery",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn install_close_completion_retains_uncertainty_even_when_rejected() {
+    uncertain_install_completion(
+        NativeInstallFailure {
+            outcome: InstallOutcome::Rejected,
+            operation: Operation::Close,
+            cause: native_install::Cause::Io,
+            rollback_cause: None,
+            recovery_paths: Vec::new(),
+        },
+        "completion-close",
+    )
+    .await;
+}
