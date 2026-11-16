@@ -37,6 +37,18 @@ function ledgerTerms(cfg, extra = []) {
   return [...terms];
 }
 
+function runtimeTerms(cfg, {
+  platform = process.platform,
+  githubActions = process.env.GITHUB_ACTIONS,
+  username = os.userInfo().username,
+  hostname = os.hostname(),
+} = {}) {
+  // Only this auto-added public CI identity is classified; explicit ledger terms stay private.
+  const publicWindowsUser = platform === 'win32' && githubActions === 'true'
+    && username.toLowerCase() === ['runner', 'admin'].join('');
+  return ledgerTerms(cfg, publicWindowsUser ? [hostname] : [username, hostname]);
+}
+
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 // skip: その本文では探さない規則（package-lock.json の作者メールは第三者の公開情報なので email を外す）
@@ -107,11 +119,11 @@ function revListArgs(argv) {
   return null;
 }
 
-function main(argv) {
+function main(argv, runtimeIdentity) {
   const range = revListArgs(argv);
   const history = !!range;
   const { file, cfg } = loadLedger();
-  const terms = ledgerTerms(cfg, [os.userInfo().username, os.hostname()]);
+  const terms = runtimeTerms(cfg, runtimeIdentity);
   const revs = history ? git(range).split('\n').filter(Boolean) : ['HEAD'];
   const short = (rev) => (history ? `@${rev.slice(0, 7)}` : '');
   const findings = [];
@@ -142,4 +154,4 @@ function main(argv) {
 }
 
 if (require.main === module) process.exitCode = main(process.argv.slice(2));
-module.exports = { ledgerTerms, scanText, scanFileText, revListArgs };
+module.exports = { ledgerTerms, runtimeTerms, scanText, scanFileText, revListArgs, main };

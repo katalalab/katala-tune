@@ -108,6 +108,15 @@ examples under that one heuristic. The distinct policy participates in blob
 deduplication, so identical content at another path remains checked in HEAD
 and history scans. No GLib email exception is needed.
 
+On GitHub Actions Windows only (`win32` and `GITHUB_ACTIONS` exactly `true`),
+the known public hosted-runner account is classified as public runtime metadata
+when adding the current OS username to scan terms. Matching is case-insensitive.
+The cost is that this one automatically supplied CI username is no longer a
+private term in that context. Explicit node/fleet ledger terms, even the same
+name, and the hostname remain checked everywhere, including comments and
+commit messages. Other usernames and contexts retain their existing behavior;
+the exact-comment home-path policy above is unchanged.
+
 ### Reproducible regression boundary
 
 The root workspace lock selects `vendor/glib-0.18.5` for the Linux Tauri graph.
