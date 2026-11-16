@@ -159,16 +159,114 @@ test('represented-minute coverage is explicit and invalid percentages remain unk
   }
 });
 
-test('pure report is independent of host timezone and never echoes identifiers', () => {
-  const { execFileSync } = require('node:child_process');
+function withTimezoneInput(input, run) {
+  const fs = require('node:fs');
   const path = require('node:path');
-  const points = series().map(p => ({ ...p, node_id: 'do-not-echo-fixture', raw: 'canary-only' }));
-  const code = `const fs=require('node:fs'); const {analyzeHours}=require(process.argv[1]); const x=JSON.parse(fs.readFileSync(0,'utf8')); process.stdout.write(JSON.stringify(analyzeHours(x.points,x.opts)));`;
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'kt-hourly-input-'));
+  try {
+    const inputPath = path.join(dir, 'input.json');
+    // Exclusive creation writes and closes the immutable input before any child starts.
+    fs.writeFileSync(inputPath, input, { flag: 'wx', mode: 0o400 });
+    return run(inputPath);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function runTimezoneChild(code, TZ, inputPath, t) {
+  const fs = require('node:fs');
+  const { spawnSync } = require('node:child_process');
+  const path = require('node:path');
   const modulePath = path.resolve(__dirname, '../lib/hourly-baseline.js');
-  const run = TZ => execFileSync(process.execPath, ['-e', code, modulePath], {input:JSON.stringify({points,opts:opts()}),env:{...process.env,TZ},encoding:'utf8',timeout:5000,maxBuffer:1024*1024});
-  assert.equal(run('Pacific/Kiritimati'), run('America/Los_Angeles'));
-  const report = JSON.stringify(analyzeHours(points, opts()));
-  assert.ok(!report.includes('do-not-echo-fixture') && !report.includes('canary-only'));
+  const fd = fs.openSync(inputPath, 'r');
+  const began = process.hrtime.bigint();
+  let result;
+  try {
+    result = spawnSync(process.execPath, ['-e', code, modulePath], {
+      stdio: [fd, 'pipe', 'pipe'], env: { ...process.env, TZ }, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
+    });
+  } finally {
+    fs.closeSync(fd);
+  }
+  const elapsed = Number(process.hrtime.bigint() - began) / 1e6;
+  // Only fixed phase labels and numeric timings enter diagnostics, never raw stderr.
+  const phases = (result.stderr || '').split('\n').filter(line => /^(entry|module|stdin_read|stdin_parsed|analysis) \d+(?:\.\d+)?$/.test(line));
+  const diagnostic = `elapsed_ms=${elapsed.toFixed(3)} error=${result.error ? result.error.code || 'unknown' : 'none'} status=${result.status} signal=${result.signal} phases=${phases.join(',') || 'none'}`;
+  assert.equal(Boolean(result.error), false, diagnostic);
+  assert.equal(result.signal, null, diagnostic);
+  assert.equal(result.status, 0, diagnostic);
+  assert.ok(result.stdout.trim(), `empty JSON; ${diagnostic}`);
+  let report;
+  try {
+    report = JSON.parse(result.stdout);
+  } catch {
+    assert.fail(`invalid JSON; ${diagnostic}`);
+  }
+  t.diagnostic(diagnostic);
+  return { report, stdout: result.stdout, phases };
+}
+
+test('pure report is independent of host timezone and never echoes identifiers', t => {
+  const points = series().map(p => ({ ...p, node_id: 'do-not-echo-fixture', raw: 'canary-only' }));
+  const code = `
+    const began = process.hrtime.bigint();
+    const fs = require('node:fs');
+    const phase = name => fs.writeSync(2, name + ' ' + (Number(process.hrtime.bigint() - began) / 1e6).toFixed(3) + '\\n');
+    phase('entry');
+    const { analyzeHours } = require(process.argv[1]);
+    phase('module');
+    const input = fs.readFileSync(0, 'utf8');
+    phase('stdin_read');
+    const x = JSON.parse(input);
+    phase('stdin_parsed');
+    const report = analyzeHours(x.points, x.opts);
+    phase('analysis');
+    process.stdout.write(JSON.stringify(report));
+  `;
+  const input = JSON.stringify({ points, opts: opts() });
+  const expected = analyzeHours(points, opts());
+  withTimezoneInput(input, inputPath => {
+    const first = runTimezoneChild(code, 'Pacific/Kiritimati', inputPath, t);
+    const second = runTimezoneChild(code, 'America/Los_Angeles', inputPath, t);
+    for (const child of [first, second]) {
+      assert.ok(!child.stdout.includes('do-not-echo-fixture') && !child.stdout.includes('canary-only'));
+      assert.deepEqual(child.report, expected);
+      assert.deepEqual(child.phases.map(line => line.split(' ')[0]), ['entry', 'module', 'stdin_read', 'stdin_parsed', 'analysis']);
+    }
+    assert.deepEqual(first.report, second.report);
+  });
+});
+
+test('fresh timezone input is a readonly regular file with EOF and cleanup on child failure', t => {
+  const fs = require('node:fs');
+  let ownedPath;
+  withTimezoneInput('{"fixture":true}', inputPath => {
+    ownedPath = inputPath;
+    const code = `
+      const fs = require('node:fs');
+      const regular = fs.fstatSync(0).isFile();
+      const input = fs.readFileSync(0, 'utf8');
+      const eof = fs.readSync(0, Buffer.alloc(1), 0, 1, null) === 0;
+      let readonly = false;
+      try { fs.writeSync(0, 'x'); } catch (error) { readonly = error.code === 'EBADF'; }
+      process.stdout.write(JSON.stringify({ regular, input, eof, readonly }));
+    `;
+    const expected = { regular: true, input: '{"fixture":true}', eof: true, readonly: true };
+    assert.deepEqual(runTimezoneChild(code, 'Pacific/Kiritimati', inputPath, t).report, expected);
+    assert.deepEqual(runTimezoneChild(code, 'America/Los_Angeles', inputPath, t).report, expected);
+  });
+  assert.ok(!fs.existsSync(ownedPath));
+  assert.throws(() => withTimezoneInput('{}', inputPath => {
+    ownedPath = inputPath;
+    runTimezoneChild('process.exit(7);', 'Pacific/Kiritimati', inputPath, t);
+  }), /status=7 signal=null/);
+  assert.ok(!fs.existsSync(ownedPath));
+});
+
+test('fresh timezone fixture rejects a child that exceeds its whole-process watchdog', t => {
+  // Default SIGTERM terminates this exact owned child; no retry or detached descendant.
+  assert.throws(() => withTimezoneInput('{}', inputPath => runTimezoneChild('setInterval(() => {}, 1000);', 'Pacific/Kiritimati', inputPath, t)),
+    /error=ETIMEDOUT status=null signal=SIGTERM/);
 });
 
 

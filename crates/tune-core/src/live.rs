@@ -1925,7 +1925,11 @@ mod tests {
 
         fn new() -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
-            Self::create(std::env::temp_dir().join(format!("kt-live-launch-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)))).unwrap()
+            #[cfg(target_os = "linux")]
+            let parent = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+            #[cfg(not(target_os = "linux"))]
+            let parent = std::env::temp_dir();
+            Self::create(parent.join(format!("kt-live-launch-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)))).unwrap()
         }
     }
 
@@ -1940,6 +1944,8 @@ mod tests {
     struct ExactChildOutput {
         status: Option<std::process::ExitStatus>,
         reason: Option<&'static str>,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     }
@@ -1981,6 +1987,36 @@ mod tests {
         }
     }
 
+    fn capture_limit_reason(out: &std::fs::File, err: &std::fs::File, deadline: Instant, cap: usize) -> std::io::Result<Option<&'static str>> {
+        // Prefer an observed excess even if this observation is also late.
+        if out.metadata()?.len().saturating_add(err.metadata()?.len()) > cap as u64 {
+            return Ok(Some("output limit"));
+        }
+        if Instant::now() >= deadline {
+            return Ok(Some("deadline"));
+        }
+        Ok(None)
+    }
+
+    #[test]
+    fn launch_test_capture_prioritizes_observed_output_over_an_expired_deadline() {
+        let dir = LaunchTestDir::new();
+        let out = std::fs::OpenOptions::new().write(true).create_new(true).open(dir.path.join("stdout")).unwrap();
+        let err = std::fs::OpenOptions::new().write(true).create_new(true).open(dir.path.join("stderr")).unwrap();
+        let cap = 4096;
+        let expired = Instant::now();
+        assert_eq!(capture_limit_reason(&out, &err, expired, cap).unwrap(), Some("deadline"));
+        out.set_len(cap as u64 + 1).unwrap();
+        assert_eq!(capture_limit_reason(&out, &err, expired, cap).unwrap(), Some("output limit"));
+        out.set_len(0).unwrap();
+        err.set_len(cap as u64 + 1).unwrap();
+        assert_eq!(capture_limit_reason(&out, &err, expired, cap).unwrap(), Some("output limit"));
+        err.set_len(cap as u64).unwrap();
+        assert_eq!(capture_limit_reason(&out, &err, expired, cap).unwrap(), Some("deadline"));
+        out.set_len(1).unwrap();
+        assert_eq!(capture_limit_reason(&out, &err, expired, cap).unwrap(), Some("output limit"));
+    }
+
     fn capture_exact_child(command: &mut std::process::Command, dir: &mut LaunchTestDir, limit: Duration, cap: usize) -> ExactChildOutput {
         use std::io::Read as _;
         let deadline = Instant::now() + limit;
@@ -1995,15 +2031,12 @@ mod tests {
         dir.cleanup = false;
         command.stdout(Stdio::null()).stderr(Stdio::null());
         let reason = loop {
-            if Instant::now() >= deadline {
-                break Some("deadline");
-            }
-            let reaped = child.reap().unwrap();
             // Regular files avoid pipe-reader joins. Poll size and stop excess
             // output; only cap bytes in total are ever loaded into diagnostics.
-            if out_file.metadata().unwrap().len().saturating_add(err_file.metadata().unwrap().len()) > cap as u64 {
-                break Some("output limit");
+            if let Some(reason) = capture_limit_reason(&out_file, &err_file, deadline, cap).unwrap() {
+                break Some(reason);
             }
+            let reaped = child.reap().unwrap();
             if reaped {
                 break None;
             }
@@ -2011,11 +2044,13 @@ mod tests {
         };
         child.stop_and_reap();
         dir.cleanup = child.status.is_some();
+        let stdout_bytes = out_file.metadata().unwrap().len();
+        let stderr_bytes = err_file.metadata().unwrap().len();
         let mut stdout = Vec::new();
         std::fs::File::open(out_path).unwrap().take(cap as u64).read_to_end(&mut stdout).unwrap();
         let mut stderr = Vec::new();
         std::fs::File::open(err_path).unwrap().take((cap - stdout.len()) as u64).read_to_end(&mut stderr).unwrap();
-        ExactChildOutput { status: child.status, reason, stdout, stderr }
+        ExactChildOutput { status: child.status, reason, stdout_bytes, stderr_bytes, stdout, stderr }
     }
 
     fn launch_test_command(dir: &std::path::Path, test: &str, case: &str) -> std::process::Command {
@@ -2024,6 +2059,11 @@ mod tests {
         std::fs::create_dir(&app).unwrap();
         std::fs::create_dir(&home).unwrap();
         let executable = app.join(crate::helpers::exe("live-test"));
+        // Linux links the already-running inode, avoiding a writable executable
+        // copy while parallel tests spawn children. The owned root is on its FS.
+        #[cfg(target_os = "linux")]
+        std::fs::hard_link(std::env::current_exe().unwrap(), &executable).unwrap();
+        #[cfg(not(target_os = "linux"))]
         std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
         let mut child = std::process::Command::new(&executable);
         child
@@ -2053,6 +2093,37 @@ mod tests {
         let path = owner.path.clone();
         drop(owner);
         assert!(!path.exists(), "successful exclusive owner cleans its own fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_test_links_the_running_inode_and_cleans_only_owned_names() {
+        use std::os::unix::fs::MetadataExt as _;
+        let source = std::env::current_exe().unwrap();
+        let identity = |path: &std::path::Path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            (metadata.dev(), metadata.ino())
+        };
+        let source_identity = identity(&source);
+        let first = LaunchTestDir::new();
+        let second = LaunchTestDir::new();
+        assert_ne!(first.path, second.path);
+        assert_eq!(first.path.parent(), source.parent());
+        assert_eq!(second.path.parent(), source.parent());
+        let first_command = launch_test_command(&first.path, "live::tests::launch_follows_the_probe_conventions", "absent");
+        let second_command = launch_test_command(&second.path, "live::tests::launch_follows_the_probe_conventions", "absent");
+        let first_executable = std::path::Path::new(first_command.get_program());
+        let second_executable = std::path::Path::new(second_command.get_program());
+        assert_ne!(first_executable, second_executable);
+        assert_eq!(identity(first_executable), source_identity);
+        assert_eq!(identity(second_executable), source_identity);
+        drop(first);
+        assert!(!first_executable.exists());
+        assert_eq!(identity(&source), source_identity);
+        assert_eq!(identity(second_executable), source_identity);
+        drop(second);
+        assert!(!second_executable.exists());
+        assert_eq!(identity(&source), source_identity);
     }
 
     // Invoked only as an exact child with the test-only case environment set.
@@ -2092,14 +2163,20 @@ mod tests {
         let limit = Duration::from_secs(5);
         let began = Instant::now();
         let output = capture_exact_child(&mut command, &mut dir, limit, 4096);
+        let ready = String::from_utf8_lossy(&output.stdout).contains("watchdog fixture ready");
+        eprintln!(
+            "watchdog reaped={} exit_code={} stdout_bytes={} stderr_bytes={} ready={}",
+            u8::from(output.status.is_some()),
+            output.status.and_then(|status| status.code()).unwrap_or(-1),
+            output.stdout_bytes,
+            output.stderr_bytes,
+            u8::from(ready)
+        );
         assert_eq!(output.reason, expected);
         assert!(output.status.is_some(), "retained child must be reaped before cleanup");
         assert!(began.elapsed() < limit + Duration::from_secs(3));
         assert!(output.stdout.len() + output.stderr.len() <= 4096, "capture must be bounded");
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("watchdog fixture ready"),
-            "child must reach the controlled fixture before watchdog termination"
-        );
+        assert!(ready, "child must reach the controlled fixture before watchdog termination");
         if expected.is_none() {
             assert!(output.status.unwrap().success());
             assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
@@ -2125,8 +2202,8 @@ mod tests {
         watchdog_case("normal", None);
     }
 
-    // Only child processes receive this HOME/data namespace. Copying the test
-    // executable also confines the beside-app search; no installed helper runs.
+    // Only child processes receive this HOME/data namespace. Placing the test
+    // executable here also confines the beside-app search; no installed helper runs.
     fn isolated_launch_child(test: &str, cases: &[&str]) -> Option<(PathBuf, String)> {
         const ROOT: &str = "KT_LIVE_LAUNCH_TEST_ROOT";
         const CASE: &str = "KT_LIVE_LAUNCH_TEST_CASE";

@@ -166,7 +166,17 @@ impl Session {
         self.assert_passive();
         self.host.request_exit(); // Same admission close used for last-window close and Quit.
         let report = self.host.shutdown().await;
-        assert_eq!(report, ShutdownReport { manual_complete: None, monitor_complete: None, scheduler_complete: None, journal_ack: Some(true) });
+        assert_eq!(
+            report,
+            ShutdownReport {
+                manual_complete: None,
+                monitor_complete: None,
+                scheduler_complete: None,
+                journal_ack: Some(true),
+                install_complete: None,
+                install_recovery_required: false
+            }
+        );
         assert_eq!(self.host.shutdown().await, report);
         self.assert_passive();
         let old_engine = Arc::downgrade(&self.engine);

@@ -46,7 +46,7 @@ impl Gate {
     }
 
     #[cfg(test)]
-    fn with_timeout(mut self, t: Duration) -> Self {
+    pub(crate) fn with_timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
         self
     }

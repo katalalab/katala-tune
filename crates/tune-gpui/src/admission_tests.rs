@@ -90,6 +90,7 @@ fn rejected_after_blocked_db(label: &'static str) {
     let request = *host.request.borrow();
     let schedule = host.schedule_snapshot().0;
     let journal = engine.monitor_journal_health()["running"].clone();
+    assert!(!host.native_install_snapshot().ever_collection_admitted);
     host.request_exit();
     let report = rt.block_on(host.shutdown());
     drop((host, engine, enter));
@@ -194,6 +195,9 @@ fn collection_owner_rejects_independent_gui_admission() {
         host.save_monitor_settings(json!({"enabled":true,"hub":"fixture-b"})).unwrap();
         host.save_schedule_settings(json!({"enabled":true})).unwrap();
         let gate = Gate::new(|| {});
+        assert!(host.admit_install_work(&gate, || panic!("another GUI owns collection")).is_err());
+        assert!(!host.native_install_snapshot().ever_collection_admitted);
+        assert!(host.state.lock().unwrap().install_job.is_none());
         for kind in [Kind::Probe, Kind::Logs, Kind::Inventory, Kind::Ai, Kind::Specs, Kind::Network(false), Kind::Network(true)] {
             assert!(host.start_manual(&mut job, kind).is_err());
             assert!(host.start_manual_from_ui(&mut job, kind, &gate).is_err());
@@ -326,4 +330,177 @@ fn passive_host_does_not_reserve_collection() {
     drop((host, engine, enter));
     drop(rt);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn rejected_install() -> Result<LocalInstallReceipt, InstallError> {
+    Err(tune_core::helpers::native_install::prepare_native_sampler(std::path::Path::new("relative-source")).unwrap_err())
+}
+
+#[tokio::test]
+async fn install_reservation_blocks_every_common_start_before_any_mutation() {
+    let (dir, engine, host) = fixture("install-first");
+    let gate = Gate::new(|| {});
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = mpsc::channel();
+    host.admit_install_work(&gate, move || {
+        entered.send(()).unwrap();
+        wait.recv_timeout(Duration::from_secs(10)).unwrap();
+        rejected_install()
+    })
+    .unwrap();
+    ready.await.unwrap();
+    crate::native::tests::assert_install_blocks_live_pending(&host, host.live.clone());
+    for kind in [Kind::Probe, Kind::Logs, Kind::Inventory, Kind::Ai, Kind::Specs, Kind::Network(false), Kind::Network(true)] {
+        for gated in [false, true] {
+            let mut job = Job::default();
+            assert!(host.start_manual_admitted(&mut job, kind, gated.then_some(&gate), || panic!("not admitted")).is_err());
+            assert!(job.running.is_none());
+        }
+    }
+    assert!(host.start_monitor().is_err());
+    assert!(host.start_monitor_from_ui(&gate).is_err());
+    assert!(host.request_pull().is_err());
+    assert!(host.request_pull_from_ui(&gate).is_err());
+    assert!(host.start_schedule().is_err());
+    assert!(host.start_schedule_from_ui(&gate).is_err());
+    assert!(host.ensure_ticker().is_err());
+    assert!(host.ensure_ticker_from_ui(&gate).is_err());
+    assert!(host.start_diagnostic_journal_from_ui(&gate).is_err());
+    assert!(host.admit_live_request(&gate, || panic!("pending must not commit")).is_err());
+    assert!(!host.native_install_snapshot().ever_collection_admitted);
+    assert!(host.admit_install_work(&gate, || panic!("duplicate install")).is_err());
+    assert_eq!((host.request.borrow().start_seq, host.request.borrow().pull_seq), (0, 0));
+    assert_eq!(host.snapshot().status.phase, RunPhase::Paused);
+    assert!(!host.schedule_snapshot().0);
+    assert_eq!(engine.monitor_journal_health()["running"], false);
+    release.send(()).unwrap();
+    assert_eq!(host.shutdown().await.install_complete, Some(true));
+    assert!(matches!(host.native_install_snapshot().result.as_deref(), Some(NativeInstallResult::Completed(Err(_)))));
+    drop((engine, host));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn live_pending_commits_ever_atomically_and_rejected_intent_does_not() {
+    let (dir, engine, host) = fixture("live-pending");
+    let gate = Gate::new(|| {});
+    assert_eq!(host.admit_live_request(&gate, || None).unwrap(), None);
+    assert!(!host.native_install_snapshot().ever_collection_admitted);
+    assert!(host.state.lock().unwrap().ticker.is_none());
+    assert_eq!(host.admit_live_request(&gate, || Some((7, "fixture".into()))).unwrap(), Some((7, "fixture".into())));
+    assert!(host.native_install_snapshot().ever_collection_admitted);
+    assert!(host.admit_install_work(&gate, || panic!("pending collection won")).is_err());
+    host.pause_monitor().unwrap();
+    host.stop_schedule().unwrap();
+    gate.close();
+    let reopened = Gate::new(|| {});
+    assert!(host.admit_install_work(&reopened, || panic!("reopen cannot reset ever")).is_err());
+    assert!(host.shutdown().await.confirmed());
+    drop((engine, host));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn all_manual_kinds_commit_lifetime_even_after_work_finishes() {
+    for kind in [Kind::Probe, Kind::Logs, Kind::Inventory, Kind::Ai, Kind::Specs, Kind::Network(false), Kind::Network(true)] {
+        let (dir, engine, host) = fixture("manual-ever");
+        let gate = Gate::new(|| {});
+        let mut job = Job::default();
+        host.start_manual_admitted(&mut job, kind, Some(&gate), move || Receipt::error(kind, "synthetic connection failure")).unwrap();
+        assert!(host.native_install_snapshot().ever_collection_admitted);
+        let report = host.shutdown().await;
+        assert_eq!(report.manual_complete, Some(true));
+        assert!(host.native_install_snapshot().ever_collection_admitted);
+        drop((job, engine, host));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn closed_gate_and_quit_first_never_register_install_or_collection_intent() {
+    let (dir, engine, host) = fixture("install-closed");
+    let gate = Gate::new(|| {});
+    gate.close();
+    assert!(host.admit_install_work(&gate, || panic!("closed gate")).is_err());
+    assert!(host.admit_live_request(&gate, || panic!("closed gate")).is_err());
+    assert!(!host.native_install_snapshot().ever_collection_admitted);
+    host.request_exit();
+    let reopened = Gate::new(|| {});
+    assert!(host.admit_install_work(&reopened, || panic!("Quit won")).is_err());
+    let report = host.shutdown().await;
+    assert_eq!(report.install_complete, None);
+    assert!(report.confirmed());
+    drop((engine, host));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn revocation_while_live_waits_for_gate_never_commits_host_intent() {
+    let (dir, engine, host) = fixture("live-revoke");
+    crate::native::tests::assert_revoked_live_generation(host.clone(), host.live.clone(), || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while host.state.try_lock().is_ok() {
+            assert!(Instant::now() < deadline, "request must hold host before revocation");
+            std::thread::yield_now();
+        }
+    });
+    assert!(!host.native_install_snapshot().ever_collection_admitted);
+    assert!(host.state.lock().unwrap().ticker.is_none());
+    assert!(host.shutdown().await.confirmed());
+    drop((engine, host));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn completed_rejection_releases_busy_but_retains_result_during_next_attempt() {
+    let (dir, engine, host) = fixture("install-repeat");
+    let gate = Gate::new(|| {});
+    host.admit_install_work(&gate, rejected_install).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while host.native_install_snapshot().busy {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let previous = host.native_install_snapshot().result.unwrap();
+    let (release, wait) = mpsc::channel();
+    host.admit_install_work(&gate, move || {
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        rejected_install()
+    })
+    .unwrap();
+    assert!(Arc::ptr_eq(&previous, &host.native_install_snapshot().result.unwrap()));
+    assert!(host.native_install_snapshot().busy);
+    assert!(!host.native_install_snapshot().ever_collection_admitted);
+    release.send(()).unwrap();
+    let report = host.shutdown().await;
+    assert_eq!(report.install_complete, Some(true));
+    assert!(report.confirmed());
+    drop((previous, engine, host));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn each_successful_collection_entry_permanently_closes_install_admission() {
+    for label in ["monitor", "pull", "schedule", "ticker", "journal"] {
+        let (dir, engine, host) = fixture(label);
+        let gate = Gate::new(|| {});
+        match label {
+            "monitor" => host.start_monitor_from_ui(&gate),
+            "pull" => host.request_pull_from_ui(&gate),
+            "schedule" => host.start_schedule_from_ui(&gate),
+            "ticker" => host.ensure_ticker_from_ui(&gate),
+            _ => host.start_diagnostic_journal_from_ui(&gate),
+        }
+        .unwrap();
+        assert!(host.native_install_snapshot().ever_collection_admitted, "{label}");
+        assert!(host.admit_install_work(&gate, || panic!("collection already admitted")).is_err());
+        // Exit before polling the synthetic hub worker: no transport may open.
+        host.request_exit();
+        assert!(host.shutdown().await.confirmed());
+        assert!(host.native_install_snapshot().ever_collection_admitted);
+        drop((engine, host));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

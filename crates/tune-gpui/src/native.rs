@@ -4,6 +4,9 @@
 //! `--selftest` は保存データの全ルートを読み、終了する（収集はしない）。
 //! `--selftest --live <id>` だけは指定機体を一度ストリームし、3 CPU 点以上を確認する。
 
+#[path = "sampler_install.rs"]
+mod sampler_install;
+
 use crate::{
     browser::{Reader, Request, Route},
     collection::{self, Job, Kind},
@@ -311,36 +314,35 @@ impl LiveControl {
         }
     }
 
-    fn request(&self, id: &str) -> Option<(u64, String)> {
+    fn request(&self, host: &crate::monitor_host::MonitorHost, gate: &gate::Gate, id: &str) -> Option<(u64, String)> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.stop_locked(&mut state, Stop::User);
         if state.closing || !state.active {
             state.notice = Some("ライブは前面のウィンドウから開始してください".into());
             return None;
         }
-        state.notice = None;
         let generation = state.generation;
-        // OS admission may block on local metadata; close/stop must still revoke
-        // this generation while it runs. No pending intent or ticker exists yet.
         drop(state);
-        let claim = tune_core::gui_collection::ensure_gui_collection_owner();
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.generation != generation || state.closing || !state.active {
-            return None;
-        }
-        if let Err(error) = claim {
-            state.notice = Some(error.to_string());
-            return None;
-        }
-        state.intent = Some(LiveIntent { generation, id: id.into(), started: false, pending: true, heartbeat: Instant::now() });
-        Some((generation, id.into()))
-    }
-
-    fn refuse_request(&self, generation: u64, error: String) {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.intent.as_ref().is_some_and(|i| i.generation == generation) {
+        // Blocking claim occurs without a Live lock. Host rejection must not
+        // stop an already owned stream or create a pending intent.
+        match host.admit_live_request(gate, || {
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.generation != generation || state.closing || !state.active {
+                return None;
+            }
             self.stop_locked(&mut state, Stop::User);
-            state.notice = Some(error);
+            state.notice = None;
+            let generation = state.generation;
+            state.intent = Some(LiveIntent { generation, id: id.into(), started: false, pending: true, heartbeat: Instant::now() });
+            Some((generation, id.into()))
+        }) {
+            Ok(request) => request,
+            Err(error) => {
+                let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.generation == generation && !state.closing {
+                    state.notice = Some(error);
+                }
+                None
+            }
         }
     }
 
@@ -485,6 +487,7 @@ struct TuneApp {
     gate: gate::Gate,
     /// 変更操作の結果（画面上部に一行で出す）
     action_result: Arc<Mutex<Option<String>>>,
+    sampler_ui: Arc<Mutex<sampler_install::UiState>>,
 }
 
 fn revoke_ui(live: &LiveControl, gate: &gate::Gate) {
@@ -580,6 +583,7 @@ impl TuneApp {
             review_error: None,
             gate: gate::Gate::new(move || gate_dirty.store(true, Ordering::Release)),
             action_result: Arc::new(Mutex::new(None)),
+            sampler_ui: Arc::new(Mutex::new(sampler_install::UiState::default())),
         };
         app.reload(cx);
         // Only poll small notification/mailbox state. All SQLite work is in Reader.
@@ -729,10 +733,6 @@ impl TuneApp {
     }
 
     fn refresh_live(&self, (generation, id): (u64, String)) {
-        if let Err(error) = self.monitor.ensure_ticker_from_ui(&self.gate) {
-            self.live.refuse_request(generation, error);
-            return;
-        }
         let engine = self.engine.clone();
         let control = self.live.clone();
         self.rt.spawn(async move {
@@ -755,7 +755,7 @@ impl TuneApp {
             self.live_notice = Some("ライブを開始する機体を先に開いてください".into());
             return;
         }
-        if let Some(request) = self.live.request(id) {
+        if let Some(request) = self.live.request(&self.monitor, &self.gate, id) {
             self.refresh_live(request);
         }
     }
@@ -2069,6 +2069,99 @@ impl TuneApp {
             )
     }
 
+    fn choose_sampler(&mut self, cx: &mut Context<Self>) {
+        if self.monitor.native_install_snapshot().unavailable.is_some() {
+            return;
+        }
+        if !self.sampler_ui.lock().unwrap_or_else(std::sync::PoisonError::into_inner).choose() {
+            return;
+        }
+        let picker = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("展開済みの収集ヘルパー配布フォルダを選択".into()),
+        });
+        let rt = self.rt.handle().clone();
+        let host = self.monitor.clone();
+        let gate = self.gate.clone();
+        let state = self.sampler_ui.clone();
+        let dirty = self.live_dirty.clone();
+        cx.spawn(async move |_this, _cx| {
+            match picker.await {
+                Ok(Ok(paths)) => {
+                    // This task owns only preparation/confirmation. Acceptance
+                    // registers a separate host worker before this future ends.
+                    rt.spawn(async move {
+                        let _ = sampler_install::run_selection(paths, host, gate, state, dirty).await;
+                    });
+                }
+                Ok(Err(error)) => sampler_install::finish(&state, &dirty, &Err(format!("フォルダを選択できません: {error}"))),
+                Err(_) => sampler_install::finish(&state, &dirty, &Err("フォルダ選択を完了できませんでした".into())),
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn tools_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let snapshot = self.monitor.native_install_snapshot();
+        let ui = self.sampler_ui.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let disabled = snapshot.ever_collection_admitted
+            || snapshot.busy
+            || snapshot.recovery_required
+            || snapshot.unavailable.is_some()
+            || ui.phase != sampler_install::Phase::Idle;
+        let reason = ui.phase.label().map(str::to_owned).or(snapshot.unavailable);
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex_none()
+                    .mx_5()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(palette::line())
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(div().text_sm().child("この Mac / PC の収集ヘルパーを、選んだ配布フォルダから導入します。"))
+                    .child(
+                        div()
+                            .id("install-native-sampler")
+                            .px_3()
+                            .py_1p5()
+                            .rounded_md()
+                            .text_sm()
+                            .bg(if disabled { palette::card() } else { palette::accent() })
+                            .text_color(if disabled { palette::muted() } else { palette::text() })
+                            .child("収集ヘルパーを導入…")
+                            .when(!disabled, |button| {
+                                button.cursor_pointer().on_mouse_down(MouseButton::Left, cx.listener(|app, _, _, cx| app.choose_sampler(cx)))
+                            }),
+                    )
+                    .when_some(reason, |card, reason| card.child(div().text_xs().text_color(palette::muted()).child(reason)))
+                    .when_some(ui.notice, |card, notice| card.child(div().text_xs().text_color(palette::warn()).child(notice)))
+                    .when_some(snapshot.result, |card, result| {
+                        card.child(
+                            div()
+                                .id("native-sampler-receipt")
+                                .max_h(px(180.0))
+                                .overflow_y_scroll()
+                                .text_xs()
+                                .text_color(palette::muted())
+                                .child(sampler_install::receipt_text(&result)),
+                        )
+                    }),
+            )
+            .child(self.record_panel(cx))
+    }
+
     fn copy_record(&self, cx: &mut Context<Self>) {
         if let Some(row) = self.panel.as_ref().and_then(|p| p.as_ref().ok()).and_then(|p| self.selected_row.and_then(|i| p.rows.get(i))) {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(format!("{}\n{}\n{}", row.title, row.badge, row.detail)));
@@ -2093,6 +2186,7 @@ impl Render for TuneApp {
             None if self.page == Page::Resources => {
                 div().flex_1().min_h_0().flex().flex_col().child(self.resources_live(cx)).child(self.record_panel(cx)).into_any_element()
             }
+            None if self.page == Page::Tools => self.tools_panel(cx).into_any_element(),
             None => self.record_panel(cx).into_any_element(),
         };
         let root = div()
@@ -2413,7 +2507,7 @@ pub fn run(options: startup::Options) {
     let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio"));
     // Engine の中の tokio 呼び出し（接続・子プロセス）が動くよう、ランタイムの文脈で開く
     let dirty = Arc::new(AtomicBool::new(true));
-    let os = Arc::new(crate::native_host::NativeHost::new(dirty.clone(), crate::os::platform(&config, &data, selftest, resident), rt.handle().clone()));
+    let os = Arc::new(crate::native_host::NativeHost::new(dirty.clone(), crate::os::platform(&config, &data, selftest, resident, hidden), rt.handle().clone()));
     let engine = {
         let _g = rt.enter();
         match Engine::open(config, data, os.clone()) {
@@ -2820,7 +2914,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn assert_passive_live_does_not_start() {
-        let (control, route) = controller();
+        let (control, route, _admission) = controller();
         control.accept_nodes(&[node("fixture-b")]);
         control.set_active(false);
         control.set_active(true);
@@ -2830,8 +2924,8 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn assert_collection_refuses_live() {
-        let (control, route) = controller();
-        assert!(control.request("fixture-b").is_none());
+        let (control, route, admission) = controller();
+        assert!(control.request(admission.host(), &admission.gate, "fixture-b").is_none());
         let state = control.state.lock().unwrap();
         assert!(state.intent.is_none(), "refusal must clear pending intent");
         assert!(state.notice.as_ref().is_some_and(|s| !s.is_empty() && s.len() < 512));
@@ -2849,10 +2943,85 @@ pub(crate) mod tests {
         assert_eq!(route.0.load(Ordering::SeqCst), 0);
     }
 
-    fn controller() -> (LiveControl, Arc<FailingRoute>) {
+    pub(crate) fn assert_install_blocks_live_pending(host: &crate::monitor_host::MonitorHost, live: Arc<Live>) {
+        let control = LiveControl::new(live, true);
+        let gate = gate::Gate::new(|| {});
+        assert!(control.request(host, &gate, "a").is_none());
+        let state = control.state.lock().unwrap();
+        assert!(state.intent.is_none());
+        let generation = state.generation;
+        drop(state);
+        control.complete(generation, "a", &[node("a")], None);
+        assert!(control.live.active().is_empty());
+    }
+
+    pub(crate) fn assert_revoked_live_generation(host: Arc<crate::monitor_host::MonitorHost>, live: Arc<Live>, reached_host: impl Fn()) {
+        for revoke in ["close", "focus", "navigate"] {
+            let control = Arc::new(LiveControl::new(live.clone(), true));
+            let gate = gate::Gate::new(|| {});
+            let admission = gate.admit().unwrap();
+            let pending_control = control.clone();
+            let pending_gate = gate.clone();
+            let pending_host = host.clone();
+            let request = std::thread::spawn(move || pending_control.request(&pending_host, &pending_gate, "a"));
+            reached_host(); // Host lock held while the real Gate commit is blocked.
+            match revoke {
+                "close" => control.close(),
+                "focus" => control.set_active(false),
+                _ => control.stop(Stop::User),
+            }
+            drop(admission);
+            assert!(request.join().unwrap().is_none(), "{revoke}");
+            assert!(control.state.lock().unwrap().intent.is_none());
+            control.complete(0, "a", &[node("a")], None);
+            assert!(control.live.active().is_empty());
+        }
+    }
+
+    struct AdmissionFixture {
+        host: Option<Arc<crate::monitor_host::MonitorHost>>,
+        gate: gate::Gate,
+        dir: std::path::PathBuf,
+    }
+    impl AdmissionFixture {
+        fn new(live: Arc<Live>) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!("live-admission-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("nodes.json"), r#"{"nodes":[]}"#).unwrap();
+            let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(tune_core::engine::NoHost)).unwrap();
+            let host = Arc::new(crate::monitor_host::MonitorHost::new(engine, live, tokio::runtime::Handle::current(), Arc::new(AtomicBool::new(false))));
+            Self { host: Some(host), gate: gate::Gate::new(|| {}), dir }
+        }
+        fn host(&self) -> &Arc<crate::monitor_host::MonitorHost> {
+            self.host.as_ref().unwrap()
+        }
+    }
+    impl Drop for AdmissionFixture {
+        fn drop(&mut self) {
+            self.host().request_exit();
+            drop(self.host.take());
+            std::fs::remove_dir_all(&self.dir).unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn live_pending_sets_host_lifetime_before_ledger_or_stream_exists() {
+        let (control, route, admission) = controller();
+        let (generation, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
+        assert!(admission.host().native_install_snapshot().ever_collection_admitted);
+        assert!(control.live.active().is_empty());
+        control.set_active(false);
+        control.complete(generation, &id, &[node("a")], None);
+        assert_eq!(route.0.load(Ordering::SeqCst), 0);
+        assert!(admission.host().native_install_snapshot().ever_collection_admitted);
+        assert!(admission.host().shutdown().await.confirmed());
+    }
+
+    fn controller() -> (LiveControl, Arc<FailingRoute>, AdmissionFixture) {
         let route = Arc::new(FailingRoute::default());
         let live = Live::new(route.clone(), Opts { max_retries: 0, ..Opts::default() }, Box::new(|_| {}));
-        (LiveControl::new(live, true), route)
+        let admission = AdmissionFixture::new(live.clone());
+        (LiveControl::new(live, true), route, admission)
     }
 
     fn node(id: &str) -> nodes::Node {
@@ -2886,10 +3055,11 @@ pub(crate) mod tests {
         }
     }
 
-    fn shared_controller() -> (LiveControl, Arc<SteadyRoute>) {
+    fn shared_controller() -> (LiveControl, Arc<SteadyRoute>, AdmissionFixture) {
         let route = Arc::new(SteadyRoute::default());
         let live = Live::new(route.clone(), Opts::default(), Box::new(|_| {}));
-        (LiveControl::new(live, true), route)
+        let admission = AdmissionFixture::new(live.clone());
+        (LiveControl::new(live, true), route, admission)
     }
 
     pub(super) async fn samples_after(live: &Live, before: usize) {
@@ -2904,12 +3074,12 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn quit_rejects_pending_live_completion_and_reactivation() {
-        let (control, route) = controller();
-        let (generation, id) = control.request("a").unwrap();
+        let (control, route, admission) = controller();
+        let (generation, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
         control.close();
         control.set_active(true);
         control.complete(generation, &id, &[node("a")], None);
-        assert!(control.request("a").is_none());
+        assert!(control.request(admission.host(), &admission.gate, "a").is_none());
         assert!(control.live.active().is_empty());
         assert_eq!(route.0.load(Ordering::SeqCst), 0);
         control.live.shutdown(Duration::from_secs(1)).await;
@@ -2918,9 +3088,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn live_ui_stop_navigation_inactivity_and_release_preserve_monitor_samples() {
         for action in ["manual", "navigation", "inactive", "release", "pending_hidden"] {
-            let (control, route) = shared_controller();
+            let (control, route, admission) = shared_controller();
             control.live.start_owned(Owner::Monitor, &[node("a")], &[]);
-            let (generation, id) = control.request("a").unwrap();
+            let (generation, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
             if action != "pending_hidden" {
                 control.complete(generation, &id, &[node("a")], None);
             }
@@ -2956,8 +3126,8 @@ pub(crate) mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let reader = Reader::new(engine.clone(), &rt);
         rt.block_on(async {
-            let (control, route) = shared_controller();
-            let (generation, id) = control.request("a").unwrap();
+            let (control, route, admission) = shared_controller();
+            let (generation, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
             control.complete(generation, &id, &[node("a"), node("b")], None);
             control.live.start_owned(Owner::Monitor, &[node("a"), node("b")], &[]);
             samples_after(&control.live, 0).await;
@@ -3008,7 +3178,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn live_accepted_exclusion_stops_monitor_owned_nodes_without_ui_intent() {
-        let (control, _) = shared_controller();
+        let (control, _, _admission) = shared_controller();
         control.live.start_owned(Owner::Monitor, &[node("a")], &[]);
         let ledger = [nodes::Node::from_value(&json!({"id":"a","status":"paused"}), "synthetic-host")];
         control.accept_nodes(&ledger);
@@ -3022,8 +3192,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn live_current_ledger_read_failure_stops_both_owners() {
         for from_reader in [false, true] {
-            let (control, _) = shared_controller();
-            let (generation, id) = control.request("a").unwrap();
+            let (control, _, admission) = shared_controller();
+            let (generation, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
             control.complete(generation, &id, &[node("a")], None);
             control.live.start_owned(Owner::Monitor, &[node("a")], &[]);
             if from_reader {
@@ -3040,8 +3210,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn live_monitor_release_preserves_the_ui_claim_and_samples() {
-        let (control, route) = shared_controller();
-        let (generation, id) = control.request("a").unwrap();
+        let (control, route, admission) = shared_controller();
+        let (generation, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
         control.complete(generation, &id, &[node("a")], None);
         control.live.start_owned(Owner::Monitor, &[node("a")], &[]);
         samples_after(&control.live, 0).await;
@@ -3061,10 +3231,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn live_hidden_invalidates_pending_start_and_focus_return_requires_manual_start() {
-        let (control, route) = controller();
-        let (generation, id) = control.request("a").unwrap();
+        let (control, route, admission) = controller();
+        let (generation, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
         control.set_active(false);
-        assert!(control.request("a").is_none());
+        assert!(control.request(admission.host(), &admission.gate, "a").is_none());
         control.set_active(true);
         control.complete(generation, &id, &[node("a")], None);
         assert!(!control.on("a"));
@@ -3075,10 +3245,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn live_stale_start_cannot_stop_newer_intent_for_the_same_node() {
-        let (control, _) = controller();
-        let (old, id) = control.request("a").unwrap();
+        let (control, _, admission) = controller();
+        let (old, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
         control.stop(Stop::User);
-        let (new, _) = control.request("a").unwrap();
+        let (new, _) = control.request(admission.host(), &admission.gate, "a").unwrap();
         control.complete(new, &id, &[node("a")], None);
         // A stale disk load fails after the newer request has started.
         control.complete(old, &id, &[], Some("stale invalid ledger".into()));
@@ -3090,8 +3260,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn live_invalid_ledger_stops_last_good_stream_and_clears_intent() {
-        let (control, _) = controller();
-        let (generation, id) = control.request("a").unwrap();
+        let (control, _, admission) = controller();
+        let (generation, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
         let last_good = [node("a")];
         control.complete(generation, &id, &last_good, None);
         assert_eq!(control.live.active(), ["a"]);
@@ -3106,9 +3276,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn live_unknown_or_excluded_node_refuses_and_clears_intent() {
-        let (control, route) = controller();
+        let (control, route, admission) = controller();
         for ledger in [Vec::new(), vec![nodes::Node::from_value(&json!({"id":"a","status":"paused"}), "synthetic-host")]] {
-            let (generation, id) = control.request("a").unwrap();
+            let (generation, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
             control.complete(generation, &id, &ledger, None);
             assert!(!control.on("a"));
             assert!(control.live.active().is_empty());
@@ -3120,11 +3290,11 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn live_retains_against_the_full_ledger_and_stops_removed_nodes() {
-        let (control, _) = controller();
+        let (control, _, admission) = controller();
         let a = node("a");
         let b = node("b");
         control.live.start(std::slice::from_ref(&b), &[]);
-        let (generation, id) = control.request("a").unwrap();
+        let (generation, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
         control.complete(generation, &id, &[a.clone(), b], None);
         assert_eq!(control.live.active(), ["a", "b"]);
         control.complete(generation, &id, &[a], None);
@@ -3134,8 +3304,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn live_terminal_backend_failure_never_resets_its_retry_budget() {
-        let (control, route) = controller();
-        let (generation, id) = control.request("a").unwrap();
+        let (control, route, admission) = controller();
+        let (generation, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
         control.complete(generation, &id, &[node("a")], None);
         tokio::time::timeout(Duration::from_secs(1), async {
             while !control.live.active().is_empty() {
@@ -3158,8 +3328,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn live_accepted_exclusion_stops_owned_stream_before_the_next_heartbeat() {
         for status in ["paused", "retired"] {
-            let (control, _) = controller();
-            let (generation, id) = control.request("a").unwrap();
+            let (control, _, admission) = controller();
+            let (generation, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
             control.complete(generation, &id, &[node("a")], None);
             assert_eq!(control.live.active(), ["a"]);
             let ledger = [nodes::Node::from_value(&json!({"id":"a","status":status}), "synthetic-host")];
@@ -3175,8 +3345,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn live_accepted_exclusion_for_another_node_preserves_the_owned_stream() {
-        let (control, _) = controller();
-        let (generation, id) = control.request("a").unwrap();
+        let (control, _, admission) = controller();
+        let (generation, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
         control.complete(generation, &id, &[node("a")], None);
         let ledger = [node("a"), nodes::Node::from_value(&json!({"id":"b","status":"paused"}), "synthetic-host")];
         control.accept_nodes(&ledger);
@@ -3187,8 +3357,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn live_delayed_heartbeat_after_terminal_failure_does_not_start_a_new_stream() {
-        let (control, route) = controller();
-        let (generation, id) = control.request("a").unwrap();
+        let (control, route, admission) = controller();
+        let (generation, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
         control.complete(generation, &id, &[node("a")], None);
         tokio::time::timeout(Duration::from_secs(1), async {
             while !control.live.active().is_empty() {
@@ -3206,6 +3376,20 @@ pub(crate) mod tests {
         assert!(control.take_notice().unwrap().contains("手動"));
         assert_eq!(route.0.load(Ordering::SeqCst), 1);
         control.live.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn host_refusal_does_not_release_current_live_intent() {
+        let (control, route, admission) = shared_controller();
+        let (generation, id) = control.request(admission.host(), &admission.gate, "a").unwrap();
+        control.complete(generation, &id, &[node("a")], None);
+        samples_after(&control.live, 0).await;
+        admission.host().request_exit();
+        assert!(control.request(admission.host(), &admission.gate, "b").is_none());
+        assert!(control.on("a"));
+        assert!(control.live.heartbeat_owned(Owner::Ui, "a"));
+        assert_eq!(route.0.load(Ordering::SeqCst), 1);
+        assert!(admission.host().shutdown().await.confirmed());
     }
 
     #[test]
