@@ -607,8 +607,20 @@ fn windows_case_alias_is_observed_and_no_replace_is_native() {
     let old = os::named(dir.file(), OsStr::new("TUNE-AGENT.EXE")).unwrap();
     let error = os::rename(dir.file(), OsStr::new("TUNE-AGENT.EXE"), OsStr::new("tune.exe"), &old.identity).err().unwrap();
     assert!(!error.moved);
+    assert_eq!(error.error.kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(fs::read(f.target()).unwrap(), b"old sampler");
     f.sentinels();
+    // A negative-only check could pass on an invalid native request. Exercise
+    // actual moves as well, including the shortest valid destination component.
+    for (from, to) in [("TUNE-AGENT.EXE", "x"), ("x", "TUNE-AGENT.EXE")] {
+        if let Err(failure) = os::rename(dir.file(), OsStr::new(from), OsStr::new(to), &old.identity) {
+            panic!("native rename {from} -> {to}: {} (moved={})", failure.error, failure.moved);
+        }
+        assert_eq!(os::named(dir.file(), OsStr::new(to)).unwrap().identity, old.identity);
+        assert_eq!(fs::read(f.bin.join(to)).unwrap(), b"old sampler");
+        assert!(!f.bin.join(from).exists());
+        f.sentinels();
+    }
     dir.close().unwrap();
 }
 #[cfg(windows)]

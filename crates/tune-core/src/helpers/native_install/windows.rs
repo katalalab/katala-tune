@@ -5,7 +5,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io,
-    mem::{offset_of, size_of},
+    mem::size_of,
     os::windows::{
         ffi::OsStrExt,
         fs::MetadataExt,
@@ -18,8 +18,8 @@ use windows_sys::{
     Wdk::{
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
-            FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_NO_RECALL, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
-            NtCreateFile,
+            FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_NO_RECALL, FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION,
+            FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile, NtSetInformationFile,
         },
     },
     Win32::{
@@ -245,10 +245,11 @@ pub(super) fn rename(parent: &File, from: &OsStr, to: &OsStr, id: &Identity) -> 
         return Err(invalid().into());
     }
     let units = component(to)?;
-    let bytes = offset_of!(FILE_RENAME_INFO, FileName) + units.len() * 2;
+    // Include the complete native struct and UTF-16 tail, with zeroed padding.
+    let bytes = size_of::<FILE_RENAME_INFORMATION>() + units.len() * 2;
     // usize backing gives the native struct pointer alignment, unlike Vec<u8>.
     let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
-    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     // SAFETY: aligned storage is large enough for all fixed fields and UTF-16 tail;
     // RootDirectory is retained, ReplaceIfExists=false enforces no-replace rename.
     unsafe {
@@ -257,9 +258,17 @@ pub(super) fn rename(parent: &File, from: &OsStr, to: &OsStr, id: &Identity) -> 
         (*info).FileNameLength = (units.len() * 2) as u32;
         std::ptr::copy_nonoverlapping(units.as_ptr(), std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(), units.len());
     }
-    // SAFETY: buffer stays live and immutable during the synchronous native call.
-    let ok = unsafe { SetFileInformationByHandle(file.as_raw_handle(), FileRenameInfo, info.cast(), bytes as u32) };
-    let result = if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(()) };
+    let mut status = IO_STATUS_BLOCK::default();
+    // SAFETY: retained source/parent handles and aligned buffer stay live during
+    // the synchronous native handle-relative rename. The Win32 wrapper rejects
+    // this relative request; do not fall back to a pathname or a null root.
+    let result = unsafe { NtSetInformationFile(file.as_raw_handle(), &mut status, info.cast(), bytes as u32, FileRenameInformation) };
+    let result = if result < 0 {
+        // SAFETY: pure conversion of the NTSTATUS returned by this call.
+        Err(io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(result) } as i32))
+    } else {
+        Ok(())
+    };
     let closed = super::filesystem::checked_close(file).map_err(|_| io::Error::other("checked rename close failed"));
     match (result, closed) {
         (Err(error), _) => Err(error.into()),
