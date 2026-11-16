@@ -707,3 +707,7 @@ mod schedule_tests;
 #[cfg(test)]
 #[path = "admission_tests.rs"]
 mod admission_tests;
+
+#[cfg(test)]
+#[path = "persisted_state_tests.rs"]
+mod persisted_state_tests;
