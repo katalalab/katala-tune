@@ -126,10 +126,14 @@ fn status_counts(rows: &[Value]) -> BTreeMap<String, i64> {
 }
 
 impl Engine {
-    /// 台帳（無ければ見本を置く）と DB を開く。以前の JSON Lines があれば一度だけ取り込む
+    /// 台帳（無ければ見本を置く）と DB を開く。以前の JSON Lines があれば一度だけ取り込む。
+    /// Same-data participating Engines are refused before these writes. Ownership
+    /// lasts until the last DB Arc closes; raw Store callers do not participate.
     pub fn open(config_path: PathBuf, data_dir: PathBuf, host: Arc<dyn Host>) -> Result<Arc<Engine>, String> {
+        let claim = crate::data_ownership::DataClaim::acquire(&data_dir).map_err(|e| e.to_string())?;
+        let data_dir = claim.data().to_path_buf();
         let _ = nodes::ensure_config(&config_path);
-        let store = Store::open(&data_dir).map_err(|e| format!("DB を開けない（{}）: {e}", data_dir.display()))?;
+        let store = Store::open_claimed(claim).map_err(|_| "Engine database could not be opened or initialized".to_string())?;
         let _ = store.import_legacy(&data_dir, |e| summarize(e.get("data").unwrap_or(&Value::Null), js::arr(e.get("findings"))));
         let e = Arc::new(Engine {
             host,
@@ -1110,3 +1114,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 }
+
+#[cfg(test)]
+#[path = "engine_ownership_tests.rs"]
+mod ownership_tests;

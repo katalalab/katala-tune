@@ -50,7 +50,7 @@ jobs:
             target
           key: gpui-release-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
       - name: Test artifact staging
-        run: node --test test/ci-gpui-artifact.test.js
+        run: node --test test/ci-gpui-artifact.test.js test/inspect-gpui-artifact.test.js
       - name: Build native preview, CLI and sampler
         run: cargo build --release --locked -p tune-gpui -p tune-cli -p tune-agent
       - name: Stage binaries and their hashes

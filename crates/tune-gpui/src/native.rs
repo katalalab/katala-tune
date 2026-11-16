@@ -31,6 +31,9 @@ use tune_core::nodes;
 actions!(tune, [Quit, CloseWindow, GoOverview, NextPage, PreviousPage, Refresh, FocusSearch, FocusContent, ToggleFocus, NextRow, PreviousRow, CopyRecord]);
 
 #[cfg(target_os = "macos")]
+actions!(tune, [OsQuery, OsRequestPermission, OsOpenSettings, OsSendSyntheticTest, OsEnableLogin, OsDisableLogin]);
+
+#[cfg(target_os = "macos")]
 const FONT: &str = ".SystemUIFont";
 #[cfg(not(target_os = "macos"))]
 const FONT: &str = "Segoe UI";
@@ -317,8 +320,28 @@ impl LiveControl {
         }
         state.notice = None;
         let generation = state.generation;
+        // OS admission may block on local metadata; close/stop must still revoke
+        // this generation while it runs. No pending intent or ticker exists yet.
+        drop(state);
+        let claim = tune_core::gui_collection::ensure_gui_collection_owner();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation != generation || state.closing || !state.active {
+            return None;
+        }
+        if let Err(error) = claim {
+            state.notice = Some(error.to_string());
+            return None;
+        }
         state.intent = Some(LiveIntent { generation, id: id.into(), started: false, pending: true, heartbeat: Instant::now() });
         Some((generation, id.into()))
+    }
+
+    fn refuse_request(&self, generation: u64, error: String) {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.intent.as_ref().is_some_and(|i| i.generation == generation) {
+            self.stop_locked(&mut state, Stop::User);
+            state.notice = Some(error);
+        }
     }
 
     fn streaming(&self, id: &str) -> bool {
@@ -706,7 +729,8 @@ impl TuneApp {
     }
 
     fn refresh_live(&self, (generation, id): (u64, String)) {
-        if !self.monitor.ensure_ticker() {
+        if let Err(error) = self.monitor.ensure_ticker_from_ui(&self.gate) {
+            self.live.refuse_request(generation, error);
             return;
         }
         let engine = self.engine.clone();
@@ -799,7 +823,7 @@ impl TuneApp {
             return;
         }
         let mut job = self.collection.borrow_mut();
-        if let Err(error) = self.monitor.start_manual(&mut job, kind) {
+        if let Err(error) = self.monitor.start_manual_from_ui(&mut job, kind, &self.gate) {
             job.result = Some(collection::Receipt::error(kind, &error));
         }
         cx.notify();
@@ -2071,7 +2095,7 @@ impl Render for TuneApp {
             }
             None => self.record_panel(cx).into_any_element(),
         };
-        div()
+        let root = div()
             .key_context("Browser")
             .track_focus(&self.focus)
             .on_action(cx.listener(|app, _: &Quit, _, cx| {
@@ -2105,8 +2129,38 @@ impl Render for TuneApp {
             }))
             .on_action(cx.listener(|app, _: &NextRow, _, cx| app.select_row(1, cx)))
             .on_action(cx.listener(|app, _: &PreviousRow, _, cx| app.select_row(-1, cx)))
-            .on_action(cx.listener(|app, _: &CopyRecord, _, cx| app.copy_record(cx)))
-            .size_full()
+            .on_action(cx.listener(|app, _: &CopyRecord, _, cx| app.copy_record(cx)));
+        // Window-scoped handlers let the native menu validate availability.
+        // NativeHost's mutex remains the final guard if dispatch races a render.
+        #[cfg(target_os = "macos")]
+        let root = root.when(!self.os.snapshot().busy, |root| {
+            use crate::native_host::Action;
+            root.on_action(cx.listener(|app, _: &OsQuery, _, cx| {
+                app.os.act(Action::Refresh);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|app, _: &OsRequestPermission, _, cx| {
+                app.os.act(Action::Permission);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|app, _: &OsOpenSettings, _, cx| {
+                app.os.act(Action::Settings);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|app, _: &OsSendSyntheticTest, _, cx| {
+                app.os.act(Action::Test);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|app, _: &OsEnableLogin, _, cx| {
+                app.os.act(Action::Login(true));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|app, _: &OsDisableLogin, _, cx| {
+                app.os.act(Action::Login(false));
+                cx.notify();
+            }))
+        });
+        root.size_full()
             .flex()
             .font_family(FONT)
             .bg(palette::bg())
@@ -2359,7 +2413,7 @@ pub fn run(options: startup::Options) {
     let rt = Arc::new(tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio"));
     // Engine の中の tokio 呼び出し（接続・子プロセス）が動くよう、ランタイムの文脈で開く
     let dirty = Arc::new(AtomicBool::new(true));
-    let os = Arc::new(crate::native_host::NativeHost::new(dirty.clone(), crate::os::platform(&config, &data, selftest), rt.handle().clone()));
+    let os = Arc::new(crate::native_host::NativeHost::new(dirty.clone(), crate::os::platform(&config, &data, selftest, resident), rt.handle().clone()));
     let engine = {
         let _g = rt.enter();
         match Engine::open(config, data, os.clone()) {
@@ -2446,6 +2500,25 @@ pub fn run(options: startup::Options) {
                 KeyBinding::new(format!("{modifier}-r").as_str(), Refresh, Some("Browser")),
                 KeyBinding::new(format!("{modifier}-f").as_str(), FocusSearch, Some("Browser")),
                 KeyBinding::new(format!("{modifier}-c").as_str(), CopyRecord, Some("Browser && !SearchInput")),
+            ]);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use gpui::{Menu, MenuItem};
+            // set_menus replaces the entire bar, so preserve the existing Quit.
+            cx.set_menus(vec![
+                Menu { name: "Katala Tune".into(), items: vec![MenuItem::action("Katala Tune を終了", Quit)] },
+                Menu {
+                    name: "OS 連携".into(),
+                    items: vec![
+                        MenuItem::action("OS 状態を照会", OsQuery),
+                        MenuItem::action("通知の許可を要求", OsRequestPermission),
+                        MenuItem::action("通知設定を開く", OsOpenSettings),
+                        MenuItem::action("合成テスト通知を送信", OsSendSyntheticTest),
+                        MenuItem::action("ログイン起動を有効にする", OsEnableLogin),
+                        MenuItem::action("ログイン起動を無効にする", OsDisableLogin),
+                    ],
+                },
             ]);
         }
         // Failure to provide a tray is fatal for resident/hidden mode: never
@@ -2550,13 +2623,11 @@ pub fn run(options: startup::Options) {
                 let result: Result<(), String> = async {
                     window
                         .update(cx, |app, _, cx| {
-                            {
-                                let _runtime = app.rt.enter();
-                                app.engine.start_monitor_journal();
-                            }
+                            app.monitor.start_diagnostic_journal_from_ui(&app.gate)?;
                             app.collect(Kind::Probe, cx);
+                            Ok::<(), String>(())
                         })
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| e.to_string())??;
                     let deadline = Instant::now() + Duration::from_secs(15);
                     while !shutdown_gate.join("child-ready").exists() {
                         if Instant::now() >= deadline {
@@ -2732,7 +2803,7 @@ pub fn run(options: startup::Options) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
@@ -2746,6 +2817,36 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Err("synthetic transport unavailable".into())
         }
+    }
+
+    pub(crate) fn assert_passive_live_does_not_start() {
+        let (control, route) = controller();
+        control.accept_nodes(&[node("fixture-b")]);
+        control.set_active(false);
+        control.set_active(true);
+        assert!(control.poll().is_none());
+        assert_eq!(route.0.load(Ordering::SeqCst), 0);
+        control.close();
+    }
+
+    pub(crate) fn assert_collection_refuses_live() {
+        let (control, route) = controller();
+        assert!(control.request("fixture-b").is_none());
+        let state = control.state.lock().unwrap();
+        assert!(state.intent.is_none(), "refusal must clear pending intent");
+        assert!(state.notice.as_ref().is_some_and(|s| !s.is_empty() && s.len() < 512));
+        let generation = state.generation;
+        drop(state);
+        // Obsolete async completion and periodic polls cannot revive refusal.
+        control.complete(generation, "fixture-b", &[node("fixture-b")], None);
+        for _ in 0..3 {
+            assert!(control.poll().is_none());
+        }
+        control.set_active(false);
+        control.set_active(true);
+        assert!(control.poll().is_none());
+        assert!(control.live.active().is_empty());
+        assert_eq!(route.0.load(Ordering::SeqCst), 0);
     }
 
     fn controller() -> (LiveControl, Arc<FailingRoute>) {

@@ -97,6 +97,10 @@ jobs:
           else
             cargo test --workspace --locked --no-fail-fast
           fi
+      # Collection reservations last for the process lifetime; the passive-host
+      # assertion must run in its own process after the shared unit-test suite.
+      - name: Passive GPUI host collection admission
+        run: cargo test --locked -p tune-gpui --bin katala-tune-gpui monitor_host::admission_tests::passive_host_does_not_reserve_collection -- --exact --ignored --nocapture
       - name: Tauri アプリのリンクを検証
         if: runner.os != 'Linux'
         run: cargo build --package katala-tune --locked

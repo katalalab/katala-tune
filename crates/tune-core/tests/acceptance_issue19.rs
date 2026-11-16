@@ -586,6 +586,8 @@ async fn undo_refuses_a_reassigned_original_target_and_legacy_audit() {
         s.engine.confirm_and_run_with(s.host.as_ref(), "w", &disable(), "t", None, approve(true, || {})).await.unwrap();
         let original = s.engine.with_db(|d| d.actions(1000)).unwrap()[0].clone();
         assert!(!original["undo"].is_null());
+        // A restart closes the original Store before reopening the same data.
+        drop(s.engine);
         write_ledger(&s.ledger, &[replacement], &[]);
         let reopened = Engine::open(s.ledger.clone(), s.dir.join("data"), Arc::new(NoHost)).unwrap();
         let r = reopened.undo_with(s.host.as_ref(), original["id"].as_str().unwrap(), approve(true, || {})).await.unwrap();

@@ -71,9 +71,12 @@ pub trait Service: Send + Sync + 'static {
     fn login(&self, enabled: bool, done: Completion<Effect>);
     fn notify(&self, title: String, body: String, done: Completion<Effect>);
 }
-pub fn platform(config: &Path, data: &Path, diagnostic: bool) -> std::sync::Arc<dyn Service> {
+pub fn platform(config: &Path, data: &Path, diagnostic: bool, resident: bool) -> std::sync::Arc<dyn Service> {
     #[cfg(target_os = "macos")]
-    return std::sync::Arc::new(macos::Mac::new(config, data, diagnostic));
+    return std::sync::Arc::new(macos::Mac::new(config, data, diagnostic, resident));
     #[cfg(target_os = "windows")]
-    return std::sync::Arc::new(windows::Windows::new(config, data, diagnostic));
+    {
+        let _ = resident;
+        std::sync::Arc::new(windows::Windows::new(config, data, diagnostic))
+    }
 }

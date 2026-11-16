@@ -152,3 +152,178 @@ async fn committed_sessions_survive_resident_close_and_quit_drains_same_workers(
     drop((host, engine));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+// Each contender is an independent copy of this test harness, never the product.
+fn contender() {
+    harness_child("collection_owner_rejects_independent_gui_admission");
+}
+fn harness_child(test: &str) {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &format!("monitor_host::admission_tests::{test}"), "--include-ignored", "--nocapture"])
+        .env("TUNE_COLLECTION_CONTENDER", "1")
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "independent GUI contender must be refused");
+            return;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("owned GUI harness child timed out");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+#[test]
+fn collection_owner_rejects_independent_gui_admission() {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let enter = rt.enter();
+    let (dir, engine, host) = fixture("collection-owner");
+    let child = std::env::var_os("TUNE_COLLECTION_CONTENDER").is_some();
+    let ids = if child { ["fixture-b", "fixture-c"] } else { ["fixture-a", "fixture-b"] };
+    std::fs::write(dir.join("nodes.json"), json!({"nodes":ids.map(|id| json!({"id":id,"os":"macos"}))}).to_string()).unwrap();
+    engine.reload_config();
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut job = Job::default();
+    if child {
+        // Engine and saved settings work with a different data directory even
+        // while collection is owned. All production wrappers must refuse.
+        host.save_monitor_settings(json!({"enabled":true,"hub":"fixture-b"})).unwrap();
+        host.save_schedule_settings(json!({"enabled":true})).unwrap();
+        let gate = Gate::new(|| {});
+        for kind in [Kind::Probe, Kind::Logs, Kind::Inventory, Kind::Ai, Kind::Specs, Kind::Network(false), Kind::Network(true)] {
+            assert!(host.start_manual(&mut job, kind).is_err());
+            assert!(host.start_manual_from_ui(&mut job, kind, &gate).is_err());
+            let calls = count.clone();
+            assert!(
+                host.start_manual_with(&mut job, kind, move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Receipt::error(kind, "synthetic completed work")
+                })
+                .is_err()
+            );
+            assert!(job.running.is_none());
+            assert!(job.result.is_none());
+        }
+        assert!(host.start_monitor().is_err());
+        assert!(host.start_monitor_from_ui(&gate).is_err());
+        assert!(host.request_pull().is_err());
+        assert!(host.request_pull_from_ui(&gate).is_err());
+        assert!(host.start_schedule().is_err());
+        assert!(host.start_schedule_from_ui(&gate).is_err());
+        let calls = count.clone();
+        assert!(
+            host.start_schedule_with(move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            })
+            .is_err()
+        );
+        assert!(host.ensure_ticker().is_err());
+        assert!(host.ensure_ticker_from_ui(&gate).is_err());
+        assert!(host.start_diagnostic_journal_from_ui(&gate).is_err());
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        crate::native::tests::assert_collection_refuses_live();
+        rt.block_on(async {
+            tokio::task::yield_now().await;
+        });
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        let state = host.state.lock().unwrap();
+        assert!(state.manual.is_none() && state.worker.is_none() && state.ticker.is_none() && state.scheduler.is_none());
+        drop(state);
+        let request = *host.request.borrow();
+        assert_eq!((request.start_seq, request.pull_seq), (0, 0));
+        assert_eq!(request.mode, RunMode::Paused);
+        assert!(!host.schedule_snapshot().0);
+        assert!(!host.snapshot().started);
+        assert_eq!(engine.monitor_journal_health()["running"], false);
+        assert!(host.live.active().is_empty());
+    } else {
+        let calls = count.clone();
+        host.start_fixture_manual(&mut job, move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Receipt::error(Kind::Probe, "synthetic completed work")
+        })
+        .expect("unexpected external collector ownership; never take over");
+        contender(); // Admitted manual, before runtime polling.
+        rt.block_on(async {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while job.running.is_some() {
+                job.poll();
+                assert!(Instant::now() < deadline);
+                tokio::task::yield_now().await;
+            }
+        });
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        contender(); // Manual completion cannot release.
+        // Empty ledger prevents any remote effects in this owner's worker.
+        std::fs::write(dir.join("nodes.json"), r#"{"nodes":[]}"#).unwrap();
+        host.start_monitor().unwrap();
+        host.start_schedule_with(|_| async { Ok(()) }).unwrap();
+        host.pause_monitor().unwrap();
+        host.stop_schedule().unwrap();
+        let gate = Gate::new(|| {});
+        gate.close();
+        assert!(host.start_monitor_from_ui(&gate).is_err());
+        assert!(host.start_manual_admitted(&mut job, Kind::Probe, Some(&gate), || panic!("closed gate")).is_err());
+        assert!(host.ensure_ticker_from_ui(&gate).is_err());
+        contender(); // Pause / Stop / resident window close cannot release.
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = mpsc::channel();
+        host.start_fixture_manual(&mut job, move || {
+            entered.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(10)).unwrap();
+            Receipt::error(Kind::Probe, "synthetic drain completed")
+        })
+        .unwrap();
+        rt.block_on(async {
+            ready.await.unwrap();
+            let draining = host.clone();
+            let shutdown = tokio::spawn(async move { draining.shutdown().await });
+            tokio::task::yield_now().await;
+            assert!(host.state.lock().unwrap().exiting);
+            assert!(!shutdown.is_finished());
+            contender(); // Claim remains reserved throughout a blocked producer drain.
+            release.send(()).unwrap();
+            assert!(shutdown.await.unwrap().confirmed());
+        });
+    }
+    host.request_exit();
+    assert!(rt.block_on(host.shutdown()).confirmed());
+    if !child {
+        contender();
+    } // Even shutdown return retains the process claim.
+    drop((job, host, engine, enter));
+    drop(rt);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "run alone: the passive parent must never share another unit test's process-static reservation"]
+fn passive_host_does_not_reserve_collection() {
+    if std::env::var_os("TUNE_COLLECTION_CONTENDER").is_some() {
+        tune_core::gui_collection::ensure_gui_collection_owner()
+            .expect("passive parent must leave collection unreserved; unexpected external ownership is not taken over");
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let enter = rt.enter();
+    let (dir, engine, host) = fixture("passive");
+    engine.reload_config();
+    host.save_monitor_settings(json!({"enabled":true})).unwrap();
+    host.save_schedule_settings(json!({"enabled":true})).unwrap();
+    assert!(!host.snapshot().started);
+    assert!(!host.schedule_snapshot().0);
+    assert!(host.live.active().is_empty());
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    crate::native::tests::assert_passive_live_does_not_start();
+    harness_child("passive_host_does_not_reserve_collection");
+    assert!(rt.block_on(host.shutdown()).confirmed());
+    harness_child("passive_host_does_not_reserve_collection");
+    drop((host, engine, enter));
+    drop(rt);
+    std::fs::remove_dir_all(dir).unwrap();
+}
