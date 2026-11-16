@@ -51,14 +51,27 @@ function scanText(text, terms = [], skip = []) {
 }
 
 // These exact upstream manifests retain public author metadata. All other rules still apply.
-function skipAuthorEmail(file) {
-  return path.basename(file) === 'package-lock.json'
+function scanPolicy(file) {
+  if (path.basename(file) === 'package-lock.json'
     || file === 'vendor/taffy-0.9.0/Cargo.toml'
-    || file === 'vendor/taffy-0.9.0/Cargo.toml.orig';
+    || file === 'vendor/taffy-0.9.0/Cargo.toml.orig') return 'author-email';
+  if (file === 'vendor/glib-0.18.5/src/translate.rs') return 'glib-ci-comments';
+  return 'normal';
 }
 
+// Preserve the two canonical upstream comments about public Windows CI short paths.
+// Only home-path findings on these complete lines are exempt; ledger terms remain active.
+const GLIB_CI_COMMENTS = new Set([
+  '// This currently fails on Windows because ' + ['C:', 'Users', 'runneradmin'].join('\\\\'),
+  '// gets shortened to ' + ['C:', 'Users', 'RUNNER~1'].join('\\\\'),
+]);
+
 function scanFileText(file, text, terms = []) {
-  return scanText(text, terms, skipAuthorEmail(file) ? ['email'] : []);
+  const policy = scanPolicy(file);
+  const findings = scanText(text, terms, policy === 'author-email' ? ['email'] : []);
+  if (policy !== 'glib-ci-comments') return findings;
+  const lines = text.split('\n');
+  return findings.filter((x) => x.rule !== 'home-path' || !GLIB_CI_COMMENTS.has(lines[x.line - 1].trimStart()));
 }
 
 const git = (args, opts = {}) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 256 << 20, ...opts });
@@ -70,7 +83,7 @@ function blobsOf(revs) {
     for (const row of git(['ls-tree', '-r', rev]).split('\n').filter(Boolean)) {
       const [meta, file] = row.split('\t');
       const [, type, oid] = meta.split(' ');
-      const key = `${oid}:${skipAuthorEmail(file)}`;
+      const key = `${oid}:${scanPolicy(file)}`;
       if (type === 'blob' && !blobs.has(key)) blobs.set(key, { oid, file, rev });
     }
   }

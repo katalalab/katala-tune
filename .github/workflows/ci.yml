@@ -83,8 +83,28 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: rust-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          key: rust-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock', 'test/glib-variant-regression/Cargo.lock') }}
           restore-keys: rust-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+      - name: Linux GLib native library versions
+        if: runner.os == 'Linux'
+        run: pkg-config --modversion glib-2.0 gobject-2.0 gio-2.0 gtk+-3.0 webkit2gtk-4.1
+      - name: GLib VariantStrIter harness format
+        if: runner.os == 'Linux'
+        run: cargo fmt --manifest-path test/glib-variant-regression/Cargo.toml --check
+      - name: GLib VariantStrIter debug regression
+        if: runner.os == 'Linux'
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/glib-variant-regression
+        run: cargo test --manifest-path test/glib-variant-regression/Cargo.toml --locked --test variant_str_iter
+      - name: GLib VariantStrIter optimized regression
+        if: runner.os == 'Linux'
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/glib-variant-regression
+        # Verbose output records rustc optimization flags for GLib itself.
+        run: cargo test --manifest-path test/glib-variant-regression/Cargo.toml --locked --release --verbose --test variant_str_iter
+      - name: Tauri Linux compile with patched GLib
+        if: runner.os == 'Linux'
+        run: cargo check --locked -p katala-tune --all-targets
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo test

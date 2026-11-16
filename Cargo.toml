@@ -11,6 +11,7 @@ members = [
     "crates/tune-agent",
     "crates/tune-gpui",
 ]
+exclude = ["vendor/glib-0.18.5", "test/glib-variant-regression"]
 
 [workspace.package]
 version = "0.7.0-rc.1"
@@ -40,6 +41,7 @@ opt-level = "s"
 panic = "abort"
 strip = true
 
-# GPUI pins Taffy 0.9.0; retain its source while requiring the fixed registry grid.
+# Preserve upstream versions while applying the documented dependency backports.
 [patch.crates-io]
 taffy = { path = "vendor/taffy-0.9.0" }
+glib = { path = "vendor/glib-0.18.5" }

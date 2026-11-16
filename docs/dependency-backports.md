@@ -44,7 +44,8 @@ only its email heuristic for the exact paths `vendor/taffy-0.9.0/Cargo.toml` and
 Other patterns and ledger terms remain active, as tested by the focused scanner
 regressions. Other vendor files and application files retain email scanning. Blob deduplication
 includes the effective scan policy, so identical content at an exempt and a
-nonexempt path is checked under both policies (at most two scans per blob).
+nonexempt path is checked under each policy (at most three scans per blob,
+including the separate GLib comment policy below).
 The cost is that future email metadata in these two manifests is not checked by
 that heuristic; source provenance review and private-ledger scanning remain required.
 
@@ -62,4 +63,93 @@ debug overflow checks alone do not reproduce it.
 `x86_64-pc-windows-msvc`. The Linux GPUI package has no grid edge.
 Native Windows CI/artifact verification and actual Mac/Windows layout, resize,
 and scroll checks are release gates; a target dependency tree is not a native build.
-The independent Linux GTK/glib advisory is outside this backport.
+The independent Linux GTK/GLib repair is described separately below.
+
+## GLib 0.18.5 VariantStrIter out-pointer
+
+The Linux Tauri GTK 0.18 graph still requires GLib 0.18. The workspace patches
+the genuine GLib 0.18.5 binding for
+[GHSA-wrw7-89jp-8q8g](https://github.com/advisories/GHSA-wrw7-89jp-8q8g),
+without changing its version or GTK ABI. In `src/variant_iter.rs`, the only
+changes are `let p` → `let mut p` and `&p` → `&mut p`, exactly as in
+[upstream PR #1343](https://github.com/gtk-rs/gtk-rs-core/pull/1343.diff).
+The C call writes through this output-pointer argument; the returned `&s`
+string remains borrowed. See the official
+[GLib pointer contract](https://docs.gtk.org/glib/gvariant-format-strings.html#pointers).
+
+### Provenance and license
+
+All 121 files from the
+[official GLib 0.18.5 archive](https://crates.io/api/v1/crates/glib/0.18.5/download)
+are retained, including both manifests, README, VCS metadata, LICENSE, and
+COPYRIGHT. Its SHA-256, also recorded in the original registry lock, is
+`233daaf6e83ae6a12a52055f568f9d7cf4671dabb78ff9560ab6da230ce00ee5`.
+The archive records upstream commit
+`42b9caf98e03ded086362d9653ca58fe94dc8658`, path `glib`.
+Only the two lines above differ from the archive; the other 120 files,
+including the other 107 Rust files, are unchanged byte for byte.
+
+The original `src/variant_iter.rs` SHA-256 is
+`1fd02859333761c45321b32f28b24233446b97d0022a90d3a937ed162585b90e`.
+The unchanged LICENSE SHA-256 is
+`8cf56d10131ce201cf69ab74b111d3ebac1acca3833d7efb39ae357224b70edb`;
+COPYRIGHT is
+`dae402989de65164815b7e2b6bc2b9576285434c3785934c8b6ece0fa055960d`.
+The Rust binding is MIT licensed. Native GNOME libraries retain their own
+licenses; this backport does not relicense them.
+
+The OSS scanner exempts only `home-path` findings on the two exact original
+comment lines about public Windows CI path shortening in
+`vendor/glib-0.18.5/src/translate.rs`. Leading indentation may vary; any changed
+wording, suffix, or path remains checked. Other rules and all supplied ledger
+terms stay active, including on those lines. This preserves the canonical
+upstream comments at the cost of no longer reporting those two public path
+examples under that one heuristic. The distinct policy participates in blob
+deduplication, so identical content at another path remains checked in HEAD
+and history scans. No GLib email exception is needed.
+
+### Reproducible regression boundary
+
+The root workspace lock selects `vendor/glib-0.18.5` for the Linux Tauri graph.
+`test/glib-variant-regression` is an excluded, test-only workspace with its own
+committed lock and an exact 0.18.5 path dev-dependency to that same directory.
+Its lock was seeded from the existing root lock and pruned offline; shared
+registry packages retain the same versions, sources, and checksums. The vendor
+archive contains no lock, and no vendor lock is added.
+
+On native Linux, run:
+
+```sh
+cargo fmt --manifest-path test/glib-variant-regression/Cargo.toml --check
+cargo test --manifest-path test/glib-variant-regression/Cargo.toml --locked --test variant_str_iter
+cargo test --manifest-path test/glib-variant-regression/Cargo.toml --locked --release --verbose --test variant_str_iter
+cargo check --locked -p katala-tune --all-targets
+```
+
+The three tests cover empty, ordinary (including an empty string), and Unicode
+arrays through the actual `Variant::array_from_iter` / `array_iter_str` API.
+Each checks all string values in forward, reverse, and mixed directions, plus
+length, size hints, and repeated exhaustion. No GTK initialization or display
+is needed. The harness rejects non-Linux compilation, rather than reporting an
+empty test suite as native validation.
+
+The harness debug profile is unoptimized with debug assertions. Its release
+profile applies optimization level 3, LTO off, debug assertions off, and
+overflow checks off to GLib as well as the tests. Linux CI records native
+library versions and runs both profiles in a step-scoped harness target
+directory, then separately compile-checks Tauri with the normal root target.
+Existing workspace checks remain required. The Tauri check does not prove GUI
+execution or release linking.
+
+### Maintenance and remaining gates
+
+The old immutable-out-pointer code is structural defect evidence against the
+official C contract and upstream repair. Do not execute known undefined
+behavior merely to force a failing test. Native Linux debug and optimized
+results must establish the patched regression gate; Mac dependency resolution
+or formatting checks cannot establish it.
+
+Version-based advisories may still report genuine 0.18.5. No version spoofing,
+advisory dismissal, or blanket vendor scanner exception is used. Remove this
+patch when the compatible Tauri/GTK graph selects an official fixed GLib,
+after rerunning these native regressions and the Tauri Linux compile gate.

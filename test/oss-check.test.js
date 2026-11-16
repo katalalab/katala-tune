@@ -134,3 +134,64 @@ test('同じ blob を Taffy manifest と別のパスに置いても例外を広�
     assert.doesNotMatch(result.stdout, /NG email\s+vendor\//);
   }
 });
+
+test('GLib の公開 CI パスは正確なパスとコメント行だけで home-path を許可する', () => {
+  const file = 'vendor/glib-0.18.5/src/translate.rs';
+  const home = ['C:', 'Users', 'runneradmin'].join('\\\\');
+  const shortHome = ['C:', 'Users', 'RUNNER~1'].join('\\\\');
+  const comments = [
+    `        // This currently fails on Windows because ${home}`,
+    `        // gets shortened to ${shortHome}`,
+  ];
+  for (const comment of comments) {
+    assert.deepEqual(scanFileText(file, comment), []);
+    assert.deepEqual(scanFileText(file, comment, ['Users']).map((x) => x.rule), ['ledger']);
+    for (const changed of [comment + ' suffix', comment + ' ', comment.replace('// ', '// changed ')]) {
+      assert.deepEqual(scanFileText(file, changed).map((x) => x.rule), ['home-path']);
+    }
+    for (const other of ['vendor/glib-0.18.5/src/other.rs', 'src/translate.rs']) {
+      assert.deepEqual(scanFileText(other, comment).map((x) => x.rule), ['home-path']);
+    }
+  }
+  const privateHome = ['C:', 'Users', 'private-user'].join('\\\\');
+  const bad = [
+    comments[0].replace(home, privateHome),
+    comments[1].replace(shortHome, shortHome + 'extra'),
+    ['100', '101', '2', '3'].join('.'),
+    ['box.tail', '1234.ts', '.net'].join(''),
+    ['op:', '//Vault/item/field'].join(''),
+    ['person', '@corp.example', '.jp'].join(''),
+  ];
+  assert.deepEqual(scanFileText(file, bad.join('\n')).map((x) => x.rule),
+    ['home-path', 'home-path', 'tailscale-ip', 'tailnet-host', 'op-ref', 'email']);
+});
+
+test('同じ GLib コメント blob も通常パスでは HEAD と履歴の両方で検出する', (t) => {
+  const { execFileSync } = require('node:child_process');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-oss-glib-'));
+  t.after(() => fs.promises.rm(dir, { recursive: true, force: true }));
+  const vcs = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com',
+    '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=' + path.join(dir, 'no-hooks'), ...args], { cwd: dir });
+  vcs('init', '-q');
+  fs.writeFileSync(path.join(dir, 'LICENSE'), 'MIT');
+  fs.writeFileSync(path.join(dir, 'package.json'), '{ "license": "MIT" }');
+  fs.mkdirSync(path.join(dir, 'vendor', 'glib-0.18.5', 'src'), { recursive: true });
+  const comment = '// This currently fails on Windows because ' + ['C:', 'Users', 'runneradmin'].join('\\\\');
+  fs.writeFileSync(path.join(dir, 'vendor', 'glib-0.18.5', 'src', 'translate.rs'), comment);
+  fs.writeFileSync(path.join(dir, 'zz-app.txt'), comment);
+  vcs('add', '.');
+  vcs('commit', '-q', '-m', 'init');
+  const script = path.join(__dirname, '..', 'scripts', 'oss-check.js');
+  for (const args of [[], ['--history']]) {
+    let result;
+    try { execFileSync(process.execPath, [script, ...args], { cwd: dir, encoding: 'utf8',
+      env: { ...process.env, KATALA_TUNE_NODES: path.join(dir, 'none.json') } }); }
+    catch (e) { result = e; }
+    assert.equal(result?.status, 1);
+    assert.match(result.stdout, /NG home-path\s+zz-app\.txt(?:@[0-9a-f]{7})?:1/);
+    assert.doesNotMatch(result.stdout, /NG home-path\s+vendor\//);
+  }
+});
