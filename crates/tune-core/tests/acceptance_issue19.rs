@@ -172,11 +172,23 @@ impl Runner for FakeTaskHost {
 }
 
 /// 永久に返らない実行器（結果を書く前にアプリが止まった状態を作る）
-struct Hung(AtomicUsize);
+struct Hung {
+    calls: AtomicUsize,
+    dropped: AtomicBool,
+}
 impl Runner for Hung {
     fn run<'a>(&'a self, _cmd: &'a str, _args: &'a [String], _input: Option<&'a [u8]>, _timeout: Duration) -> RunFuture<'a> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Box::pin(std::future::pending())
+        struct PendingRun<'a>(&'a AtomicBool);
+        impl Drop for PendingRun<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        Box::pin(async move {
+            let _pending = PendingRun(&self.dropped);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        })
     }
 }
 
@@ -417,23 +429,58 @@ async fn failed_rollback_is_recorded_and_can_be_retried() {
 // ---- 条件5: アプリ再起動後に未完了操作を成功扱いしない ----
 #[tokio::test]
 async fn interrupted_action_is_incomplete_after_restart_not_success() {
+    const CHILD: &str = "TUNE_INTERRUPTED_ACTION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Engine を作る前に専用プロセスへ移す。他の並列テストの fork に
+        // claim の fd が継承されると、Arc 消失後も exec まで lock が残りうる。
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = OwnedChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "interrupted_action_is_incomplete_after_restart_not_success", "--nocapture"])
+                .env(CHILD, "1")
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success(), "restart acceptance child failed: {status}");
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "restart acceptance child exceeded deadline");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
     let s = setup(&[node_json("w")], &[]);
-    let hung = Arc::new(Hung(AtomicUsize::new(0)));
+    let weak_engine = Arc::downgrade(&s.engine);
+    let weak_store = Arc::downgrade(&s.engine.db);
+    let hung = Arc::new(Hung { calls: AtomicUsize::new(0), dropped: AtomicBool::new(false) });
     let (engine, runner) = (s.engine.clone(), hung.clone());
     let task =
         tokio::spawn(async move { engine.confirm_and_run_with(runner.as_ref(), "w", &disable(), "w: タスクを止める", None, approve(true, || {})).await });
     for _ in 0..200 {
-        if hung.0.load(Ordering::SeqCst) > 0 {
+        if hung.calls.load(Ordering::SeqCst) > 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(hung.0.load(Ordering::SeqCst), 1, "実行器まで進んだ（結果は返らない）");
+    assert_eq!(hung.calls.load(Ordering::SeqCst), 1, "実行器まで進んだ（結果は返らない）");
     assert_eq!(actions_of(&s.engine).len(), 1, "実行の前に記録が書かれている");
+    assert!(!hung.dropped.load(Ordering::SeqCst), "実行 future はまだ pending");
     // アプリが止まる
     task.abort();
-    let _ = task.await;
+    assert!(task.await.expect_err("pending action must be cancelled").is_cancelled());
+    assert!(hung.dropped.load(Ordering::SeqCst), "中断した実行 future が破棄された");
     drop(s.engine);
+    assert!(weak_engine.upgrade().is_none());
+    assert!(weak_store.upgrade().is_none());
 
     // 再起動: 同じ DB を開き直す
     let reopened = Engine::open(s.ledger.clone(), s.dir.join("data"), Arc::new(NoHost)).unwrap();
