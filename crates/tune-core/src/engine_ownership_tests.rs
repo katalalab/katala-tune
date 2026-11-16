@@ -5,14 +5,19 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("kt-data-claim-{}-{}", std::process::id(), crate::db::now_ms()));
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let path =
+            std::env::temp_dir().join(format!("kt-data-claim-{}-{}-{}", std::process::id(), crate::db::now_ms(), SEQUENCE.fetch_add(1, Ordering::Relaxed)));
         fs::create_dir(&path).unwrap();
         fs::write(path.join("owner.json"), br#"{"nodes":[]}"#).unwrap();
         Self(path)
