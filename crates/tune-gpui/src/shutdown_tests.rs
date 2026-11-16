@@ -358,3 +358,81 @@ fn live_and_journal_share_one_final_budget_and_missing_ack_is_not_success() {
     drop(rt);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn accepted_install_outlives_window_and_three_second_drain_budget() {
+    let (dir, engine, host) = host_fixture("install-join");
+    let gate = crate::gate::Gate::new(|| {});
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = mpsc::channel();
+    host.admit_install_work(&gate, move || {
+        entered.send(()).unwrap();
+        wait.recv_timeout(Duration::from_secs(10)).unwrap();
+        Err(tune_core::helpers::native_install::prepare_native_sampler(Path::new("relative-source")).unwrap_err())
+    })
+    .unwrap();
+    // Registration precedes both window close and shutdown, even before polling.
+    assert!(host.state.lock().unwrap().install_job.is_some());
+    gate.close();
+    ready.await.unwrap();
+    let draining = host.clone();
+    let mut task = tokio::spawn(async move { draining.shutdown().await });
+    assert!(tokio::time::timeout(Duration::from_millis(3150), &mut task).await.is_err());
+    assert!(host.native_install_snapshot().busy);
+    release.send(()).unwrap();
+    let report = task.await.unwrap();
+    assert_eq!(report.install_complete, Some(true));
+    assert!(!report.install_recovery_required);
+    assert!(report.confirmed());
+    assert_eq!(host.shutdown().await, report);
+    assert!(matches!(host.native_install_snapshot().result.as_deref(), Some(NativeInstallResult::Completed(Err(_)))));
+    drop((engine, host));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn install_panic_retains_uncertainty_and_blocks_all_reuse() {
+    let (dir, engine, host) = host_fixture("install-panic");
+    let gate = crate::gate::Gate::new(|| {});
+    host.admit_install_work(&gate, || panic!("synthetic blocking transaction loss")).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while host.native_install_snapshot().busy {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(host.native_install_snapshot().recovery_required);
+    assert!(host.ensure_ticker().is_err());
+    assert!(host.start_diagnostic_journal_from_ui(&gate).is_err());
+    assert!(host.admit_install_work(&gate, || panic!("recovery cannot retry")).is_err());
+    let report = host.shutdown().await;
+    assert_eq!(report.install_complete, Some(false));
+    assert!(report.install_recovery_required);
+    assert!(!report.confirmed());
+    assert!(matches!(host.native_install_snapshot().result.as_deref(), Some(NativeInstallResult::WorkerFailed)));
+    assert!(host.admit_install_work(&gate, || panic!("no retry")).is_err());
+    assert_eq!(host.shutdown().await, report);
+    drop((engine, host));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn registered_install_still_runs_when_quit_precedes_first_worker_poll() {
+    let (dir, engine, host) = host_fixture("install-register-first");
+    let gate = crate::gate::Gate::new(|| {});
+    let called = Arc::new(AtomicBool::new(false));
+    let observed = called.clone();
+    host.admit_install_work(&gate, move || {
+        observed.store(true, Ordering::Release);
+        Err(tune_core::helpers::native_install::prepare_native_sampler(Path::new("relative-source")).unwrap_err())
+    })
+    .unwrap();
+    assert!(!called.load(Ordering::Acquire));
+    host.request_exit();
+    gate.close();
+    assert_eq!(host.shutdown().await.install_complete, Some(true));
+    assert!(called.load(Ordering::Acquire));
+    drop((host, engine));
+    std::fs::remove_dir_all(dir).unwrap();
+}

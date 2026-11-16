@@ -46,7 +46,11 @@ node scripts/inspect-gpui-artifact.js --source C:/absolute/extracted/gpui-previe
 
 検査はdownload・展開・外部問い合わせ・実行・署名検査・DB操作・配置を行わず、余分なdirectory entryも読んだり変更したりしない。sourceや配置先へbytesを書き込まない。CI全成功、配布元とsourceTreeの出所、OS/arch、Mac署名・quarantine・実行、Windows Defender・実行の確認は操作者の別ゲートとして残る。通常起動時のdata/bin限定探索とWindows専用helper承認の契約も変わらない。
 
-検証したnative samplerの対象Preview `data/bin`への配置は手動で行う。GPUIから使う導入UIと自動同期は未実装。CIのstagingは通常のbin、Preview data、DB、台帳を変更しない。特に同梱releaseの`tune.exe`は診断用で、Windowsの固定Probe・承認付き操作に使うhelperとして自動承認されない。それらには[Windows helperの導入・更新](windows-helper-approval.md)の専用all-success CI release CLI artifactと非公開の`action_helper` v2承認記録を別途使う。native samplerの出所確認は、そのaction helperの承認を兼ねない。
+道具（Tools）の「収集ヘルパーを導入…」から、展開済みのv2配布フォルダをOS標準の選択画面で一つ指定できる。ZIPの展開やダウンロードは行わない。導入先、旧・新SHA-256、版とCI情報を確認欄に表示し、「実行する」で進む。フォルダ選択の取消や確認の取消・時間切れ・置換・受理前のウィンドウ終了では配置しない。承認後も配布元を再検査し、最初に表示した配布物と導入先のidentityが変わっていれば拒否して再確認を求める。
+
+導入できるのは、この起動中に収集・診断を一度も受理していない場合だけである。Liveの準備中、Network診断、監視・自動スキャン・手動収集も含む。停止・Pause・接続失敗・画面の再表示では導入可能へ戻らない。必要ならアプリを終了し、収集・診断を始めずに開き直す。導入処理中は新しい収集・診断を受け付けない。受理済みの導入はウィンドウを閉じても続け、Quitは配置または復元の終了まで待つ。結果は道具画面に読み取り専用で表示し、常駐中の再表示でも保持する。復元やcloseの完了を確認できない場合は収集と再導入を止め、回復用情報を残す。自動更新・自動回復は行わない。
+
+CIのstagingは通常のbin、Preview data、DB、台帳を変更しない。特に同梱releaseの`tune.exe`は診断用で、Windowsの固定Probe・承認付き操作に使うhelperとして自動承認されない。それらには[Windows helperの導入・更新](windows-helper-approval.md)の専用all-success CI release CLI artifactと非公開の`action_helper` v2承認記録を別途使う。native samplerの出所確認は、そのaction helperの承認を兼ねない。
 
 Rust coreには、明示導入のための `helpers::native_install` を用意している。`prepare_native_sampler(absolute_source)` はNodeの結果を受け取らず、raw v2 manifestと三つのファイルを自身で開いて検証する。未知・重複field、リンク・reparse・複数hardlink、読取・close・identity・hashの不一致を拒否し、既存の構造検査を通したsamplerのbytesだけを最大256 MiB保持する。宣言可能なOS/archは実ビルドのmacOS arm64またはWindows x64に固定し、他の組合せは未対応とする。
 
@@ -54,9 +58,9 @@ Rust coreには、明示導入のための `helpers::native_install` を用意�
 
 旧samplerの退避と新samplerの配置には上書きしないnative renameを使い、配置後の検証まで今回のbackupを保持する。失敗結果は `Rejected`、`RolledBack`、回復用pathを持つ `RecoveryRequired` を区別する。未知の置換先を上書きして復元せず、backup削除だけの失敗は配置済み・backup保持のreceiptになる。receiptやhelper metadataをDB・ファイルへ保存しない。
 
-この公開core API自体は導入承認や収集停止を保証しない。呼出側にmaintenance所有と静止状態の確立が必要であり、まだGUI/CLIから接続していない。GUIへ導入操作を出す前に、全収集開始とpending Liveを含む開始受付の直列化、および終了時に受理済み導入workerを待つ処理を別途実装する。起動・表示・再読込・設定読取だけで配置や収集を始める動作は加えない。
+この公開core API自体は導入承認や収集停止を保証しない。GPUIは全収集開始とpending Liveを共有MonitorHostで直列化し、never-admittedの判定、同OS userの協調claim、ウィンドウGate、受理とworker登録を一つの受付に結び付ける。`revalidate_bound_target(original_snapshot)`は元のdata/bin/file identityを作成なしで再照合する。終了時は登録済み導入workerを時間制限なしで待ち、その後に既存のLive/journal終了予算を開始する。起動・表示・再読込・設定読取だけで配置や収集を始める動作は加えない。
 
-これは電源断に対してatomicなupdaterではなく、同userによる悪意あるnamespace置換を完全には防がない。署名・quarantine・Defender・CPU/プロトコル適合・CI出所・remote orphan不在の保証も含まない。Windowsはlocal NTFSのheld handleとno-replace操作を使用し、稼働ファイルのsharing拒否を回避するためのprocess停止やlease緩和は行わない。Windows native CIとOS上の実行受入は別の検証ゲートである。
+これは電源断に対してatomicなupdaterではなく、同userによる悪意あるnamespace置換を完全には防がない。署名・quarantine・Defender・CPU/プロトコル適合・CI出所・remote orphan不在の保証も含まない。Windowsはlocal NTFSのheld handleとno-replace操作を使用し、稼働ファイルのsharing拒否を回避するためのprocess停止やlease緩和は行わない。Windows native CIとOS上の実行受入は別の検証ゲートである。追加した導入UIのmacOS/Windows実フォルダ選択、確認、receipt、再表示、通常/native QuitのE2E受入は別途必要で、合成ファイルのテストだけから実機受入済みとは判断しない。
 
 `scripts/e2e-gpui.sh`はモデル・保存データ・入力編集・起動引数のテストを実行し、見本台帳と一時DBで全17画面の読み込みsmokeを行う。続いて合成の分析・ログ・操作記録を持つDBでも実行ファイルから全画面を開き、前後の観測・収集カーソル・状態・操作記録が不変であることを確認する。この追加テストはdesktop GPUセッションが必要なため、通常の`cargo test`ではignoreし、このスクリプトから明示実行する。
 

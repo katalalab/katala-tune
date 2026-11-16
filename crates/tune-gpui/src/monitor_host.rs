@@ -10,6 +10,7 @@ use tokio::{runtime::Handle, sync::watch, task::JoinHandle};
 use tune_core::{
     engine::Engine,
     gui_collection::ensure_gui_collection_owner,
+    helpers::native_install::{self, InstallError, InstallOutcome, LocalInstallReceipt, NativeTargetSnapshot, Operation, PreparedNativeSampler},
     live::Live,
     monitor::{self, RunMode, RunPhase, RunRequest, RunStatus},
 };
@@ -34,7 +35,40 @@ struct State {
     scheduler: Option<JoinHandle<()>>,
     scheduler_in_flight: bool,
     exiting: bool,
+    ever_collection_admitted: bool,
+    install_job: Option<JoinHandle<()>>,
+    install_result: Option<Arc<NativeInstallResult>>,
+    install_confirmed: Option<bool>,
+    install_phase: InstallPhase,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InstallPhase {
+    Idle,
+    Running,
+    RecoveryRequired,
+}
+#[derive(Debug)]
+pub(crate) enum NativeInstallResult {
+    Completed(Result<LocalInstallReceipt, InstallError>),
+    WorkerFailed,
+}
+impl NativeInstallResult {
+    fn confirmed(&self) -> bool {
+        match self {
+            Self::Completed(Ok(_)) => true,
+            Self::Completed(Err(error)) => error.outcome() != InstallOutcome::RecoveryRequired && error.operation() != Operation::Close,
+            Self::WorkerFailed => false,
+        }
+    }
+}
+pub(crate) struct NativeInstallSnapshot {
+    pub(crate) ever_collection_admitted: bool,
+    pub(crate) busy: bool,
+    pub(crate) recovery_required: bool,
+    pub(crate) result: Option<Arc<NativeInstallResult>>,
+    pub(crate) unavailable: Option<String>,
+}
+
 /// These are local completion/commit acknowledgements, never proof that a
 /// remote producer no longer exists. None means that worker was never started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,10 +77,17 @@ pub struct ShutdownReport {
     pub monitor_complete: Option<bool>,
     pub scheduler_complete: Option<bool>,
     pub journal_ack: Option<bool>,
+    pub install_complete: Option<bool>,
+    pub install_recovery_required: bool,
 }
 impl ShutdownReport {
     pub fn confirmed(self) -> bool {
-        self.scheduler_complete != Some(false) && self.manual_complete != Some(false) && self.monitor_complete != Some(false) && self.journal_ack == Some(true)
+        self.install_complete != Some(false)
+            && !self.install_recovery_required
+            && self.scheduler_complete != Some(false)
+            && self.manual_complete != Some(false)
+            && self.monitor_complete != Some(false)
+            && self.journal_ack == Some(true)
     }
 }
 #[derive(Clone, Debug)]
@@ -90,9 +131,115 @@ impl MonitorHost {
             request,
             status,
             started: AtomicBool::new(false),
-            state: Mutex::new(State { manual: None, worker: None, ticker: None, scheduler: None, scheduler_in_flight: false, exiting: false }),
+            state: Mutex::new(State {
+                manual: None,
+                worker: None,
+                ticker: None,
+                scheduler: None,
+                scheduler_in_flight: false,
+                exiting: false,
+                ever_collection_admitted: false,
+                install_job: None,
+                install_result: None,
+                install_confirmed: None,
+                install_phase: InstallPhase::Idle,
+            }),
             drain: tokio::sync::Mutex::new(None),
         }
+    }
+    fn install_busy(state: &State) -> bool {
+        state.install_phase == InstallPhase::Running || state.install_job.as_ref().is_some_and(|job| !job.is_finished())
+    }
+    fn collection_allowed(state: &State) -> Result<(), String> {
+        if state.exiting {
+            return Err("アプリを終了しています".into());
+        }
+        if state.install_phase == InstallPhase::RecoveryRequired {
+            return Err("収集ヘルパーの状態を確認できません。導入結果の回復情報を確認してください".into());
+        }
+        if Self::install_busy(state) {
+            return Err("収集ヘルパーを導入しています。完了をお待ちください".into());
+        }
+        Ok(())
+    }
+    fn install_allowed(state: &State) -> Result<(), String> {
+        Self::collection_allowed(state)?;
+        if state.ever_collection_admitted {
+            return Err("収集・診断を開始済みです。アプリを終了し、収集・診断を始めずに開き直してください".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn native_install_snapshot(&self) -> NativeInstallSnapshot {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        NativeInstallSnapshot {
+            ever_collection_admitted: state.ever_collection_admitted,
+            busy: Self::install_busy(&state),
+            recovery_required: state.install_phase == InstallPhase::RecoveryRequired,
+            result: state.install_result.clone(),
+            unavailable: Self::install_allowed(&state).err(),
+        }
+    }
+    pub(crate) fn admit_native_install(
+        self: &Arc<Self>,
+        prepared: PreparedNativeSampler,
+        expected: NativeTargetSnapshot,
+        gate: &crate::gate::Gate,
+    ) -> Result<(), String> {
+        self.admit_install_work(gate, move || native_install::install_native_sampler(prepared, expected))
+    }
+    #[cfg(test)]
+    pub(crate) fn start_fixture_install(
+        self: &Arc<Self>,
+        gate: &crate::gate::Gate,
+        work: impl FnOnce() -> Result<LocalInstallReceipt, InstallError> + Send + 'static,
+    ) -> Result<(), String> {
+        self.admit_install_work(gate, work)
+    }
+    fn record_install(state: &mut State, result: NativeInstallResult) {
+        let confirmed = result.confirmed();
+        state.install_confirmed = Some(state.install_confirmed.unwrap_or(true) && confirmed);
+        if !confirmed || state.install_phase == InstallPhase::RecoveryRequired {
+            state.install_phase = InstallPhase::RecoveryRequired;
+        } else {
+            state.install_phase = InstallPhase::Idle;
+        }
+        state.install_result = Some(Arc::new(result));
+    }
+    fn admit_install_work(
+        self: &Arc<Self>,
+        gate: &crate::gate::Gate,
+        work: impl FnOnce() -> Result<LocalInstallReceipt, InstallError> + Send + 'static,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::install_allowed(&state)?;
+        ensure_gui_collection_owner().map_err(|error| error.to_string())?;
+        let _admission = gate.admit()?;
+        state.install_phase = InstallPhase::Running;
+        let host = self.clone();
+        state.install_job = Some(self.rt.spawn(async move {
+            // Registration and Gate admission finish before any transaction IO.
+            drop(host.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+            let result = match tokio::task::spawn_blocking(work).await {
+                Ok(result) => NativeInstallResult::Completed(result),
+                Err(_) => NativeInstallResult::WorkerFailed,
+            };
+            Self::record_install(&mut host.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner), result);
+            host.dirty.store(true, Ordering::Release);
+        }));
+        Ok(())
+    }
+    /// Host -> Gate -> UI Live -> core Live. The callback must be memory-only.
+    pub(crate) fn admit_live_request(&self, gate: &crate::gate::Gate, commit: impl FnOnce() -> Option<(u64, String)>) -> Result<Option<(u64, String)>, String> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::collection_allowed(&state)?;
+        ensure_gui_collection_owner().map_err(|error| error.to_string())?;
+        let _admission = gate.admit()?;
+        let request = commit();
+        if request.is_some() {
+            state.ever_collection_admitted = true;
+            self.ticker(&mut state);
+        }
+        Ok(request)
     }
     fn fail(&self) {
         self.request.send_modify(|r| r.mode = RunMode::Paused);
@@ -143,6 +290,7 @@ impl MonitorHost {
     }
     fn start_monitor_admitted(&self, gate: Option<&crate::gate::Gate>) -> Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::collection_allowed(&state)?;
         let (_, settings) = self.inputs(&state)?;
         if !settings.enabled && settings.hub.is_none() {
             self.request.send_modify(|r| r.mode = RunMode::Paused);
@@ -158,6 +306,7 @@ impl MonitorHost {
             self.status.send_replace(RunStatus { phase: RunPhase::Starting, policy: None, local_collecting: None, hub_configured: settings.hub.is_some() });
         });
         self.worker(&mut state);
+        state.ever_collection_admitted = true;
         Ok(())
     }
     pub fn pause_monitor(&self) -> Result<(), String> {
@@ -178,6 +327,7 @@ impl MonitorHost {
     }
     fn request_pull_admitted(&self, gate: Option<&crate::gate::Gate>) -> Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::collection_allowed(&state)?;
         let (_, settings) = self.inputs(&state)?;
         if settings.hub.is_none() {
             return Err("取得するハブが設定されていません".into());
@@ -189,6 +339,7 @@ impl MonitorHost {
         }
         self.request.send_modify(|r| r.pull_seq = r.pull_seq.wrapping_add(1));
         self.worker(&mut state);
+        state.ever_collection_admitted = true;
         Ok(())
     }
     pub fn save_monitor_settings(&self, patch: Value) -> Result<(), String> {
@@ -272,9 +423,7 @@ impl MonitorHost {
         Fut: std::future::Future<Output = Result<(), String>> + Send,
     {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.exiting {
-            return Err("アプリを終了しています".into());
-        }
+        Self::collection_allowed(&state)?;
         let settings = self.engine.checked_schedule().inspect_err(|e| self.schedule_failure(e.clone()))?;
         if settings["enabled"] != true {
             self.schedule_failure("自動スキャン設定は無効です。保存後に開始してください".into());
@@ -381,6 +530,7 @@ impl MonitorHost {
                 }
             }));
         }
+        state.ever_collection_admitted = true;
         Ok(())
     }
     pub fn stop_schedule(&self) -> Result<(), String> {
@@ -409,30 +559,30 @@ impl MonitorHost {
     pub fn ensure_ticker(&self) -> Result<(), String> {
         self.ensure_ticker_admitted(None)
     }
+    #[cfg(test)]
     pub fn ensure_ticker_from_ui(&self, gate: &crate::gate::Gate) -> Result<(), String> {
         self.ensure_ticker_admitted(Some(gate))
     }
+    #[cfg(test)]
     fn ensure_ticker_admitted(&self, gate: Option<&crate::gate::Gate>) -> Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.exiting {
-            return Err("アプリを終了しています".into());
-        }
+        Self::collection_allowed(&state)?;
         ensure_gui_collection_owner().map_err(|e| e.to_string())?;
         let _admission = gate.map(crate::gate::Gate::admit).transpose()?;
         self.ticker(&mut state);
+        state.ever_collection_admitted = true;
         Ok(())
     }
     /// The explicit shutdown diagnostic also owns a journal producer. It uses
     /// the same admission and shutdown ACK path; ordinary preview never calls it.
     pub fn start_diagnostic_journal_from_ui(&self, gate: &crate::gate::Gate) -> Result<(), String> {
-        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.exiting {
-            return Err("アプリを終了しています".into());
-        }
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::collection_allowed(&state)?;
         ensure_gui_collection_owner().map_err(|e| e.to_string())?;
         let _admission = gate.admit()?;
         let _runtime = self.rt.enter();
         self.engine.start_monitor_journal();
+        state.ever_collection_admitted = true;
         Ok(())
     }
     pub fn start_manual_from_ui(&self, job: &mut Job, kind: Kind, gate: &crate::gate::Gate) -> Result<(), String> {
@@ -463,15 +613,14 @@ impl MonitorHost {
         work: impl FnOnce() -> Receipt + Send + 'static,
     ) -> Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.exiting {
-            return Err("アプリを終了しています".into());
-        }
+        Self::collection_allowed(&state)?;
         if job.running.is_some() || state.manual.as_ref().is_some_and(|task| !task.is_finished()) {
             return Err("別の収集が実行中です".into());
         }
         ensure_gui_collection_owner().map_err(|e| e.to_string())?;
         let _admission = gate.map(crate::gate::Gate::admit).transpose()?;
         let sender = job.begin(kind).ok_or("別の収集が実行中です")?;
+        state.ever_collection_admitted = true;
         state.manual = Some(self.rt.spawn(async move {
             // Started blocking work is not abortable. Keep both task scopes
             // alive through result delivery, even if the UI receiver is gone.
@@ -505,9 +654,9 @@ impl MonitorHost {
         if let Some(report) = *drained {
             return report;
         }
-        let (manual, worker, ticker, scheduler) = {
+        let (manual, worker, ticker, scheduler, install) = {
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            (state.manual.take(), state.worker.take(), state.ticker.take(), state.scheduler.take())
+            (state.manual.take(), state.worker.take(), state.ticker.take(), state.scheduler.take(), state.install_job.take())
         };
         if let Some(ticker) = ticker {
             let _ = ticker.await;
@@ -524,10 +673,20 @@ impl MonitorHost {
             Some(task) => Some(task.await.is_ok()),
             None => None,
         };
+        if let Some(install) = install
+            && install.await.is_err()
+        {
+            Self::record_install(&mut self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner), NativeInstallResult::WorkerFailed);
+            self.dirty.store(true, Ordering::Release);
+        }
+        let (install_complete, install_recovery_required) = {
+            let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (state.install_confirmed, state.install_phase == InstallPhase::RecoveryRequired)
+        };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         self.live.shutdown(deadline.saturating_duration_since(tokio::time::Instant::now())).await;
         let journal_ack = Some(self.engine.finish_monitor_journal(deadline.saturating_duration_since(tokio::time::Instant::now())).await);
-        let report = ShutdownReport { manual_complete, monitor_complete, scheduler_complete, journal_ack };
+        let report = ShutdownReport { manual_complete, monitor_complete, scheduler_complete, journal_ack, install_complete, install_recovery_required };
         *drained = Some(report);
         report
     }
