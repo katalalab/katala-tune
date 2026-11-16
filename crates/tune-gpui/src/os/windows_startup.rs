@@ -586,6 +586,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[allow(unsafe_code)] // This fixture audits the real Windows serializer in its owned namespace.
     fn native_files_registry_and_windows_argv_roundtrip_in_owned_test_namespace() {
         use windows::{
             Win32::{
@@ -602,12 +603,35 @@ mod tests {
             let command = fixture.registry.read(&name).unwrap().command.unwrap();
             assert!(command.encode_utf16().count() <= 260);
             let mut count = 0;
+            // SAFETY: the bounded command HSTRING is NUL-terminated and alive
+            // throughout the call; count points to a valid writable integer.
+            // A non-null result owns one LocalFree allocation containing count
+            // pointers and their NUL-terminated strings, per the Win32 contract.
             let argv = unsafe { CommandLineToArgvW(&HSTRING::from(&command), &mut count) };
             assert!(!argv.is_null());
-            let values: Vec<String> = unsafe { std::slice::from_raw_parts(argv, count as usize) }.iter().map(|p| unsafe { p.to_string() }.unwrap()).collect();
+            let values = if count == 3 {
+                // SAFETY: successful CommandLineToArgvW guarantees count valid
+                // entries. The exact closed-command count is checked before
+                // forming this bounded slice, and the allocation remains live.
+                unsafe { std::slice::from_raw_parts(argv, 3) }
+                    .iter()
+                    .map(|p| {
+                        // SAFETY: each PWSTR belongs to the still-live argv
+                        // allocation and is NUL-terminated by the API. Copying
+                        // produces an owned String; no borrowed pointer escapes.
+                        unsafe { p.to_string() }.map_err(|_| "invalid Windows argv UTF-16")
+                    })
+                    .collect::<Result<Vec<String>, _>>()
+            } else {
+                Err("unexpected Windows argv count")
+            };
+            // SAFETY: argv is the non-null base returned by CommandLineToArgvW;
+            // this is its only free. Release it before propagating a count or
+            // string-decoding failure, after all pointer access has ended.
             unsafe {
                 let _ = LocalFree(Some(HLOCAL(argv.cast())));
             }
+            let values = values.expect("closed Windows startup command roundtrip");
             assert_eq!(values.len(), 3);
             assert_eq!(values[0], f.profile.executable);
             assert_eq!(values[1], "--installed-startup");
@@ -782,7 +806,11 @@ pub(super) mod native {
         },
         core::GUID,
     };
+    #[allow(unsafe_code)] // Own and release the one buffer returned by the known-folder API.
     fn folder(id: &GUID) -> Result<PathBuf, State> {
+        // SAFETY: id borrows a valid GUID for this synchronous call; None uses
+        // the current user's token. A successful result transfers ownership of
+        // a NUL-terminated CoTaskMem allocation, retained until the free below.
         let value = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DONT_VERIFY, None) }.map_err(|error| {
             if error.code().0 as u32 == 0x80070005 {
                 State::Denied
@@ -790,7 +818,11 @@ pub(super) mod native {
                 State::Failed(format!("Windows known-folder HRESULT 0x{:08X}", error.code().0 as u32))
             }
         })?;
+        // SAFETY: the successful API result is a live NUL-terminated UTF-16
+        // buffer. Decode into owned storage while its allocation is still live.
         let result = unsafe { value.to_string() }.map(PathBuf::from).map_err(|_| invalid());
+        // SAFETY: free exactly the returned base with its matching allocator,
+        // once, even if UTF-16 decoding failed; no pointer escapes this function.
         unsafe { CoTaskMemFree(Some(value.0.cast())) };
         fs::canonicalize(result?).map_err(io_error)
     }

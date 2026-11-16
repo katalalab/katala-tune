@@ -59,6 +59,7 @@ impl NativeRegistry {
     pub(super) fn current() -> Self {
         Self { root: RegKey::predef(HKEY_CURRENT_USER), run: RUN.into(), approved: APPROVED.into() }
     }
+    #[allow(unsafe_code)] // Audited bounded Win32 read; the workspace deny remains in force elsewhere.
     fn raw(&self, path: &str, name: &str) -> Result<Option<(u32, Vec<u8>)>, State> {
         use windows::{
             Win32::System::Registry::{HKEY, REG_VALUE_TYPE, RegQueryValueExW},
@@ -74,6 +75,12 @@ impl NativeRegistry {
         let mut bytes = vec![0u8; 64 * 1024];
         let mut length = bytes.len() as u32;
         let mut kind = REG_VALUE_TYPE(0);
+        // SAFETY: key owns a live KEY_READ handle for the entire synchronous
+        // call. The temporary HSTRING is NUL-terminated and lives through the
+        // call. kind/length are valid writable outputs; length initially equals
+        // the initialized buffer's length in bytes. Win32 may write at most
+        // that length. No pointer escapes, and status/length are checked
+        // before any returned bytes are decoded or used.
         let status =
             unsafe { RegQueryValueExW(HKEY(key.raw_handle()), &HSTRING::from(name), None, Some(&mut kind), Some(bytes.as_mut_ptr()), Some(&mut length)) };
         if status.0 == 2 {
