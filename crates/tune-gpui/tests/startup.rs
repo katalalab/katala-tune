@@ -74,3 +74,24 @@ fn unsupported_desktop_does_not_open_or_create_user_state() {
     assert_eq!(std::fs::read(f.0.join("production")).unwrap(), b"keep");
     assert_eq!(std::fs::read(f.0.join("invalid.json")).unwrap(), b"invalid fixture");
 }
+
+#[test]
+fn installed_entry_refuses_mixtures_and_unmanaged_binary_before_opening_user_state() {
+    let f = Fixture::new();
+    let digest = "a".repeat(64);
+    for args in [
+        vec!["--installed-startup"],
+        vec!["--installed-startup", "../profile"],
+        vec!["--installed-startup", &digest, "--selftest"],
+        vec!["--installed-startup", &digest, "--config", "other"],
+        vec!["--installed-startup", &digest, "--notification-com-server"],
+        vec!["--installed-startup", &digest, "-Embedding"],
+        // This test binary lives outside the fixed managed Preview layout.
+        vec!["--installed-startup", &digest],
+    ] {
+        assert!(!f.run(&args).status.success());
+        assert_eq!(std::fs::read(f.0.join("production")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(f.0.join("invalid.json")).unwrap(), b"invalid fixture");
+        assert_eq!(std::fs::read_dir(&f.0).unwrap().count(), 2);
+    }
+}

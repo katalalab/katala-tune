@@ -5,7 +5,7 @@ pub fn identity(executable: &str) -> String {
     let hash: String = Sha256::digest(executable.to_lowercase().as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
     format!("KatalaTuneGPUI-{hash}")
 }
-pub fn command(executable: &str, args: &[&str]) -> Result<String, String> {
+pub fn lossless_command(executable: &str, args: &[&str]) -> Result<String, String> {
     fn quote(value: &str) -> Result<String, String> {
         if value.contains(['\0', '\r', '\n']) {
             return Err("起動引数に制御文字があります".into());
@@ -26,6 +26,10 @@ pub fn command(executable: &str, args: &[&str]) -> Result<String, String> {
         Ok(out)
     }
     let result = std::iter::once(executable).chain(args.iter().copied()).map(quote).collect::<Result<Vec<_>, _>>()?.join(" ");
+    Ok(result)
+}
+pub fn command(executable: &str, args: &[&str]) -> Result<String, String> {
+    let result = lossless_command(executable, args)?;
     // Documented Run-key command limit. Count UTF-16, not UTF-8 bytes.
     if result.encode_utf16().count() > 260 {
         return Err("Windows Run の起動コマンド上限（260文字）を超えます".into());
@@ -47,6 +51,17 @@ pub fn observed(registered: Option<&str>, expected: &str, approval: Option<&[u8]
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn serializer_budget_counts_utf16_after_quoting_without_losing_owned_long_commands() {
+        for (units, allowed) in [(259, true), (260, true), (261, false)] {
+            let exe = format!("{}😀", "x".repeat(units - 4));
+            let serialized = lossless_command(&exe, &[]).unwrap();
+            assert_eq!(serialized.encode_utf16().count(), units);
+            assert_eq!(command(&exe, &[]).is_ok(), allowed);
+            assert_eq!(observed(Some(&serialized), &serialized, None), State::Enabled);
+        }
+    }
+
     #[test]
     fn quoted_launch_preserves_paths_arguments_and_metacharacters() {
         assert_eq!(

@@ -11,6 +11,8 @@ pub(crate) mod windows_activation;
 mod windows_login;
 #[cfg(any(target_os = "windows", test))]
 mod windows_notifications;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod windows_startup;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
@@ -71,12 +73,14 @@ pub trait Service: Send + Sync + 'static {
     fn login(&self, enabled: bool, done: Completion<Effect>);
     fn notify(&self, title: String, body: String, done: Completion<Effect>);
 }
-pub fn platform(config: &Path, data: &Path, diagnostic: bool, resident: bool) -> std::sync::Arc<dyn Service> {
+pub fn platform(config: &Path, data: &Path, diagnostic: bool, resident: bool, hidden: bool) -> std::sync::Arc<dyn Service> {
     #[cfg(target_os = "macos")]
-    return std::sync::Arc::new(macos::Mac::new(config, data, diagnostic, resident));
+    {
+        let _ = hidden;
+        std::sync::Arc::new(macos::Mac::new(config, data, diagnostic, resident))
+    }
     #[cfg(target_os = "windows")]
     {
-        let _ = resident;
-        std::sync::Arc::new(windows::Windows::new(config, data, diagnostic))
+        std::sync::Arc::new(windows::Windows::new(config, data, diagnostic, resident, hidden))
     }
 }

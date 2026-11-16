@@ -34,13 +34,13 @@ pub(super) trait Boundary {
 }
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Installation {
+pub(super) struct Installation {
     schema: String,
     aumid: String,
     activator_clsid: String,
-    executable: String,
-    config: String,
-    data: String,
+    pub(super) executable: String,
+    pub(super) config: String,
+    pub(super) data: String,
 }
 fn invalid() -> State {
     State::Failed("通知の導入情報が不正です".into())
@@ -54,7 +54,7 @@ fn api_failure(code: i32) -> State {
         code => State::Failed(format!("Windows HRESULT 0x{code:08X}")),
     }
 }
-fn registry_string(bytes: &[u8]) -> Result<String, State> {
+pub(super) fn registry_string(bytes: &[u8]) -> Result<String, State> {
     if bytes.len() > LIMIT || !bytes.len().is_multiple_of(2) {
         return Err(invalid());
     }
@@ -68,7 +68,7 @@ fn registry_string(bytes: &[u8]) -> Result<String, State> {
     }
     Ok(value)
 }
-fn installation(bytes: &[u8]) -> Result<Installation, State> {
+pub(super) fn installation(bytes: &[u8]) -> Result<Installation, State> {
     if bytes.len() > LIMIT {
         return Err(invalid());
     }
