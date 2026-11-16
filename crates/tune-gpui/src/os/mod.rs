@@ -7,6 +7,8 @@ mod macos;
 mod windows;
 #[cfg(any(target_os = "windows", test))]
 mod windows_login;
+#[cfg(any(target_os = "windows", test))]
+mod windows_notifications;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {

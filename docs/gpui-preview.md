@@ -47,7 +47,13 @@ Windowsの常駐時は、GPUI 0.2.2が最後のネイティブウィンドウ破
 
 Dashboard の「監視開始」「自動スキャン開始」は独立した明示操作。保存設定が有効でも、起動・表示・再読込・設定保存だけではどちらも開始しない。「詳細」から監視・ハブ設定と分析・ログ・道具・AI の間隔を保存できる。自動スキャンは開始5秒後、その後60秒ごとに既存 core の予定を確認し、手動収集中はその回を見送る。各回の完了を待ち、停止・終了後は新たな回を開始しない。現在の台帳や保存設定が読めない場合は停止し、修復・保存後も明示的な再開が必要。終了時は実行中の収集を待ち、その後に Live と収集記録を合計3秒の予算で終了する。
 
-機体間ペアリングと自動更新は未移植。常駐は前述の明示オプションで利用する。OS通知・ログイン起動はダッシュボードの「詳細」から明示操作するが、対応条件はOSと配布形態によって異なる。Windows Previewの通知はAUMIDとStart menu登録が未整備のため未対応と表示する。macOSのログイン起動は正規のapp bundleと標準起動条件が必要で、引数・環境変数による独自config/data指定は登録しない。機体詳細のLiveは保持する。アクセシビリティも未完了。既存版を置換する正式リリースとしては扱わず、別DBで試す。Windowsではreleaseビルド、DirectXと実画面の起動を別途確認する。
+機体間ペアリングと自動更新は未移植。常駐は前述の明示オプションで利用する。OS通知・ログイン起動はダッシュボードの「詳細」から明示操作するが、対応条件はOSと配布形態によって異なる。Windows Previewは、後述の導入契約を満たす場合だけ通知設定を明示照会する。通知のinstaller、送信、クリック起動、許可要求と設定画面操作は未実装で、通知対応としては利用できない。macOSのログイン起動は正規のapp bundleと標準起動条件が必要で、引数・環境変数による独自config/data指定は登録しない。機体詳細のLiveは保持する。アクセシビリティも未完了。既存版を置換する正式リリースとしては扱わず、別DBで試す。Windowsではreleaseビルド、DirectXと実画面の起動を別途確認する。
+
+Windows通知の導入契約はPreview専用のAUMID `org.katala.tune.gpui.preview`、表示名 `Katala Tune GPUI Preview`、CLSID `{7FA17089-16BD-4C17-8035-3CB6ACAF04AC}` を固定する。将来のinstallerが配置する公開metadataは、OSの`FOLDERID_LocalAppData`配下の`Katala Tune GPUI Preview/installation.json`。schemaは`katala-tune/gpui-preview-installation/v1`で、`schema`、`aumid`、`activator_clsid`、`executable`、`config`、`data`の6 string fieldsだけを持ち、上限は64 KiB。`executable`は導入exe、`config`と`data`は解決済みの絶対パスで、台帳・DBの内容、approval、credentialsは含めない。既知folderはOS APIから取得し、環境変数だけで決めない。
+
+明示照会ではmetadataと現在のexe/config/data、`FOLDERID_Programs/Katala Tune GPUI Preview.lnk`のtargetと正確な`--config <config> --data <data>`、`AppUserModel_ID`と`ToastActivatorCLSID`を照合する。さらに`HKCU\Software\Classes\CLSID\{7FA17089-16BD-4C17-8035-3CB6ACAF04AC}\LocalServer32`のREG_SZ既定値が引用した導入exeと固定`--notification-com-server`を指し、REG_SZ `ServerExecutable`が引用なしの同じexeを指す場合だけ`ToastNotifier.Setting`を読む。同一user内の導入先整合の検査で、登録の作成・修復や認証の代わりではない。既存パスはfilesystemの正規化結果で比較し、未作成部分の曖昧な大文字小文字の違いは不一致として保守的に扱う。
+
+登録欠落・不一致は未対応、access deniedとgroup policyは拒否、application/userによる無効化は無効、未知のsettingや型は未確認または照会失敗として表示する。OS設定が有効でも、送信可能・実表示済みを意味しない。通常起動、保存、診断モードは通知登録や設定を照会せず、照会自身も登録・送信・shell実行・shortcutのResolveを行わない。Windows実機での登録照合と設定観測は後続の受入が必要。
 
 プレビューのGUI対象は既存アプリと同じmacOSとWindows。Linuxではcore・CLIを検証し、GPUIとそのプラットフォーム依存をビルドへ入れない。Linuxでこのバイナリを起動すると、台帳・DBを開かずに未対応として終了する。
 

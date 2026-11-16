@@ -7971,6 +7971,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-service-management",
  "objc2-user-notifications",
+ "serde",
  "serde_json",
  "sha2 0.11.1",
  "tokio",
@@ -7978,6 +7979,7 @@ dependencies = [
  "tune-core",
  "tune-link",
  "unicode-segmentation",
+ "windows 0.61.3",
  "windows-sys 0.61.2",
  "winreg",
 ]
