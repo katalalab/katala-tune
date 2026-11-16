@@ -1,13 +1,12 @@
-//! Read-only Preview notification installation contract; shared with portable tests.
-use super::{Completion, Observation, State};
+//! Preview notification installation contract and explicit effects; portable policy tests.
+use super::{Completion, Effect, Observation, State};
 
 pub(super) const AUMID: &str = "org.katala.tune.gpui.preview";
 #[cfg(target_os = "windows")]
 pub(super) const DISPLAY_NAME: &str = "Katala Tune GPUI Preview";
 pub(super) const CLSID: &str = "{7FA17089-16BD-4C17-8035-3CB6ACAF04AC}";
-pub(super) const SOURCE: &str = "Windows · この実行ファイル · HKCU Run / StartupApproved · 通知設定の照会のみ（送信・クリック起動は未実装）";
-#[cfg(target_os = "windows")]
-pub(super) const UNIMPLEMENTED: &str = "通知の送信・クリック起動・設定操作は未実装です";
+pub(super) const SOURCE: &str = "Windows · この実行ファイル · HKCU Run / StartupApproved · 通知の明示送信 / COM 経由 Reopen（表示・実機動作は未確認）";
+
 const LIMIT: usize = 64 * 1024;
 
 #[derive(Clone)]
@@ -69,20 +68,24 @@ fn registry_string(bytes: &[u8]) -> Result<String, State> {
     }
     Ok(value)
 }
-fn notification(profile: &Profile, boundary: &mut impl Boundary) -> Result<State, State> {
-    let bytes = boundary.installation()?;
+fn installation(bytes: &[u8]) -> Result<Installation, State> {
     if bytes.len() > LIMIT {
         return Err(invalid());
     }
-    let installed: Installation = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let installed: Installation = serde_json::from_slice(bytes).map_err(|_| invalid())?;
     if installed.schema != "katala-tune/gpui-preview-installation/v1"
         || [&installed.executable, &installed.config, &installed.data].iter().any(|v| v.is_empty() || v.contains(['\0', '\r', '\n']))
     {
         return Err(invalid());
     }
-    if installed.aumid != AUMID
-        || installed.activator_clsid != CLSID
-        || !boundary.same_path(&installed.executable, &profile.executable)?
+    if installed.aumid != AUMID || installed.activator_clsid != CLSID {
+        return Err(mismatch());
+    }
+    Ok(installed)
+}
+pub(super) fn registration(profile: &Profile, boundary: &mut impl Boundary) -> Result<(), State> {
+    let installed = installation(&boundary.installation()?)?;
+    if !boundary.same_path(&installed.executable, &profile.executable)?
         || !boundary.same_path(&installed.config, &profile.config)?
         || !boundary.same_path(&installed.data, &profile.data)?
     {
@@ -108,6 +111,10 @@ fn notification(profile: &Profile, boundary: &mut impl Boundary) -> Result<State
     {
         return Err(mismatch());
     }
+    Ok(())
+}
+fn notification(profile: &Profile, boundary: &mut impl Boundary) -> Result<State, State> {
+    registration(profile, boundary)?;
     Ok(match boundary.setting()? {
         0 => State::Enabled,
         1 | 2 => State::Disabled,
@@ -121,6 +128,65 @@ pub(super) fn complete_query(profile: Result<&Profile, State>, boundary: &mut im
     done(Observation { source: SOURCE.into(), notification, login: login() });
 }
 
+pub(super) const REOPEN: &str = "reopen-v1";
+const SETTINGS: &str = "ms-settings:notifications";
+pub(super) trait Effects: Boundary {
+    fn show(&mut self, title: &str, body: &str, token: &str) -> Result<(), State>;
+    fn open_settings(&mut self, uri: &str) -> Result<(), State>;
+}
+fn effect(result: Result<(), State>) -> Effect {
+    match result {
+        Ok(()) => Effect::Accepted,
+        Err(State::Denied | State::Disabled) => Effect::Denied,
+        Err(State::Unsupported(reason)) => Effect::Unsupported(reason),
+        Err(State::Failed(reason)) => Effect::Failed(reason),
+        Err(_) => Effect::Failed("通知の設定を確認できません".into()),
+    }
+}
+fn text_valid(title: &str, body: &str) -> Result<(), State> {
+    // Product bound below the platform's 5 KB XML limit. Charge XML escaping
+    // conservatively in UTF-16 bytes, plus 512 bytes for the fixed DOM envelope.
+    // No truncation, interpolation, logging, or unbounded walk of oversized input.
+    if title.len().saturating_add(body.len()) > 2048 {
+        return Err(payload_error());
+    }
+    let mut bytes = 512;
+    for ch in title.chars().chain(body.chars()) {
+        if !matches!(ch, '\u{9}' | '\u{a}' | '\u{d}' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}') {
+            return Err(payload_error());
+        }
+        bytes += match ch {
+            '&' => 10,
+            '<' | '>' => 8,
+            '\'' | '"' => 12,
+            _ => ch.len_utf16() * 2,
+        };
+        if bytes > 5000 {
+            return Err(payload_error());
+        }
+    }
+    Ok(())
+}
+fn payload_error() -> State {
+    State::Failed("通知の文字が XML 条件またはサイズ上限を超えています".into())
+}
+pub(super) fn send(profile: Result<&Profile, State>, boundary: &mut impl Effects, title: &str, body: &str) -> Effect {
+    effect((|| {
+        let profile = profile?;
+        text_valid(title, body)?;
+        match notification(profile, boundary)? {
+            State::Enabled => boundary.show(title, body, REOPEN),
+            state => Err(state),
+        }
+    })())
+}
+pub(super) fn settings(profile: Result<&Profile, State>, boundary: &mut impl Effects) -> Effect {
+    effect(profile.and_then(|profile| {
+        registration(profile, boundary)?;
+        boundary.open_settings(SETTINGS)
+    }))
+}
+
 #[cfg(target_os = "windows")]
 pub(super) mod native {
     #![allow(unsafe_code)] // Narrow, read-only calls into pinned Windows bindings.
@@ -130,7 +196,8 @@ pub(super) mod native {
         path::{Path, PathBuf},
     };
     use windows::{
-        UI::Notifications::ToastNotificationManager,
+        Data::Xml::Dom::XmlDocument,
+        UI::Notifications::{ToastNotification, ToastNotificationManager},
         Win32::{
             Foundation::{HLOCAL, LocalFree},
             Storage::EnhancedStorage::{PKEY_AppUserModel_ID, PKEY_AppUserModel_ToastActivatorCLSID},
@@ -141,10 +208,10 @@ pub(super) mod native {
             },
             UI::Shell::{
                 CommandLineToArgvW, FOLDERID_LocalAppData, FOLDERID_Programs, IShellLinkW, KF_FLAG_DONT_VERIFY, PropertiesSystem::IPropertyStore,
-                SHGetKnownFolderPath, SLGP_RAWPATH, ShellLink,
+                SHGetKnownFolderPath, SLGP_RAWPATH, ShellExecuteW, ShellLink,
             },
         },
-        core::{GUID, HSTRING, Interface, PCWSTR},
+        core::{GUID, HSTRING, Interface, PCWSTR, w},
     };
     use winreg::{
         RegKey,
@@ -163,10 +230,10 @@ pub(super) mod native {
     pub(crate) struct Native {
         apartment: Option<Apartment>,
     }
-    fn api(error: windows::core::Error) -> State {
+    pub(crate) fn api(error: windows::core::Error) -> State {
         api_failure(error.code().0)
     }
-    fn io_error(error: io::Error) -> State {
+    pub(crate) fn io_error(error: io::Error) -> State {
         match error.kind() {
             io::ErrorKind::PermissionDenied => State::Denied,
             io::ErrorKind::NotFound => State::Unsupported("通知の登録がありません".into()),
@@ -218,11 +285,60 @@ pub(super) mod native {
             Err(error) => Err(io_error(error)),
         }
     }
+    impl Native {
+        pub(crate) fn installed_profile(&mut self) -> Result<Profile, State> {
+            let installed = installation(&self.installation()?)?;
+            let current = std::env::current_exe().map_err(io_error)?;
+            let current = current.to_str().ok_or_else(invalid)?;
+            if !self.same_path(current, &installed.executable)? {
+                return Err(mismatch());
+            }
+            // Retain resolved names, not metadata aliases: revalidation before
+            // spawn must detect an alias being redirected to another profile.
+            let resolved = |value: &str| normalized(value)?.to_str().map(str::to_owned).ok_or_else(invalid);
+            let profile = Profile { executable: resolved(current)?, config: resolved(&installed.config)?, data: resolved(&installed.data)? };
+            registration(&profile, self)?;
+            Ok(profile)
+        }
+    }
+    impl Effects for Native {
+        fn show(&mut self, title: &str, body: &str, token: &str) -> Result<(), State> {
+            let document = XmlDocument::new().map_err(api)?;
+            // Fixed schema only; title/body are DOM text nodes, never markup.
+            document.LoadXml(&HSTRING::from("<toast><visual><binding template=\"ToastGeneric\"><text/><text/></binding></visual></toast>")).map_err(api)?;
+            document.DocumentElement().map_err(api)?.SetAttribute(&HSTRING::from("launch"), &HSTRING::from(token)).map_err(api)?;
+            let texts = document.GetElementsByTagName(&HSTRING::from("text")).map_err(api)?;
+            for (index, value) in [title, body].iter().enumerate() {
+                let text = document.CreateTextNode(&HSTRING::from(*value)).map_err(api)?;
+                texts.Item(index as u32).map_err(api)?.AppendChild(&text).map_err(api)?;
+            }
+            let serialized = document.GetXml().map_err(api)?;
+            if serialized.len() * 2 > 5000 || serialized.to_string().len() > 5000 {
+                return Err(payload_error());
+            }
+            let toast = ToastNotification::CreateToastNotification(&document).map_err(api)?;
+            ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID)).and_then(|notifier| notifier.Show(&toast)).map_err(api)
+        }
+        fn open_settings(&mut self, uri: &str) -> Result<(), State> {
+            let uri = HSTRING::from(uri);
+            let result = unsafe {
+                ShellExecuteW(None, w!("open"), PCWSTR(uri.as_ptr()), PCWSTR::null(), PCWSTR::null(), windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL)
+            };
+            let code = result.0 as isize;
+            match code {
+                33.. => Ok(()),
+                5 => Err(State::Denied),
+                _ => Err(State::Failed(format!("Windows ShellExecute code {code}"))),
+            }
+        }
+    }
     impl Boundary for Native {
         fn installation(&mut self) -> Result<Vec<u8>, State> {
             // No fallback on RPC_E_CHANGED_MODE; an incompatible apartment fails.
-            unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.map_err(api)?;
-            self.apartment = Some(Apartment(std::marker::PhantomData));
+            if self.apartment.is_none() {
+                unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.map_err(api)?;
+                self.apartment = Some(Apartment(std::marker::PhantomData));
+            }
             let path = folder(&FOLDERID_LocalAppData)?.join(DISPLAY_NAME).join("installation.json");
             let mut bytes = Vec::new();
             std::fs::File::open(path).map_err(io_error)?.take((LIMIT + 1) as u64).read_to_end(&mut bytes).map_err(io_error)?;
@@ -303,6 +419,8 @@ mod tests {
         server: Server,
         setting: Result<i32, State>,
         reads: Vec<&'static str>,
+        effects: Vec<Vec<String>>,
+        effect_error: Option<State>,
     }
     impl Fake {
         fn valid() -> Self {
@@ -315,7 +433,7 @@ mod tests {
                     activator_clsid: "{7FA17089-16BD-4C17-8035-3CB6ACAF04AC}".into(),
                 },
                 server: Server { command: [r"C:\Preview Space\通知.exe", "--notification-com-server"].map(str::to_owned).into(), executable: r"C:\Preview Space\通知.exe".into() },
-                setting: Ok(0), reads: vec![],
+                setting: Ok(0), reads: vec![], effects: vec![], effect_error: None,
             }
         }
         fn query(&mut self, diagnostic: bool) -> Observation {
@@ -360,13 +478,107 @@ mod tests {
             self.setting.clone()
         }
     }
+    impl Effects for Fake {
+        fn show(&mut self, title: &str, body: &str, token: &str) -> Result<(), State> {
+            self.effects.push([title, body, token].map(str::to_owned).into());
+            self.effect_error.clone().map_or(Ok(()), Err)
+        }
+        fn open_settings(&mut self, uri: &str) -> Result<(), State> {
+            self.effects.push(vec![uri.into()]);
+            self.effect_error.clone().map_or(Ok(()), Err)
+        }
+    }
+    impl super::super::windows_activation::Launcher for Fake {
+        fn spawn(&mut self, exe: &str, args: &[&str]) -> Result<(), State> {
+            self.effects.push(std::iter::once(exe).chain(args.iter().copied()).map(str::to_owned).collect());
+            self.effect_error.clone().map_or(Ok(()), Err)
+        }
+    }
+    #[test]
+    fn reopen_uses_fresh_registration_and_fixed_profile_argv_and_propagates_spawn_failure() {
+        use super::super::windows_activation::reopen;
+        let mut fake = Fake::valid();
+        reopen(&profile(), &mut fake).unwrap();
+        assert_eq!(
+            fake.effects,
+            [vec![r"C:\Preview Space\通知.exe", "--config", r"C:\profile\nodes.json", "--data", r"C:\profile\data", "--open", "dashboard"]]
+        );
+        assert_eq!(fake.reads, ["installation", "shortcut", "server"]);
+        fake.shortcut.arguments[1] = "foreign".into();
+        assert!(reopen(&profile(), &mut fake).is_err());
+        assert_eq!(fake.effects.len(), 1);
+        let mut fake = Fake::valid();
+        fake.effect_error = Some(State::Denied);
+        assert_eq!(reopen(&profile(), &mut fake), Err(State::Denied));
+        assert_eq!(fake.effects.len(), 1);
+    }
+    #[test]
+    fn effect_api_failures_are_not_reported_as_accepted_and_query_has_no_effects() {
+        let mut fake = Fake::valid();
+        fake.query(false);
+        assert!(fake.effects.is_empty());
+        fake.effect_error = Some(State::Denied);
+        assert_eq!(send(Ok(&profile()), &mut fake, "title", "body"), Effect::Denied);
+        assert_eq!(settings(Ok(&profile()), &mut fake), Effect::Denied);
+        fake.effect_error = Some(State::Failed("HRESULT".into()));
+        assert_eq!(send(Ok(&profile()), &mut fake, "title", "body"), Effect::Failed("HRESULT".into()));
+    }
+    fn profile() -> Profile {
+        Profile { executable: r"C:\Preview Space\通知.exe".into(), config: r"C:\profile\nodes.json".into(), data: r"C:\profile\data".into() }
+    }
+    #[test]
+    fn explicit_send_rechecks_registration_and_setting_and_passes_text_as_data_once() {
+        let mut fake = Fake::valid();
+        assert_eq!(send(Ok(&profile()), &mut fake, "<title>&", "本文\n\"body\""), Effect::Accepted);
+        assert_eq!(fake.effects, [vec!["<title>&", "本文\n\"body\"", "reopen-v1"]]);
+        assert_eq!(fake.reads, ["installation", "shortcut", "server", "setting"]);
+        fake.shortcut.aumid = "foreign".into();
+        assert!(matches!(send(Ok(&profile()), &mut fake, "title", "body"), Effect::Unsupported(_)));
+        assert_eq!(fake.effects.len(), 1);
+    }
+    #[test]
+    fn send_rejects_disabled_unknown_errors_diagnostic_and_invalid_payload_without_effects() {
+        for state in [Ok(1), Ok(2), Ok(3), Ok(4), Ok(99), Err(State::Denied), Err(State::Failed("api".into()))] {
+            let mut fake = Fake::valid();
+            fake.setting = state;
+            assert_ne!(send(Ok(&profile()), &mut fake, "t", "b"), Effect::Accepted);
+            assert!(fake.effects.is_empty());
+        }
+        for error in [State::Unsupported("missing".into()), State::Denied, State::Unknown, State::Failed("registration".into())] {
+            let mut fake = Fake::valid();
+            fake.metadata = Err(error);
+            assert_ne!(send(Ok(&profile()), &mut fake, "t", "b"), Effect::Accepted);
+            assert_eq!(fake.reads, ["installation"]);
+            assert!(fake.effects.is_empty());
+        }
+        let mut fake = Fake::valid();
+        for text in ["bad\0text".into(), "bad\u{b}".into(), "bad\u{fffe}".into(), "x".repeat(2049), "&".repeat(1000)] {
+            assert!(matches!(send(Ok(&profile()), &mut fake, &text, "body"), Effect::Failed(_)));
+        }
+        assert!(matches!(send(Err(State::Unsupported("diagnostic".into())), &mut fake, "t", "b"), Effect::Unsupported(_)));
+        assert!(fake.reads.is_empty());
+        assert!(fake.effects.is_empty());
+    }
+    #[test]
+    fn settings_requires_registration_and_uses_only_fixed_uri_without_setting_query() {
+        let mut fake = Fake::valid();
+        assert_eq!(settings(Ok(&profile()), &mut fake), Effect::Accepted);
+        assert_eq!(fake.effects, [vec!["ms-settings:notifications"]]);
+        assert!(!fake.reads.contains(&"setting"));
+        fake.server.executable = "foreign".into();
+        assert!(matches!(settings(Ok(&profile()), &mut fake), Effect::Unsupported(_)));
+        assert_eq!(fake.effects.len(), 1);
+        let mut fake = Fake::valid();
+        assert!(matches!(settings(Err(State::Unsupported("diagnostic".into())), &mut fake), Effect::Unsupported(_)));
+        assert!(fake.reads.is_empty());
+    }
     #[test]
     fn explicit_query_checks_installation_before_observing_setting_and_preserves_login() {
         let mut fake = Fake::valid();
         let observation = fake.query(false);
         assert_eq!(observation.notification, State::Enabled);
         assert_eq!(observation.login, State::Denied);
-        assert!(observation.source.contains("送信・クリック起動は未実装"));
+        assert!(observation.source.contains("COM 経由 Reopen"));
         assert_eq!(fake.reads, ["installation", "shortcut", "server", "setting"]);
     }
     #[test]

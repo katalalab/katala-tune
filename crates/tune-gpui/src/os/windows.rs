@@ -1,4 +1,4 @@
-//! Explicit, read-only notification query; no installer, delivery or activation.
+//! Explicit notification operations and existing login registration.
 use super::{Completion, Effect, Observation, Service, State, windows_login, windows_notifications as notifications};
 use std::{io, path::Path};
 use winreg::types::FromRegValue;
@@ -81,13 +81,15 @@ impl Service for Windows {
         );
     }
     fn permission(&self, done: Completion<Effect>) {
-        done(Effect::Unsupported(notifications::UNIMPLEMENTED.into()));
+        done(Effect::Unsupported("Classic Windows 通知に許可要求ダイアログはありません。通知設定から変更してください".into()));
     }
     fn settings(&self, done: Completion<Effect>) {
-        done(Effect::Unsupported(notifications::UNIMPLEMENTED.into()));
+        let mut boundary = notifications::native::Native::default();
+        done(notifications::settings(self.profile.as_ref().map_err(|e| State::Unsupported(e.clone())), &mut boundary));
     }
-    fn notify(&self, _: String, _: String, done: Completion<Effect>) {
-        done(Effect::Unsupported(notifications::UNIMPLEMENTED.into()));
+    fn notify(&self, title: String, body: String, done: Completion<Effect>) {
+        let mut boundary = notifications::native::Native::default();
+        done(notifications::send(self.profile.as_ref().map_err(|e| State::Unsupported(e.clone())), &mut boundary, &title, &body));
     }
     fn login(&self, enabled: bool, done: Completion<Effect>) {
         let (name, command) = match &self.launch {
