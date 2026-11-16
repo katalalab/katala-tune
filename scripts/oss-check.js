@@ -50,16 +50,28 @@ function scanText(text, terms = [], skip = []) {
   return found;
 }
 
+// These exact upstream manifests retain public author metadata. All other rules still apply.
+function skipAuthorEmail(file) {
+  return path.basename(file) === 'package-lock.json'
+    || file === 'vendor/taffy-0.9.0/Cargo.toml'
+    || file === 'vendor/taffy-0.9.0/Cargo.toml.orig';
+}
+
+function scanFileText(file, text, terms = []) {
+  return scanText(text, terms, skipAuthorEmail(file) ? ['email'] : []);
+}
+
 const git = (args, opts = {}) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 256 << 20, ...opts });
 
-// rev ごとのファイル一覧から、中身が同じものは1回だけ読む
+// 同じ blob は走査規則ごとに1回読む。例外のあるパスを通常のパスへ広げない。
 function blobsOf(revs) {
   const blobs = new Map();
   for (const rev of revs) {
     for (const row of git(['ls-tree', '-r', rev]).split('\n').filter(Boolean)) {
       const [meta, file] = row.split('\t');
       const [, type, oid] = meta.split(' ');
-      if (type === 'blob' && !blobs.has(oid)) blobs.set(oid, { file, rev });
+      const key = `${oid}:${skipAuthorEmail(file)}`;
+      if (type === 'blob' && !blobs.has(key)) blobs.set(key, { oid, file, rev });
     }
   }
   return blobs;
@@ -91,10 +103,9 @@ function main(argv) {
   const short = (rev) => (history ? `@${rev.slice(0, 7)}` : '');
   const findings = [];
 
-  for (const [oid, { file: f, rev }] of blobsOf(revs)) {
+  for (const { oid, file: f, rev } of blobsOf(revs).values()) {
     const text = readBlob(oid);
-    const skip = path.basename(f) === 'package-lock.json' ? ['email'] : [];
-    if (text) for (const x of scanText(text, terms, skip)) findings.push({ ...x, where: `${f}${short(rev)}:${x.line}` });
+    if (text) for (const x of scanFileText(f, text, terms)) findings.push({ ...x, where: `${f}${short(rev)}:${x.line}` });
   }
   if (history) {
     for (const rev of revs) {
@@ -118,4 +129,4 @@ function main(argv) {
 }
 
 if (require.main === module) process.exitCode = main(process.argv.slice(2));
-module.exports = { ledgerTerms, scanText, revListArgs };
+module.exports = { ledgerTerms, scanText, scanFileText, revListArgs };
