@@ -24,10 +24,17 @@ pub(crate) fn mode(args: &[OsString]) -> Result<Mode, &'static str> {
         Err("invalid COM server arguments")
     }
 }
+#[derive(Clone, Copy)]
+enum Reference {
+    Object,
+    Lock,
+}
 #[derive(Default)]
 struct Pending {
     pending: bool,
     closed: bool,
+    objects: usize,
+    locks: usize,
 }
 #[derive(Default)]
 struct Queue {
@@ -47,6 +54,33 @@ impl Queue {
         self.wake.notify_one();
         Ok(())
     }
+    fn reference(&self, kind: Reference, acquire: bool) -> Result<(), State> {
+        let mut state = self.state.lock().map_err(|_| State::Failed("通知 broker queue が停止しました".into()))?;
+        if acquire && state.closed {
+            return Err(State::Failed("通知 broker は終了中です".into()));
+        }
+        let count = match kind {
+            Reference::Object => &mut state.objects,
+            Reference::Lock => &mut state.locks,
+        };
+        if acquire {
+            *count += 1;
+        } else {
+            *count = count.saturating_sub(1);
+        }
+        Ok(())
+    }
+    fn close_if_idle(&self) -> bool {
+        // The idle decision and close linearize with callback/object/lock
+        // admission. An admitted request or reference wins over idle shutdown;
+        // once closed, subsequent admissions fail before teardown starts.
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.pending || state.objects != 0 || state.locks != 0 {
+            return false;
+        }
+        state.closed = true;
+        true
+    }
     fn complete(&self) {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).pending = false;
     }
@@ -60,7 +94,6 @@ const LIFETIME: Duration = Duration::from_secs(120);
 trait Driver {
     fn start(&mut self, queue: Arc<Queue>) -> Result<(), State>;
     fn elapsed(&self) -> Duration;
-    fn referenced(&self) -> bool;
     fn wait(&mut self, timeout: Duration) -> Result<bool, State>;
     fn reopen(&mut self) -> Result<(), State>;
     fn stop(&mut self) -> Result<(), State>;
@@ -76,7 +109,7 @@ fn serve(driver: &mut impl Driver) -> Result<(), State> {
                 break;
             }
             let idle = now.saturating_sub(last);
-            if idle >= IDLE && !driver.referenced() {
+            if idle >= IDLE && queue.close_if_idle() {
                 break;
             }
             let timeout = if idle >= IDLE { LIFETIME - now } else { (IDLE - idle).min(LIFETIME - now) };
@@ -156,9 +189,14 @@ mod tests {
         fail: Option<&'static str>,
         busy: bool,
         held: bool,
+        after_timeout: bool,
+        reference_after_timeout: Option<Reference>,
     }
     impl Driver for Fake {
         fn start(&mut self, queue: Arc<Queue>) -> Result<(), State> {
+            if self.held {
+                queue.reference(Reference::Object, true)?;
+            }
             self.queue = Some(queue);
             self.log.push("start");
             if self.fail == Some("start") { Err(State::Denied) } else { Ok(()) }
@@ -166,13 +204,13 @@ mod tests {
         fn elapsed(&self) -> Duration {
             self.now
         }
-        fn referenced(&self) -> bool {
-            self.held
-        }
         fn wait(&mut self, timeout: Duration) -> Result<bool, State> {
             self.log.push("wait");
             if self.fail == Some("wait") {
                 return Err(State::Denied);
+            }
+            if self.queue.as_ref().unwrap().state.lock().unwrap().pending {
+                return Ok(true);
             }
             if self.busy || self.fail == Some("spawn") {
                 self.now += Duration::from_secs(1);
@@ -180,6 +218,18 @@ mod tests {
                 Ok(true)
             } else {
                 self.now += timeout;
+                if self.after_timeout {
+                    self.after_timeout = false;
+                    // The OS wait has timed out; a callback is accepted before
+                    // the worker decides whether to stop. Its client has released.
+                    let queue = self.queue.as_ref().unwrap();
+                    queue.reference(Reference::Object, true)?;
+                    queue.submit(&utf16(notifications::AUMID), &utf16("reopen-v1"), 0)?;
+                    queue.reference(Reference::Object, false)?;
+                }
+                if let Some(kind) = self.reference_after_timeout.take() {
+                    self.queue.as_ref().unwrap().reference(kind, true)?;
+                }
                 Ok(false)
             }
         }
@@ -191,6 +241,37 @@ mod tests {
             assert!(self.queue.as_ref().unwrap().state.lock().unwrap().closed);
             self.log.push("revoke/drop/apartment");
             if self.fail == Some("stop") { Err(State::Denied) } else { Ok(()) }
+        }
+    }
+    #[test]
+    fn pending_accepted_after_idle_timeout_is_reopened_before_idle_close() {
+        let mut fake = Fake { after_timeout: true, ..Fake::default() };
+        serve(&mut fake).unwrap();
+        assert_eq!(fake.log.iter().filter(|entry| **entry == "spawn").count(), 1);
+        assert_eq!(fake.now, IDLE + IDLE);
+    }
+    #[test]
+    fn reference_admission_and_idle_close_share_one_decision() {
+        for kind in [Reference::Object, Reference::Lock] {
+            let queue = Queue::default();
+            // Admission wins: idle may not close until the client releases.
+            queue.reference(kind, true).unwrap();
+            assert!(!queue.close_if_idle());
+            queue.reference(kind, false).unwrap();
+            // Idle wins: before any later teardown, native shared admission
+            // must reject both CreateInstance and LockServer(true).
+            assert!(queue.close_if_idle());
+            assert!(queue.reference(kind, true).is_err());
+            assert!(queue.submit(&utf16(notifications::AUMID), &utf16("reopen-v1"), 0).is_err());
+        }
+    }
+    #[test]
+    fn reference_admitted_after_timeout_prevents_ordinary_idle_shutdown() {
+        for kind in [Reference::Object, Reference::Lock] {
+            let mut fake = Fake { reference_after_timeout: Some(kind), ..Fake::default() };
+            serve(&mut fake).unwrap();
+            assert_eq!(fake.now, LIFETIME);
+            assert!(!fake.log.contains(&"spawn"));
         }
     }
     #[test]
@@ -217,11 +298,7 @@ pub(crate) mod native {
     #![allow(unsafe_code)] // COM ABI pointers are supplied by COM's marshaler.
     use super::*;
     use notifications::native::{Native, api, io_error};
-    use std::{
-        ffi::c_void,
-        sync::atomic::{AtomicUsize, Ordering},
-        time::Instant,
-    };
+    use std::{ffi::c_void, time::Instant};
     use windows::{
         Win32::{
             Foundation::{CLASS_E_NOAGGREGATION, E_INVALIDARG, E_POINTER, RPC_E_DISCONNECTED},
@@ -230,19 +307,13 @@ pub(crate) mod native {
         },
         core::{BOOL, GUID, IUnknown, Interface, PCWSTR, Ref, implement},
     };
-    #[derive(Default)]
-    struct Counts {
-        objects: AtomicUsize,
-        locks: AtomicUsize,
-    }
     #[implement(INotificationActivationCallback)]
     struct Callback {
         queue: Arc<Queue>,
-        counts: Arc<Counts>,
     }
     impl Drop for Callback {
         fn drop(&mut self) {
-            self.counts.objects.fetch_sub(1, Ordering::Relaxed);
+            let _ = self.queue.reference(Reference::Object, false);
         }
     }
     // Safety: non-null pointers must designate readable NUL-terminated UTF-16
@@ -279,7 +350,6 @@ pub(crate) mod native {
     #[implement(IClassFactory)]
     struct Factory {
         queue: Arc<Queue>,
-        counts: Arc<Counts>,
     }
     impl IClassFactory_Impl for Factory_Impl {
         fn CreateInstance(&self, outer: Ref<'_, IUnknown>, iid: *const GUID, object: *mut *mut c_void) -> windows::core::Result<()> {
@@ -297,28 +367,15 @@ pub(crate) mod native {
             if !outer.is_null() {
                 return Err(CLASS_E_NOAGGREGATION.into());
             }
-            let state = self.queue.state.lock().map_err(|_| windows::core::Error::from(RPC_E_DISCONNECTED))?;
-            if state.closed {
-                return Err(RPC_E_DISCONNECTED.into());
-            }
-            self.counts.objects.fetch_add(1, Ordering::Relaxed);
-            let callback: INotificationActivationCallback = Callback { queue: self.queue.clone(), counts: self.counts.clone() }.into();
+            self.queue.reference(Reference::Object, true).map_err(|_| windows::core::Error::from(RPC_E_DISCONNECTED))?;
+            let callback: INotificationActivationCallback = Callback { queue: self.queue.clone() }.into();
             unsafe { callback.query(iid, object).ok() }
         }
         fn LockServer(&self, lock: BOOL) -> windows::core::Result<()> {
-            if lock.as_bool() {
-                let state = self.queue.state.lock().map_err(|_| windows::core::Error::from(RPC_E_DISCONNECTED))?;
-                if state.closed {
-                    return Err(RPC_E_DISCONNECTED.into());
-                }
-                self.counts.locks.fetch_add(1, Ordering::Relaxed);
-            } else {
-                #[allow(deprecated)] // try_update is newer than the workspace MSRV 1.90.
-                let _ = self.counts.locks.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| count.checked_sub(1));
-            }
-            Ok(())
+            self.queue.reference(Reference::Lock, lock.as_bool()).map_err(|_| RPC_E_DISCONNECTED.into())
         }
     }
+
     struct Registration {
         cookie: Option<u32>,
         _factory: IClassFactory,
@@ -347,7 +404,6 @@ pub(crate) mod native {
     struct Runtime {
         started: Instant,
         queue: Option<Arc<Queue>>,
-        counts: Arc<Counts>,
         registration: Option<Registration>,
         boundary: Option<Native>,
         profile: Option<Profile>,
@@ -357,7 +413,7 @@ pub(crate) mod native {
             self.queue = Some(queue.clone());
             let boundary = self.boundary.insert(Native::default());
             self.profile = Some(boundary.installed_profile()?);
-            let factory: IClassFactory = Factory { queue, counts: self.counts.clone() }.into();
+            let factory: IClassFactory = Factory { queue }.into();
             // Same MTA initialized by Native::installation. CLSID from the one
             // shared installation contract, never an independently copied GUID.
             let clsid = GUID::try_from(notifications::CLSID.trim_matches(['{', '}'])).map_err(api)?;
@@ -367,9 +423,6 @@ pub(crate) mod native {
         }
         fn elapsed(&self) -> Duration {
             self.started.elapsed()
-        }
-        fn referenced(&self) -> bool {
-            self.counts.objects.load(Ordering::Relaxed) != 0 || self.counts.locks.load(Ordering::Relaxed) != 0
         }
         fn wait(&mut self, timeout: Duration) -> Result<bool, State> {
             let queue = self.queue.as_ref().expect("started queue");
@@ -399,6 +452,6 @@ pub(crate) mod native {
         }
     }
     pub(crate) fn run() -> Result<(), State> {
-        serve(&mut Runtime { started: Instant::now(), queue: None, counts: Arc::default(), registration: None, boundary: None, profile: None })
+        serve(&mut Runtime { started: Instant::now(), queue: None, registration: None, boundary: None, profile: None })
     }
 }
