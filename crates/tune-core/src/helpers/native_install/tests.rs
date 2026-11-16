@@ -85,6 +85,44 @@ type Hook = Box<dyn FnOnce()>;
 thread_local! {
     static FAILURES: std::cell::RefCell<Vec<Operation>> = const { std::cell::RefCell::new(Vec::new()) };
     static HOOK: std::cell::RefCell<Option<(Operation, Hook)>> = const { std::cell::RefCell::new(None) };
+    static COLLISIONS: std::cell::RefCell<Option<CollisionFiles>> = const { std::cell::RefCell::new(None) };
+}
+struct CollisionFiles {
+    bin: PathBuf,
+    stages: usize,
+    backups: usize,
+    paths: Vec<PathBuf>,
+}
+fn collide_names(bin: &Path, stages: usize, backups: usize) {
+    COLLISIONS.with(|c| *c.borrow_mut() = Some(CollisionFiles { bin: bin.to_owned(), stages, backups, paths: Vec::new() }));
+}
+pub(super) fn name_chosen(role: &str, name: &str) {
+    // The global counter may advance in other tests. Collide with the actual
+    // allocated name in this thread's owned fixture; never replace the allocator
+    // or fake the exclusive-create / no-replace filesystem result.
+    COLLISIONS.with(|c| {
+        let mut c = c.borrow_mut();
+        let Some(c) = c.as_mut() else {
+            return;
+        };
+        let remaining = match role {
+            "stage" => &mut c.stages,
+            "backup" => &mut c.backups,
+            _ => panic!("unexpected install name role"),
+        };
+        if *remaining == 0 {
+            return;
+        }
+        *remaining -= 1;
+        let path = c.bin.join(name);
+        fs::File::create_new(&path).unwrap().write_all(b"collision sentinel").unwrap();
+        c.paths.push(path);
+    });
+}
+fn take_collision_files() -> Vec<PathBuf> {
+    let c = COLLISIONS.with(|c| c.borrow_mut().take().unwrap());
+    assert_eq!((c.stages, c.backups), (0, 0), "every requested real collision was exercised");
+    c.paths
 }
 pub(super) fn fault(operation: Operation) -> Result<(), InstallError> {
     let hook = HOOK.with(|h| {
@@ -285,14 +323,14 @@ fn fixed_new_hardlink_and_unowned_unique_collision_survive_install() {
     let outside = f.root.join("outside");
     fs::write(&outside, b"outside sentinel").unwrap();
     fs::hard_link(&outside, f.bin.join(format!("{}.new", crate::helpers::exe("tune-agent")))).unwrap();
-    let n = NEXT_OPERATION.load(Ordering::Relaxed);
-    let collision = f.bin.join(format!(".tune-agent-stage-{}-{n}", std::process::id()));
-    fs::write(&collision, b"collision sentinel").unwrap();
-    let backup_collision = f.bin.join(format!(".tune-agent-backup-{}-{}", std::process::id(), n + 2));
-    fs::write(&backup_collision, b"backup collision sentinel").unwrap();
+    collide_names(&f.bin, 1, 1);
     install_at(prepare_native_sampler(&f.source).unwrap(), inspect_at(&f.bin).unwrap()).unwrap();
-    assert_eq!(fs::read(collision).unwrap(), b"collision sentinel");
-    assert_eq!(fs::read(backup_collision).unwrap(), b"backup collision sentinel");
+    let collisions = take_collision_files();
+    assert_eq!(collisions.len(), 2);
+    assert_eq!(leftovers(&f).len(), 2);
+    for path in collisions {
+        assert_eq!(fs::read(path).unwrap(), b"collision sentinel");
+    }
     assert_eq!(fs::read(outside).unwrap(), b"outside sentinel");
     assert_eq!(fs::read(action).unwrap(), b"action helper sentinel");
 }
@@ -481,15 +519,14 @@ fn bounded_stage_collisions_preserve_every_existing_entry() {
     let f = Fixture::new(true);
     let p = prepare_native_sampler(&f.source).unwrap();
     let s = inspect_at(&f.bin).unwrap();
-    let n = NEXT_OPERATION.load(Ordering::Relaxed);
-    for i in n..n + 8 {
-        fs::write(f.bin.join(format!(".tune-agent-stage-{}-{i}", std::process::id())), b"collision").unwrap();
-    }
+    collide_names(&f.bin, 8, 0);
     let error = install_at(p, s).unwrap_err();
     assert_eq!(error.cause(), Cause::Collision);
+    let collisions = take_collision_files();
+    assert_eq!(collisions.len(), 8);
     assert_eq!(leftovers(&f).len(), 8);
-    for path in leftovers(&f) {
-        assert_eq!(fs::read(path).unwrap(), b"collision");
+    for path in collisions {
+        assert_eq!(fs::read(path).unwrap(), b"collision sentinel");
     }
     assert_eq!(fs::read(f.target()).unwrap(), b"old sampler");
 }

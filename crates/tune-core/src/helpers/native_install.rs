@@ -310,7 +310,10 @@ fn aliases(dir: &Directory, prepared: &PreparedNativeSampler, target: Option<&Ob
 static NEXT_OPERATION: AtomicU64 = AtomicU64::new(0);
 fn unique_name(role: &str) -> String {
     let n = NEXT_OPERATION.fetch_add(1, Ordering::Relaxed);
-    format!(".tune-agent-{role}-{}-{n}", std::process::id())
+    let name = format!(".tune-agent-{role}-{}-{n}", std::process::id());
+    #[cfg(all(test, any(target_os = "macos", windows)))]
+    tests::name_chosen(role, &name);
+    name
 }
 struct Owned {
     name: String,
