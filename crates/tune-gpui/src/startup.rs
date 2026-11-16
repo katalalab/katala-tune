@@ -27,31 +27,9 @@ pub fn prepare(mut options: Options) -> Result<Options, String> {
     Ok(options)
 }
 
-/// Canonicalize existing ancestors too, so missing and later-created paths
-/// have the same identity. Resolve symlinks before `..`; never create state.
+/// Shared with Engine so activation and DB ownership resolve aliases identically.
 pub(super) fn resolved(path: &Path) -> Result<PathBuf, String> {
-    let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
-    let mut result = PathBuf::new();
-    for part in absolute.components() {
-        match part {
-            std::path::Component::Prefix(_) => {
-                // A Windows prefix such as \\?\C: is not a complete root yet.
-                // Wait for RootDir before any filesystem query/canonicalize.
-                result.push(part.as_os_str());
-                continue;
-            }
-            std::path::Component::ParentDir => {
-                result.pop();
-            }
-            std::path::Component::CurDir => {}
-            part => result.push(part.as_os_str()),
-        }
-        // Missing tails are valid; other filesystem errors must fail closed.
-        if result.try_exists().map_err(|e| e.to_string())? {
-            result = result.canonicalize().map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(result)
+    tune_core::data_ownership::resolve_path(path).map_err(|e| e.to_string())
 }
 
 pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Options>, String> {

@@ -19,6 +19,10 @@ cargo run -p tune-gpui --release --locked -- --config /path/to/ledger.json --dat
 
 実行ファイルは`katala-tune-gpui`。Tauri版の`katala-tune`を上書きしない。既定のDBは通常のdataディレクトリの`gpui-preview`配下に分ける。`--data`で指定したDBは初期化・移行・分析保存の対象となるため、既存版と同時に同じDBを使わない。
 
+新版の`Engine::open`は、解決済みdata内の`.katala-tune-engine.lock`を非待機で排他取得してから台帳生成・DB初期化・旧ログ取り込みへ進む。同じdataでは実行ファイルやconfigが違っても二つ目のEngineを拒否し、別dataは共存できる。ガードはSQLiteのStoreに保持するため、Engineを閉じてもDBのArcが残る間は所有を返さない。正常・異常終了後のlockファイルは残し、存在だけでは使用中と判定しない。busy、I/O失敗、不安全なDB・lockパスは区別して返し、自動再試行はしない。
+
+これは参加する新版Engineの保存先だけの協調排他である。旧stable、raw `Store::open`、Engineを通さないCLI収集経路は参加せず、lock取得は旧版停止や収集の唯一性を証明しない。Engineを使うCLIは照会目的でもsameDataが使用中なら失敗する。検出できるDB・SQLite sidecar・lockのsymlink、非通常ファイル、複数hardlink（Windowsではreparseも）を拒否するが、稼働中のdirectory置換や悪意ある同userとのnamespace競争は保護しない。既存版との正式移行とcollector所有権は別の受入項目である。
+
 GPUIは起動引数の検証後、config/dataの相対パスと既存の親ディレクトリを解決し、helperの探索先をそのdataの`bin`へプロセス内で一度だけ固定する。`--data`は環境変数より優先し、省略時は`KATALA_TUNE_DATA_DIR`（無指定なら通常のdataディレクトリ）の`gpui-preview/bin`を使う。通常・常駐・非表示・診断起動で共通し、環境変数を書き換えない。別のdataへの再束縛は拒否する。未束縛のCLI/Tauriの探索先は従来どおり。
 
 起動だけではhelperをコピー・インストール・更新しない。WindowsのProbeと承認付き変更操作には、対象Previewの`data/bin/tune.exe`へ検証済みartifactを明示的に配置し、その版に一致する承認レコードをPreview用台帳に用意する必要がある。欠けている場合やハッシュ・承認が合わない場合は既存の検証で失敗し、HOMEのhelperへ切り替えない。Liveのnative samplerは別の`data/bin/tune-agent`（Windowsでは`tune-agent.exe`）で、実行ファイル隣やHOMEから補わない。native samplerが無い場合は既存のスクリプト経路を使うため、その実行環境と収集の成功は別途確認が必要。`tune.exe`の承認はnative samplerの配布や検証を兼ねない。
@@ -35,7 +39,7 @@ GPUIは起動引数の検証後、config/dataの相対パスと既存の親デ�
 
 常駐開始・非表示起動・再表示・二重起動は収集の許可にならない。保存設定が有効でも監視と自動スキャンは開始しない。ウィンドウを閉じると、その画面のLive所有権と未完了の確認要求だけを解放する。既に明示開始した監視・自動スキャン・手動収集と直近の手動結果は同じアプリ内で保持する。終了時には現在の画面の受付を閉じ、既存の収集完了とLive/journal終了を待つ。保存ACKが確認できない場合は成功終了として扱わない。
 
-通常起動は、同じ実行ファイル・解決済みconfig/dataパス・現在ユーザーの組み合わせで単一起動になる。二度目の起動はDBを開かず、既存アプリの表示だけを要求する。`--open`は256バイト以内で、既存アプリが表示先を検証する。二度目の`--review`は未対応として理由つきで拒否するため、既存ウィンドウへのドラッグか別のdata領域を使う。別の実行ファイルやdata領域は独立したPreviewになるので、異なる版から同じDBを指定しない。実行ファイル移動・更新時やTauri版との所有統合は正式移行で扱う。
+通常起動は、同じ実行ファイル・解決済みconfig/dataパス・現在ユーザーの組み合わせで単一起動になる。二度目の起動はDBを開かず、既存アプリの表示だけを要求する。`--open`は256バイト以内で、既存アプリが表示先を検証する。二度目の`--review`は未対応として理由つきで拒否するため、既存ウィンドウへのドラッグか別のdata領域を使う。別の実行ファイルやdata領域はactivation上は独立したPreviewになる。新版Engine同士のsameDataは前述のdata claimで拒否するが、未参加の旧版と同じDBは指定しない。実行ファイル移動・更新時やTauri版との所有統合は正式移行で扱う。
 
 Windowsの常駐時は、GPUI 0.2.2が最後のネイティブウィンドウ破棄で終了するため、空の非表示keeperを一つ保持する。`show=false`、`focus=false`、taskbarに出ないtool windowとして作り、画面・Reader・UI Live・収集処理を持たせない。指定boundsは1×1で、非表示時に保留されるplacementとは別に、生成時の公開resize APIでもcontentの1×1を要求する。実際の物理HWNDサイズはscale factorなどの影響を受け、renderer確保量が1×1相当になるとは限らない。platform/renderer資源は必要で、ゼロGPU確保を保証するものではない。実サイズとCPU/RSSは実機受入で確認する。通常Preview、診断、macOSにはkeeperを作らない。ユーザー画面のCloseで現在の確認GateとUI Liveだけを失効し、承認済みの収集は保持する。keeperが失われた場合は終了処理へ進み、明示的な終了でも保存ACKを同期的に待ってからkeeperを含む全ウィンドウを破棄する。
 

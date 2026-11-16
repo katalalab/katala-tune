@@ -30,6 +30,7 @@ pub mod capabilities;
 pub mod codex_limits;
 pub mod collate;
 pub mod collect;
+pub mod data_ownership;
 pub mod db;
 pub mod decision;
 pub mod dogu;

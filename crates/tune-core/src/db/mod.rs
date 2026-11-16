@@ -70,7 +70,9 @@ const META_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, 
 pub type Result<T> = rusqlite::Result<T>;
 
 pub struct Store {
+    // Fields drop in declaration order: SQLite must close before the claim.
     conn: Connection,
+    _data_claim: Option<crate::data_ownership::DataClaim>,
 }
 
 pub fn now_ms() -> i64 {
@@ -78,28 +80,35 @@ pub fn now_ms() -> i64 {
 }
 
 impl Store {
-    /// `<dir>/katala-tune.db` を開く（無ければ作る）
+    /// `<dir>/katala-tune.db` を開く（無ければ作る）。Raw Store APIs do not
+    /// participate in Engine data ownership; callers coordinate their own writes.
     pub fn open(dir: &Path) -> Result<Store> {
         std::fs::create_dir_all(dir).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let conn = Connection::open(dir.join(DB_FILE))?;
-        Self::init(conn)
+        Self::init(conn, None)
     }
 
     pub fn open_in_memory() -> Result<Store> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(Connection::open_in_memory()?, None)
     }
 
     /// 既存 DB を読み取り専用で開く。作成・スキーマ移行・過去ログの取り込みはしない
     pub fn open_read_only(dir: &Path) -> Result<Store> {
-        Ok(Store { conn: Connection::open_with_flags(dir.join(DB_FILE), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)? })
+        Ok(Store { conn: Connection::open_with_flags(dir.join(DB_FILE), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?, _data_claim: None })
     }
 
-    fn init(conn: Connection) -> Result<Store> {
-        conn.execute_batch(PRAGMAS)?;
+    pub(crate) fn open_claimed(claim: crate::data_ownership::DataClaim) -> Result<Store> {
+        let conn = Connection::open(claim.data().join(DB_FILE))?;
+        Self::init(conn, Some(claim))
+    }
+
+    fn init(conn: Connection, claim: Option<crate::data_ownership::DataClaim>) -> Result<Store> {
+        // Own both even on initialization failure, preserving their drop order.
+        let s = Store { conn, _data_claim: claim };
+        s.conn.execute_batch(PRAGMAS)?;
         // 出どころの台帳・費用の列を足す前の DB の ai_claude_messages / ai_sessions に列が無い（CREATE TABLE IF NOT EXISTS では足されない）ので、後で足す
-        let old_ai = conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ai_sessions'")?.exists([])?;
-        conn.execute_batch(&SCHEMA_PARTS.concat())?;
-        let s = Store { conn };
+        let old_ai = s.conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ai_sessions'")?.exists([])?;
+        s.conn.execute_batch(&SCHEMA_PARTS.concat())?;
         s.add_columns()?;
         s.migrate()?;
         s.tx(|c| ai_sessions::migrate(c, old_ai))?;
