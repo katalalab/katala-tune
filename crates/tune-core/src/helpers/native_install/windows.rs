@@ -121,32 +121,29 @@ fn child(parent: &File, name: &OsStr, access: u32, share: u32, disposition: u32,
     };
     let mut status = IO_STATUS_BLOCK::default();
     let mut handle = null_mut();
+    // FILE_DIRECTORY_FILE + FILE_OPEN_NO_RECALL is rejected by NtCreateFile.
+    // Existing directories use a type-neutral no-reparse/no-recall open and an
+    // immediate held-handle directory check below. Exclusive new directories
+    // require FILE_DIRECTORY_FILE; FILE_CREATE and OBJ_DONT_REPARSE refuse an
+    // occupied/reparse leaf instead of opening it, so no existing file is recalled.
+    let options = if directory && disposition == FILE_CREATE {
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT
+    } else {
+        FILE_OPEN_REPARSE_POINT | FILE_OPEN_NO_RECALL | FILE_SYNCHRONOUS_IO_NONALERT | if directory { 0 } else { FILE_NON_DIRECTORY_FILE }
+    };
     // SAFETY: one checked component, retained parent, correctly sized NT output.
     // FILE_CREATE is exclusive; no truncate/overwrite disposition is available.
-    let result = unsafe {
-        NtCreateFile(
-            &mut handle,
-            access | SYNCHRONIZE,
-            &attrs,
-            &mut status,
-            null(),
-            FILE_ATTRIBUTE_NORMAL,
-            share,
-            disposition,
-            FILE_OPEN_REPARSE_POINT
-                | FILE_OPEN_NO_RECALL
-                | FILE_SYNCHRONOUS_IO_NONALERT
-                | if directory { FILE_DIRECTORY_FILE } else { FILE_NON_DIRECTORY_FILE },
-            null(),
-            0,
-        )
-    };
+    let result =
+        unsafe { NtCreateFile(&mut handle, access | SYNCHRONIZE, &attrs, &mut status, null(), FILE_ATTRIBUTE_NORMAL, share, disposition, options, null(), 0) };
     if result < 0 {
         // SAFETY: pure conversion of the returned NTSTATUS to a Win32 error.
         return Err(io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(result) } as i32));
     }
     let file = file(handle)?;
-    state(&file)?;
+    let observed = state(&file)?;
+    if directory && !observed.directory {
+        return Err(invalid());
+    }
     Ok(file)
 }
 pub(super) fn open(parent: &File, name: &OsStr, kind: Kind) -> io::Result<File> {

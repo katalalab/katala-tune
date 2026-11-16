@@ -706,3 +706,30 @@ fn stage_reopen_rejects_equal_bytes_at_another_identity() {
     assert_eq!(fs::read(&leftovers(&f)[0]).unwrap(), f.bytes);
     assert_eq!(fs::read(f.bin.join("moved-stage-sentinel")).unwrap(), f.bytes);
 }
+#[cfg(windows)]
+#[test]
+fn windows_directory_opens_check_type_and_creation_remains_exclusive() {
+    let f = Fixture::new(true);
+    let dir = Directory::open(&f.bin).unwrap();
+    let name = OsStr::new("fresh-directory");
+    os::mkdir(dir.file(), name).unwrap();
+    let before = os::named(dir.file(), name).unwrap();
+    let held = os::open(dir.file(), name, filesystem::Kind::Directory).unwrap();
+    let opened = os::state(&held).unwrap();
+    assert!(opened.directory);
+    assert_eq!(opened.identity, before.identity);
+    checked_close(held).unwrap();
+    assert!(os::mkdir(dir.file(), name).is_err());
+    assert_eq!(os::named(dir.file(), name).unwrap().identity, before.identity);
+    let sampler = crate::helpers::exe("tune-agent");
+    assert!(os::mkdir(dir.file(), OsStr::new(&sampler)).is_err());
+    assert!(os::open(dir.file(), OsStr::new(&sampler), filesystem::Kind::Directory).is_err());
+    assert_eq!(fs::read(f.target()).unwrap(), b"old sampler");
+    // The compatible existing-directory open must still deny parent deletion.
+    let moved = f.root.join("moved-bin");
+    assert!(fs::rename(&f.bin, &moved).is_err());
+    dir.close().unwrap();
+    fs::rename(&f.bin, &moved).unwrap();
+    fs::rename(&moved, &f.bin).unwrap();
+    f.sentinels();
+}
