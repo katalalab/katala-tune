@@ -176,13 +176,19 @@ function fakeGit(name, pattern, body) {
   const bin = path.join(FX.base, name);
   fs.mkdirSync(bin);
   const real = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
-  fs.writeFileSync(path.join(bin, 'git'), `#!/bin/sh\ncase "$*" in *"${pattern}"*) ${body};; esac\nexec "${real}" "$@"\n`, { mode: 0o755 });
+  const fake = path.join(bin, 'git');
+  fs.writeFileSync(fake, `#!/bin/sh\ncase "$*" in *"${pattern}"*) ${body};; esac\nexec "${real}" "$@"\n`, { mode: 0o755 });
+  // 書いたばかりの実行ファイルの初回起動は、macOS のマルウェア検査などで負荷が高いと数秒〜十数秒待たされる。
+  // 調査の cmd_s の計測に入る前に一度起動しておき、時間切れの判定に初回起動の待ちを混ぜない
+  const warm = spawnSync(fake, ['--version'], { encoding: 'utf8' });
+  assert.equal(warm.status, 0, warm.stderr);
   return { PATH: `${bin}${path.delimiter}${process.env.PATH}` };
 }
 
 test('status の後の git が時間切れなら、きれいとは数えず未観測にする', { skip: process.platform === 'win32' }, () => {
   const env = fakeGit('bin-revlist', 'rev-list', 'sleep 5');
-  // acme/clean は本物の git が時間内に読み切る必要がある。負荷の高い機体でも 1 秒を超えるので 3 秒にする（偽の rev-list は 5 秒止まる）
+  // acme/clean は git が cmd_s 以内に読み切る必要があるので、負荷の高い機体向けに 3 秒の余裕を取る
+  // （偽の rev-list は 5 秒止まるので、acme/localonly の時間切れは負荷に関係なく必ず起きる）
   const { data } = probe({ ghq_root: FX.ghq, cmd_s: 3, budget_s: 30 }, env);
   const r = byPath(hygiene.normalize(data));
   assert.deepEqual([r['acme/localonly'].state, r['acme/localonly'].reason], ['unobserved', 'timeout']);
