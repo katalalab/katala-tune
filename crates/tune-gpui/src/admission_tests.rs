@@ -24,7 +24,8 @@ fn fixture(label: &str) -> (PathBuf, Arc<Engine>, Arc<MonitorHost>) {
     engine.with_db(|db| db.set_meta("monitor", &json!({"enabled":true,"hub":if label == "pull" { Some("hub-fixture") } else { None }}))).unwrap();
     engine.set_schedule(&json!({"enabled":true})).unwrap();
     let live = Live::new(Arc::new(Never), Opts::default(), Box::new(|_| {}));
-    let host = Arc::new(MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false))));
+    let host = MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false)));
+    let host = Arc::new(if label == "collection-owner" || label == "passive" { host } else { super::shutdown_tests::with_fake_owner(host) });
     (dir, engine, host)
 }
 fn rejected_after_blocked_db(label: &'static str) {

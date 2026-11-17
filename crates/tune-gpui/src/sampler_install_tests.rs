@@ -12,7 +12,7 @@ impl Route for Never {
         panic!("source confirmation never collects")
     }
 }
-fn source(root: &Path) -> Vec<u8> {
+pub(crate) fn source(root: &Path) -> Vec<u8> {
     let bytes = if cfg!(windows) { pe() } else { macho() };
     let files: Vec<Value> = [("katala-tune-gpui", "gui"), ("tune", "diagnostic-cli"), ("tune-agent", "native-sampler")]
         .into_iter()

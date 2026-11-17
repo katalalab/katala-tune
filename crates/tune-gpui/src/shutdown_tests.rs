@@ -12,6 +12,13 @@ use tune_core::{
     live::{Opts, Route, Source},
 };
 
+// Explicit fake ownership for synthetic lifetime tests. Default hosts retain
+// the actual OS-user claim; native ownership integration is a separate gate.
+pub(super) fn with_fake_owner(mut host: MonitorHost) -> MonitorHost {
+    host.collection_owner = Some(Arc::new(|| Ok(())));
+    host
+}
+
 struct Refused;
 impl Route for Refused {
     fn open(&self, _: &tune_core::nodes::Node, _: &Opts) -> Result<Source, String> {
@@ -74,7 +81,7 @@ fn close_boundary(phase: &'static str, completed_first: bool) {
         let (engine, host, mut job) = rt.block_on(async {
             let engine = Engine::open(worker_dir.join("nodes.json"), worker_dir.join("data"), Arc::new(tune_core::engine::NoHost)).unwrap();
             let live = Live::new(Arc::new(Refused), Opts::default(), Box::new(|_| {}));
-            let host = MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false)));
+            let host = with_fake_owner(MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false))));
             let mut job = Job::default();
             let work_engine = engine.clone();
             let work_dir = worker_dir.clone();
@@ -222,7 +229,7 @@ fn host_fixture(label: &str) -> (PathBuf, Arc<Engine>, Arc<MonitorHost>) {
     std::fs::write(dir.join("nodes.json"), r#"{"nodes":[]}"#).unwrap();
     let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(tune_core::engine::NoHost)).unwrap();
     let live = Live::new(Arc::new(Refused), Opts::default(), Box::new(|_| {}));
-    let host = Arc::new(MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false))));
+    let host = Arc::new(with_fake_owner(MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false)))));
     (dir, engine, host)
 }
 
@@ -323,7 +330,7 @@ fn live_and_journal_share_one_final_budget_and_missing_ack_is_not_success() {
         let node = tune_core::nodes::Node::from_value(&json!({"id":"fixture","os":"macos"}), "synthetic-host");
         live.start(&[node], &[]);
         tokio::time::timeout(Duration::from_secs(2), opened.notified()).await.unwrap();
-        let host = MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false)));
+        let host = with_fake_owner(MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false))));
         let (held_send, held_recv) = tokio::sync::oneshot::channel();
         let (release_send, release_recv) = mpsc::channel();
         let held = tokio::task::spawn_blocking(move || {
@@ -532,4 +539,210 @@ async fn install_close_completion_retains_uncertainty_even_when_rejected() {
         "completion-close",
     )
     .await;
+}
+
+use tune_core::helpers::remote_update::{
+    RemoteArchitecture, RemoteTargetSnapshot, RemoteUpdateControl, RemoteUpdateFuture, RemoteUpdateOutcome, RemoteUpdatePayload, RemoteUpdateReply,
+    RemoteUpdateRequest, RemoteUpdateStage, RemoteUpdateTransport,
+};
+struct RemoteRoute;
+impl Route for RemoteRoute {
+    fn open(&self, _: &tune_core::nodes::Node, _: &Opts) -> Result<Source, String> {
+        let (send, recv) = tokio::sync::mpsc::channel(4);
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let (done, finished) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            send.send(r#"{"type":"hello","impl":"rust","agent":"0.0.1"}"#.into()).await.unwrap();
+            let _ = stopped.await;
+            drop(send);
+            let _ = done.send(tune_core::live::Ended::default());
+        });
+        Ok(Source::new(recv, stop, finished))
+    }
+}
+struct FakeRemoteUpdate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    reply: u8,
+    calls: std::sync::atomic::AtomicUsize,
+}
+impl RemoteUpdateTransport for FakeRemoteUpdate {
+    fn place<'a>(&'a self, node: &'a tune_core::nodes::Node, payload: RemoteUpdatePayload<'a>) -> RemoteUpdateFuture<'a> {
+        Box::pin(async move {
+            assert_eq!(node.id, "remote-fixture");
+            assert!(!payload.bytes().is_empty());
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            if self.reply == 3 {
+                panic!("synthetic remote panic");
+            }
+            RemoteUpdateReply::observed(
+                if self.reply == 2 { None } else { Some(if self.reply == 1 { 1 } else { 0 }) },
+                payload.expected_response().as_bytes(),
+                RemoteUpdateStage::Placed,
+                true,
+            )
+        })
+    }
+}
+fn remote_request(engine: &Engine, dir: &Path, id: u64, seq: u64) -> RemoteUpdateRequest {
+    let source = dir.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    crate::native::synthetic_sampler_source(&source);
+    let prepared = tune_core::helpers::native_install::prepare_native_sampler(&source).unwrap();
+    let architecture = if cfg!(windows) { RemoteArchitecture::X64 } else { RemoteArchitecture::Arm64 };
+    let target = RemoteTargetSnapshot::checked(engine, "remote-fixture", Some(architecture)).unwrap();
+    RemoteUpdateRequest::new(id, seq, Instant::now() + Duration::from_secs(120), target, prepared).unwrap()
+}
+fn remote_host(
+    label: &str,
+    reply: u8,
+    owner_busy: bool,
+) -> (PathBuf, Arc<Engine>, Arc<MonitorHost>, Arc<FakeRemoteUpdate>, Arc<std::sync::atomic::AtomicUsize>) {
+    let (dir, engine, _) = host_fixture(label);
+    let os = if cfg!(windows) { "windows" } else { "macos" };
+    std::fs::write(dir.join("nodes.json"), json!({"nodes":[{"id":"remote-fixture","os":os}]}).to_string()).unwrap();
+    engine.reload_config();
+    engine.with_db(|d| d.set_meta("monitor", &json!({"enabled":true}))).unwrap();
+    let live = Live::new(Arc::new(RemoteRoute), Opts::default(), Box::new(|_| {}));
+    let transport = Arc::new(FakeRemoteUpdate { entered: tokio::sync::Notify::new(), release: tokio::sync::Notify::new(), reply, calls: 0.into() });
+    let mut host = MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false)));
+    host.remote_updates = Some(Arc::new(RemoteUpdateControl::new(transport.clone())));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = calls.clone();
+    host.collection_owner = Some(Arc::new(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+        if owner_busy { Err(tune_core::gui_collection::AdmissionError::Busy) } else { Ok(()) }
+    }));
+    (dir, engine, Arc::new(host), transport, calls)
+}
+async fn remote_hello(host: &MonitorHost) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while host.live.brief("remote-fixture").is_none_or(|b| b["impl"] != "rust") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+#[tokio::test]
+async fn remote_update_owned_shutdown_keeps_join_placement_and_ack_separate() {
+    for (reply, missing_ack) in [(0, false), (1, false), (2, false), (3, false), (0, true)] {
+        let (dir, engine, host, transport, owner) = remote_host(&format!("remote-{reply}-{missing_ack}"), reply, false);
+        let gate = crate::gate::Gate::new(|| {});
+        host.start_monitor_from_ui(&gate).unwrap();
+        remote_hello(&host).await;
+        let seq = host.request.borrow().start_seq;
+        host.admit_remote_update(remote_request(&engine, &dir, 1, seq), &gate).unwrap();
+        transport.entered.notified().await;
+        assert!(owner.load(Ordering::SeqCst) >= 2, "same real host ownership boundary uses the explicit fake provider");
+        assert!(host.admit_install_work(&gate, || panic!("remote admission preserves ever-collection")).is_err());
+        host.pause_monitor().unwrap();
+        assert_eq!(host.snapshot().status.phase, RunPhase::Stopping);
+        assert!(host.admit_install_work(&gate, || panic!("Pause cannot reset local install admission")).is_err());
+        gate.close();
+        if missing_ack {
+            engine.with_db(|d| d.conn().execute_batch("DROP TABLE monitor_events")).unwrap();
+        }
+        let draining = host.clone();
+        let mut task = tokio::spawn(async move { draining.shutdown().await });
+        if reply == 0 && !missing_ack {
+            assert!(tokio::time::timeout(Duration::from_millis(3150), &mut task).await.is_err());
+            assert_eq!(host.snapshot().status.phase, RunPhase::Stopping);
+            assert_eq!(engine.monitor_journal_health()["running"], true);
+        }
+        transport.release.notify_one();
+        let report = task.await.unwrap();
+        assert_eq!(report.monitor_complete, Some(true));
+        assert_eq!(report.remote_update_complete, Some(true));
+        assert_eq!(report.journal_ack, Some(!missing_ack));
+        assert_eq!(report.confirmed(), reply == 0 && !missing_ack);
+        assert_eq!(report.manual_complete, None);
+        assert_eq!(report.install_complete, None);
+        assert_eq!(report.remote_update.unwrap().placement_known(), reply == 0);
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(host.shutdown().await, report);
+        drop((host, engine));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+#[tokio::test]
+async fn remote_update_admission_refuses_owner_local_install_gate_and_quit_conflicts() {
+    // Owner refusal is checked before any worker/admission is created.
+    let (dir, engine, host, transport, owner) = remote_host("remote-owner-busy", 0, true);
+    host.live.start_owned(tune_core::live::Owner::Ui, &engine.config().nodes, &[]);
+    remote_hello(&host).await;
+    host.request.send_modify(|r| {
+        r.mode = RunMode::Run;
+        r.start_seq = 1;
+    });
+    let gate = crate::gate::Gate::new(|| {});
+    assert!(host.admit_remote_update(remote_request(&engine, &dir, 1, 1), &gate).is_err());
+    assert_eq!(owner.load(Ordering::SeqCst), 1);
+    assert!(!host.remote_updates.as_ref().unwrap().busy());
+    assert!(!host.native_install_snapshot().ever_collection_admitted);
+    assert!(!host.snapshot().started);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+    assert!(host.shutdown().await.confirmed());
+    drop((host, engine));
+    std::fs::remove_dir_all(dir).unwrap();
+    // A real admitted local fake transaction blocks remote admission before IO.
+    let (dir, engine, host, transport, _) = remote_host("remote-install-conflict", 0, false);
+    let gate = crate::gate::Gate::new(|| {});
+    let (release, wait) = mpsc::channel();
+    host.admit_install_work(&gate, move || {
+        wait.recv_timeout(Duration::from_secs(10)).unwrap();
+        Err(native_install::prepare_native_sampler(Path::new("relative")).unwrap_err())
+    })
+    .unwrap();
+    assert!(host.admit_remote_update(remote_request(&engine, &dir, 1, 0), &gate).is_err());
+    release.send(()).unwrap();
+    assert!(host.shutdown().await.confirmed());
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+    drop((host, engine));
+    std::fs::remove_dir_all(dir).unwrap();
+    let (dir, engine, host, transport, _) = remote_host("remote-recovery-conflict", 0, false);
+    MonitorHost::record_install(&mut host.state.lock().unwrap(), NativeInstallResult::WorkerFailed);
+    assert!(host.admit_remote_update(remote_request(&engine, &dir, 1, 0), &crate::gate::Gate::new(|| {})).is_err());
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+    assert!(!host.shutdown().await.confirmed());
+    drop((host, engine));
+    std::fs::remove_dir_all(dir).unwrap();
+    // Closed Gate, new Start, Pause and Quit synchronously withdraw Pending.
+    let (dir, engine, host, transport, _) = remote_host("remote-pending-close", 0, false);
+    let gate = crate::gate::Gate::new(|| {});
+    host.start_monitor_from_ui(&gate).unwrap();
+    remote_hello(&host).await;
+    gate.close();
+    let seq = host.request.borrow().start_seq;
+    assert!(host.admit_remote_update(remote_request(&engine, &dir, 1, seq), &gate).is_err());
+    let gate = crate::gate::Gate::new(|| {});
+    host.admit_remote_update(remote_request(&engine, &dir, 1, seq), &gate).unwrap();
+    host.pause_monitor().unwrap();
+    host.start_monitor_from_ui(&gate).unwrap();
+    assert!(!host.remote_updates.as_ref().unwrap().busy());
+    let seq = host.request.borrow().start_seq;
+    host.admit_remote_update(remote_request(&engine, &dir, 2, seq), &gate).unwrap();
+    host.request_exit();
+    assert!(!host.remote_updates.as_ref().unwrap().busy());
+    assert!(host.admit_remote_update(remote_request(&engine, &dir, 3, seq), &gate).is_err());
+    assert!(matches!(host.shutdown().await.remote_update, Some(RemoteUpdateOutcome::Refused { attempt_id: 2, .. })));
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+    drop((host, engine));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[tokio::test]
+async fn remote_update_monitor_join_failure_cannot_confirm_shutdown() {
+    let (dir, engine, host, _, _) = remote_host("remote-join-failure", 0, false);
+    host.state.lock().unwrap().worker = Some(tokio::spawn(async {
+        panic!("synthetic controlled worker join loss");
+    }));
+    let report = host.shutdown().await;
+    assert_eq!(report.monitor_complete, Some(false));
+    assert_eq!(report.remote_update_complete, Some(false));
+    assert!(!report.confirmed());
+    assert_eq!(report.journal_ack, Some(true));
+    drop((host, engine));
+    std::fs::remove_dir_all(dir).unwrap();
 }

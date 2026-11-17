@@ -82,6 +82,8 @@ Windowsの常駐時は、GPUI 0.2.2が最後のネイティブウィンドウ破
 
 Dashboard の「監視開始」「自動スキャン開始」は独立した明示操作。保存設定が有効でも、起動・表示・再読込・設定保存だけではどちらも開始しない。「詳細」から監視・ハブ設定と分析・ログ・道具・AI の間隔を保存できる。自動スキャンは開始5秒後、その後60秒ごとに既存 core の予定を確認し、手動収集中はその回を見送る。各回の完了を待ち、停止・終了後は新たな回を開始しない。現在の台帳や保存設定が読めない場合は停止し、修復・保存後も明示的な再開が必要。終了時は実行中の収集を待ち、その後に Live と収集記録を合計3秒の予算で終了する。
 
+controlled monitor の remote sampler 更新は、対象一台・保持済みbytes・期限を持つcoreの許可型と終了待ちだけを合成transportで検証している。GPUIは更新許可を渡さず、更新UIや実通信は未対応。配置応答の確認と稼働版の確認は別であり、不明な配置結果は同一セッションの再試行を止める。
+
 機体間ペアリングと自動更新は未移植。常駐は前述の明示オプションで利用する。OS通知・ログイン起動はダッシュボードの「詳細」から明示操作するが、対応条件はOSと配布形態によって異なる。Windows Previewは、後述の導入契約を満たす場合に通知設定の明示照会・送信・設定画面操作と、通知クリックからのReopenを行う。登録はoperator/installerの責務で、アプリは作成・修復・解除しない。Classic Windows通知には許可要求ダイアログがないため、その操作は未対応と表示する。Windows実機での送信・warm/cold activation・cleanupの受入は未完了で、公開前の必須ゲートとする。macOSのログイン起動は正規のapp bundleと標準config/dataでの通常表示起動にのみ対応する。`--resident`と`--resident --hidden`のセッションからの有効化は、起動方法を引き継げないため拒否する。引数・環境変数による独自config/data指定も登録しない。OS状態の照会と無効化は常駐・非表示や独自パスのセッションからも行える。機体詳細のLiveは保持する。アクセシビリティも未完了。既存版を置換する正式リリースとしては扱わず、別DBで試す。Windowsではreleaseビルド、DirectXと実画面の起動を別途確認する。
 
 Windows通知の導入契約はPreview専用のAUMID `org.katala.tune.gpui.preview`、表示名 `Katala Tune GPUI Preview`、CLSID `{7FA17089-16BD-4C17-8035-3CB6ACAF04AC}` を固定する。operator/installerが配置する公開metadataは、OSの`FOLDERID_LocalAppData`配下の`Katala Tune GPUI Preview/installation.json`。schemaは`katala-tune/gpui-preview-installation/v1`で、`schema`、`aumid`、`activator_clsid`、`executable`、`config`、`data`の6 string fieldsだけを持ち、上限は64 KiB。`executable`は導入exe、`config`と`data`は解決済みの絶対パスで、台帳・DBの内容、approval、credentialsは含めない。既知folderはOS APIから取得し、環境変数だけで決めない。

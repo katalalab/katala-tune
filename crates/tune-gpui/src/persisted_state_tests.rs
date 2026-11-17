@@ -87,7 +87,7 @@ impl Fixture {
         let engine = Engine::open(self.dir.join("nodes.json"), self.dir.join("data"), native.clone()).unwrap();
         let route = Arc::new(RefusedRoute(AtomicUsize::new(0)));
         let live = Live::new(route.clone(), Opts::default(), Box::new(|_| {}));
-        let host = Arc::new(MonitorHost::new(engine.clone(), live, Handle::current(), dirty));
+        let host = Arc::new(super::shutdown_tests::with_fake_owner(MonitorHost::new(engine.clone(), live, Handle::current(), dirty)));
         Session { engine, native, host, fake, route }
     }
 }
@@ -174,7 +174,9 @@ impl Session {
                 scheduler_complete: None,
                 journal_ack: Some(true),
                 install_complete: None,
-                install_recovery_required: false
+                install_recovery_required: false,
+                remote_update_complete: None,
+                remote_update: None
             }
         );
         assert_eq!(self.host.shutdown().await, report);

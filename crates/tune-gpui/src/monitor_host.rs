@@ -19,6 +19,9 @@ use tune_core::{
 pub struct MonitorHost {
     engine: Arc<Engine>,
     live: Arc<Live>,
+    remote_updates: Option<Arc<tune_core::helpers::remote_update::RemoteUpdateControl>>,
+    #[cfg(test)]
+    collection_owner: Option<Arc<dyn Fn() -> Result<(), tune_core::gui_collection::AdmissionError> + Send + Sync>>,
     rt: Handle,
     dirty: Arc<AtomicBool>,
     state: Mutex<State>,
@@ -31,7 +34,7 @@ pub struct MonitorHost {
 }
 struct State {
     manual: Option<JoinHandle<bool>>,
-    worker: Option<JoinHandle<()>>,
+    worker: Option<JoinHandle<monitor::ControlledExit>>,
     ticker: Option<JoinHandle<()>>,
     scheduler: Option<JoinHandle<()>>,
     scheduler_in_flight: bool,
@@ -119,10 +122,14 @@ pub struct ShutdownReport {
     pub journal_ack: Option<bool>,
     pub install_complete: Option<bool>,
     pub install_recovery_required: bool,
+    pub remote_update_complete: Option<bool>,
+    pub remote_update: Option<tune_core::helpers::remote_update::RemoteUpdateOutcome>,
 }
 impl ShutdownReport {
     pub fn confirmed(self) -> bool {
-        self.install_complete != Some(false)
+        self.remote_update_complete != Some(false)
+            && self.remote_update.is_none_or(|outcome| outcome.placement_known())
+            && self.install_complete != Some(false)
             && !self.install_recovery_required
             && self.scheduler_complete != Some(false)
             && self.manual_complete != Some(false)
@@ -166,6 +173,9 @@ impl MonitorHost {
             schedule_status,
             engine,
             live,
+            remote_updates: None,
+            #[cfg(test)]
+            collection_owner: None,
             rt,
             dirty,
             request,
@@ -186,6 +196,13 @@ impl MonitorHost {
             }),
             drain: tokio::sync::Mutex::new(None),
         }
+    }
+    fn ensure_collection_owner(&self) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(provider) = &self.collection_owner {
+            return provider().map_err(|error| error.to_string());
+        }
+        ensure_gui_collection_owner().map_err(|error| error.to_string())
     }
     fn install_busy(state: &State) -> bool {
         state.install_phase == InstallPhase::Running || state.install_job.as_ref().is_some_and(|job| !job.is_finished())
@@ -235,6 +252,28 @@ impl MonitorHost {
     ) -> Result<(), String> {
         self.admit_install_work(gate, work)
     }
+    // Explicit remote confirmation UI wiring is a later slice. Actual GPUI
+    // constructs no transport/control; synthetic tests use this same admission.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn admit_remote_update(&self, update: tune_core::helpers::remote_update::RemoteUpdateRequest, gate: &crate::gate::Gate) -> Result<(), String> {
+        let updates = self.remote_updates.as_ref().ok_or("remote sampler 更新は未対応です")?;
+        Self::collection_allowed(&self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner))?;
+        let checked = updates.check_admission(&self.engine, &self.live, update).map_err(|e| format!("remote sampler: {e:?}"))?;
+        // Collector ownership acquisition can perform IO; no host/Gate lock
+        // spans it. Recheck host conflicts after acquisition and before register.
+        self.ensure_collection_owner()?;
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::collection_allowed(&state)?;
+        let _admission = gate.admit()?;
+        updates.admit_checked(&self.request, checked).map_err(|e| format!("remote sampler: {e:?}"))?;
+        state.ever_collection_admitted = true;
+        Ok(())
+    }
+    fn revoke_pending_update(&self) {
+        if let Some(updates) = &self.remote_updates {
+            updates.refuse_pending(tune_core::helpers::remote_update::Refusal::Session);
+        }
+    }
     fn record_install(state: &mut State, result: NativeInstallResult) {
         let confirmed = result.confirmed();
         state.install_confirmed = Some(state.install_confirmed.unwrap_or(true) && confirmed);
@@ -252,7 +291,7 @@ impl MonitorHost {
     ) -> Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         Self::install_allowed(&state)?;
-        ensure_gui_collection_owner().map_err(|error| error.to_string())?;
+        self.ensure_collection_owner()?;
         let _admission = gate.admit()?;
         state.install_phase = InstallPhase::Running;
         let host = self.clone();
@@ -272,7 +311,7 @@ impl MonitorHost {
     pub(crate) fn admit_live_request(&self, gate: &crate::gate::Gate, commit: impl FnOnce() -> Option<(u64, String)>) -> Result<Option<(u64, String)>, String> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         Self::collection_allowed(&state)?;
-        ensure_gui_collection_owner().map_err(|error| error.to_string())?;
+        self.ensure_collection_owner()?;
         let _admission = gate.admit()?;
         let request = commit();
         if request.is_some() {
@@ -282,7 +321,10 @@ impl MonitorHost {
         Ok(request)
     }
     fn fail(&self) {
-        self.request.send_modify(|r| r.mode = RunMode::Paused);
+        self.request.send_modify(|r| {
+            self.revoke_pending_update();
+            r.mode = RunMode::Paused;
+        });
         self.live.release_owned(tune_core::live::Owner::Monitor, &self.live.active(), tune_core::live::Stop::User);
         self.status.send_replace(RunStatus { phase: RunPhase::Failed, policy: None, local_collecting: None, hub_configured: false });
     }
@@ -310,7 +352,7 @@ impl MonitorHost {
                 },
                 self.request.clone(),
                 self.status.clone(),
-                None,
+                self.remote_updates.clone(),
             )));
         }
     }
@@ -333,14 +375,18 @@ impl MonitorHost {
         Self::collection_allowed(&state)?;
         let (_, settings) = self.inputs(&state)?;
         if !settings.enabled && settings.hub.is_none() {
-            self.request.send_modify(|r| r.mode = RunMode::Paused);
+            self.request.send_modify(|r| {
+                self.revoke_pending_update();
+                r.mode = RunMode::Paused;
+            });
             return Err("監視設定が無効でハブもありません。設定を保存してから明示的に開始してください".into());
         }
         // Host state -> blocking validation -> Gate -> memory-only permission.
         // close() never takes Host state, and no Gate lock spans the DB wait.
-        ensure_gui_collection_owner().map_err(|e| e.to_string())?;
+        self.ensure_collection_owner()?;
         let _admission = gate.map(crate::gate::Gate::admit).transpose()?;
         self.request.send_modify(|r| {
+            self.revoke_pending_update();
             r.start_seq = r.start_seq.wrapping_add(1);
             r.mode = RunMode::Run;
             self.status.send_replace(RunStatus { phase: RunPhase::Starting, policy: None, local_collecting: None, hub_configured: settings.hub.is_some() });
@@ -357,7 +403,10 @@ impl MonitorHost {
         if state.worker.is_some() {
             self.status.send_modify(|s| s.phase = RunPhase::Stopping);
         }
-        self.request.send_modify(|r| r.mode = RunMode::Paused);
+        self.request.send_modify(|r| {
+            self.revoke_pending_update();
+            r.mode = RunMode::Paused;
+        });
         Ok(())
     }
     // Preserve app-owned callers; per-window UI uses the gated entry point.
@@ -372,7 +421,7 @@ impl MonitorHost {
         if settings.hub.is_none() {
             return Err("取得するハブが設定されていません".into());
         }
-        ensure_gui_collection_owner().map_err(|e| e.to_string())?;
+        self.ensure_collection_owner()?;
         let _admission = gate.map(crate::gate::Gate::admit).transpose()?;
         if self.request.borrow().mode == RunMode::Paused {
             self.status.send_modify(|s| s.phase = RunPhase::Starting);
@@ -469,7 +518,7 @@ impl MonitorHost {
             self.schedule_failure("自動スキャン設定は無効です。保存後に開始してください".into());
             return Err("自動スキャン設定は無効です。保存後に開始してください".into());
         }
-        ensure_gui_collection_owner().map_err(|e| e.to_string())?;
+        self.ensure_collection_owner()?;
         let _admission = gate.map(crate::gate::Gate::admit).transpose()?;
         if !*self.schedule_request.borrow() {
             self.schedule_status.send_modify(|s| {
@@ -607,7 +656,7 @@ impl MonitorHost {
     fn ensure_ticker_admitted(&self, gate: Option<&crate::gate::Gate>) -> Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         Self::collection_allowed(&state)?;
-        ensure_gui_collection_owner().map_err(|e| e.to_string())?;
+        self.ensure_collection_owner()?;
         let _admission = gate.map(crate::gate::Gate::admit).transpose()?;
         self.ticker(&mut state);
         state.ever_collection_admitted = true;
@@ -618,7 +667,7 @@ impl MonitorHost {
     pub fn start_diagnostic_journal_from_ui(&self, gate: &crate::gate::Gate) -> Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         Self::collection_allowed(&state)?;
-        ensure_gui_collection_owner().map_err(|e| e.to_string())?;
+        self.ensure_collection_owner()?;
         let _admission = gate.admit()?;
         let _runtime = self.rt.enter();
         self.engine.start_monitor_journal();
@@ -657,7 +706,7 @@ impl MonitorHost {
         if job.running.is_some() || state.manual.as_ref().is_some_and(|task| !task.is_finished()) {
             return Err("別の収集が実行中です".into());
         }
-        ensure_gui_collection_owner().map_err(|e| e.to_string())?;
+        self.ensure_collection_owner()?;
         let _admission = gate.map(crate::gate::Gate::admit).transpose()?;
         let sender = job.begin(kind).ok_or("別の収集が実行中です")?;
         state.ever_collection_admitted = true;
@@ -679,7 +728,10 @@ impl MonitorHost {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.exiting = true;
         self.schedule_request.send_replace(false);
-        self.request.send_modify(|r| r.mode = RunMode::Exit);
+        self.request.send_modify(|r| {
+            self.revoke_pending_update();
+            r.mode = RunMode::Exit;
+        });
         if let Some(ticker) = &state.ticker {
             ticker.abort();
         }
@@ -705,9 +757,12 @@ impl MonitorHost {
             Some(task) => Some(task.await.unwrap_or(false)),
             None => None,
         };
-        let monitor_complete = match worker {
-            Some(task) => Some(task.await.is_ok()),
-            None => None,
+        let (monitor_complete, remote_update_complete, remote_update) = match worker {
+            Some(task) => match task.await {
+                Ok(exit) => (Some(true), exit.update_complete, exit.remote_update),
+                Err(_) => (Some(false), self.remote_updates.as_ref().map(|_| false), self.remote_updates.as_ref().and_then(|updates| updates.outcome())),
+            },
+            None => (None, None, self.remote_updates.as_ref().and_then(|updates| updates.outcome())),
         };
         let scheduler_complete = match scheduler {
             Some(task) => Some(task.await.is_ok()),
@@ -726,7 +781,16 @@ impl MonitorHost {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         self.live.shutdown(deadline.saturating_duration_since(tokio::time::Instant::now())).await;
         let journal_ack = Some(self.engine.finish_monitor_journal(deadline.saturating_duration_since(tokio::time::Instant::now())).await);
-        let report = ShutdownReport { manual_complete, monitor_complete, scheduler_complete, journal_ack, install_complete, install_recovery_required };
+        let report = ShutdownReport {
+            manual_complete,
+            monitor_complete,
+            scheduler_complete,
+            journal_ack,
+            install_complete,
+            install_recovery_required,
+            remote_update_complete,
+            remote_update,
+        };
         *drained = Some(report);
         report
     }
@@ -750,7 +814,7 @@ mod tests {
         let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(tune_core::engine::NoHost)).unwrap();
         engine.with_db(|d| d.set_meta("monitor", &json!({"enabled":false}))).unwrap();
         let live = Live::new(Arc::new(Refused), Opts { max_retries: 0, ..Opts::default() }, Box::new(|_| {}));
-        let host = MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false)));
+        let host = super::shutdown_tests::with_fake_owner(MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false))));
         for _ in 0..3 {
             assert!(!host.snapshot().started);
         }
@@ -793,7 +857,7 @@ mod tests {
         engine.with_db(|d| d.set_meta("monitor", &json!({"enabled":true}))).unwrap();
         engine.with_db(|d| d.conn().execute("UPDATE meta SET v=? WHERE k='monitor'", [raw])).unwrap();
         let live = Live::new(Arc::new(Refused), Opts::default(), Box::new(|_| {}));
-        let host = MonitorHost::new(engine.clone(), live.clone(), Handle::current(), Arc::new(AtomicBool::new(false)));
+        let host = super::shutdown_tests::with_fake_owner(MonitorHost::new(engine.clone(), live.clone(), Handle::current(), Arc::new(AtomicBool::new(false))));
         let refused = host.start_monitor().is_err();
         let snapshot = host.snapshot();
         let inactive = live.active().is_empty();
@@ -839,7 +903,7 @@ mod tests {
         let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(tune_core::engine::NoHost)).unwrap();
         engine.with_db(|d| d.set_meta("monitor", &json!({"enabled":true}))).unwrap();
         let live = Live::new(Arc::new(Refused), Opts::default(), Box::new(|_| {}));
-        let host = MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false)));
+        let host = super::shutdown_tests::with_fake_owner(MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false))));
         let mut status = host.status.subscribe();
         host.start_monitor().unwrap();
         monitor_phase(&mut status, RunPhase::Running).await;
@@ -886,7 +950,7 @@ mod tests {
         let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(Notifications(dirty.clone()))).unwrap();
         let live = Live::new(Arc::new(Refused), Opts::default(), Box::new(|_| {}));
         dirty.store(false, Ordering::Release);
-        let host = Arc::new(MonitorHost::new(engine.clone(), live, Handle::current(), dirty.clone()));
+        let host = Arc::new(super::shutdown_tests::with_fake_owner(MonitorHost::new(engine.clone(), live, Handle::current(), dirty.clone())));
         let records = engine.monitor_events(&tune_core::monitor_journal::Filter { limit: Some(50), ..Default::default() }).unwrap();
         assert!(records["events"].as_array().unwrap().is_empty());
         assert_eq!(records["health"]["running"], false);
@@ -921,7 +985,7 @@ mod tests {
         let engine = Engine::open(dir.join("nodes.json"), dir.join("data"), Arc::new(tune_core::engine::NoHost)).unwrap();
         engine.with_db(|d| d.set_meta("monitor", &json!({"enabled":true}))).unwrap();
         let live = Live::new(Arc::new(Refused), Opts::default(), Box::new(|_| {}));
-        let host = MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false)));
+        let host = super::shutdown_tests::with_fake_owner(MonitorHost::new(engine.clone(), live, Handle::current(), Arc::new(AtomicBool::new(false))));
         host.start_monitor().unwrap();
         let mut status = host.status.subscribe();
         tokio::time::timeout(Duration::from_secs(2), async {

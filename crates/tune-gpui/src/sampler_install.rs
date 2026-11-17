@@ -179,4 +179,4 @@ pub(super) fn receipt_text(result: &NativeInstallResult) -> String {
 
 #[cfg(test)]
 #[path = "sampler_install_tests.rs"]
-mod tests;
+pub(crate) mod tests;

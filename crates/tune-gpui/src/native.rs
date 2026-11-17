@@ -6,6 +6,8 @@
 
 #[path = "sampler_install.rs"]
 mod sampler_install;
+#[cfg(test)]
+pub(crate) use sampler_install::tests::source as synthetic_sampler_source;
 
 use crate::{
     browser::{Reader, Request, Route},
