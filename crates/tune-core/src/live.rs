@@ -2005,8 +2005,17 @@ mod tests {
         let mut dir = LaunchTestDir::new();
         let mut command = launch_test_command(&dir.path, "live::tests::launch_test_watchdog_fixture", case);
         command.arg("--ignored");
-        // 子はこのテストバイナリ自身なので、負荷が高いと準備完了までに 2 秒を超える。期限は準備完了の後に来るようにする
-        let limit = Duration::from_secs(5);
+        // 複製したばかりの実行ファイルは、macOS では最初の起動だけ OS の検査で負荷に応じて数秒〜十数秒待たされる。
+        // 期限を測る前に一度起動しておき、期限で確かめるのは準備完了後に止まった子だけにする。
+        let warmed = std::process::Command::new(command.get_program())
+            .args(["--list", "--exact", "live::tests::launch_test_watchdog_fixture"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(warmed.success());
+        let limit = if case == "hung" { Duration::from_secs(2) } else { Duration::from_secs(5) };
         let began = Instant::now();
         let output = capture_exact_child(&mut command, &mut dir, limit, 4096);
         assert_eq!(output.reason, expected);
@@ -2476,16 +2485,16 @@ echo '{\"type\":\"hello\",\"os\":\"macos\",\"impl\":\"rust\"}'
     async fn mac_sampler_runs_here() {
         use std::os::unix::fs::PermissionsExt;
         for with_sensor in [false, true] {
-            // センサーの最初の値は別の python の起動を待つ。負荷が高いと 1 秒近くかかるので、センサーありは標本を多めに取る
-            let count = if with_sensor { 10 } else { 3 };
             let (_, dir) = fake("");
             if with_sensor {
                 let sensor = dir.join("macmon");
                 std::fs::write(
                     &sensor,
                     r#"#!/usr/bin/python3
-import json,os,time
+import json,os,sys,time
 from pathlib import Path
+if sys.argv[1:] == ['warm']:
+    sys.exit(0)
 Path(__file__).with_suffix('.pid').write_text(str(os.getpid()))
 for _ in range(400):
     print(json.dumps({'cpu_power':0,'gpu_power':3,'all_power':4,'sys_power':0,'gpu_freq_mhz':500}),flush=True)
@@ -2493,7 +2502,10 @@ for _ in range(400):
 "#,
                 )
                 .unwrap();
-                std::fs::set_permissions(sensor, std::fs::Permissions::from_mode(0o700)).unwrap();
+                std::fs::set_permissions(&sensor, std::fs::Permissions::from_mode(0o700)).unwrap();
+                // 作ったばかりの実行ファイルは、macOS では最初の起動だけ OS の検査で負荷に応じて数秒〜十数秒待たされる。
+                // 標本 3 回の間に最初の値が届くよう、サンプラーより先に一度起動しておく。
+                assert!(std::process::Command::new(&sensor).arg("warm").status().unwrap().success());
             }
             let mut src = spawn(Launch {
                 program: "/usr/bin/env".into(),
@@ -2504,7 +2516,7 @@ for _ in range(400):
                     "-".into(),
                     "interval=0.3".into(),
                     "procs=0.3".into(),
-                    format!("count={count}"),
+                    "count=3".into(),
                 ]
                 .into(),
                 stdin: MAC_LIVE.as_bytes().to_vec(),
@@ -2533,7 +2545,7 @@ for _ in range(400):
                     _ => None,
                 })
                 .collect();
-            assert_eq!(samples.len(), count);
+            assert_eq!(samples.len(), 3);
             let last = samples.last().unwrap();
             assert!(last.cpu.is_some() && last.cores.len() == h.cores.unwrap() as usize);
             assert!(last.mem.as_ref().and_then(|m| m.used_pct).is_some());
