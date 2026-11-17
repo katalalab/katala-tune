@@ -4,7 +4,6 @@
 // 例外は { __throw: メッセージ } として返す（同じ入力で Rust 側も失敗するかを比べる）
 'use strict';
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
 
 const LIB = path.join(__dirname, '..', '..', '..', '..', 'lib');
@@ -13,6 +12,7 @@ const health = require(path.join(LIB, 'health'));
 const logs = require(path.join(LIB, 'logs'));
 const actions = require(path.join(LIB, 'actions'));
 const { openDb } = require(path.join(LIB, 'db'));
+const withTempDb = require('./with-temp-db');
 
 const cases = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const safe = (fn) => { try { return fn(); } catch (e) { return { __throw: String(e && e.message || e) }; } };
@@ -50,7 +50,6 @@ function write(db, w) {
   for (const [k, v] of Object.entries(w.meta)) db.setMeta(k, v);
 }
 
-const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'kt-parity-'));
 const out = {};
 out.analyze = (cases.analyze || []).map((c) => safe(() => plain(rules.analyze(c.snap, c.node))));
 out.score = (cases.analyze || []).map((c) => safe(() => rules.score(rules.analyze(c.snap, c.node))));
@@ -66,12 +65,11 @@ out.plan = (cases.plan || []).map((c) => safe(() => {
   const w = safe(() => actions.wrap(c.node, p));
   return plain({ describe: p.describe, script: p.script, shell: p.shell, undo: p.undo ?? null, exits: !!p.exits, wrap: w });
 }));
-out.logFindings = (cases.logFindings || []).map((c) => safe(() => {
-  const db = openDb(tmp());
+out.logFindings = (cases.logFindings || []).map((c) => safe(() => withTempDb('kt-parity-', (db) => {
   for (const l of c.logs) db.insertLogs(c.node_id, l.source, logs.normalize(l.source, l.rows), c.now);
   for (const d of c.dropped) db.cursorOk(c.node_id, d.source, '1', 0, d.n);
   return plain(logs.logFindings(db, c.node_id, c.now));
-}));
+})));
 // DB の相互運用: Rust が書いた DB を JS で読む／JS が書いた DB を Rust で読むための書き出しと読み出し
 if (cases.dbRead) out.dbRead = plain(dump(openDb(cases.dbRead.dir), cases.dbRead.spec));
 if (cases.dbWrite) {

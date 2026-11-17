@@ -10,11 +10,29 @@ const { spawnSync } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
 const { normalize, fingerprint, redact, logFindings, sourceNote, occurrencesOf } = require('../lib/logs');
 const { nodeChecks, LOGS_FAIL_STREAK, LOGS_FAIL_AFTER_MIN } = require('../lib/health');
-const { openDb } = require('../lib/db');
+const { openDb: openStore } = require('../lib/db');
 
 const PROBES = path.join(__dirname, '..', 'probes');
 const PY = ['python3', 'python'].find((c) => spawnSync(c, ['--version']).status === 0);
-const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'kt-resil-'));
+const tempDirs = [];
+const stores = [];
+const tmp = () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kt-resil-'));
+  tempDirs.push(dir);
+  return dir;
+};
+const openDb = (dir) => {
+  const store = openStore(dir);
+  stores.push(store);
+  return store;
+};
+test.after(() => {
+  try {
+    for (const store of stores) store.db.close();
+  } finally {
+    for (const dir of tempDirs) fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 // probes/mac_logs.py の関数を架空の入力で呼ぶ（機体には何もしない）
 // 大きな入力は引数に載らないので、ファイルに書いて DATA_PATH で渡す
