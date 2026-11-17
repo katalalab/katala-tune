@@ -719,7 +719,7 @@ async fn run_loop(
 ) -> ControlledExit {
     let updates = control.as_ref().and_then(|c| c.3.clone());
     let finished = || ControlledExit {
-        update_complete: updates.as_ref().and_then(|u| u.outcome().map(|_| true)),
+        update_complete: updates.as_ref().and_then(|u| u.local_completion()),
         remote_update: updates.as_ref().and_then(|u| u.outcome()),
     };
     let journal = engine.start_monitor_journal();
