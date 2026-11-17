@@ -10,17 +10,27 @@ use tokio::{
     process::{Child, Command},
 };
 
+#[derive(Clone, Copy)]
+enum NativeBackend {
+    Mac,
+    Windows,
+}
+
 type CommandFactory = dyn Fn(&Node) -> io::Result<Command> + Send + Sync;
 /// Opt-in native transport. Only a bound native observation can place bytes.
 pub struct OwnedSshUpdateTransport {
     command: Box<CommandFactory>,
     context: SamplerHash,
     glue: &'static [u8],
-    native: bool,
+    native: Option<NativeBackend>,
 }
 impl RemoteUpdateTransport for OwnedSshUpdateTransport {
     fn preflight(&self, node: &Node, payload: RemoteUpdatePayload<'_>) -> Result<(), super::Refusal> {
-        if self.native { super::macos::preflight(node, payload) } else { Ok(()) }
+        match self.native {
+            Some(NativeBackend::Mac) => super::macos::preflight(node, payload),
+            Some(NativeBackend::Windows) => super::windows::preflight(node, payload),
+            None => Ok(()),
+        }
     }
     fn place<'a>(&'a self, node: &'a Node, payload: RemoteUpdatePayload<'a>) -> RemoteUpdateFuture<'a> {
         Box::pin(async move {
@@ -29,9 +39,9 @@ impl RemoteUpdateTransport for OwnedSshUpdateTransport {
                 reply.before_start_refusal = Some(reason);
                 return reply;
             }
-            let context = if self.native { super::observation::place_context(payload.destination_observation().unwrap()) } else { self.context };
+            let context = if self.native.is_some() { super::observation::place_context(payload.destination_observation().unwrap()) } else { self.context };
             let mut image = Image::payload(&payload, context, self.glue);
-            if self.native {
+            if self.native.is_some() {
                 image.ttl_ms = match super::observation::remaining(payload.request) {
                     Ok(ttl) => ttl,
                     Err(reason) => {
@@ -40,7 +50,7 @@ impl RemoteUpdateTransport for OwnedSshUpdateTransport {
                         return reply;
                     }
                 };
-                image.observation = &payload.destination_observation().unwrap().snapshot.record;
+                image.observation = payload.destination_observation().unwrap().snapshot.record();
             } else {
                 // Trusted synthetic executor fixtures keep a fixed before image.
                 #[cfg(test)]
@@ -54,7 +64,7 @@ impl RemoteUpdateTransport for OwnedSshUpdateTransport {
 }
 pub(super) struct ExchangeResult {
     pub reply: RemoteUpdateReply,
-    pub observed: Option<super::observation::MacSnapshot>,
+    pub observed: Option<super::observation::DestinationSnapshot>,
     pub failure: Option<super::macos::InspectFailure>,
 }
 pub(super) fn native_transport() -> OwnedSshUpdateTransport {
@@ -62,12 +72,26 @@ pub(super) fn native_transport() -> OwnedSshUpdateTransport {
         command: Box::new(|node| ssh_command(node, &super::macos::launcher())),
         context: SamplerHash::parse(&"0".repeat(64)).unwrap(),
         glue: super::macos::GLUE,
-        native: true,
+        native: Some(NativeBackend::Mac),
+    }
+}
+pub(super) fn windows_native() -> OwnedSshUpdateTransport {
+    OwnedSshUpdateTransport {
+        command: Box::new(|node| ssh_command(node, &super::windows::launcher())),
+        context: SamplerHash::parse(&"0".repeat(64)).unwrap(),
+        glue: super::windows::GLUE,
+        native: Some(NativeBackend::Windows),
     }
 }
 impl OwnedSshUpdateTransport {
     pub(super) fn is_native(&self) -> bool {
-        self.native
+        self.native.is_some()
+    }
+    pub(super) fn is_windows(&self) -> bool {
+        matches!(self.native, Some(NativeBackend::Windows))
+    }
+    pub(super) fn native_glue(&self) -> &'static [u8] {
+        self.glue
     }
     pub(super) async fn execute_image(&self, node: &Node, image: &Image<'_>) -> ExchangeResult {
         let empty = || ExchangeResult { reply: unknown(), observed: None, failure: None };
@@ -112,8 +136,32 @@ fn ssh_command(node: &Node, fixed_launcher: &str) -> io::Result<Command> {
     ] {
         command.args(["-o", option]);
     }
-    command.arg(&node.alias).arg(collect::remote_command(node, fixed_launcher));
+    let remote = collect::remote_command(node, fixed_launcher);
+    // ASCII wire bound includes the existing Git Bash outer wrapper. The
+    // doubled bound also covers Windows argument quoting/backslash expansion.
+    if node.is_windows() && (!remote.is_ascii() || remote.len() > 7900) {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    command.arg(&node.alias).arg(remote);
+    if node.is_windows() && command_line_bound(&command).is_none_or(|units| units > 32767) {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
     Ok(command)
+}
+fn utf16_units(value: &std::ffi::OsStr) -> usize {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        value.encode_wide().count()
+    }
+    #[cfg(not(windows))]
+    {
+        value.to_string_lossy().encode_utf16().count()
+    }
+}
+fn command_line_bound(command: &Command) -> Option<usize> {
+    let initial = utf16_units(command.as_std().get_program()).checked_mul(2)?.checked_add(3)?;
+    command.as_std().get_args().try_fold(initial, |units, arg| units.checked_add(utf16_units(arg).checked_mul(2)?.checked_add(3)?))
 }
 pub(super) async fn write_image(mut stdin: impl AsyncWrite + Unpin, image: &Image<'_>, prefix: &str, header: &str) -> io::Result<()> {
     for part in [prefix.as_bytes(), header.as_bytes(), image.glue, image.bytes] {
@@ -190,7 +238,7 @@ mod test_access {
         factory: impl Fn(&Node) -> io::Result<Command> + Send + Sync + 'static,
         context: SamplerHash,
     ) -> OwnedSshUpdateTransport {
-        OwnedSshUpdateTransport { command: Box::new(factory), context, glue: b"inert-owned-transport-fixture\n", native: false }
+        OwnedSshUpdateTransport { command: Box::new(factory), context, glue: b"inert-owned-transport-fixture\n", native: None }
     }
     pub(in crate::helpers::remote_update) async fn execute(transport: &OwnedSshUpdateTransport, node: &Node, image: &Image<'_>) -> RemoteUpdateReply {
         transport.execute_image(node, image).await.reply
@@ -199,7 +247,7 @@ mod test_access {
         let (prefix, header) = image.header().unwrap();
         exchange(child, image, &prefix, &header, on_wait).await.reply
     }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "windows", target_arch = "x86_64")))]
     pub(in crate::helpers::remote_update) async fn wire_execute(
         transport: &OwnedSshUpdateTransport,
         node: &Node,
@@ -217,6 +265,17 @@ mod test_access {
         let mut transport = native_transport();
         transport.command = Box::new(factory);
         transport
+    }
+    #[cfg(any(all(target_os = "windows", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
+    pub(in crate::helpers::remote_update) fn windows_factory(
+        factory: impl Fn(&Node) -> io::Result<Command> + Send + Sync + 'static,
+    ) -> OwnedSshUpdateTransport {
+        let mut transport = windows_native();
+        transport.command = Box::new(factory);
+        transport
+    }
+    pub(in crate::helpers::remote_update) fn local_command_bound(command: &Command) -> Option<usize> {
+        command_line_bound(command)
     }
     pub(in crate::helpers::remote_update) fn command(node: &Node, launcher: &str) -> io::Result<Command> {
         ssh_command(node, launcher)

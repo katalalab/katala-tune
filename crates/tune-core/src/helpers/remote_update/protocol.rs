@@ -124,7 +124,7 @@ impl<'a> Image<'a> {
             source_hash: payload.sha256(),
             ttl_ms: 1,
             observation: "-",
-            before: payload.destination_observation().map_or(BeforeImageFact::Missing, |o| o.snapshot.before),
+            before: payload.destination_observation().map_or(BeforeImageFact::Missing, |o| o.snapshot.before()),
         }
     }
     pub(super) fn header(&self) -> Option<(String, String)> {
@@ -189,7 +189,8 @@ pub(super) struct Parser {
     pub facts: Option<PlacementFacts>,
     mode: ExchangeMode,
     before: BeforeImageFact,
-    pub observed: Option<super::observation::MacSnapshot>,
+    pub observed: Option<super::observation::DestinationSnapshot>,
+    target: String,
     pub inspect_failure: Option<super::macos::InspectFailure>,
 }
 impl Parser {
@@ -206,6 +207,7 @@ impl Parser {
             stage: RemoteUpdateStage::Started,
             facts: None,
             mode: image.mode,
+            target: image.target.into(),
             before: image.before,
             observed: None,
             inspect_failure: None,
@@ -251,7 +253,7 @@ impl Parser {
             }
             match *event {
                 "Observed" => {
-                    let Some(snapshot) = super::observation::MacSnapshot::parse(detail) else {
+                    let Some(snapshot) = super::observation::DestinationSnapshot::parse(&self.target, detail) else {
                         return false;
                     };
                     self.observed = Some(snapshot);
