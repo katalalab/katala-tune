@@ -37,8 +37,30 @@ if(mode==='partial-input') {
     fs.writeFileSync(path.join(root,'responded'),'yes');
     if(mode.startsWith('held'))hold();
     else if(mode==='descendant') {
-      cp.spawn(process.execPath,['-e',`const fs=require('node:fs');const p=process.argv[1];const t=setInterval(()=>{if(fs.existsSync(p)){clearInterval(t);process.exit(0)}},10);setTimeout(()=>process.exit(9),15000)`,path.join(root,'release')],{stdio:['ignore',1,2]});
-      process.exit(0);
+      // libuv's Windows non-detached child job ends with its Node parent.
+      // Only this fixture descendant must outlive that parent; no product work.
+      const child=cp.spawn(process.execPath,['-e',`
+const fs=require('node:fs'),path=require('node:path');const root=process.argv[1];
+setInterval(()=>{if(fs.existsSync(path.join(root,'release')))process.exit(0)},10);
+setTimeout(()=>process.exit(9),15000);
+try {
+  const out=process.stdout,err=process.stderr;
+  const ready={stdout:out.fd===1&&out.writable&&!out.destroyed,stderr:err.fd===2&&err.writable&&!err.destroyed};
+  if(!ready.stdout||!ready.stderr)throw new Error('stdio-not-ready');
+  fs.writeFileSync(path.join(root,'descendant-ready'),JSON.stringify(ready));
+} catch(_) {
+  fs.writeFileSync(path.join(root,'descendant-error'),JSON.stringify({cause:'stdio-not-ready'}));process.exit(8);
+}
+`,root],{detached:process.platform==='win32',windowsHide:true,stdio:['ignore',1,2]});
+      child.once('spawn',()=>fs.writeFileSync(path.join(root,'descendant-spawn'),JSON.stringify({spawned:true})));
+      child.once('error',()=>{
+        fs.writeFileSync(path.join(root,'descendant-error'),JSON.stringify({cause:'spawn'}));process.exit(8);
+      });
+      const ready=setInterval(()=>{
+        if(fs.existsSync(path.join(root,'descendant-error'))){clearInterval(ready);process.exit(8)}
+        if(fs.existsSync(path.join(root,'descendant-ready'))){clearInterval(ready);process.exit(0)}
+      },10);
+      setTimeout(()=>process.exit(9),15000);
     } else process.exitCode=mode==='nonzero'?7:0;
     };
     if(!mode.includes('lost'))process.stdout.write(response,finish);else finish();
@@ -151,16 +173,28 @@ async fn owned_exchange_actual_root_exit_still_waits_for_descendant_stdout_eof()
     let mut child = fixture.command(&frames(&image), "descendant").spawn().unwrap();
     let waited = tokio::sync::Notify::new();
     let mut future = Box::pin(super::ssh::exchange_child(&mut child, &image, || waited.notify_one()));
-    tokio::select! { _ = waited.notified() => {}, _ = &mut future => panic!("completed before descendant release") }
-    let early = tokio::time::timeout(Duration::from_millis(100), &mut future).await.ok();
+    // Collect precondition/early completion as values. No assertion may drop
+    // this owned exchange before explicit release, actual wait and pipe EOF.
+    let early = tokio::select! {
+        _ = waited.notified() => tokio::time::timeout(Duration::from_millis(100), &mut future).await.ok(),
+        reply = &mut future => Some(reply),
+    };
     let premature = early.is_some();
+    let read_fact = |name| std::fs::read(fixture.0.join(name)).ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let spawned = read_fact("descendant-spawn");
+    let ready = read_fact("descendant-ready");
+    let error = read_fact("descendant-error");
     fixture.release();
     let reply = match early {
         Some(reply) => reply,
         None => (&mut future).await,
     };
     drop(future);
-    assert!(child.wait().await.unwrap().success());
+    let status = child.wait().await;
+    assert!(status.is_ok_and(|status| status.success()), "retained actual root wait must succeed");
+    assert_eq!(spawned, Some(serde_json::json!({"spawned":true})), "descendant must actually spawn");
+    assert_eq!(ready, Some(serde_json::json!({"stdout":true,"stderr":true})), "descendant must hold both inherited writable stdio handles");
+    assert_eq!(error, None, "descendant spawn/stdio failure is not a valid held-pipe fixture");
     assert!(!premature, "actual root exit is insufficient while stdout/stderr remain held");
     assert!(accepted(&reply, &hash));
     fixture.cleanup();
