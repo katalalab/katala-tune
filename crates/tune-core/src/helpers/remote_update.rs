@@ -1,5 +1,5 @@
 //! One explicitly selected remote placement, owned by the controlled monitor.
-//! There is deliberately no production constructor or default source in this module.
+//! Native transport remains opt-in; the GPUI default has no update backend.
 use super::native_install::PreparedNativeSampler;
 use crate::{
     engine::Engine,
@@ -116,6 +116,7 @@ pub struct RemoteUpdateRequest {
     expires: Instant,
     target: RemoteTargetSnapshot,
     prepared: PreparedNativeSampler,
+    observation: Option<RemoteDestinationObservation>,
 }
 impl RemoteUpdateRequest {
     pub fn new(attempt_id: u64, start_seq: u64, expires: Instant, target: RemoteTargetSnapshot, prepared: PreparedNativeSampler) -> Result<Self, Refusal> {
@@ -131,7 +132,18 @@ impl RemoteUpdateRequest {
         if prepared.version() != super::VERSION || prepared.build_target() != expected || !super::binary::declared_target(prepared.remote_bytes(), expected) {
             return Err(Refusal::Source);
         }
-        Ok(Self { attempt_id, token: AttemptToken::fresh(attempt_id), start_seq, expires, target, prepared })
+        Ok(Self { attempt_id, token: AttemptToken::fresh(attempt_id), start_seq, expires, target, prepared, observation: None })
+    }
+    pub fn with_observation(mut self, observation: RemoteDestinationObservation) -> Result<Self, Refusal> {
+        if self.observation.is_some() {
+            return Err(Refusal::InvalidRequest);
+        }
+        observation.check(&self, &self.target.node)?;
+        self.observation = Some(observation);
+        Ok(self)
+    }
+    fn payload(&self) -> RemoteUpdatePayload<'_> {
+        RemoteUpdatePayload { request: self }
     }
     fn validate(&self, engine: &Engine, live: &Live) -> Result<(), Refusal> {
         let (cfg, settings) = monitor::controlled_inputs(engine).map_err(|_| Refusal::Inputs)?;
@@ -158,27 +170,29 @@ impl RemoteUpdateRequest {
 }
 /// Borrowed immutable prepared bytes. No caller can construct an unvalidated payload.
 pub struct RemoteUpdatePayload<'a> {
-    token: AttemptToken,
-    prepared: &'a PreparedNativeSampler,
+    request: &'a RemoteUpdateRequest,
 }
 impl RemoteUpdatePayload<'_> {
     pub fn attempt_token(&self) -> AttemptToken {
-        self.token
+        self.request.token
+    }
+    pub fn destination_observation(&self) -> Option<&RemoteDestinationObservation> {
+        self.request.observation.as_ref()
     }
     pub fn version(&self) -> &str {
-        self.prepared.version()
+        self.request.prepared.version()
     }
     pub fn build_target(&self) -> &str {
-        self.prepared.build_target()
+        self.request.prepared.build_target()
     }
     pub fn manifest_sha256(&self) -> &str {
-        self.prepared.manifest_sha256()
+        self.request.prepared.manifest_sha256()
     }
     pub fn bytes(&self) -> &[u8] {
-        self.prepared.remote_bytes()
+        self.request.prepared.remote_bytes()
     }
     pub fn sha256(&self) -> &str {
-        self.prepared.sampler_sha256()
+        self.request.prepared.sampler_sha256()
     }
     pub fn expected_response(&self) -> String {
         format!("placed-{}", self.sha256())
@@ -192,6 +206,7 @@ pub struct RemoteUpdateReply {
     response_complete: bool,
     local_settled: bool,
     facts: Option<PlacementFacts>,
+    before_start_refusal: Option<Refusal>,
 }
 impl RemoteUpdateReply {
     /// Synthetic/third-party implementations assert all local owned work is
@@ -204,13 +219,16 @@ impl RemoteUpdateReply {
             .filter(|s| s.len() == 64 && s.iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)))
             .and_then(|s| std::str::from_utf8(s).ok())
             .map(str::to_owned);
-        Self { code, hash, stage, response_complete, local_settled: true, facts: None }
+        Self { code, hash, stage, response_complete, local_settled: true, facts: None, before_start_refusal: None }
     }
 }
 pub type RemoteUpdateFuture<'a> = Pin<Box<dyn Future<Output = RemoteUpdateReply> + Send + 'a>>;
-/// Implementations must own their work through completion. This slice supplies
-/// no production constructor; the legacy killing System runner is excluded.
+/// Implementations must own their work through completion. The native backend
+/// is opt-in; the legacy killing System runner is excluded.
 pub trait RemoteUpdateTransport: Send + Sync {
+    fn preflight(&self, _node: &Node, _payload: RemoteUpdatePayload<'_>) -> Result<(), Refusal> {
+        Ok(())
+    }
     fn place<'a>(&'a self, node: &'a Node, payload: RemoteUpdatePayload<'a>) -> RemoteUpdateFuture<'a>;
 }
 /// Non-cloneable checked admission, held only across the short host/Gate boundary.
@@ -251,6 +269,7 @@ impl RemoteUpdateControl {
     pub fn check_admission(&self, engine: &Engine, live: &Live, update: RemoteUpdateRequest) -> Result<CheckedRemoteUpdate, AdmissionError> {
         self.available()?;
         update.validate(engine, live).map_err(AdmissionError::Refused)?;
+        self.transport.preflight(&update.target.node, update.payload()).map_err(AdmissionError::Refused)?;
         Ok(CheckedRemoteUpdate(update))
     }
     /// Memory-only registration. Core rechecks current inputs before claim;
@@ -369,7 +388,7 @@ impl RemoteUpdateControl {
             if !super::agent_outdated(&r.target.node, live.brief(&r.target.node.id).as_ref()) {
                 return Err(Refusal::Target);
             }
-            Ok(())
+            self.transport.preflight(&r.target.node, r.payload())
         });
         if let Err(reason) = valid {
             state.slot = Slot::Finished(RemoteUpdateOutcome::Refused { attempt_id: id, reason });
@@ -380,9 +399,7 @@ impl RemoteUpdateControl {
     }
     pub(crate) async fn execute(&self, update: RemoteUpdateRequest) {
         let attempt_id = update.attempt_id;
-        let future = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.transport.place(&update.target.node, RemoteUpdatePayload { token: update.token, prepared: &update.prepared })
-        }));
+        let future = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.transport.place(&update.target.node, update.payload())));
         let observed = match future {
             Ok(mut future) => {
                 std::future::poll_fn(|cx| match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx))) {
@@ -397,6 +414,7 @@ impl RemoteUpdateControl {
         let local_settled = observed.as_ref().is_ok_and(|reply| reply.local_settled);
         let facts = observed.as_ref().ok().and_then(|reply| reply.facts);
         let outcome = match observed {
+            Ok(reply) if reply.before_start_refusal.is_some() => RemoteUpdateOutcome::Refused { attempt_id, reason: reply.before_start_refusal.unwrap() },
             Ok(reply)
                 if reply.local_settled
                     && reply.response_complete
@@ -428,11 +446,18 @@ impl RemoteUpdateControl {
     }
 }
 
+mod macos;
+mod observation;
+pub use macos::{InspectFailure, RemoteInspectError};
+pub use observation::RemoteDestinationObservation;
 mod protocol;
 mod ssh;
-pub use protocol::{AttemptToken, PlacementDisposition, PlacementFacts, SamplerHash};
+pub use protocol::{AttemptToken, BeforeImageFact, PlacementDisposition, PlacementFacts, SamplerHash};
 pub use ssh::OwnedSshUpdateTransport;
 #[cfg(test)]
 mod ssh_tests;
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod macos_tests;

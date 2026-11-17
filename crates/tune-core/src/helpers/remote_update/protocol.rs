@@ -48,6 +48,9 @@ impl SamplerHash {
         }
         Some(Self(bytes))
     }
+    pub(super) fn raw(&self) -> &[u8] {
+        &self.0
+    }
     pub fn hex(self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -59,19 +62,36 @@ pub enum PlacementDisposition {
     Unchanged,
     Failed,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BeforeImageFact {
+    Missing,
+    Present(SamplerHash),
+}
+impl BeforeImageFact {
+    pub fn hash(self) -> Option<SamplerHash> {
+        match self {
+            Self::Missing => None,
+            Self::Present(h) => Some(h),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExchangeMode {
+    Inspect,
+    Place,
+}
 /// Bounded evidence only. A progress fact is not a present remote-state proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlacementFacts {
     pub token: AttemptToken,
-    pub old_hash: Option<SamplerHash>,
+    pub before: BeforeImageFact,
     pub new_hash: SamplerHash,
     pub disposition: PlacementDisposition,
     pub retained_backup: bool,
     pub rollback_observed: bool,
 }
 
-/// Private trusted boundary; B/C must supply native-bound context and fixed glue.
-/// Only test factories can currently construct an image/context in this module tree.
+/// Fixed native or private synthetic image; no public wire construction.
 pub(super) struct Image<'a> {
     pub token: AttemptToken,
     pub version: &'a str,
@@ -81,6 +101,12 @@ pub(super) struct Image<'a> {
     pub context: SamplerHash,
     pub glue: &'static [u8],
     pub bytes: &'a [u8],
+    pub mode: ExchangeMode,
+    pub source_size: usize,
+    pub source_hash: &'a str,
+    pub ttl_ms: u64,
+    pub observation: &'a str,
+    pub before: BeforeImageFact,
 }
 impl<'a> Image<'a> {
     pub(super) fn payload(payload: &'a RemoteUpdatePayload<'a>, context: SamplerHash, glue: &'static [u8]) -> Self {
@@ -93,6 +119,12 @@ impl<'a> Image<'a> {
             context,
             glue,
             bytes: payload.bytes(),
+            mode: ExchangeMode::Place,
+            source_size: payload.bytes().len(),
+            source_hash: payload.sha256(),
+            ttl_ms: 1,
+            observation: "-",
+            before: payload.destination_observation().map_or(BeforeImageFact::Missing, |o| o.snapshot.before),
         }
     }
     pub(super) fn header(&self) -> Option<(String, String)> {
@@ -104,23 +136,42 @@ impl<'a> Image<'a> {
             || SamplerHash::parse(self.hash).is_none()
             || self.glue.len() > GLUE_LIMIT
             || self.bytes.len() > SAMPLER_LIMIT
+            || self.source_size == 0
+            || self.source_size > SAMPLER_LIMIT
+            || SamplerHash::parse(self.source_hash).is_none()
+            || !(1..=120000).contains(&self.ttl_ms)
+            || self.observation.len() > 3072
+            || !self.observation.is_ascii()
+            || self.observation.contains(['\n', '\r'])
+            || match self.mode {
+                ExchangeMode::Inspect => !self.bytes.is_empty() || self.hash != crate::db::sha256_hex(b"") || self.observation != "-",
+                ExchangeMode::Place => self.bytes.len() != self.source_size || self.hash != self.source_hash,
+            }
         {
             return None;
         }
         let header = format!(
-            "token={}\nversion={}\ntarget={}\nmanifest={}\nsize={}\nsha256={}\ncontext={}\n",
+            "token={}\nversion={}\ntarget={}\nmanifest={}\nsize={}\nsha256={}\ncontext={}\nmode={}\nsource-size={}\nsource-sha256={}\nttl-ms={}\nobservation={}\n",
             self.token.as_str(),
             self.version,
             self.target,
             self.manifest,
             self.bytes.len(),
             self.hash,
-            self.context.hex()
+            self.context.hex(),
+            match self.mode {
+                ExchangeMode::Inspect => "inspect",
+                ExchangeMode::Place => "place",
+            },
+            self.source_size,
+            self.source_hash,
+            self.ttl_ms,
+            self.observation
         );
         if header.len() > HEADER_LIMIT {
             return None;
         }
-        let prefix = format!("KTU1 {} {} {}\n", header.len(), self.glue.len(), self.bytes.len());
+        let prefix = format!("KTU2 {} {} {}\n", header.len(), self.glue.len(), self.bytes.len());
         Some((prefix, header))
     }
 }
@@ -136,13 +187,17 @@ pub(super) struct Parser {
     terminal: bool,
     pub stage: RemoteUpdateStage,
     pub facts: Option<PlacementFacts>,
+    mode: ExchangeMode,
+    before: BeforeImageFact,
+    pub observed: Option<super::observation::MacSnapshot>,
+    pub inspect_failure: Option<super::macos::InspectFailure>,
 }
 impl Parser {
     pub(super) fn new(image: &Image<'_>) -> Self {
         Self {
             token: image.token,
             context: image.context,
-            expected: SamplerHash::parse(image.hash).unwrap(),
+            expected: SamplerHash::parse(image.source_hash).unwrap(),
             line: Vec::new(),
             total: 0,
             frames: 0,
@@ -150,6 +205,10 @@ impl Parser {
             terminal: false,
             stage: RemoteUpdateStage::Started,
             facts: None,
+            mode: image.mode,
+            before: image.before,
+            observed: None,
+            inspect_failure: None,
         }
     }
     pub(super) fn feed(&mut self, bytes: &[u8]) {
@@ -179,10 +238,39 @@ impl Parser {
             return false;
         };
         let fields: Vec<_> = text.split(' ').collect();
+        if self.mode == ExchangeMode::Inspect {
+            let ["KTU2", token, context, event, hash, detail] = fields.as_slice() else {
+                return false;
+            };
+            if self.frames != 1
+                || AttemptToken::parse(token) != Some(self.token)
+                || SamplerHash::parse(context) != Some(self.context)
+                || SamplerHash::parse(hash) != Some(self.expected)
+            {
+                return false;
+            }
+            match *event {
+                "Observed" => {
+                    let Some(snapshot) = super::observation::MacSnapshot::parse(detail) else {
+                        return false;
+                    };
+                    self.observed = Some(snapshot);
+                }
+                "InspectFailed" => {
+                    let Some(reason) = super::macos::InspectFailure::parse(detail) else {
+                        return false;
+                    };
+                    self.inspect_failure = Some(reason);
+                }
+                _ => return false,
+            }
+            self.terminal = true;
+            return true;
+        }
         let [protocol, token, context, event, new, old, backup, rollback] = fields.as_slice() else {
             return false;
         };
-        if *protocol != "KTU1"
+        if *protocol != "KTU2"
             || AttemptToken::parse(token) != Some(self.token)
             || SamplerHash::parse(context) != Some(self.context)
             || SamplerHash::parse(new) != Some(self.expected)
@@ -203,19 +291,27 @@ impl Parser {
             ("0", "1") => (false, true),
             _ => return false,
         };
-        let prior = self.facts;
+        if old_hash != self.before.hash() {
+            return false;
+        }
+        let present = matches!(self.before, BeforeImageFact::Present(_));
         let disposition = match (*event, self.frames) {
-            ("Started", 1) if old_hash.is_none() && !retained_backup && !rollback_observed => PlacementDisposition::Progress,
-            ("Staged", 2) if old_hash.is_none() && !retained_backup && !rollback_observed => {
+            ("Started", 1) if !retained_backup && !rollback_observed => PlacementDisposition::Progress,
+            ("Staged", 2) if !retained_backup && !rollback_observed => {
                 self.stage = RemoteUpdateStage::Staged;
                 PlacementDisposition::Progress
             }
-            ("BackedUp", 3) if self.stage == RemoteUpdateStage::Staged && old_hash.is_some() && retained_backup && !rollback_observed => {
+            ("BackedUp", 3) if present && self.stage == RemoteUpdateStage::Staged && retained_backup && !rollback_observed => {
                 self.stage = RemoteUpdateStage::BackedUp;
                 PlacementDisposition::Progress
             }
-            ("Placed", 4)
-                if self.stage == RemoteUpdateStage::BackedUp && prior.is_some_and(|p| p.old_hash == old_hash) && retained_backup && !rollback_observed =>
+            ("Placed", n)
+                if !rollback_observed
+                    && if present {
+                        n == 4 && self.stage == RemoteUpdateStage::BackedUp && retained_backup
+                    } else {
+                        n == 3 && self.stage == RemoteUpdateStage::Staged && !retained_backup
+                    } =>
             {
                 self.stage = RemoteUpdateStage::Placed;
                 self.terminal = true;
@@ -227,10 +323,11 @@ impl Parser {
                 PlacementDisposition::Unchanged
             }
             ("Failed", 2..=4)
-                if prior.is_some()
+                if self.facts.is_some()
                     && match self.stage {
-                        RemoteUpdateStage::BackedUp => prior.is_some_and(|p| p.old_hash == old_hash) && (retained_backup || rollback_observed),
-                        _ => old_hash.is_none() && !retained_backup && !rollback_observed,
+                        RemoteUpdateStage::BackedUp => present,
+                        RemoteUpdateStage::Staged if !present => !retained_backup,
+                        _ => !retained_backup && !rollback_observed,
                     } =>
             {
                 self.terminal = true;
@@ -238,7 +335,7 @@ impl Parser {
             }
             _ => return false,
         };
-        self.facts = Some(PlacementFacts { token: self.token, old_hash, new_hash: self.expected, disposition, retained_backup, rollback_observed });
+        self.facts = Some(PlacementFacts { token: self.token, before: self.before, new_hash: self.expected, disposition, retained_backup, rollback_observed });
         true
     }
     pub(super) fn complete(&self) -> bool {

@@ -11,34 +11,76 @@ use tokio::{
 };
 
 type CommandFactory = dyn Fn(&Node) -> io::Result<Command> + Send + Sync;
-/// Opaque until reviewed native inspect/placement binds Node/account/canonical
-/// destination to context and supplies fixed glue. There is no production constructor.
+/// Opt-in native transport. Only a bound native observation can place bytes.
 pub struct OwnedSshUpdateTransport {
     command: Box<CommandFactory>,
     context: SamplerHash,
     glue: &'static [u8],
+    native: bool,
 }
 impl RemoteUpdateTransport for OwnedSshUpdateTransport {
+    fn preflight(&self, node: &Node, payload: RemoteUpdatePayload<'_>) -> Result<(), super::Refusal> {
+        if self.native { super::macos::preflight(node, payload) } else { Ok(()) }
+    }
     fn place<'a>(&'a self, node: &'a Node, payload: RemoteUpdatePayload<'a>) -> RemoteUpdateFuture<'a> {
         Box::pin(async move {
-            let image = Image::payload(&payload, self.context, self.glue);
-            self.execute(node, &image).await
+            if let Err(reason) = self.preflight(node, payload.request.payload()) {
+                let mut reply = unknown();
+                reply.before_start_refusal = Some(reason);
+                return reply;
+            }
+            let context = if self.native { super::observation::place_context(payload.destination_observation().unwrap()) } else { self.context };
+            let mut image = Image::payload(&payload, context, self.glue);
+            if self.native {
+                image.ttl_ms = match super::observation::remaining(payload.request) {
+                    Ok(ttl) => ttl,
+                    Err(reason) => {
+                        let mut reply = unknown();
+                        reply.before_start_refusal = Some(reason);
+                        return reply;
+                    }
+                };
+                image.observation = &payload.destination_observation().unwrap().snapshot.record;
+            } else {
+                // Trusted synthetic executor fixtures keep a fixed before image.
+                #[cfg(test)]
+                {
+                    image.before = super::BeforeImageFact::Present(SamplerHash::parse(&"b".repeat(64)).unwrap());
+                }
+            }
+            self.execute_image(node, &image).await.reply
         })
     }
 }
+pub(super) struct ExchangeResult {
+    pub reply: RemoteUpdateReply,
+    pub observed: Option<super::observation::MacSnapshot>,
+    pub failure: Option<super::macos::InspectFailure>,
+}
+pub(super) fn native_transport() -> OwnedSshUpdateTransport {
+    OwnedSshUpdateTransport {
+        command: Box::new(|node| ssh_command(node, &super::macos::launcher())),
+        context: SamplerHash::parse(&"0".repeat(64)).unwrap(),
+        glue: super::macos::GLUE,
+        native: true,
+    }
+}
 impl OwnedSshUpdateTransport {
-    async fn execute(&self, node: &Node, image: &Image<'_>) -> RemoteUpdateReply {
+    pub(super) fn is_native(&self) -> bool {
+        self.native
+    }
+    pub(super) async fn execute_image(&self, node: &Node, image: &Image<'_>) -> ExchangeResult {
+        let empty = || ExchangeResult { reply: unknown(), observed: None, failure: None };
         let Some((prefix, header)) = image.header().filter(|_| valid_alias(&node.alias)) else {
-            return unknown();
+            return empty();
         };
         let Ok(mut command) = (self.command)(node) else {
-            return unknown();
+            return empty();
         };
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(false);
         let Ok(mut child) = command.spawn() else {
-            return unknown();
+            return empty();
         };
-        // No owned branch is detached or canceled by an error in another branch.
         exchange(&mut child, image, &prefix, &header, || {}).await
     }
 }
@@ -51,10 +93,9 @@ fn valid_alias(alias: &str) -> bool {
         && alias.as_bytes()[0].is_ascii_alphanumeric()
         && alias.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
-/// Future native renderer calls this private builder with its fixed launcher.
+/// Native renderer calls this private builder with its fixed launcher.
 /// Never invoke the legacy timeout/kill runner. Options are built from scratch:
 /// OpenSSH uses the first value, so appending over SSH_OPTS is not an override.
-#[cfg_attr(not(test), expect(dead_code, reason = "production native launcher is deferred to B/C"))]
 fn ssh_command(node: &Node, fixed_launcher: &str) -> io::Result<Command> {
     if !valid_alias(&node.alias) {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
@@ -107,7 +148,7 @@ async fn stderr(mut pipe: impl AsyncRead + Unpin) -> bool {
 /// Child remains owned by the directly awaiting caller. The private on_wait
 /// observer lets tests prove *actual* root wait while descendant EOF is held;
 /// it does not replace wait or any production executor/parser/writer branch.
-async fn exchange(child: &mut Child, image: &Image<'_>, prefix: &str, header: &str, on_wait: impl FnOnce()) -> RemoteUpdateReply {
+async fn exchange(child: &mut Child, image: &Image<'_>, prefix: &str, header: &str, on_wait: impl FnOnce()) -> ExchangeResult {
     let stdin = child.stdin.take().expect("owned piped stdin");
     let out = child.stdout.take().expect("owned piped stdout");
     let err = child.stderr.take().expect("owned piped stderr");
@@ -127,14 +168,16 @@ async fn exchange(child: &mut Child, image: &Image<'_>, prefix: &str, header: &s
     };
     let (written, out_eof, err_ok, status) = tokio::join!(write_image(stdin, image, prefix, header), stdout(out, &mut parser), stderr(err), wait);
     let complete = written.is_ok() && out_eof && err_ok && parser.complete();
-    RemoteUpdateReply {
+    let reply = RemoteUpdateReply {
         code: status.code(),
         hash: (complete && parser.confirmed()).then(|| image.hash.to_owned()),
         stage: parser.stage,
         response_complete: complete,
         local_settled: true,
         facts: parser.facts,
-    }
+        before_start_refusal: None,
+    };
+    ExchangeResult { reply, observed: parser.observed, failure: parser.inspect_failure }
 }
 
 #[cfg(test)]
@@ -147,14 +190,33 @@ mod test_access {
         factory: impl Fn(&Node) -> io::Result<Command> + Send + Sync + 'static,
         context: SamplerHash,
     ) -> OwnedSshUpdateTransport {
-        OwnedSshUpdateTransport { command: Box::new(factory), context, glue: b"inert-owned-transport-fixture\n" }
+        OwnedSshUpdateTransport { command: Box::new(factory), context, glue: b"inert-owned-transport-fixture\n", native: false }
     }
     pub(in crate::helpers::remote_update) async fn execute(transport: &OwnedSshUpdateTransport, node: &Node, image: &Image<'_>) -> RemoteUpdateReply {
-        transport.execute(node, image).await
+        transport.execute_image(node, image).await.reply
     }
     pub(in crate::helpers::remote_update) async fn exchange_child(child: &mut Child, image: &Image<'_>, on_wait: impl FnOnce()) -> RemoteUpdateReply {
         let (prefix, header) = image.header().unwrap();
-        exchange(child, image, &prefix, &header, on_wait).await
+        exchange(child, image, &prefix, &header, on_wait).await.reply
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(in crate::helpers::remote_update) async fn wire_execute(
+        transport: &OwnedSshUpdateTransport,
+        node: &Node,
+        image: &Image<'_>,
+        prefix: &str,
+        header: &str,
+    ) -> ExchangeResult {
+        let mut command = (transport.command)(node).unwrap();
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(false);
+        let mut child = command.spawn().unwrap();
+        exchange(&mut child, image, prefix, header, || {}).await
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(in crate::helpers::remote_update) fn native_factory(factory: impl Fn(&Node) -> io::Result<Command> + Send + Sync + 'static) -> OwnedSshUpdateTransport {
+        let mut transport = native_transport();
+        transport.command = Box::new(factory);
+        transport
     }
     pub(in crate::helpers::remote_update) fn command(node: &Node, launcher: &str) -> io::Result<Command> {
         ssh_command(node, launcher)
