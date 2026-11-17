@@ -665,7 +665,8 @@ impl RemoteUpdateTransport for HeldUpdate {
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 fn update_request(engine: &Engine, dir: &std::path::Path, id: u64, seq: u64, ttl: Duration) -> RemoteUpdateRequest {
     let target = RemoteTargetSnapshot::checked(engine, "a", remote_update::tests::architecture()).unwrap();
-    RemoteUpdateRequest::new(id, seq, std::time::Instant::now() + ttl, target, remote_update::tests::prepared(dir, crate::helpers::VERSION)).unwrap()
+    let prepared = remote_update::tests::prepared(dir, crate::helpers::VERSION);
+    RemoteUpdateRequest::new(id, seq, std::time::Instant::now() + ttl, target, prepared).unwrap()
 }
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 async fn outdated(engine: &Engine, live: &Live) {
@@ -759,8 +760,9 @@ async fn controlled_update_rechecks_changed_or_invalid_inputs_before_claim() {
         outdated(&engine, &live).await;
         let transport = HeldUpdate::new(0);
         let updates = Arc::new(RemoteUpdateControl::new(transport.clone()));
-        let ttl = if scenario == "expiry" { Duration::from_millis(15) } else { Duration::from_secs(120) };
-        updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 1, 0, ttl)).unwrap();
+        updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 1, 0, Duration::from_secs(120))).unwrap();
+        assert!(updates.busy(), "{scenario}");
+        assert_eq!(updates.outcome(), None, "{scenario}");
         let mut ledger: Value = serde_json::from_slice(&std::fs::read(dir.join("nodes.json")).unwrap()).unwrap();
         match scenario {
             "missing" => {
@@ -786,7 +788,7 @@ async fn controlled_update_rechecks_changed_or_invalid_inputs_before_claim() {
                 engine.with_db(|d| d.set_meta("hubPull", &json!({"ok":true,"at":now_ms(),"fresh":true}))).unwrap();
             }
             "start" => tx.send_modify(|r| r.start_seq += 1),
-            "expiry" => tokio::time::sleep(Duration::from_millis(25)).await,
+            "expiry" => remote_update::tests::expire_pending(&updates),
             "ledger" => {}
             _ => unreachable!(),
         }
@@ -805,7 +807,11 @@ async fn controlled_update_rechecks_changed_or_invalid_inputs_before_claim() {
             })
             .await
             .unwrap();
-            assert!(matches!(updates.outcome(), Some(RemoteUpdateOutcome::Refused { .. })), "{scenario}");
+            if scenario == "expiry" {
+                assert_eq!(updates.outcome(), Some(RemoteUpdateOutcome::Refused { attempt_id: 1, reason: remote_update::Refusal::Expired }));
+            } else {
+                assert!(matches!(updates.outcome(), Some(RemoteUpdateOutcome::Refused { .. })), "{scenario}");
+            }
             tx.send_modify(|r| r.mode = RunMode::Exit);
             phase(&mut status, RunPhase::Exited).await;
             worker.await.unwrap();

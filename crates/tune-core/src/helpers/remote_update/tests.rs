@@ -25,6 +25,14 @@ pub(crate) fn prepared(root: &Path, version: &str) -> PreparedNativeSampler {
     super::super::native_install::prepare_native_sampler(&source).unwrap()
 }
 #[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+pub(crate) fn expire_pending(control: &super::RemoteUpdateControl) {
+    let mut state = control.state.lock().unwrap();
+    let super::Slot::Pending(update) = &mut state.slot else {
+        panic!("expected admitted Pending fixture");
+    };
+    update.expires = std::time::Instant::now();
+}
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 pub(crate) fn architecture() -> Option<RemoteArchitecture> {
     Some(if cfg!(windows) { RemoteArchitecture::X64 } else { RemoteArchitecture::Arm64 })
 }
