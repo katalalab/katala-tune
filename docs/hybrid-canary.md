@@ -31,7 +31,7 @@ node scripts/check-hybrid-canary.js target/debug/examples/hybrid-canary
 ```
 
 On Windows, pass `target/debug/examples/hybrid-canary.exe`. The Node harness
-bounds runtime to 10 seconds and output to 24 KiB; use it rather than an unbounded
+bounds runtime to 10 seconds using an unconditional child kill and output to 24 KiB; use it rather than an unbounded
 scheduler. A driver call has no library-level hard deadline. A timeout is a
 failed diagnostic, not evidence that the machine is offline. No background
 process is intentionally retained. Build artifacts remain in this checkout.

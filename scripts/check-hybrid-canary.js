@@ -54,11 +54,22 @@ function validateSnapshot(value, now = Date.now()) {
   return value;
 }
 
+// One direct, read-only probe process; never a shell or process tree. SIGKILL is
+// intentional: a stuck native driver must not extend the diagnostic lifetime by
+// ignoring SIGTERM. Node terminates the child unconditionally on Windows too.
+function runBounded(binary, args = [], timeoutMs = 10_000) {
+  integer(timeoutMs, 1, 10_000);
+  return execFileSync(binary, args, {
+    encoding: 'utf8', timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 24 * 1024,
+    windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
 if (require.main === module) {
   try {
     if (process.argv.length !== 3) throw Error('usage: node scripts/check-hybrid-canary.js PATH_TO_BUILT_EXAMPLE');
     const started = performance.now();
-    const output = execFileSync(path.resolve(process.argv[2]), [], { encoding: 'utf8', timeout: 10_000, maxBuffer: 24 * 1024, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const output = runBounded(path.resolve(process.argv[2]));
     const value = validateSnapshot(JSON.parse(output));
     // Local diagnostic only. Never makes an HTTP request or persists identity.
     console.log(JSON.stringify({ valid: true, elapsedMs: performance.now() - started, snapshot: value }));
@@ -68,4 +79,4 @@ if (require.main === module) {
     process.exitCode = 1;
   }
 }
-module.exports = { validateSnapshot };
+module.exports = { validateSnapshot, runBounded };

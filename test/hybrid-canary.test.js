@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { validateSnapshot } = require('../scripts/check-hybrid-canary');
+const { validateSnapshot, runBounded } = require('../scripts/check-hybrid-canary');
 const now = 1_800_000_000_000;
 const observed = value => ({ value, status: 'observed', reason: null });
 const unknown = reason => ({ value: null, status: 'unknown', reason });
@@ -38,4 +38,25 @@ test('hybrid rejects stale, future, unprimed, malformed and identifying data', (
     const value = fixture(); mutate(value);
     assert.throws(() => validateSnapshot(value, now));
   }
+});
+
+test('hybrid timeout kills a child even when it ignores SIGTERM', () => {
+  const started = performance.now();
+  assert.throws(() => runBounded(process.execPath,
+    ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], 200),
+    error => error.code === 'ETIMEDOUT');
+  assert.ok(performance.now() - started < 5000, 'ignored SIGTERM must not hang the harness');
+});
+test('hybrid bounds output and never forwards raw stderr', () => {
+  const { spawnSync } = require('node:child_process');
+  const child = spawnSync(process.execPath, ['-e', `
+    const {runBounded} = require('./scripts/check-hybrid-canary');
+    try { runBounded(process.execPath, ['-e', 'console.error("RAW_PRIVATE_SENTINEL"); process.exit(1)']); }
+    catch { process.stdout.write('sanitized'); }
+  `], { encoding: 'utf8', timeout: 5000, killSignal: 'SIGKILL' });
+  assert.equal(child.status, 0);
+  assert.equal(child.stdout, 'sanitized');
+  assert.equal(child.stderr, '');
+  assert.throws(() => runBounded(process.execPath,
+    ['-e', "process.stdout.write('x'.repeat(100000))"]), error => error.code === 'ENOBUFS');
 });
