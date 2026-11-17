@@ -8,3 +8,4 @@ crates/tune-core/src/topology/adapters/docker_api.rs text eol=lf
 crates/tune-core/src/topology/adapters/docker_api/** text eol=lf
 crates/tune-core/src/topology/adapters/docker.rs text eol=lf
 crates/tune-core/src/topology/candidates.rs text eol=lf
+crates/tune-core/src/helpers/remote_update/windows_glue.ps1 text eol=lf

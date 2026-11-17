@@ -640,7 +640,60 @@ public static class Ktu2Fixture {{
     }
     #[tokio::test]
     async fn same_bridge_boot_abi_agrees_across_processes_and_account_acl_inputs_are_bounded() {
-        let source = r#"public class F{static void Reject(Action f){bool rejected=false;try{f();}catch(Ktu2.Failure){rejected=true;}Ktu2.Need(rejected);}static byte[] Sd(string s){RawSecurityDescriptor d=new RawSecurityDescriptor(s);byte[] b=new byte[d.BinaryLength];d.GetBinaryForm(b,0);return b;}public static int Run(Stream s,byte[] b,long n,long q,long frequency){var h=Ktu2.Header.Parse(b,(ulong)n);Ktu2.Need(s.ReadByte()==-1);string boot=Ktu2.Boot();var lease=Ktu2.Lease.Start(h.Ttl,q,frequency);lease.Check();Ktu2.Need(lease.BootId==boot);byte[] sid=Ktu2.KnownSid(21,1,2,3,1001);string sidText=new SecurityIdentifier(sid,0).Value;string profile=\"C:\\\\Example\\\\fixture\";string bash=Ktu2.Hex(Encoding.UTF8.GetBytes(\"/c/Example/fixture\"));string native=Ktu2.Hex(Encoding.UTF8.GetBytes(profile));Ktu2.ValidateAccount(sid,profile,profile,profile,bash,native);Reject(delegate{Ktu2.ValidateAccount(sid,profile,profile.ToLowerInvariant(),profile,bash,native);});byte[] safe=Sd(\"O:\"+sidText+\"D:(A;;FA;;;\"+sidText+\")\");Ktu2.SecurityBytes(safe,(uint)safe.Length,sid,false);byte[] ancestor=Sd(\"O:\"+sidText+\"D:(A;;0x2;;;WD)\");Ktu2.SecurityBytes(ancestor,(uint)ancestor.Length,sid,true);Reject(delegate{Ktu2.SecurityBytes(ancestor,(uint)ancestor.Length,sid,false);});byte[] unsafeMask=Sd(\"O:\"+sidText+\"D:(A;;GW;;;WD)\");Reject(delegate{Ktu2.SecurityBytes(unsafeMask,(uint)unsafeMask.Length,sid,true);});Reject(delegate{Ktu2.SecurityBytes(safe,16385,sid,false);});byte[] bad=(byte[])safe.Clone();int acl=(int)BitConverter.ToUInt32(bad,16);bad[acl+8]=5;Reject(delegate{Ktu2.SecurityBytes(bad,(uint)bad.Length,sid,false);});bad=(byte[])safe.Clone();bad[acl+9]=32;Reject(delegate{Ktu2.SecurityBytes(bad,(uint)bad.Length,sid,false);});bad=(byte[])safe.Clone();bad[acl+2]=255;bad[acl+3]=255;Reject(delegate{Ktu2.SecurityBytes(bad,(uint)bad.Length,sid,false);});Ktu2.Need(!Ktu2.SidBytes(new byte[]{1,16,0,0,0,0,0,5}));var output=Console.OpenStandardOutput();new Ktu2.Wire(output,h).Emit(\"Observed\",RECORD.Replace(\"|01010101010101010101010101010101|\",\"|\"+boot+\"|\"));output.Flush();return 0;}}"#;
+        let source = r#"
+public class F {
+    static void Reject(Action f) {
+        bool rejected=false;
+        try { f(); } catch(Ktu2.Failure) { rejected=true; }
+        Ktu2.Need(rejected);
+    }
+    static byte[] Sd(string s) {
+        RawSecurityDescriptor d=new RawSecurityDescriptor(s);
+        byte[] b=new byte[d.BinaryLength];
+        d.GetBinaryForm(b,0);
+        return b;
+    }
+    public static int Run(Stream s,byte[] b,long n,long q,long frequency) {
+        var h=Ktu2.Header.Parse(b,(ulong)n);
+        Ktu2.Need(s.ReadByte()==-1);
+        string boot=Ktu2.Boot();
+        var lease=Ktu2.Lease.Start(h.Ttl,q,frequency);
+        lease.Check();
+        Ktu2.Need(lease.BootId==boot);
+        byte[] sid=Ktu2.KnownSid(21,1,2,3,1001);
+        string sidText=new SecurityIdentifier(sid,0).Value;
+        string profile="C:\\Example\\fixture";
+        string bash=Ktu2.Hex(Encoding.UTF8.GetBytes("/c/Example/fixture"));
+        string native=Ktu2.Hex(Encoding.UTF8.GetBytes(profile));
+        Ktu2.ValidateAccount(sid,profile,profile,profile,bash,native);
+        Reject(delegate { Ktu2.ValidateAccount(sid,profile,profile.ToLowerInvariant(),profile,bash,native); });
+        byte[] safe=Sd("O:"+sidText+"D:(A;;FA;;;"+sidText+")");
+        Ktu2.SecurityBytes(safe,(uint)safe.Length,sid,false);
+        byte[] ancestor=Sd("O:"+sidText+"D:(A;;0x2;;;WD)");
+        Ktu2.SecurityBytes(ancestor,(uint)ancestor.Length,sid,true);
+        Reject(delegate { Ktu2.SecurityBytes(ancestor,(uint)ancestor.Length,sid,false); });
+        byte[] unsafeMask=Sd("O:"+sidText+"D:(A;;GW;;;WD)");
+        Reject(delegate { Ktu2.SecurityBytes(unsafeMask,(uint)unsafeMask.Length,sid,true); });
+        Reject(delegate { Ktu2.SecurityBytes(safe,16385,sid,false); });
+        byte[] bad=(byte[])safe.Clone();
+        int acl=(int)BitConverter.ToUInt32(bad,16);
+        bad[acl+8]=5;
+        Reject(delegate { Ktu2.SecurityBytes(bad,(uint)bad.Length,sid,false); });
+        bad=(byte[])safe.Clone();
+        bad[acl+9]=32;
+        Reject(delegate { Ktu2.SecurityBytes(bad,(uint)bad.Length,sid,false); });
+        bad=(byte[])safe.Clone();
+        bad[acl+2]=255;
+        bad[acl+3]=255;
+        Reject(delegate { Ktu2.SecurityBytes(bad,(uint)bad.Length,sid,false); });
+        Ktu2.Need(!Ktu2.SidBytes(new byte[]{1,16,0,0,0,0,0,5}));
+        var output=Console.OpenStandardOutput();
+        new Ktu2.Wire(output,h).Emit("Observed",RECORD.Replace("|01010101010101010101010101010101|","|"+boot+"|"));
+        output.Flush();
+        return 0;
+    }
+}
+"#;
         let source = source.replace("RECORD", &serde_json::to_string(&record("M")).unwrap());
         let mut boots = vec![];
         for _ in 0..2 {
