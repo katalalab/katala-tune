@@ -105,6 +105,22 @@ jobs:
       - name: Tauri Linux compile with patched GLib
         if: runner.os == 'Linux'
         run: cargo check --locked -p katala-tune --all-targets
+      - name: Optional hybrid collector (no service or network)
+        run: |
+          cargo test -p tune-agent --example hybrid-canary --features hybrid-canary --locked
+          cargo clippy -p tune-agent --example hybrid-canary --features hybrid-canary --locked -- -D warnings
+      - name: Bounded local hybrid canary
+        shell: bash
+        run: |
+          cargo build -p tune-agent --example hybrid-canary --features hybrid-canary --locked
+          suffix=""
+          if [ "$RUNNER_OS" = Windows ]; then suffix=".exe"; fi
+          node scripts/check-hybrid-canary.js "target/debug/examples/hybrid-canary${suffix}"
+      - name: Hybrid collector MSRV (workspace declaration)
+        shell: bash
+        run: |
+          rustup toolchain install 1.90.0 --profile minimal
+          cargo +1.90.0 test -p tune-agent --example hybrid-canary --features hybrid-canary --locked
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo test
