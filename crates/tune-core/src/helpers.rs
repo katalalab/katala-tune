@@ -24,10 +24,6 @@ use crate::nodes::Node;
 mod binary;
 pub mod native_install;
 pub mod remote_update;
-#[cfg(test)]
-pub(crate) fn synthetic_sampler_bytes() -> Vec<u8> {
-    if cfg!(windows) { binary::fixtures::pe() } else { binary::fixtures::macho() }
-}
 
 /// この版（アプリ・CLI・サンプラーはワークスペースで同じ版）
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -748,11 +748,9 @@ async fn run_loop(
             iv.tick().await;
         }
         let now = now_ms();
-        let requested = control.as_mut().map(|(r, _, _, _)| *r.borrow_and_update());
+        let requested =
+            control.as_mut().map(|(r, _, _, updates)| if let Some(updates) = updates { updates.observe_request(r) } else { *r.borrow_and_update() });
         if requested.is_some_and(|r| r.mode == RunMode::Exit) {
-            if let Some(updates) = &updates {
-                updates.refuse_start(requested.unwrap().start_seq, crate::helpers::remote_update::Refusal::Session);
-            }
             release();
             control.as_ref().unwrap().2.send_replace(RunStatus { phase: RunPhase::Exited, policy: None, local_collecting: Some(false), hub_configured: false });
             return finished();
@@ -788,9 +786,6 @@ async fn run_loop(
         };
         collect &= running;
         if !running && !explicit_pull {
-            if let Some(updates) = &updates {
-                updates.refuse_start(requested.unwrap().start_seq, crate::helpers::remote_update::Refusal::Session);
-            }
             record_policy(&journal, &mut previous_policy, policy);
             release();
             control.as_ref().unwrap().2.send_replace(RunStatus {

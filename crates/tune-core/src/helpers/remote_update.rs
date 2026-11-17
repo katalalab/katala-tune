@@ -282,6 +282,19 @@ impl RemoteUpdateControl {
             state.slot = Slot::Finished(RemoteUpdateOutcome::Refused { attempt_id: r.attempt_id, reason });
         }
     }
+    /// Observe the latest watch value and retire invalid Pending work under the
+    /// same short watch -> slot boundary, including coalesced Start/stop changes.
+    /// A valid newer request and already Claimed work are preserved.
+    pub(crate) fn observe_request(&self, request: &mut watch::Receiver<RunRequest>) -> RunRequest {
+        let current = request.borrow_and_update();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Slot::Pending(update) = &state.slot
+            && let Err(reason) = update.current(&current)
+        {
+            state.slot = Slot::Finished(RemoteUpdateOutcome::Refused { attempt_id: update.attempt_id, reason });
+        }
+        *current
+    }
     pub(crate) fn refuse_start(&self, start_seq: u64, reason: Refusal) {
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Slot::Pending(r) = &state.slot

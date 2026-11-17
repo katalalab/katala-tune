@@ -611,10 +611,14 @@ async fn controlled_valid_ledger_removal_wins_over_malformed_settings() {
     assert!(active.is_empty() && !ui, "valid full-ledger removal must revoke even Ui ownership before rejecting malformed settings");
 }
 
+// Prepared native source and same-OS eligibility exist only for these tuples.
+// Earlier controlled tests and the CPU parser tests stay OS-independent.
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 use crate::helpers::remote_update::{
     self, RemoteTargetSnapshot, RemoteUpdateControl, RemoteUpdateFuture, RemoteUpdateOutcome, RemoteUpdatePayload, RemoteUpdateReply, RemoteUpdateRequest,
     RemoteUpdateStage, RemoteUpdateTransport,
 };
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 fn update_fixture() -> (Arc<Engine>, Arc<Live>, std::path::PathBuf) {
     let (engine, live, dir) = fixture();
     if cfg!(windows) {
@@ -623,17 +627,20 @@ fn update_fixture() -> (Arc<Engine>, Arc<Live>, std::path::PathBuf) {
     }
     (engine, live, dir)
 }
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 struct HeldUpdate {
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
     calls: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
     reply: u8,
 }
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 impl HeldUpdate {
     fn new(reply: u8) -> Arc<Self> {
         Arc::new(Self { entered: tokio::sync::Notify::new(), release: tokio::sync::Notify::new(), calls: std::sync::Mutex::new(Vec::new()), reply })
     }
 }
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 impl RemoteUpdateTransport for HeldUpdate {
     fn place<'a>(&'a self, node: &'a Node, payload: RemoteUpdatePayload<'a>) -> RemoteUpdateFuture<'a> {
         Box::pin(async move {
@@ -655,10 +662,12 @@ impl RemoteUpdateTransport for HeldUpdate {
         })
     }
 }
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 fn update_request(engine: &Engine, dir: &std::path::Path, id: u64, seq: u64, ttl: Duration) -> RemoteUpdateRequest {
     let target = RemoteTargetSnapshot::checked(engine, "a", remote_update::tests::architecture()).unwrap();
     RemoteUpdateRequest::new(id, seq, std::time::Instant::now() + ttl, target, remote_update::tests::prepared(dir, crate::helpers::VERSION)).unwrap()
 }
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 async fn outdated(engine: &Engine, live: &Live) {
     tokio::time::timeout(Duration::from_secs(2), async {
         while !crate::helpers::agent_outdated(&engine.config().nodes[0], live.brief("a").as_ref()) {
@@ -668,6 +677,7 @@ async fn outdated(engine: &Engine, live: &Live) {
     .await
     .unwrap();
 }
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 #[tokio::test]
 async fn controlled_update_exit_must_drain_fake_transport() {
     for exit in [false, true] {
@@ -706,6 +716,7 @@ async fn controlled_update_exit_must_drain_fake_transport() {
     }
 }
 
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 #[tokio::test]
 async fn controlled_update_target_only_and_immutable_prepared_source() {
     let (engine, live, dir) = update_fixture();
@@ -738,6 +749,7 @@ async fn controlled_update_target_only_and_immutable_prepared_source() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 #[tokio::test]
 async fn controlled_update_rechecks_changed_or_invalid_inputs_before_claim() {
     for scenario in ["missing", "duplicate", "alias", "raw", "status", "os", "local", "ledger", "settings", "disabled", "hub-fresh", "start", "expiry"] {
@@ -806,6 +818,7 @@ async fn controlled_update_rechecks_changed_or_invalid_inputs_before_claim() {
     }
 }
 
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 #[tokio::test]
 async fn controlled_update_pending_withdrawal_busy_and_attempt_binding() {
     let (engine, live, dir) = update_fixture();
@@ -847,6 +860,7 @@ async fn controlled_update_pending_withdrawal_busy_and_attempt_binding() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 #[tokio::test]
 async fn controlled_update_unknown_is_sticky_without_retry_or_unrelated_policy_change() {
     for reply in 1..=8 {
@@ -899,6 +913,7 @@ async fn controlled_update_unknown_is_sticky_without_retry_or_unrelated_policy_c
     }
 }
 
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 #[tokio::test]
 async fn controlled_update_pause_wins_while_claim_rechecks_blocked_inputs() {
     let (engine, live, dir) = update_fixture();
@@ -950,6 +965,7 @@ async fn controlled_update_pause_wins_while_claim_rechecks_blocked_inputs() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
 #[tokio::test]
 async fn controlled_update_rejects_prepared_binary_cpu_declared_as_other_cpu() {
     let (engine, live, dir) = update_fixture();
@@ -978,4 +994,81 @@ async fn controlled_update_rejects_prepared_binary_cpu_declared_as_other_cpu() {
     live.shutdown(Duration::from_secs(1)).await;
     drop((live, engine));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+#[tokio::test]
+async fn controlled_update_coalesced_start_then_exit_finishes_old_pending() {
+    let (engine, live, dir) = update_fixture();
+    let (tx, _rx, stx, _status) = channels(RunMode::Run);
+    live.start_owned(Owner::Ui, &engine.config().nodes[..1], &[]);
+    outdated(&engine, &live).await;
+    let transport = HeldUpdate::new(0);
+    let updates = Arc::new(RemoteUpdateControl::new(transport.clone()));
+    updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 1, 0, Duration::from_secs(120))).unwrap();
+    tx.send_modify(|r| {
+        r.start_seq = 1;
+        r.mode = RunMode::Run;
+    });
+    tx.send_modify(|r| r.mode = RunMode::Exit);
+    // The actual controlled worker first polls only the latest coalesced value.
+    let result = run_controlled(engine.clone(), live.clone(), |_| {}, tx, stx, Some(updates.clone())).await;
+    let outcome = updates.outcome();
+    let busy = updates.busy();
+    updates.withdraw(1); // RED cleanup only, after observing the terminal facts.
+    live.shutdown(Duration::from_secs(1)).await;
+    assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+    drop((live, engine));
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(transport.calls.lock().unwrap().len(), 0);
+    assert_eq!(outcome, Some(RemoteUpdateOutcome::Refused { attempt_id: 1, reason: remote_update::Refusal::Session }));
+    assert!(!busy);
+    assert_eq!(result.update_complete, Some(true));
+    assert_eq!(result.remote_update, outcome);
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+#[tokio::test]
+async fn controlled_update_coalesced_start_then_pause_releases_old_pending_for_new_attempt() {
+    let (engine, live, dir) = update_fixture();
+    let (tx, _rx, stx, mut status) = channels(RunMode::Run);
+    live.start_owned(Owner::Ui, &engine.config().nodes[..1], &[]);
+    outdated(&engine, &live).await;
+    let transport = HeldUpdate::new(0);
+    let updates = Arc::new(RemoteUpdateControl::new(transport.clone()));
+    updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 1, 0, Duration::from_secs(120))).unwrap();
+    tx.send_modify(|r| {
+        r.start_seq = 1;
+        r.mode = RunMode::Run;
+    });
+    tx.send_modify(|r| r.mode = RunMode::Paused);
+    let worker = tokio::spawn(run_controlled(engine.clone(), live.clone(), |_| {}, tx.clone(), stx, Some(updates.clone())));
+    phase(&mut status, RunPhase::Paused).await;
+    let outcome = updates.outcome();
+    let busy = updates.busy();
+    let old_calls = transport.calls.lock().unwrap().len();
+    tx.send_modify(|r| {
+        r.start_seq = 2;
+        r.mode = RunMode::Run;
+    });
+    let new_admission = updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 2, 2, Duration::from_secs(120)));
+    if new_admission.is_ok() {
+        tokio::time::timeout(Duration::from_secs(2), transport.entered.notified()).await.unwrap();
+        transport.release.notify_one();
+    } else {
+        updates.withdraw(1); // RED cleanup after observing the failed admission.
+    }
+    tx.send_modify(|r| r.mode = RunMode::Exit);
+    let result = worker.await.unwrap();
+    live.shutdown(Duration::from_secs(1)).await;
+    assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+    drop((live, engine));
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(old_calls, 0);
+    assert_eq!(outcome, Some(RemoteUpdateOutcome::Refused { attempt_id: 1, reason: remote_update::Refusal::Session }));
+    assert!(!busy);
+    assert_eq!(new_admission, Ok(()));
+    assert_eq!(result.update_complete, Some(true));
+    assert_eq!(result.remote_update, Some(RemoteUpdateOutcome::ConfirmedPlacement { attempt_id: 2 }));
+    assert_eq!(transport.calls.lock().unwrap().len(), 1);
 }
