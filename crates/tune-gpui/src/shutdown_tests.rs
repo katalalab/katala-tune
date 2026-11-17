@@ -655,7 +655,7 @@ async fn remote_update_owned_shutdown_keeps_join_placement_and_ack_separate() {
         transport.release.notify_one();
         let report = task.await.unwrap();
         assert_eq!(report.monitor_complete, Some(true));
-        assert_eq!(report.remote_update_complete, Some(true));
+        assert_eq!(report.remote_update_complete, Some(reply != 3));
         assert_eq!(report.journal_ack, Some(!missing_ack));
         assert_eq!(report.confirmed(), reply == 0 && !missing_ack);
         assert_eq!(report.manual_complete, None);

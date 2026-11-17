@@ -909,7 +909,7 @@ async fn controlled_update_unknown_is_sticky_without_retry_or_unrelated_policy_c
         assert_eq!(engine.with_db(|d| d.get_meta("monitor")).unwrap(), settings);
         tx.send_modify(|r| r.mode = RunMode::Exit);
         let exit = worker.await.unwrap();
-        assert_eq!(exit.update_complete, Some(true));
+        assert_eq!(exit.update_complete, Some(reply != 5));
         assert_eq!(exit.remote_update, Some(outcome));
         assert_eq!(transport.calls.lock().unwrap().len(), 1);
         live.shutdown(Duration::from_secs(1)).await;

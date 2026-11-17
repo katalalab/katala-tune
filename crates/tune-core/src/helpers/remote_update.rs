@@ -1,5 +1,5 @@
 //! One explicitly selected remote placement, owned by the controlled monitor.
-//! There is deliberately no System transport or default source in this module.
+//! There is deliberately no production constructor or default source in this module.
 use super::native_install::PreparedNativeSampler;
 use crate::{
     engine::Engine,
@@ -111,6 +111,7 @@ fn unique<'a>(cfg: &'a Config, id: &str) -> Result<&'a Node, Refusal> {
 #[derive(Debug)]
 pub struct RemoteUpdateRequest {
     attempt_id: u64,
+    token: AttemptToken,
     start_seq: u64,
     expires: Instant,
     target: RemoteTargetSnapshot,
@@ -130,7 +131,7 @@ impl RemoteUpdateRequest {
         if prepared.version() != super::VERSION || prepared.build_target() != expected || !super::binary::declared_target(prepared.remote_bytes(), expected) {
             return Err(Refusal::Source);
         }
-        Ok(Self { attempt_id, start_seq, expires, target, prepared })
+        Ok(Self { attempt_id, token: AttemptToken::fresh(attempt_id), start_seq, expires, target, prepared })
     }
     fn validate(&self, engine: &Engine, live: &Live) -> Result<(), Refusal> {
         let (cfg, settings) = monitor::controlled_inputs(engine).map_err(|_| Refusal::Inputs)?;
@@ -157,9 +158,22 @@ impl RemoteUpdateRequest {
 }
 /// Borrowed immutable prepared bytes. No caller can construct an unvalidated payload.
 pub struct RemoteUpdatePayload<'a> {
+    token: AttemptToken,
     prepared: &'a PreparedNativeSampler,
 }
 impl RemoteUpdatePayload<'_> {
+    pub fn attempt_token(&self) -> AttemptToken {
+        self.token
+    }
+    pub fn version(&self) -> &str {
+        self.prepared.version()
+    }
+    pub fn build_target(&self) -> &str {
+        self.prepared.build_target()
+    }
+    pub fn manifest_sha256(&self) -> &str {
+        self.prepared.manifest_sha256()
+    }
     pub fn bytes(&self) -> &[u8] {
         self.prepared.remote_bytes()
     }
@@ -176,22 +190,26 @@ pub struct RemoteUpdateReply {
     hash: Option<String>,
     stage: RemoteUpdateStage,
     response_complete: bool,
+    local_settled: bool,
+    facts: Option<PlacementFacts>,
 }
 impl RemoteUpdateReply {
-    /// Set response_complete only after the owned response IO finishes. An exit
-    /// code and matching marker from an incomplete stream remain Unknown.
+    /// Synthetic/third-party implementations assert all local owned work is
+    /// settled when returning this observation, even if the response was lost.
+    /// An exit code and matching marker from an incomplete stream stay Unknown.
+    /// OwnedSshUpdateTransport constructs its reply only after join/wait/EOF.
     pub fn observed(code: Option<i32>, response: &[u8], stage: RemoteUpdateStage, response_complete: bool) -> Self {
         let hash = response
             .strip_prefix(b"placed-")
             .filter(|s| s.len() == 64 && s.iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)))
             .and_then(|s| std::str::from_utf8(s).ok())
             .map(str::to_owned);
-        Self { code, hash, stage, response_complete }
+        Self { code, hash, stage, response_complete, local_settled: true, facts: None }
     }
 }
 pub type RemoteUpdateFuture<'a> = Pin<Box<dyn Future<Output = RemoteUpdateReply> + Send + 'a>>;
 /// Implementations must own their work through completion. This slice supplies
-/// synthetic implementations only; the legacy killing System runner is excluded.
+/// no production constructor; the legacy killing System runner is excluded.
 pub trait RemoteUpdateTransport: Send + Sync {
     fn place<'a>(&'a self, node: &'a Node, payload: RemoteUpdatePayload<'a>) -> RemoteUpdateFuture<'a>;
 }
@@ -208,6 +226,8 @@ struct State {
     slot: Slot,
     closed: bool,
     last_attempt: u64,
+    completion: Option<bool>,
+    facts: Option<PlacementFacts>,
 }
 pub struct RemoteUpdateControl {
     state: Mutex<State>,
@@ -215,7 +235,7 @@ pub struct RemoteUpdateControl {
 }
 impl RemoteUpdateControl {
     pub fn new(transport: Arc<dyn RemoteUpdateTransport>) -> Self {
-        Self { state: Mutex::new(State { slot: Slot::Idle, closed: false, last_attempt: 0 }), transport }
+        Self { state: Mutex::new(State { slot: Slot::Idle, closed: false, last_attempt: 0, completion: None, facts: None }), transport }
     }
     fn available(&self) -> Result<(), AdmissionError> {
         let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -250,6 +270,8 @@ impl RemoteUpdateControl {
             return Err(AdmissionError::Refused(Refusal::InvalidRequest));
         }
         state.last_attempt = update.attempt_id;
+        state.completion = None;
+        state.facts = None;
         state.slot = Slot::Pending(Box::new(update));
         drop(state);
         drop(current);
@@ -272,6 +294,18 @@ impl RemoteUpdateControl {
     pub fn outcome(&self) -> Option<RemoteUpdateOutcome> {
         let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Slot::Finished(outcome) = state.slot { Some(outcome) } else { None }
+    }
+    /// Placement certainty, local work settlement and journal ACK are independent.
+    pub fn local_completion(&self) -> Option<bool> {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match state.slot {
+            Slot::Finished(RemoteUpdateOutcome::Refused { .. }) => Some(true),
+            Slot::Finished(_) => state.completion,
+            _ => None,
+        }
+    }
+    pub fn placement_facts(&self) -> Option<PlacementFacts> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).facts
     }
     pub fn busy(&self) -> bool {
         matches!(self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).slot, Slot::Pending(_) | Slot::Claimed(_))
@@ -347,7 +381,7 @@ impl RemoteUpdateControl {
     pub(crate) async fn execute(&self, update: RemoteUpdateRequest) {
         let attempt_id = update.attempt_id;
         let future = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.transport.place(&update.target.node, RemoteUpdatePayload { prepared: &update.prepared })
+            self.transport.place(&update.target.node, RemoteUpdatePayload { token: update.token, prepared: &update.prepared })
         }));
         let observed = match future {
             Ok(mut future) => {
@@ -360,9 +394,12 @@ impl RemoteUpdateControl {
             }
             Err(_) => Err(()),
         };
+        let local_settled = observed.as_ref().is_ok_and(|reply| reply.local_settled);
+        let facts = observed.as_ref().ok().and_then(|reply| reply.facts);
         let outcome = match observed {
             Ok(reply)
-                if reply.response_complete
+                if reply.local_settled
+                    && reply.response_complete
                     && reply.stage == RemoteUpdateStage::Placed
                     && reply.code == Some(0)
                     && reply.hash.as_deref() == Some(update.prepared.sampler_sha256()) =>
@@ -384,10 +421,18 @@ impl RemoteUpdateControl {
         };
         let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         debug_assert!(matches!(state.slot, Slot::Claimed(id) if id == attempt_id));
+        state.completion = Some(local_settled);
+        state.facts = facts;
         state.closed |= !outcome.placement_known();
         state.slot = Slot::Finished(outcome);
     }
 }
 
+mod protocol;
+mod ssh;
+pub use protocol::{AttemptToken, PlacementDisposition, PlacementFacts, SamplerHash};
+pub use ssh::OwnedSshUpdateTransport;
+#[cfg(test)]
+mod ssh_tests;
 #[cfg(test)]
 pub(crate) mod tests;
