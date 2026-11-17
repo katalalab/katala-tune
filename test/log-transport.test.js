@@ -154,6 +154,22 @@ test('Windows Git Bash executes >8191-byte bodies and rejects corrupt or truncat
     assert.equal(r.code, 0, r.err);
     assert.deepEqual(JSON.parse(r.out), { text: '日本語', cursor: 42 });
   }
+  // stdin を閉じない（EOF が届かない中継と同じ）ままでも、フレームを読み終えれば終了する
+  await t.test('no-stdin-eof', async () => {
+    const child = require('node:child_process').spawn(bash, ['-c', transport.command], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+    const out = [];
+    child.stdout.on('data', b => out.push(b));
+    const timer = setTimeout(() => child.kill('SIGKILL'), 30000);
+    child.stdin.write(transport.input);
+    const { once } = require('node:events');
+    const ended = once(child.stdout, 'end');
+    const [code] = await once(child, 'exit');
+    clearTimeout(timer);
+    child.stdin.destroy();
+    assert.equal(code, 0);
+    await ended;
+    assert.deepEqual(JSON.parse(Buffer.concat(out).toString('utf8')), { text: '日本語', cursor: 42 });
+  });
   for (const body of [Buffer.from('param(\n'), Buffer.from([255]), Buffer.from('param()\n[Console]::WriteLine("{}")\nexit 7')]) {
     const t = windowsRemoteTransport({}, body);
     assert.equal((await runWindowsLogs(bash, ['-c', t.command], { input: t.input, timeoutMs: 30000 })).code, null);
