@@ -38,7 +38,7 @@ impl AttemptToken {
 pub struct SamplerHash([u8; 32]);
 impl SamplerHash {
     pub(super) fn parse(text: &str) -> Option<Self> {
-        if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        if !crate::db::is_lower_hex(text, 64) {
             return None;
         }
         let mut bytes = [0; 32];
