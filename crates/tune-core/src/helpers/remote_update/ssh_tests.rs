@@ -28,8 +28,8 @@ if(mode==='partial-input') {
     if(specified==='derive') {
       const nl=capture.indexOf(10),len=Number(capture.subarray(0,nl).toString().split(' ')[1]);
       const h=Object.fromEntries(capture.subarray(nl+1,nl+1+len).toString().trimEnd().split('\n').map(s=>s.split('=')));
-      const prefix='KTU1 '+h.token+' '+h.context+' ',old='b'.repeat(64);
-      response=prefix+'Started '+h.sha256+' - 0 0\n'+prefix+'Staged '+h.sha256+' - 0 0\n'+prefix+'BackedUp '+h.sha256+' '+old+' 1 0\n'+prefix+'Placed '+h.sha256+' '+old+' 1 0\n';
+      const prefix='KTU2 '+h.token+' '+h.context+' ',old='b'.repeat(64);
+      response=prefix+'Started '+h.sha256+' '+old+' 0 0\n'+prefix+'Staged '+h.sha256+' '+old+' 0 0\n'+prefix+'BackedUp '+h.sha256+' '+old+' 1 0\n'+prefix+'Placed '+h.sha256+' '+old+' 1 0\n';
     }
     if(mode==='stderr-flood')process.stderr.write(Buffer.alloc(128*1024,120));
     if(mode==='stdout-flood')process.stdout.write(Buffer.alloc(128*1024,120));
@@ -118,12 +118,18 @@ fn image<'a>(bytes: &'a [u8], hash: &'a str) -> Image<'a> {
         context: SamplerHash::parse(CONTEXT).unwrap(),
         glue: GLUE,
         bytes,
+        mode: protocol::ExchangeMode::Place,
+        source_size: bytes.len(),
+        source_hash: hash,
+        ttl_ms: 120000,
+        observation: "-",
+        before: BeforeImageFact::Present(SamplerHash::parse(OLD).unwrap()),
     }
 }
 fn frames(image: &Image<'_>) -> String {
-    let prefix = format!("KTU1 {} {}", image.token.as_str(), CONTEXT);
+    let prefix = format!("KTU2 {} {}", image.token.as_str(), CONTEXT);
     format!(
-        "{prefix} Started {} - 0 0\n{prefix} Staged {} - 0 0\n{prefix} BackedUp {} {OLD} 1 0\n{prefix} Placed {} {OLD} 1 0\n",
+        "{prefix} Started {} {OLD} 0 0\n{prefix} Staged {} {OLD} 0 0\n{prefix} BackedUp {} {OLD} 1 0\n{prefix} Placed {} {OLD} 1 0\n",
         image.hash, image.hash, image.hash, image.hash
     )
 }
@@ -237,7 +243,7 @@ async fn owned_exchange_sends_finite_image_once_and_normal_eof() {
     let capture = std::fs::read(fixture.0.join("capture")).unwrap();
     let nl = capture.iter().position(|b| *b == b'\n').unwrap();
     let sizes: Vec<_> = std::str::from_utf8(&capture[..nl]).unwrap().split(' ').collect();
-    assert_eq!(sizes[0], "KTU1");
+    assert_eq!(sizes[0], "KTU2");
     assert_eq!(sizes.len(), 4);
     let header_len: usize = sizes[1].parse().unwrap();
     let glue_len: usize = sizes[2].parse().unwrap();
@@ -251,7 +257,7 @@ async fn owned_exchange_sends_finite_image_once_and_normal_eof() {
     assert!(header.contains(&format!("manifest={MANIFEST}\nsize=150003\nsha256={hash}\ncontext={CONTEXT}\n")));
     let facts = reply.facts.unwrap();
     assert_eq!(facts.token, image.token);
-    assert_eq!(facts.old_hash.unwrap().hex(), OLD);
+    assert_eq!(facts.before.hash().unwrap().hex(), OLD);
     assert!(facts.retained_backup);
     fixture.cleanup();
 }
@@ -284,14 +290,17 @@ fn owned_protocol_rejects_wrong_token_hash_order_partial_duplicate_trailing() {
         parser.feed(&[b]);
     }
     assert!(parser.confirmed());
-    let unchanged = format!("{}KTU1 {} {CONTEXT} Unchanged {hash} {hash} 0 0\n", lines[0], image.token.as_str());
-    let mut parser = Parser::new(&image);
-    parser.feed(unchanged.as_bytes());
+    let unchanged = format!("{}KTU2 {} {CONTEXT} Unchanged {hash} {hash} 0 0\n", lines[0], image.token.as_str());
+    let mut same_image = self::image(b"inert", &hash);
+    same_image.token = image.token;
+    same_image.before = BeforeImageFact::Present(SamplerHash::parse(&hash).unwrap());
+    let mut parser = Parser::new(&same_image);
+    parser.feed(unchanged.replace(OLD, &hash).as_bytes());
     assert!(parser.confirmed());
     assert_eq!(parser.facts.unwrap().disposition, PlacementDisposition::Unchanged);
     for terminal in [
-        format!("{}KTU1 {} {CONTEXT} Failed {hash} - 0 0\n", lines[0], image.token.as_str()),
-        format!("{}{}{}KTU1 {} {CONTEXT} Failed {hash} {OLD} 0 1\n", lines[0], lines[1], lines[2], image.token.as_str()),
+        format!("{}KTU2 {} {CONTEXT} Failed {hash} {OLD} 0 0\n", lines[0], image.token.as_str()),
+        format!("{}{}{}KTU2 {} {CONTEXT} Failed {hash} {OLD} 0 1\n", lines[0], lines[1], lines[2], image.token.as_str()),
     ] {
         let mut parser = Parser::new(&image);
         parser.feed(terminal.as_bytes());
@@ -494,8 +503,8 @@ async fn owned_exchange_terminal_failure_retains_bounded_rollback_fact() {
     let hash = crate::db::sha256_hex(b"inert");
     let image = image(b"inert", &hash);
     let valid = frames(&image);
-    let prefix = valid.rsplit_once("KTU1").unwrap().0;
-    let response = format!("{prefix}KTU1 {} {CONTEXT} Failed {hash} {OLD} 0 1\n", image.token.as_str());
+    let prefix = valid.rsplit_once("KTU2").unwrap().0;
+    let response = format!("{prefix}KTU2 {} {CONTEXT} Failed {hash} {OLD} 0 1\n", image.token.as_str());
     let reply = super::ssh::execute(&fixture.transport(response, "good"), &node(), &image).await;
     assert!(reply.response_complete, "valid terminal failure receipt was lost");
     assert!(!accepted(&reply, &hash));
@@ -503,4 +512,15 @@ async fn owned_exchange_terminal_failure_retains_bounded_rollback_fact() {
     assert!(reply.facts.unwrap().rollback_observed);
     assert!(!reply.facts.unwrap().retained_backup);
     fixture.cleanup();
+}
+
+#[test]
+fn ktu2_missing_destination_has_no_backup_transition() {
+    let hash = crate::db::sha256_hex(b"inert");
+    let mut image = image(b"inert", &hash);
+    image.before = BeforeImageFact::Missing;
+    let p = format!("KTU2 {} {CONTEXT}", image.token.as_str());
+    let mut parser = Parser::new(&image);
+    parser.feed(format!("{p} Started {hash} - 0 0\n{p} Staged {hash} - 0 0\n{p} Placed {hash} - 0 0\n").as_bytes());
+    assert!(parser.confirmed(), "Missing placement must succeed without inventing an old backup");
 }

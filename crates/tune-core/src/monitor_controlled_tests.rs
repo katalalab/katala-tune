@@ -1078,3 +1078,45 @@ async fn controlled_update_coalesced_start_then_pause_releases_old_pending_for_n
     assert_eq!(result.remote_update, Some(RemoteUpdateOutcome::ConfirmedPlacement { attempt_id: 2 }));
     assert_eq!(transport.calls.lock().unwrap().len(), 1);
 }
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+#[tokio::test]
+async fn controlled_update_preflight_rechecks_admission_and_claim_without_placing() {
+    struct AdmissionGuard {
+        denied: std::sync::atomic::AtomicBool,
+        checks: AtomicUsize,
+    }
+    impl RemoteUpdateTransport for AdmissionGuard {
+        fn preflight(&self, _: &Node, _: RemoteUpdatePayload<'_>) -> Result<(), remote_update::Refusal> {
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            if self.denied.load(Ordering::SeqCst) { Err(remote_update::Refusal::InvalidRequest) } else { Ok(()) }
+        }
+        fn place<'a>(&'a self, _: &'a Node, _: RemoteUpdatePayload<'a>) -> RemoteUpdateFuture<'a> {
+            panic!("refused preflight must never place")
+        }
+    }
+    let (engine, live, dir) = update_fixture();
+    live.start_owned(Owner::Ui, &engine.config().nodes[..1], &[]);
+    outdated(&engine, &live).await;
+    let guard = Arc::new(AdmissionGuard { denied: std::sync::atomic::AtomicBool::new(true), checks: AtomicUsize::new(0) });
+    let updates = RemoteUpdateControl::new(guard.clone());
+    let (tx, _rx, _stx, _status) = channels(RunMode::Run);
+    assert!(matches!(
+        updates.check_admission(&engine, &live, update_request(&engine, &dir, 1, 0, Duration::from_secs(120))),
+        Err(remote_update::AdmissionError::Refused(remote_update::Refusal::InvalidRequest))
+    ));
+    guard.denied.store(false, Ordering::SeqCst);
+    updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 2, 0, Duration::from_secs(120))).unwrap();
+    guard.denied.store(true, Ordering::SeqCst);
+    assert!(updates.claim(&engine, &live, &tx).is_none());
+    assert_eq!(guard.checks.load(Ordering::SeqCst), 3);
+    assert_eq!(updates.outcome(), Some(RemoteUpdateOutcome::Refused { attempt_id: 2, reason: remote_update::Refusal::InvalidRequest }));
+    assert_eq!(updates.local_completion(), Some(true));
+    guard.denied.store(false, Ordering::SeqCst);
+    updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 3, 0, Duration::from_secs(120))).unwrap();
+    updates.refuse_pending(remote_update::Refusal::Withdrawn);
+    live.shutdown(Duration::from_secs(1)).await;
+    assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+    drop((updates, live, engine));
+    std::fs::remove_dir_all(dir).unwrap();
+}
