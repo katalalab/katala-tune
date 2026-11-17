@@ -21,10 +21,6 @@ use crate::topology::{
     parsers::{parse_cargo, parse_go, parse_node, parse_python, parse_workflow},
 };
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|value| value.as_millis() as i64).unwrap_or_default()
-}
-
 fn sha256(value: &[u8]) -> String {
     crate::db::sha256_hex(value)
 }
@@ -749,7 +745,7 @@ pub fn capture_local_with_progress(
         scope_id,
         adapter: "local".into(),
         target_identity: None,
-        observed_at_ms: now_ms(),
+        observed_at_ms: crate::db::now_ms(),
         limits: limits.clone(),
         repositories: Vec::new(),
         failures: Vec::new(),
