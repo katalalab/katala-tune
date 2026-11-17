@@ -122,6 +122,9 @@ pub struct PreparedNativeSampler {
     sources: Vec<os::Identity>,
 }
 impl PreparedNativeSampler {
+    pub(super) fn remote_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
     pub fn source(&self) -> &Path {
         &self.source
     }

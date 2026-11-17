@@ -9,6 +9,25 @@ pub(super) fn mac_executable(bytes: &[u8]) -> bool {
     macho64(bytes).is_some() || fat(bytes).is_some()
 }
 
+/// CPU compatibility with the explicit supported raw artifact tuple. Structural
+/// parsing runs first; a file-format magic alone never establishes this fact.
+pub(super) fn declared_target(bytes: &[u8], target: &str) -> bool {
+    match target {
+        "x86_64-pc-windows-msvc" => pe(bytes).is_some() && u32at(bytes, 60, false).and_then(|at| u16le(bytes, at as usize + 4)) == Some(0x8664),
+        "aarch64-apple-darwin" => {
+            macho64(bytes).is_some_and(|(cpu, _)| cpu == 0x0100000c)
+                || (fat(bytes).is_some() && {
+                    let big = bytes[0] == 0xca;
+                    let wide = if big { bytes[3] == 0xbf } else { bytes[0] == 0xbf };
+                    let stride = if wide { 32 } else { 20 };
+                    let count = u32at(bytes, 4, big).unwrap_or(0) as usize;
+                    (0..count).any(|i| u32at(bytes, 8 + i * stride, big) == Some(0x0100000c))
+                })
+        }
+        _ => false,
+    }
+}
+
 fn read<const N: usize>(bytes: &[u8], at: usize) -> Option<[u8; N]> {
     bytes.get(at..at.checked_add(N)?)?.try_into().ok()
 }

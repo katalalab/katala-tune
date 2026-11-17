@@ -199,16 +199,35 @@ pub(super) mod tests {
         assert_eq!(registry.read(name).unwrap().approval, State::Denied);
         assert_eq!(approved.get_raw_value(name).unwrap(), denied);
         let (run, _) = registry.root.create_subkey("RunFixture").unwrap();
-        for value in [
-            RegValue { vtype: REG_DWORD, bytes: vec![0; 4].into() },
-            RegValue { vtype: REG_SZ, bytes: vec![b'a', 0].into() },
-            RegValue { vtype: REG_SZ, bytes: vec![0, 0xd8, 0, 0].into() },
-            RegValue { vtype: REG_SZ, bytes: vec![0; 64 * 1024 + 2].into() },
+        for (case, value) in [
+            ("wrong-type", RegValue { vtype: REG_DWORD, bytes: vec![0; 4].into() }),
+            ("unpaired-surrogate", RegValue { vtype: REG_SZ, bytes: vec![0, 0xd8, 0, 0].into() }),
+            ("over-bound", RegValue { vtype: REG_SZ, bytes: vec![0; 64 * 1024 + 2].into() }),
         ] {
-            run.set_raw_value(name, &value).unwrap();
-            assert!(registry.read(name).is_err());
-            assert_eq!(run.get_raw_value(name).unwrap(), value);
-            assert_eq!(approved.get_raw_value(name).unwrap(), denied);
+            run.set_raw_value(name, &value).expect(case);
+            let stored = run.get_raw_value(name).expect(case);
+            assert_eq!(stored, value, "{case}: malformed fixture must remain exact before product read");
+            assert!(matches!(registry.read(name), Err(State::Failed(_))), "{case}: malformed stored value must fail");
+            assert_eq!(run.get_raw_value(name).expect(case), stored, "{case}: product read must preserve stored bytes and type");
+            assert_eq!(approved.get_raw_value(name).expect(case), denied, "{case}: product read must preserve ApprovalFixture");
         }
+        let case = "unterminated-a";
+        run.set_raw_value(name, &RegValue { vtype: REG_SZ, bytes: vec![b'a', 0].into() }).expect(case);
+        let stored = run.get_raw_value(name).expect(case);
+        assert_eq!(stored.vtype, REG_SZ, "{case}: stored type must remain REG_SZ");
+        // Windows may persist this input with a terminal NUL. Only that exact
+        // normalization is accepted; raw missing-NUL rejection is tested in
+        // windows_notifications::tests independently of registry storage.
+        match stored.bytes.as_ref() {
+            [b'a', 0] => assert!(matches!(registry.read(name), Err(State::Failed(_))), "{case}: stored missing-NUL text must fail"),
+            [b'a', 0, 0, 0] => assert_eq!(
+                registry.read(name).expect(case),
+                startup::Snapshot { command: Some("a".into()), approval: State::Denied },
+                "{case}: exact NUL normalization must decode and retain approval denial"
+            ),
+            _ => panic!("{case}: unexpected persisted bytes: {:?}", stored.bytes),
+        }
+        assert_eq!(run.get_raw_value(name).expect(case), stored, "{case}: product read must preserve stored bytes and type");
+        assert_eq!(approved.get_raw_value(name).expect(case), denied, "{case}: product read must preserve ApprovalFixture");
     }
 }

@@ -13,6 +13,7 @@ impl Route for FakeRoute {
         let (stop, mut stopped) = oneshot::channel();
         let (done, finished) = oneshot::channel();
         tokio::spawn(async move {
+            tx.send(r#"{"type":"hello","impl":"rust","agent":"0.0.1"}"#.into()).await.unwrap();
             let mut iv = tokio::time::interval(Duration::from_millis(5));
             loop {
                 tokio::select! {
@@ -143,7 +144,7 @@ async fn controlled_fresh_hub_does_not_start_local_then_stale_and_db_error_trans
     let (tx, rx, stx, mut status) = channels(RunMode::Run);
     let (e, l, r) = (engine.clone(), live.clone(), runner.clone());
     let worker_request = tx.clone();
-    let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, worker_request, stx)), r.as_ref()).await });
+    let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, worker_request, stx, None)), r.as_ref()).await });
     phase(&mut status, RunPhase::Running).await;
     assert_eq!(status.borrow().policy, Some(Policy::Hub));
     assert!(live.active().is_empty(), "fresh pull must be observed before acquiring local ownership");
@@ -181,7 +182,7 @@ async fn controlled_paused_pull_coalesces_pending_requests_without_collection() 
     tx.send_modify(|r| r.pull_seq = 1);
     let (e, l, r) = (engine.clone(), live.clone(), runner.clone());
     let worker_request = tx.clone();
-    let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, worker_request, stx)), r.as_ref()).await });
+    let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, worker_request, stx, None)), r.as_ref()).await });
     tokio::time::timeout(Duration::from_secs(2), async {
         while runner.calls.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
@@ -222,7 +223,7 @@ async fn controlled_exit_waits_for_current_transport_without_starting_collection
     let (tx, rx, stx, mut status) = channels(RunMode::Run);
     let (e, l, r) = (engine.clone(), live.clone(), runner.clone());
     let worker_request = tx.clone();
-    let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, worker_request, stx)), r.as_ref()).await });
+    let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, worker_request, stx, None)), r.as_ref()).await });
     tokio::time::timeout(Duration::from_secs(2), async {
         while runner.calls.load(Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
@@ -267,7 +268,7 @@ async fn controlled_failed_pull_notifies_saved_result_without_collecting() {
             }),
             None,
             None,
-            Some((rx, worker_request, stx)),
+            Some((rx, worker_request, stx, None)),
             &FailedHub,
         )
         .await
@@ -317,7 +318,7 @@ async fn controlled_disabled_hub_pull_keeps_page_bound_and_cursor() {
     let (tx, rx, stx, mut status) = channels(RunMode::Run);
     let (e, l, r) = (engine.clone(), live.clone(), runner.clone());
     let worker_request = tx.clone();
-    let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, worker_request, stx)), r.as_ref()).await });
+    let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, worker_request, stx, None)), r.as_ref()).await });
     phase(&mut status, RunPhase::Running).await;
     assert_eq!(status.borrow().policy, Some(Policy::Disabled));
     assert_eq!(status.borrow().local_collecting, Some(false));
@@ -344,7 +345,7 @@ async fn controlled_hub_change_wakes_pull_and_uses_new_hub_freshness() {
     let (tx, rx, stx, mut status) = channels(RunMode::Run);
     let (e, l, r) = (engine.clone(), live.clone(), runner.clone());
     let worker_request = tx.clone();
-    let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, worker_request, stx)), r.as_ref()).await });
+    let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, worker_request, stx, None)), r.as_ref()).await });
     phase(&mut status, RunPhase::Running).await;
     assert_eq!(status.borrow().policy, Some(Policy::Hub));
     runner.fresh.store(false, Ordering::SeqCst);
@@ -380,7 +381,7 @@ async fn controlled_releases_monitor_before_new_noncollecting_pull_preserving_ui
         let (tx, rx, stx, mut status) = channels(RunMode::Run);
         let (e, l, r) = (engine.clone(), live.clone(), runner.clone());
         let worker_request = tx.clone();
-        let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, worker_request, stx)), r.as_ref()).await });
+        let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, worker_request, stx, None)), r.as_ref()).await });
         phase(&mut status, RunPhase::Running).await;
         assert!(live.heartbeat_owned(Owner::Monitor, "a"));
         assert!(live.heartbeat_owned(Owner::Monitor, "b"));
@@ -454,7 +455,7 @@ async fn controlled_worker_input_failure_requires_explicit_restart_after_repair(
         let (tx, rx, stx, mut status) = channels(RunMode::Run);
         let (e, l, r) = (engine.clone(), live.clone(), runner.clone());
         let worker_request = tx.clone();
-        let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, worker_request, stx)), r.as_ref()).await });
+        let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, worker_request, stx, None)), r.as_ref()).await });
         phase(&mut status, RunPhase::Running).await;
         assert!(live.heartbeat_owned(Owner::Monitor, "a"));
         let collector = engine.monitor_journal_health()["collector_id"].clone();
@@ -531,7 +532,7 @@ async fn controlled_old_pull_failure_cannot_revoke_new_start_or_exit() {
         let runner = Arc::new(HubRunner { calls: AtomicUsize::new(0), fresh: false.into(), gate: Some(gate.clone()), more: false });
         let (tx, rx, stx, mut status) = channels(RunMode::Run);
         let (e, l, r, request) = (engine.clone(), live.clone(), runner.clone(), tx.clone());
-        let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, request, stx)), r.as_ref()).await });
+        let worker = tokio::spawn(async move { run_loop(e, l, Arc::new(|_| {}), None, None, Some((rx, request, stx, None)), r.as_ref()).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while runner.calls.load(Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
@@ -608,4 +609,472 @@ async fn controlled_valid_ledger_removal_wins_over_malformed_settings() {
     drop((live, engine));
     std::fs::remove_dir_all(dir).unwrap();
     assert!(active.is_empty() && !ui, "valid full-ledger removal must revoke even Ui ownership before rejecting malformed settings");
+}
+
+// Prepared native source and same-OS eligibility exist only for these tuples.
+// Earlier controlled tests and the CPU parser tests stay OS-independent.
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+use crate::helpers::remote_update::{
+    self, RemoteTargetSnapshot, RemoteUpdateControl, RemoteUpdateFuture, RemoteUpdateOutcome, RemoteUpdatePayload, RemoteUpdateReply, RemoteUpdateRequest,
+    RemoteUpdateStage, RemoteUpdateTransport,
+};
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+fn update_fixture() -> (Arc<Engine>, Arc<Live>, std::path::PathBuf) {
+    let (engine, live, dir) = fixture();
+    if cfg!(windows) {
+        std::fs::write(dir.join("nodes.json"), r#"{"nodes":[{"id":"a","os":"windows"},{"id":"failed","os":"windows"}]}"#).unwrap();
+        engine.reload_config();
+    }
+    (engine, live, dir)
+}
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+struct HeldUpdate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    calls: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    reply: u8,
+}
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+impl HeldUpdate {
+    fn new(reply: u8) -> Arc<Self> {
+        Arc::new(Self { entered: tokio::sync::Notify::new(), release: tokio::sync::Notify::new(), calls: std::sync::Mutex::new(Vec::new()), reply })
+    }
+}
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+impl RemoteUpdateTransport for HeldUpdate {
+    fn place<'a>(&'a self, node: &'a Node, payload: RemoteUpdatePayload<'a>) -> RemoteUpdateFuture<'a> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push((node.id.clone(), payload.bytes().to_vec()));
+            self.entered.notify_one();
+            self.release.notified().await;
+            match self.reply {
+                0 => RemoteUpdateReply::observed(Some(0), payload.expected_response().as_bytes(), RemoteUpdateStage::Placed, true),
+                1 => RemoteUpdateReply::observed(Some(1), payload.expected_response().as_bytes(), RemoteUpdateStage::Placed, true),
+                2 => RemoteUpdateReply::observed(Some(0), format!("placed-{}", "0".repeat(64)).as_bytes(), RemoteUpdateStage::Placed, true),
+                3 => RemoteUpdateReply::observed(Some(2), b"partial", RemoteUpdateStage::Staged, true),
+                4 => RemoteUpdateReply::observed(None, b"", RemoteUpdateStage::Placed, true),
+                5 => panic!("synthetic update panic"),
+                6 => RemoteUpdateReply::observed(Some(0), payload.expected_response().as_bytes(), RemoteUpdateStage::Staged, true),
+                7 => RemoteUpdateReply::observed(Some(0), format!("unexpected {}", payload.expected_response()).as_bytes(), RemoteUpdateStage::Placed, true),
+                8 => RemoteUpdateReply::observed(Some(0), payload.expected_response().as_bytes(), RemoteUpdateStage::Placed, false),
+                _ => unreachable!(),
+            }
+        })
+    }
+}
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+fn update_request(engine: &Engine, dir: &std::path::Path, id: u64, seq: u64, ttl: Duration) -> RemoteUpdateRequest {
+    let target = RemoteTargetSnapshot::checked(engine, "a", remote_update::tests::architecture()).unwrap();
+    let prepared = remote_update::tests::prepared(dir, crate::helpers::VERSION);
+    RemoteUpdateRequest::new(id, seq, std::time::Instant::now() + ttl, target, prepared).unwrap()
+}
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+async fn outdated(engine: &Engine, live: &Live) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !crate::helpers::agent_outdated(&engine.config().nodes[0], live.brief("a").as_ref()) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+#[tokio::test]
+async fn controlled_update_exit_must_drain_fake_transport() {
+    for exit in [false, true] {
+        let (engine, live, dir) = update_fixture();
+        let (tx, _rx, stx, mut status) = channels(RunMode::Run);
+        live.start_owned(Owner::Ui, &engine.config().nodes[..1], &[]);
+        outdated(&engine, &live).await;
+        let transport = HeldUpdate::new(0);
+        let updates = Arc::new(RemoteUpdateControl::new(transport.clone()));
+        updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 1, 0, Duration::from_secs(120))).unwrap();
+        let worker = tokio::spawn(run_controlled(engine.clone(), live.clone(), |_| {}, tx.clone(), stx.clone(), Some(updates.clone())));
+        transport.entered.notified().await;
+        stx.send_modify(|s| s.phase = RunPhase::Stopping);
+        tx.send_modify(|r| r.mode = if exit { RunMode::Exit } else { RunMode::Paused });
+        // Accepted work precedes the later three-second Live/journal stage.
+        tokio::time::sleep(Duration::from_millis(3100)).await;
+        assert!(!worker.is_finished());
+        assert_eq!(status.borrow().phase, RunPhase::Stopping);
+        assert!(updates.busy());
+        assert!(!updates.withdraw(1));
+        assert_eq!(updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 2, 0, Duration::from_secs(120))), Err(remote_update::AdmissionError::Busy));
+        assert!(live.heartbeat_owned(Owner::Ui, "a"));
+        transport.release.notify_one();
+        phase(&mut status, if exit { RunPhase::Exited } else { RunPhase::Paused }).await;
+        assert_eq!(updates.outcome(), Some(RemoteUpdateOutcome::ConfirmedPlacement { attempt_id: 1 }));
+        assert!(live.heartbeat_owned(Owner::Ui, "a"));
+        tx.send_modify(|r| r.mode = RunMode::Exit);
+        let result = worker.await.unwrap();
+        assert_eq!(result.update_complete, Some(true));
+        assert_eq!(result.remote_update, updates.outcome());
+        assert_eq!(transport.calls.lock().unwrap().len(), 1);
+        live.shutdown(Duration::from_secs(1)).await;
+        assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+        drop((live, engine));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+#[tokio::test]
+async fn controlled_update_target_only_and_immutable_prepared_source() {
+    let (engine, live, dir) = update_fixture();
+    let os = if cfg!(windows) { "windows" } else { "macos" };
+    let ledger = json!({"nodes":[{"id":"a","os":os},{"id":"b","os":os},{"id":"c","os":os},{"id":"deferred","os":os,"status":"paused"}]});
+    std::fs::write(dir.join("nodes.json"), ledger.to_string()).unwrap();
+    let cfg = engine.reload_config();
+    live.start_owned(Owner::Ui, &cfg.nodes[..3], &[]);
+    outdated(&engine, &live).await;
+    let (tx, _rx, stx, _status) = channels(RunMode::Run);
+    let transport = HeldUpdate::new(0);
+    let updates = Arc::new(RemoteUpdateControl::new(transport.clone()));
+    let update = update_request(&engine, &dir, 1, 0, Duration::from_secs(120));
+    let expected = std::fs::read(dir.join("synthetic-source").join(crate::helpers::exe("tune-agent"))).unwrap();
+    updates.admit(&engine, &live, &tx, update).unwrap();
+    std::fs::write(dir.join("synthetic-source").join(crate::helpers::exe("tune-agent")), b"replaced source sentinel").unwrap();
+    assert!(crate::helpers::native_install::prepare_native_sampler(&dir.join("synthetic-source")).is_err());
+    let worker = tokio::spawn(run_controlled(engine.clone(), live.clone(), |_| {}, tx.clone(), stx, Some(updates.clone())));
+    transport.entered.notified().await;
+    // Post-claim replacement never redirects the already accepted endpoint.
+    std::fs::write(dir.join("nodes.json"), json!({"nodes":[{"id":"a","os":os,"alias":"replacement"}]}).to_string()).unwrap();
+    transport.release.notify_one();
+    tx.send_modify(|r| r.mode = RunMode::Exit);
+    assert_eq!(worker.await.unwrap().remote_update, Some(RemoteUpdateOutcome::ConfirmedPlacement { attempt_id: 1 }));
+    assert_eq!(*transport.calls.lock().unwrap(), vec![("a".into(), expected)]);
+    assert!(live.heartbeat_owned(Owner::Ui, "a"));
+    live.shutdown(Duration::from_secs(1)).await;
+    assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+    drop((live, engine));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+#[tokio::test]
+async fn controlled_update_rechecks_changed_or_invalid_inputs_before_claim() {
+    for scenario in ["missing", "duplicate", "alias", "raw", "status", "os", "local", "ledger", "settings", "disabled", "hub-fresh", "start", "expiry"] {
+        let (engine, live, dir) = update_fixture();
+        let (tx, _rx, stx, mut status) = channels(RunMode::Run);
+        live.start_owned(Owner::Ui, &engine.config().nodes[..1], &[]);
+        outdated(&engine, &live).await;
+        let transport = HeldUpdate::new(0);
+        let updates = Arc::new(RemoteUpdateControl::new(transport.clone()));
+        updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 1, 0, Duration::from_secs(120))).unwrap();
+        assert!(updates.busy(), "{scenario}");
+        assert_eq!(updates.outcome(), None, "{scenario}");
+        let mut ledger: Value = serde_json::from_slice(&std::fs::read(dir.join("nodes.json")).unwrap()).unwrap();
+        match scenario {
+            "missing" => {
+                ledger["nodes"] = json!([]);
+            }
+            "duplicate" => {
+                let node = ledger["nodes"][0].clone();
+                ledger["nodes"].as_array_mut().unwrap().push(node);
+            }
+            "alias" => ledger["nodes"][0]["alias"] = json!("changed"),
+            "raw" => ledger["nodes"][0]["ssh_shell"] = json!("changed"),
+            "status" => ledger["nodes"][0]["status"] = json!("paused"),
+            "os" => ledger["nodes"][0]["os"] = json!("unsupported"),
+            "local" => ledger["nodes"][0]["local_hostname"] = json!(crate::nodes::local_host()),
+            "settings" => {
+                engine.with_db(|d| d.set_meta("monitor", &json!({"enabled":"broken"}))).unwrap();
+            }
+            "disabled" => {
+                engine.with_db(|d| d.set_meta("monitor", &json!({"enabled":false}))).unwrap();
+            }
+            "hub-fresh" => {
+                hub(&engine);
+                engine.with_db(|d| d.set_meta("hubPull", &json!({"ok":true,"at":now_ms(),"fresh":true}))).unwrap();
+            }
+            "start" => tx.send_modify(|r| r.start_seq += 1),
+            "expiry" => remote_update::tests::expire_pending(&updates),
+            "ledger" => {}
+            _ => unreachable!(),
+        }
+        std::fs::write(dir.join("nodes.json"), if scenario == "ledger" { "broken".into() } else { ledger.to_string() }).unwrap();
+        // A fresh-hub policy must refuse without starting a pull. All other
+        // cases run the same production controlled worker with fake routes.
+        if scenario == "hub-fresh" {
+            assert!(updates.claim(&engine, &live, &tx).is_none());
+            assert_eq!(updates.outcome(), Some(RemoteUpdateOutcome::Refused { attempt_id: 1, reason: remote_update::Refusal::Policy }));
+        } else {
+            let worker = tokio::spawn(run_controlled(engine.clone(), live.clone(), |_| {}, tx.clone(), stx, Some(updates.clone())));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while updates.outcome().is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if scenario == "expiry" {
+                assert_eq!(updates.outcome(), Some(RemoteUpdateOutcome::Refused { attempt_id: 1, reason: remote_update::Refusal::Expired }));
+            } else {
+                assert!(matches!(updates.outcome(), Some(RemoteUpdateOutcome::Refused { .. })), "{scenario}");
+            }
+            tx.send_modify(|r| r.mode = RunMode::Exit);
+            phase(&mut status, RunPhase::Exited).await;
+            worker.await.unwrap();
+        }
+        assert!(transport.calls.lock().unwrap().is_empty(), "{scenario}");
+        live.shutdown(Duration::from_secs(1)).await;
+        assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+        drop((live, engine));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+#[tokio::test]
+async fn controlled_update_pending_withdrawal_busy_and_attempt_binding() {
+    let (engine, live, dir) = update_fixture();
+    let (tx, _rx, _stx, _status) = channels(RunMode::Run);
+    live.start_owned(Owner::Ui, &engine.config().nodes[..1], &[]);
+    outdated(&engine, &live).await;
+    let transport = HeldUpdate::new(0);
+    let updates = RemoteUpdateControl::new(transport.clone());
+    updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 1, 0, Duration::from_secs(120))).unwrap();
+    assert_eq!(updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 2, 0, Duration::from_secs(120))), Err(remote_update::AdmissionError::Busy));
+    assert!(updates.withdraw(1));
+    assert_eq!(
+        updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 1, 0, Duration::from_secs(120))),
+        Err(remote_update::AdmissionError::Refused(remote_update::Refusal::InvalidRequest))
+    );
+    updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 2, 0, Duration::from_secs(120))).unwrap();
+    assert!(!updates.withdraw(1));
+    assert!(updates.busy());
+    // Same short watch -> slot order used by host Pause/Exit/new Start.
+    tx.send_modify(|r| {
+        updates.refuse_pending(remote_update::Refusal::Session);
+        r.mode = RunMode::Paused;
+    });
+    tx.send_modify(|r| {
+        r.start_seq += 1;
+        r.mode = RunMode::Run;
+    });
+    assert!(updates.claim(&engine, &live, &tx).is_none());
+    assert!(transport.calls.lock().unwrap().is_empty());
+    let target = RemoteTargetSnapshot::checked(&engine, "a", None);
+    assert!(target.is_err());
+    let target = RemoteTargetSnapshot::checked(&engine, "a", remote_update::tests::architecture()).unwrap();
+    assert!(matches!(
+        RemoteUpdateRequest::new(3, 1, std::time::Instant::now() + Duration::from_secs(120), target, remote_update::tests::prepared(&dir, "0.0.1")),
+        Err(remote_update::Refusal::Source)
+    ));
+    live.shutdown(Duration::from_secs(1)).await;
+    drop((live, engine));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+#[tokio::test]
+async fn controlled_update_unknown_is_sticky_without_retry_or_unrelated_policy_change() {
+    for reply in 1..=8 {
+        let (engine, live, dir) = update_fixture();
+        let (tx, _rx, stx, mut status) = channels(RunMode::Run);
+        live.start_owned(Owner::Ui, &engine.config().nodes[..1], &[]);
+        outdated(&engine, &live).await;
+        let settings = engine.with_db(|d| d.get_meta("monitor")).unwrap();
+        let transport = HeldUpdate::new(reply);
+        let updates = Arc::new(RemoteUpdateControl::new(transport.clone()));
+        updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 1, 0, Duration::from_secs(120))).unwrap();
+        let worker = tokio::spawn(run_controlled(engine.clone(), live.clone(), |_| {}, tx.clone(), stx, Some(updates.clone())));
+        transport.entered.notified().await;
+        transport.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while updates.outcome().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let outcome = updates.outcome().unwrap();
+        assert!(!outcome.placement_known());
+        if reply == 3 {
+            assert!(matches!(outcome, RemoteUpdateOutcome::Unknown { stage: RemoteUpdateStage::Staged, .. }));
+        }
+        tx.send_modify(|r| r.mode = RunMode::Paused);
+        phase(&mut status, RunPhase::Paused).await;
+        tx.send_modify(|r| {
+            r.mode = RunMode::Run;
+            r.start_seq += 1;
+        });
+        phase(&mut status, RunPhase::Running).await;
+        assert_eq!(
+            updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 2, 1, Duration::from_secs(120))),
+            Err(remote_update::AdmissionError::Closed)
+        );
+        assert_eq!(updates.outcome(), Some(outcome));
+        assert!(live.heartbeat_owned(Owner::Ui, "a"));
+        assert_eq!(engine.with_db(|d| d.get_meta("monitor")).unwrap(), settings);
+        tx.send_modify(|r| r.mode = RunMode::Exit);
+        let exit = worker.await.unwrap();
+        assert_eq!(exit.update_complete, Some(true));
+        assert_eq!(exit.remote_update, Some(outcome));
+        assert_eq!(transport.calls.lock().unwrap().len(), 1);
+        live.shutdown(Duration::from_secs(1)).await;
+        assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+        drop((live, engine));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+#[tokio::test]
+async fn controlled_update_pause_wins_while_claim_rechecks_blocked_inputs() {
+    let (engine, live, dir) = update_fixture();
+    let (tx, _rx, _stx, _status) = channels(RunMode::Run);
+    live.start_owned(Owner::Ui, &engine.config().nodes[..1], &[]);
+    outdated(&engine, &live).await;
+    let transport = HeldUpdate::new(0);
+    let updates = Arc::new(RemoteUpdateControl::new(transport.clone()));
+    updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 1, 0, Duration::from_secs(120))).unwrap();
+    let db = engine.db.lock().unwrap();
+    let (e, l, u, t) = (engine.clone(), live.clone(), updates.clone(), tx.clone());
+    let (entered, ready) = std::sync::mpsc::channel();
+    let (done, received) = std::sync::mpsc::channel();
+    let claiming = std::thread::spawn(move || {
+        entered.send(()).unwrap();
+        let result = u.claim(&e, &l, &t);
+        done.send(result.is_some()).unwrap();
+    });
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(received.recv_timeout(Duration::from_millis(30)).is_err(), "claim must wait at checked DB boundary");
+    // The command must acquire watch and slot while claim IO is blocked.
+    let (paused, acknowledged) = std::sync::mpsc::channel();
+    let (pause_request, pause_updates) = (tx.clone(), updates.clone());
+    let pause = std::thread::spawn(move || {
+        pause_request.send_modify(|r| {
+            pause_updates.refuse_pending(remote_update::Refusal::Session);
+            r.mode = RunMode::Paused;
+        });
+        paused.send(()).unwrap();
+    });
+    let paused_before_io = acknowledged.recv_timeout(Duration::from_secs(1)).is_ok();
+    drop(db);
+    pause.join().unwrap();
+    assert!(!received.recv_timeout(Duration::from_secs(2)).unwrap());
+    claiming.join().unwrap();
+    assert!(paused_before_io, "no request or slot guard may span checked IO");
+    tx.send_modify(|r| {
+        r.mode = RunMode::Run;
+        r.start_seq = 1;
+    });
+    updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 2, 1, Duration::from_secs(120))).unwrap();
+    updates.refuse_start(0, remote_update::Refusal::Inputs);
+    assert!(updates.busy(), "an old cycle's refusal cannot withdraw a newer Start");
+    assert!(!updates.withdraw(1));
+    assert!(updates.withdraw(2));
+    assert!(transport.calls.lock().unwrap().is_empty());
+    live.shutdown(Duration::from_secs(1)).await;
+    drop((live, engine));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+#[tokio::test]
+async fn controlled_update_rejects_prepared_binary_cpu_declared_as_other_cpu() {
+    let (engine, live, dir) = update_fixture();
+    let prepared = remote_update::tests::prepared(&dir, crate::helpers::VERSION);
+    let source = prepared.source().to_path_buf();
+    let sampler = source.join(crate::helpers::exe("tune-agent"));
+    let mut bytes = std::fs::read(&sampler).unwrap();
+    if cfg!(windows) {
+        bytes[132..134].copy_from_slice(&0xaa64u16.to_le_bytes());
+    } else {
+        bytes[4..8].copy_from_slice(&0x01000007u32.to_le_bytes());
+    }
+    std::fs::write(sampler, &bytes).unwrap();
+    let manifest = source.join("manifest.json");
+    let mut raw: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    raw["files"].as_array_mut().unwrap().iter_mut().find(|f| f["role"] == "native-sampler").unwrap()["sha256"] = json!(crate::db::sha256_hex(&bytes));
+    std::fs::write(manifest, serde_json::to_vec(&raw).unwrap()).unwrap();
+    // Existing structural native prepare accepts either CPU. The stricter
+    // remote boundary rejects this declaration/content disagreement.
+    let prepared = crate::helpers::native_install::prepare_native_sampler(&source).unwrap();
+    let target = RemoteTargetSnapshot::checked(&engine, "a", remote_update::tests::architecture()).unwrap();
+    assert!(matches!(
+        RemoteUpdateRequest::new(1, 0, std::time::Instant::now() + Duration::from_secs(120), target, prepared),
+        Err(remote_update::Refusal::Source)
+    ));
+    live.shutdown(Duration::from_secs(1)).await;
+    drop((live, engine));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+#[tokio::test]
+async fn controlled_update_coalesced_start_then_exit_finishes_old_pending() {
+    let (engine, live, dir) = update_fixture();
+    let (tx, _rx, stx, _status) = channels(RunMode::Run);
+    live.start_owned(Owner::Ui, &engine.config().nodes[..1], &[]);
+    outdated(&engine, &live).await;
+    let transport = HeldUpdate::new(0);
+    let updates = Arc::new(RemoteUpdateControl::new(transport.clone()));
+    updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 1, 0, Duration::from_secs(120))).unwrap();
+    tx.send_modify(|r| {
+        r.start_seq = 1;
+        r.mode = RunMode::Run;
+    });
+    tx.send_modify(|r| r.mode = RunMode::Exit);
+    // The actual controlled worker first polls only the latest coalesced value.
+    let result = run_controlled(engine.clone(), live.clone(), |_| {}, tx, stx, Some(updates.clone())).await;
+    let outcome = updates.outcome();
+    let busy = updates.busy();
+    updates.withdraw(1); // RED cleanup only, after observing the terminal facts.
+    live.shutdown(Duration::from_secs(1)).await;
+    assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+    drop((live, engine));
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(transport.calls.lock().unwrap().len(), 0);
+    assert_eq!(outcome, Some(RemoteUpdateOutcome::Refused { attempt_id: 1, reason: remote_update::Refusal::Session }));
+    assert!(!busy);
+    assert_eq!(result.update_complete, Some(true));
+    assert_eq!(result.remote_update, outcome);
+}
+
+#[cfg(any(all(target_os = "macos", target_arch = "aarch64"), all(windows, target_arch = "x86_64")))]
+#[tokio::test]
+async fn controlled_update_coalesced_start_then_pause_releases_old_pending_for_new_attempt() {
+    let (engine, live, dir) = update_fixture();
+    let (tx, _rx, stx, mut status) = channels(RunMode::Run);
+    live.start_owned(Owner::Ui, &engine.config().nodes[..1], &[]);
+    outdated(&engine, &live).await;
+    let transport = HeldUpdate::new(0);
+    let updates = Arc::new(RemoteUpdateControl::new(transport.clone()));
+    updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 1, 0, Duration::from_secs(120))).unwrap();
+    tx.send_modify(|r| {
+        r.start_seq = 1;
+        r.mode = RunMode::Run;
+    });
+    tx.send_modify(|r| r.mode = RunMode::Paused);
+    let worker = tokio::spawn(run_controlled(engine.clone(), live.clone(), |_| {}, tx.clone(), stx, Some(updates.clone())));
+    phase(&mut status, RunPhase::Paused).await;
+    let outcome = updates.outcome();
+    let busy = updates.busy();
+    let old_calls = transport.calls.lock().unwrap().len();
+    tx.send_modify(|r| {
+        r.start_seq = 2;
+        r.mode = RunMode::Run;
+    });
+    let new_admission = updates.admit(&engine, &live, &tx, update_request(&engine, &dir, 2, 2, Duration::from_secs(120)));
+    if new_admission.is_ok() {
+        tokio::time::timeout(Duration::from_secs(2), transport.entered.notified()).await.unwrap();
+        transport.release.notify_one();
+    } else {
+        updates.withdraw(1); // RED cleanup after observing the failed admission.
+    }
+    tx.send_modify(|r| r.mode = RunMode::Exit);
+    let result = worker.await.unwrap();
+    live.shutdown(Duration::from_secs(1)).await;
+    assert!(engine.finish_monitor_journal(Duration::from_secs(1)).await);
+    drop((live, engine));
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(old_calls, 0);
+    assert_eq!(outcome, Some(RemoteUpdateOutcome::Refused { attempt_id: 1, reason: remote_update::Refusal::Session }));
+    assert!(!busy);
+    assert_eq!(new_admission, Ok(()));
+    assert_eq!(result.update_complete, Some(true));
+    assert_eq!(result.remote_update, Some(RemoteUpdateOutcome::ConfirmedPlacement { attempt_id: 2 }));
+    assert_eq!(transport.calls.lock().unwrap().len(), 1);
 }

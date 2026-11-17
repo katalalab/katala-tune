@@ -634,15 +634,22 @@ fn controlled_inputs_retaining(engine: &Engine, live: Option<&Live>) -> Result<(
     Ok((cfg, settings))
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlledExit {
+    pub update_complete: Option<bool>,
+    pub remote_update: Option<crate::helpers::remote_update::RemoteUpdateOutcome>,
+}
+
 pub async fn run_controlled(
     engine: Arc<Engine>,
     live: Arc<Live>,
     event: impl Fn(Value) + Send + Sync + 'static,
     request: tokio::sync::watch::Sender<RunRequest>,
     status: tokio::sync::watch::Sender<RunStatus>,
-    agent: Option<Arc<Vec<u8>>>,
-) {
-    run_loop(engine, live, Arc::new(event), None, agent, Some((request.subscribe(), request, status)), &collect::System).await;
+    updates: Option<Arc<crate::helpers::remote_update::RemoteUpdateControl>>,
+) -> ControlledExit {
+    // Raw bundled bytes and automatic all-ledger distribution are legacy only.
+    run_loop(engine, live, Arc::new(event), None, None, Some((request.subscribe(), request, status, updates)), &collect::System).await
 }
 
 /// 15 秒ごとに: 常時監視が入っていてハブの数字が新しくなければ全機体のライブに合図を送って保ち、
@@ -666,7 +673,12 @@ fn record_policy(journal: &crate::monitor_journal::Journal, previous: &mut Optio
     }
 }
 
-type Control = (tokio::sync::watch::Receiver<RunRequest>, tokio::sync::watch::Sender<RunRequest>, tokio::sync::watch::Sender<RunStatus>);
+type Control = (
+    tokio::sync::watch::Receiver<RunRequest>,
+    tokio::sync::watch::Sender<RunRequest>,
+    tokio::sync::watch::Sender<RunStatus>,
+    Option<Arc<crate::helpers::remote_update::RemoteUpdateControl>>,
+);
 
 /// Revoke only the session that read the failed inputs. Serialize permission,
 /// owner release and Failed status with Start so stale work cannot undo it.
@@ -676,6 +688,9 @@ fn fail_controlled(control: &Control, observed: RunRequest, live: &Live) {
             return false;
         }
         current.mode = RunMode::Paused;
+        if let Some(updates) = &control.3 {
+            updates.refuse_start(observed.start_seq, crate::helpers::remote_update::Refusal::Inputs);
+        }
         live.release_owned(crate::live::Owner::Monitor, &live.active(), crate::live::Stop::User);
         control.2.send_replace(RunStatus { phase: RunPhase::Failed, policy: None, local_collecting: None, hub_configured: false });
         // No self-wake: preserve Failed until an external wake or the next period.
@@ -683,7 +698,7 @@ fn fail_controlled(control: &Control, observed: RunRequest, live: &Live) {
     });
 }
 
-fn controlled_collect(engine: &Engine, settings: &Settings, now: i64) -> Result<bool, String> {
+pub(crate) fn controlled_collect(engine: &Engine, settings: &Settings, now: i64) -> Result<bool, String> {
     // The validated settings are the policy input; never reread permissive defaults.
     engine.with_db(|d| {
         let pull = d.get_meta_checked("hubPull")?;
@@ -701,7 +716,12 @@ async fn run_loop(
     agent: Option<Arc<Vec<u8>>>,
     mut control: Option<Control>,
     runner: &dyn collect::Runner,
-) {
+) -> ControlledExit {
+    let updates = control.as_ref().and_then(|c| c.3.clone());
+    let finished = || ControlledExit {
+        update_complete: updates.as_ref().and_then(|u| u.outcome().map(|_| true)),
+        remote_update: updates.as_ref().and_then(|u| u.outcome()),
+    };
     let journal = engine.start_monitor_journal();
     live.bind_journal(journal.clone());
     let mut previous_policy = None;
@@ -719,20 +739,21 @@ async fn run_loop(
         live.release_owned(crate::live::Owner::Monitor, &live.active(), crate::live::Stop::User);
     };
     loop {
-        if let Some((request, _, _)) = &mut control {
+        if let Some((request, _, _, _)) = &mut control {
             tokio::select! {
                 _ = iv.tick() => {},
-                changed = request.changed() => if changed.is_err() { release(); return; },
+                changed = request.changed() => if changed.is_err() { release(); return finished(); },
             }
         } else {
             iv.tick().await;
         }
         let now = now_ms();
-        let requested = control.as_mut().map(|(r, _, _)| *r.borrow_and_update());
+        let requested =
+            control.as_mut().map(|(r, _, _, updates)| if let Some(updates) = updates { updates.observe_request(r) } else { *r.borrow_and_update() });
         if requested.is_some_and(|r| r.mode == RunMode::Exit) {
             release();
             control.as_ref().unwrap().2.send_replace(RunStatus { phase: RunPhase::Exited, policy: None, local_collecting: Some(false), hub_configured: false });
-            return;
+            return finished();
         }
         let running = requested.is_none_or(|r| r.mode == RunMode::Run);
         let explicit_pull = requested.is_some_and(|r| r.pull_seq != processed_pull);
@@ -826,10 +847,23 @@ async fn run_loop(
                 }
             }
         }
+        if let (Some(updates), Some(control)) = (&updates, &control)
+            && updates.busy()
+        {
+            if let Some(update) = updates.claim(&engine, &live, &control.1) {
+                // Own and await exactly this request. No request/host/Gate guard
+                // spans IO, and no stale collection/status/commit follows it.
+                updates.execute(update).await;
+            }
+            // Both completed and refused requests invalidate this cycle's inputs.
+            // Wake the same worker to reread the latest Pause/Exit/Start now.
+            control.1.send_modify(|_| {});
+            continue;
+        }
         // Hold the request read guard through the synchronous collection/commit
         // boundary so a newer command cannot be overwritten by this cycle's status.
-        let current = control.as_ref().map(|(request, _, _)| request.borrow());
-        if let Some((_, _, status)) = &control {
+        let current = control.as_ref().map(|(request, _, _, _)| request.borrow());
+        if let Some((_, _, status, _)) = &control {
             let current = current.as_ref().unwrap();
             let mode = current.mode;
             if mode != RunMode::Exit && current.start_seq != requested.unwrap().start_seq {
@@ -844,7 +878,7 @@ async fn run_loop(
                     hub_configured: s.hub.is_some(),
                 });
                 if mode == RunMode::Exit {
-                    return;
+                    return finished();
                 }
                 continue;
             }
@@ -907,11 +941,11 @@ async fn run_loop(
             commit_minute_rows(&engine, &journal, &rows, &mut rolled, &mut pending_from, &*event);
         }
         maintain_retention(&engine, &journal, now, std::time::Instant::now(), &mut retention_schedule);
-        if let Some((_, _, status)) = &control {
+        if let Some((_, _, status, _)) = &control {
             status.send_replace(RunStatus { phase: RunPhase::Running, policy: Some(policy), local_collecting: Some(collect), hub_configured: s.hub.is_some() });
         }
         if until.is_some_and(|u| std::time::Instant::now() >= u) {
-            return;
+            return finished();
         }
     }
 }
