@@ -16,7 +16,11 @@
 //! 置き場所（--dir）の既定は `~/.katala-tune/agent`（`KATALA_TUNE_AGENT_DIR` で差し替えられる）。
 //! 常駐としての登録（launchd・タスク スケジューラ）と、Claude Code・Codex の設定の書き換えはしない（手順は docs）。
 
+#[cfg(windows)]
+mod gpu_win;
 mod listen;
+#[cfg(windows)]
+mod nvml;
 mod otlp;
 mod probe;
 mod sample;
@@ -385,6 +389,10 @@ fn usage() -> ExitCode {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // サンプラーは 1 本のスレッドで足りる（tokio の作業スレッドをコアの数だけ作らない）
+    #[cfg(windows)]
+    if args.as_slice() == ["gpu-query-nvml"] {
+        return if nvml::query().is_some() { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+    }
     if args.first().map(String::as_str) == Some("sample") {
         return sample::main(&args[1..]);
     }

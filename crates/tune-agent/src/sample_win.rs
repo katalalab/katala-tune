@@ -4,7 +4,7 @@
 //! - メモリ: used = 1 - Available Bytes / 物理メモリ、commit = Committed Bytes / Commit Limit
 //! - プロセス: NtQuerySystemInformation(SystemProcessInformation) 1 回で全プロセスの CPU 時間・ワーキングセット・
 //!   名前・親。ハンドルを開かないので、保護されたプロセス（vmmemWSL など）も数えられる
-//! - GPU: nvidia-smi があるときだけ、最大5秒間隔・4秒上限の読み取り専用query（専用VRAMはadapter別）
+//! - GPU: NVML または nvidia-smi による読み取り専用の隔離クエリ（間隔5秒以上、4秒上限、専用VRAMはadapter別）
 //!
 //! 取り出すのは数と、上位プロセスの PID・実行ファイル名だけ（コマンドライン・環境・ファイルの中身は読まない）。
 #![allow(unsafe_code)] // PDH・NtQuerySystemInformation・GlobalMemoryStatusEx・OpenProcess の呼び出しだけ。前提は各所に書く
@@ -22,7 +22,8 @@ use windows_sys::Win32::System::Performance::{
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 
-use crate::sample::{Args, GpuQuery as Gpus, ProcRow, display_name, procs_json, round, virtual_adapter};
+use crate::gpu_win::WindowsGpu;
+use crate::sample::{Args, ProcRow, display_name, procs_json, round, virtual_adapter};
 
 /// 100 を超える値をそのまま返す（コアの % は丸めない側で収める）
 const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
@@ -290,7 +291,7 @@ pub struct Sampler {
     errors: Vec<String>,
     buf: Vec<u64>,
     rates: ProcRates,
-    gpus: Option<Gpus>,
+    gpus: Option<WindowsGpu>,
     session: Option<SessionWatch>,
     cores: usize,
     power_seen: bool,
@@ -345,7 +346,7 @@ impl Sampler {
             errors,
             buf: vec![0u64; 512 * 1024 / 8],
             rates: ProcRates { prev: HashMap::new(), at: None },
-            gpus: nvidia_smi().map(|p| Gpus::open(p, a.procs_every)),
+            gpus: nvidia_smi().map(|p| WindowsGpu::open(p, a.procs_every)),
             session: None,
             cores: 0,
             power_seen: false,
