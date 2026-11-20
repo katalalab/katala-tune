@@ -22,13 +22,14 @@ use crate::{
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, MouseButton, PathBuilder, UniformListScrollHandle, Window,
     WindowBounds, WindowOptions, actions, canvas, div, hsla, img, point, prelude::*, px, rgb, size, uniform_list,
 };
 use model::{Finding, Health, NodeView, Severity};
+use tune_core::db::now_ms;
 use tune_core::engine::Engine;
 use tune_core::live::{Live, Owner, ProcessRoute, Stop};
 use tune_core::nodes;
@@ -75,10 +76,6 @@ pub(crate) mod palette {
     pub fn crit() -> Hsla {
         rgb(0xe5584f).into()
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
 fn score_color(h: &Health) -> Hsla {
@@ -692,7 +689,7 @@ impl TuneApp {
 
     /// 完了台帳 JSON を読む（保存しない・外部参照を取得しない）。読めなければ理由を出し、前の表示は消す
     fn load_review(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
-        match review::load(path, review::now_ms()) {
+        match review::load(path, now_ms()) {
             Ok(loaded) => {
                 self.review = Some(loaded);
                 self.review_error = None;
