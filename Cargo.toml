@@ -14,7 +14,7 @@ members = [
 exclude = ["vendor/glib-0.18.5", "test/glib-variant-regression"]
 
 [workspace.package]
-version = "0.7.0-rc.1"
+version = "0.7.0"
 license = "MIT"
 repository = "https://github.com/katalalab/katala-tune"
 edition = "2024"
