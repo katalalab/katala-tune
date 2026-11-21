@@ -90,7 +90,7 @@ mod native {
         assert!(result.reply.local_settled, "all child/stdin/stdout/stderr/wait must settle");
         assert!(entries.is_empty(), "inspect cannot create locks or stage files");
         assert_eq!(result.reply.code, Some(0));
-        assert_eq!(result.observed.unwrap().before, BeforeImageFact::Missing);
+        assert_eq!(result.observed.unwrap().mac().before, BeforeImageFact::Missing);
     }
     async fn place(f: &Fixture, snapshot: &observation::MacSnapshot, body: &[u8], extra: &str) -> ssh::ExchangeResult {
         let hash = crate::db::sha256_hex(body);
@@ -114,7 +114,7 @@ mod native {
                 std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
             let before = std::fs::metadata(&target).ok().map(|s| (s.dev(), s.ino()));
-            let snapshot = inspect(&f).await.observed.expect("native inspect must complete");
+            let snapshot = inspect(&f).await.observed.expect("native inspect must complete").mac();
             let result = place(&f, &snapshot, &body, "").await;
             let actual = std::fs::read(&target).ok();
             let meta = std::fs::metadata(&target).ok();
@@ -210,7 +210,7 @@ mod native {
             old.extend_from_slice(b"exact-old");
             write_executable(&target, &old);
             let old_inode = std::fs::metadata(&target).unwrap().ino();
-            let snapshot = inspect(&f).await.observed.unwrap();
+            let snapshot = inspect(&f).await.observed.unwrap().mac();
             let adapter = format!("    fault={}\n{FAULT_ADAPTER}", serde_json::to_string(fault).unwrap());
             let result = place(&f, &snapshot, &body, &adapter).await;
             let entries = names(&f);
@@ -282,7 +282,7 @@ mod native {
     async fn same_function_missing_failure_restores_absence() {
         let f = Fixture::new();
         let body = super::super::super::binary::fixtures::macho();
-        let snapshot = inspect(&f).await.observed.unwrap();
+        let snapshot = inspect(&f).await.observed.unwrap().mac();
         let adapter = format!("    fault='afterfinalrename'\n{FAULT_ADAPTER}");
         let result = place(&f, &snapshot, &body, &adapter).await;
         let entries = names(&f);
@@ -300,7 +300,7 @@ mod native {
             let old = b"safe-executable-old";
             write_executable(&target, old);
             let before = std::fs::metadata(&target).unwrap().ino();
-            let snapshot = inspect(&f).await.observed.unwrap();
+            let snapshot = inspect(&f).await.observed.unwrap().mac();
             let body = super::super::super::binary::fixtures::macho();
             let hash = crate::db::sha256_hex(&body);
             let mut image = image(&body, &hash);
@@ -340,7 +340,7 @@ mod native {
             let target = bin.join("tune-agent");
             let old = b"safe-before-image";
             write_executable(&target, old);
-            let snapshot = inspect(&f).await.observed.unwrap();
+            let snapshot = inspect(&f).await.observed.unwrap().mac();
             let mut extra = String::new();
             match drift {
                 "leafsymlink" => {
@@ -427,7 +427,7 @@ mod native {
         });
         assert_eq!(transport.preflight(&request.target.node, request.payload()), Err(Refusal::InvalidRequest));
         assert_eq!(transport.place(&request.target.node, request.payload()).await.before_start_refusal, Some(Refusal::InvalidRequest));
-        let snapshot = inspect(&f).await.observed.unwrap();
+        let snapshot = inspect(&f).await.observed.unwrap().mac();
         let observed = RemoteDestinationObservation::native(&request, observation::inspect_context(&request, 120000), snapshot);
         request = request.with_observation(observed).unwrap();
         assert!(transport.preflight(&request.target.node, request.payload()).is_ok());
@@ -514,14 +514,14 @@ mod native {
         assert_eq!(names(&f), ["tune-agent"]);
         f.cleanup();
         assert!(result.reply.local_settled && result.reply.response_complete && result.reply.code == Some(0));
-        assert!(matches!(result.observed.unwrap().before, BeforeImageFact::Present(_)));
+        assert!(matches!(result.observed.unwrap().mac().before, BeforeImageFact::Present(_)));
     }
 
     #[tokio::test]
     async fn same_buffered_stream_rejects_truncated_excess_corrupt_body_and_bad_prefix_header() {
         for case in ["short", "excess", "hash", "prefix-overflow", "prefix-leadingzero", "header-order", "header-extra", "inspect-body"] {
             let f = Fixture::new();
-            let snapshot = inspect(&f).await.observed.unwrap();
+            let snapshot = inspect(&f).await.observed.unwrap().mac();
             let hash = crate::db::sha256_hex(b"abc");
             let mut image = image(b"abc", &hash);
             image.observation = &snapshot.record;
@@ -559,7 +559,7 @@ mod native {
         let bin = f.home.join(".katala-tune/bin");
         let target = bin.join("tune-agent");
         write_executable(&target, b"exact-old");
-        let snapshot = inspect(&f).await.observed.unwrap();
+        let snapshot = inspect(&f).await.observed.unwrap().mac();
         let extra = r#"    class Changed(FixtureOps):
         def point(self,name,chain):
             super().point(name,chain)
@@ -597,7 +597,7 @@ mod native {
             )
             .unwrap();
             if bound {
-                let snapshot = inspect(&f).await.observed.unwrap();
+                let snapshot = inspect(&f).await.observed.unwrap().mac();
                 let o = RemoteDestinationObservation::native(&request, observation::inspect_context(&request, 120000), snapshot);
                 request = request.with_observation(o).unwrap();
             }
@@ -636,7 +636,7 @@ mod native {
                 prepared,
             )
             .unwrap();
-            let snapshot = inspect(&f).await.observed.unwrap();
+            let snapshot = inspect(&f).await.observed.unwrap().mac();
             let o = RemoteDestinationObservation::native(&request, observation::inspect_context(&request, 120000), snapshot);
             if case == "token" {
                 request.token = AttemptToken::fresh(1);
@@ -644,11 +644,11 @@ mod native {
             } else {
                 request = request.with_observation(o).unwrap();
                 if case == "rebind" {
-                    let snapshot = inspect(&f).await.observed.unwrap();
+                    let snapshot = inspect(&f).await.observed.unwrap().mac();
                     let o = RemoteDestinationObservation::native(&request, observation::inspect_context(&request, 120000), snapshot);
                     assert!(matches!(request.with_observation(o), Err(Refusal::InvalidRequest)));
                 } else {
-                    let mut snapshot = request.observation.take().unwrap().snapshot;
+                    let mut snapshot = request.observation.take().unwrap().snapshot.mac();
                     let mut fields: Vec<_> = snapshot.record.split('|').collect();
                     fields[4] = "0";
                     snapshot.record = fields.join("|");
@@ -712,7 +712,7 @@ mod native {
         let target = f.home.join(".katala-tune/bin/tune-agent");
         write_executable(&target, b"xyz");
         let before = std::fs::metadata(&target).unwrap().ino();
-        let snapshot = inspect(&f).await.observed.unwrap();
+        let snapshot = inspect(&f).await.observed.unwrap().mac();
         let hash = crate::db::sha256_hex(b"xyz");
         let mut image = image(b"abc", &hash);
         image.observation = &snapshot.record;
@@ -733,7 +733,7 @@ mod native {
             let target = bin.join("tune-agent");
             write_executable(&target, b"old-before");
             let old_inode = std::fs::metadata(&target).unwrap().ino();
-            let snapshot = inspect(&f).await.observed.unwrap();
+            let snapshot = inspect(&f).await.observed.unwrap().mac();
             let extra = format!(
                 r#"    which={which}
     class Drift(FixtureOps):
