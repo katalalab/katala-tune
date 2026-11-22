@@ -332,7 +332,7 @@ public static class Ktu2Fixture {{
     }}
     public static int Run(Stream input,byte[] bytes,long body,long q,long freq) {{
         string root={root};Ktu2.Need(Directory.Exists(root));
-        SecurityIdentifier sid;using(WindowsIdentity identity=WindowsIdentity.GetCurrent()){sid=identity.User;}byte[] raw=new byte[sid.BinaryLength];sid.GetBinaryForm(raw,0);
+        SecurityIdentifier sid;using(WindowsIdentity identity=WindowsIdentity.GetCurrent()){{sid=identity.User;}}byte[] raw=new byte[sid.BinaryLength];sid.GetBinaryForm(raw,0);
         Ktu2.Manifest manifest=new Ktu2.Manifest();manifest.Root=root;manifest.RootIdentity={rootid};manifest.RootIndex=Ktu2.Components(root).Length;manifest.Sid=raw;manifest.Identities=new string[]{{{ids}}};manifest.Security=new string[]{{{sec}}};
         if(manifest.Identities.Length==0){{
             DirectorySecurity security=new DirectorySecurity();security.SetOwner(sid);security.SetAccessRuleProtection(true,false);

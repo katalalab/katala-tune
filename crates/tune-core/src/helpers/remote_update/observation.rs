@@ -205,7 +205,7 @@ impl DestinationSnapshot {
             Self::Windows(s) => s.before,
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(super) fn mac(self) -> MacSnapshot {
         match self {
             Self::Mac(s) => s,
