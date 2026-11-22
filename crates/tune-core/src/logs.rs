@@ -784,6 +784,3 @@ mod tests {
         assert_eq!(source_note(None), None);
     }
 }
-
-#[cfg(test)]
-mod transport_diagnostics;
