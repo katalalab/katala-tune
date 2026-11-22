@@ -490,11 +490,6 @@ pub fn parse(input: &Value, now_ms: i64) -> R<Document> {
     Ok(Document { tasks, coverage: coverage(input.get("coverage"))? })
 }
 
-/// 現在時刻（ミリ秒）
-pub fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Source {
     pub name: String,
@@ -504,7 +499,6 @@ pub struct Source {
 
 /// ファイルを読む（2 MiB まで・UTF-8 のみ）。内容は保存しない
 pub fn load(path: &std::path::Path, now: i64) -> R<(Source, Document)> {
-    use sha2::{Digest, Sha256};
     let meta = std::fs::metadata(path).map_err(|_| "ファイルサイズを確認できません。".to_string())?;
     if !meta.is_file() {
         return Err("ファイルを指定してください。".into());
@@ -516,8 +510,7 @@ pub fn load(path: &std::path::Path, now: i64) -> R<(Source, Document)> {
     if bytes.len() > MAX_FILE {
         return Err("ファイルを安全に読み込めません。".into());
     }
-    let digest = Sha256::digest(&bytes);
-    let sha256 = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let sha256 = tune_core::db::sha256_hex(&bytes);
     let source = String::from_utf8(bytes.clone()).map_err(|_| "入力を受け付けられません: UTF-8 として読めません".to_string())?;
     let value: Value = serde_json::from_str(&source).map_err(|_| "JSONの形式が不正です。".to_string())?;
     let doc = parse(&value, now).map_err(|e| format!("入力を受け付けられません: {e}"))?;

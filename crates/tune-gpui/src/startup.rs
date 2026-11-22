@@ -27,10 +27,8 @@ pub fn installed(arguments: &[OsString], resolve: impl FnOnce(&str) -> Result<Op
     if arguments.len() != 2 || arguments[0] != "--installed-startup" {
         return Err("--installed-startup requires only one profile digest".into());
     }
-    let digest = arguments[1]
-        .to_str()
-        .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
-        .ok_or("--installed-startup requires a lower-case SHA-256 digest")?;
+    let digest =
+        arguments[1].to_str().filter(|value| tune_core::db::is_lower_hex(value, 64)).ok_or("--installed-startup requires a lower-case SHA-256 digest")?;
     resolve(digest).map(Some)
 }
 

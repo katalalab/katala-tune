@@ -440,7 +440,7 @@ fn local_probe_path(bin: &std::path::Path) -> Result<PathBuf, &'static str> {
 }
 
 async fn probe_exchange_system(node: &Node, helper_sha256: &str, benchmark: bool, network: bool, observe_wsl: bool) -> RunResult {
-    if node.refusal().is_some() || !lower_hex(helper_sha256, 64) {
+    if node.refusal().is_some() || !crate::db::is_lower_hex(helper_sha256, 64) {
         return RunResult { code: Some(9), out: String::new(), err: "Windows probe request is invalid; collection refused".into() };
     }
     if node.local {
@@ -557,7 +557,7 @@ async fn action_exchange_system(node: &Node, helper_sha256: &str, body: &[u8], t
     if let Some(err) = node.refusal() {
         return RunResult { code: Some(9), out: String::new(), err };
     }
-    if body.is_empty() || body.len() > 65_536 || helper_sha256.len() != 64 || !helper_sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if body.is_empty() || body.len() > 65_536 || !crate::db::is_lower_hex(helper_sha256, 64) {
         return RunResult { code: Some(9), out: String::new(), err: "KT2 action request is invalid; operation refused".into() };
     }
     if node.local {
@@ -581,10 +581,6 @@ async fn action_exchange_system(node: &Node, helper_sha256: &str, body: &[u8], t
     let mut c = command("ssh");
     c.args(node_ssh_args(node, &remote_command));
     action_exchange_command(c, body, timeout).await
-}
-
-fn lower_hex(value: &str, size: usize) -> bool {
-    value.len() == size && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn canonical_usize(value: &str) -> Option<usize> {
@@ -721,7 +717,7 @@ async fn action_exchange_command(mut c: Command, body: &[u8], timeout: Duration)
             return action_exchange_failure(&mut child, &mut read_err, false, "KT2 READY unavailable; operation refused").await;
         }
     };
-    let Some(nonce) = ready.strip_prefix("KT2 READY ").filter(|v| lower_hex(v, 64)) else {
+    let Some(nonce) = ready.strip_prefix("KT2 READY ").filter(|v| crate::db::is_lower_hex(v, 64)) else {
         return action_exchange_failure(&mut child, &mut read_err, false, "KT2 READY invalid; operation refused").await;
     };
     let hash = crate::db::sha256_hex(body);

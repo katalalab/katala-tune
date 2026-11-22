@@ -60,10 +60,6 @@ pub fn run_meta(node_id: &str, started_at: i64, finished_at: i64) -> crate::db::
     }
 }
 
-fn is_sha(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
 /// 続きの位置を埋め込んだスクリプト。state は {"files": {鍵: 数}, "anchors": {鍵: [数, 16 進]}}（[`crate::db::Store::ai_state`]）。
 /// 数と文字列と配列だけなので、JSON がそのまま Python の辞書として読める（形の違う値は落とす）
 pub fn script(state: &Value) -> String {
@@ -82,7 +78,7 @@ pub fn script(state: &Value) -> String {
         .flatten()
         .filter(|(_, v)| {
             let a = js::arr(Some(v));
-            a.len() == 2 && a[0].is_u64() && a[1].as_str().is_some_and(is_sha)
+            a.len() == 2 && a[0].is_u64() && a[1].as_str().is_some_and(|s| crate::db::is_lower_hex(s, 64))
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
