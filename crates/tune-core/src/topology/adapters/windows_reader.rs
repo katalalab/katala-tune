@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use super::remote::{self, RemotePlatform, RemoteRequest, RemoteRuntimeKind, RemoteSourceCheckout};
 use crate::collect::{BoundedResult, ProcessIdentity, ProcessReceipt, ProcessStop};
+use crate::db::is_lower_hex;
 use crate::topology::{TopologyLimits, config::TopologyConfig};
 
 const MAGIC: &[u8; 8] = b"KTRDR001";
@@ -166,9 +167,6 @@ struct ResponseHeader {
 pub fn probe_sha256() -> String {
     crate::db::sha256_hex(remote::WINDOWS_PROBE.as_bytes())
 }
-fn hex(value: &str, len: usize) -> bool {
-    value.len() == len && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
 
 /// Narrow, quoted Git Bash executable argument; no UNC, expansion, alternate
 /// data stream, dot segment, trailing-dot/space component or option ambiguity.
@@ -235,12 +233,12 @@ impl ReaderRequest {
     pub fn validate(&self) -> Result<(), ReaderError> {
         let native = self.schema == super::native_protocol::REQUEST_SCHEMA;
         if (!native && self.schema != REQUEST_SCHEMA)
-            || !hex(&self.nonce, 32)
+            || !is_lower_hex(&self.nonce, 32)
             || self.scope_id.is_empty()
             || self.scope_id.len() > 512
             || self.scope_id.chars().any(char::is_control)
             || self.observed_at_ms <= 0
-            || !hex(&self.expected_identity_hash, 64)
+            || !is_lower_hex(&self.expected_identity_hash, 64)
             || self.expected_runtime != RemoteRuntimeKind::Native
             || self.expected_distro.is_some()
             || (!native && self.probe_sha256 != probe_sha256())

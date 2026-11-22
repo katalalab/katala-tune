@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 pub const PARSER_VERSION: &str = "katala-topology-parser.v2";
 
@@ -236,8 +235,7 @@ fn id(namespace: &str, parts: &[&str]) -> String {
         bytes.extend_from_slice(&(part.len() as u64).to_be_bytes());
         bytes.extend_from_slice(part.as_bytes());
     }
-    let hash = Sha256::digest(bytes);
-    format!("kt.topology.v1.{namespace}.{}", hash.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    format!("kt.topology.v1.{namespace}.{}", crate::db::sha256_hex(&bytes))
 }
 
 pub fn canonical_entity_id(kind: EntityKind, key: &str) -> String {

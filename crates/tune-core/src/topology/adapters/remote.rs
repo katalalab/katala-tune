@@ -511,7 +511,7 @@ fn valid_cursor(value: &Value, roots: usize, depth: usize) -> bool {
     };
     if object.len() != 4
         || value["version"].as_u64() != Some(1)
-        || !value["fingerprint"].as_str().is_some_and(|text| text.len() == 64 && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        || !value["fingerprint"].as_str().is_some_and(|text| crate::db::is_lower_hex(text, 64))
         || serde_json::to_vec(value).map_or(true, |data| data.len() > 8192)
     {
         return false;
