@@ -8,7 +8,7 @@ Windows の通常収集と GPU 操作は、台帳の `action_helper` v2 が承�
 
 1. GitHub API の run と artifacts を取得する。repository、workflow path `.github/workflows/ci.yml`、event、head SHA、run ID/attempt、全体の success、artifact の name・期限・digest を確認する。artifact 名は `tune-cli-windows-x64-<run ID>-<attempt>`。
 2. その artifact ID の ZIP をダウンロードし、**展開前に ZIP の SHA-256 を GitHub API の `digest` と比較**する。`gh run download` だけでは、この記録を省略しない。ZIP の項目が通常ファイルの `tune.exe` と `manifest.json` だけで、絶対パス、親ディレクトリ参照、リンク、重複がないことを確認し、新しい空の場所へ展開する。
-3. `manifest.json` の schemaVersion が1、artifact の file が `tune.exe`、サイズ・SHA-256 が実ファイルと同じ、build が `tune-cli` / `debug` / `x86_64-pc-windows-msvc` / `win32` / `x64`、Rust が指定版であることを確認する。source の `githubSha` と `head` が同じで、CI の repository・runId・runAttempt・event・workflowRef・workflowSha が実 run に対応することを確認する。
+3. `manifest.json` の schemaVersion が1、artifact の file が `tune.exe`、サイズ・SHA-256 が実ファイルと同じ、build が `tune-cli` / `release` / `x86_64-pc-windows-msvc` / `win32` / `x64`、Rust が指定版であることを確認する。source の `githubSha` と `head` が同じで、CI の repository・runId・runAttempt・event・workflowRef・workflowSha が実 run に対応することを確認する。
 4. PR では GitHub の検証用 merge SHA と PR head SHA は異なる。`source.pullRequest.headSha` がレビュー済み head、baseSha が対象 base、`source.tree` がレビューした統合 tree、Cargo.lock の canonical hash がその tree の内容と一致することを照合する。merge tree が変わったら再レビューする。manifest の自己申告だけで出所を承認しない。
 5. 対象 Windows で保護を有効にしたまま、展開したファイルと候補アプリ一式を Defender でスキャンする。検出時は実行せず停止する。検出名・時刻・ハッシュ・定義版を非公開の証跡へ残す。clean はその検査結果であり、過去の検出の誤検知判定にはならない。
 
@@ -22,6 +22,8 @@ manifest_sha256 SHA-256(manifest.json) (64 hex)
 run_id          ci.runId (integer)
 attempt         ci.runAttempt (integer)
 ```
+
+新しい専用CI artifactは`cargo build --release --locked -p tune-cli`でビルドし、`target/release/tune.exe`を記録する。release出力が無ければ失敗し、debug出力には戻らない。既に上の手順で承認済みのdebug版と、その`action_helper` v2記録は引き続き有効である。release版への更新にも成功CI・出所・実ファイルの照合と操作者の明示的な承認が必要で、GPUI同梱の診断用CLIを代用しない。
 
 ## 切り替え
 

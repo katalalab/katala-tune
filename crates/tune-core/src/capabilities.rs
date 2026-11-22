@@ -57,7 +57,7 @@ pub fn transport(node: &Node) -> (String, Vec<String>, Vec<u8>) {
     if node.local {
         (cmd, args, input)
     } else {
-        let mut args = collect::ssh_args(&node.alias, &remote);
+        let mut args = collect::node_ssh_args(node, &remote);
         args.insert(args.len() - 2, "--".into());
         args.splice(
             0..0,

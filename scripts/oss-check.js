@@ -37,6 +37,18 @@ function ledgerTerms(cfg, extra = []) {
   return [...terms];
 }
 
+function runtimeTerms(cfg, {
+  platform = process.platform,
+  githubActions = process.env.GITHUB_ACTIONS,
+  username = os.userInfo().username,
+  hostname = os.hostname(),
+} = {}) {
+  // Only this auto-added public CI identity is classified; explicit ledger terms stay private.
+  const publicWindowsUser = platform === 'win32' && githubActions === 'true'
+    && username.toLowerCase() === ['runner', 'admin'].join('');
+  return ledgerTerms(cfg, publicWindowsUser ? [hostname] : [username, hostname]);
+}
+
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 // skip: その本文では探さない規則（package-lock.json の作者メールは第三者の公開情報なので email を外す）
@@ -50,16 +62,41 @@ function scanText(text, terms = [], skip = []) {
   return found;
 }
 
+// These exact upstream manifests retain public author metadata. All other rules still apply.
+function scanPolicy(file) {
+  if (path.basename(file) === 'package-lock.json'
+    || file === 'vendor/taffy-0.9.0/Cargo.toml'
+    || file === 'vendor/taffy-0.9.0/Cargo.toml.orig') return 'author-email';
+  if (file === 'vendor/glib-0.18.5/src/translate.rs') return 'glib-ci-comments';
+  return 'normal';
+}
+
+// Preserve the two canonical upstream comments about public Windows CI short paths.
+// Only home-path findings on these complete lines are exempt; ledger terms remain active.
+const GLIB_CI_COMMENTS = new Set([
+  '// This currently fails on Windows because ' + ['C:', 'Users', 'runneradmin'].join('\\\\'),
+  '// gets shortened to ' + ['C:', 'Users', 'RUNNER~1'].join('\\\\'),
+]);
+
+function scanFileText(file, text, terms = []) {
+  const policy = scanPolicy(file);
+  const findings = scanText(text, terms, policy === 'author-email' ? ['email'] : []);
+  if (policy !== 'glib-ci-comments') return findings;
+  const lines = text.split('\n');
+  return findings.filter((x) => x.rule !== 'home-path' || !GLIB_CI_COMMENTS.has(lines[x.line - 1].trimStart()));
+}
+
 const git = (args, opts = {}) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 256 << 20, ...opts });
 
-// rev ごとのファイル一覧から、中身が同じものは1回だけ読む
+// 同じ blob は走査規則ごとに1回読む。例外のあるパスを通常のパスへ広げない。
 function blobsOf(revs) {
   const blobs = new Map();
   for (const rev of revs) {
     for (const row of git(['ls-tree', '-r', rev]).split('\n').filter(Boolean)) {
       const [meta, file] = row.split('\t');
       const [, type, oid] = meta.split(' ');
-      if (type === 'blob' && !blobs.has(oid)) blobs.set(oid, { file, rev });
+      const key = `${oid}:${scanPolicy(file)}`;
+      if (type === 'blob' && !blobs.has(key)) blobs.set(key, { oid, file, rev });
     }
   }
   return blobs;
@@ -82,19 +119,18 @@ function revListArgs(argv) {
   return null;
 }
 
-function main(argv) {
+function main(argv, runtimeIdentity) {
   const range = revListArgs(argv);
   const history = !!range;
   const { file, cfg } = loadLedger();
-  const terms = ledgerTerms(cfg, [os.userInfo().username, os.hostname()]);
+  const terms = runtimeTerms(cfg, runtimeIdentity);
   const revs = history ? git(range).split('\n').filter(Boolean) : ['HEAD'];
   const short = (rev) => (history ? `@${rev.slice(0, 7)}` : '');
   const findings = [];
 
-  for (const [oid, { file: f, rev }] of blobsOf(revs)) {
+  for (const { oid, file: f, rev } of blobsOf(revs).values()) {
     const text = readBlob(oid);
-    const skip = path.basename(f) === 'package-lock.json' ? ['email'] : [];
-    if (text) for (const x of scanText(text, terms, skip)) findings.push({ ...x, where: `${f}${short(rev)}:${x.line}` });
+    if (text) for (const x of scanFileText(f, text, terms)) findings.push({ ...x, where: `${f}${short(rev)}:${x.line}` });
   }
   if (history) {
     for (const rev of revs) {
@@ -118,4 +154,4 @@ function main(argv) {
 }
 
 if (require.main === module) process.exitCode = main(process.argv.slice(2));
-module.exports = { ledgerTerms, scanText, revListArgs };
+module.exports = { ledgerTerms, runtimeTerms, scanText, scanFileText, revListArgs, main };

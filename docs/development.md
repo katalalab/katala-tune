@@ -44,6 +44,10 @@ Tauri QA は本番アプリを終了・置換しない。別 identifier / produc
 
 ### CLI の発見と副作用
 
+`tune e2e --db <新規ディレクトリ> [node-id ...]`は、GPUI・Tauriと共通のEngineで収集、分析、SQLite保存、再読込、ログ同期とカーソル保存を検証する。親ディレクトリは事前に作成し、`--db`にはまだ存在しないパスを渡す。台帳を変更せず、通常のDBは開かない。監視・自動更新・helper配布も開始しない。ベンチマークとネットワーク収集の範囲は機体台帳の設定に従う。
+
+JSONの`counts`は対象・成功・失敗・除外を分け、機体ごとに`probe`、`reload`、`logs.sources`を返す。失敗または対象0台ではJSONを出力して終了コード1。正常な0件のログは成功にできるが、取得元のエラーやカーソル保存の欠測は成功にしない。`note`は、そのアカウントに任意のログが存在しない等の観測範囲を示す。snapshotやログ本文は出力せず、エラーも`unreachable`・`auth`・`timeout`・`error`・`helper_unavailable`等の分類だけにする。実台帳での出力と検証DBには機体情報が入るため、公開repositoryに置かない。このコマンドの成功はGUI操作・配布・自動更新の実機受入を意味しない。
+
 `tune --help` / `tune help` は全公開コマンド、`tune help <command>` は引数・出力形式・副作用を表示する。成功時は stdout と exit 0、未知の help 対象や不正な discovery 引数は stderr と exit 2。内部 native reader のプロトコルは対象外。
 
 `tune cli-info --json` は `schema_version: 1`、`cli_version`、`commands` を返す。各項目は `name`、`arguments`（usage 構文の文字列配列）、`summary`、`output.default/formats`、`effects`、`notes`。引数の `[]` は任意、`<>` は必須、`...` は繰返しを表す。これは入力検証用 JSON Schema ではない。既存コマンドの出力を包む形式でもない。

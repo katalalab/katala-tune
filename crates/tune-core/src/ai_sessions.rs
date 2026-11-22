@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
-use crate::collect::{self, RunResult, last_json_line, ssh_args};
+use crate::collect::{self, RunResult, last_json_line, node_ssh_args};
 use crate::js;
 use crate::nodes::Node;
 
@@ -60,10 +60,6 @@ pub fn run_meta(node_id: &str, started_at: i64, finished_at: i64) -> crate::db::
     }
 }
 
-fn is_sha(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
 /// 続きの位置を埋め込んだスクリプト。state は {"files": {鍵: 数}, "anchors": {鍵: [数, 16 進]}}（[`crate::db::Store::ai_state`]）。
 /// 数と文字列と配列だけなので、JSON がそのまま Python の辞書として読める（形の違う値は落とす）
 pub fn script(state: &Value) -> String {
@@ -82,7 +78,7 @@ pub fn script(state: &Value) -> String {
         .flatten()
         .filter(|(_, v)| {
             let a = js::arr(Some(v));
-            a.len() == 2 && a[0].is_u64() && a[1].as_str().is_some_and(is_sha)
+            a.len() == 2 && a[0].is_u64() && a[1].as_str().is_some_and(|s| crate::db::is_lower_hex(s, 64))
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
@@ -172,7 +168,7 @@ fn mac_python(local: bool, alias: &str) -> (String, Vec<String>) {
         ("/usr/bin/env".into(), ["python3", "-X", "utf8", "-c", MAC_BOOT].map(String::from).to_vec())
     } else {
         let remote = format!("command -v python3 >/dev/null && exec python3 -X utf8 -c '{MAC_BOOT}' || exec /usr/bin/python3 -X utf8 -c '{MAC_BOOT}'");
-        ("ssh".into(), ssh_args(alias, &remote))
+        ("ssh".into(), collect::ssh_args(alias, &remote))
     }
 }
 
@@ -197,7 +193,7 @@ pub async fn run_python(node: &Node, src: &str, timeout: Duration) -> RunResult 
         }
         last
     } else {
-        collect::run("ssh", &ssh_args(&node.alias, &windows_remote()), input, timeout).await
+        collect::run("ssh", &node_ssh_args(node, &windows_remote()), input, timeout).await
     }
 }
 

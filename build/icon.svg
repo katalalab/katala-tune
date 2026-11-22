@@ -1,13 +1,15 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1b1f2b"/><stop offset="1" stop-color="#0d0f15"/></linearGradient>
-    <linearGradient id="ac" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9aa6ff"/><stop offset="1" stop-color="#5b6cff"/></linearGradient>
+    <linearGradient id="shell" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#29384b"/><stop offset="1" stop-color="#111720"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#61748d" stop-opacity=".55"/><stop offset="1" stop-color="#61748d" stop-opacity=".12"/>
+    </linearGradient>
   </defs>
-  <rect x="100" y="100" width="824" height="824" rx="190" fill="url(#bg)"/>
-  <rect x="100" y="100" width="824" height="824" rx="190" fill="none" stroke="#2f3546" stroke-width="6"/>
-  <path d="M300 700 A240 240 0 1 1 724 700" fill="none" stroke="#2a3040" stroke-width="56" stroke-linecap="round"/>
-  <path d="M300 700 A240 240 0 0 1 640 330" fill="none" stroke="url(#ac)" stroke-width="56" stroke-linecap="round"/>
-  <line x1="512" y1="560" x2="650" y2="400" stroke="#e6e8ee" stroke-width="30" stroke-linecap="round"/>
-  <circle cx="512" cy="560" r="44" fill="#e6e8ee"/>
-  <circle cx="400" cy="760" r="20" fill="#4fd18b"/><circle cx="512" cy="760" r="20" fill="#4fd18b"/><circle cx="624" cy="760" r="20" fill="#f5b94a"/>
+  <rect x="100" y="100" width="824" height="824" rx="190" fill="url(#shell)"/>
+  <rect x="102" y="102" width="820" height="820" rx="188" fill="none" stroke="url(#edge)" stroke-width="4"/>
+  <g transform="translate(96 96) scale(13)"><rect x="10" y="10" width="11" height="44" rx="5.5" fill="#e4f0ff"/>
+  <path d="M28 26 42.2 11.8A6.2 6.2 0 0 1 46.6 10H52a2 2 0 0 1 1.4 3.4L36.8 30H29.6a2.34 2.34 0 0 1-1.6-4Z" fill="#a4ceff"/>
+  <path d="M29.6 34h7.2l16.6 16.6A2 2 0 0 1 52 54h-5.4a6.2 6.2 0 0 1-4.4-1.8L28 38a2.34 2.34 0 0 1 1.6-4Z" fill="#5b9bff"/></g>
 </svg>

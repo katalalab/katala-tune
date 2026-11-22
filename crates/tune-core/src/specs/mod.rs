@@ -265,7 +265,7 @@ pub async fn collect_node(node: &Node) -> Value {
         } else {
             "if [ -x \"$HOME/.katala-tune/bin/tune.exe\" ]; then exec \"$HOME/.katala-tune/bin/tune.exe\" specs-local; else exec tune.exe specs-local; fi"
         };
-        let mut args = collect::ssh_args(&node.alias, remote);
+        let mut args = collect::node_ssh_args(node, remote);
         args.splice(
             0..0,
             ["-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no", "-o", "ClearAllForwardings=yes", "-o", "PermitLocalCommand=no"].map(str::to_string),

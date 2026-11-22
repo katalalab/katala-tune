@@ -56,8 +56,7 @@ pub fn main(entry: &str, arguments: &[String], started: Instant) -> ExitCode {
             if program_flag != "--reader-program"
                 || hash_flag != "--helper-sha256"
                 || !windows_reader::valid_program_path(program)
-                || hash.len() != 64
-                || !hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || !tune_core::db::is_lower_hex(hash, 64)
             {
                 return None;
             }

@@ -65,10 +65,10 @@ impl Settings {
 }
 
 pub fn settings(db: &Store) -> Settings {
-    checked_settings(db).unwrap_or_default()
+    read_settings(db).unwrap_or_default()
 }
 
-fn checked_settings(db: &Store) -> rusqlite::Result<Settings> {
+pub fn read_settings(db: &Store) -> rusqlite::Result<Settings> {
     let v = db.get_meta("monitor")?.unwrap_or(Value::Null);
     Ok(Settings {
         enabled: v.get("enabled").and_then(Value::as_bool).unwrap_or(false),
@@ -301,9 +301,20 @@ pub fn hub_command(hub: &Node, since: i64) -> String {
 
 /// ハブから写す（続きがあれば next から最大 16 ページまで続ける）。結果は meta の hubPull に残す（画面に出す）
 pub async fn pull(engine: &Engine) -> Result<Value, String> {
-    let s = engine.with_db(|d| Ok(settings(d)))?;
+    pull_with(engine, &collect::System, false).await
+}
+
+async fn pull_with(engine: &Engine, runner: &dyn collect::Runner, controlled: bool) -> Result<Value, String> {
+    let (cfg, s) = if controlled {
+        controlled_inputs(engine)?
+    } else {
+        let s = engine.with_db(|d| Ok(settings(d)))?;
+        if s.hub.is_none() {
+            return Err("ハブを選んでいない".into());
+        }
+        (engine.reload_config(), s)
+    };
     let hub_id = s.hub.ok_or("ハブを選んでいない")?;
-    let cfg = engine.reload_config();
     let hub = cfg.node(&hub_id).ok_or_else(|| format!("台帳に無い機体: {hub_id}"))?.clone();
     let t0 = now_ms();
     let (mut rows, mut snaps, mut pages) = (0u64, 0u64, 0usize);
@@ -313,10 +324,16 @@ pub async fn pull(engine: &Engine) -> Result<Value, String> {
         }
         let mut last = Value::Null;
         while pages < PULL_MAX_PAGES {
+            if controlled {
+                let (current, settings) = controlled_inputs(engine)?;
+                if settings.hub.as_deref() != Some(&hub_id) || current.node(&hub_id).map(Node::public) != Some(hub.public()) {
+                    return Err("ハブ設定または台帳が変更されました。再取得してください".into());
+                }
+            }
             let cursor = engine.with_db(|d| d.get_meta("hubCursor"))?.and_then(|v| v.as_i64()).unwrap_or(0);
             // 前回の終わりより 2 分前から（その後に書かれた分の集計を取りこぼさない。置き換えなので重なってよい）
             let since = cursor.saturating_sub(2 * MINUTE).max(0);
-            let r = collect::run("ssh", &collect::ssh_args(&hub.alias, &hub_command(&hub, since)), None, Duration::from_secs(60)).await;
+            let r = runner.run("ssh", &collect::node_ssh_args(&hub, &hub_command(&hub, since)), None, Duration::from_secs(60)).await;
             let line = r.out.lines().rev().find(|l| l.trim_start().starts_with('{')).ok_or_else(|| {
                 let e = r.err.trim();
                 format!(
@@ -347,6 +364,9 @@ pub async fn pull(engine: &Engine) -> Result<Value, String> {
             rec["ok"] = json!(true);
             for k in ["hub_at", "freshest_minute", "fresh", "latest_snapshot", "snapshot_fresh", "more"] {
                 rec[k] = v[k].clone();
+            }
+            if controlled {
+                rec["next"] = v["next"].clone();
             }
         }
         Err(e) => {
@@ -403,7 +423,7 @@ pub fn live_opts(nodes: usize) -> Opts {
 pub const AGENT_PUSH_EVERY_MS: i64 = 60 * MINUTE;
 
 fn collection_decision(db: &Store, now: i64) -> rusqlite::Result<(Settings, bool)> {
-    let s = checked_settings(db)?;
+    let s = read_settings(db)?;
     let fresh = last_pull_ok_for(db, now, s.hub.is_some()).is_some_and(|p| p.get("fresh").and_then(Value::as_bool) == Some(true));
     let collect = s.enabled && !fresh;
     Ok((s, collect))
@@ -545,6 +565,93 @@ fn maintain_retention(
     Some(ok)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunMode {
+    Run,
+    Paused,
+    Exit,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct RunRequest {
+    pub mode: RunMode,
+    pub pull_seq: u64,
+    /// Incremented only by an explicit accepted Start, never by settings/Pull wakes.
+    pub start_seq: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunPhase {
+    Starting,
+    Running,
+    Paused,
+    Stopping,
+    Failed,
+    Exited,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunStatus {
+    pub phase: RunPhase,
+    pub policy: Option<Policy>,
+    pub local_collecting: Option<bool>,
+    pub hub_configured: bool,
+}
+
+/// A checked input boundary for the native session. Never use the last-good ledger.
+pub fn controlled_inputs(engine: &Engine) -> Result<(Config, Settings), String> {
+    controlled_inputs_retaining(engine, None)
+}
+
+fn controlled_inputs_retaining(engine: &Engine, live: Option<&Live>) -> Result<(Config, Settings), String> {
+    let cfg = engine.reload_config();
+    if let Some(error) = engine.config_error() {
+        return Err(error);
+    }
+    // A validated full ledger is authoritative even if settings later fail.
+    // An unreadable ledger must not revoke unrelated UI ownership from cached data.
+    if let Some(live) = live {
+        live.retain_active(&cfg.nodes);
+    }
+    let saved = engine.with_db(|d| d.get_meta_checked("monitor"))?;
+    if saved
+        .as_ref()
+        .is_some_and(|v| !v.is_object() || v.get("enabled").is_some_and(|v| !v.is_boolean()) || v.get("hub").is_some_and(|v| !v.is_null() && !v.is_string()))
+    {
+        return Err("監視設定を読み出せません".into());
+    }
+    let v = saved.unwrap_or(Value::Null);
+    let settings = Settings {
+        enabled: v.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+        hub: v.get("hub").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string),
+    };
+    if let Some(id) = &settings.hub {
+        let node = cfg.node(id).ok_or("設定されたハブが台帳にありません")?;
+        if let Some(error) = node.refusal() {
+            return Err(error);
+        }
+        if node.local || !(node.is_mac() || node.is_windows()) {
+            return Err("利用できないハブ設定です".into());
+        }
+    }
+    Ok((cfg, settings))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlledExit {
+    pub update_complete: Option<bool>,
+    pub remote_update: Option<crate::helpers::remote_update::RemoteUpdateOutcome>,
+}
+
+pub async fn run_controlled(
+    engine: Arc<Engine>,
+    live: Arc<Live>,
+    event: impl Fn(Value) + Send + Sync + 'static,
+    request: tokio::sync::watch::Sender<RunRequest>,
+    status: tokio::sync::watch::Sender<RunStatus>,
+    updates: Option<Arc<crate::helpers::remote_update::RemoteUpdateControl>>,
+) -> ControlledExit {
+    // Raw bundled bytes and automatic all-ledger distribution are legacy only.
+    run_loop(engine, live, Arc::new(event), None, None, Some((request.subscribe(), request, status, updates)), &collect::System).await
+}
+
 /// 15 秒ごとに: 常時監視が入っていてハブの数字が新しくなければ全機体のライブに合図を送って保ち、
 /// 終わった分を集計して保存し、ハブを選んでいれば 1 分ごとに写す。14 日より古い集計は 1 日 1 回消す。
 /// agent（同梱のサンプラー。Windows の操作卓だけ）があれば、hello の版が古い・無い Windows の機体へ入れ替えを送る（helpers.rs）。
@@ -556,7 +663,63 @@ pub async fn run(
     until: Option<std::time::Instant>,
     agent: Option<Arc<Vec<u8>>>,
 ) {
-    let event = Arc::new(event);
+    run_loop(engine, live, Arc::new(event), until, agent, None, &collect::System).await;
+}
+
+fn record_policy(journal: &crate::monitor_journal::Journal, previous: &mut Option<Policy>, policy: Policy) {
+    if *previous != Some(policy) {
+        journal.record(None, 0, 0, Kind::Policy, Data { policy: Some(policy), ..Data::default() });
+        *previous = Some(policy);
+    }
+}
+
+type Control = (
+    tokio::sync::watch::Receiver<RunRequest>,
+    tokio::sync::watch::Sender<RunRequest>,
+    tokio::sync::watch::Sender<RunStatus>,
+    Option<Arc<crate::helpers::remote_update::RemoteUpdateControl>>,
+);
+
+/// Revoke only the session that read the failed inputs. Serialize permission,
+/// owner release and Failed status with Start so stale work cannot undo it.
+fn fail_controlled(control: &Control, observed: RunRequest, live: &Live) {
+    control.1.send_if_modified(|current| {
+        if current.start_seq != observed.start_seq || current.mode == RunMode::Exit {
+            return false;
+        }
+        current.mode = RunMode::Paused;
+        if let Some(updates) = &control.3 {
+            updates.refuse_start(observed.start_seq, crate::helpers::remote_update::Refusal::Inputs);
+        }
+        live.release_owned(crate::live::Owner::Monitor, &live.active(), crate::live::Stop::User);
+        control.2.send_replace(RunStatus { phase: RunPhase::Failed, policy: None, local_collecting: None, hub_configured: false });
+        // No self-wake: preserve Failed until an external wake or the next period.
+        false
+    });
+}
+
+pub(crate) fn controlled_collect(engine: &Engine, settings: &Settings, now: i64) -> Result<bool, String> {
+    // The validated settings are the policy input; never reread permissive defaults.
+    engine.with_db(|d| {
+        let pull = d.get_meta_checked("hubPull")?;
+        let fresh = settings.hub.is_some()
+            && pull.is_some_and(|p| p["ok"] == true && p["at"].as_i64().is_some_and(|at| now - at <= HUB_STALE_MS) && p["fresh"] == true);
+        Ok(settings.enabled && !fresh)
+    })
+}
+
+async fn run_loop(
+    engine: Arc<Engine>,
+    live: Arc<Live>,
+    event: Arc<dyn Fn(Value) + Send + Sync>,
+    until: Option<std::time::Instant>,
+    agent: Option<Arc<Vec<u8>>>,
+    mut control: Option<Control>,
+    runner: &dyn collect::Runner,
+) -> ControlledExit {
+    let updates = control.as_ref().and_then(|c| c.3.clone());
+    let finished =
+        || ControlledExit { update_complete: updates.as_ref().and_then(|u| u.local_completion()), remote_update: updates.as_ref().and_then(|u| u.outcome()) };
     let journal = engine.start_monitor_journal();
     live.bind_journal(journal.clone());
     let mut previous_policy = None;
@@ -565,16 +728,52 @@ pub async fn run(
     let mut retry_at: HashMap<String, i64> = HashMap::new();
     let mut pushed_at: HashMap<String, i64> = HashMap::new();
     let mut last_pull = 0i64;
+    let mut controlled_hub = None;
     let mut retention_schedule = RetentionSchedule::default();
     let host = crate::nodes::local_host();
     let mut iv = tokio::time::interval(Duration::from_secs(15));
+    let mut processed_pull = 0;
+    let release = || {
+        live.release_owned(crate::live::Owner::Monitor, &live.active(), crate::live::Stop::User);
+    };
     loop {
-        iv.tick().await;
+        if let Some((request, _, _, _)) = &mut control {
+            tokio::select! {
+                _ = iv.tick() => {},
+                changed = request.changed() => if changed.is_err() { release(); return finished(); },
+            }
+        } else {
+            iv.tick().await;
+        }
         let now = now_ms();
-        let decision = engine.with_db(|d| collection_decision(d, now));
-        let unknown = decision.is_err();
-        let (s, collect) = decision.unwrap_or_default();
-        let policy = if unknown {
+        let requested =
+            control.as_mut().map(|(r, _, _, updates)| if let Some(updates) = updates { updates.observe_request(r) } else { *r.borrow_and_update() });
+        if requested.is_some_and(|r| r.mode == RunMode::Exit) {
+            release();
+            control.as_ref().unwrap().2.send_replace(RunStatus { phase: RunPhase::Exited, policy: None, local_collecting: Some(false), hub_configured: false });
+            return finished();
+        }
+        let running = requested.is_none_or(|r| r.mode == RunMode::Run);
+        let explicit_pull = requested.is_some_and(|r| r.pull_seq != processed_pull);
+        if let Some(r) = requested {
+            processed_pull = r.pull_seq;
+        }
+        let inputs = if control.is_some() { Some(controlled_inputs_retaining(&engine, Some(&live))) } else { None };
+        let decision = match &inputs {
+            Some(Ok((_, settings))) => controlled_collect(&engine, settings, now).map(|collect| (settings.clone(), collect)),
+            Some(Err(error)) => Err(error.clone()),
+            None => engine.with_db(|d| collection_decision(d, now)),
+        };
+        let unknown = decision.is_err() || inputs.as_ref().is_some_and(Result::is_err);
+        let (s, mut collect) = decision.unwrap_or_default();
+        if let Some(control) = &control
+            && unknown
+        {
+            record_policy(&journal, &mut previous_policy, Policy::SettingsUnknown);
+            fail_controlled(control, requested.unwrap(), &live);
+            continue;
+        }
+        let mut policy = if unknown {
             Policy::SettingsUnknown
         } else if collect {
             Policy::Local
@@ -583,18 +782,112 @@ pub async fn run(
         } else {
             Policy::Disabled
         };
-        if previous_policy != Some(policy) {
-            journal.record(None, 0, 0, Kind::Policy, Data { policy: Some(policy), ..Data::default() });
-            previous_policy = Some(policy);
+        collect &= running;
+        if !running && !explicit_pull {
+            record_policy(&journal, &mut previous_policy, policy);
+            release();
+            control.as_ref().unwrap().2.send_replace(RunStatus {
+                phase: RunPhase::Paused,
+                policy: Some(policy),
+                local_collecting: Some(false),
+                hub_configured: s.hub.is_some(),
+            });
+            continue;
         }
-        if s.hub.is_some() && now - last_pull >= MINUTE - 5_000 {
+        // A newly started pull must not keep collection that is already disallowed.
+        // The release after pull still handles a newly fresh hub response.
+        if control.is_some() && !collect {
+            release();
+        }
+        if control.is_none() {
+            record_policy(&journal, &mut previous_policy, policy);
+        }
+        if control.is_some() && controlled_hub != s.hub {
+            controlled_hub = s.hub.clone();
+            last_pull = 0;
+        }
+        if s.hub.is_some() && (explicit_pull || (running && now - last_pull >= MINUTE - 5_000)) {
             last_pull = now;
-            if pull(&engine).await.is_ok() {
-                event(json!({ "pulled": true }));
+            let pulled = pull_with(&engine, runner, control.is_some()).await.is_ok();
+            if pulled || control.is_some() {
+                event(json!({ "pulled": pulled }));
             }
         }
-        let cfg = engine.reload_config();
+        // After a potentially long pull, recheck both permission and current inputs
+        // before claiming streams or committing local data.
+        let cfg = if let Some(control) = &control {
+            match controlled_inputs_retaining(&engine, Some(&live)) {
+                Ok((cfg, latest)) if latest == s => cfg,
+                _ => {
+                    record_policy(&journal, &mut previous_policy, Policy::SettingsUnknown);
+                    fail_controlled(control, requested.unwrap(), &live);
+                    continue;
+                }
+            }
+        } else {
+            engine.reload_config()
+        };
+        if let Some(control) = &control {
+            match controlled_collect(&engine, &s, now_ms()) {
+                Ok(latest_collect) => {
+                    collect = latest_collect;
+                    policy = if collect {
+                        Policy::Local
+                    } else if s.enabled {
+                        Policy::Hub
+                    } else {
+                        Policy::Disabled
+                    };
+                }
+                _ => {
+                    fail_controlled(control, requested.unwrap(), &live);
+                    continue;
+                }
+            }
+        }
+        if let (Some(updates), Some(control)) = (&updates, &control)
+            && updates.busy()
+        {
+            if let Some(update) = updates.claim(&engine, &live, &control.1) {
+                // Own and await exactly this request. No request/host/Gate guard
+                // spans IO, and no stale collection/status/commit follows it.
+                updates.execute(update).await;
+            }
+            // Both completed and refused requests invalidate this cycle's inputs.
+            // Wake the same worker to reread the latest Pause/Exit/Start now.
+            control.1.send_modify(|_| {});
+            continue;
+        }
+        // Hold the request read guard through the synchronous collection/commit
+        // boundary so a newer command cannot be overwritten by this cycle's status.
+        let current = control.as_ref().map(|(request, _, _, _)| request.borrow());
+        if let Some((_, _, status, _)) = &control {
+            let current = current.as_ref().unwrap();
+            let mode = current.mode;
+            if mode != RunMode::Exit && current.start_seq != requested.unwrap().start_seq {
+                continue;
+            }
+            if mode != RunMode::Run {
+                release();
+                status.send_replace(RunStatus {
+                    phase: if mode == RunMode::Exit { RunPhase::Exited } else { RunPhase::Paused },
+                    policy: Some(policy),
+                    local_collecting: Some(false),
+                    hub_configured: s.hub.is_some(),
+                });
+                if mode == RunMode::Exit {
+                    return finished();
+                }
+                continue;
+            }
+        }
+        if control.is_some() {
+            record_policy(&journal, &mut previous_policy, policy);
+        }
         live.retain_active(&cfg.nodes);
+        if control.is_some() && !collect {
+            release();
+        }
         if collect {
             // 流れていれば合図、止まっていれば流し直す。つなぎ直しても続かなかった機体は 5 分おきにだけ試す
             let targets: Vec<Node> = cfg
@@ -607,7 +900,7 @@ pub async fn run(
                 })
                 .cloned()
                 .collect();
-            let r = live.start(&targets, &[]);
+            let r = if control.is_some() { live.start_owned(crate::live::Owner::Monitor, &targets, &[]) } else { live.start(&targets, &[]) };
             // 上限で断られた機体（アプリを開いたあとで台帳に足したなど）は黙って欠かさず知らせる。画面にも注意として出る
             let refused: Vec<&Value> = r["refused"].as_array().into_iter().flatten().filter(|x| x["reason"] == "limit").map(|x| &x["id"]).collect();
             if !refused.is_empty() {
@@ -646,8 +939,11 @@ pub async fn run(
             commit_minute_rows(&engine, &journal, &rows, &mut rolled, &mut pending_from, &*event);
         }
         maintain_retention(&engine, &journal, now, std::time::Instant::now(), &mut retention_schedule);
+        if let Some((_, _, status, _)) = &control {
+            status.send_replace(RunStatus { phase: RunPhase::Running, policy: Some(policy), local_collecting: Some(collect), hub_configured: s.hub.is_some() });
+        }
         if until.is_some_and(|u| std::time::Instant::now() >= u) {
-            return;
+            return finished();
         }
     }
 }
@@ -1263,3 +1559,7 @@ mod tests {
         assert!(collection_decision(&db, 1000).is_err(), "a failed settings read must not be labelled disabled");
     }
 }
+
+#[cfg(test)]
+#[path = "monitor_controlled_tests.rs"]
+mod controlled_tests;

@@ -13,3 +13,6 @@ __pycache__/
 # CI がリリースのときに作る同梱の道具（release.yml）
 src-tauri/binaries/
 sidecars.json
+
+# Windows GPUI distribution output; use verified CI artifacts instead of committing binaries.
+/dist-win/

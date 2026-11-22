@@ -244,7 +244,7 @@ pub struct RawSample {
 #[serde(tag = "type")]
 enum Line {
     #[serde(rename = "hello")]
-    Hello(Hello),
+    Hello(Box<Hello>),
     #[serde(rename = "s")]
     Sample(Box<RawSample>),
     #[serde(rename = "end")]
@@ -257,7 +257,7 @@ enum Line {
 /// 解析した 1 行
 #[derive(Clone, Debug)]
 pub enum Msg {
-    Hello(Hello),
+    Hello(Box<Hello>),
     Sample(Box<RawSample>),
     /// サンプラーが自分から終わる（max_age: 長く動いたので区切る、count: 確認用）
     End(String),
@@ -664,10 +664,10 @@ pub struct Launch {
 /// 機体側のサンプラーに切断が伝わらない（実機で確認）。ライブ表示は自分の接続を持ち、止めたら接続ごと閉じる
 pub const LIVE_SSH_OPTS: [&str; 4] = ["-o", "ControlMaster=no", "-o", "ControlPath=none"];
 
-fn live_ssh_args(alias: &str, remote: &str) -> Vec<String> {
+fn live_ssh_args(node: &Node, remote: &str) -> Vec<String> {
     let mut a: Vec<String> = collect::SSH_OPTS.iter().chain(LIVE_SSH_OPTS.iter()).map(|s| s.to_string()).collect();
-    a.push(alias.into());
-    a.push(remote.into());
+    a.push(node.alias.clone());
+    a.push(collect::remote_command(node, remote));
     a
 }
 
@@ -705,10 +705,14 @@ fn native_args(o: &Opts) -> Vec<String> {
     .to_vec()
 }
 
-/// この機体のネイティブのサンプラー: アプリの隣、無ければ helpers の namespace。
-/// `KATALA_TUNE_DATA_DIR` を明示した QA では `data/bin` に閉じ、通常は従来の HOME を使う。
+/// GPUI は束縛済み data/bin だけ。未束縛の CLI/Tauri は従来どおり
+/// アプリの隣、無ければ helpers の namespace を探す。
 fn local_native() -> Option<PathBuf> {
     let name = crate::helpers::exe("tune-agent");
+    if let Some(bin) = crate::helpers::bound_bin_dir() {
+        let native = bin.join(&name);
+        return native.is_file().then_some(native);
+    }
     let beside = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(&name)));
     let managed = crate::helpers::bin_dir().join(&name);
     [beside, Some(managed)].into_iter().flatten().find(|p| p.is_file())
@@ -742,7 +746,7 @@ pub fn launch(node: &Node, o: &Opts) -> Result<Launch, String> {
         let remote = format!(
             "[ -x {NATIVE_REMOTE_MAC} ] && {NATIVE_REMOTE_MAC} {native} || {{ command -v python3 >/dev/null && exec python3 -c '{boot}' {a} || exec /usr/bin/python3 -c '{boot}' {a}; }}"
         );
-        return Ok(Launch { program: "ssh".into(), args: live_ssh_args(&node.alias, &remote), stdin, keep_stdin: true, cleanup: None });
+        return Ok(Launch { program: "ssh".into(), args: live_ssh_args(node, &remote), stdin, keep_stdin: true, cleanup: None });
     }
     if node.is_windows() {
         let params = format!("-Interval {} -ProcEvery {} -MaxSeconds {} -WatchStdin", secs(o.interval), secs(o.procs_every), secs(o.sampler_max_age));
@@ -766,7 +770,7 @@ pub fn launch(node: &Node, o: &Opts) -> Result<Launch, String> {
             "if [ -x {NATIVE_REMOTE} ]; then exec {NATIVE_REMOTE} {}; else exec powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}; fi",
             native.join(" ")
         );
-        return Ok(Launch { program: "ssh".into(), args: live_ssh_args(&node.alias, &remote), stdin, keep_stdin: true, cleanup: None });
+        return Ok(Launch { program: "ssh".into(), args: live_ssh_args(node, &remote), stdin, keep_stdin: true, cleanup: None });
     }
     Err(format!("この OS（{}）はライブ表示に対応していない", node.os))
 }
@@ -1070,6 +1074,22 @@ impl Stop {
     }
 }
 
+/// Shared native-host stream consumers. Legacy callers keep their existing API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Owner {
+    Ui,
+    Monitor,
+}
+
+impl Owner {
+    fn bit(self) -> u8 {
+        match self {
+            Self::Ui => 1,
+            Self::Monitor => 2,
+        }
+    }
+}
+
 /// 機体ごとの流れの段階
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -1188,6 +1208,7 @@ impl NodeLive {
 
 struct Stream {
     epoch: u64,
+    owners: u8,
     last_hb: Instant,
     stop: watch::Sender<Option<Stop>>,
     task: Option<JoinHandle<()>>,
@@ -1263,10 +1284,20 @@ impl Live {
     /// 戻り値: `{ started, running, refused: [{ id, reason, detail }], limit, snapshot: { id: 画面へ渡す形 } }`。
     /// unknown は台帳に無かった id（理由つきで断る）。非同期の実行環境（tokio）の中から呼ぶ
     pub fn start(self: &Arc<Self>, nodes: &[Node], unknown: &[String]) -> Value {
+        self.start_with_owner(None, nodes, unknown)
+    }
+
+    /// Atomically claim and start/renew only the nodes accepted as started/running.
+    pub fn start_owned(self: &Arc<Self>, owner: Owner, nodes: &[Node], unknown: &[String]) -> Value {
+        self.start_with_owner(Some(owner), nodes, unknown)
+    }
+
+    fn start_with_owner(self: &Arc<Self>, owner: Option<Owner>, nodes: &[Node], unknown: &[String]) -> Value {
         let excluded: Vec<String> = nodes.iter().filter(|n| !n.is_active()).map(|n| n.id.clone()).chain(unknown.iter().cloned()).collect();
-        self.stop(Some(&excluded), Stop::Excluded);
-        let now = Instant::now();
         let mut st = self.lock();
+        Self::stop_locked(&mut st, Some(&excluded), Stop::Excluded);
+        let now = Instant::now();
+        let owners = owner.map_or(0, Owner::bit);
         let (mut started, mut running, mut refused) = (Vec::new(), Vec::new(), Vec::new());
         for id in unknown {
             refused.push(json!({ "id": id, "reason": "unknown", "detail": "台帳に無い機体" }));
@@ -1283,6 +1314,7 @@ impl Live {
                 continue;
             }
             if let Some(s) = st.streams.get_mut(&n.id).filter(|s| !s.stopping) {
+                s.owners |= owners;
                 s.last_hb = now;
                 running.push(n.id.clone());
                 continue;
@@ -1297,7 +1329,7 @@ impl Live {
             let epoch = st.epoch;
             let (tx, rx) = watch::channel(None);
             let task = tokio::spawn(run_stream(self.clone(), n.clone(), epoch, rx));
-            st.streams.insert(n.id.clone(), Stream { epoch, last_hb: now, stop: tx, task: Some(task), stopping: false });
+            st.streams.insert(n.id.clone(), Stream { epoch, owners, last_hb: now, stop: tx, task: Some(task), stopping: false });
             let nl = self.node(&mut st, &n.id);
             nl.set(Phase::Connecting, None, None, 0);
             nl.me_prev = None;
@@ -1315,14 +1347,60 @@ impl Live {
         json!({ "started": started, "running": running, "refused": refused, "limit": self.opts.max_streams, "snapshot": snapshot })
     }
 
-    /// 止める（ids が None なら全部）。戻り値は `{ stopped: [id] }`。止まり終わったら画面へ state: stopped を送る
-    pub fn stop(&self, ids: Option<&[String]>, why: Stop) -> Value {
+    /// Renew only an existing running stream. This never starts a new sampler.
+    pub fn heartbeat(&self, id: &str) -> bool {
+        let mut state = self.lock();
+        if state.closed {
+            return false;
+        }
+        let Some(stream) = state.streams.get_mut(id).filter(|s| !s.stopping) else { return false };
+        stream.last_hb = Instant::now();
+        true
+    }
+
+    /// Renew an existing claim only. This cannot claim, start or reset retries.
+    pub fn heartbeat_owned(&self, owner: Owner, id: &str) -> bool {
         let mut st = self.lock();
+        if st.closed {
+            return false;
+        }
+        let Some(stream) = st.streams.get_mut(id).filter(|s| !s.stopping && s.owners & owner.bit() != 0) else { return false };
+        stream.last_hb = Instant::now();
+        true
+    }
+
+    /// Release only this consumer. Last-owner detection and stop share the lock.
+    /// Returns `{ stopped: [id] }` for samplers stopped by this release.
+    pub fn release_owned(&self, owner: Owner, ids: &[String], why: Stop) -> Value {
+        let mut st = self.lock();
+        let mut stopped = Vec::new();
+        for (id, s) in st.streams.iter_mut() {
+            if s.stopping || !ids.contains(id) || s.owners & owner.bit() == 0 {
+                continue;
+            }
+            s.owners &= !owner.bit();
+            if s.owners == 0 {
+                s.stopping = true;
+                let _ = s.stop.send(Some(why.clone()));
+                stopped.push(id.clone());
+            }
+        }
+        stopped.sort();
+        json!({ "stopped": stopped })
+    }
+
+    /// 止める（ids が None なら全部）。所有者に優先する管理操作。戻り値は `{ stopped: [id] }`。
+    pub fn stop(&self, ids: Option<&[String]>, why: Stop) -> Value {
+        Self::stop_locked(&mut self.lock(), ids, why)
+    }
+
+    fn stop_locked(st: &mut Shared, ids: Option<&[String]>, why: Stop) -> Value {
         let mut stopped = Vec::new();
         for (id, s) in st.streams.iter_mut() {
             if s.stopping || ids.is_some_and(|ids| !ids.contains(id)) {
                 continue;
             }
+            s.owners = 0;
             s.stopping = true;
             let _ = s.stop.send(Some(why.clone()));
             stopped.push(id.clone());
@@ -1340,8 +1418,9 @@ impl Live {
 
     /// 最新の全件台帳から外れた既存ストリームも止める（常時監視・画面の合図で再確認）
     pub fn retain_active(&self, nodes: &[Node]) {
-        let excluded: Vec<String> = self.active().into_iter().filter(|id| !nodes.iter().any(|n| n.id == *id && n.is_active())).collect();
-        self.stop(Some(&excluded), Stop::Excluded);
+        let mut st = self.lock();
+        let excluded: Vec<String> = st.streams.keys().filter(|id| !nodes.iter().any(|n| n.id == **id && n.is_active())).cloned().collect();
+        Self::stop_locked(&mut st, Some(&excluded), Stop::Excluded);
     }
 
     /// 機体ごとの段階と保持している点の数（確認用）
@@ -1592,7 +1671,7 @@ async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Re
                             Ok(Some(line)) => match parse_line(&line) {
                                 Some(Msg::Hello(h)) => {
                                     live.record(&node.id, epoch, attempt, Kind::Hello, Data { native_rust: match h.implementation.as_deref() { Some("rust") => Some(true), _ => None }, reported_version: crate::monitor_journal::reported_version(h.agent.as_deref()), ..Data::default() });
-                                    live.on_hello(&node.id, epoch, h);
+                                    live.on_hello(&node.id, epoch, *h);
                                 }
                                 Some(Msg::Sample(s)) => {
                                     got += 1;
@@ -1728,6 +1807,10 @@ async fn run_stream(live: Arc<Live>, node: Node, epoch: u64, mut stop: watch::Re
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parsed_live_messages_keep_the_event_size_bounded() {
+        assert!(std::mem::size_of::<super::Msg>() <= 64);
+    }
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1842,7 +1925,11 @@ mod tests {
 
         fn new() -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
-            Self::create(std::env::temp_dir().join(format!("kt-live-launch-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)))).unwrap()
+            #[cfg(target_os = "linux")]
+            let parent = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+            #[cfg(not(target_os = "linux"))]
+            let parent = std::env::temp_dir();
+            Self::create(parent.join(format!("kt-live-launch-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)))).unwrap()
         }
     }
 
@@ -1857,6 +1944,8 @@ mod tests {
     struct ExactChildOutput {
         status: Option<std::process::ExitStatus>,
         reason: Option<&'static str>,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     }
@@ -1898,6 +1987,36 @@ mod tests {
         }
     }
 
+    fn capture_limit_reason(out: &std::fs::File, err: &std::fs::File, deadline: Instant, cap: usize) -> std::io::Result<Option<&'static str>> {
+        // Prefer an observed excess even if this observation is also late.
+        if out.metadata()?.len().saturating_add(err.metadata()?.len()) > cap as u64 {
+            return Ok(Some("output limit"));
+        }
+        if Instant::now() >= deadline {
+            return Ok(Some("deadline"));
+        }
+        Ok(None)
+    }
+
+    #[test]
+    fn launch_test_capture_prioritizes_observed_output_over_an_expired_deadline() {
+        let dir = LaunchTestDir::new();
+        let out = std::fs::OpenOptions::new().write(true).create_new(true).open(dir.path.join("stdout")).unwrap();
+        let err = std::fs::OpenOptions::new().write(true).create_new(true).open(dir.path.join("stderr")).unwrap();
+        let cap = 4096;
+        let expired = Instant::now();
+        assert_eq!(capture_limit_reason(&out, &err, expired, cap).unwrap(), Some("deadline"));
+        out.set_len(cap as u64 + 1).unwrap();
+        assert_eq!(capture_limit_reason(&out, &err, expired, cap).unwrap(), Some("output limit"));
+        out.set_len(0).unwrap();
+        err.set_len(cap as u64 + 1).unwrap();
+        assert_eq!(capture_limit_reason(&out, &err, expired, cap).unwrap(), Some("output limit"));
+        err.set_len(cap as u64).unwrap();
+        assert_eq!(capture_limit_reason(&out, &err, expired, cap).unwrap(), Some("deadline"));
+        out.set_len(1).unwrap();
+        assert_eq!(capture_limit_reason(&out, &err, expired, cap).unwrap(), Some("output limit"));
+    }
+
     fn capture_exact_child(command: &mut std::process::Command, dir: &mut LaunchTestDir, limit: Duration, cap: usize) -> ExactChildOutput {
         use std::io::Read as _;
         let deadline = Instant::now() + limit;
@@ -1912,15 +2031,12 @@ mod tests {
         dir.cleanup = false;
         command.stdout(Stdio::null()).stderr(Stdio::null());
         let reason = loop {
-            if Instant::now() >= deadline {
-                break Some("deadline");
-            }
-            let reaped = child.reap().unwrap();
             // Regular files avoid pipe-reader joins. Poll size and stop excess
             // output; only cap bytes in total are ever loaded into diagnostics.
-            if out_file.metadata().unwrap().len().saturating_add(err_file.metadata().unwrap().len()) > cap as u64 {
-                break Some("output limit");
+            if let Some(reason) = capture_limit_reason(&out_file, &err_file, deadline, cap).unwrap() {
+                break Some(reason);
             }
+            let reaped = child.reap().unwrap();
             if reaped {
                 break None;
             }
@@ -1928,11 +2044,13 @@ mod tests {
         };
         child.stop_and_reap();
         dir.cleanup = child.status.is_some();
+        let stdout_bytes = out_file.metadata().unwrap().len();
+        let stderr_bytes = err_file.metadata().unwrap().len();
         let mut stdout = Vec::new();
         std::fs::File::open(out_path).unwrap().take(cap as u64).read_to_end(&mut stdout).unwrap();
         let mut stderr = Vec::new();
         std::fs::File::open(err_path).unwrap().take((cap - stdout.len()) as u64).read_to_end(&mut stderr).unwrap();
-        ExactChildOutput { status: child.status, reason, stdout, stderr }
+        ExactChildOutput { status: child.status, reason, stdout_bytes, stderr_bytes, stdout, stderr }
     }
 
     fn launch_test_command(dir: &std::path::Path, test: &str, case: &str) -> std::process::Command {
@@ -1941,6 +2059,11 @@ mod tests {
         std::fs::create_dir(&app).unwrap();
         std::fs::create_dir(&home).unwrap();
         let executable = app.join(crate::helpers::exe("live-test"));
+        // Linux links the already-running inode, avoiding a writable executable
+        // copy while parallel tests spawn children. The owned root is on its FS.
+        #[cfg(target_os = "linux")]
+        std::fs::hard_link(std::env::current_exe().unwrap(), &executable).unwrap();
+        #[cfg(not(target_os = "linux"))]
         std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
         let mut child = std::process::Command::new(&executable);
         child
@@ -1970,6 +2093,37 @@ mod tests {
         let path = owner.path.clone();
         drop(owner);
         assert!(!path.exists(), "successful exclusive owner cleans its own fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_test_links_the_running_inode_and_cleans_only_owned_names() {
+        use std::os::unix::fs::MetadataExt as _;
+        let source = std::env::current_exe().unwrap();
+        let identity = |path: &std::path::Path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            (metadata.dev(), metadata.ino())
+        };
+        let source_identity = identity(&source);
+        let first = LaunchTestDir::new();
+        let second = LaunchTestDir::new();
+        assert_ne!(first.path, second.path);
+        assert_eq!(first.path.parent(), source.parent());
+        assert_eq!(second.path.parent(), source.parent());
+        let first_command = launch_test_command(&first.path, "live::tests::launch_follows_the_probe_conventions", "absent");
+        let second_command = launch_test_command(&second.path, "live::tests::launch_follows_the_probe_conventions", "absent");
+        let first_executable = std::path::Path::new(first_command.get_program());
+        let second_executable = std::path::Path::new(second_command.get_program());
+        assert_ne!(first_executable, second_executable);
+        assert_eq!(identity(first_executable), source_identity);
+        assert_eq!(identity(second_executable), source_identity);
+        drop(first);
+        assert!(!first_executable.exists());
+        assert_eq!(identity(&source), source_identity);
+        assert_eq!(identity(second_executable), source_identity);
+        drop(second);
+        assert!(!second_executable.exists());
+        assert_eq!(identity(&source), source_identity);
     }
 
     // Invoked only as an exact child with the test-only case environment set.
@@ -2005,17 +2159,24 @@ mod tests {
         let mut dir = LaunchTestDir::new();
         let mut command = launch_test_command(&dir.path, "live::tests::launch_test_watchdog_fixture", case);
         command.arg("--ignored");
-        let limit = if case == "hung" { Duration::from_secs(2) } else { Duration::from_secs(5) };
+        // 子はこのテストバイナリ自身なので、負荷が高いと準備完了までに 2 秒を超える。期限は準備完了の後に来るようにする
+        let limit = Duration::from_secs(5);
         let began = Instant::now();
         let output = capture_exact_child(&mut command, &mut dir, limit, 4096);
+        let ready = String::from_utf8_lossy(&output.stdout).contains("watchdog fixture ready");
+        eprintln!(
+            "watchdog reaped={} exit_code={} stdout_bytes={} stderr_bytes={} ready={}",
+            u8::from(output.status.is_some()),
+            output.status.and_then(|status| status.code()).unwrap_or(-1),
+            output.stdout_bytes,
+            output.stderr_bytes,
+            u8::from(ready)
+        );
         assert_eq!(output.reason, expected);
         assert!(output.status.is_some(), "retained child must be reaped before cleanup");
         assert!(began.elapsed() < limit + Duration::from_secs(3));
         assert!(output.stdout.len() + output.stderr.len() <= 4096, "capture must be bounded");
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("watchdog fixture ready"),
-            "child must reach the controlled fixture before watchdog termination"
-        );
+        assert!(ready, "child must reach the controlled fixture before watchdog termination");
         if expected.is_none() {
             assert!(output.status.unwrap().success());
             assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
@@ -2041,8 +2202,8 @@ mod tests {
         watchdog_case("normal", None);
     }
 
-    // Only child processes receive this HOME/data namespace. Copying the test
-    // executable also confines the beside-app search; no installed helper runs.
+    // Only child processes receive this HOME/data namespace. Placing the test
+    // executable here also confines the beside-app search; no installed helper runs.
     fn isolated_launch_child(test: &str, cases: &[&str]) -> Option<(PathBuf, String)> {
         const ROOT: &str = "KT_LIVE_LAUNCH_TEST_ROOT";
         const CASE: &str = "KT_LIVE_LAUNCH_TEST_CASE";
@@ -2284,6 +2445,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owned_release_preserves_the_other_owner_and_stops_the_last() {
+        if cfg!(windows) {
+            return;
+        }
+        for (first, last) in [(Owner::Ui, Owner::Monitor), (Owner::Monitor, Owner::Ui)] {
+            let (route, dir) = fake(STEADY);
+            let live = Live::new(route.clone(), quick(), Box::new(|_| {}));
+            let nodes = [node("a", "macos")];
+            assert_eq!(live.start_owned(first, &nodes, &[])["started"], json!(["a"]));
+            assert_eq!(live.start_owned(last, &nodes, &[])["running"], json!(["a"]));
+            assert_eq!(live.start_owned(first, &nodes, &[])["running"], json!(["a"]), "repeated claim is idempotent");
+            until("initial samples", || live.samples("a").len() >= 2).await;
+            let before = live.samples("a").len();
+            let released = live.release_owned(first, &["a".into()], Stop::Hidden);
+            let still_active = live.active();
+            let renewed = live.heartbeat_owned(last, "a");
+            assert!(!live.heartbeat_owned(first, "a"));
+            assert_eq!(live.release_owned(first, &["a".into()], Stop::User)["stopped"], json!([]));
+            if still_active == ["a"] {
+                until("samples after owner release", || live.samples("a").len() > before).await;
+            }
+            let final_release = live.release_owned(last, &["a".into()], Stop::User);
+            until("last owner stopped", || state(&live, "a").0 == "stopped").await;
+            let opened = route.opened.load(Ordering::SeqCst);
+            let reason = state(&live, "a").1;
+            live.shutdown(Duration::from_secs(1)).await;
+            let _ = std::fs::remove_dir_all(dir);
+            assert_eq!(released["stopped"], json!([]), "one owner cannot stop the other");
+            assert_eq!(still_active, ["a"]);
+            assert!(renewed);
+            assert_eq!(final_release["stopped"], json!(["a"]));
+            assert_eq!(reason, "user");
+            assert_eq!(opened, 1, "owners share the same sampler");
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_heartbeat_and_unclaimed_release_cannot_acquire_or_stop_a_stream() {
+        if cfg!(windows) {
+            return;
+        }
+        let (route, dir) = fake(STEADY);
+        let live = Live::new(route.clone(), quick(), Box::new(|_| {}));
+        assert!(!live.heartbeat_owned(Owner::Ui, "missing"));
+        live.start_owned(Owner::Monitor, &[node("a", "macos")], &[]);
+        until("initial sample", || !live.samples("a").is_empty()).await;
+        let renewed_without_claim = live.heartbeat_owned(Owner::Ui, "a");
+        let released_without_claim = live.release_owned(Owner::Ui, &["a".into()], Stop::User);
+        let active = live.active();
+        live.release_owned(Owner::Monitor, &["a".into()], Stop::User);
+        live.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(!renewed_without_claim, "renewal must not claim another owner's stream");
+        assert_eq!(released_without_claim["stopped"], json!([]));
+        assert_eq!(active, ["a"]);
+        assert_eq!(route.opened.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn owned_refused_start_never_claims_a_later_legacy_stream() {
+        if cfg!(windows) {
+            return;
+        }
+        let (route, dir) = fake(STEADY);
+        let live = Live::new(route, Opts { max_streams: 1, ..quick() }, Box::new(|_| {}));
+        live.start_owned(Owner::Monitor, &[node("a", "macos")], &[]);
+        let refused = live.start_owned(Owner::Ui, &[node("b", "macos")], &["missing".into()]);
+        assert_eq!(refused["started"], json!([]));
+        assert_eq!(refused["running"], json!([]));
+        assert_eq!(refused["refused"][0]["reason"], "unknown");
+        assert_eq!(refused["refused"][1]["reason"], "limit");
+        live.release_owned(Owner::Monitor, &["a".into()], Stop::User);
+        assert_eq!(live.start(&[node("b", "macos")], &[])["started"], json!(["b"]));
+        assert!(!live.heartbeat_owned(Owner::Ui, "b"));
+        assert_eq!(live.release_owned(Owner::Ui, &["b".into()], Stop::User)["stopped"], json!([]));
+        assert_eq!(live.active(), ["b"]);
+        assert!(live.heartbeat("b"), "legacy heartbeat still renews a legacy stream");
+        assert_eq!(live.stop(None, Stop::User)["stopped"], json!(["b"]));
+        live.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn owned_administrative_stop_exclusion_restart_and_shutdown_override_both_owners() {
+        if cfg!(windows) {
+            return;
+        }
+        for reason in [Stop::User, Stop::Excluded, Stop::Restart, Stop::AppExit] {
+            let (route, dir) = fake(STEADY);
+            let live = Live::new(route, quick(), Box::new(|_| {}));
+            let nodes = [node("a", "macos")];
+            live.start_owned(Owner::Ui, &nodes, &[]);
+            live.start_owned(Owner::Monitor, &nodes, &[]);
+            assert_eq!(live.stop(None, reason)["stopped"], json!(["a"]));
+            assert!(!live.heartbeat_owned(Owner::Ui, "a"));
+            assert!(!live.heartbeat_owned(Owner::Monitor, "a"));
+            live.shutdown(Duration::from_secs(1)).await;
+            assert_eq!(live.start_owned(Owner::Monitor, &nodes, &[])["refused"][0]["reason"], "app_exit");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        for excluded in [Vec::new(), vec![Node::from_value(&json!({"id":"a","status":"paused"}), "synthetic-host")]] {
+            let (route, dir) = fake(STEADY);
+            let live = Live::new(route, quick(), Box::new(|_| {}));
+            live.start_owned(Owner::Ui, &[node("a", "macos")], &[]);
+            live.start_owned(Owner::Monitor, &[node("a", "macos")], &[]);
+            live.retain_active(&excluded);
+            assert!(live.active().is_empty(), "the full ledger removes both claims");
+            live.shutdown(Duration::from_secs(1)).await;
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_heartbeat_renews_deadline_but_never_restarts_exhausted_retries() {
+        if cfg!(windows) {
+            return;
+        }
+        let (route, dir) = fake(STEADY);
+        let live = Live::new(route, quick(), Box::new(|_| {}));
+        live.start_owned(Owner::Monitor, &[node("a", "macos")], &[]);
+        live.lock().streams.get_mut("a").unwrap().last_hb = Instant::now() - quick().idle_stop - Duration::from_secs(1);
+        assert!(live.heartbeat_owned(Owner::Monitor, "a"));
+        live.tick();
+        assert_eq!(live.active(), ["a"]);
+        live.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+
+        let (route, dir) = fake("exit 255");
+        let live = Live::new(route.clone(), Opts { max_retries: 0, ..quick() }, Box::new(|_| {}));
+        live.start_owned(Owner::Ui, &[node("a", "macos")], &[]);
+        until("retry exhaustion", || state(&live, "a").0 == "stopped").await;
+        assert!(!live.heartbeat_owned(Owner::Ui, "a"));
+        assert!(!live.heartbeat_owned(Owner::Monitor, "a"));
+        assert_eq!(route.opened.load(Ordering::SeqCst), 1);
+        live.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn owned_stale_finish_cannot_erase_the_replacement_stream_or_its_owner() {
+        if cfg!(windows) {
+            return;
+        }
+        let (route, dir) = fake(STEADY);
+        let live = Live::new(route, quick(), Box::new(|_| {}));
+        live.start_owned(Owner::Monitor, &[node("a", "macos")], &[]);
+        let old = live.lock().streams["a"].epoch;
+        live.release_owned(Owner::Monitor, &["a".into()], Stop::User);
+        live.start_owned(Owner::Ui, &[node("a", "macos")], &[]);
+        live.finish("a", old, Stop::Disconnected("old transport".into()));
+        assert!(live.heartbeat_owned(Owner::Ui, "a"));
+        assert!(!live.heartbeat_owned(Owner::Monitor, "a"));
+        assert_eq!(live.release_owned(Owner::Monitor, &["a".into()], Stop::User)["stopped"], json!([]));
+        assert_eq!(live.active(), ["a"]);
+        live.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn streams_samples_and_stop_kills_the_sampler() {
         if cfg!(windows) {
             return;
@@ -2388,6 +2708,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_renews_existing_streams_without_starting_missing_or_stopped_targets() {
+        if cfg!(windows) {
+            return;
+        }
+        let (route, dir) = fake(STEADY);
+        let (sink, _) = events();
+        let live = Live::new(route.clone(), quick(), sink);
+        assert!(!live.heartbeat("missing"));
+        assert_eq!(route.opened.load(Ordering::SeqCst), 0);
+        live.start(&[node("fixture", "macos")], &[]);
+        until("initial sample", || state(&live, "fixture").0 == "running").await;
+        // Advance just the fixture's heartbeat age instead of sleeping through
+        // the production idle budget. A no-op renewal must fail the next tick.
+        live.lock().streams.get_mut("fixture").unwrap().last_hb = Instant::now() - quick().idle_stop - Duration::from_secs(1);
+        let renewed = live.heartbeat("fixture");
+        live.tick();
+        let kept_running = live.active().contains(&"fixture".to_string());
+        live.stop(None, Stop::User);
+        let while_stopping = live.heartbeat("fixture");
+        until("stopped", || state(&live, "fixture").0 == "stopped").await;
+        let after_stopping = live.heartbeat("fixture");
+        let opened = route.opened.load(Ordering::SeqCst);
+        live.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(renewed, "an existing stream accepts its heartbeat");
+        assert!(kept_running, "renewal resets the idle deadline");
+        assert!(!while_stopping && !after_stopping, "heartbeat must never restart a stopped stream");
+        assert_eq!(opened, 1);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_does_not_reset_exhausted_retries() {
+        if cfg!(windows) {
+            return;
+        }
+        let (route, dir) = fake("exit 255");
+        let (sink, _) = events();
+        let live = Live::new(route.clone(), Opts { max_retries: 0, ..quick() }, sink);
+        live.start(&[node("fixture", "macos")], &[]);
+        until("retry limit", || state(&live, "fixture").0 == "stopped").await;
+        let renewed = live.heartbeat("fixture");
+        let opened = route.opened.load(Ordering::SeqCst);
+        live.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(!renewed);
+        assert_eq!(opened, 1, "heartbeat cannot reset the sampler retry budget");
+    }
+
+    #[tokio::test]
     async fn reconnects_without_counting_when_the_sampler_rotates() {
         if cfg!(windows) {
             return;
@@ -2475,6 +2844,9 @@ echo '{\"type\":\"hello\",\"os\":\"macos\",\"impl\":\"rust\"}'
     async fn mac_sampler_runs_here() {
         use std::os::unix::fs::PermissionsExt;
         for with_sensor in [false, true] {
+            // センサーの最初の値は別の python の起動を待つ。負荷が高いと数秒かかる（全テストの並列実行や他のビルドと重なると
+            // 10 点 = 約 3 秒では最後の標本にも値が届かない）ので、センサーありは標本を多めに取る
+            let count = if with_sensor { 30 } else { 3 };
             let (_, dir) = fake("");
             if with_sensor {
                 let sensor = dir.join("macmon");
@@ -2501,7 +2873,7 @@ for _ in range(400):
                     "-".into(),
                     "interval=0.3".into(),
                     "procs=0.3".into(),
-                    "count=3".into(),
+                    format!("count={count}"),
                 ]
                 .into(),
                 stdin: MAC_LIVE.as_bytes().to_vec(),
@@ -2530,7 +2902,7 @@ for _ in range(400):
                     _ => None,
                 })
                 .collect();
-            assert_eq!(samples.len(), 3);
+            assert_eq!(samples.len(), count);
             let last = samples.last().unwrap();
             assert!(last.cpu.is_some() && last.cores.len() == h.cores.unwrap() as usize);
             assert!(last.mem.as_ref().and_then(|m| m.used_pct).is_some());

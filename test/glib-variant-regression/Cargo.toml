@@ -1,0 +1,31 @@
+[package]
+name = "glib-variant-regression"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+publish = false
+
+[workspace]
+resolver = "3"
+
+[[test]]
+name = "variant_str_iter"
+path = "tests/variant_str_iter.rs"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+glib = { version = "=0.18.5", path = "../../vendor/glib-0.18.5" }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[profile.test]
+opt-level = 0
+debug = 2
+debug-assertions = true
+
+[profile.release]
+opt-level = 3
+lto = "off"
+debug-assertions = false
+overflow-checks = false

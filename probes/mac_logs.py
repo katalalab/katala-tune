@@ -134,7 +134,10 @@ def parse_kernel(text, start):
 
 
 def kernel(cursor_epoch):
-    start = cursor_epoch or time.time() - 2 * 3600  # 初回は2時間（24時間だと M2 で25秒を超えた）
+    now = time.time()
+    # 初回は2時間（24時間だと M2 で25秒を超えた）。長く止まっていた後も12時間より前は読まない。
+    # 古い cursor のまま広い範囲を読むと timeout し、cursor が進まず永久に失敗し続けるため
+    start = max(cursor_epoch or now - 2 * 3600, now - 12 * 3600)
     since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start))
     try:
         p = subprocess.run(["log", "show", "--style", "ndjson", "--start", since, "--predicate",

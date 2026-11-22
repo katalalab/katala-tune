@@ -9,7 +9,9 @@ members = [
     # 各機体の常駐（tune-agent）と、機体どうしの接続（tune-link。ペアリング・機体鍵・端末間暗号化）
     "crates/tune-link",
     "crates/tune-agent",
+    "crates/tune-gpui",
 ]
+exclude = ["vendor/glib-0.18.5", "test/glib-variant-regression"]
 
 [workspace.package]
 version = "0.7.0-rc.1"
@@ -39,3 +41,8 @@ lto = true
 opt-level = "s"
 panic = "abort"
 strip = true
+
+# Preserve upstream versions while applying the documented dependency backports.
+[patch.crates-io]
+taffy = { path = "vendor/taffy-0.9.0" }
+glib = { path = "vendor/glib-0.18.5" }
