@@ -438,7 +438,13 @@ pub fn app_checks(ctx: &Value) -> Vec<Check> {
         "login",
         "ログイン時に起動",
         if login { "ok" } else { "unknown" },
-        if login { "有効" } else { "無効（自動スキャンはアプリを開いている間だけ動く）" },
+        if get(c, "openAtLogin") == Some(&Value::Null) {
+            "未確認（OS の状態を照会してください）"
+        } else if login {
+            "有効"
+        } else {
+            "無効（自動スキャンはアプリを開いている間だけ動く）"
+        },
     );
     out.0
 }
@@ -447,6 +453,13 @@ pub fn app_checks(ctx: &Value) -> Vec<Check> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn unobserved_login_is_not_measured_disabled() {
+        let check = app_checks(&json!({"openAtLogin": null})).into_iter().find(|c| c.id == "login").unwrap();
+        assert_eq!(check.status, "unknown");
+        assert_eq!(check.detail.as_deref(), Some("未確認（OS の状態を照会してください）"));
+    }
 
     #[test]
     fn failing_jobs_skip_sched_ok_and_disabled() {

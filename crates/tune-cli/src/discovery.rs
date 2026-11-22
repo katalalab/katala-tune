@@ -90,6 +90,14 @@ const COMMANDS: &[Command] = &[
         notes: "省略時は全運用対象。DBへ保存しない。機体ごとの失敗は結果内に含む。",
     },
     Command {
+        name: "e2e",
+        arguments: &["--db <new-directory>", "[node ...]"],
+        summary: "収集・分析・保存・再読込・ログ同期を検証",
+        format: "json",
+        effects: CONFIG | DB | WRITE_DB | CONNECT,
+        notes: "新規DB専用。省略時は全運用対象。除外数を別に報告し、対象0台・収集や保存・取り込み元の失敗は終了コード1。台帳と既存DBを変更せず、監視・更新・helper配布を開始しない。GUI操作・配布・更新受入は別途確認する。",
+    },
+    Command {
         name: "logs",
         arguments: &["[--db <dir>]", "[node ...]"],
         summary: "ログを DB に取り込む",
@@ -232,6 +240,14 @@ const COMMANDS: &[Command] = &[
         format: "json",
         effects: CONFIG | CONNECT,
         notes: "省略時は全運用対象のうち有効な機体。opt-in・読取専用・DB保存なし。--repos で個別行も出す。",
+    },
+    Command {
+        name: "ssh",
+        arguments: &["[--probe]", "[node ...]"],
+        summary: "SSH の設定・鍵・known_hosts を点検",
+        format: "json",
+        effects: CONFIG | CONNECT,
+        notes: "省略時は全運用対象（この機体を除く）。ssh -G・ssh-keygen・ssh-add で読むだけで、秘密鍵は開かない。接続先の名前・パス・指紋は出さない。--probe だけ BatchMode で接続する。DB保存なし。",
     },
     Command {
         name: "export",

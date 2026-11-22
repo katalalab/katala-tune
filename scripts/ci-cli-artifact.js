@@ -86,7 +86,7 @@ function createArtifact({ root = process.cwd(), env = process.env, platform = pr
     llvmVersion: compilerField('LLVM version', /^[0-9]{1,3}(?:\.[0-9]{1,3}){1,2}$/),
   };
   if (!versionLine.includes(rustc.commitDate) || !rustc.commitHash.startsWith(versionLine.split('(')[1].split(' ')[0])) throw new Error('toolchain metadata inconsistent');
-  const binary = regular(root, 'target/debug/tune.exe', MAX_BINARY, 'binary');
+  const binary = regular(root, 'target/release/tune.exe', MAX_BINARY, 'binary');
   const lock = regular(root, 'Cargo.lock', 2 * 1024 * 1024, 'lock');
   // Checkout bytes may be CRLF; Git's canonical blob retains its original final LF.
   const gitLock = run('git', ['show', 'HEAD:Cargo.lock'], root);
@@ -110,7 +110,7 @@ function createArtifact({ root = process.cwd(), env = process.env, platform = pr
   // mkdir is exclusive; existing directories/symlinks fail instead of being reused.
   fs.mkdirSync(dist);
   const artifact = copyBinary(binary, path.join(dist, 'tune.exe'));
-  const manifest = { schemaVersion: 1, artifact, build: { package: 'tune-cli', profile: 'debug', target: HOST, platform, arch, rustc }, source, ci: { repository, workflowRef, workflowSha, eventName, runId, runAttempt } };
+  const manifest = { schemaVersion: 1, artifact, build: { package: 'tune-cli', profile: 'release', target: HOST, platform, arch, rustc }, source, ci: { repository, workflowRef, workflowSha, eventName, runId, runAttempt } };
   fs.writeFileSync(path.join(dist, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' });
   return manifest;
 }

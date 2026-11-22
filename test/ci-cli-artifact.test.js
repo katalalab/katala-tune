@@ -11,8 +11,8 @@ const MERGE = 'a'.repeat(40), TREE = 'b'.repeat(40), HEAD = 'c'.repeat(40), BASE
 function fixture(t, patch = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ci-cli-artifact-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  fs.mkdirSync(path.join(root, 'target', 'debug'), { recursive: true });
-  fs.writeFileSync(path.join(root, 'target', 'debug', 'tune.exe'), Buffer.from([77, 90, 0, 1, 2]));
+  fs.mkdirSync(path.join(root, 'target', 'release'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'target', 'release', 'tune.exe'), Buffer.from([77, 90, 0, 1, 2]));
   fs.writeFileSync(path.join(root, 'Cargo.lock'), 'version = 4\n');
   const eventPath = path.join(root, 'event.json');
   fs.writeFileSync(eventPath, JSON.stringify({ pull_request: { head: { sha: HEAD, label: 'discard' }, base: { sha: BASE } }, actor: 'discard', secret: 'DO_NOT_EXPORT' }));
@@ -35,17 +35,36 @@ test('PR merge artifact preserves actual merge/tree and separate PR head/base wi
   const manifest = createArtifact(f.options);
   assert.deepEqual(manifest.source, { githubSha: MERGE, head: MERGE, tree: TREE, cargoLockSha256: sha('version = 4\n'), cargoLockGitSha256: sha('version = 4\n'), pullRequest: { headSha: HEAD, baseSha: BASE } });
   assert.deepEqual(manifest.artifact, { file: 'tune.exe', bytes: 5, sha256: sha(Buffer.from([77, 90, 0, 1, 2])) });
-  assert.equal(manifest.build.profile, 'debug');
+  assert.equal(manifest.build.profile, 'release');
   assert.equal(manifest.build.target, 'x86_64-pc-windows-msvc');
   assert.deepEqual(manifest.build.rustc, { versionLine: 'rustc 1.99.0 (012345678 2026-10-01)', binary: 'rustc', commitHash: '0123456789012345678901234567890123456789', commitDate: '2026-10-01', release: '1.99.0', host: 'x86_64-pc-windows-msvc', llvmVersion: '23.1.0' });
   assert.equal(manifest.ci.runId, '12345678901234567890');
   assert.equal(manifest.ci.runAttempt, '2');
   assert.deepEqual(fs.readdirSync(f.dist).sort(), ['manifest.json', 'tune.exe']);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.dist, 'manifest.json'), 'utf8')), manifest);
-  assert.deepEqual(fs.readFileSync(path.join(f.dist, 'tune.exe')), fs.readFileSync(path.join(f.root, 'target', 'debug', 'tune.exe')));
+  assert.deepEqual(fs.readFileSync(path.join(f.dist, 'tune.exe')), fs.readFileSync(path.join(f.root, 'target', 'release', 'tune.exe')));
   assert.deepEqual(f.calls, [['git', ['rev-parse', 'HEAD']], ['git', ['rev-parse', 'HEAD^{tree}']], ['git', ['diff', '--quiet', 'HEAD', '--']], ['rustc', ['-vV']], ['git', ['show', 'HEAD:Cargo.lock']]]);
   const text = JSON.stringify(manifest);
   for (const forbidden of ['DO_NOT_EXPORT', 'actor', 'runnerName', f.root, 'event.json', 'label']) assert.equal(text.includes(forbidden), false, forbidden);
+});
+test('fixed release input wins over different debug bytes and the manifest describes the copied release', t => {
+  const f = fixture(t);
+  const release = Buffer.from([77, 90, 3, 4, 5, 6]);
+  const debug = Buffer.from([77, 90, 0, 1, 2]);
+  fs.writeFileSync(path.join(f.root, 'target', 'release', 'tune.exe'), release);
+  fs.mkdirSync(path.join(f.root, 'target', 'debug'));
+  fs.writeFileSync(path.join(f.root, 'target', 'debug', 'tune.exe'), debug);
+  const manifest = createArtifact(f.options);
+  assert.equal(manifest.build.profile, 'release');
+  assert.deepEqual(manifest.artifact, { file: 'tune.exe', bytes: release.length, sha256: sha(release) });
+  assert.deepEqual(fs.readFileSync(path.join(f.dist, 'tune.exe')), release);
+  assert.deepEqual(fs.readFileSync(path.join(f.root, 'target', 'debug', 'tune.exe')), debug);
+});
+test('debug-only input is rejected without fallback or artifact output', t => {
+  const f = fixture(t);
+  fs.renameSync(path.join(f.root, 'target', 'release'), path.join(f.root, 'target', 'debug'));
+  assert.throws(() => createArtifact(f.options), /binary missing/);
+  assert.equal(fs.existsSync(path.join(f.root, 'dist')), false);
 });
 test('push keeps no PR fields and never requires an event payload', t => {
   const f = fixture(t, { GITHUB_EVENT_NAME: 'push', GITHUB_EVENT_PATH: 'missing', GITHUB_WORKFLOW_REF: 'example/project/.github/workflows/ci.yml@refs/heads/main' });
@@ -71,7 +90,7 @@ test('only native Windows x64 and pinned rustc host/release may produce an artif
 });
 test('missing, empty and oversized binaries are rejected', t => {
   for (const kind of ['missing', 'empty', 'oversized']) {
-    const f = fixture(t), binary = path.join(f.root, 'target', 'debug', 'tune.exe');
+    const f = fixture(t), binary = path.join(f.root, 'target', 'release', 'tune.exe');
     fs.unlinkSync(binary);
     if (kind === 'empty') fs.writeFileSync(binary, '');
     if (kind === 'oversized') { const fd = fs.openSync(binary, 'wx'); fs.ftruncateSync(fd, 128 * 1024 * 1024 + 1); fs.closeSync(fd); }
@@ -107,7 +126,7 @@ test('tracked source modifications reject provenance before packaging', t => {
 });
 
 test('a symlink input binary is rejected explicitly', t => {
-  const f = fixture(t), binary = path.join(f.root, 'target', 'debug', 'tune.exe');
+  const f = fixture(t), binary = path.join(f.root, 'target', 'release', 'tune.exe');
   fs.unlinkSync(binary);
   const real = path.join(f.root, 'actual.exe'); fs.writeFileSync(real, 'MZ');
   try { fs.symlinkSync(real, binary); } catch (e) {
@@ -125,7 +144,7 @@ test('Windows artifact steps append to existing checks and upload exactly the ve
     const build = workflow.indexOf('      - name: Windows CLI artifact build');
     assert.ok(build > workflow.indexOf('run: cargo build --package katala-tune --locked'));
     const tail = workflow.slice(build);
-    assert.match(tail, /run: cargo build --locked -p tune-cli/);
+    assert.match(tail, /^        run: cargo build --release --locked -p tune-cli$/m);
     assert.match(tail, /timeout-minutes: 20/);
     assert.equal((tail.match(/if: runner.os == 'Windows'/g) || []).length, 3);
     assert.match(tail, /run: node scripts\/ci-cli-artifact.js/);

@@ -2,7 +2,8 @@
 $ProgressPreference="SilentlyContinue"
 [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false)
 try {
-$p=[Console]::In.ReadToEnd().Split([char]10)
+# Read exactly the 8 frame lines. Waiting for stdin EOF can hang when it is relayed through Git Bash.
+$i=[Console]::In;$p=@(for($k=0;$k -lt 8;$k++){$l=$i.ReadLine();if($null -eq $l){throw "frame"};$l})
 if($p.Length -ne 8 -or $p[0] -cne "KTLOG1"){throw "frame"}
 if($p[1] -cne "events" -and $p[1] -cne "logons"){throw "kind"}
 $a=@()

@@ -1,0 +1,64 @@
+name: gpui-preview
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/**
+      - probes/**
+      - scripts/**
+      - test/**
+      - package.json
+      - .github/workflows/gpui-preview.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpui-preview-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      RUST_TOOLCHAIN: '1.99.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: gpui-release-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+      - name: Test artifact staging
+        run: node --test test/ci-gpui-artifact.test.js test/inspect-gpui-artifact.test.js
+      - name: Build native preview, CLI and sampler
+        run: cargo build --release --locked -p tune-gpui -p tune-cli -p tune-agent
+      - name: Stage binaries and their hashes
+        shell: bash
+        run: node scripts/ci-gpui-artifact.js
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gpui-preview-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/gpui-preview/
+          if-no-files-found: error
+          retention-days: 7

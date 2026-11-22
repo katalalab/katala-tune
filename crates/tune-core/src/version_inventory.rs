@@ -76,7 +76,7 @@ async fn inspect(node: Node) -> Value {
         } else {
             "if [ -x \"$HOME/.katala-tune/bin/tune.exe\" ]; then exec \"$HOME/.katala-tune/bin/tune.exe\" version --json; else exec tune.exe version --json; fi"
         };
-        let mut args = collect::ssh_args(&node.alias, remote);
+        let mut args = collect::node_ssh_args(&node, remote);
         args.splice(
             0..0,
             ["-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no", "-o", "ClearAllForwardings=yes", "-o", "PermitLocalCommand=no"].map(str::to_string),

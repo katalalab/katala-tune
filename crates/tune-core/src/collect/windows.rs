@@ -44,12 +44,14 @@ use windows_sys::Win32::{
     },
 };
 
+#[cfg(test)]
+use super::windows_pid_list::MAX_ACTIVE;
+use super::windows_pid_list::{self, ReadError};
 use super::windows_pin::PinnedWindowsExecutable;
 use super::windows_quiescence::{CLEANUP, Decision as QuiescenceDecision, Observation as QuiescenceObservation, Quiescence};
 use super::{BoundedResult, ProcessIdentity, ProcessReceipt, ProcessStop, WindowsMetadataExitPolicy};
 
 const POLL: Duration = Duration::from_millis(10);
-const MAX_ACTIVE: usize = 256;
 const MAX_OBSERVED: usize = 4096;
 const SYNCHRONIZE_PROCESS: u32 = 0x0010_0000;
 const GENERIC_READ_ACCESS: u32 = 0x8000_0000;
@@ -326,31 +328,23 @@ type AccountingHook = Box<dyn FnOnce(&Job, &ProcessReceipt) -> io::Result<()> + 
 #[cfg(test)]
 type PidListHook = Box<dyn FnOnce(&Job, &[u32]) -> io::Result<()> + Send>;
 
+fn pid_list_error(_failure: windows_pid_list::ValidationError) -> io::Error {
+    diagnostic_pid_error!(
+        match _failure.reason {
+            windows_pid_list::Reason::AssignedCountMismatch => windows_io_diagnostic::PidListReason::AssignedCountMismatch,
+            windows_pid_list::Reason::CountOutOfBounds => windows_io_diagnostic::PidListReason::CountOutOfBounds,
+            windows_pid_list::Reason::IdentifierOutOfRange => windows_io_diagnostic::PidListReason::IdentifierOutOfRange,
+            windows_pid_list::Reason::ZeroIdentifier => windows_io_diagnostic::PidListReason::ZeroIdentifier,
+            windows_pid_list::Reason::DuplicateIdentifier => windows_io_diagnostic::PidListReason::DuplicateIdentifier,
+        },
+        _failure.assigned,
+        _failure.count
+    )
+}
+
+#[cfg(test)]
 fn complete_pid_list(assigned: u32, count: u32, pids: &[usize]) -> io::Result<Vec<u32>> {
-    if assigned != count || count as usize > MAX_ACTIVE || count as usize > pids.len() {
-        return Err(diagnostic_pid_error!(
-            if assigned != count {
-                windows_io_diagnostic::PidListReason::AssignedCountMismatch
-            } else {
-                windows_io_diagnostic::PidListReason::CountOutOfBounds
-            },
-            assigned,
-            count
-        ));
-    }
-    let mut result = Vec::with_capacity(count as usize);
-    for value in &pids[..count as usize] {
-        let pid = u32::try_from(*value).map_err(|_| diagnostic_pid_error!(windows_io_diagnostic::PidListReason::IdentifierOutOfRange, assigned, count))?;
-        if pid == 0 || result.contains(&pid) {
-            return Err(diagnostic_pid_error!(
-                if pid == 0 { windows_io_diagnostic::PidListReason::ZeroIdentifier } else { windows_io_diagnostic::PidListReason::DuplicateIdentifier },
-                assigned,
-                count
-            ));
-        }
-        result.push(pid);
-    }
-    Ok(result)
+    windows_pid_list::complete_pid_list(assigned, count, pids).map_err(pid_list_error)
 }
 
 struct Job {
@@ -416,27 +410,26 @@ impl Job {
         Ok(())
     }
     fn process_ids(&self) -> io::Result<Vec<u32>> {
-        #[repr(C)]
-        struct Pids {
-            assigned: u32,
-            count: u32,
-            pids: [usize; MAX_ACTIVE],
-        }
-        let mut pids = Pids { assigned: 0, count: 0, pids: [0; MAX_ACTIVE] };
-        // SAFETY: flexible-array output has a fixed cap with correct pointer-size alignment.
-        diagnostic_io!(
-            JobPidQuery,
-            check(unsafe {
-                QueryInformationJobObject(
-                    self.handle.as_raw_handle(),
-                    JobObjectBasicProcessIdList,
-                    std::ptr::from_mut(&mut pids).cast(),
-                    size_of_val(&pids) as u32,
-                    null_mut(),
-                )
-            })
-        )?;
-        complete_pid_list(pids.assigned, pids.count, &pids.pids)
+        windows_pid_list::read_complete_pid_list(|pids| {
+            // SAFETY: fixed-cap repr(C) flexible-array output has pointer-size
+            // alignment; every query uses only this retained, newly owned Job.
+            diagnostic_io!(
+                JobPidQuery,
+                check(unsafe {
+                    QueryInformationJobObject(
+                        self.handle.as_raw_handle(),
+                        JobObjectBasicProcessIdList,
+                        std::ptr::from_mut(pids).cast(),
+                        size_of_val(pids) as u32,
+                        null_mut(),
+                    )
+                })
+            )
+        })
+        .map_err(|error| match error {
+            ReadError::Query(error) => error,
+            ReadError::Validation(failure) => pid_list_error(failure),
+        })
     }
     fn observe(&mut self, receipt: &mut ProcessReceipt) -> io::Result<()> {
         self.accounting(receipt)?;

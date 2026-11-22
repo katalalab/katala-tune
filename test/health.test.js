@@ -5,6 +5,12 @@ const { nodeChecks, appChecks, failingJobs, currentCheckRows, statusCounts } = r
 
 const now = 1_800_000_000_000;
 
+test('未観測のログイン設定は観測済みの無効と区別する', () => {
+  const check = appChecks({ openAtLogin: null }).find(c => c.id === 'login');
+  assert.equal(check.status, 'unknown');
+  assert.equal(check.detail, '未確認（OS の状態を照会してください）');
+});
+
 test('収集を無効にしたログイン元の旧cursorを失敗・鮮度判定に使わない', () => {
   for (const source of ['mac_auth', 'win_security']) {
     for (const node of [{ id: 'pc', network: false }, { id: 'pc', network_logins: false }, { id: 'pc', shared: true }]) {

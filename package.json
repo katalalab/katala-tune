@@ -32,7 +32,9 @@
     "check": "node scripts/check.js",
     "benchmark:live": "node scripts/benchmark-live.js",
     "version:check": "node scripts/version.js",
-    "network": "node scripts/network-check.js"
+    "network": "node scripts/network-check.js",
+    "icons": "node scripts/icons.js",
+    "gpui:package:mac": "node scripts/package-gpui-macos.js"
   },
   "devDependencies": {
     "@electron/fuses": "^2.1.3",

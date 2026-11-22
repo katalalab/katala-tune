@@ -52,6 +52,11 @@ impl Engine {
         }
         self.host().state_changed();
         let cfg = self.reload_config();
+        if let Some(error) = self.config_error() {
+            self.tools.inventorying.store(false, Ordering::SeqCst);
+            self.host().state_changed();
+            return json!({ "error": error });
+        }
         let all = ids.as_ref().is_none_or(Vec::is_empty);
         let targets: Vec<Node> = cfg.nodes.iter().filter(|n| n.is_active() && (all || ids.as_ref().is_some_and(|i| i.contains(&n.id)))).cloned().collect();
         let mut set = tokio::task::JoinSet::new();
@@ -246,6 +251,11 @@ impl Engine {
         self.host().state_changed();
         let t0 = now_ms();
         let cfg = self.reload_config();
+        if let Some(error) = self.config_error() {
+            self.tools.ai_syncing.store(false, Ordering::SeqCst);
+            self.host().state_changed();
+            return json!({ "error": error });
+        }
         let all = ids.as_ref().is_none_or(Vec::is_empty);
         let targets: Vec<Node> =
             cfg.nodes.iter().filter(|n| ai_sessions::enabled(n) && (all || ids.as_ref().is_some_and(|i| i.contains(&n.id)))).cloned().collect();

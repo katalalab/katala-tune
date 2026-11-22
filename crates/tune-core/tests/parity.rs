@@ -751,7 +751,7 @@ fn rules_health_logs_actions_match_js() {
         ]);
         node_in.push(json!({ "node": { "id": "pc" }, "snap": snap, "findings": findings, "ctx": ctx }));
     }
-    let app_in: Vec<Value> = (0..800)
+    let mut app_in: Vec<Value> = (0..800)
         .map(|_| {
             obj(vec![
                 ("now", Some(json!(now))),
@@ -785,6 +785,7 @@ fn rules_health_logs_actions_match_js() {
             ])
         })
         .collect();
+    app_in.push(json!({ "now": now, "openAtLogin": null }));
     let mut jobs_in: Vec<Value> = (0..300).map(|i| jobs(&mut r, i % 2 == 0)).collect();
     for (id, name, kind, code) in [
         ("\\nefarius_HidHide_Updater", "nefarius_HidHide_Updater", "schtask", 202),
