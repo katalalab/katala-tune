@@ -22,3 +22,13 @@ macOSでは `~/.katala-tune/bin/tune versions` のように実行する。各JSO
 `tune specs --saved [機体ID ...]` は保存済みの仕様と最終試行だけをJSONで表示する。SSHやローカル収集を実行せず、既存DBを読取専用で開く。DB未作成の場合は `report: null` を返し、DBやディレクトリを作成しない。引数省略時は台帳の全機体を表示し、退役・共用・収集停止の機体も閲覧できる。出力の `read_only: true` はこの保存済み表示を示し、別プロセスでの収集中かどうかは判定しない。
 
 `tune specs [機体ID ...]` は収集・保存、`tune specs-local` は台帳・DB不要の単体収集。[機体仕様の詳細](machine-specs.md)を参照。指定したIDとオプションはDB初期化前に検証する。その他の従来コマンドのJSON出力形式は変更していない。
+
+`tune ssh [--probe] [機体ID ...]` は、この機体の SSH クライアントから台帳の機体へ向けた設定・鍵・known_hosts を読み取り専用で点検する。引数省略時は運用対象のうちこの機体以外が対象。秘密鍵は開かず、出力に接続先の名前・ユーザー名・鍵のパス・指紋・コメントを含めない。DB・設定・known_hosts は変更しない。`--probe` を付けたときだけ BatchMode で接続し、所要時間と失敗の種類（`unreachable`・`auth`・`timeout`・`error`）を返す。所見の種類は [roadmap.md](roadmap.md) の「SSH」を参照。
+
+### SSH 点検の範囲
+
+`tune ssh --probe` は `StrictHostKeyChecking=yes`・`UpdateHostKeys=no` を強制し、未知のホスト鍵を登録しません。ポート転送・エージェント転送・X11 転送・トンネル・LocalCommand・RemoteCommand・バックグラウンド化も無効にし、`exit 0` だけを要求します。設定の所見は元の設定に対して出すため、`accept-new` の設定でも probe は未知のホストを拒否します。
+
+設定ファイルは信頼済みであることが前提です。OpenSSH 自体が `ssh -G` でも `Match exec` を実行することがあり、probe の ProxyCommand / ProxyJump も利用者が定義した経路を使います。任意の設定ファイルを安全に実行するサンドボックスではありません。秘密鍵を開かないのは設定・鍵の点検処理のことで、明示した `--probe` の認証では OpenSSH が秘密鍵を利用する場合があります。台帳の `node_id` は結果を識別するため出力されます。
+
+IdentityFile の `~` と `%d`・`%h`・`%n`・`%p`・`%r`・`%u`・`%%` を展開し、`.pub` を直接指定した構成も読みます。未対応のトークンや環境変数を含むパスでは鍵の検出ができない場合があります。known_hosts は登録の存在だけを調べ、提示されたホスト鍵との一致は probe で確認します。空白を含む単一ファイルのパスに対応し、`ssh -G` の出力で複数パスの区切りを判別できない場合は未登録と断定せず `known_host: null` を返します。

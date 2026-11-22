@@ -55,7 +55,8 @@ pub fn sha256_hex(b: &[u8]) -> String {
     Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn is_hex(s: &str, n: usize) -> bool {
+/// `s` が長さ `n` の小文字 16 進（SHA-256 の hex など）か
+pub fn is_lower_hex(s: &str, n: usize) -> bool {
     s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
@@ -94,14 +95,14 @@ impl SpanIn {
     pub fn from_probe(file: &str, v: Option<&Value>) -> Option<SpanIn> {
         let v = v?.as_object()?;
         let int = |k: &str| v.get(k).and_then(Value::as_i64).filter(|x| *x >= 0);
-        let sha = v.get("sha256").and_then(Value::as_str).filter(|s| is_hex(s, 64))?.to_string();
+        let sha = v.get("sha256").and_then(Value::as_str).filter(|s| is_lower_hex(s, 64))?.to_string();
         let (start, end) = (int("start")?, int("end")?);
         if end < start || file.is_empty() {
             return None;
         }
         let anchor = v.get("anchor").and_then(Value::as_array).and_then(|a| {
             let n = a.first()?.as_i64().filter(|n| *n >= 0 && *n <= end)?;
-            let s = a.get(1)?.as_str().filter(|s| is_hex(s, 64))?;
+            let s = a.get(1)?.as_str().filter(|s| is_lower_hex(s, 64))?;
             Some((n, s.to_string()))
         });
         Some(SpanIn {

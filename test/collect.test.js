@@ -3,6 +3,16 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { run, probeNode, SSH_OPTS, windowsSshCommand, macProbeArgs, macSshCommand } = require('../lib/collect');
 
+test('probe rejects failed commands with valid JSON and empty snapshots', async () => {
+  for (const [code, out] of [[255, '{"probe":"macos"}'], [null, '{"probe":"macos"}'], [0, '{}']]) {
+    const result = await probeNode({ id: 'dev', os: 'macos', local: true, network: false, benchmark: false }, {
+      run: async () => ({ code, out, err: 'fixture collection failure' }),
+    });
+    assert.equal(result.ok, false, `code=${code}, out=${out}`);
+    assert.equal(result.data, undefined);
+  }
+});
+
 test('SSH は既存の ControlPersist master を使わない', () => {
   assert.ok(SSH_OPTS.includes('-T'));
   assert.ok(SSH_OPTS.includes('ControlMaster=no'));

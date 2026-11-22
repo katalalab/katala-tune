@@ -99,9 +99,7 @@ pub(crate) fn validate(payload: &DockerCandidatePayload, now: i64) -> Result<Vec
         EntityKind, ScopeStatus,
         adapters::docker::{Container, DockerEngine, DockerPacket, Network, Volume, engine_snapshots},
     };
-    fn digest(value: &str) -> bool {
-        value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    }
+    let digest = |value: &str| crate::db::is_lower_hex(value, 64);
     if payload.version != 1
         || !digest(&payload.engine_identity)
         || !digest(&payload.source_generation)

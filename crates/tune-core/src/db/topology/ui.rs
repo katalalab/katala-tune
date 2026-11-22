@@ -216,9 +216,6 @@ struct Envelope {
     stored_entities: usize,
     stored_edges: usize,
 }
-fn hex(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
 fn row_digest(binding: [&str; 9]) -> String {
     crate::db::sha256_hex(json!(binding).to_string().as_bytes())
 }
@@ -378,9 +375,9 @@ fn envelopes(db: &Connection, now: i64) -> Result<EnvelopeScan> {
             || e.ordinal != ordinal
             || ordinal <= 0
             || e.writer_generation <= 0
-            || !hex(&e.source_generation)
-            || !hex(&e.settings_generation)
-            || !hex(&e.payload_digest)
+            || !crate::db::is_lower_hex(&e.source_generation, 64)
+            || !crate::db::is_lower_hex(&e.settings_generation, 64)
+            || !crate::db::is_lower_hex(&e.payload_digest, 64)
             || crate::db::sha256_hex(raw.as_bytes()) != binding
             || serde_json::to_string(&e).ok().as_deref() != Some(&raw)
             || e.stored_entities > 4096

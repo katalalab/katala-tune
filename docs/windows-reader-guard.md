@@ -71,6 +71,24 @@ approved action does not acquire permission for an additional operation merely
 because its descendants have more time to finish.
 Exit code `259` alone is never used as a liveness test.
 
+PID enumeration returns only a complete, validated list from the owned Job.
+Within the existing 256-member cap, a successful query with fewer returned than
+assigned PIDs is retried immediately, with at most four queries per enumeration.
+Four bounds the extra synchronous work while allowing several fresh observations;
+it does not guarantee that a changing Job will yield a complete list. Every
+returned PID is checked even in a partial list; malformed counts, zero, duplicate
+or out-of-range PIDs and native query errors fail immediately. Four partial lists
+also fail closed, retaining the last incomplete counts and existing query context
+in test diagnostics. Partial membership never proves that a candidate vanished.
+The retries do not sleep, grow the buffer or introduce or extend a deadline.
+The observed partial result despite sufficient buffer capacity is consistent with
+child creation/exit during enumeration; this is an inference, not an API guarantee
+of atomic snapshots. Microsoft's
+[PID-list definition](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_process_id_list)
+defines the incomplete counts, and
+[query contract](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-queryinformationjobobject)
+defines native success and failure separately.
+
 A completed input writer is not a delivery acknowledgement. Tokio/mio may have
 accepted an asynchronous write before it completes in the OS. Its pipe is dropped
 rather than relying on `shutdown()` as a half-close. Process/Job exit and output

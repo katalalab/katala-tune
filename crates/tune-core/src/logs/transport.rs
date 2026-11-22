@@ -42,7 +42,7 @@ pub(super) fn windows_script_transport(script: &[u8], kind: &str, cursors: [&str
         return Err("Windows log bootstrap exceeds 8191 bytes".into());
     }
     let input =
-        format!("KTLOG1\n{kind}\n{}\n{}\n{}\n{}\n{}\n{}", cursors[0], cursors[1], cursors[2], body.len(), crate::db::sha256_hex(&body), super::base64(&body));
+        format!("KTLOG1\n{kind}\n{}\n{}\n{}\n{}\n{}\n{}\n", cursors[0], cursors[1], cursors[2], body.len(), crate::db::sha256_hex(&body), super::base64(&body));
     Ok(Transport { command, bootstrap, input })
 }
 
@@ -55,95 +55,328 @@ async fn read_complete(pipe: impl AsyncRead + Unpin, limit: usize) -> std::io::R
     Ok(bytes)
 }
 
+// The non-test expansions are exactly the original expressions: no observer or
+// extra future exists in production builds.
+macro_rules! observe {
+    ($trace:ident.$method:ident, $stage:ident, $expression:expr) => {{
+        #[cfg(test)]
+        {
+            let result = $expression;
+            $trace.$method(diagnostic::Stage::$stage, &result);
+            result
+        }
+        #[cfg(not(test))]
+        {
+            $expression
+        }
+    }};
+}
+
+macro_rules! observe_future {
+    ($trace:ident.$method:ident, $stage:ident, $expression:expr) => {{
+        #[cfg(test)]
+        {
+            async { observe!($trace.$method, $stage, ($expression).await) }
+        }
+        #[cfg(not(test))]
+        {
+            $expression
+        }
+    }};
+}
+
 /// Release parser input only after stdin, both EOFs and exit 0 before deadline.
 pub(super) async fn run(mut command: Command, input: &[u8], timeout: Duration) -> RunResult {
     #[cfg(test)]
-    let trace = {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let invocation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let started = std::time::Instant::now();
-        move |stage: &'static str, error: Option<&std::io::Error>| {
-            // Fixed stages and OS error metadata only: never commands, input,
-            // output, paths, process identities, or an error's arbitrary text.
-            eprintln!(
-                "log_transport invocation={invocation} elapsed_ms={} stage={stage} error_kind={:?} raw_os_error={:?}",
-                started.elapsed().as_millis(),
-                error.map(std::io::Error::kind),
-                error.and_then(std::io::Error::raw_os_error)
-            );
-        }
-    };
-    macro_rules! exchange_step {
-        ($stage:literal, $future:expr) => {{
-            let result = $future.await;
-            #[cfg(test)]
-            trace($stage, result.as_ref().err());
-            result
-        }};
-    }
+    let trace = diagnostic::Trace::new();
     command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(_error) => {
-            #[cfg(test)]
-            trace("spawn", Some(&_error));
-            return failure();
-        }
+    let Ok(mut child) = observe!(trace.io, Spawn, command.spawn()) else {
+        #[cfg(test)]
+        trace.report();
+        return failure();
     };
-    #[cfg(test)]
-    trace("spawned", None);
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let deadline = tokio::time::Instant::now() + timeout;
+    #[cfg(test)]
+    trace.begin_exchange();
+    #[cfg(test)]
+    let stdout = trace.reader(stdout, diagnostic::Stage::Stdout, MAX_STDOUT);
+    #[cfg(test)]
+    let stderr = trace.reader(stderr, diagnostic::Stage::Stderr, MAX_STDERR);
     let exchange = async {
         let writer = async {
-            exchange_step!("stdin_write", stdin.write_all(input))?;
-            exchange_step!("stdin_shutdown", stdin.shutdown())?;
+            observe!(trace.io, StdinWrite, stdin.write_all(input).await)?;
+            observe!(trace.io, StdinShutdown, stdin.shutdown().await)?;
             drop(stdin);
             Ok::<_, std::io::Error>(())
         };
-        let (_, out, err, status) = tokio::try_join!(
-            writer,
-            async { exchange_step!("stdout_eof", read_complete(stdout, MAX_STDOUT)) },
-            async { exchange_step!("stderr_eof", read_complete(stderr, MAX_STDERR)) },
-            async { exchange_step!("root_exit", child.wait()) }
-        )?;
+        let (_, out, err, status) =
+            tokio::try_join!(writer, read_complete(stdout, MAX_STDOUT), read_complete(stderr, MAX_STDERR), observe_future!(trace.wait, Wait, child.wait()))?;
         if !status.success() {
             #[cfg(test)]
-            trace("nonzero_exit", None);
+            trace.record(diagnostic::Stage::Exit, diagnostic::Outcome::Nonzero);
             return Err(std::io::Error::other(FAILURE));
         }
-        let out = String::from_utf8(out).map_err(|_| std::io::Error::other(FAILURE))?;
-        let err = String::from_utf8(err).map_err(|_| std::io::Error::other(FAILURE))?;
+        let out = observe!(trace.utf8, StdoutUtf8, String::from_utf8(out)).map_err(|_| std::io::Error::other(FAILURE))?;
+        let err = observe!(trace.utf8, StderrUtf8, String::from_utf8(err)).map_err(|_| std::io::Error::other(FAILURE))?;
         Ok::<_, std::io::Error>(RunResult {
             code: Some(0),
             out: out.strip_prefix('\u{feff}').unwrap_or(&out).to_owned(),
             err: err.strip_prefix('\u{feff}').unwrap_or(&err).to_owned(),
         })
     };
-    match tokio::time::timeout_at(deadline, exchange).await {
-        Ok(Ok(result)) if tokio::time::Instant::now() <= deadline => return result,
-        Ok(Ok(_)) => {
-            #[cfg(test)]
-            trace("completed_after_deadline", None);
-        }
-        Ok(Err(_error)) => {
-            #[cfg(test)]
-            trace("exchange_error", Some(&_error));
-        }
-        Err(_) => {
-            #[cfg(test)]
-            trace("deadline", None);
-        }
+    if let Ok(Ok(result)) = observe!(trace.exchange, TimeoutAt, tokio::time::timeout_at(deadline, exchange).await)
+        && observe!(trace.deadline, AfterDeadline, tokio::time::Instant::now() <= deadline)
+    {
+        return result;
     }
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+    #[cfg(test)]
+    trace.record(diagnostic::Stage::CleanupStart, diagnostic::Outcome::Ok);
+    let _ = observe!(trace.io, Kill, child.start_kill());
+    let _ = observe!(trace.reap, Reap, tokio::time::timeout(Duration::from_secs(1), child.wait()).await);
+    #[cfg(test)]
+    trace.report();
     failure()
 }
 
 fn failure() -> RunResult {
     RunResult { code: None, out: String::new(), err: FAILURE.into() }
+}
+
+#[cfg(test)]
+mod diagnostic {
+    use std::io;
+    use std::pin::Pin;
+    use std::process::ExitStatus;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll};
+    use std::time::Instant;
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Stage {
+        Spawn,
+        StdinWrite,
+        StdinShutdown,
+        Stdout,
+        Stderr,
+        Wait,
+        Exit,
+        StdoutUtf8,
+        StderrUtf8,
+        TimeoutAt,
+        AfterDeadline,
+        CleanupStart,
+        Kill,
+        Reap,
+    }
+
+    const STAGES: [Stage; 14] = [
+        Stage::Spawn,
+        Stage::StdinWrite,
+        Stage::StdinShutdown,
+        Stage::Stdout,
+        Stage::Stderr,
+        Stage::Wait,
+        Stage::Exit,
+        Stage::StdoutUtf8,
+        Stage::StderrUtf8,
+        Stage::TimeoutAt,
+        Stage::AfterDeadline,
+        Stage::CleanupStart,
+        Stage::Kill,
+        Stage::Reap,
+    ];
+
+    // No error Display, command, environment, input or output content is retained.
+    #[derive(Clone, Copy)]
+    pub(super) enum Outcome {
+        Ok,
+        Io(io::ErrorKind, Option<i32>),
+        Exit(Option<i32>, bool),
+        Limit,
+        Nonzero,
+        Utf8,
+        Timeout,
+        Late,
+    }
+
+    impl std::fmt::Debug for Outcome {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Ok => f.write_str("Ok"),
+                Self::Io(kind, raw) => f.debug_tuple("Io").field(kind).field(raw).finish(),
+                Self::Exit(code, success) => f.debug_tuple("Exit").field(code).field(success).finish(),
+                Self::Limit => f.write_str("Limit"),
+                Self::Nonzero => f.write_str("Nonzero"),
+                Self::Utf8 => f.write_str("Utf8"),
+                Self::Timeout => f.write_str("Timeout"),
+                Self::Late => f.write_str("Late"),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct State {
+        exchange_start_us: Option<u128>,
+        phases: [Option<(u128, Outcome)>; 14],
+        bytes: [usize; 2],
+        eof_us: [Option<u128>; 2],
+        first_failure: Option<(Stage, Outcome)>,
+    }
+
+    pub(super) struct Trace {
+        start: Instant,
+        state: Mutex<State>,
+    }
+
+    impl Trace {
+        pub(super) fn new() -> Self {
+            Self {
+                start: Instant::now(),
+                state: Mutex::new(State { exchange_start_us: None, phases: [None; 14], bytes: [0; 2], eof_us: [None; 2], first_failure: None }),
+            }
+        }
+
+        pub(super) fn begin_exchange(&self) {
+            self.state.lock().unwrap().exchange_start_us = Some(self.start.elapsed().as_micros());
+        }
+
+        pub(super) fn record(&self, stage: Stage, outcome: Outcome) {
+            let mut state = self.state.lock().unwrap();
+            state.phases[stage as usize] = Some((self.start.elapsed().as_micros(), outcome));
+            if !matches!(outcome, Outcome::Ok | Outcome::Exit(_, true)) && state.first_failure.is_none() {
+                state.first_failure = Some((stage, outcome));
+            }
+        }
+
+        pub(super) fn io<T>(&self, stage: Stage, result: &io::Result<T>) {
+            self.record(
+                stage,
+                match result {
+                    Ok(_) => Outcome::Ok,
+                    Err(error) => Outcome::Io(error.kind(), error.raw_os_error()),
+                },
+            );
+        }
+
+        pub(super) fn wait(&self, stage: Stage, result: &io::Result<ExitStatus>) {
+            match result {
+                Ok(status) => self.record(stage, Outcome::Exit(status.code(), status.success())),
+                Err(_) => self.io(stage, result),
+            }
+        }
+
+        pub(super) fn utf8(&self, stage: Stage, result: &Result<String, std::string::FromUtf8Error>) {
+            self.record(stage, if result.is_ok() { Outcome::Ok } else { Outcome::Utf8 });
+        }
+
+        pub(super) fn exchange<T>(&self, stage: Stage, result: &Result<T, tokio::time::error::Elapsed>) {
+            if result.is_err() {
+                self.record(stage, Outcome::Timeout);
+            }
+        }
+
+        pub(super) fn deadline(&self, stage: Stage, within: &bool) {
+            if !within {
+                self.record(stage, Outcome::Late);
+            }
+        }
+
+        pub(super) fn reap(&self, stage: Stage, result: &Result<io::Result<ExitStatus>, tokio::time::error::Elapsed>) {
+            match result {
+                Ok(status) => self.wait(stage, status),
+                Err(_) => self.record(stage, Outcome::Timeout),
+            }
+        }
+
+        pub(super) fn reader<R>(&self, pipe: R, stage: Stage, limit: usize) -> Reader<'_, R> {
+            Reader { pipe, trace: self, stage, limit }
+        }
+
+        pub(super) fn report(&self) {
+            let state = self.state.lock().unwrap();
+            // A fixed-size summary, once per failed run. None means unobserved,
+            // including cancellation by try_join!, and is not a causal claim.
+            let phases = STAGES.map(|stage| (stage, state.phases[stage as usize]));
+            eprintln!(
+                "log_transport_phase_v1 elapsed_us={} exchange_start_us={:?} phases={:?} stdout_stderr_bytes={:?} stdout_stderr_eof_us={:?} first_failure={:?}",
+                self.start.elapsed().as_micros(),
+                state.exchange_start_us,
+                phases,
+                state.bytes,
+                state.eof_us,
+                state.first_failure
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn diagnostic_categories_distinguish_limit_io_timeout_and_late_success() {
+        let limit = Trace::new();
+        assert!(super::read_complete(limit.reader(tokio::io::repeat(0), Stage::Stdout, 3), 3).await.is_err());
+        {
+            let state = limit.state.lock().unwrap();
+            assert!(matches!(state.first_failure, Some((Stage::Stdout, Outcome::Limit))));
+            assert_eq!(state.bytes, [4, 0]);
+            assert_eq!(state.eof_us, [None, None]);
+        }
+
+        let io = Trace::new();
+        io.io::<()>(Stage::StdinWrite, &Err(io::Error::from_raw_os_error(5)));
+        io.record(Stage::TimeoutAt, Outcome::Timeout);
+        assert!(matches!(io.state.lock().unwrap().first_failure, Some((Stage::StdinWrite, Outcome::Io(_, Some(5))))));
+
+        let timeout = Trace::new();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(1), std::future::pending::<()>()).await;
+        timeout.exchange(Stage::TimeoutAt, &result);
+        assert!(matches!(timeout.state.lock().unwrap().first_failure, Some((Stage::TimeoutAt, Outcome::Timeout))));
+        assert!(timeout.state.lock().unwrap().phases[Stage::AfterDeadline as usize].is_none());
+
+        let late = Trace::new();
+        late.exchange(Stage::TimeoutAt, &Ok::<_, tokio::time::error::Elapsed>(Ok::<_, io::Error>(())));
+        late.deadline(Stage::AfterDeadline, &false);
+        assert!(matches!(late.state.lock().unwrap().first_failure, Some((Stage::AfterDeadline, Outcome::Late))));
+        assert!(late.state.lock().unwrap().phases[Stage::TimeoutAt as usize].is_none());
+    }
+
+    pub(super) struct Reader<'a, R> {
+        pipe: R,
+        trace: &'a Trace,
+        stage: Stage,
+        limit: usize,
+    }
+
+    impl<R: AsyncRead + Unpin> AsyncRead for Reader<'_, R> {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let before = buf.filled().len();
+            let capacity = buf.remaining();
+            let result = Pin::new(&mut self.pipe).poll_read(cx, buf);
+            match &result {
+                Poll::Ready(Ok(())) => {
+                    let read = buf.filled().len() - before;
+                    let index = usize::from(matches!(self.stage, Stage::Stderr));
+                    let mut state = self.trace.state.lock().unwrap();
+                    state.bytes[index] += read;
+                    if read == 0 && capacity != 0 {
+                        state.eof_us[index] = Some(self.trace.start.elapsed().as_micros());
+                    }
+                    let limited = state.bytes[index] > self.limit;
+                    drop(state);
+                    if limited {
+                        self.trace.record(self.stage, Outcome::Limit);
+                    } else if read == 0 && capacity != 0 {
+                        self.trace.record(self.stage, Outcome::Ok);
+                    }
+                }
+                Poll::Ready(Err(error)) => self.trace.record(self.stage, Outcome::Io(error.kind(), error.raw_os_error())),
+                Poll::Pending => {}
+            }
+            result
+        }
+    }
 }
 
 #[cfg(test)]

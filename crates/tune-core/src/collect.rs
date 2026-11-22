@@ -152,6 +152,8 @@ mod bounded;
 pub use bounded::{BoundedResult, ProcessIdentity, ProcessReceipt, ProcessStop};
 #[cfg(windows)]
 mod windows;
+#[cfg(any(windows, test))]
+mod windows_pid_list;
 #[cfg(windows)]
 mod windows_pin;
 #[cfg(windows)]
@@ -438,7 +440,7 @@ fn local_probe_path(bin: &std::path::Path) -> Result<PathBuf, &'static str> {
 }
 
 async fn probe_exchange_system(node: &Node, helper_sha256: &str, benchmark: bool, network: bool, observe_wsl: bool) -> RunResult {
-    if node.refusal().is_some() || !lower_hex(helper_sha256, 64) {
+    if node.refusal().is_some() || !crate::db::is_lower_hex(helper_sha256, 64) {
         return RunResult { code: Some(9), out: String::new(), err: "Windows probe request is invalid; collection refused".into() };
     }
     if node.local {
@@ -464,7 +466,7 @@ async fn probe_exchange_system(node: &Node, helper_sha256: &str, benchmark: bool
         u8::from(observe_wsl)
     );
     let mut command = command("ssh");
-    command.args(ssh_args(&node.alias, &remote));
+    command.args(node_ssh_args(node, &remote));
     probe_exchange_command(command, &[]).await
 }
 
@@ -555,7 +557,7 @@ async fn action_exchange_system(node: &Node, helper_sha256: &str, body: &[u8], t
     if let Some(err) = node.refusal() {
         return RunResult { code: Some(9), out: String::new(), err };
     }
-    if body.is_empty() || body.len() > 65_536 || helper_sha256.len() != 64 || !helper_sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if body.is_empty() || body.len() > 65_536 || !crate::db::is_lower_hex(helper_sha256, 64) {
         return RunResult { code: Some(9), out: String::new(), err: "KT2 action request is invalid; operation refused".into() };
     }
     if node.local {
@@ -577,12 +579,8 @@ async fn action_exchange_system(node: &Node, helper_sha256: &str, body: &[u8], t
     }
     let remote_command = format!(r#"exec "$HOME/.katala-tune/bin/tune.exe" windows-action-receiver-v2 --helper-sha256 {helper_sha256} --budget-ms 25000"#);
     let mut c = command("ssh");
-    c.args(ssh_args(&node.alias, &remote_command));
+    c.args(node_ssh_args(node, &remote_command));
     action_exchange_command(c, body, timeout).await
-}
-
-fn lower_hex(value: &str, size: usize) -> bool {
-    value.len() == size && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn canonical_usize(value: &str) -> Option<usize> {
@@ -719,7 +717,7 @@ async fn action_exchange_command(mut c: Command, body: &[u8], timeout: Duration)
             return action_exchange_failure(&mut child, &mut read_err, false, "KT2 READY unavailable; operation refused").await;
         }
     };
-    let Some(nonce) = ready.strip_prefix("KT2 READY ").filter(|v| lower_hex(v, 64)) else {
+    let Some(nonce) = ready.strip_prefix("KT2 READY ").filter(|v| crate::db::is_lower_hex(v, 64)) else {
         return action_exchange_failure(&mut child, &mut read_err, false, "KT2 READY invalid; operation refused").await;
     };
     let hash = crate::db::sha256_hex(body);
@@ -933,6 +931,51 @@ pub fn ssh_args(alias: &str, remote: &str) -> Vec<String> {
     a
 }
 
+/// 機体の台帳設定に合わせてリモートコマンドを包んだ ssh の引数
+pub fn node_ssh_args(node: &Node, remote: &str) -> Vec<String> {
+    ssh_args(&node.alias, &remote_command(node, remote))
+}
+
+/// Windows の OpenSSH の既定シェル（台帳の `ssh_shell`）。省略時は Git Bash とみなす
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteShell {
+    Bash,
+    PowerShell,
+    Cmd,
+}
+
+pub fn remote_shell(node: &Node) -> RemoteShell {
+    if !node.is_windows() {
+        return RemoteShell::Bash;
+    }
+    match node.get("ssh_shell").and_then(Value::as_str).map(str::to_ascii_lowercase).as_deref() {
+        Some("powershell") => RemoteShell::PowerShell,
+        Some("cmd") => RemoteShell::Cmd,
+        _ => RemoteShell::Bash,
+    }
+}
+
+const GIT_BASH: &str = r"C:\Program Files\Git\bin\bash.exe";
+
+/// 送るコマンドは Git Bash の構文で書いている。既定シェルが PowerShell / cmd の Windows 機では、
+/// 本文を base64 にして Git Bash へ渡す。標準入出力はバイト列のまま子へ継承させる（PowerShell の
+/// パイプラインを通すと出力が文字列に変換されるので、Start-Process -NoNewWindow で継承させる）。
+/// どのシェルでも同じ意味になる文字だけのコマンド（`powershell.exe … -EncodedCommand …` など）は包まない
+pub fn remote_command(node: &Node, remote: &str) -> String {
+    let shell = remote_shell(node);
+    if shell == RemoteShell::Bash || remote.bytes().all(|b| b.is_ascii_alphanumeric() || b" .-_=+/".contains(&b)) {
+        return remote.to_string();
+    }
+    let b64 = crate::logs::base64(remote.as_bytes());
+    match shell {
+        RemoteShell::PowerShell => format!(
+            "$p=Start-Process -FilePath '{GIT_BASH}' -ArgumentList '-c \"source <(echo {b64}|base64 -d)\"' -NoNewWindow -Wait -PassThru; exit $p.ExitCode"
+        ),
+        RemoteShell::Cmd => format!("\"{GIT_BASH}\" -c \"source <(echo {b64}|base64 -d)\""),
+        RemoteShell::Bash => unreachable!(),
+    }
+}
+
 /// 調査スクリプトへの印。benchmark = false（台帳の "benchmark": false）でベンチマークを省き、
 /// network = false（台帳の "network": false）でネットワークとセキュリティ（netsec）を集めない（lib/collect.js と同じ）
 fn mac_probe_flags(benchmark: bool, network: bool) -> Vec<String> {
@@ -987,7 +1030,7 @@ pub async fn probe_node_with(runner: &dyn Runner, node: &Node) -> Value {
         if node.local {
             runner.run("/usr/bin/env", &mac_probe_args(benchmark, network), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
         } else {
-            runner.run("ssh", &ssh_args(&node.alias, &mac_ssh_command(benchmark, network)), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
+            runner.run("ssh", &node_ssh_args(node, &mac_ssh_command(benchmark, network)), Some(MAC_PROBE.as_bytes()), Duration::from_secs(90)).await
         }
     } else {
         match crate::actions::action_helper(node) {
@@ -1000,7 +1043,8 @@ pub async fn probe_node_with(runner: &dyn Runner, node: &Node) -> Value {
         Some((m, b)) => (m, Some(b)),
         None => (res.out.as_str(), None),
     };
-    let Some(mut data) = last_json_line(main) else {
+    let Some(mut data) = (res.code == Some(0)).then(|| last_json_line(main)).flatten().filter(|data| data.as_object().is_some_and(|object| !object.is_empty()))
+    else {
         let e = if !res.err.is_empty() {
             res.err.clone()
         } else if !res.out.is_empty() {
@@ -1079,7 +1123,7 @@ pub async fn exec_on_with(runner: &dyn Runner, node: &Node, script: &str, timeou
     if let Some(err) = node.refusal() {
         return RunResult { code: None, out: String::new(), err };
     }
-    if node.local { runner.local_script(script, timeout).await } else { runner.run("ssh", &ssh_args(&node.alias, script), None, timeout).await }
+    if node.local { runner.local_script(script, timeout).await } else { runner.run("ssh", &node_ssh_args(node, script), None, timeout).await }
 }
 
 /// `exec_on_with` の stdin 付き版。ローカル action が本文を黙って落とすことは許可しない。
@@ -1090,7 +1134,7 @@ pub async fn exec_on_with_input(runner: &dyn Runner, node: &Node, script: &str, 
     if node.local {
         return RunResult { code: None, out: String::new(), err: "ローカル action に stdin を渡す経路は未対応のため実行しない".into() };
     }
-    runner.run("ssh", &ssh_args(&node.alias, script), Some(input), timeout).await
+    runner.run("ssh", &node_ssh_args(node, script), Some(input), timeout).await
 }
 
 #[cfg(test)]
@@ -1188,6 +1232,22 @@ mod tests {
     #[derive(Default)]
     struct CaptureRunner {
         calls: Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_failed_commands_with_json_and_empty_snapshots() {
+        struct FixtureRunner(Option<i32>, &'static str);
+        impl Runner for FixtureRunner {
+            fn run<'a>(&'a self, _cmd: &'a str, _args: &'a [String], _input: Option<&'a [u8]>, _timeout: Duration) -> RunFuture<'a> {
+                Box::pin(async move { RunResult { code: self.0, out: self.1.into(), err: "fixture collection failure".into() } })
+            }
+        }
+        let node = Node::from_value(&json!({"id":"dev","os":"macos","network":false,"benchmark":false}), "test-host");
+        for (code, text) in [(Some(255), r#"{"probe":"macos"}"#), (None, r#"{"probe":"macos"}"#), (Some(0), "{}")] {
+            let result = probe_node_with(&FixtureRunner(code, text), &node).await;
+            assert_eq!(result["ok"], false, "code={code:?}, text={text}");
+            assert!(result.get("data").is_none());
+        }
     }
 
     impl Runner for CaptureRunner {
@@ -1691,5 +1751,46 @@ sys.stderr.write('z');sys.stderr.flush();time.sleep(3)"#,
         })
         .await;
         assert!(reaped.is_ok(), "owned timeout fixture root {pid} was not reaped");
+    }
+
+    fn shell_node(os: &str, shell: Option<&str>) -> Node {
+        let mut v = json!({"id": "n", "alias": "n", "os": os});
+        if let Some(shell) = shell {
+            v["ssh_shell"] = json!(shell);
+        }
+        Node::from_value(&v, "other-host")
+    }
+
+    #[test]
+    fn remote_command_keeps_bash_nodes_unchanged() {
+        let script = "mkdir -p ~/.katala-tune && cat > x";
+        for node in [shell_node("windows", None), shell_node("windows", Some("bash")), shell_node("macos", Some("powershell"))] {
+            assert_eq!(remote_command(&node, script), script);
+            assert_eq!(node_ssh_args(&node, script).last().unwrap(), script);
+        }
+    }
+
+    #[test]
+    fn remote_command_routes_powershell_and_cmd_through_git_bash() {
+        let script = "if [ -x ~/a.exe ]; then exec ~/a.exe \"$HOME\"; fi";
+        let b64 = crate::logs::base64(script.as_bytes());
+        let ps = remote_command(&shell_node("windows", Some("PowerShell")), script);
+        assert_eq!(
+            ps,
+            format!(
+                r#"$p=Start-Process -FilePath 'C:\Program Files\Git\bin\bash.exe' -ArgumentList '-c "source <(echo {b64}|base64 -d)"' -NoNewWindow -Wait -PassThru; exit $p.ExitCode"#
+            )
+        );
+        let cmd = remote_command(&shell_node("windows", Some("cmd")), script);
+        assert_eq!(cmd, format!(r#""C:\Program Files\Git\bin\bash.exe" -c "source <(echo {b64}|base64 -d)""#));
+        // base64 は 3 つのシェルで特別な意味を持たない文字だけ
+        assert!(b64.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b)));
+    }
+
+    #[test]
+    fn remote_command_passes_shell_neutral_commands_through() {
+        let neutral = "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand QQBCAA==";
+        assert_eq!(remote_command(&shell_node("windows", Some("cmd")), neutral), neutral);
+        assert_eq!(remote_command(&shell_node("windows", Some("powershell")), neutral), neutral);
     }
 }

@@ -1,8 +1,9 @@
 //! アプリに同梱した道具（`tune` CLI・Windows の `tune-agent` サンプラー）を、アプリと同じ版に保つ。
 //!
-//! - この機体: 起動のたびに、アプリの隣にある道具を `~/.katala-tune/bin` へ写す（中身が違うときだけ）。
+//! - 既存 Tauri 版のこの機体: 起動のたびに、アプリの隣にある道具を `~/.katala-tune/bin` へ写す（中身が違うときだけ）。
 //!   Windows の既存 tune.exe は承認済みハッシュを保つため自動で上書きせず、artifact と台帳を明示的に更新する。
 //!   ローカルのサンプラーはアプリと同じ版に保ち、Windows CLI の版は承認した更新に従う
+//! - GPUI: 解決済みの `data/bin` を使い、起動時に道具を自動配置しない。
 //! - ほかの機体: ハブ（常時監視）が、サンプラーの hello に入った版が古い・無い機体へ、同梱のサンプラーを
 //!   SSH の標準入力で送り、SHA-256 を確かめてから入れ替える（`~/.katala-tune/bin` だけ。probe.ps1 を置くのと同じ場所）。
 //!   同梱物はハブと同じ OS の物なので、送るのはハブと同じ OS の機体だけ（Windows のハブから Mac へは送らない）。
@@ -11,6 +12,7 @@
 //! 動いているサンプラーがあっても置き換えられるよう、古い物は名前を変えて退け、使われていない古い物は消す。
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -20,6 +22,8 @@ use crate::db::{now_ms, sha256_hex};
 use crate::nodes::Node;
 
 mod binary;
+pub mod native_install;
+pub mod remote_update;
 
 /// この版（アプリ・CLI・サンプラーはワークスペースで同じ版）
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -33,13 +37,36 @@ pub fn bundled_agent() -> Option<Vec<u8>> {
     std::fs::read(std::env::current_exe().ok()?.parent()?.join(exe("tune-agent"))).ok()
 }
 
-/// 同梱道具の保存先。検証用に `KATALA_TUNE_DATA_DIR` を明示したときは
-/// その隔離 data directory 配下へ置き、通常運用は従来の `~/.katala-tune/bin` を使う。
+static PROCESS_BIN_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Bind helper discovery once at application entry, before Engine or producers.
+/// The caller resolves the data path; this creates no files and changes no env.
+/// Engine::open deliberately does not bind: legacy callers retain their policy.
+pub fn bind_process_data_dir(data: &Path) -> Result<(), String> {
+    if !data.is_absolute() || data.components().any(|part| matches!(part, std::path::Component::CurDir | std::path::Component::ParentDir)) {
+        return Err("helper data directory must be resolved and absolute".into());
+    }
+    let bin = data.join("bin");
+    if PROCESS_BIN_DIR.get_or_init(|| bin.clone()) != &bin {
+        return Err("helper directory is already bound to a different data directory".into());
+    }
+    Ok(())
+}
+
+/// A bound host must not discover helpers beside its executable or in HOME.
+pub fn bound_bin_dir() -> Option<&'static Path> {
+    PROCESS_BIN_DIR.get().map(PathBuf::as_path)
+}
+
+/// 未束縛の CLI/Tauri は環境変数、無指定なら従来の HOME を使う。
 fn bin_dir_for(data_dir: Option<&Path>) -> PathBuf {
     data_dir.map(|path| path.join("bin")).unwrap_or_else(|| crate::nodes::home().join(".katala-tune").join("bin"))
 }
 
 pub fn bin_dir() -> PathBuf {
+    if let Some(bin) = bound_bin_dir() {
+        return bin.to_path_buf();
+    }
     let isolated = std::env::var_os("KATALA_TUNE_DATA_DIR").filter(|value| !value.is_empty()).map(PathBuf::from);
     bin_dir_for(isolated.as_deref())
 }
@@ -172,7 +199,7 @@ async fn push_agent_with(node: &Node, bytes: &[u8], runner: &dyn collect::Runner
          && {mode}{{ [ ! -e {name} ] || mv -f {name} {name}.old-{stamp}; }} && mv -f {name}.new {name} \
          && {{ rm -f {name}.old-* 2>/dev/null; true; }} && echo pushed-{hash}"
     );
-    let r = runner.run("ssh", &collect::ssh_args(&node.alias, &remote), Some(bytes), Duration::from_secs(120)).await;
+    let r = runner.run("ssh", &collect::node_ssh_args(node, &remote), Some(bytes), Duration::from_secs(120)).await;
     if r.out.contains(&format!("pushed-{hash}")) {
         Ok(hash)
     } else {

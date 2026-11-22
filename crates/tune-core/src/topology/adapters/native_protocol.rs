@@ -5,6 +5,7 @@ use super::{
     windows_reader::{self as reader, ReaderError, ReaderRequest},
 };
 use crate::collect::{ProcessIdentity, ProcessReceipt, ProcessStop};
+use crate::db::is_lower_hex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::{self, Cursor, Write};
@@ -28,9 +29,6 @@ pub fn source_backend_sha256() -> String {
     }
     hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
 }
-fn hex(value: &str, length: usize) -> bool {
-    value.len() == length && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
 fn identity_ok(identity: &ProcessIdentity) -> bool {
     identity.pid != 0 && identity.created_filetime.parse::<u64>().is_ok_and(|n| n != 0 && n.to_string() == identity.created_filetime)
 }
@@ -51,7 +49,7 @@ impl Write for SizeLimit {
 pub(crate) fn validate_native(request: &ReaderRequest) -> Result<(), ReaderError> {
     if request.schema != REQUEST_SCHEMA
         || request.probe_sha256 != source_backend_sha256()
-        || !request.git_artifact_sha256.as_deref().is_some_and(|digest| hex(digest, 64))
+        || !request.git_artifact_sha256.as_deref().is_some_and(|digest| is_lower_hex(digest, 64))
         || request.cursor.is_some()
         || !request.configs.is_empty()
         || request.source_allowlist.len().checked_mul(5).is_none_or(|n| n > super::native_reader::MAX_GIT_CHILDREN)
@@ -105,7 +103,7 @@ fn parts<'a>(bytes: &'a [u8], magic: &[u8; 8], header_max: usize, payload_max: u
 /// Canonical derivation v1: only nonce and budget change, with one serde DTO.
 pub fn derive_inner(original: &ReaderRequest, nonce: String, budget_ms: u64) -> Result<(ReaderRequest, Vec<u8>), ReaderError> {
     original.validate()?;
-    if original.schema != REQUEST_SCHEMA || nonce == original.nonce || !hex(&nonce, 32) || budget_ms == 0 || budget_ms > original.budget_ms {
+    if original.schema != REQUEST_SCHEMA || nonce == original.nonce || !is_lower_hex(&nonce, 32) || budget_ms == 0 || budget_ms > original.budget_ms {
         return Err(ReaderError);
     }
     let mut inner = original.clone();
@@ -196,7 +194,7 @@ fn receipt_ok(receipt: &ProcessReceipt, original: &ReaderRequest, inner: &Reader
         && receipt.stop == ProcessStop::Completed
         && receipt.root_exit_code == Some(0)
         && receipt.cleanup_confirmed()
-        && hex(&receipt.owner_session, 32)
+        && is_lower_hex(&receipt.owner_session, 32)
         && receipt.owner_session != original.nonce
         && receipt.owner_session != inner.nonce
 }
@@ -215,7 +213,7 @@ pub fn encode_outer_response(
     expected_artifact: &str,
 ) -> Result<Vec<u8>, ReaderError> {
     exact_body(original, body)?;
-    if !hex(expected_artifact, 64) || derived.len() > reader::MAX_REQUEST_BYTES + PREFIX || response.len() > inner_frame_max(original)? {
+    if !is_lower_hex(expected_artifact, 64) || derived.len() > reader::MAX_REQUEST_BYTES + PREFIX || response.len() > inner_frame_max(original)? {
         return Err(ReaderError);
     }
     let mut cursor = Cursor::new(derived);
@@ -259,7 +257,7 @@ pub fn decode_outer_response<'a>(
     expected_outer_identity: &ProcessIdentity,
 ) -> Result<&'a [u8], ReaderError> {
     exact_body(original, body)?;
-    if !hex(expected_artifact, 64) || !identity_ok(expected_outer_identity) {
+    if !is_lower_hex(expected_artifact, 64) || !identity_ok(expected_outer_identity) {
         return Err(ReaderError);
     }
     let (header, response) = parts(frame, OUTER_MAGIC, reader::MAX_RESPONSE_HEADER_BYTES, inner_frame_max(original)?)?;
