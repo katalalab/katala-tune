@@ -98,6 +98,9 @@ jobs:
           else
             cargo test --workspace --locked --no-fail-fast
           fi
+      - name: Tauri アプリのリンクを検証
+        if: runner.os != 'Linux'
+        run: cargo build --package katala-tune --locked
       # Separate diagnostic attempt: it cannot classify a prior non-reproduced failure.
       - name: Windows native diagnostic fixture
         if: ${{ !cancelled() && runner.os == 'Windows' && (steps.workspace_test.outcome == 'success' || steps.workspace_test.outcome == 'failure') }}
@@ -124,9 +127,6 @@ jobs:
           run_case fixture cargo test -p tune-cli --test topology_native --locked native_windows::native_three_entries_use_real_git_and_process_one_frame_without_eof -- --exact --nocapture || result=1
           run_case unicode cargo test -p tune-cli --test topology_native --locked native_windows::native_verify_preserves_real_unicode_linked_worktree_and_git_metadata -- --exact --nocapture || result=1
           exit "$result"
-      - name: Tauri アプリのリンクを検証
-        if: runner.os != 'Linux'
-        run: cargo build --package katala-tune --locked
       - name: Windows CLI artifact build
         if: runner.os == 'Windows'
         timeout-minutes: 20
