@@ -175,6 +175,11 @@ jobs:
           cat dist/latest.json
       - name: 配布物と更新 feed の対応・SHA256 を検証
         run: node scripts/verify-release.js dist "${TAG#v}" "$REPO"
+      - name: 単体 CPU 比較 CLI を配布物と SHA256SUMS に追加
+        working-directory: dist
+        run: |
+          cp ../scripts/cpu-reference.js cpu-reference.js
+          sha256sum cpu-reference.js >> SHA256SUMS
       - name: 公開する（通常の版は latest＝自動更新の対象、「-」つきは prerelease）
         shell: bash
         env:
