@@ -1,14 +1,16 @@
 //! Local operator-invoked wrapper. No GUI command execution or remote shells.
 mod options;
+mod receipt;
 mod volume;
 
 use options::Options;
+use receipt::ReportClaim;
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
-    fs::{self, File},
+    fs,
     hash::{DefaultHasher, Hash, Hasher},
-    io::{self, Write},
+    io,
     path::Path,
     process::{Command, ExitCode},
     sync::mpsc,
@@ -105,16 +107,8 @@ impl Observations {
     }
 }
 
-fn save(file: &mut File, report: &Value) -> io::Result<()> {
-    serde_json::to_writer(&mut *file, report)?;
-    file.write_all(b"\n")?;
-    file.sync_all()
-}
-
 fn run(o: Options<'_>) -> Result<ExitCode, String> {
     let device = volume::identity(&o.target).ok();
-    // The report is claimed before spawning the command. Losing a create_new race never runs a job.
-    let mut placeholder = File::options().create_new(true).write(true).open(&o.report).map_err(|e| format!("cannot create a new report ({})", e.kind()))?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| "invalid system clock")?.as_millis() as u64;
     let mut report = json!({
         "schema_version":1,"kind":"job-storage","job_id":o.job,"volume":label(device),"interval_ms":o.interval,
@@ -122,8 +116,7 @@ fn run(o: Options<'_>) -> Result<ExitCode, String> {
         "peak_bytes":null,"net_bytes":null,"unattributed_net_bytes":null,"residual_bytes":null,
         "categories":[],"preflight":{"os_reserve_bytes":o.os,"other_reserved_bytes":o.other,"expected_peak_bytes":o.expected,"free_bytes":null}
     });
-    save(&mut placeholder, &report).map_err(|e| format!("cannot reserve report ({})", e.kind()))?;
-    drop(placeholder);
+    let claim = ReportClaim::acquire(&o.report, &report).map_err(|e| format!("cannot reserve report ({e})"))?;
     let category_sizes = || {
         o.categories
             .values()
@@ -150,13 +143,12 @@ fn run(o: Options<'_>) -> Result<ExitCode, String> {
     report["started_at_ms"] = json!(SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| "invalid system clock")?.as_millis() as u64);
     let mut obs = Observations::default();
     obs.add(0, initial, false);
-    let admission = match (initial, allowance) {
-        _ if volume::guest_only() => Some("guest_capacity_only"),
+    let admission = volume::environment_hold().or_else(|| match (initial, allowance) {
         _ if o.categories.values().any(|d| !same_volume(d, device)) => Some("unavailable_space"),
         (None, _) | (_, None) => Some("unavailable_space"),
         (_, Some(n)) if n < o.required => Some("insufficient_space"),
         _ => None,
-    };
+    });
     let mut ran = false;
     let (status, reason, code) = if let Some(reason) = admission {
         ("blocked", Some(reason), None)
@@ -200,9 +192,7 @@ fn run(o: Options<'_>) -> Result<ExitCode, String> {
     report["categories"] = Value::Array(
         o.categories.keys().zip(after).zip(before).map(|((kind, end), start)| json!({"kind":kind,"logical_delta_bytes":difference(end,start)})).collect(),
     );
-    let mut temp = tempfile::NamedTempFile::new_in(o.report.parent().expect("normalized report path")).map_err(|e| e.to_string())?;
-    save(temp.as_file_mut(), &report).map_err(|e| e.to_string())?;
-    temp.persist(&o.report).map_err(|e| format!("cannot finalize report ({})", e.error.kind()))?;
+    claim.publish(&o.report, &report).map_err(|e| format!("cannot finalize report ({e})"))?;
     if let Some(reason) = reason {
         eprintln!("storage-run: {reason}");
     }

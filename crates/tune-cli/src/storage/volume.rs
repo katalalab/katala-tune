@@ -61,14 +61,50 @@ pub(super) fn admission(path: &Path) -> Option<u64> {
     result.status.success().then(|| std::str::from_utf8(&result.stdout).ok()?.trim().parse().ok()).flatten()
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn classify_linux(release: Option<&str>, wsl_hint: bool) -> Option<&'static str> {
+    let release = release.map(str::trim).filter(|s| !s.is_empty());
+    if wsl_hint
+        || release.is_some_and(|r| {
+            let kernel = r.to_ascii_lowercase();
+            kernel.contains("microsoft") || kernel.contains("wsl")
+        })
+    {
+        Some("guest_capacity_only")
+    } else if release.is_none() {
+        Some("environment_unknown")
+    } else {
+        None
+    }
+}
+
 #[cfg(target_os = "linux")]
-pub(super) fn guest_only() -> bool {
-    std::fs::read_to_string("/proc/sys/kernel/osrelease").is_ok_and(|r| r.to_ascii_lowercase().contains("microsoft"))
+pub(super) fn environment_hold() -> Option<&'static str> {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok();
+    let hint = ["WSL_DISTRO_NAME", "WSL_INTEROP"].iter().any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty()))
+        || Path::new("/run/WSL").is_dir()
+        || Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists();
+    classify_linux(release.as_deref(), hint)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(super) fn guest_only() -> bool {
-    false
+pub(super) fn environment_hold() -> Option<&'static str> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_linux;
+
+    #[test]
+    fn wsl_and_unidentified_environments_hold_admission() {
+        assert_eq!(classify_linux(Some("6.1-standard-Microsoft"), false), Some("guest_capacity_only"));
+        assert_eq!(classify_linux(Some("6.8-custom"), true), Some("guest_capacity_only"));
+        assert_eq!(classify_linux(None, true), Some("guest_capacity_only"));
+        assert_eq!(classify_linux(None, false), Some("environment_unknown"));
+        assert_eq!(classify_linux(Some("\n"), false), Some("environment_unknown"));
+        assert_eq!(classify_linux(Some("6.8-generic"), false), None);
+    }
 }
 
 pub(super) fn link(meta: &std::fs::Metadata) -> bool {
