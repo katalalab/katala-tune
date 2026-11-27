@@ -59,11 +59,26 @@ test('blocked and compacted reports preserve status and missing counts', async (
   assert.match(v.html, /9 回（欠測 2 回、保存 3 点）/);
 });
 
+test('guest-only and failed-to-spawn jobs show the initial sample only', async () => {
+  const v = open();
+  const before = { ...cold, samples: [cold.samples[0]], peak_bytes: null, net_bytes: null };
+  await v.select(file({ ...before, status: 'blocked', reason: 'guest_capacity_only' }),
+    file({ ...before, status: 'failed', reason: 'spawn_error' }));
+  const row = name => v.html.match(new RegExp(name + '</th>(.*?)</tr>'))[1];
+  assert.match(v.html, /Windows側で仮想ディスクのあるドライブを指定/);
+  assert.match(v.html, /ジョブを起動できず/);
+  assert.equal((row('開始時の空き').match(/8 KiB/g) || []).length, 2);
+  assert.equal((row('終了時の空き').match(/未取得/g) || []).length, 2);
+});
+
 test('rejects malformed, oversized and excess inputs; already selected reports survive', async () => {
   const v = open();
   const invalid = [
     { ...cold, samples: [{ elapsed_ms: 0, free_bytes: -1 }] },
     { ...cold, net_bytes: '0' }, { ...cold, net_bytes: 0 }, { ...cold, peak_bytes: 4 }, { ...cold, categories: [{ kind: '__proto__', logical_delta_bytes: 1 }] },
+    { ...cold, preflight: { ...cold.preflight, os_reserve_bytes: Number.MAX_SAFE_INTEGER + 1 } },
+    { ...cold, preflight: { ...cold.preflight, free_bytes: Number.MAX_SAFE_INTEGER + 1 } },
+    { ...cold, unattributed_net_bytes: Number.MAX_SAFE_INTEGER + 1 },
     { ...cold, sample_count: 1 }, { ...cold, status: ['failed'] }, { ...cold, schema_version: 2 },
   ];
   for (const data of invalid) {
