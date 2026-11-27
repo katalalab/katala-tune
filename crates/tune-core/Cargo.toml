@@ -13,7 +13,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
-hyper = { version = "=1.12.0", features = ["client", "http1"] }
+hyper = { version = "=1.13.0", features = ["client", "http1"] }
 hyper-util = { version = "=0.1.21", features = ["tokio"] }
 http-body-util = "=0.1.5"
 regex = "1"
