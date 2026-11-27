@@ -92,6 +92,17 @@ pub(super) fn environment_hold() -> Option<&'static str> {
     None
 }
 
+pub(super) fn link(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    meta.file_type().is_symlink()
+}
+
 #[cfg(test)]
 mod tests {
     use super::classify_linux;
@@ -105,15 +116,4 @@ mod tests {
         assert_eq!(classify_linux(Some("\n"), false), Some("environment_unknown"));
         assert_eq!(classify_linux(Some("6.8-generic"), false), None);
     }
-}
-
-pub(super) fn link(meta: &std::fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if meta.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return true;
-        }
-    }
-    meta.file_type().is_symlink()
 }
