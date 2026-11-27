@@ -17,6 +17,7 @@ tune-core.workspace = true
 tune-link.workspace = true
 zeroize = "1"
 tempfile = "3"
+same-file = "1"
 serde_json.workspace = true
 tokio.workspace = true
 
