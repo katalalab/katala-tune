@@ -7926,7 +7926,9 @@ dependencies = [
 name = "tune-cli"
 version = "0.7.0-rc.1"
 dependencies = [
+ "rustix 1.1.5",
  "serde_json",
+ "tempfile",
  "tokio",
  "tune-core",
  "tune-link",

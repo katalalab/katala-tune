@@ -10,6 +10,8 @@ Tauri版に[Mac / Windowsのスペック比較](docs/machine-specs.md)を追加�
 - 配布物の作成: `npm run package`。版・署名・更新の手順は [リリース手順](docs/release.md)（main で版を上げれば自動で公開され、動いているアプリが自動で更新する）
 - 端末から: `cargo run -p tune-cli -- --help`。従来の JS 検証用 CLI は `npm run probe` / `npm run logs`
 
+ジョブごとの出力ボリュームの空き・途中の最大消費と終了時の純増を測るには、[容量計測CLI](docs/job-storage.md)を使います。
+
 ## 初めて使うとき
 
 1. [Releases](https://github.com/katalalab/katala-tune/releases) から、Mac は `universal.dmg`、Windows x64 は `x64-setup.exe` を取得する
