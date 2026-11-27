@@ -5,9 +5,11 @@
   const MAX_REPORTS = 4;
   const labels = { original: '原本', artifact: '成果', intermediate: '中間ファイル', log: 'ログ' };
   const statuses = { completed: '正常終了', failed: '失敗', blocked: '開始保留' };
+  const bases = { important_usage: '重要用途に使える空き（macOS）', available_to_caller: '実行ユーザーが直接使える空き' };
   const reasons = {
     insufficient_space: '必要量に対して空き不足', unavailable_space: '開始時の空きを取得できず',
     guest_capacity_only: 'WSL内の空きのみ取得。Windows側で仮想ディスクのあるドライブを指定し、WSL内の空きも確認してください',
+    environment_unknown: '実行環境を識別できず、ホスト側の容量を確認できない',
     spawn_error: 'ジョブを起動できず', command_failed: 'コマンドが異常終了',
     incomplete: '終了未確認', wait_error: '終了状態を取得できず',
   };
@@ -23,12 +25,14 @@
   // 長いサンプル列や表示に使用しない拡張項目を画面の状態に保持しない。
   function summarize(r, name) {
     if (!r || r.schema_version !== 1 || r.kind !== 'job-storage') throw new Error('job-storage v1 のレポートを選んでください。');
-    if (!identifier(r.job_id) || !identifier(r.volume) || typeof r.status !== 'string' || !Object.hasOwn(statuses, r.status)
+    if (!identifier(r.job_id) || !identifier(r.volume) || typeof r.status !== 'string' || !Object.hasOwn(statuses, r.status) || !nullable(r.reason ?? null, identifier)
       || !natural(r.interval_ms) || !r.interval_ms || !Array.isArray(r.samples)
       || !nullable(r.peak_bytes, natural) || !nullable(r.net_bytes, Number.isSafeInteger)
-      || !nullable(r.residual_bytes, Number.isSafeInteger) || !nullable(r.unattributed_net_bytes ?? null, Number.isSafeInteger)
+      || r.residual_bytes !== null || (r.unattributed_net_bytes != null && r.unattributed_net_bytes !== r.net_bytes)
+      || !nullable(r.exit_code ?? null, Number.isSafeInteger)
       || !Array.isArray(r.categories)
       || !r.preflight || !nullable(r.preflight.free_bytes ?? null, natural)
+      || !nullable(r.preflight.basis ?? null, identifier)
       || !['os_reserve_bytes', 'other_reserved_bytes', 'expected_peak_bytes'].every(k => natural(r.preflight[k]))) {
       throw new Error('レポートの項目または数値を確認してください。');
     }
@@ -62,7 +66,11 @@
     // 間引きのある報告では保存列より小さい空きを観測している場合がある。
     const observedPeak = start == null ? null : Math.max(0, start - minimum);
     const neverRan = r.status === 'blocked' || r.reason === 'incomplete' || r.reason === 'spawn_error';
-    if ((neverRan && [r.net_bytes, r.peak_bytes, r.residual_bytes].some(n => n !== null))
+    if ((neverRan && (r.net_bytes !== null || r.peak_bytes !== null || r.exit_code != null || total > 1 || [...categories.values()].some(n => n !== null)))
+      || (!neverRan && r.samples.length < 2)
+      || (r.status === 'completed' && (r.reason != null || (r.exit_code ?? 0) !== 0))
+      || (r.reason === 'command_failed' && r.exit_code === 0)
+      || (r.samples.length && r.samples[0].elapsed_ms !== 0)
       || (r.net_bytes !== null && (start == null || end == null || r.net_bytes !== start - end))
       || (r.peak_bytes !== null && (observedPeak === null || r.peak_bytes > start || r.peak_bytes < observedPeak
         || (total === r.samples.length && r.peak_bytes !== observedPeak)))) {
@@ -71,14 +79,15 @@
 
     return {
       name, id: r.job_id, volume: r.volume, status: statuses[r.status],
-      reason: typeof r.reason === 'string' && Object.hasOwn(reasons, r.reason) ? reasons[r.reason] : '',
+      reason: r.reason == null ? '' : Object.hasOwn(reasons, r.reason) ? reasons[r.reason] : '不明な理由',
+      exit: r.exit_code ?? null, elapsed: !neverRan && r.samples.length >= 2 ? previous : null,
       started: natural(r.started_at_ms) && r.started_at_ms <= 8.64e15 ? new Date(r.started_at_ms).toLocaleString('ja-JP') : '未記録',
       interval: r.interval_ms, recorded: r.samples.length, total,
       gaps: r.missing_sample_count ?? (r.samples.length === total ? missing : null), retainedGaps: missing,
       start, end: !neverRan && r.samples.length >= 2 ? end : null,
-      peak: r.peak_bytes, net: r.net_bytes, residual: r.residual_bytes, categories,
-      unassigned: r.unattributed_net_bytes === r.net_bytes ? r.unattributed_net_bytes : null,
+      peak: r.peak_bytes, net: r.net_bytes, categories, unassigned: r.unattributed_net_bytes ?? null,
       available: natural(r.preflight.free_bytes) ? r.preflight.free_bytes : null,
+      basis: r.preflight.basis == null ? '未記録' : Object.hasOwn(bases, r.preflight.basis) ? bases[r.preflight.basis] : '不明な算出方法',
       osReserve: r.preflight.os_reserve_bytes, otherReserved: r.preflight.other_reserved_bytes, expected: r.preflight.expected_peak_bytes,
     };
   }
@@ -110,18 +119,20 @@
     const details = reports.length ? UI.section('ボリュームの変化', '観測時点の空き容量から算出')
       + comparison([
         ['ジョブID', r => r.id], ['結果', r => r.reason ? r.status + '（' + r.reason + '）' : r.status],
+        ['子プロセスの終了コード', r => r.exit ?? '未取得'],
+        ['最終観測までの経過時間', r => r.elapsed === null ? '未取得' : fmt.format(r.elapsed) + ' ms'],
         ['開始時刻', r => r.started], ['対象ボリューム', r => r.volume], ['観測間隔', r => r.interval + ' ms'],
         ['観測回数', observations], ['開始時の空き', r => bytes(r.start)], ['終了時の空き', r => bytes(r.end)],
         ['観測した最大消費量', r => bytes(r.peak)], ['終了時の純増', r => bytes(r.net)],
         ['分類先が未確定の実容量', r => bytes(r.unassigned, '未判定')],
-        ['物理量で照合した残差', r => bytes(r.residual, '未判定')],
+        ['物理量で照合した残差', () => '未判定'],
       ])
       + UI.section('分類別のファイル増減', '論理サイズ。共有ブロックや圧縮があるため、実占有の内訳は別途測定が必要です。')
       + comparison(Object.entries(labels).map(([kind, label]) => [label, r =>
         r.categories.has(kind) ? bytes(r.categories.get(kind)) : '記録なし']))
       + UI.section('開始時の容量判定')
       + comparison([
-        ['判定に使った空き', r => bytes(r.available)], ['OS用の余裕', r => bytes(r.osReserve)],
+        ['判定に使った空き', r => bytes(r.available)], ['空きの算出方法', r => r.basis], ['OS用の余裕', r => bytes(r.osReserve)],
         ['他ジョブの予約', r => bytes(r.otherReserved)], ['予想最大消費量', r => bytes(r.expected)],
       ]) : '';
 
