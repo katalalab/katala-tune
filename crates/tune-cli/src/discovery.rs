@@ -8,6 +8,7 @@ const WRITE_CONFIG: u16 = 4;
 const WRITE_DB: u16 = 8;
 const CONNECT: u16 = 16;
 const DEPLOY: u16 = 32;
+const LOCAL_JOB: u16 = 256;
 const LINK: u16 = 64;
 const WRITE_LINK: u16 = 128;
 // Engine::open may install example config, initialize/migrate DB and import legacy logs.
@@ -25,6 +26,26 @@ struct Command {
 // Argument strings are usage syntax: [] optional, <> required, ... repeatable.
 // Effects describe possibilities across options/platforms, not a permission grant.
 const COMMANDS: &[Command] = &[
+    Command {
+        name: "storage-run",
+        arguments: &[
+            "--job-id <label>",
+            "--target <dir>",
+            "--report <new.json>",
+            "--expected-peak-bytes <n>",
+            "--os-reserve-bytes <n>",
+            "--other-reserved-bytes <n>",
+            "[--interval-ms <ms>]",
+            "[--category <kind=relative-dir>]...",
+            "--",
+            "<program>",
+            "[args ...]",
+        ],
+        summary: "実行前に空きを確認し、指定ジョブによるボリューム変化を測定",
+        format: "none",
+        effects: LOCAL_JOB,
+        notes: "明示した外部コマンドを現在の作業フォルダで実行し、新規JSONレポートを作成。子プロセスの出力は端末へ。詳しくは docs/job-storage.md。",
+    },
     Command {
         name: "version",
         arguments: &["[--json]"],
@@ -388,12 +409,17 @@ const COMMANDS: &[Command] = &[
 ];
 
 fn effects(bits: u16) -> Value {
-    json!({
+    let mut effects = json!({
         "reads_config": bits & CONFIG != 0, "reads_db": bits & DB != 0,
         "writes_config": bits & WRITE_CONFIG != 0, "writes_db": bits & WRITE_DB != 0,
         "connects_to_nodes": bits & CONNECT != 0, "may_deploy_helper": bits & DEPLOY != 0,
         "reads_link_state": bits & LINK != 0, "writes_link_state": bits & WRITE_LINK != 0
-    })
+    });
+    if bits & LOCAL_JOB != 0 {
+        effects["runs_user_command"] = json!(true);
+        effects["writes_report"] = json!(true);
+    }
+    effects
 }
 
 fn catalog() -> Value {

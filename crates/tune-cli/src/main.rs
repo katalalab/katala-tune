@@ -54,6 +54,7 @@ mod agent;
 mod discovery;
 mod e2e;
 mod specs;
+mod storage;
 mod topology_native;
 mod topology_reader;
 mod windows_action;
@@ -368,6 +369,14 @@ async fn live(rest: &[String]) -> Result<(), String> {
 
 fn main() -> ExitCode {
     let started = std::time::Instant::now();
+    // Keep child command arguments in their native encoding.
+    let mut native = std::env::args_os().skip(1);
+    if native.next().as_deref() == Some(std::ffi::OsStr::new("storage-run")) {
+        let rest: Vec<_> = native.collect();
+        if !(rest.len() == 1 && (rest[0] == "--help" || rest[0] == "-h")) {
+            return storage::main(&rest);
+        }
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(code) = discovery::run(&args) {
         return code;
