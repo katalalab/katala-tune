@@ -7,6 +7,7 @@
   const statuses = { completed: '正常終了', failed: '失敗', blocked: '開始保留' };
   const reasons = {
     insufficient_space: '必要量に対して空き不足', unavailable_space: '開始時の空きを取得できず',
+    guest_capacity_only: 'WSL内の空きのみ取得。Windows側で仮想ディスクのあるドライブを指定し、WSL内の空きも確認してください',
     spawn_error: 'ジョブを起動できず', command_failed: 'コマンドが異常終了',
     incomplete: '終了未確認', wait_error: '終了状態を取得できず',
   };
@@ -25,8 +26,10 @@
     if (!identifier(r.job_id) || !identifier(r.volume) || typeof r.status !== 'string' || !Object.hasOwn(statuses, r.status)
       || !natural(r.interval_ms) || !r.interval_ms || !Array.isArray(r.samples)
       || !nullable(r.peak_bytes, natural) || !nullable(r.net_bytes, Number.isSafeInteger)
-      || !nullable(r.residual_bytes, Number.isSafeInteger) || !Array.isArray(r.categories)
-      || !r.preflight || !['os_reserve_bytes', 'other_reserved_bytes', 'expected_peak_bytes'].every(k => natural(r.preflight[k]))) {
+      || !nullable(r.residual_bytes, Number.isSafeInteger) || !nullable(r.unattributed_net_bytes ?? null, Number.isSafeInteger)
+      || !Array.isArray(r.categories)
+      || !r.preflight || !nullable(r.preflight.free_bytes ?? null, natural)
+      || !['os_reserve_bytes', 'other_reserved_bytes', 'expected_peak_bytes'].every(k => natural(r.preflight[k]))) {
       throw new Error('レポートの項目または数値を確認してください。');
     }
     let missing = 0;
@@ -58,7 +61,8 @@
     const end = r.samples.at(-1)?.free_bytes;
     // 間引きのある報告では保存列より小さい空きを観測している場合がある。
     const observedPeak = start == null ? null : Math.max(0, start - minimum);
-    if ((r.status === 'blocked' && [r.net_bytes, r.peak_bytes, r.residual_bytes].some(n => n !== null))
+    const neverRan = r.status === 'blocked' || r.reason === 'incomplete' || r.reason === 'spawn_error';
+    if ((neverRan && [r.net_bytes, r.peak_bytes, r.residual_bytes].some(n => n !== null))
       || (r.net_bytes !== null && (start == null || end == null || r.net_bytes !== start - end))
       || (r.peak_bytes !== null && (observedPeak === null || r.peak_bytes > start || r.peak_bytes < observedPeak
         || (total === r.samples.length && r.peak_bytes !== observedPeak)))) {
@@ -71,7 +75,7 @@
       started: natural(r.started_at_ms) && r.started_at_ms <= 8.64e15 ? new Date(r.started_at_ms).toLocaleString('ja-JP') : '未記録',
       interval: r.interval_ms, recorded: r.samples.length, total,
       gaps: r.missing_sample_count ?? (r.samples.length === total ? missing : null), retainedGaps: missing,
-      start, end: r.status !== 'blocked' && r.reason !== 'incomplete' ? end : null,
+      start, end: !neverRan && r.samples.length >= 2 ? end : null,
       peak: r.peak_bytes, net: r.net_bytes, residual: r.residual_bytes, categories,
       unassigned: r.unattributed_net_bytes === r.net_bytes ? r.unattributed_net_bytes : null,
       available: natural(r.preflight.free_bytes) ? r.preflight.free_bytes : null,
