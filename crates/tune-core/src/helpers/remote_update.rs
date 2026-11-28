@@ -448,6 +448,9 @@ impl RemoteUpdateControl {
 
 mod macos;
 mod observation;
+mod windows;
+#[cfg(test)]
+mod windows_tests;
 pub use macos::{InspectFailure, RemoteInspectError};
 pub use observation::RemoteDestinationObservation;
 mod protocol;

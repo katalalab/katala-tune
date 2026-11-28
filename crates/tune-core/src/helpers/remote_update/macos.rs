@@ -85,9 +85,14 @@ impl OwnedSshUpdateTransport {
     }
     pub async fn inspect(&self, engine: &Engine, request: &RemoteUpdateRequest) -> Result<RemoteDestinationObservation, RemoteInspectError> {
         if !self.is_native()
-            || !supported()
-            || request.target.node.os != "macos"
-            || request.target.architecture != RemoteArchitecture::Arm64
+            || if self.is_windows() {
+                !super::windows::supported()
+                    || request.target.node.os != "windows"
+                    || request.target.architecture != RemoteArchitecture::X64
+                    || request.prepared.build_target() != "x86_64-pc-windows-msvc"
+            } else {
+                !supported() || request.target.node.os != "macos" || request.target.architecture != RemoteArchitecture::Arm64
+            }
             || request.target.node.local
         {
             return Err(error(InspectFailure::Unsupported));
@@ -103,7 +108,7 @@ impl OwnedSshUpdateTransport {
         let context = observation::inspect_context(request, ttl);
         let payload = request.payload();
         let empty_hash = crate::db::sha256_hex(b"");
-        let mut image = Image::payload(&payload, context, GLUE);
+        let mut image = Image::payload(&payload, context, self.native_glue());
         image.mode = ExchangeMode::Inspect;
         image.bytes = b"";
         image.hash = &empty_hash;

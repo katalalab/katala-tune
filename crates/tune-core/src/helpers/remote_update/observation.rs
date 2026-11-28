@@ -8,11 +8,14 @@ use super::{
 pub struct RemoteDestinationObservation {
     binding: Binding,
     pub(super) context: SamplerHash,
-    pub(super) snapshot: MacSnapshot,
-    origin: NativeMac,
+    pub(super) snapshot: DestinationSnapshot,
+    origin: NativeOrigin,
 }
 #[derive(Debug)]
-struct NativeMac;
+enum NativeOrigin {
+    NativeMac,
+    NativeWindows,
+}
 #[derive(Debug, PartialEq, Eq)]
 struct Binding {
     node: Vec<u8>,
@@ -41,16 +44,27 @@ impl Binding {
     }
 }
 impl RemoteDestinationObservation {
-    pub(super) fn native(request: &RemoteUpdateRequest, context: SamplerHash, snapshot: MacSnapshot) -> Self {
-        Self { binding: Binding::new(request), context, snapshot, origin: NativeMac }
+    pub(super) fn native(request: &RemoteUpdateRequest, context: SamplerHash, snapshot: impl Into<DestinationSnapshot>) -> Self {
+        let snapshot = snapshot.into();
+        let origin = match snapshot {
+            DestinationSnapshot::Mac(_) => NativeOrigin::NativeMac,
+            DestinationSnapshot::Windows(_) => NativeOrigin::NativeWindows,
+        };
+        Self { binding: Binding::new(request), context, snapshot, origin }
     }
     pub(super) fn check(&self, request: &RemoteUpdateRequest, node: &Node) -> Result<(), Refusal> {
-        let NativeMac = self.origin;
         if Instant::now() >= self.binding.expires {
             return Err(Refusal::Expired);
         }
         if self.binding != Binding::new(request) || self.binding.node != node_bytes(node) {
             return Err(Refusal::InvalidRequest);
+        }
+        if !matches!(
+            (&self.origin, &self.snapshot, request.target.node.os.as_str(), request.target.architecture, request.prepared.build_target()),
+            (NativeOrigin::NativeMac, DestinationSnapshot::Mac(_), "macos", RemoteArchitecture::Arm64, "aarch64-apple-darwin")
+                | (NativeOrigin::NativeWindows, DestinationSnapshot::Windows(_), "windows", RemoteArchitecture::X64, "x86_64-pc-windows-msvc")
+        ) {
+            return Err(Refusal::Target);
         }
         Ok(())
     }
@@ -97,7 +111,7 @@ pub(super) fn inspect_context(request: &RemoteUpdateRequest, ttl: u64) -> Sample
     )
 }
 pub(super) fn place_context(observation: &RemoteDestinationObservation) -> SamplerHash {
-    digest(b"KTU2-place\0", &[observation.context.raw(), observation.snapshot.record.as_bytes()])
+    digest(b"KTU2-place\0", &[observation.context.raw(), observation.snapshot.record().as_bytes()])
 }
 #[derive(Debug)]
 pub(super) struct MacSnapshot {
@@ -161,6 +175,144 @@ impl MacSnapshot {
             }
             decimal::<i128>(mt)?;
             decimal::<i128>(ct)?;
+            BeforeImageFact::Present(SamplerHash::parse(hash)?)
+        };
+        Some(Self { record: record.into(), before })
+    }
+}
+
+/// Closed platform selection. Raw wire data stays private to native transport.
+#[derive(Debug)]
+pub(super) enum DestinationSnapshot {
+    Mac(MacSnapshot),
+    Windows(WindowsSnapshot),
+}
+impl From<MacSnapshot> for DestinationSnapshot {
+    fn from(s: MacSnapshot) -> Self {
+        Self::Mac(s)
+    }
+}
+impl DestinationSnapshot {
+    pub(super) fn record(&self) -> &str {
+        match self {
+            Self::Mac(s) => &s.record,
+            Self::Windows(s) => &s.record,
+        }
+    }
+    pub(super) fn before(&self) -> BeforeImageFact {
+        match self {
+            Self::Mac(s) => s.before,
+            Self::Windows(s) => s.before,
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn mac(self) -> MacSnapshot {
+        match self {
+            Self::Mac(s) => s,
+            Self::Windows(_) => panic!("Mac fixture received a Windows observation"),
+        }
+    }
+    pub(super) fn parse(target: &str, record: &str) -> Option<Self> {
+        match target {
+            "aarch64-apple-darwin" => MacSnapshot::parse(record).map(Self::Mac),
+            "x86_64-pc-windows-msvc" => WindowsSnapshot::parse(record).map(Self::Windows),
+            _ => None,
+        }
+    }
+}
+#[derive(Debug)]
+pub(super) struct WindowsSnapshot {
+    pub record: String,
+    pub before: BeforeImageFact,
+}
+pub(super) fn unhex(text: &str, min: usize, max: usize) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) || !(min..=max).contains(&(text.len() / 2)) || !text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return None;
+    }
+    text.as_bytes().as_chunks::<2>().0.iter().map(|b| u8::from_str_radix(std::str::from_utf8(b).ok()?, 16).ok()).collect()
+}
+pub(super) fn sid_valid(sid: &[u8]) -> bool {
+    (8..=68).contains(&sid.len()) && sid[0] == 1 && sid[1] <= 15 && sid.len() == 8 + 4 * sid[1] as usize
+}
+pub(super) fn profile_components(raw: &[u8]) -> Option<usize> {
+    if !raw.len().is_multiple_of(2) || !(2..=256).contains(&raw.len()) {
+        return None;
+    }
+    let units: Vec<_> = raw.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+    let profile = String::from_utf16(&units).ok()?;
+    let b = profile.as_bytes();
+    if b.len() < 4 || !b[0].is_ascii_uppercase() || &b[1..3] != b":\\" {
+        return None;
+    }
+    let components: Vec<_> = profile[3..].split('\\').collect();
+    for c in &components {
+        if c.is_empty()
+            || *c == "."
+            || *c == ".."
+            || c.ends_with(['.', ' '])
+            || c.encode_utf16().count() > 255
+            || c.chars().any(|c| c.is_control() || "/:<>\"|?*".contains(c))
+        {
+            return None;
+        }
+    }
+    Some(components.len())
+}
+impl WindowsSnapshot {
+    pub(super) fn parse(record: &str) -> Option<Self> {
+        if record.len() > 3072 || !record.is_ascii() {
+            return None;
+        }
+        let f: Vec<_> = record.split('|').collect();
+        let ["w1", sid, profile, bash, "windows", "x64", boot, tick, lease, parents, leaf] = f.as_slice() else {
+            return None;
+        };
+        if !sid_valid(&unhex(sid, 8, 68)?) {
+            return None;
+        }
+        let count = profile_components(&unhex(profile, 2, 256)?)?;
+        let bash = unhex(bash, 1, 256)?;
+        if std::str::from_utf8(&bash).ok()?.chars().any(char::is_control) {
+            return None;
+        }
+        if unhex(boot, 16, 16)?.iter().all(|b| *b == 0) {
+            return None;
+        }
+        let tick = decimal::<u64>(tick)?;
+        let lease = decimal::<u64>(lease)?;
+        if !(1..=120000).contains(&lease.checked_sub(tick)?) {
+            return None;
+        }
+        let ps: Vec<_> = parents.split(';').collect();
+        if ps.len() != count + 3 || ps.len() > 12 {
+            return None;
+        }
+        for p in ps {
+            let f: Vec<_> = p.split(',').collect();
+            let [volume, id, attrs, security] = f.as_slice() else {
+                return None;
+            };
+            decimal::<u64>(volume)?;
+            unhex(id, 16, 16)?;
+            decimal::<u32>(attrs)?;
+            SamplerHash::parse(security)?;
+        }
+        let before = if *leaf == "M" {
+            BeforeImageFact::Missing
+        } else {
+            let f: Vec<_> = leaf.split(',').collect();
+            let ["P", volume, id, size, attrs, write, change, "1", security, hash] = f.as_slice() else {
+                return None;
+            };
+            decimal::<u64>(volume)?;
+            unhex(id, 16, 16)?;
+            decimal::<u32>(attrs)?;
+            decimal::<i64>(write)?;
+            decimal::<i64>(change)?;
+            SamplerHash::parse(security)?;
+            if !(1..=super::protocol::SAMPLER_LIMIT as u64).contains(&decimal::<u64>(size)?) {
+                return None;
+            }
             BeforeImageFact::Present(SamplerHash::parse(hash)?)
         };
         Some(Self { record: record.into(), before })
