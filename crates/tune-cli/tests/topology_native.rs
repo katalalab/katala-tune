@@ -341,6 +341,52 @@ mod native_windows {
         assert!(!bytes.windows(b"unapproved dirty synthetic fixture".len()).any(|value| value == b"unapproved dirty synthetic fixture"));
     }
 
+    #[cfg(katala_ci_diagnostics)]
+    #[test]
+    fn ci_diagnostic_reports_supervisor_pin_rejection_without_output() {
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = Fixture::new(MANIFEST.to_vec());
+        let before = fixture.snapshot();
+        let request = fixture.request(30_000);
+        let (output, _, _) = run(&fixture, "topology-supervise", &request, false, &"0".repeat(64));
+        assert_eq!(output.status.code(), Some(84), "private pin-stage rejection code");
+        assert!(output.stdout.is_empty() && output.stderr.is_empty(), "failure must withhold output");
+        assert!(fixture.snapshot() == before, "fixture must remain unchanged");
+        fixture.assert_private_state_absent();
+    }
+
+    #[cfg(katala_ci_diagnostics)]
+    #[test]
+    fn ci_diagnostic_reports_nested_reader_pin_rejection_without_output() {
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = Fixture::new(MANIFEST.to_vec());
+        let before = fixture.snapshot();
+        let mut request = fixture.request(30_000);
+        request.git_artifact_sha256 = Some("0".repeat(64));
+        let (_, digest) = artifact();
+        let (output, _, _) = run(&fixture, "topology-supervise", &request, false, &digest);
+        assert_eq!(output.status.code(), Some(51), "nested reader pin-stage rejection code");
+        assert!(output.stdout.is_empty() && output.stderr.is_empty(), "failure must withhold output");
+        assert!(fixture.snapshot() == before, "fixture must remain unchanged");
+        fixture.assert_private_state_absent();
+    }
+
+    #[cfg(katala_ci_diagnostics)]
+    #[test]
+    fn ci_diagnostic_reports_verifier_nested_reader_pin_rejection_without_output() {
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fixture = Fixture::new(MANIFEST.to_vec());
+        let before = fixture.snapshot();
+        let mut request = fixture.request(30_000);
+        request.git_artifact_sha256 = Some("0".repeat(64));
+        let (_, digest) = artifact();
+        let (output, _, _) = run(&fixture, "topology-verify", &request, false, &digest);
+        assert_eq!(output.status.code(), Some(51), "verifier nested reader pin-stage rejection code");
+        assert!(output.stdout.is_empty() && output.stderr.is_empty(), "failure must withhold output");
+        assert!(fixture.snapshot() == before, "fixture must remain unchanged");
+        fixture.assert_private_state_absent();
+    }
+
     #[test]
     fn native_three_entries_use_real_git_and_process_one_frame_without_eof() {
         let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -531,6 +577,19 @@ mod native_windows {
         // Exercise the independent verifier once, without repeating all roles.
         let native_started = Instant::now();
         let (output, _retained, _) = run(&fixture, "topology-verify", &request, true, &digest);
+        #[cfg(katala_ci_diagnostics)]
+        assert!(
+            writeln!(
+                std::io::stderr().lock(),
+                "native_role=topology-verify elapsed_ms={} code={:?} stdout_len={} stderr_len={}",
+                native_started.elapsed().as_millis(),
+                output.status.code(),
+                output.stdout.len(),
+                output.stderr.len()
+            )
+            .is_ok(),
+            "sanitized native-role observation must be recorded"
+        );
         assert!(
             output.status.success(),
             "native Unicode/worktree verification must exit zero: code={:?} elapsed_ms={} stdout_len={} stderr_len={}",
