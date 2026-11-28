@@ -21,7 +21,7 @@ unicode-segmentation = "1.12"
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 gpui = { version = "0.2.2", default-features = false, features = ["font-kit", "windows-manifest"] }
 sha2 = "0.11"
-tray-icon = { version = "0.25.1", default-features = false }
+tray-icon = { version = "0.26.1", default-features = false }
 tune-link.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
