@@ -14,7 +14,6 @@ path = "src/main.rs"
 
 [dependencies]
 tune-link.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "signal"] }
 # OTLP/HTTP の受け口の要求の解析（hyper も使っている小さな解析器。依存なし）
