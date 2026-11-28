@@ -3713,7 +3713,7 @@ dependencies = [
 
 [[package]]
 name = "katala-tune"
-version = "0.7.0-rc.1"
+version = "0.7.0"
 dependencies = [
  "objc2-app-kit",
  "rfd",
@@ -7909,7 +7909,7 @@ dependencies = [
 
 [[package]]
 name = "tune-agent"
-version = "0.7.0-rc.1"
+version = "0.7.0"
 dependencies = [
  "gethostname",
  "httparse",
@@ -7924,7 +7924,7 @@ dependencies = [
 
 [[package]]
 name = "tune-cli"
-version = "0.7.0-rc.1"
+version = "0.7.0"
 dependencies = [
  "rustix 1.1.5",
  "same-file",
@@ -7939,7 +7939,7 @@ dependencies = [
 
 [[package]]
 name = "tune-core"
-version = "0.7.0-rc.1"
+version = "0.7.0"
 dependencies = [
  "dirs 7.0.0",
  "encoding_rs",
@@ -7987,7 +7987,7 @@ dependencies = [
 
 [[package]]
 name = "tune-link"
-version = "0.7.0-rc.1"
+version = "0.7.0"
 dependencies = [
  "curve25519-dalek 5.0.0",
  "ed25519-dalek",
