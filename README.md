@@ -103,6 +103,24 @@ macOS ではサイドバーが半透明（vibrancy）、Windows 11 では Mica�
 
 対象台帳（対象・除外・未観測とその理由）は、画面の「状態」の「対象台帳」と `tune ledger`（`--json` で JSON）で見られる。対象は `online` で最後の分析が成功した機体、未観測は `online` なのに観測できていない機体（到達不能・まだ分析していない。理由つき）、除外は `online` 以外の機体（理由と判断日つき）。読み取りだけで、機体へ接続せず台帳も書き換えない。
 
+## CPU を同じ処理で比べる
+
+「状態」の CPU 使用率に加え、同じ機体で同じ処理を行ったときの基準との差を確認できます。Node.js 24 で、リポジトリの `scripts/cpu-reference.js` を使います。別の機体にはこの1ファイルだけをコピーできます。リリース版は、機能を含むタグの Releases にある Source code (.zip) から同じファイルを取り出せます。追加パッケージは不要です。
+
+同じ入力の処理を別ターミナルで繰り返し、実行中の区間で次の計測を行います。最初の行は基準日の実行、2行目は調査したい実行で使います。引数は処理名、電源条件、1秒ごとの窓数（1～300）。処理名と電源条件は操作者が確認して付けるラベルです。
+
+```sh
+node scripts/cpu-reference.js sample fixed-job ac-balanced 10 > baseline.json
+node scripts/cpu-reference.js sample fixed-job ac-balanced 10 > current.json
+node scripts/cpu-reference.js compare baseline.json current.json
+```
+
+単体ファイルの利用時はパスを `cpu-reference.js` に変えます。リポジトリでは `npm run --silent cpu-reference --` に続けて同じ引数を渡せます。JSON にホスト名が含まれるため測定ファイルは機体内に保存してください。
+
+比較結果の `baseline.cpu_pct`、`observation.cpu_pct` は全論理CPUの累積時間から求めた各区間の使用率、`delta_percentage_points` はその差です。基準と対象で機体・OS・CPU・Node版・ラベルが異なる場合、時刻の順に重複がある場合、欠測がある場合は理由を示して終了コード1を返します。ホスト名の再利用やラベルに含めなかった条件までは識別できません。
+
+同時に、1回あたりの処理時間をワークロード側で記録してください。たとえば固定入力のビルドなら、別ターミナルで同じビルドを実行し、macOSでは `time`、PowerShellでは `Measure-Command` の経過時間を比較します。1コアに競合が集中すると、全機CPUの平均がほぼ同じでも処理は遅くなります。このコマンドは全機CPUの差を提示し、設定変更や異常判定は行いません。
+
 ## 開発
 
 ```sh

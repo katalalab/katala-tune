@@ -13,6 +13,7 @@
   "scripts": {
     "start": "cargo tauri dev",
     "test": "node --test test/*.test.js",
+    "cpu-reference": "node scripts/cpu-reference.js",
     "probe": "node scripts/probe-all.js",
     "package": "cargo tauri build",
     "package:win": "cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis",
